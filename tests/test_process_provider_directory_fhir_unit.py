@@ -2446,6 +2446,57 @@ async def test_import_linked_resource_rows_fetches_network_organization_from_net
 
 
 @pytest.mark.asyncio
+async def test_import_linked_resource_rows_reports_progress_when_flushing(monkeypatch):
+    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+        if "/Practitioner/prac-1" in url:
+            return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
+        if "/Location/loc-1" in url:
+            return (
+                200,
+                {
+                    "resourceType": "Location",
+                    "id": "loc-1",
+                    "address": {"line": ["100 Main"], "city": "Chicago", "state": "IL", "postalCode": "60601"},
+                },
+                None,
+                5,
+            )
+        return 404, None, None, 5
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        return len(rows)
+
+    progress: list[tuple[str, int]] = []
+
+    async def linked_progress(resource_type: str, written: int) -> None:
+        progress.append((resource_type, written))
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    counts = await importer._import_linked_resource_rows(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        {
+            "PractitionerRole": [
+                {
+                    "resource_id": "role-1",
+                    "practitioner_ref": "Practitioner/prac-1",
+                    "location_refs": ["Location/loc-1"],
+                }
+            ]
+        },
+        per_source_limit=5,
+        timeout=3,
+        run_id="run_1",
+        progress_callback=linked_progress,
+        flush_rows=1,
+    )
+
+    assert counts == {"Practitioner": 1, "Location": 1}
+    assert sorted(progress) == [("Location", 1), ("Practitioner", 1)]
+
+
+@pytest.mark.asyncio
 async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
@@ -2500,17 +2551,16 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
 
     assert counts == {"PractitionerRole": 1}
     assert linked_counts == {"Location": 2}
-    assert linked_kwargs == [
-        {
-            "per_source_limit": 5,
-            "concurrency": 5,
-            "timeout": 3,
-            "run_id": "run_1",
-            "source_ids": ["source_a"],
-            "track_seen": False,
-            "seen_table": None,
-        }
-    ]
+    assert len(linked_kwargs) == 1
+    assert linked_kwargs[0]["per_source_limit"] == 5
+    assert linked_kwargs[0]["concurrency"] == 5
+    assert linked_kwargs[0]["timeout"] == 3
+    assert linked_kwargs[0]["run_id"] == "run_1"
+    assert linked_kwargs[0]["source_ids"] == ["source_a"]
+    assert linked_kwargs[0]["track_seen"] is False
+    assert linked_kwargs[0]["seen_table"] is None
+    assert linked_kwargs[0]["deadline_seconds"] == 0
+    assert callable(linked_kwargs[0]["progress_callback"])
 
 
 @pytest.mark.asyncio
@@ -4479,6 +4529,7 @@ def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
         stale_cleanup=None,
         resource_limit=None,
         linked_resource_limit=None,
+        linked_resource_deadline_seconds=None,
         page_limit=None,
         page_count=None,
         stream_batch_size=None,
@@ -4512,12 +4563,15 @@ def test_harness_parse_args_accepts_retest_supplement_args():
             "https://example.test/retest_results.json",
             "--credential-config-file",
             "/tmp/provider-directory-credentials.json",
+            "--linked-resource-deadline-seconds",
+            "1800",
         ]
     )
 
     assert args.retest_results_path == "/tmp/retest_results.json"
     assert args.retest_results_url == "https://example.test/retest_results.json"
     assert args.credential_config_file == "/tmp/provider-directory-credentials.json"
+    assert args.linked_resource_deadline_seconds == 1800
 
 
 def test_harness_fixture_covers_healthcare_service_location_refs():

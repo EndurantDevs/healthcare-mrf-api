@@ -5588,6 +5588,9 @@ async def _import_linked_resource_rows(
     source_ids: list[str] | None = None,
     track_seen: bool = False,
     seen_table: str | None = None,
+    progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
+    deadline_seconds: int = 0,
+    flush_rows: int | None = None,
 ) -> dict[str, int]:
     if per_source_limit <= 0:
         return {}
@@ -5624,29 +5627,69 @@ async def _import_linked_resource_rows(
             model, row = result
             return resource_type, model, row
 
-    by_model: dict[type, list[dict[str, Any]]] = {}
-    for result in await asyncio.gather(*[_fetch_one(ref) for ref in refs_to_fetch]):
-        if not result:
-            continue
-        fetched_resource_type, model, row = result
-        by_model.setdefault(model, []).append(row)
-        existing.add((fetched_resource_type, row.get("resource_id")))
-
     counts: dict[str, int] = {}
     edge_source_ids = source_ids or [source["source_id"]]
     canonical_api_base = source.get("canonical_api_base") or source.get("api_base")
-    for model, rows in by_model.items():
-        imported = await _upsert_resource_rows(
-            model,
-            rows,
-            run_id=run_id,
-            track_seen=track_seen,
-            seen_table=seen_table,
-            canonical_api_base=canonical_api_base,
-            source_ids=edge_source_ids,
-        )
-        if imported:
-            counts[model.__name__.removeprefix("ProviderDirectory")] = imported
+    by_model: dict[type, list[dict[str, Any]]] = {}
+    pending_row_count = 0
+    flush_threshold = max(int(flush_rows or _linked_resource_flush_rows()), 1)
+
+    async def flush_pending_rows() -> None:
+        nonlocal pending_row_count
+        if not by_model:
+            return
+        pending = by_model.copy()
+        by_model.clear()
+        pending_row_count = 0
+        for model, rows in pending.items():
+            if not rows:
+                continue
+            imported = await _upsert_resource_rows(
+                model,
+                rows,
+                run_id=run_id,
+                track_seen=track_seen,
+                seen_table=seen_table,
+                canonical_api_base=canonical_api_base,
+                source_ids=edge_source_ids,
+            )
+            if imported:
+                resource_name = model.__name__.removeprefix("ProviderDirectory")
+                counts[resource_name] = counts.get(resource_name, 0) + imported
+                if progress_callback is not None:
+                    await progress_callback(resource_name, imported)
+
+    tasks = [asyncio.create_task(_fetch_one(ref)) for ref in refs_to_fetch]
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    try:
+        for future in asyncio.as_completed(tasks):
+            try:
+                if deadline_at is None:
+                    result = await future
+                else:
+                    remaining = deadline_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    result = await asyncio.wait_for(future, timeout=remaining)
+            except TimeoutError:
+                break
+            except Exception:  # pragma: no cover - defensive per-reference isolation
+                continue
+            if not result:
+                continue
+            fetched_resource_type, model, row = result
+            by_model.setdefault(model, []).append(row)
+            pending_row_count += 1
+            existing.add((fetched_resource_type, row.get("resource_id")))
+            if pending_row_count >= flush_threshold:
+                await flush_pending_rows()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    await flush_pending_rows()
     return counts
 
 
@@ -5947,6 +5990,10 @@ def _env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _linked_resource_flush_rows() -> int:
+    return _env_int("HLTHPRT_PROVIDER_DIRECTORY_LINKED_RESOURCE_FLUSH_ROWS", 1000)
+
+
 async def _mark_provider_directory_progress(
     run_id: str | None,
     *,
@@ -6237,6 +6284,7 @@ async def _import_resources(
     run_id: str | None,
     linked_resource_limit: int = 0,
     linked_resource_concurrency: int = 5,
+    linked_resource_deadline_seconds: int = 0,
     linked_counts: dict[str, int] | None = None,
     resource_fetch_stats: dict[str, dict[str, Any]] | None = None,
     stale_counts: dict[str, int] | None = None,
@@ -6520,6 +6568,15 @@ async def _import_resources(
                                 source_stale_counts.get("PractitionerRole", 0) + stale_deleted
                             )
         if linked_resource_limit > 0 and rows_by_resource:
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = "Linked resources"
+                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
+
+            async def linked_progress(resource_type: str, written: int) -> None:
+                await maybe_report_partial_progress(group_key, resource_type, written)
+
             source_linked_counts = await _import_linked_resource_rows(
                 source,
                 rows_by_resource,
@@ -6530,6 +6587,8 @@ async def _import_resources(
                 source_ids=source_ids,
                 track_seen=stale_cleanup,
                 seen_table=seen_stage_table,
+                progress_callback=linked_progress,
+                deadline_seconds=linked_resource_deadline_seconds,
             )
         return (
             source_ids,
@@ -6662,6 +6721,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("linked_resource_limit"),
         _env_int("HLTHPRT_PROVIDER_DIRECTORY_LINKED_RESOURCE_LIMIT", resource_limit),
     )
+    linked_resource_deadline_seconds = _int_or_default(
+        task.get("linked_resource_deadline_seconds"),
+        _env_int("HLTHPRT_PROVIDER_DIRECTORY_LINKED_RESOURCE_DEADLINE_SECONDS", 0),
+    )
     stream_batch_size = _int_or_default(
         task.get("stream_batch_size"),
         0 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_STREAM_BATCH_SIZE", DEFAULT_STREAM_BATCH_SIZE),
@@ -6777,6 +6840,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "resource_rows": {},
             "full_refresh": full_refresh,
             "resource_limit": resource_limit,
+            "linked_resource_limit": linked_resource_limit,
+            "linked_resource_deadline_seconds": linked_resource_deadline_seconds,
             "page_limit": page_limit,
             "page_count": page_count,
             "stream_batch_size": stream_batch_size,
@@ -6873,6 +6938,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 run_id=run_id,
                 linked_resource_limit=linked_resource_limit,
                 linked_resource_concurrency=concurrency,
+                linked_resource_deadline_seconds=linked_resource_deadline_seconds,
                 linked_counts=metrics.setdefault("linked_resource_rows", {}),
                 resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
                 stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
@@ -6961,6 +7027,7 @@ async def main(
     resources: str | None = None,
     resource_limit: int | None = None,
     linked_resource_limit: int | None = None,
+    linked_resource_deadline_seconds: int | None = None,
     page_limit: int | None = None,
     page_count: int | None = None,
     stream_batch_size: int | None = None,
@@ -6995,6 +7062,7 @@ async def main(
         "resources": resources,
         "resource_limit": resource_limit,
         "linked_resource_limit": linked_resource_limit,
+        "linked_resource_deadline_seconds": linked_resource_deadline_seconds,
         "page_limit": page_limit,
         "page_count": page_count,
         "stream_batch_size": stream_batch_size,

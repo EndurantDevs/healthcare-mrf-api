@@ -164,7 +164,10 @@ role/affiliation rows reference resources outside the fetched page slice,
 `linked_resource_limit` bounds optional direct FHIR reads for those referenced
 Practitioners, Organizations, Locations, HealthcareServices, InsurancePlans, and
 Endpoints. A value of `0` disables that linked fallback; full refresh normally
-relies on the direct resource collections.
+relies on the direct resource collections. `linked_resource_deadline_seconds`
+optionally bounds the linked fallback per source so a slow remote endpoint does
+not hold the whole import chain after the direct resource collections have been
+captured.
 
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing
@@ -607,8 +610,9 @@ signals:
 catalog, include the upstream `provider-directory-db` retest snapshot
 supplement, include credentialed/auth-required sources when credentials are
 configured, run a full resource refresh (`resource_limit=0`,
-`linked_resource_limit=50000`, `page_limit=0`, `page_count=100`,
-`stream_batch_size=5000`, `bulk_export=true`, `source_concurrency=4`,
+`linked_resource_limit=50000`, `linked_resource_deadline_seconds=1800`,
+`page_limit=0`, `page_count=100`, `stream_batch_size=5000`,
+`bulk_export=true`, `source_concurrency=4`,
 `publish_artifacts=true`, `publish_corroboration=false`), and delete stale rows
 only for completed source/resource scans.
 `import-control` also schedules a follow-up artifact-only Provider Directory

@@ -372,6 +372,8 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             command.extend(["--resource-limit", str(args.resource_limit)])
         if args.linked_resource_limit is not None:
             command.extend(["--linked-resource-limit", str(args.linked_resource_limit)])
+        if args.linked_resource_deadline_seconds is not None:
+            command.extend(["--linked-resource-deadline-seconds", str(args.linked_resource_deadline_seconds)])
         if args.page_limit is not None:
             command.extend(["--page-limit", str(args.page_limit)])
         if args.page_count is not None:
@@ -439,7 +441,15 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         payload["params"]["stale_cleanup"] = args.stale_cleanup
     if args.publish_artifacts is not None:
         payload["params"]["publish_artifacts"] = args.publish_artifacts
-    for key in ("resource_limit", "linked_resource_limit", "page_limit", "page_count", "stream_batch_size", "source_concurrency"):
+    for key in (
+        "resource_limit",
+        "linked_resource_limit",
+        "linked_resource_deadline_seconds",
+        "page_limit",
+        "page_count",
+        "stream_batch_size",
+        "source_concurrency",
+    ):
         value = getattr(args, key)
         if value is not None:
             payload["params"][key] = value
@@ -573,6 +583,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resources", help="Comma-separated resource list for local CLI imports.")
     parser.add_argument("--resource-limit", type=int, default=None, help="Rows per source/resource; 0 means unbounded.")
     parser.add_argument("--linked-resource-limit", type=int, default=None, help="Referenced FHIR resources per source.")
+    parser.add_argument("--linked-resource-deadline-seconds", type=int, default=None, help="Seconds to spend fetching linked resources per source; 0 disables the deadline.")
     parser.add_argument("--page-limit", type=int, default=None, help="FHIR pages per source/resource; 0 means unbounded.")
     parser.add_argument("--page-count", type=int, default=None, help="FHIR _count page size.")
     parser.add_argument("--stream-batch-size", type=int, default=None, help="Rows per streaming upsert batch; 0 disables streaming.")

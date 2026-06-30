@@ -1182,6 +1182,7 @@ def provider_enrichment(test: bool):
 )
 @click.option("--resource-limit", type=int, help="Rows per source/resource to retain.")
 @click.option("--linked-resource-limit", type=int, help="Referenced FHIR resources per source to fetch after paged resources.")
+@click.option("--linked-resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching linked resources per source.")
 @click.option("--page-limit", type=int, help="Maximum FHIR pages per source/resource.")
 @click.option("--page-count", type=int, help="FHIR _count page size.")
 @click.option("--stream-batch-size", type=int, help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.")
@@ -1217,6 +1218,7 @@ def provider_directory_fhir(
     resources: str | None,
     resource_limit: int | None,
     linked_resource_limit: int | None,
+    linked_resource_deadline_seconds: int | None,
     page_limit: int | None,
     page_count: int | None,
     stream_batch_size: int | None,
@@ -1250,6 +1252,7 @@ def provider_directory_fhir(
             resources=resources,
             resource_limit=resource_limit,
             linked_resource_limit=linked_resource_limit,
+            linked_resource_deadline_seconds=linked_resource_deadline_seconds,
             page_limit=page_limit,
             page_count=page_count,
             stream_batch_size=stream_batch_size,
