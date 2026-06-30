@@ -39,7 +39,111 @@
   "thresholds": {
     "max_file_lines": 500,
     "max_function_lines": 60,
-    "max_nesting_depth": 4
+    "max_nesting_depth": 4,
+    "max_function_name_tokens": 6,
+    "max_class_name_tokens": 6,
+    "min_generic_function_lines": 30,
+    "min_ambiguous_variable_scope_lines": 30,
+    "max_single_letter_scope_lines": 15,
+    "min_docstring_function_lines": 60,
+    "max_parameters": 8,
+    "max_locals": 25
+  },
+  "readability": {
+    "ambiguous_function_names": [
+      "build",
+      "callback",
+      "do",
+      "execute",
+      "get",
+      "get_all",
+      "handle",
+      "helper",
+      "load",
+      "main",
+      "parse",
+      "process",
+      "process_data",
+      "run",
+      "save",
+      "shutdown",
+      "start"
+    ],
+    "ambiguous_class_names": [
+      "Base",
+      "Data",
+      "Handler",
+      "Helper",
+      "Manager",
+      "Processor",
+      "Service",
+      "Wrapper"
+    ],
+    "ambiguous_variable_names": [
+      "data",
+      "item",
+      "items",
+      "obj",
+      "payload",
+      "record",
+      "records",
+      "res",
+      "result",
+      "results",
+      "row",
+      "rows",
+      "source",
+      "sources",
+      "target",
+      "targets",
+      "tmp",
+      "value",
+      "values"
+    ],
+    "allowed_short_names": [
+      "_",
+      "i",
+      "j",
+      "k",
+      "n",
+      "x",
+      "y",
+      "z"
+    ],
+    "always_bad_short_names": [
+      "l",
+      "O"
+    ],
+    "boolean_prefixes": [
+      "can_",
+      "has_",
+      "include_",
+      "includes_",
+      "is_",
+      "needs_",
+      "should_",
+      "supports_",
+      "use_",
+      "uses_"
+    ],
+    "dict_name_markers": [
+      "by_",
+      "_by_",
+      "_dict",
+      "_index",
+      "_lookup",
+      "_map",
+      "_registry"
+    ],
+    "collection_singular_exceptions": [
+      "data",
+      "metadata",
+      "payload"
+    ],
+    "comment_noise_patterns": [
+      "^(?:increment|decrement|return|returns|loop|iterate|assign|set|get|create|call|print)\\b",
+      "^(?:initialize|initialise) (?:variable|counter|list|dict|dictionary|set)\\b"
+    ]
   },
   "inline_suppression_patterns": [
     {

@@ -24,6 +24,25 @@ def _write_config(repo_root: Path) -> None:
             "max_file_lines": 8,
             "max_function_lines": 4,
             "max_nesting_depth": 1,
+            "max_function_name_tokens": 6,
+            "max_class_name_tokens": 6,
+            "min_generic_function_lines": 4,
+            "min_ambiguous_variable_scope_lines": 4,
+            "max_single_letter_scope_lines": 2,
+            "min_docstring_function_lines": 4,
+            "max_parameters": 3,
+            "max_locals": 3,
+        },
+        "readability": {
+            "ambiguous_function_names": ["process_data"],
+            "ambiguous_class_names": ["Manager"],
+            "ambiguous_variable_names": ["data", "row", "result"],
+            "allowed_short_names": ["_", "i"],
+            "always_bad_short_names": ["l", "O"],
+            "boolean_prefixes": ["is_", "has_", "should_"],
+            "dict_name_markers": ["_by_", "_map"],
+            "collection_singular_exceptions": ["data"],
+            "comment_noise_patterns": ["^return\\b"],
         },
         "inline_suppression_patterns": [
             {"name": "python_noqa", "pattern": "#\\s*noqa\\b"},
@@ -128,3 +147,72 @@ def test_readability_budget_does_not_parse_non_python_files(tmp_path):
     snapshot = readability_budget.build_snapshot(repo_root, config)
 
     assert snapshot["issue_counts"]["syntax_errors"] == 0
+
+
+def test_readability_budget_reports_naming_and_contract_debt(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text(
+        textwrap.dedent(
+            """
+            class Manager:
+                pass
+
+            def process_data(a, b, c, d):
+                # return result
+                data = [1, 2, 3]
+                row = {"a": 1}
+                result = a == b
+                l = 1
+                extra = 2
+                another = 3
+                return result
+            """
+        ),
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+
+    snapshot = readability_budget.build_snapshot(
+        repo_root,
+        json.loads((repo_root / "readability-budget.json").read_text(encoding="utf-8")),
+    )
+
+    assert snapshot["issue_counts"]["ambiguous_function_names"] == 1
+    assert snapshot["issue_counts"]["ambiguous_variable_names"] == 3
+    assert snapshot["issue_counts"]["boolean_name_mismatch"] == 1
+    assert snapshot["issue_counts"]["class_name_shape"] == 1
+    assert snapshot["issue_counts"]["comment_noise"] == 1
+    assert snapshot["issue_counts"]["missing_contract_docstrings"] == 1
+    assert snapshot["issue_counts"]["single_letter_names"] == 5
+    assert snapshot["issue_counts"]["too_many_locals"] == 1
+    assert snapshot["issue_counts"]["too_many_parameters"] == 1
+
+
+def test_readability_budget_reports_collection_and_global_state_debt(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text(
+        textwrap.dedent(
+            """
+            def build_lookup():
+                global CACHE
+                names = {"a": 1}
+                thing = []
+                ...
+            """
+        ),
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+
+    snapshot = readability_budget.build_snapshot(
+        repo_root,
+        json.loads((repo_root / "readability-budget.json").read_text(encoding="utf-8")),
+    )
+
+    assert snapshot["issue_counts"]["collection_name_mismatch"] == 2
+    assert snapshot["issue_counts"]["global_state_usage"] == 1
+    assert snapshot["issue_counts"]["pass_placeholders"] == 1
