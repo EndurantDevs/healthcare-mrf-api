@@ -4476,11 +4476,11 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     }
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.publish_provider_directory_location_address_keys.assert_awaited_once_with(
-        run_id=None,
+        run_id="run_publish", source_ids=[],
         seen_table=None,
     )
     importer.publish_provider_directory_location_archive.assert_awaited_once_with(
-        run_id="run_publish",
+        run_id="run_publish", source_ids=[],
         seen_table=None,
     )
     importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
@@ -4645,3 +4645,49 @@ def test_primary_gateway_host():
 
     assert importer._source_uses_known_onboarding_gateway(public_cigna_dict) is False
     assert importer._source_uses_known_onboarding_gateway(availity_primary_dict) is True
+
+
+def test_location_archive_source_scope():
+    sql = importer.provider_directory_location_archive_stage_sql(
+        "mrf",
+        "provider_directory_location_archive_stage_test",
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+    )
+
+    assert "loc.last_seen_run_id = CAST(:run_id AS varchar)" in sql
+    assert "loc.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+
+
+@pytest.mark.asyncio
+async def test_artifact_publish_source_scope(monkeypatch):
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 2}),
+    )
+    key_publish = AsyncMock(return_value=3)
+    archive_publish = AsyncMock(return_value={"inserted": 4, "provenance_updates": 5})
+    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", key_publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_location_archive", archive_publish)
+
+    metrics = await importer._publish_provider_directory_artifacts(
+        run_id="run_1",
+        metrics={},
+        address_key_run_id="run_1",
+        source_ids=["source_a", "source_b"],
+    )
+
+    assert metrics["location_address_keys_stamped"] == 3
+    assert metrics["location_archive"]["inserted"] == 4
+    key_publish.assert_awaited_once_with(
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+        seen_table=None,
+    )
+    archive_publish.assert_awaited_once_with(
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+        seen_table=None,
+    )

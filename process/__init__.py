@@ -1122,6 +1122,12 @@ def provider_enrichment(test: bool):
 @click.option("--retest-results-path", help="Path to provider-directory-db retest_results.json supplemental source file.")
 @click.option("--retest-results-url", help="URL for provider-directory-db retest_results.json supplemental source file.")
 @click.option("--credential-config-file", help="Path to secret-backed Provider Directory credentials JSON file.")
+@click.option("--run-id", help="Existing Provider Directory FHIR run id to scope artifact publishing.")
+@click.option(
+    "--source-id",
+    multiple=True,
+    help="Provider Directory source id to scope artifact publishing. Can be passed more than once.",
+)
 @click.option("--limit", type=int, help="Maximum seed sources to process.")
 @click.option("--source-query", help="Case-insensitive org/plan substring filter for the seed database.")
 @click.option("--seed-only", is_flag=True, help="Load source rows without probing endpoints.")
@@ -1201,6 +1207,8 @@ def provider_directory_fhir(
     retest_results_path: str | None,
     retest_results_url: str | None,
     credential_config_file: str | None,
+    run_id: str | None,
+    source_id: tuple[str, ...],
     limit: int | None,
     source_query: str | None,
     seed_only: bool,
@@ -1235,6 +1243,8 @@ def provider_directory_fhir(
             retest_results_path=retest_results_path,
             retest_results_url=retest_results_url,
             credential_config_file=credential_config_file,
+            run_id=run_id,
+            source_ids=list(source_id),
             limit=limit,
             source_query=source_query,
             seed_only=seed_only,

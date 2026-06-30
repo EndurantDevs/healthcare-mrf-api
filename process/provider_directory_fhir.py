@@ -3010,7 +3010,7 @@ async def _publish_provider_directory_artifacts(
     run_id: str | None,
     metrics: dict[str, Any],
     seen_table: str | None = None,
-    address_key_run_id: str | None = None,
+    address_key_run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
     publish_corroboration: bool = False,
 ) -> dict[str, Any]:
     await _mark_provider_directory_progress(
@@ -3036,8 +3036,7 @@ async def _publish_provider_directory_artifacts(
     if seen_table:
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
     metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
-        run_id=address_key_run_id,
-        seen_table=seen_table,
+        run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
     )
     await _mark_provider_directory_progress(
         run_id,
@@ -3051,8 +3050,7 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     metrics["location_archive"] = await publish_provider_directory_location_archive(
-        run_id=run_id,
-        seen_table=seen_table,
+        run_id=run_id, source_ids=source_ids, seen_table=seen_table,
     )
     await _mark_provider_directory_progress(
         run_id,
@@ -3088,7 +3086,6 @@ async def _publish_provider_directory_artifacts(
     )
     return metrics
 
-
 def _provider_directory_location_archive_stage_table_name(run_id: str | None = None) -> str:
     raw = run_id or f"{os.getpid()}_{time.time_ns()}"
     digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -3099,7 +3096,7 @@ def provider_directory_location_archive_stage_sql(
     db_schema: str | None = None,
     stage_table: str | None = None,
     *,
-    run_id: str | None = None,
+    run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
     seen_table: str | None = None,
 ) -> str:
     schema = db_schema or _schema()
@@ -3123,6 +3120,7 @@ def provider_directory_location_archive_stage_sql(
         )
     elif run_id is not None:
         scope_clauses.append("loc.last_seen_run_id = CAST(:run_id AS varchar)")
+    if source_ids: scope_clauses.append("loc.source_id = ANY(CAST(:source_ids AS varchar[]))")
     scope_sql = "".join(f"\n           AND {clause}" for clause in scope_clauses)
     return f"""
     CREATE UNLOGGED TABLE {stage_ref} AS
@@ -3181,7 +3179,7 @@ def provider_directory_location_archive_stage_sql(
 async def publish_provider_directory_location_archive(
     db_schema: str | None = None,
     *,
-    run_id: str | None = None,
+    run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
     stage_table: str | None = None,
     seen_table: str | None = None,
 ) -> dict[str, Any]:
@@ -3199,10 +3197,10 @@ async def publish_provider_directory_location_archive(
             provider_directory_location_archive_stage_sql(
                 schema,
                 stage,
-                run_id=run_id,
+                run_id=run_id, source_ids=source_ids,
                 seen_table=seen_table,
             ),
-            **({"run_id": run_id} if run_id is not None else {}),
+            **(({"run_id": run_id} if run_id is not None else {}) | ({"source_ids": list(source_ids)} if source_ids else {})),
         )
         await db.status(f"ANALYZE {_qt(schema, stage)};")
         stats = await resolve_into_archive(
@@ -4600,6 +4598,8 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
             best_payload = payload
     assert best_probe is not None
     return best_probe, best_payload
+
+
 
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
@@ -6710,6 +6710,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     await _ensure_provider_directory_tables()
 
     run_id = _clean_text(task.get("run_id")) or _clean_text(ctx.get("control_run_id"))
+    requested_source_ids = _clean_source_id_list(
+        task.get("source_ids")
+        or task.get("source_id")
+        or task.get("provider_directory_source_ids")
+        or task.get("provider_directory_source_id")
+    )
     limit = int(task.get("limit") or 0) or None
     source_query = _clean_text(task.get("source_query"))
     timeout = int(task.get("timeout") or os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TIMEOUT", "15"))
@@ -6777,10 +6783,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         metrics = {
             "publish_artifacts": True,
             "publish_artifacts_only": True,
+            "source_ids": requested_source_ids,
         }
         metrics = await _publish_provider_directory_artifacts(
             run_id=run_id,
             metrics=metrics,
+            address_key_run_id=run_id,
+            source_ids=requested_source_ids,
             publish_corroboration=publish_corroboration,
         )
         ctx["context"]["audit"] = metrics
@@ -6848,6 +6857,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             )
         metrics: dict[str, Any] = {
             "sources_seeded": len(source_rows),
+            "source_ids": requested_source_ids,
             "supplemental_retest_sources_considered": len(supplemental_retest_seed_rows),
             "stale_source_rows_deleted": stale_source_rows_deleted,
             "sources_probed": 0,
@@ -6968,11 +6978,19 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             )
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts:
+                artifact_source_ids = requested_source_ids
+                if not artifact_source_ids:
+                    artifact_source_ids = [
+                        importable_source["source_id"]
+                        for importable_source in importable
+                        if _clean_text(importable_source.get("source_id")) is not None
+                    ]
                 metrics = await _publish_provider_directory_artifacts(
                     run_id=run_id,
                     metrics=metrics,
                     seen_table=seen_stage_table_for_publish,
                     address_key_run_id=run_id,
+                    source_ids=artifact_source_ids,
                     publish_corroboration=publish_corroboration,
                 )
             else:
@@ -7024,6 +7042,8 @@ async def main(
     seed_db_url: str | None = None,
     retest_results_path: str | None = None,
     retest_results_url: str | None = None,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | str | None = None,
     limit: int | None = None,
     source_query: str | None = None,
     seed_only: bool = False,
@@ -7059,6 +7079,8 @@ async def main(
         "seed_db_url": seed_db_url,
         "retest_results_path": retest_results_path,
         "retest_results_url": retest_results_url,
+        "run_id": run_id,
+        "source_ids": source_ids,
         "limit": limit,
         "source_query": source_query,
         "seed_only": seed_only,
@@ -7089,3 +7111,23 @@ async def main(
     result = await process_data(ctx, task)
     await shutdown(ctx)
     return result
+
+
+def _clean_source_id_list(raw_source_ids: Any) -> list[str]:
+    if raw_source_ids in (None, ""):
+        return []
+    if isinstance(raw_source_ids, str):
+        source_id_values = raw_source_ids.split(",")
+    elif isinstance(raw_source_ids, (bytes, bytearray, dict)) or not hasattr(raw_source_ids, "__iter__"):
+        source_id_values = (raw_source_ids,)
+    else:
+        source_id_values = raw_source_ids
+    cleaned_source_ids: list[str] = []
+    seen_source_ids: set[str] = set()
+    for source_id_candidate in source_id_values:
+        source_id_text = _clean_text(source_id_candidate)
+        if not source_id_text or source_id_text in seen_source_ids:
+            continue
+        seen_source_ids.add(source_id_text)
+        cleaned_source_ids.append(source_id_text)
+    return cleaned_source_ids
