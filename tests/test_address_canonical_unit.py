@@ -2574,18 +2574,30 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     heap_name = entity_address_unified._provider_directory_replacement_stage_table_name(  # pylint: disable=protected-access
         "entity_address_unified_20260614"
     )
+    affected_location_table = entity_address_unified._provider_directory_affected_live_location_table_name(  # pylint: disable=protected-access
+        "entity_address_unified_20260614"
+    )
     create_sql = entity_address_unified._create_provider_directory_replacement_stage_sql(  # pylint: disable=protected-access
         "mrf",
         replacement_stage_table=heap_name,
         stage_table="entity_address_unified_20260614",
     )
-    copy_live_sql = entity_address_unified._copy_unaffected_live_entity_rows_sql(  # pylint: disable=protected-access
+    prepare_affected_sql = entity_address_unified._prepare_provider_directory_affected_live_locations_sql(  # pylint: disable=protected-access
         "mrf",
         live_table="entity_address_unified",
-        stage_table=heap_name,
         affected_group_table="entity_address_unified_20260614_pd_groups",
         replacement_lookup_table="entity_address_unified_20260614",
-        on_conflict=False,
+        affected_location_table=affected_location_table,
+    )
+    index_affected_sql = entity_address_unified._index_provider_directory_affected_live_locations_sql(  # pylint: disable=protected-access
+        "mrf",
+        affected_location_table,
+    )
+    copy_live_sql = entity_address_unified._copy_unaffected_live_entity_rows_by_location_sql(  # pylint: disable=protected-access
+        "mrf",
+        live_table="entity_address_unified",
+        target_stage_table=heap_name,
+        affected_location_table=affected_location_table,
     )
     copy_stage_sql = entity_address_unified._copy_stage_entity_rows_sql(  # pylint: disable=protected-access
         "mrf",
@@ -2596,9 +2608,21 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     assert heap_name.endswith("_pd_replacement")
     assert f"CREATE UNLOGGED TABLE mrf.{heap_name}" in create_sql
     assert "(LIKE mrf.entity_address_unified_20260614 INCLUDING DEFAULTS)" in create_sql
+    assert affected_location_table.endswith("_pd_live_locations")
+    assert f"CREATE UNLOGGED TABLE mrf.{affected_location_table} AS" in prepare_affected_sql
+    assert "affected_npis AS MATERIALIZED" in prepare_affected_sql
+    assert "affected_unknown_groups AS MATERIALIZED" in prepare_affected_sql
+    assert "FROM mrf.entity_address_unified AS live" in prepare_affected_sql
+    assert "JOIN affected_npis AS affected_npi" in prepare_affected_sql
+    assert "FROM mrf.entity_address_unified_20260614 AS replacement" in prepare_affected_sql
+    assert "CREATE UNIQUE INDEX" in index_affected_sql
+    assert f"ON mrf.{affected_location_table} (location_key)" in index_affected_sql
     assert f"INSERT INTO mrf.{heap_name}" in copy_live_sql
-    assert "LEFT JOIN mrf.entity_address_unified_20260614 AS replacement" in copy_live_sql
+    assert f"LEFT JOIN mrf.{affected_location_table} AS affected" in copy_live_sql
+    assert "affected.location_key = live.location_key" in copy_live_sql
+    assert "WHERE affected.location_key IS NULL" in copy_live_sql
     assert "ON CONFLICT" not in copy_live_sql
+    assert "DELETE FROM" not in "\n".join((prepare_affected_sql, copy_live_sql, copy_stage_sql))
     assert f"INSERT INTO mrf.{heap_name}" in copy_stage_sql
     assert "FROM mrf.entity_address_unified_20260614 AS stage" in copy_stage_sql
 

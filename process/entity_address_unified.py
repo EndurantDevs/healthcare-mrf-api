@@ -3244,6 +3244,10 @@ def _provider_directory_partial_affected_group_table_name(stage_table: str) -> s
     return _archived_identifier(stage_table, "_pd_groups")
 
 
+def _provider_directory_affected_live_location_table_name(stage_table: str) -> str:
+    return _archived_identifier(stage_table, "_pd_live_locations")
+
+
 def _is_provider_directory_source_select(db_schema: str, source_select: str) -> bool:
     return (
         f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
@@ -3552,6 +3556,89 @@ def _copy_unaffected_live_entity_rows_sql(
        )
        AND replacement.location_key IS NULL
     {on_conflict_sql};
+    """
+
+
+def _prepare_provider_directory_affected_live_locations_sql(
+    db_schema: str,
+    *,
+    live_table: str,
+    affected_group_table: str,
+    replacement_lookup_table: str,
+    affected_location_table: str,
+) -> str:
+    live_npi_expr = _entity_address_row_npi_expr("live")
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{affected_location_table} AS
+    WITH affected_npis AS MATERIALIZED (
+        SELECT DISTINCT affected.entity_npi
+          FROM {db_schema}.{affected_group_table} AS affected
+         WHERE affected.entity_npi IS NOT NULL
+    ), affected_unknown_groups AS MATERIALIZED (
+        SELECT affected.*
+          FROM {db_schema}.{affected_group_table} AS affected
+         WHERE affected.entity_npi IS NULL
+    )
+    SELECT DISTINCT affected_location.location_key::varchar AS location_key
+      FROM (
+            SELECT live.location_key::varchar AS location_key
+              FROM {db_schema}.{live_table} AS live
+              JOIN affected_npis AS affected_npi
+                ON live.npi = affected_npi.entity_npi
+             WHERE live.location_key IS NOT NULL
+            UNION
+            SELECT live.location_key::varchar AS location_key
+              FROM {db_schema}.{live_table} AS live
+              JOIN affected_npis AS affected_npi
+                ON live.npi IS NULL
+               AND affected_npi.entity_npi = {live_npi_expr}
+             WHERE live.location_key IS NOT NULL
+            UNION
+            SELECT live.location_key::varchar AS location_key
+              FROM {db_schema}.{live_table} AS live
+             WHERE live.location_key IS NOT NULL
+               AND EXISTS (
+                    SELECT 1
+                      FROM affected_unknown_groups AS affected
+                     WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+               )
+            UNION
+            SELECT replacement.location_key::varchar AS location_key
+              FROM {db_schema}.{replacement_lookup_table} AS replacement
+             WHERE replacement.location_key IS NOT NULL
+          ) AS affected_location
+     WHERE affected_location.location_key IS NOT NULL;
+    """
+
+
+def _index_provider_directory_affected_live_locations_sql(
+    db_schema: str,
+    affected_location_table: str,
+) -> str:
+    index_name = _archived_identifier(f"{affected_location_table}_idx_location", "")
+    return f"""
+    CREATE UNIQUE INDEX {index_name}
+        ON {db_schema}.{affected_location_table} (location_key);
+    """
+
+
+def _copy_unaffected_live_entity_rows_by_location_sql(
+    db_schema: str,
+    *,
+    live_table: str,
+    target_stage_table: str,
+    affected_location_table: str,
+) -> str:
+    columns = _entity_address_column_names()
+    column_list = ", ".join(columns)
+    select_list = ", ".join(f"live.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{target_stage_table} ({column_list})
+    SELECT {select_list}
+      FROM {db_schema}.{live_table} AS live
+      LEFT JOIN {db_schema}.{affected_location_table} AS affected
+        ON affected.location_key = live.location_key
+     WHERE affected.location_key IS NULL;
     """
 
 
@@ -10353,14 +10440,78 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await db.status(_disable_autovacuum_sql(db_schema, replacement_stage_table))
-        copied_rows = await _run_sql_phase(
-            _copy_unaffected_live_entity_rows_sql(
+        affected_live_location_table = _provider_directory_affected_live_location_table_name(stage_table)
+        context["partial_provider_directory_affected_live_location_table"] = affected_live_location_table
+        await _run_sql_phase(
+            f"DROP TABLE IF EXISTS {db_schema}.{affected_live_location_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing Provider Directory affected locations",
+            unit="tables",
+            done=0,
+            total=1,
+            pct=90,
+            message="dropping stale Provider Directory affected location stage",
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            _prepare_provider_directory_affected_live_locations_sql(
                 db_schema,
                 live_table=EntityAddressUnified.__main_table__,
-                stage_table=replacement_stage_table,
                 affected_group_table=affected_group_table,
                 replacement_lookup_table=stage_table,
-                on_conflict=False,
+                affected_location_table=affected_live_location_table,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing Provider Directory affected locations",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=90,
+            message="materializing Provider Directory affected live locations",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            _index_provider_directory_affected_live_locations_sql(
+                db_schema,
+                affected_live_location_table,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified indexing Provider Directory affected locations",
+            unit="indexes",
+            done=0,
+            total=1,
+            pct=90,
+            message="indexing Provider Directory affected live locations",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"ANALYZE {db_schema}.{affected_live_location_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified analyzing Provider Directory affected locations",
+            unit="tables",
+            done=0,
+            total=1,
+            pct=90,
+            message="analyzing Provider Directory affected live locations",
+            emit_start=True,
+            emit_done=True,
+        )
+        affected_live_locations = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_live_location_table};") or 0
+        )
+        context["partial_provider_directory_affected_live_locations"] = affected_live_locations
+        copied_rows = await _run_sql_phase(
+            _copy_unaffected_live_entity_rows_by_location_sql(
+                db_schema,
+                live_table=EntityAddressUnified.__main_table__,
+                target_stage_table=replacement_stage_table,
+                affected_location_table=affected_live_location_table,
             ),
             context=context,
             run_id=run_id,
@@ -10432,6 +10583,18 @@ async def process_data(ctx, task=None):
             total=1,
             pct=90,
             message="dropping affected Provider Directory groups",
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"DROP TABLE IF EXISTS {db_schema}.{affected_live_location_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified dropping Provider Directory affected locations",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=90,
+            message="dropping Provider Directory affected live locations",
             emit_done=True,
         )
 
@@ -10546,6 +10709,9 @@ async def shutdown(ctx):
         or context.get("partial_provider_directory_affected_group_table")
         or ""
     ).strip()
+    affected_live_location_table = str(
+        context.get("partial_provider_directory_affected_live_location_table") or ""
+    ).strip()
     partial_support_patch = bool(context.get("partial_support_patch_publish"))
     partial_main_patch = bool(
         context.get("partial_main_patch_publish")
@@ -10582,7 +10748,7 @@ async def shutdown(ctx):
             db_schema,
             stage_cls,
             support_stage_classes,
-            extra_tables=[affected_group_table],
+            extra_tables=[affected_group_table, affected_live_location_table],
         )
         await mark_control_run(
             run_id,
@@ -10615,6 +10781,9 @@ async def shutdown(ctx):
                 ),
                 "partial_provider_directory_affected_stage_rows_copied": int(
                     context.get("partial_provider_directory_affected_stage_rows_copied") or 0
+                ),
+                "partial_provider_directory_affected_live_locations": int(
+                    context.get("partial_provider_directory_affected_live_locations") or 0
                 ),
                 "npi_rows": int(context.get("npi_rows") or 0),
                 "inferred_rows": int(context.get("inferred_rows") or 0),
@@ -10765,7 +10934,7 @@ async def shutdown(ctx):
             db_schema,
             stage_cls,
             support_stage_classes,
-            extra_tables=[affected_group_table],
+            extra_tables=[affected_group_table, affected_live_location_table],
         )
 
     published_rows = stage_rows
@@ -10829,6 +10998,9 @@ async def shutdown(ctx):
             ),
             "partial_provider_directory_affected_stage_rows_copied": int(
                 context.get("partial_provider_directory_affected_stage_rows_copied") or 0
+            ),
+            "partial_provider_directory_affected_live_locations": int(
+                context.get("partial_provider_directory_affected_live_locations") or 0
             ),
             "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
             "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),
