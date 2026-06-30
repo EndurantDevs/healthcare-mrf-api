@@ -652,6 +652,26 @@ def _phase_timing_rows(context: dict, phase: str) -> int:
         return 0
 
 
+def _fallback_summary_counts(context: dict) -> dict[str, int] | None:
+    replacement_rows = _int_context_metric(context, "partial_provider_directory_replacement_rows")
+    if replacement_rows > 0:
+        return {
+            "staged_rows": replacement_rows,
+            "npi_rows": 0,
+            "inferred_rows": 0,
+            "multi_source_rows": 0,
+        }
+    aggregated_rows = _phase_timing_rows(context, "entity-address-unified aggregating")
+    if aggregated_rows > 0:
+        return {
+            "staged_rows": aggregated_rows,
+            "npi_rows": 0,
+            "inferred_rows": 0,
+            "multi_source_rows": 0,
+        }
+    return None
+
+
 def _hospital_facility_taxonomy_codes_sql(indent: str = "                ") -> str:
     return (",\n" + indent).join(_sql_literal(code) for code in HOSPITAL_FACILITY_TAXONOMY_CODES)
 
@@ -10374,6 +10394,9 @@ async def process_data(ctx, task=None):
         context["partial_provider_directory_affected_stage_rows_copied"] = int(
             affected_stage_rows or 0
         )
+        context["partial_provider_directory_replacement_rows"] = (
+            int(copied_rows or 0) + int(affected_stage_rows or 0)
+        )
         await _run_sql_phase(
             f"DROP TABLE {db_schema}.{stage_table};",
             context=context,
@@ -10448,14 +10471,7 @@ async def process_data(ctx, task=None):
     context["final_summary_counts"] = final_summary_counts
     summary_counts = None
     if not final_summary_counts:
-        aggregated_rows = _phase_timing_rows(context, "entity-address-unified aggregating")
-        if aggregated_rows > 0:
-            summary_counts = {
-                "staged_rows": aggregated_rows,
-                "npi_rows": 0,
-                "inferred_rows": 0,
-                "multi_source_rows": 0,
-            }
+        summary_counts = _fallback_summary_counts(context)
     if summary_counts is None:
         summary_counts = await _stage_summary_counts(db_schema, stage_table)
     staged_rows = summary_counts["staged_rows"]

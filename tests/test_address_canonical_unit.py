@@ -3195,6 +3195,24 @@ def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
     assert entity_address_unified._phase_timing_rows(context, "missing") == 0  # pylint: disable=protected-access
 
 
+def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows():
+    context = {
+        "partial_provider_directory_replacement_rows": 35506247,
+        "phase_timings": {
+            "entity-address-unified aggregating": {
+                "rows": 585171,
+            },
+        },
+    }
+
+    assert entity_address_unified._fallback_summary_counts(context) == {  # pylint: disable=protected-access
+        "staged_rows": 35506247,
+        "npi_rows": 0,
+        "inferred_rows": 0,
+        "multi_source_rows": 0,
+    }
+
+
 def test_entity_address_unified_final_summary_counts_can_be_disabled(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS", "false")
 
