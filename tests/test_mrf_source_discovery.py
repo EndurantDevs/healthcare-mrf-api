@@ -2693,14 +2693,14 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Shield of Arizona, Inc." in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of IL" in by_name["BCBS Illinois"].aliases
     assert "ILLINOIS BLUE CROSS" in by_name["BCBS Illinois"].aliases
-    assert by_name["BCBS Illinois"].benefit_lines == ("medical", "vision")
+    assert by_name["BCBS Illinois"].benefit_lines == ("medical", "dental", "vision")
     assert "Blue Cross and Blue Shield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Oklahoma" in by_name["BCBS Oklahoma"].aliases
     assert "BlueCross BlueShield of Nebraska" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Shield of NE" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
-    assert by_name["BCBS Texas"].benefit_lines == ("medical", "vision")
+    assert by_name["BCBS Texas"].benefit_lines == ("medical", "dental", "vision")
     assert by_name["BCBS Tennessee"].benefit_lines == ("medical", "dental")
     assert "Premera Blue Cross WA AK" in by_name["Premera Blue Cross"].aliases
     assert (
