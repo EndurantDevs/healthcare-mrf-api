@@ -1713,6 +1713,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Benefits and Risk Management Services" in aliases_by_name["BRMS"]
     assert "Benefits & Risk Management Services" in aliases_by_name["BRMS"]
+    assert by_name["BRMS"].benefit_lines == ("medical", "dental")
     assert "Aetna Dental" in aliases_by_name["Aetna"]
     assert by_name["Aetna"].benefit_lines == ("medical", "dental")
     assert "The Standard AHL" in aliases_by_name["Allied Benefit Systems"]
@@ -2560,6 +2561,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Concordia Dental" in matching_names("United Concorida")
     assert "EMI Health" in matching_importable_names("TDA Dental")
     assert "EMI Health" in matching_importable_names("Total Dental Administrators")
+    assert "BRMS" in matching_importable_names("Benefits and Risk Management Services")
+    assert "BRMS" in matching_importable_names("Benefit & Risk Management Services")
     assert "HAP" in matching_importable_names(
         "Alliance Health and Life Insurance Company"
     )
