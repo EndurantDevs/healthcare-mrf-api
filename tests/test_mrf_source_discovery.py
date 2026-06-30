@@ -2058,12 +2058,15 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Shield of Arizona, Inc." in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of IL" in by_name["BCBS Illinois"].aliases
     assert "ILLINOIS BLUE CROSS" in by_name["BCBS Illinois"].aliases
+    assert by_name["BCBS Illinois"].benefit_lines == ("medical", "vision")
     assert "Blue Cross and Blue Shield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Oklahoma" in by_name["BCBS Oklahoma"].aliases
     assert "BlueCross BlueShield of Nebraska" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Shield of NE" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
+    assert by_name["BCBS Texas"].benefit_lines == ("medical", "vision")
+    assert by_name["BCBS Tennessee"].benefit_lines == ("medical", "dental")
     assert "Premera Blue Cross WA AK" in by_name["Premera Blue Cross"].aliases
     assert (
         "BLUE CROSS WA/AK PREMERA BLUE CROSS"
@@ -2109,7 +2112,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Ameritas Holding Company Health Plan" in by_name["United Healthcare"].aliases
     assert "KCL Group Benefits" in by_name["United Healthcare"].aliases
     assert "Anthem CA" in by_name["Anthem"].aliases
-    assert by_name["Anthem"].benefit_lines == ("medical", "vision")
+    assert by_name["Anthem"].benefit_lines == ("medical", "dental", "vision")
     assert "Anthem BlueCross & BlueShield Plan" in by_name["Anthem"].aliases
     assert "Anthem Vision Plan" in by_name["Anthem"].aliases
     assert "Anthem Blue View Vision Plan" in by_name["Anthem"].aliases
@@ -2133,7 +2136,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Priority Health of Michigan" in by_name["Priority Health"].aliases
     assert "Sutter Health Plus" in by_name["Sutter Health Plan"].aliases
     assert "UHA" in by_name["UHA Health Insurance"].aliases
-    assert by_name["EMI Health"].benefit_lines == ("dental",)
+    assert by_name["EMI Health"].benefit_lines == ("dental", "medical")
+    assert "vision" not in by_name["EMI Health"].benefit_lines
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["EMI Health"].status == "active"
     assert by_name["EMI Health"].index_url == "https://emihealth.com/machinereadables"
@@ -2200,7 +2204,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "First Health Cofinity" in by_name["Luminare Health Benefits"].aliases
     assert "Medical Benefits Administrators, Inc." in by_name["MedBen"].aliases
     assert "Unified Group" in by_name["Unified Group Services"].aliases
-    assert by_name["EMI Health"].benefit_lines == ("dental",)
+    assert by_name["EMI Health"].benefit_lines == ("dental", "medical")
+    assert "vision" not in by_name["EMI Health"].benefit_lines
     assert "TDA Dental" in by_name["EMI Health"].aliases
     assert "Total Dental Administrators" in by_name["EMI Health"].aliases
     assert by_name["HAP"].hosting_platform == "healthsparq"
