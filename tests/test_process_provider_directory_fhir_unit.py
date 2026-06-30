@@ -4628,3 +4628,20 @@ def test_harness_run_includes_sql_typing_case(monkeypatch, tmp_path):
     assert report["overall_status"] == "succeeded"
     assert [item["case_id"] for item in report["results"]] == ["fixture-parser", "sql-typing"]
     assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["results"][1]["kind"] == "sql"
+
+
+def test_primary_gateway_host():
+    public_cigna_dict = {
+        "source_id": "cigna_public",
+        "api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        "endpoint_network": "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4/Network",
+    }
+    availity_primary_dict = {
+        "source_id": "availity_source",
+        "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/payer/r4",
+        "canonical_api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/payer/r4",
+    }
+
+    assert importer._source_uses_known_onboarding_gateway(public_cigna_dict) is False
+    assert importer._source_uses_known_onboarding_gateway(availity_primary_dict) is True

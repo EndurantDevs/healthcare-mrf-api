@@ -973,7 +973,7 @@ def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
 
 
 def _source_uses_known_onboarding_gateway(source: dict[str, Any]) -> bool:
-    return bool(_source_hosts(source) & FHIR_ONBOARDING_GATEWAY_HOSTS)
+    return urllib.parse.urlsplit(_canonical_base(source.get("canonical_api_base") or source.get("api_base")) or "").netloc.lower() in FHIR_ONBOARDING_GATEWAY_HOSTS
 
 
 def _select_resource_import_sources(
