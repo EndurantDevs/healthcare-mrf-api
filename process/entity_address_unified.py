@@ -3210,6 +3210,16 @@ def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -
     )
 
 
+def _entity_address_row_npi_expr(row_alias: str) -> str:
+    return (
+        f"COALESCE({row_alias}.npi, CASE\n"
+        f"            WHEN {row_alias}.entity_type = 'npi' AND {row_alias}.entity_id ~ '^[0-9]+$'\n"
+        f"                THEN {row_alias}.entity_id::bigint\n"
+        f"            ELSE NULL::bigint\n"
+        f"        END)"
+    )
+
+
 def _provider_directory_partial_affected_group_table_name(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_pd_groups")
 
@@ -3356,6 +3366,23 @@ def _affected_group_source_select_sql(db_schema: str, source_select: str, group_
     """
 
 
+def _affected_npi_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
+    source_select = _prefilter_npi_source_select_sql(db_schema, source_select, group_table)
+    return f"""
+    SELECT src.*
+      FROM (
+        {source_select.strip()}
+      ) AS src
+     WHERE src.npi IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+              FROM {db_schema}.{group_table} AS affected
+             WHERE affected.entity_npi IS NOT NULL
+               AND affected.entity_npi = src.npi
+     )
+    """
+
+
 def _prefilter_npi_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
     affected_join = f"""
               JOIN (
@@ -3394,7 +3421,7 @@ def _provider_directory_partial_source_selects(
             provider_selects += 1
         else:
             filtered.append(
-                _affected_group_source_select_sql(db_schema, source_select, affected_group_table)
+                _affected_npi_source_select_sql(db_schema, source_select, affected_group_table)
             )
     if provider_selects == 0:
         return []
@@ -3479,29 +3506,31 @@ def _copy_unaffected_live_entity_rows_sql(
     select_list = ", ".join(f"live.{column}" for column in columns)
     replacement_lookup_table = replacement_lookup_table or stage_table
     on_conflict_sql = "ON CONFLICT (location_key) DO NOTHING" if on_conflict else ""
+    live_npi_expr = _entity_address_row_npi_expr("live")
     return f"""
+    WITH affected_npis AS MATERIALIZED (
+        SELECT DISTINCT affected.entity_npi
+          FROM {db_schema}.{affected_group_table} AS affected
+         WHERE affected.entity_npi IS NOT NULL
+    ), affected_unknown_groups AS MATERIALIZED (
+        SELECT affected.*
+          FROM {db_schema}.{affected_group_table} AS affected
+         WHERE affected.entity_npi IS NULL
+    )
     INSERT INTO {db_schema}.{stage_table} ({column_list})
     SELECT {select_list}
       FROM {db_schema}.{live_table} AS live
-     WHERE NOT EXISTS (
-            SELECT 1
-              FROM {db_schema}.{affected_group_table} AS affected
-             WHERE affected.entity_npi IS NOT NULL
-               AND live.npi IS NOT NULL
-               AND affected.entity_npi = live.npi
-               AND {_entity_address_evidence_group_match_sql("affected", "live")}
-       )
+      LEFT JOIN affected_npis AS affected_npi
+        ON affected_npi.entity_npi = {live_npi_expr}
+      LEFT JOIN {db_schema}.{replacement_lookup_table} AS replacement
+        ON replacement.location_key = live.location_key
+     WHERE affected_npi.entity_npi IS NULL
        AND NOT EXISTS (
             SELECT 1
-              FROM {db_schema}.{affected_group_table} AS affected
-             WHERE affected.entity_npi IS NULL
-               AND {_entity_address_evidence_group_match_sql("affected", "live")}
+              FROM affected_unknown_groups AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
        )
-       AND NOT EXISTS (
-            SELECT 1
-              FROM {db_schema}.{replacement_lookup_table} AS replacement
-             WHERE replacement.location_key = live.location_key
-       )
+       AND replacement.location_key IS NULL
     {on_conflict_sql};
     """
 
@@ -5236,11 +5265,22 @@ def _load_multi_source_evidence_base_sql(
     *,
     evidence_shards: int,
     affected_group_table: str | None = None,
+    affected_scope: str = "group",
 ) -> str:
     group_hash_expr = _evidence_group_hash_expr(evidence_shards)
     affected_filter = ""
     if affected_group_table:
-        affected_filter = f"""
+        if affected_scope == "npi":
+            affected_filter = f"""
+           AND {_entity_address_row_npi_expr("t")} IS NOT NULL
+           AND EXISTS (
+                SELECT 1
+                  FROM {db_schema}.{affected_group_table} AS affected
+                 WHERE affected.entity_npi IS NOT NULL
+                   AND affected.entity_npi = {_entity_address_row_npi_expr("t")}
+           )"""
+        else:
+            affected_filter = f"""
            AND EXISTS (
                 SELECT 1
                   FROM {db_schema}.{affected_group_table} AS affected
@@ -10001,6 +10041,7 @@ async def process_data(ctx, task=None):
                 evidence_table,
                 evidence_shards=evidence_shards,
                 affected_group_table=affected_group_table,
+                affected_scope="npi" if partial_provider_directory_refresh else "group",
             ),
             context=context,
             run_id=run_id,

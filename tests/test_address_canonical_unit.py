@@ -1154,6 +1154,9 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     assert "SELECT DISTINCT entity_npi" in filtered[0]
     assert "affected_npi.entity_npi = a.npi" in filtered[0]
     assert "entity_address_unified_pd_groups AS affected" in filtered[0]
+    assert "WHERE src.npi IS NOT NULL" in filtered[0]
+    assert "affected.entity_npi = src.npi" in filtered[0]
+    assert "affected.entity_type = src.entity_type" not in filtered[0]
     assert any(
         "provider_directory_practitioner_role AS role" in source_select
         for source_select in filtered
@@ -2398,6 +2401,25 @@ def test_entity_address_unified_evidence_base_can_scope_to_affected_groups():
     assert "affected.street_key IS NOT DISTINCT FROM" in load_sql
 
 
+def test_entity_address_unified_evidence_base_can_scope_to_affected_npis():
+    evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
+    load_sql = entity_address_unified._load_multi_source_evidence_base_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        evidence_table,
+        evidence_shards=32,
+        affected_group_table="entity_address_unified_stage_affected_groups",
+        affected_scope="npi",
+    )
+
+    assert "FROM mrf.entity_address_unified_stage AS t" in load_sql
+    assert "FROM mrf.entity_address_unified_stage_affected_groups AS affected" in load_sql
+    assert "affected.entity_npi IS NOT NULL" in load_sql
+    assert "affected.entity_npi = COALESCE(t.npi, CASE" in load_sql
+    assert "affected.entity_type = t.entity_type" not in load_sql
+    assert "affected.address_key = t.address_key" not in load_sql
+
+
 def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     stage_classes = entity_address_unified._support_stage_classes("20260614")
     sql_blob = "\n".join(
@@ -2537,9 +2559,13 @@ def test_entity_address_unified_provider_directory_replacement_copies_unaffected
     assert "INSERT INTO mrf.entity_address_unified_20260614" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "FROM mrf.entity_address_unified_20260614_pd_groups AS affected" in sql
-    assert "affected.entity_npi = live.npi" in sql
+    assert "affected_npis AS MATERIALIZED" in sql
+    assert "affected_unknown_groups AS MATERIALIZED" in sql
+    assert "affected_npi.entity_npi = COALESCE(live.npi, CASE" in sql
     assert "affected.entity_npi IS NULL" in sql
+    assert "LEFT JOIN mrf.entity_address_unified_20260614 AS replacement" in sql
     assert "replacement.location_key = live.location_key" in sql
+    assert "replacement.location_key IS NULL" in sql
     assert "ON CONFLICT (location_key) DO NOTHING" in sql
     assert "DELETE FROM mrf.entity_address_unified" not in sql
 
@@ -2571,7 +2597,7 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     assert f"CREATE UNLOGGED TABLE mrf.{heap_name}" in create_sql
     assert "(LIKE mrf.entity_address_unified_20260614 INCLUDING DEFAULTS)" in create_sql
     assert f"INSERT INTO mrf.{heap_name}" in copy_live_sql
-    assert "FROM mrf.entity_address_unified_20260614 AS replacement" in copy_live_sql
+    assert "LEFT JOIN mrf.entity_address_unified_20260614 AS replacement" in copy_live_sql
     assert "ON CONFLICT" not in copy_live_sql
     assert f"INSERT INTO mrf.{heap_name}" in copy_stage_sql
     assert "FROM mrf.entity_address_unified_20260614 AS stage" in copy_stage_sql
