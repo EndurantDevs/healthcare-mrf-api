@@ -4821,6 +4821,54 @@ def test_mymedicalshopper_url_helpers_and_employer_selector():
     }
 
 
+def test_mymedicalshopper_query_expansion_uses_employer_search_selector():
+    source = {
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging, Inc.",
+                "query_expansion_source": True,
+            }
+        }
+    }
+    base_selector = {"tpaSlug": "example-tpa", "status": "Enabled"}
+    expected_search_selector = {
+        "$and": [
+            base_selector,
+            {
+                "$or": [
+                    {"name": {"$regex": "example.*packaging", "$options": "i"}},
+                    {"slug": {"$regex": "example.*packaging", "$options": "i"}},
+                ]
+            },
+        ]
+    }
+
+    assert (
+        discovery._mymedicalshopper_employer_search_selector(
+            base_selector, "Example Packaging, Inc."
+        )
+        == expected_search_selector
+    )
+    assert discovery._mymedicalshopper_entity_employer_selectors(
+        "example-tpa",
+        all_employers_searchable=True,
+        source=source,
+        resolver={},
+    ) == [expected_search_selector]
+    assert discovery._mymedicalshopper_entity_employer_selectors(
+        "example-tpa",
+        all_employers_searchable=True,
+        source=source,
+        resolver={"query_search_include_full_table": True},
+    ) == [expected_search_selector, base_selector]
+    assert discovery._mymedicalshopper_entity_employer_selectors(
+        "example-tpa",
+        all_employers_searchable=True,
+        source={},
+        resolver={},
+    ) == [base_selector]
+
+
 def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
     frame = "a" + json.dumps(
         [
@@ -5007,6 +5055,103 @@ async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeat
     assert any(message.get("msg") == "pong" for message in _mms_sent_messages(ws))
 
 
+@pytest.mark.asyncio
+async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypatch):
+    calls = []
+
+    async def fake_subscribe_collect(
+        _ws, *, name, params, sub_id, timeout_seconds
+    ):
+        calls.append(
+            {
+                "name": name,
+                "params": params,
+                "sub_id": sub_id,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        if name == "entityMRFsConfig":
+            return [
+                {
+                    "collection": "thirdPartyAdministrators",
+                    "fields": {
+                        "slug": "example-tpa",
+                        "name": "Example TPA",
+                        "machineReadableFiles": {"allEmployersSearchable": True},
+                    },
+                }
+            ]
+        if name == "tabular_getInfo":
+            return [
+                {
+                    "collection": "tabular_records",
+                    "id": "EntityMRFEmployers",
+                    "fields": {
+                        "ids": [{"$type": "oid", "$value": "61a"}],
+                        "recordsTotal": 1,
+                        "recordsFiltered": 1,
+                    },
+                }
+            ]
+        if name == "entityMRFEmployers":
+            return [
+                {
+                    "msg": "added",
+                    "collection": "employers",
+                    "id": "61a",
+                    "fields": {
+                        "name": "Example Packaging Choice",
+                        "slug": "example-packaging-choice-example-tpa-10001",
+                        "status": "Enabled",
+                    },
+                }
+            ]
+        raise AssertionError(f"unexpected subscription: {name}")
+
+    monkeypatch.setattr(
+        discovery, "_mymedicalshopper_ddp_subscribe_collect", fake_subscribe_collect
+    )
+    source = {
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging Inc",
+                "query_expansion_source": True,
+            }
+        }
+    }
+
+    employers = await discovery._mymedicalshopper_entity_employers(
+        object(),
+        source=source,
+        entity_slug="example-tpa",
+        resolver={"page_size": 20},
+        timeout_seconds=5,
+    )
+
+    assert employers == [
+        {
+            "_id": "61a",
+            "name": "Example Packaging Choice",
+            "slug": "example-packaging-choice-example-tpa-10001",
+            "status": "Enabled",
+            "tpaSlug": "example-tpa",
+            "tpaName": "Example TPA",
+        }
+    ]
+    [info_call] = [call for call in calls if call["name"] == "tabular_getInfo"]
+    assert info_call["params"][1] == {
+        "$and": [
+            {"tpaSlug": "example-tpa", "status": "Enabled"},
+            {
+                "$or": [
+                    {"name": {"$regex": "example.*packaging", "$options": "i"}},
+                    {"slug": {"$regex": "example.*packaging", "$options": "i"}},
+                ]
+            },
+        ]
+    }
+
+
 def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
     assert (
         discovery._mymedicalshopper_group_id_from_employer_slug(
@@ -5040,7 +5185,10 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
         assert timeout_seconds == 30
         return FakeWS()
 
-    async def fake_entity_employers(_ws, *, entity_slug, resolver, timeout_seconds):
+    async def fake_entity_employers(
+        _ws, *, source, entity_slug, resolver, timeout_seconds
+    ):
+        assert source["source_id"] == "source_bywater"
         assert entity_slug == "bywater"
         assert timeout_seconds == 30
         assert resolver["max_targets"] == 2

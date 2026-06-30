@@ -2824,6 +2824,56 @@ def _mymedicalshopper_employer_selector(
     return selector
 
 
+def _mymedicalshopper_employer_search_pattern(query: str | None) -> str | None:
+    clean_query = _clean_text(query).lower()
+    if len(clean_query) < 3:
+        return None
+    tokens = _query_match_tokens(clean_query)
+    if not tokens:
+        return None
+    return ".*".join(re.escape(token) for token in tokens)
+
+
+def _mymedicalshopper_employer_search_selector(
+    base_selector: dict[str, Any], query: str | None
+) -> dict[str, Any] | None:
+    pattern = _mymedicalshopper_employer_search_pattern(query)
+    if not pattern:
+        return None
+    return {
+        "$and": [
+            dict(base_selector),
+            {
+                "$or": [
+                    {"name": {"$regex": pattern, "$options": "i"}},
+                    {"slug": {"$regex": pattern, "$options": "i"}},
+                ]
+            },
+        ]
+    }
+
+
+def _mymedicalshopper_entity_employer_selectors(
+    entity_slug: str,
+    *,
+    all_employers_searchable: bool,
+    source: dict[str, Any] | None,
+    resolver: dict[str, Any],
+) -> list[dict[str, Any]]:
+    base_selector = _mymedicalshopper_employer_selector(
+        entity_slug, all_employers_searchable=all_employers_searchable
+    )
+    search_selector = _mymedicalshopper_employer_search_selector(
+        base_selector, _source_target_payer_query(source or {})
+    )
+    if not search_selector:
+        return [base_selector]
+    selectors = [search_selector]
+    if resolver.get("query_search_include_full_table"):
+        selectors.append(base_selector)
+    return selectors
+
+
 def _mymedicalshopper_sockjs_ws_url(base_url: str) -> str:
     parsed = urlsplit(str(base_url or ""))
     scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -3096,6 +3146,7 @@ def _mymedicalshopper_employer_docs_from_messages(
 async def _mymedicalshopper_entity_employers(
     ws: aiohttp.ClientWebSocketResponse,
     *,
+    source: dict[str, Any] | None = None,
     entity_slug: str,
     resolver: dict[str, Any],
     timeout_seconds: float,
@@ -3114,11 +3165,13 @@ async def _mymedicalshopper_entity_employers(
         if isinstance(config.get("machineReadableFiles"), dict)
         else {}
     )
-    selector = _mymedicalshopper_employer_selector(
+    selectors = _mymedicalshopper_entity_employer_selectors(
         entity_slug,
         all_employers_searchable=bool(
             machine_readable_files.get("allEmployersSearchable")
         ),
+        source=source,
+        resolver=resolver,
     )
     page_size = max(_as_int(resolver.get("page_size")) or 100, 1)
     max_employers = max(_as_int(resolver.get("max_employers")) or 10000, 1)
@@ -3135,43 +3188,45 @@ async def _mymedicalshopper_entity_employers(
         "ein": 1,
     }
     employers: dict[str, dict[str, Any]] = {}
-    offset = 0
-    while offset < max_employers:
-        info_messages = await _mymedicalshopper_ddp_subscribe_collect(
-            ws,
-            name="tabular_getInfo",
-            params=[
-                "EntityMRFEmployers",
-                selector,
-                [["name", "asc"]],
-                offset,
-                min(page_size, max_employers - offset),
-            ],
-            sub_id=f"mms-info-{entity_slug}-{offset}",
-            timeout_seconds=timeout_seconds,
-        )
-        info = _mymedicalshopper_tabular_info_from_messages(info_messages)
-        ids = [item for item in info.get("ids") or [] if item]
-        if not ids:
-            break
-        doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
-            ws,
-            name="entityMRFEmployers",
-            params=["EntityMRFEmployers", ids, fields],
-            sub_id=f"mms-employers-{entity_slug}-{offset}",
-            timeout_seconds=timeout_seconds,
-        )
-        for employer in _mymedicalshopper_employer_docs_from_messages(doc_messages):
-            slug = str(employer.get("slug") or "").strip()
-            if slug:
-                employer = dict(employer)
-                employer.setdefault("tpaSlug", entity_slug)
-                if tpa_name:
-                    employer.setdefault("tpaName", tpa_name)
-                employers[slug] = employer
-        offset += len(ids)
-        if offset >= (_as_int(info.get("records_filtered")) or len(ids)):
-            break
+    for selector_index, selector in enumerate(selectors):
+        offset = 0
+        while offset < max_employers and len(employers) < max_employers:
+            batch_size = min(page_size, max_employers - len(employers))
+            info_messages = await _mymedicalshopper_ddp_subscribe_collect(
+                ws,
+                name="tabular_getInfo",
+                params=[
+                    "EntityMRFEmployers",
+                    selector,
+                    [["name", "asc"]],
+                    offset,
+                    batch_size,
+                ],
+                sub_id=f"mms-info-{entity_slug}-{selector_index}-{offset}",
+                timeout_seconds=timeout_seconds,
+            )
+            info = _mymedicalshopper_tabular_info_from_messages(info_messages)
+            ids = [item for item in info.get("ids") or [] if item]
+            if not ids:
+                break
+            doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
+                ws,
+                name="entityMRFEmployers",
+                params=["EntityMRFEmployers", ids, fields],
+                sub_id=f"mms-employers-{entity_slug}-{selector_index}-{offset}",
+                timeout_seconds=timeout_seconds,
+            )
+            for employer in _mymedicalshopper_employer_docs_from_messages(doc_messages):
+                slug = str(employer.get("slug") or "").strip()
+                if slug:
+                    employer = dict(employer)
+                    employer.setdefault("tpaSlug", entity_slug)
+                    if tpa_name:
+                        employer.setdefault("tpaName", tpa_name)
+                    employers[slug] = employer
+            offset += len(ids)
+            if offset >= (_as_int(info.get("records_filtered")) or len(ids)):
+                break
     return list(employers.values())
 
 
@@ -3338,6 +3393,7 @@ async def _resolve_mymedicalshopper_talon_mrf(
         if entity_slug:
             employers = await _mymedicalshopper_entity_employers(
                 ws,
+                source=source,
                 entity_slug=entity_slug,
                 resolver=resolver,
                 timeout_seconds=timeout_seconds,
