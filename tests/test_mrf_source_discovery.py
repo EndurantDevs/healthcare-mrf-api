@@ -865,6 +865,27 @@ def test_parse_master_list_preserves_benefit_lines_for_dental_vision_source():
     assert candidate.aliases == ("Example DV",)
 
 
+def test_parse_master_list_preserves_coverage_evidence_metadata():
+    markdown = """
+## Public employer evidence
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Example Packaging Benefits | group | https://benefits.example.test/find-a-provider | public employer benefits page; source tier: coverage_evidence; benefit lines: medical; source coverage: Example Packaging medical choices; vendor names: Example Virtual Health; network names: Example National PPO; plan names: Example Guided Health Plan; aliases: Example Packaging |
+"""
+
+    [candidate] = discovery.parse_master_list(markdown)
+
+    assert candidate.payer_name == "Example Packaging Benefits"
+    assert candidate.entity_type == "group"
+    assert candidate.source_tier == "coverage_evidence"
+    assert candidate.benefit_lines == ("medical",)
+    assert candidate.source_coverage == ("Example Packaging medical choices",)
+    assert candidate.vendor_names == ("Example Virtual Health",)
+    assert candidate.network_names == ("Example National PPO",)
+    assert candidate.plan_names == ("Example Guided Health Plan",)
+    assert candidate.aliases == ("Example Packaging",)
+
+
 def test_parse_master_list_preserves_legacy_public_aliases_for_active_sources():
     markdown = """
 ## Public regional aliases
@@ -1242,6 +1263,39 @@ def test_master_list_aliases_are_stored_on_source_and_payer_rows():
     ]
     assert source_row["metadata_json"]["benefit_lines"] == ["medical"]
     assert source_row["metadata_json"]["source_coverage"] == ["national"]
+
+
+def test_master_list_coverage_evidence_metadata_is_stored_on_source_rows():
+    candidate = discovery.SourceCandidate(
+        payer_name="Example Packaging Benefits",
+        provider="master-list",
+        index_url="https://benefits.example.test/find-a-provider",
+        entity_type="group",
+        source_tier="coverage_evidence",
+        aliases=("Example Packaging",),
+        source_coverage=("Example Packaging medical choices",),
+        vendor_names=("Example Virtual Health",),
+        network_names=("Example National PPO",),
+        plan_names=("Example Guided Health Plan",),
+    )
+
+    payer_row, source_row = discovery._candidate_to_rows(
+        candidate, discovery._utc_now()
+    )
+
+    assert payer_row["metadata_json"]["source_tier"] == "coverage_evidence"
+    assert source_row is not None
+    assert source_row["metadata_json"]["source_tier"] == "coverage_evidence"
+    assert source_row["metadata_json"]["aliases"] == [
+        "Example Packaging",
+        "Example Packaging Benefits",
+    ]
+    assert source_row["metadata_json"]["source_coverage"] == [
+        "Example Packaging medical choices"
+    ]
+    assert source_row["metadata_json"]["vendor_names"] == ["Example Virtual Health"]
+    assert source_row["metadata_json"]["network_names"] == ["Example National PPO"]
+    assert source_row["metadata_json"]["plan_names"] == ["Example Guided Health Plan"]
 
 
 def test_master_list_public_gap_sources_classify_supported_platforms():
@@ -1639,8 +1693,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert by_name["Firefly Health"].entity_type == "dtc"
     assert by_name["Firefly Health"].benefit_lines == ("medical",)
-    assert by_name["Firefly Health"].status == "needs_review"
-    assert by_name["Firefly Health"].index_url is None
+    assert by_name["Firefly Health"].source_tier == "coverage_evidence"
+    assert by_name["Firefly Health"].status == "active"
+    assert by_name["Firefly Health"].index_url == "https://www.fireflyhealth.com/pricing-transparency/"
     assert "Firefly Health Plan" in by_name["Firefly Health"].aliases
     assert "The Standard AHL" in aliases_by_name["Meritain Health"]
     assert "American Heritage Life" in aliases_by_name["Meritain Health"]
@@ -6238,6 +6293,120 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
     assert calls[-1]["json"]["visibility"] == "public"
     assert calls[-1]["json"]["status"] == "active"
     assert calls[-1]["json"]["preserve_operator_state"] is False
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_syncs_coverage_evidence_without_preview(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                return FakeResponse({"source_id": "ic_source_1"})
+            if url.endswith("/v1/catalog/seeds/import"):
+                return FakeResponse({"count": 1, "items": json.get("items") or []})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                raise AssertionError("coverage evidence should not ingest preview items")
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_1"):
+                return FakeResponse(
+                    {
+                        "source_id": "ic_source_1",
+                        "visibility": "internal",
+                        "status": "needs_review",
+                    }
+                )
+            return FakeResponse({}, status=404)
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_evidence"]
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_evidence",
+                "index_url": "https://benefits.example.test/find-a-provider",
+                "human_url": "https://benefits.example.test/find-a-provider",
+                "display_name": "Example Packaging Benefits",
+                "source_key": "example-packaging-benefits",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "coverage_evidence",
+                "status": "active",
+                "metadata_json": {
+                    "source_tier": "coverage_evidence",
+                    "aliases": ["Example Packaging"],
+                    "benefit_lines": ["medical"],
+                    "source_coverage": ["Example Packaging medical choices"],
+                    "vendor_names": ["Example Virtual Health"],
+                    "network_names": ["Example National PPO"],
+                    "plan_names": ["Example Guided Health Plan"],
+                },
+            }
+        ]
+    )
+
+    source_payloads = [
+        call["json"]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 0
+    assert errors == []
+    assert len(source_payloads) == 2
+    assert source_payloads[-1]["visibility"] == "public"
+    assert source_payloads[-1]["status"] == "active"
+    assert source_payloads[-1]["source_tier"] == "coverage_evidence"
+    assert source_payloads[-1]["metadata"]["source_tier"] == "coverage_evidence"
+    assert source_payloads[-1]["metadata"]["vendor_names"] == [
+        "Example Virtual Health"
+    ]
+    assert source_payloads[-1]["metadata"]["network_names"] == [
+        "Example National PPO"
+    ]
+    assert source_payloads[-1]["metadata"]["plan_names"] == [
+        "Example Guided Health Plan"
+    ]
 
 
 @pytest.mark.asyncio

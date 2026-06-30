@@ -104,7 +104,8 @@ Last one-time research refresh: 2026-06-05.
 | Bright HealthCare | dtc | - | needs official source URL |
 | Clover Health | dtc | https://www.cloverhealth.com/members/plan-documents | public transparency URL |
 | Devoted Health | dtc | https://www.devoted.com/plan-documents/ | public transparency URL |
-| Firefly Health | dtc | - | public price-transparency page https://www.fireflyhealth.com/pricing-transparency/ points to Opyn Health member portal, not a public pricing MRF TOC; benefit lines: medical; aliases: Firefly, Firefly Health Plan |
+| Firefly Health | dtc | https://www.fireflyhealth.com/pricing-transparency/ | public price-transparency page points to Opyn Health member portal, not a public pricing MRF TOC; source tier: coverage_evidence; benefit lines: medical; source coverage: Firefly price-transparency and member portal evidence; vendor names: Firefly Health, Opyn Health; plan names: Firefly Health Plan; aliases: Firefly, Firefly Health Plan |
+| Plastipak Packaging Firefly Health | group | https://benefits.plastipak.com/find-an-in-network-provider/ | public Plastipak benefits page confirms the Firefly medical plan and Cigna PPO network provider-search path; source tier: coverage_evidence; benefit lines: medical; source coverage: Plastipak medical plan choices; vendor names: Firefly Health; network names: Cigna PPO; plan names: Firefly medical plan; aliases: Plastipak, Plastipak Packaging, Plastipak Packaging Inc, PLASTIPAK PACKAGING INC, Firefly Plastipak |
 | Gravie | dtc | https://www.gravie.com/compliance/transparency-in-coverage/ | public transparency URL |
 | Oscar Health | dtc | https://www.hioscar.com/transparency-in-coverage-files/oscar | curated source row |
 | Sidecar Health | dtc | https://sidecarhealth.com/transparency-in-coverage/ | public transparency URL |

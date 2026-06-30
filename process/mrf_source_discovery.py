@@ -130,9 +130,13 @@ class SourceCandidate:
     entity_type: str | None = None
     aliases: tuple[str, ...] = ()
     benefit_lines: tuple[str, ...] = ("medical",)
+    source_tier: str = "mrf_importable"
     states: tuple[str, ...] = ()
     eins: tuple[str, ...] = ()
     source_coverage: tuple[str, ...] = ()
+    vendor_names: tuple[str, ...] = ()
+    network_names: tuple[str, ...] = ()
+    plan_names: tuple[str, ...] = ()
     confidence: int | None = None
     license_status: str = "public_directory"
     review_status: str = "pending"
@@ -1279,28 +1283,64 @@ def _master_list_status(url: str | None, notes: str) -> str:
 
 
 def _master_list_aliases(notes: str) -> tuple[str, ...]:
+    return _master_list_note_values(notes, r"aliases?")
+
+
+def _master_list_note_values(notes: str, label_pattern: str) -> tuple[str, ...]:
     match = re.search(
-        r"\baliases?\s*:\s*(?P<aliases>[^;]+)", notes or "", flags=re.IGNORECASE
+        rf"\b{label_pattern}\s*:\s*(?P<values>[^;]+)",
+        notes or "",
+        flags=re.IGNORECASE,
     )
     if not match:
         return ()
-    raw_aliases = match.group("aliases")
+    raw_values = match.group("values")
     try:
-        parsed_aliases = next(csv.reader([raw_aliases], skipinitialspace=True))
+        parsed_values = next(csv.reader([raw_values], skipinitialspace=True))
     except (csv.Error, StopIteration):
-        parsed_aliases = raw_aliases.split(",")
-    aliases: list[str] = []
+        parsed_values = raw_values.split(",")
+    values: list[str] = []
     seen: set[str] = set()
-    for raw_alias in parsed_aliases:
-        alias = _clean_text(raw_alias)
-        if not alias:
+    for raw_value in parsed_values:
+        value = _clean_text(raw_value)
+        if not value:
             continue
-        key = alias.lower()
+        key = value.lower()
         if key in seen:
             continue
         seen.add(key)
-        aliases.append(alias)
-    return tuple(aliases)
+        values.append(value)
+    return tuple(values)
+
+
+_SOURCE_TIER_ALIASES = {
+    "": "mrf_importable",
+    "mrf": "mrf_importable",
+    "mrf_importable": "mrf_importable",
+    "importable": "mrf_importable",
+    "tic": "mrf_importable",
+    "coverage": "coverage_evidence",
+    "coverage_evidence": "coverage_evidence",
+    "aca": "coverage_evidence",
+    "employer": "coverage_evidence",
+    "sbc": "coverage_evidence",
+    "benefit": "coverage_evidence",
+    "benefits": "coverage_evidence",
+    "directory": "directory_evidence",
+    "directory_evidence": "directory_evidence",
+    "provider_directory": "directory_evidence",
+    "vendor_directory": "directory_evidence",
+}
+
+
+def _normalize_source_tier(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _SOURCE_TIER_ALIASES.get(text, "mrf_importable")
+
+
+def _master_list_source_tier(notes: str) -> str:
+    values = _master_list_note_values(notes, r"source[-_\s]*tier")
+    return _normalize_source_tier(values[0] if values else None)
 
 
 _BENEFIT_LINE_ALIASES = {
@@ -1423,6 +1463,19 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
                     entity_type=type_value,
                     aliases=_master_list_aliases(notes_text),
                     benefit_lines=_master_list_benefit_lines(notes_text),
+                    source_tier=_master_list_source_tier(notes_text),
+                    source_coverage=_master_list_note_values(
+                        notes_text, r"source[-_\s]*coverage"
+                    ),
+                    vendor_names=_master_list_note_values(
+                        notes_text, r"vendor[-_\s]*names?"
+                    ),
+                    network_names=_master_list_note_values(
+                        notes_text, r"network[-_\s]*names?"
+                    ),
+                    plan_names=_master_list_note_values(
+                        notes_text, r"plan[-_\s]*names?"
+                    ),
                     confidence=85 if url else 45,
                     license_status="curated_public_research",
                     review_status="pending",
@@ -1984,6 +2037,7 @@ def _candidate_to_rows(
         },
         key=str.lower,
     )
+    candidate_metadata = _candidate_metadata(candidate, aliases)
     source_id = _id(
         "mrfsource",
         {
@@ -2004,9 +2058,7 @@ def _candidate_to_rows(
         "source_coverage": list(candidate.source_coverage),
         "metadata_json": {
             "providers": [candidate.provider],
-            "aliases": aliases,
-            "benefit_lines": list(candidate.benefit_lines),
-            "raw": candidate.raw_payload,
+            **candidate_metadata,
         },
         "created_at": now,
         "updated_at": now,
@@ -2042,16 +2094,33 @@ def _candidate_to_rows(
         "confidence": candidate.confidence,
         "license_status": candidate.license_status,
         "review_status": candidate.review_status,
-        "metadata_json": {
-            "aliases": aliases,
-            "benefit_lines": list(candidate.benefit_lines),
-            "source_coverage": list(candidate.source_coverage),
-            "raw": candidate.raw_payload,
-        },
+        "metadata_json": candidate_metadata,
         "created_at": now,
         "updated_at": now,
     }
     return payer_row, source_row
+
+
+def _candidate_metadata(
+    candidate: SourceCandidate, aliases: list[str] | tuple[str, ...]
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "aliases": list(aliases),
+        "benefit_lines": list(candidate.benefit_lines),
+        "source_tier": _normalize_source_tier(candidate.source_tier),
+        "raw": candidate.raw_payload,
+    }
+    optional_lists = {
+        "source_coverage": candidate.source_coverage,
+        "vendor_names": candidate.vendor_names,
+        "network_names": candidate.network_names,
+        "plan_names": candidate.plan_names,
+    }
+    for key, values in optional_lists.items():
+        cleaned = [_clean_text(value) for value in values if _clean_text(value)]
+        if cleaned:
+            metadata[key] = list(dict.fromkeys(cleaned))
+    return metadata
 
 
 async def _store_candidates(
@@ -2079,6 +2148,23 @@ async def _store_candidates(
                     (existing_metadata.get("benefit_lines") or [])
                     + list(candidate.benefit_lines)
                 )
+            )
+            for key in (
+                "aliases",
+                "source_coverage",
+                "vendor_names",
+                "network_names",
+                "plan_names",
+            ):
+                existing_metadata[key] = sorted(
+                    set(
+                        (existing_metadata.get(key) or [])
+                        + ((payer_row.get("metadata_json") or {}).get(key) or [])
+                    )
+                )
+            existing_metadata["source_tier"] = _normalize_source_tier(
+                existing_metadata.get("source_tier")
+                or (payer_row.get("metadata_json") or {}).get("source_tier")
             )
             existing["metadata_json"] = {
                 **existing_metadata,
@@ -11094,11 +11180,23 @@ def _candidate_with_target_payer_query(
 def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
     if not (candidate.index_url or candidate.human_url):
         return False
+    if _normalize_source_tier(candidate.source_tier) != "mrf_importable":
+        return False
     return str(candidate.status or "").lower() not in {
         "archived",
         "needs_review",
         "unsupported",
     }
+
+
+def _candidate_has_catalog_source(candidate: SourceCandidate) -> bool:
+    if _candidate_is_importable_source(candidate):
+        return True
+    if not (candidate.index_url or candidate.human_url):
+        return False
+    if _normalize_source_tier(candidate.source_tier) == "mrf_importable":
+        return False
+    return str(candidate.status or "").lower() not in {"archived", "unsupported"}
 
 
 def _discovery_run_mode(*, crawl: bool, check_urls: bool, probe_files: bool) -> str:
@@ -11668,6 +11766,7 @@ def _import_control_seed_item(
         "metadata": {
             "hosting_platform": row.get("hosting_platform"),
             "source_type": row.get("source_type"),
+            "source_tier": _source_row_source_tier(row),
             "domain": row.get("domain"),
             "healthcare_source_id": row.get("source_id"),
             "benefit_lines": list(
@@ -11681,6 +11780,21 @@ def _import_control_seed_item(
             "source_coverage": list(
                 dict.fromkeys(
                     (row.get("metadata_json") or {}).get("source_coverage") or []
+                )
+            ),
+            "vendor_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("vendor_names") or []
+                )
+            ),
+            "network_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("network_names") or []
+                )
+            ),
+            "plan_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("plan_names") or []
                 )
             ),
         },
@@ -11753,6 +11867,17 @@ def _coerce_metadata(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _source_row_source_tier(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata_json") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return _normalize_source_tier(row.get("source_tier") or metadata.get("source_tier"))
+
+
+def _source_row_is_importable(row: dict[str, Any]) -> bool:
+    return _source_row_source_tier(row) == "mrf_importable"
 
 
 def _eligible_for_public_promotion(row: dict[str, Any]) -> bool:
@@ -12336,6 +12461,7 @@ async def _promote_import_control_source(
         "display_name": row.get("display_name"),
         "payer_name": row.get("display_name"),
         "source_type": row.get("source_type"),
+        "source_tier": _source_row_source_tier(row),
         "domain": row.get("domain"),
         "visibility": visibility,
         "status": status,
@@ -12345,6 +12471,7 @@ async def _promote_import_control_source(
             "healthcare_source_id": row.get("source_id"),
             "seed_provider": row.get("seed_provider"),
             "access_model": row.get("access_model"),
+            "source_tier": _source_row_source_tier(row),
             "aliases": list(
                 dict.fromkeys((row.get("metadata_json") or {}).get("aliases") or [])
             ),
@@ -12356,6 +12483,21 @@ async def _promote_import_control_source(
             "source_coverage": list(
                 dict.fromkeys(
                     (row.get("metadata_json") or {}).get("source_coverage") or []
+                )
+            ),
+            "vendor_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("vendor_names") or []
+                )
+            ),
+            "network_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("network_names") or []
+                )
+            ),
+            "plan_names": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("plan_names") or []
                 )
             ),
             "raw": (row.get("metadata_json") or {}).get("raw") or {},
@@ -12476,6 +12618,7 @@ async def _push_import_control_catalog(
     eligible = _dedupe_import_control_source_rows(eligible, snapshot)
     if not snapshot and all(
         str(row.get("status") or "active").strip().lower() == "active"
+        and _source_row_is_importable(row)
         for row in eligible
     ):
         return (0, 0, [])
@@ -12496,7 +12639,8 @@ async def _push_import_control_catalog(
             source_id = str(row.get("source_id") or "")
             items = snapshot.get(source_id) or []
             source_status = str(row.get("status") or "active").strip() or "active"
-            if not items and source_status.lower() == "active":
+            evidence_only = not _source_row_is_importable(row)
+            if not items and source_status.lower() == "active" and not evidence_only:
                 continue
             ic_source_id: str | None = None
             try:
@@ -12527,6 +12671,10 @@ async def _push_import_control_catalog(
                         source_plans += await _ingest_import_control_preview(
                             session, base, ic_source_id, batch
                         )
+                    await _mark_import_control_seed_promoted(
+                        session, base, row, ic_source_id
+                    )
+                elif evidence_only:
                     await _mark_import_control_seed_promoted(
                         session, base, row, ic_source_id
                     )
@@ -12830,7 +12978,7 @@ async def main(
     candidates = [
         candidate
         for candidate in candidates
-        if _candidate_is_importable_source(candidate)
+        if _candidate_has_catalog_source(candidate)
     ]
     if bounded_limit:
         candidates = candidates[:bounded_limit]
@@ -12894,7 +13042,7 @@ async def main(
     if crawl:
         plans_discovered, files_discovered, crawl_observations = (
             await _crawl_toc_metadata(
-                source_rows,
+                [row for row in source_rows if _source_row_is_importable(row)],
                 test_mode=test_mode,
                 run_id=observation_run_id,
                 progress_run_id=progress_run_id,
