@@ -1142,10 +1142,66 @@ def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text
         ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
+    assert discovery._search_values_match_query(
+        ["Clubcorp USA Inc DBA Invited"],
+        "Invited Clubs",
+    )
     assert not discovery._search_values_match_query(
         ["Unrelated PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
+
+
+@pytest.mark.asyncio
+async def test_query_expansion_uses_sapphire_probe_when_base_resolver_fails(monkeypatch):
+    source = {
+        "source_id": "source_example_sapphire",
+        "display_name": "Example Sapphire",
+        "hosting_platform": "sapphire",
+        "index_url": "https://example.sapphiremrfhub.com/",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging Inc",
+                "query_expansion_source": True,
+            }
+        },
+    }
+
+    async def fake_crawl_targets_for_source(*_args, **_kwargs):
+        raise ValueError("no configured resolver and URL is not a direct JSON TOC")
+
+    async def fake_sapphire_query_probe_targets(source_arg, url, query, _session):
+        assert query == "Example Packaging Inc"
+        return [
+            discovery.CrawlTarget(
+                source=source_arg,
+                url="https://example.sapphiremrfhub.com/tocs/current/example-packaging",
+                label="Example Packaging",
+                resolved_from_url=url,
+                metadata={"company_name": "Example Packaging"},
+            )
+        ]
+
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
+    )
+    monkeypatch.setattr(
+        discovery, "_sapphire_query_probe_targets", fake_sapphire_query_probe_targets
+    )
+
+    targets, observations = await discovery._resolve_crawl_targets(
+        [source],
+        session=object(),
+        run_id="run_example",
+        concurrency=1,
+    )
+
+    assert observations == []
+    assert [target.url for target in targets] == [
+        "https://example.sapphiremrfhub.com/tocs/current/example-packaging"
+    ]
+    assert targets[0].metadata["query_expansion_match"] is True
+    assert targets[0].metadata["target_payer_query"] == "Example Packaging Inc"
 
 
 def test_crawl_source_dedupe_keeps_distinct_healthsparq_metadata_catalogs():

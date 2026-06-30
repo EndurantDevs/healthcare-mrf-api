@@ -10814,11 +10814,29 @@ async def _resolve_crawl_targets(
     observations: list[dict[str, Any]] = []
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
 
+    async def query_probe_targets(
+        source: dict[str, Any], url_text: str, query: str | None
+    ) -> list[CrawlTarget]:
+        if not query:
+            return []
+        try:
+            probe_targets = await _sapphire_query_probe_targets(
+                source, url_text, query, session
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            return []
+        return [
+            matched
+            for target in probe_targets
+            if (matched := _matched_query_expansion_target(target, query)) is not None
+        ]
+
     async def resolve_one(
         source: dict[str, Any], url: Any
     ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
         url_text = str(url)
         async with semaphore:
+            target_query = _source_target_payer_query(source)
             try:
                 resolved_targets = await _crawl_targets_for_source(
                     source,
@@ -10826,12 +10844,9 @@ async def _resolve_crawl_targets(
                     session,
                     target_limit=crawl_target_limit,
                 )
-                target_query = _source_target_payer_query(source)
                 if target_query:
                     resolved_targets.extend(
-                        await _sapphire_query_probe_targets(
-                            source, url_text, target_query, session
-                        )
+                        await query_probe_targets(source, url_text, target_query)
                     )
                     resolved_targets = [
                         matched
@@ -10854,6 +10869,11 @@ async def _resolve_crawl_targets(
                     ]
                 return resolved_targets, []
             except Exception as exc:  # pylint: disable=broad-exception-caught
+                probe_targets = await query_probe_targets(
+                    source, url_text, target_query
+                )
+                if probe_targets:
+                    return probe_targets, []
                 return [], [_crawl_failed_observation(source, url_text, exc, run_id)]
 
     tasks = [asyncio.create_task(resolve_one(source, url)) for source, url in items]
@@ -11180,6 +11200,20 @@ def _query_match_tokens(value: Any) -> tuple[str, ...]:
     return substantive or tokens
 
 
+def _query_token_variants(token: str) -> tuple[str, ...]:
+    token = str(token or "").strip().lower()
+    variants = [token] if token else []
+    if len(token) > 4 and token.endswith("ies"):
+        variants.append(f"{token[:-3]}y")
+    elif (
+        len(token) > 4
+        and token.endswith("s")
+        and not token.endswith(("ss", "us", "is"))
+    ):
+        variants.append(token[:-1])
+    return tuple(dict.fromkeys(variant for variant in variants if variant))
+
+
 def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool:
     clean_query = _clean_text(query).lower()
     if not clean_query:
@@ -11193,9 +11227,19 @@ def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool
             return True
         if query_tokens:
             value_tokens = set(_query_tokens(text))
-            if all(token in value_tokens for token in query_tokens):
+            token_variants = [_query_token_variants(token) for token in query_tokens]
+            if all(
+                any(variant in value_tokens for variant in variants)
+                for variants in token_variants
+            ):
                 return True
-            if all(token in text for token in query_tokens if len(token) >= 3):
+            if all(
+                any(
+                    len(variant) >= 3 and variant in text
+                    for variant in variants
+                )
+                for variants in token_variants
+            ):
                 return True
     return False
 
