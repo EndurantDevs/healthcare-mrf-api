@@ -7,6 +7,7 @@ import io
 import json
 import types
 import zipfile
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -4578,6 +4579,11 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
         return html
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        AsyncMock(return_value=True),
+    )
 
     targets = await discovery._resolve_healthcarebluebook_mrf(
         source,
@@ -4598,6 +4604,47 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
     assert targets[1].metadata["plan_info"][0]["plan_id_type"] == "ein"
     assert targets[2].metadata["target_file_type"] == "in-network"
     assert targets[2].metadata["container_format"] == "zip"
+
+
+@pytest.mark.asyncio
+async def test_healthcarebluebook_resolver_skips_html_error_numeric_links(
+    monkeypatch,
+):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example HBB",
+    }
+    html = """
+    <div class="grid-item"><a href="/Example/111111">Dead file</a></div>
+    <div class="grid-item">Table of Contents</div>
+    <div class="grid-item"><a href="/Example/222222">Valid file</a></div>
+    <div class="grid-item">Table of Contents</div>
+    """
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://mrf.healthcarebluebook.com/Example"
+        return html
+
+    async def fake_probe(url, _session):
+        return url.endswith("/222222")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        fake_probe,
+    )
+
+    [target] = await discovery._resolve_healthcarebluebook_mrf(
+        source,
+        "https://mrf.healthcarebluebook.com/Example",
+        {"type": "healthcarebluebook_mrf"},
+        None,
+    )
+
+    assert target.url == "https://mrf.healthcarebluebook.com/Example/222222"
+    assert target.label == "Valid file"
 
 
 @pytest.mark.asyncio
@@ -4622,6 +4669,11 @@ async def test_healthcarebluebook_resolver_extracts_table_row_data_href(monkeypa
         return html
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        AsyncMock(return_value=True),
+    )
 
     [target] = await discovery._resolve_healthcarebluebook_mrf(
         source,
@@ -4657,6 +4709,11 @@ async def test_healthcarebluebook_resolver_applies_max_targets_early(monkeypatch
         return html
 
     monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_healthcarebluebook_numeric_file_url_is_downloadable",
+        AsyncMock(return_value=True),
+    )
 
     targets = await discovery._resolve_healthcarebluebook_mrf(
         source,
@@ -6585,7 +6642,11 @@ async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch
             ]
         }
 
+    async def allow_url(_url):
+        return None
+
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
 
     targets = await discovery._resolve_healthsparq_public_mrf(
         source, source_url, resolver, None
@@ -6617,7 +6678,11 @@ async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
     async def fake_fetch_json(_url, **_kwargs):
         raise ValueError("too large")
 
+    async def allow_url(_url):
+        return None
+
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
 
     targets = await discovery._resolve_healthsparq_public_mrf(
         source, source_url, resolver, None

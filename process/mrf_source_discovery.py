@@ -8423,6 +8423,33 @@ def _healthcarebluebook_relative_file_url(url: str) -> bool:
     )
 
 
+async def _healthcarebluebook_numeric_file_url_is_downloadable(
+    url: str,
+    session: aiohttp.ClientSession | None,
+) -> bool:
+    if not _healthcarebluebook_relative_file_url(url):
+        return True
+    probe = await _head_url(url, session=session)
+    status = str(probe.get("status") or "")
+    if status == "failed":
+        return True
+    final_url = str(probe.get("final_url") or url)
+    if final_url != url and (
+        _container_format(final_url) or _looks_direct_mrf_body_url(final_url)
+    ):
+        return True
+    http_status = _as_int(probe.get("http_status"))
+    if http_status in (404, 410):
+        return False
+    content_type = str(probe.get("content_type") or "").lower()
+    if any(
+        marker in content_type
+        for marker in ("text/html", "application/xhtml", "xml")
+    ):
+        return False
+    return True
+
+
 def _healthcarebluebook_item_matches_query(
     item: dict[str, Any],
     *,
@@ -8515,16 +8542,23 @@ async def _resolve_healthcarebluebook_mrf(
             query=target_query,
         ):
             continue
-        if _healthcarebluebook_relative_file_url(
-            link_url
-        ) or _looks_direct_mrf_body_url(link_url):
+        is_hbb_numeric_file = _healthcarebluebook_relative_file_url(link_url)
+        if is_hbb_numeric_file or _looks_direct_mrf_body_url(link_url):
+            is_downloadable = (
+                not is_hbb_numeric_file
+                or await _healthcarebluebook_numeric_file_url_is_downloadable(
+                    link_url, session
+                )
+            )
+            if not is_downloadable:
+                continue
             plan_info = _plan_info_from_label(label)
             metadata = {
                 "resolver": resolver_type,
                 "target_kind": "file_reference",
                 "target_file_type": file_type,
                 "container_format": _container_format(link_url)
-                or ("zip" if _healthcarebluebook_relative_file_url(link_url) else None),
+                or ("zip" if is_hbb_numeric_file else None),
                 "source_format": _healthcarebluebook_source_format(link_url),
                 "healthcarebluebook_listing_url": url,
                 "healthcarebluebook_file_type": _clean_text(type_text),
