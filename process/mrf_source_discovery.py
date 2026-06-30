@@ -78,6 +78,7 @@ BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+_BROWSER_FALLBACK_HTTP_STATUSES = {403, 406}
 MRF_URL_OBSERVATION_NULLABLE_KEYS = (
     "canonical_url",
     "url_type",
@@ -1518,9 +1519,14 @@ async def _fetch_text(
             return await _fetch_text(
                 url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
             )
+    class BrowserFallbackRequired(Exception):
+        """Retry this public JSON URL with browser-compatible request headers."""
+
     async def read_response(resp: aiohttp.ClientResponse) -> tuple[bytes, str]:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
+        if expect_json and resp.status in _BROWSER_FALLBACK_HTTP_STATUSES:
+            raise BrowserFallbackRequired()
         if expect_json and any(
             marker in content_type
             for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
@@ -1544,7 +1550,7 @@ async def _fetch_text(
     try:
         async with session.get(url, allow_redirects=True) as resp:
             body, charset = await read_response(resp)
-    except aiohttp.ServerDisconnectedError:
+    except (aiohttp.ServerDisconnectedError, BrowserFallbackRequired):
         retry_headers = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",

@@ -106,6 +106,22 @@ def discovery_candidate_matches(candidate: Any, carrier: str) -> bool:
     )
 
 
+def candidate_supports_benefit_line(candidate: Any, line: str) -> bool:
+    benefit_lines = getattr(candidate, "benefit_lines", None)
+    if not benefit_lines:
+        return True
+    values = benefit_lines if isinstance(benefit_lines, (list, tuple, set)) else [benefit_lines]
+    target = normalize_carrier(line)
+    for value in values:
+        normalized = normalize_carrier(str(value).replace("_", " ").replace("-", " "))
+        if not normalized:
+            continue
+        tokens = set(re.split(r"[^a-z0-9]+", normalized))
+        if target == normalized or target in tokens:
+            return True
+    return False
+
+
 def audit_carrier_rows(
     rows: Iterable[Mapping[str, str]],
     *,
@@ -119,6 +135,16 @@ def audit_carrier_rows(
     rows_list = list(rows)
 
     for line, column in line_columns:
+        line_all_candidates = [
+            candidate
+            for candidate in all_candidates
+            if candidate_supports_benefit_line(candidate, line)
+        ]
+        line_importable_candidates = [
+            candidate
+            for candidate in importable_candidates
+            if candidate_supports_benefit_line(candidate, line)
+        ]
         mentions_total = 0
         placeholders = 0
         importable_mentions = 0
@@ -138,8 +164,8 @@ def audit_carrier_rows(
                 entry = distinct[key]
                 entry["label"] = entry["label"] or carrier
                 entry["count"] += 1
-                importable = any(matcher(candidate, carrier) for candidate in importable_candidates)
-                catalog = importable or any(matcher(candidate, carrier) for candidate in all_candidates)
+                importable = any(matcher(candidate, carrier) for candidate in line_importable_candidates)
+                catalog = importable or any(matcher(candidate, carrier) for candidate in line_all_candidates)
                 if importable:
                     importable_mentions += 1
                     entry["importable"] = True

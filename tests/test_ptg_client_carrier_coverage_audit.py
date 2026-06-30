@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from types import SimpleNamespace
+
 from scripts.research.ptg_client_carrier_coverage_audit import (
     audit_carrier_rows,
     is_placeholder_carrier,
@@ -72,3 +74,31 @@ def test_audit_carrier_rows_reports_importable_catalog_and_unmatched_counts():
     assert by_line["vision"].catalog_mentions == 1
     assert by_line["vision"].unmatched_mentions == 1
     assert unmatched["vision"] == [("Missing Vision", 1)]
+
+
+def test_audit_carrier_rows_respects_candidate_benefit_lines():
+    rows = [
+        {
+            "MEDICAL_CARRIERS": "Shared Carrier",
+            "DENTAL_CARRIERS": "Shared Carrier",
+            "VISION_CARRIERS": "Shared Carrier",
+        },
+    ]
+    candidates = [
+        SimpleNamespace(name="Shared Carrier", benefit_lines=("medical",)),
+        SimpleNamespace(name="Shared Carrier", benefit_lines=("vision",)),
+    ]
+
+    stats, unmatched = audit_carrier_rows(
+        rows,
+        all_candidates=candidates,
+        importable_candidates=candidates,
+        matcher=lambda candidate, carrier: candidate.name.lower() == carrier.lower(),
+    )
+    by_line = {item.line: item for item in stats}
+
+    assert by_line["medical"].importable_mentions == 1
+    assert by_line["dental"].importable_mentions == 0
+    assert by_line["dental"].catalog_mentions == 0
+    assert by_line["vision"].importable_mentions == 1
+    assert unmatched["dental"] == [("Shared Carrier", 1)]

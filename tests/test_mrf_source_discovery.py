@@ -1196,6 +1196,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | aliases: SBA |
 | SIHO | tpa | https://www.mymedicalshopper.com/mrf-search/siho | aliases: SIHO Insurance Services |
 | Stanislaus County Health Plan | tpa | https://schp.mrf.payercompass.com/ | aliases: SCHP, HPNC |
+| Transwestern Insurance Administrators | tpa | https://www.trans-western.com/mrf_data/multiplan/MRF_PHCS_TOC_20260531.json | benefit lines: medical; aliases: Transwestern |
 | Trustmark Small Business Benefits | tpa | https://mrf.healthcarebluebook.com/trustmarksb | aliases: Trustmark Small Business, Trustmark SB |
 | Med-Pay | tpa | https://mrf.healthcarebluebook.com/medpay | aliases: Med Pay, MedPay |
 | Municipal Benefit Health Program | network/tpa | https://mhbp.mrf.payercompass.com/ | aliases: MHBP |
@@ -1204,6 +1205,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
 | PTI Engineered Plastics | group | https://mrf.healthcarebluebook.com/PTIEngineeredPlastics | aliases: PTI |
 | RCI Group II, LLC | group | https://mrf.healthcarebluebook.com/RCI | aliases: RCI Group II, RCI |
+| Smile Brands Inc | group | https://raw.githubusercontent.com/AmeriBen/MRF/main/allowed-amounts/2026-06-01_ameriben_smile_brands_inc_allowed-amounts.zip | benefit lines: medical; aliases: Smile Brands |
 | The Ohio State University | group | https://mrf.healthcarebluebook.com/TheOhioStateUniversity | aliases: Ohio State University, OSU |
 | U.S. Renal Care | group | https://mrf.healthcarebluebook.com/USRenalCare | aliases: US Renal Care, U.S. Renal |
 | Washington Community Schools | group | https://www.mymedicalshopper.com/mrf/washington-community-schools-hdp-family | aliases: Washington Community Schools HDP Family |
@@ -1376,6 +1378,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["SIHO"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Stanislaus County Health Plan"].hosting_platform == "payercompass_mrf"
+    assert by_name["Transwestern Insurance Administrators"].hosting_platform == "direct_toc"
+    assert by_name["Transwestern Insurance Administrators"].benefit_lines == ("medical",)
     assert (
         by_name["Trustmark Small Business Benefits"].hosting_platform
         == "healthcarebluebook_mrf"
@@ -1390,6 +1394,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["PTI Engineered Plastics"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["RCI Group II, LLC"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Smile Brands Inc"].hosting_platform == "direct_mrf_body"
+    assert by_name["Smile Brands Inc"].benefit_lines == ("medical",)
     assert by_name["The Ohio State University"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["U.S. Renal Care"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["Washington Community Schools"].hosting_platform == "mymedicalshopper_talon"
@@ -1937,6 +1943,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Starmount Life Insurance Company" in (
         by_name["Unum Dental / Starmount Life"].aliases
     )
+    assert by_name["Transwestern Dental"].entity_type == "dental"
+    assert by_name["Transwestern Dental"].benefit_lines == ("dental",)
+    assert by_name["Transwestern Dental"].status == "needs_review"
+    assert by_name["Transwestern Dental"].index_url is None
+    assert "TRANSWESTERN DENTAL" in by_name["Transwestern Dental"].aliases
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
@@ -2351,6 +2362,12 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Solstice Dental" in matching_names("Solstice Benefits, Inc.")
     assert "Solstice Dental" not in matching_importable_names("Solstice Benefits, Inc.")
     assert "Sun Life Dental" in matching_names("SunLife Financail")
+    assert "Transwestern Insurance Administrators" in matching_importable_names(
+        "TRANSWESTERN INSURANCE ADMINISTRATORS, INC"
+    )
+    assert "Transwestern Dental" in matching_names("TRANSWESTERN DENTAL")
+    assert "Transwestern Dental" not in matching_importable_names("TRANSWESTERN DENTAL")
+    assert "Smile Brands Inc" in matching_importable_names("Smile Brands")
     assert "United Concordia Dental" in matching_names("United Concorida")
     assert "EMI Health" in matching_importable_names("TDA Dental")
     assert "EMI Health" in matching_importable_names("Total Dental Administrators")
@@ -2525,6 +2542,69 @@ async def test_sapphire_resolver_keeps_direct_toc_urls_without_fetching(monkeypa
     )
     assert targets[0].metadata["resolver"] == "sapphire_html_tocs"
     assert targets[0].metadata["file_name"] == "example_vision"
+
+
+@pytest.mark.asyncio
+async def test_fetch_json_retries_browser_headers_after_406(monkeypatch):
+    async def allow_url(_url):
+        return None
+
+    class FakeContent:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        async def iter_chunked(self, _size):
+            yield self._body
+
+    class FakeResponse:
+        def __init__(self, status: int, body: bytes, content_type: str):
+            self.status = status
+            self.headers = {"Content-Type": content_type}
+            self.content = FakeContent(body)
+            self.charset = "utf-8"
+            self.url = "https://example.test/toc.json"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def release(self):
+            return None
+
+    class InitialSession:
+        def get(self, _url, *, allow_redirects):
+            assert allow_redirects is True
+            return FakeResponse(406, b"<html>not acceptable</html>", "text/html")
+
+    fallback_headers = {}
+
+    class BrowserFallbackSession:
+        def __init__(self, *, headers, **_kwargs):
+            fallback_headers.update(headers)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def get(self, _url, *, allow_redirects):
+            assert allow_redirects is True
+            return FakeResponse(200, b'{"ok": true}', "application/json")
+
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", BrowserFallbackSession)
+
+    payload = await discovery._fetch_json_value(
+        "https://example.test/toc.json",
+        max_bytes=1024,
+        session=InitialSession(),
+    )
+
+    assert payload == {"ok": True}
+    assert fallback_headers["User-Agent"] == discovery.BROWSER_FALLBACK_USER_AGENT
 
 
 @pytest.mark.asyncio

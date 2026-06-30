@@ -224,6 +224,7 @@ Last one-time research refresh: 2026-06-05.
 | TruAssure Dental | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: TruAssure, TruAssure Dental |
 | Unum Dental / Starmount Life | dental | - | needs official public TiC pricing TOC or landing URL; public Unum dental pages identify Starmount underwriting but no pricing MRF source is verified; benefit lines: dental; aliases: Unum, UNUM, Unum Dental, Starmount, Starmount Life, Starmount Life Insurance Company |
 | The Standard Dental | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: The Standard, TheStandard, Standard Dental |
+| Transwestern Dental | dental | - | needs official public dental pricing MRF TOC or landing URL; Transwestern public PHCS TOC is medical-only; benefit lines: dental; aliases: TRANSWESTERN DENTAL, Transwestern Dental |
 | Pacific Life Dental | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: Pacific Life |
 | Renaissance Dental | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: Renaissance Life & Health Insurance Company of America, Renaissance Life & Health Insurance Company |
 | HRI / Paramount Dental | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: HRI Dental, HRI/Paramount Dental, HRI Dental & Vision, Paramount Dental |
@@ -469,6 +470,7 @@ Last one-time research refresh: 2026-06-05.
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | public Healthcare Bluebook MRF directory; aliases: SBA, Simplified Benefits |
 | Stanislaus County Health Plan | tpa | https://schp.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: SCHP, HPNC, Health Plan of San Joaquin and Stanislaus |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
+| Transwestern Insurance Administrators | tpa | https://www.trans-western.com/mrf_data/multiplan/MRF_PHCS_TOC_20260531.json | public Transwestern MRF data page exposes PHCS/MultiPlan table-of-contents JSON; benefit lines: medical; aliases: Transwestern, Transwestern Insurance Administrators, "TRANSWESTERN INSURANCE ADMINISTRATORS, INC" |
 | Trustmark Small Business Benefits | tpa | https://mrf.healthcarebluebook.com/trustmarksb | public Healthcare Bluebook MRF directory; aliases: Trustmark Small Business, Trustmark SB |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp, Unified Group |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | public Healthcare Bluebook MRF directory linked from UMWA transparency page; aliases: UMWA Funds, HealthSmart Funds Account |
@@ -479,6 +481,7 @@ Last one-time research refresh: 2026-06-05.
 | WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | public Healthcare Bluebook MRF directory; aliases: WellNet Healthcare |
 | PTI Engineered Plastics | group | https://mrf.healthcarebluebook.com/PTIEngineeredPlastics | public Healthcare Bluebook MRF directory for group plan source; aliases: PTI |
 | RCI Group II, LLC | group | https://mrf.healthcarebluebook.com/RCI | public Healthcare Bluebook MRF directory for group plan source; aliases: RCI Group II, RCI |
+| Smile Brands Inc | group | https://raw.githubusercontent.com/AmeriBen/MRF/main/allowed-amounts/2026-06-01_ameriben_smile_brands_inc_allowed-amounts.zip | public AmeriBen GitHub MRF file for Smile Brands allowed amounts only; no in-network Smile Brands file found in AmeriBen tree; benefit lines: medical; aliases: Smile Brands, Smile Brands Inc, Smile Brands Inc. |
 | The Ohio State University | group | https://mrf.healthcarebluebook.com/TheOhioStateUniversity | public Healthcare Bluebook MRF directory for group plan source; aliases: Ohio State University, OSU |
 | U.S. Renal Care | group | https://mrf.healthcarebluebook.com/USRenalCare | public Healthcare Bluebook MRF directory for group plan source; aliases: US Renal Care, U.S. Renal |
 | Washington Community Schools | group | https://www.mymedicalshopper.com/mrf/washington-community-schools-hdp-family | public Washington Community Schools MRF compliance page delegates to TALON/MyMedicalShopper; aliases: Washington Community Schools HDP Family |
