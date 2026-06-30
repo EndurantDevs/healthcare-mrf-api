@@ -10879,6 +10879,35 @@ async def test_resolve_crawl_targets_progress_reports_source_pages(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_crawl_targets_times_out_slow_source(monkeypatch):
+    async def slow_crawl_targets_for_source(*_args, **_kwargs):
+        await asyncio.sleep(0.05)
+        return []
+
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", slow_crawl_targets_for_source
+    )
+    monkeypatch.setenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", "0.001")
+
+    targets, observations = await discovery._resolve_crawl_targets(
+        [
+            {
+                "source_id": "slow_source",
+                "index_url": "https://example.com/source",
+            }
+        ],
+        session=object(),
+        run_id="run_1",
+        progress_run_id=None,
+        concurrency=1,
+    )
+
+    assert targets == []
+    assert len(observations) == 1
+    assert observations[0]["status"] == "crawl_failed"
+
+
+@pytest.mark.asyncio
 async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
     progress = []
 

@@ -11264,6 +11264,12 @@ async def _resolve_crawl_targets(
     targets: list[CrawlTarget] = []
     observations: list[dict[str, Any]] = []
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
+    try:
+        source_resolve_timeout = float(
+            os.getenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", "180")
+        )
+    except ValueError:
+        source_resolve_timeout = 180.0
     pending_labels = {
         idx: _source_progress_label(source, url)
         for idx, source, url in items
@@ -11298,39 +11304,49 @@ async def _resolve_crawl_targets(
         idx: int, source: dict[str, Any], url: Any
     ) -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
         url_text = str(url)
-        async with semaphore:
-            target_query = _source_target_payer_query(source)
-            try:
-                resolved_targets = await _crawl_targets_for_source(
-                    source,
-                    url_text,
-                    session,
-                    target_limit=crawl_target_limit,
+        target_query = _source_target_payer_query(source)
+
+        async def resolve_body() -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
+            resolved_targets = await _crawl_targets_for_source(
+                source,
+                url_text,
+                session,
+                target_limit=crawl_target_limit,
+            )
+            if target_query:
+                resolved_targets.extend(
+                    await query_probe_targets(source, url_text, target_query)
                 )
-                if target_query:
-                    resolved_targets.extend(
-                        await query_probe_targets(source, url_text, target_query)
+                resolved_targets = [
+                    matched
+                    for target in resolved_targets
+                    if (
+                        matched := _matched_query_expansion_target(
+                            target, target_query
+                        )
                     )
-                    resolved_targets = [
-                        matched
-                        for target in resolved_targets
-                        if (
-                            matched := _matched_query_expansion_target(
-                                target, target_query
-                            )
-                        )
-                        is not None
-                    ]
-                if not resolved_targets:
-                    return idx, [], [
-                        _crawl_skipped_observation(
-                            source,
-                            url_text,
-                            "no configured resolver and URL is not a direct JSON TOC",
-                            run_id,
-                        )
-                    ]
-                return idx, resolved_targets, []
+                    is not None
+                ]
+            if not resolved_targets:
+                return idx, [], [
+                    _crawl_skipped_observation(
+                        source,
+                        url_text,
+                        "no configured resolver and URL is not a direct JSON TOC",
+                        run_id,
+                    )
+                ]
+            return idx, resolved_targets, []
+
+        async with semaphore:
+            try:
+                if source_resolve_timeout > 0:
+                    return await asyncio.wait_for(
+                        resolve_body(), timeout=source_resolve_timeout
+                    )
+                return await resolve_body()
+            except TimeoutError as exc:
+                return idx, [], [_crawl_failed_observation(source, url_text, exc, run_id)]
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 probe_targets = await query_probe_targets(
                     source, url_text, target_query
