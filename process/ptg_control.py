@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import os
+import threading
 from contextlib import contextmanager
 from typing import Any
 
@@ -17,6 +18,7 @@ from process.control_lifecycle import (
 )
 from process.import_status_events import flush_status_events
 from process.ptg import main as ptg_main
+from process.live_progress import write_live_progress
 from process.ptg_parts.config import (
     PTG2_FILE_PROCESS_CONCURRENCY_ENV,
     PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV,
@@ -49,6 +51,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     if stale_result is not None:
         return stale_result
     heartbeat_task = None
+    heartbeat_stop = None
     try:
         await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
         if run_id:
@@ -56,6 +59,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             heartbeat_task = asyncio.create_task(
                 _live_progress_heartbeat(run_id, "ptg", "ptg_control_start", started_at)
             )
+            heartbeat_stop = _start_threaded_ptg_heartbeat(run_id, started_at)
         await raise_if_cancelled(ctx, payload)
         _assert_expected_lane(params)
         with _ptg_lane_environment(params):
@@ -95,6 +99,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         await _flush_terminal_status_events()
         raise
     finally:
+        _stop_threaded_ptg_heartbeat(heartbeat_stop)
         await _stop_live_progress_heartbeat(heartbeat_task)
     result_metrics = result if isinstance(result, dict) else {}
     await mark_control_run(
@@ -107,6 +112,40 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     )
     await _flush_terminal_status_events()
     return {**result_metrics, "status": "succeeded", "run_id": run_id}
+
+
+def _start_threaded_ptg_heartbeat(run_id: str, started_at: str) -> threading.Event:
+    stop_event = threading.Event()
+    interval = float(os.getenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "15"))
+    if interval <= 0:
+        return stop_event
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval):
+            write_live_progress(
+                run_id=run_id,
+                importer="ptg",
+                status="running",
+                phase="ptg import running",
+                unit="run",
+                done=0,
+                total=1,
+                pct=0,
+                message="running",
+                started_at=started_at,
+                source="ptg-control-thread-heartbeat",
+                confidence="heartbeat",
+                publish_event=False,
+            )
+
+    thread = threading.Thread(target=_heartbeat, name=f"ptg-heartbeat-{run_id[:12]}", daemon=True)
+    thread.start()
+    return stop_event
+
+
+def _stop_threaded_ptg_heartbeat(stop_event: threading.Event | None) -> None:
+    if stop_event is not None:
+        stop_event.set()
 
 
 async def _stale_ptg_job_result(run_id: str, source_file_import_id: str) -> dict[str, Any] | None:

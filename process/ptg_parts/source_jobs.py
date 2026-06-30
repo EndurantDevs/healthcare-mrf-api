@@ -84,8 +84,6 @@ def _plan_matches_filters(
                 "plan_name",
                 "plan_sponsor_name",
                 "plan_sponser_name",
-                "issuer_name",
-                "reporting_entity_name",
             )
         ).lower()
         if not any(term in searchable for term in normalized_name_terms):

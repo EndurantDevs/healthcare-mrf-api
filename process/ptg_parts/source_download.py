@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import time
+import zipfile
 import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -245,6 +246,13 @@ def _safe_download_label(url: str) -> str:
         tail = parsed.path.rsplit("/", 1)[-1]
         return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
     return str(url)[:128]
+
+
+def _must_materialize_logical_artifact(raw_path: str | Path) -> bool:
+    try:
+        return zipfile.is_zipfile(raw_path)
+    except OSError:
+        return False
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
@@ -715,7 +723,7 @@ async def materialize_json_source(
     )
     logical_artifact = (
         stream_logical_artifact(raw_artifact.raw_path, output_dir=output_dir)
-        if materialize_logical
+        if materialize_logical or _must_materialize_logical_artifact(raw_artifact.raw_path)
         else logical_artifact_identity(
             raw_artifact.raw_path,
             raw_sha256=raw_artifact.raw_sha256,
