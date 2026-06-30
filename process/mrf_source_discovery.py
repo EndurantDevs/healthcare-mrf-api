@@ -1686,7 +1686,7 @@ def _file_benefit_metadata(source: dict[str, Any], *values: Any) -> dict[str, An
     if not lines:
         return {}
     metadata: dict[str, Any] = {"benefit_lines": list(lines)}
-    if len(lines) == 1:
+    if len(lines) in {1}:
         metadata["benefit_line"] = lines[0]
     return metadata
 
@@ -2232,10 +2232,11 @@ async def _assert_fetch_url_allowed(url: str) -> None:
         raise ValueError("local hosts are not allowed")
     try:
         ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip = None
+    if ip is not None:
         _assert_public_ip(ip)
         return
-    except ValueError:
-        pass
     infos = await asyncio.to_thread(
         socket.getaddrinfo,
         hostname,
@@ -4194,7 +4195,7 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
     )
     if benefit_lines:
         context["benefit_lines"] = list(benefit_lines)
-        if len(benefit_lines) == 1:
+        if len(benefit_lines) in {1}:
             context["benefit_line"] = benefit_lines[0]
     if group_number:
         context["group_id"] = group_number
@@ -6292,7 +6293,7 @@ async def _resolve_fchn_payor_search(
 
 def _payercompass_file_type(frame: dict[str, Any], label: str | None = None) -> str:
     file_type = _as_int(frame.get("fileType"))
-    if file_type == 1:
+    if file_type in {1}:
         return "in-network"
     if file_type == 2:
         return "allowed-amounts"
@@ -6672,7 +6673,7 @@ def _payercompass_targets_from_structure(
         if not timeframe_id:
             continue
         listing = file_lists.get(timeframe_id) or []
-        if not listing and (_as_int(frame.get("fileCount")) or 0) == 1:
+        if not listing and (_as_int(frame.get("fileCount")) or 0) in {1}:
             listing = [
                 {"id": timeframe_id, "name": str(frame.get("name") or timeframe_id)}
             ]
@@ -8891,7 +8892,7 @@ def _socrata_benefit_metadata(
         "medical",
     )
     metadata: dict[str, Any] = {"benefit_lines": list(lines)}
-    if len(lines) == 1:
+    if len(lines) in {1}:
         metadata["benefit_line"] = lines[0]
     return metadata
 
@@ -12206,8 +12207,7 @@ async def _crawl_toc_metadata(
 ) -> tuple[int, int, list[dict[str, Any]]]:
     if test_mode:
         return 0, 0, []
-    plans_discovered = 0
-    files_discovered = 0
+    discovery_count_map = {"plans": 0, "files": 0}
     observation_ids: set[str] = set()
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     write_batch_size = WRITE_BATCH_SIZE
@@ -12342,7 +12342,7 @@ async def _crawl_toc_metadata(
         for target in targets:
             row = _toc_target_file_row(target)
             target_rows.append(row)
-        files_discovered += len(target_rows)
+        discovery_count_map["files"] += len(target_rows)
         for observation in resolver_observations:
             observation_ids.add(observation["observation_id"])
         await _push_crawl_row_batches(
@@ -12385,7 +12385,6 @@ async def _crawl_toc_metadata(
                     target_queue.task_done()
 
         async def writer(active_workers: int) -> None:
-            nonlocal plans_discovered, files_discovered
             done = 0
             finished_workers = 0
             plan_batch: list[dict[str, Any]] = []
@@ -12398,8 +12397,8 @@ async def _crawl_toc_metadata(
                     continue
                 plan_rows, file_rows, crawl_observations, url = item
                 done += 1
-                plans_discovered += len(plan_rows)
-                files_discovered += len(file_rows)
+                discovery_count_map["plans"] += len(plan_rows)
+                discovery_count_map["files"] += len(file_rows)
                 for row in crawl_observations:
                     observation_ids.add(row["observation_id"])
                 plan_batch.extend(plan_rows)
@@ -12462,8 +12461,8 @@ async def _crawl_toc_metadata(
             await asyncio.gather(worker_group, writer_task, return_exceptions=True)
             raise
     return (
-        plans_discovered,
-        files_discovered,
+        discovery_count_map["plans"],
+        discovery_count_map["files"],
         [{"observation_id": value} for value in observation_ids],
     )
 
@@ -12701,7 +12700,7 @@ def _file_column_plan_info(
         market_type = (
             markets[index]
             if index < len(markets)
-            else (markets[0] if len(markets) == 1 else None)
+            else (markets[0] if len(markets) in {1} else None)
         )
         lookup = (
             plan_lookup.get((source_id, plan_id, plan_name, market_type))

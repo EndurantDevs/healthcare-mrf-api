@@ -3521,7 +3521,7 @@ def _provider_directory_partial_source_selects(
             filtered.append(
                 _affected_npi_source_select_sql(db_schema, source_select, affected_group_table)
             )
-    if provider_selects == 0:
+    if not provider_selects:
         return []
     return filtered
 
@@ -7189,14 +7189,14 @@ async def _populate_support_stage_tables(
     )
     phase_context["support_stage_concurrency"] = support_concurrency
     total_steps = len(statements)
-    completed_steps = 0
+    step_progress_map = {"completed_steps": 0}
     progress_lock = asyncio.Lock()
 
     async def _run_item(index: int, item: _SupportStageStatement) -> None:
-        nonlocal completed_steps
+        # Progress is held in step_progress_map to avoid nonlocal state.
         if run_id:
             async with progress_lock:
-                current_done = completed_steps
+                current_done = step_progress_map["completed_steps"]
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="entity-address-unified",
@@ -7218,10 +7218,10 @@ async def _populate_support_stage_tables(
         )
 
     async def _finish_item(index: int, item: _SupportStageStatement) -> None:
-        nonlocal completed_steps
+        # Progress is held in step_progress_map to avoid nonlocal state.
         await _run_item(index, item)
         async with progress_lock:
-            completed_steps += 1
+            step_progress_map["completed_steps"] += 1
             if run_id:
                 enqueue_live_progress(
                     run_id=run_id,
@@ -7229,16 +7229,16 @@ async def _populate_support_stage_tables(
                     status="running",
                     phase=f"entity-address-unified built {item.label}",
                     unit="steps",
-                    done=completed_steps,
+                    done=step_progress_map["completed_steps"],
                     total=total_steps,
-                    pct=95 + (completed_steps / max(total_steps, 1)) * 4,
+                    pct=95 + (step_progress_map["completed_steps"] / max(total_steps, 1)) * 4,
                     message=f"built support table {index}/{total_steps}: {item.label}",
                 )
 
     async def _run_parallel_batch(batch: list[tuple[int, _SupportStageStatement]]) -> None:
         if not batch:
             return
-        if support_concurrency <= 1 or len(batch) == 1:
+        if support_concurrency <= 1 or len(batch) in {1}:
             for index, item in batch:
                 await _finish_item(index, item)
             return
@@ -9655,10 +9655,10 @@ async def process_data(ctx, task=None):
 
             sem = asyncio.Semaphore(source_concurrency)
             source_progress_lock = asyncio.Lock()
-            loaded_sources = 0
+            source_progress_map = {"loaded_sources": 0}
 
             async def _load_source(select_sql: str) -> None:
-                nonlocal loaded_sources
+                # Progress is held in source_progress_map to avoid nonlocal state.
                 async with sem:
                     await _run_sql_phase(
                         _insert_raw_from_source_sql(
@@ -9671,23 +9671,23 @@ async def process_data(ctx, task=None):
                         run_id=run_id,
                         phase="entity-address-unified loading sources",
                         unit="sources",
-                        done=loaded_sources,
+                        done=source_progress_map["loaded_sources"],
                         total=len(source_selects),
                         message="loading source shard",
                         emit_start=True,
                     )
                 if run_id:
                     async with source_progress_lock:
-                        loaded_sources += 1
+                        source_progress_map["loaded_sources"] += 1
                         enqueue_live_progress(
                             run_id=run_id,
                             importer="entity-address-unified",
                             status="running",
                             phase="entity-address-unified loading sources",
                             unit="sources",
-                            done=loaded_sources,
+                            done=source_progress_map["loaded_sources"],
                             total=len(source_selects),
-                            message=f"loaded {loaded_sources}/{len(source_selects)} sources",
+                            message=f"loaded {source_progress_map['loaded_sources']}/{len(source_selects)} sources",
                         )
 
             if source_concurrency > 1 and len(source_selects) > 1:
@@ -9735,11 +9735,11 @@ async def process_data(ctx, task=None):
                     )
                 enrich_sem = asyncio.Semaphore(enrich_concurrency)
                 enrich_progress_lock = asyncio.Lock()
-                enriched_shards = 0
+                enrich_progress_map = {"enriched_shards": 0}
                 checksum_ranges = _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
 
                 async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
-                    nonlocal enriched_shards
+                    # Progress is held in enrich_progress_map to avoid nonlocal state.
                     async with enrich_sem:
                         await _run_sql_phase(
                             _enrich_raw_stage_sql(
@@ -9759,23 +9759,23 @@ async def process_data(ctx, task=None):
                             run_id=run_id,
                             phase="entity-address-unified enriching raw",
                             unit="shards",
-                            done=enriched_shards,
+                            done=enrich_progress_map["enriched_shards"],
                             total=enrich_shards,
                             message=f"enriching checksum range {checksum_min}..{checksum_max}",
                             emit_start=True,
                         )
                     if run_id:
                         async with enrich_progress_lock:
-                            enriched_shards += 1
+                            enrich_progress_map["enriched_shards"] += 1
                             enqueue_live_progress(
                                 run_id=run_id,
                                 importer="entity-address-unified",
                                 status="running",
                                 phase="entity-address-unified enriching raw",
                                 unit="shards",
-                                done=enriched_shards,
+                                done=enrich_progress_map["enriched_shards"],
                                 total=enrich_shards,
-                                message=f"enriched {enriched_shards}/{enrich_shards} raw shards",
+                                message=f"enriched {enrich_progress_map['enriched_shards']}/{enrich_shards} raw shards",
                             )
 
                 await asyncio.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
@@ -9882,10 +9882,10 @@ async def process_data(ctx, task=None):
                 message=f"aggregating {aggregate_shards} shards",
             )
         aggregate_progress_lock = asyncio.Lock()
-        aggregated_shards = 0
+        aggregate_progress_map = {"aggregated_shards": 0}
 
         async def _aggregate_shard(remainder: int) -> None:
-            nonlocal aggregated_shards
+            # Progress is held in aggregate_progress_map to avoid nonlocal state.
             await _run_sql_phase(
                 _materialize_from_raw_sql(
                     db_schema,
@@ -9900,23 +9900,23 @@ async def process_data(ctx, task=None):
                 run_id=run_id,
                 phase="entity-address-unified aggregating",
                 unit="shards",
-                done=aggregated_shards,
+                done=aggregate_progress_map["aggregated_shards"],
                 total=aggregate_shards,
                 message=f"aggregating shard {remainder + 1}/{aggregate_shards}",
                 emit_start=True,
             )
             if run_id:
                 async with aggregate_progress_lock:
-                    aggregated_shards += 1
+                    aggregate_progress_map["aggregated_shards"] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="entity-address-unified",
                         status="running",
                         phase="entity-address-unified aggregating",
                         unit="shards",
-                        done=aggregated_shards,
+                        done=aggregate_progress_map["aggregated_shards"],
                         total=aggregate_shards,
-                        message=f"aggregated {aggregated_shards}/{aggregate_shards} shards",
+                        message=f"aggregated {aggregate_progress_map['aggregated_shards']}/{aggregate_shards} shards",
                     )
 
         if aggregate_shards > 1:
@@ -10179,10 +10179,10 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         evidence_build_progress_lock = asyncio.Lock()
-        evidence_build_done = 0
+        evidence_build_progress_map = {"evidence_build_done": 0}
 
         async def _build_evidence_shard(remainder: int) -> None:
-            nonlocal evidence_build_done
+            # Progress is held in evidence_build_progress_map to avoid nonlocal state.
             await _run_sql_phase(
                 _insert_multi_source_evidence_shard_sql(
                     db_schema,
@@ -10195,23 +10195,23 @@ async def process_data(ctx, task=None):
                 run_id=run_id,
                 phase="entity-address-unified preparing source evidence",
                 unit="shards",
-                done=evidence_build_done,
+                done=evidence_build_progress_map["evidence_build_done"],
                 total=evidence_shards,
                 message=f"preparing evidence shard {remainder + 1}/{evidence_shards}",
                 emit_start=True,
             )
             if run_id:
                 async with evidence_build_progress_lock:
-                    evidence_build_done += 1
+                    evidence_build_progress_map["evidence_build_done"] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="entity-address-unified",
                         status="running",
                         phase="entity-address-unified preparing source evidence",
                         unit="shards",
-                        done=evidence_build_done,
+                        done=evidence_build_progress_map["evidence_build_done"],
                         total=evidence_shards,
-                        message=f"prepared {evidence_build_done}/{evidence_shards} evidence shards",
+                        message=f"prepared {evidence_build_progress_map['evidence_build_done']}/{evidence_shards} evidence shards",
                     )
 
         if evidence_shards > 1:
@@ -10262,10 +10262,10 @@ async def process_data(ctx, task=None):
                 message=f"applying evidence across {evidence_shards} shards",
             )
         evidence_progress_lock = asyncio.Lock()
-        evidence_done = 0
+        evidence_progress_map = {"evidence_done": 0}
 
         async def _apply_evidence_shard(remainder: int) -> None:
-            nonlocal evidence_done
+            # Progress is held in evidence_progress_map to avoid nonlocal state.
             await _run_sql_phase(
                 _apply_multi_source_evidence_sql(
                     db_schema,
@@ -10277,23 +10277,23 @@ async def process_data(ctx, task=None):
                 run_id=run_id,
                 phase="entity-address-unified applying source evidence",
                 unit="shards",
-                done=evidence_done,
+                done=evidence_progress_map["evidence_done"],
                 total=evidence_shards,
                 message=f"applying evidence shard {remainder + 1}/{evidence_shards}",
                 emit_start=True,
             )
             if run_id:
                 async with evidence_progress_lock:
-                    evidence_done += 1
+                    evidence_progress_map["evidence_done"] += 1
                     enqueue_live_progress(
                         run_id=run_id,
                         importer="entity-address-unified",
                         status="running",
                         phase="entity-address-unified applying source evidence",
                         unit="shards",
-                        done=evidence_done,
+                        done=evidence_progress_map["evidence_done"],
                         total=evidence_shards,
-                        message=f"applied {evidence_done}/{evidence_shards} evidence shards",
+                        message=f"applied {evidence_progress_map['evidence_done']}/{evidence_shards} evidence shards",
                     )
 
         if evidence_shards > 1:

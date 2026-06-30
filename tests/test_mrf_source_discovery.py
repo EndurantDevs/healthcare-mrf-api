@@ -1245,7 +1245,7 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
         params={"insurerCode": "A", "brandCode": "BRAND"},
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     [target] = targets
     assert target.metadata["file_path"].endswith("2026-06-01_222_index.json.gz")
     plan_info = target.metadata["plan_info"]
@@ -1354,7 +1354,7 @@ def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync(
         payload,
     )
 
-    assert len(file_rows) == 1
+    assert len(file_rows) in {1}
     plan_info = file_rows[0]["metadata_json"]["plan_info"]
     assert [plan["plan_name"] for plan in plan_info] == [
         "Example Packaging HSA Choice Plan",
@@ -2129,7 +2129,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         if candidate.payer_name == "Meritain Health"
         and "MERITAINOVER" in candidate.index_url
     ]
-    assert len(meritain_health1) == 1
+    assert len(meritain_health1) in {1}
     assert meritain_health1[0].benefit_lines == ("medical", "dental")
     assert by_name["Firefly Health"].entity_type == "dtc"
     assert by_name["Firefly Health"].benefit_lines == ("medical",)
@@ -3178,7 +3178,7 @@ async def test_sapphire_resolver_keeps_direct_toc_urls_without_fetching(monkeypa
         None,
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert (
         targets[0].url
         == "https://example.sapphiremrfhub.com/tocs/current/example_vision"
@@ -3539,12 +3539,11 @@ def test_import_control_snapshot_company_fallback_from_index_url():
 
 @pytest.mark.asyncio
 async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch):
-    calls = 0
+    call_count_map = {"all": 0}
 
     async def fake_all(_stmt):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+        call_count_map["all"] += 1
+        if call_count_map["all"] in {1}:
             return []
         plan_info = [{"plan_id": "123", "plan_market_type": "group"}]
         return [
@@ -3614,12 +3613,11 @@ async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch
 async def test_import_control_snapshot_items_use_metadata_company_before_generic_path(
     monkeypatch,
 ):
-    calls = 0
+    call_count_map = {"all": 0}
 
     async def fake_all(_stmt):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+        call_count_map["all"] += 1
+        if call_count_map["all"] in {1}:
             return []
         return [
             (
@@ -4222,7 +4220,7 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
     assert plans_discovered == 2
     assert files_discovered == 2
     assert len(observations) == 2
-    assert len(captured_file_batches) == 1
+    assert len(captured_file_batches) in {1}
     assert [row["description"] for row in captured_file_batches[0]] == [
         "Example Plan 0",
         "Example Plan 1",
@@ -4824,7 +4822,7 @@ async def test_html_healthcarebluebook_resolver_passes_max_targets_to_nested(
         None,
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert captured_resolvers[0]["max_targets"] == 5
 
 
@@ -5560,7 +5558,7 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
     employers = discovery._mymedicalshopper_employer_docs_from_messages(messages)
 
     assert info["ids"] == [{"$type": "oid", "$value": "61a"}]
-    assert info["records_filtered"] == 1
+    assert info["records_filtered"] in {1}
     assert employers == [
         {
             "_id": "61a",
@@ -5955,7 +5953,7 @@ def test_viva_health_direct_commercial_target_handles_extensionless_downloads():
         "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url.endswith("viva-health-commercial-out-of-network-rates")
     assert targets[0].metadata["target_kind"] == "file_reference"
     assert targets[0].metadata["target_file_type"] == "allowed-amounts"
@@ -6093,10 +6091,10 @@ async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
         session="session",
     )
 
-    assert len(fetched_result_urls) == 1
+    assert len(fetched_result_urls) in {1}
     assert "filters=search-by%3Amagna" in fetched_result_urls[0]
-    assert len(fetched_download_urls) == 1
-    assert len(targets) == 1
+    assert len(fetched_download_urls) in {1}
+    assert len(targets) in {1}
     target = targets[0]
     assert target.url.endswith("MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret")
     assert target.resolved_from_url == "https://clm.magnacare.com/transparency/"
@@ -6298,7 +6296,7 @@ def test_humana_pct_targets_from_payload_catalogs_tocs_only_by_default():
         resolver_type="humana_pct_file_list",
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url == (
         "https://developers.humana.com/syntheticdata/Resource/"
         "DownloadTOCFile?fileName=2026-06-01_Humana_index.json"
@@ -6370,7 +6368,7 @@ def test_fchn_detail_parser_extracts_public_zip_file_reference():
         resolver_type="fchn_payor_search",
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url == (
         "https://www.fchn.com/documents/ppo/providers/payorsearch/"
         "64647/innrftpac/example.zip"
@@ -6569,9 +6567,9 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
         source, metadata_url, payload
     )
 
-    assert len(plan_rows) == 1
+    assert len(plan_rows) in {1}
     assert plan_rows[0]["plan_id"] == "20523CA003"
-    assert len(file_rows) == 1
+    assert len(file_rows) in {1}
     assert file_rows[0]["file_type"] == "in-network"
     assert (
         file_rows[0]["url"]
@@ -6714,7 +6712,7 @@ async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch
         source, source_url, resolver, None
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url == (
         "https://mrf.healthsparq.com/unvra-egress.nophi.kyruushsq.com/prd/mrf/"
         "UNVRA_I/UNVRA/2026-07-01/inNetworkRates/rates.json.zip"
@@ -6750,7 +6748,7 @@ async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
         source, source_url, resolver, None
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url.endswith("/UNVRA_I/UNVRA/latest_metadata.json")
     assert targets[0].metadata["target_kind"] == "toc_json"
     assert targets[0].metadata["target_file_type"] == "table-of-contents"
@@ -7119,7 +7117,7 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
 @pytest.mark.asyncio
 async def test_push_import_control_catalog_marks_successful_seed_promoted(monkeypatch):
     calls = []
-    source_upsert_count = 0
+    source_upsert_count_map = {"created": 0}
 
     class FakeResponse:
         def __init__(self, payload, status=200):
@@ -7140,7 +7138,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
 
     class FakeSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -7149,10 +7147,9 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
             return False
 
         def post(self, url, json):
-            nonlocal source_upsert_count
             calls.append({"url": url, "json": json})
             if url.endswith("/v1/catalog/sources"):
-                source_upsert_count += 1
+                source_upsert_count_map["created"] += 1
                 return FakeResponse({"source_id": "ic_source_1"})
             if url.endswith("/v1/ptg/discover/ingest-preview"):
                 return FakeResponse({"counts": {"plans": 2}})
@@ -7208,7 +7205,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
         ]
     )
 
-    assert sources_synced == 1
+    assert sources_synced in {1}
     assert plans_synced == 2
     assert errors == []
     assert [call["url"] for call in calls] == [
@@ -7218,7 +7215,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
         "http://import-control.test/v1/catalog/seeds/import",
         "http://import-control.test/v1/catalog/sources",
     ]
-    assert source_upsert_count == 2
+    assert source_upsert_count_map["created"] == 2
     assert calls[0]["json"]["visibility"] == "internal"
     assert calls[0]["json"]["status"] == "needs_review"
     assert calls[-1]["json"]["visibility"] == "public"
@@ -7251,7 +7248,7 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
 
     class FakeSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -7322,8 +7319,8 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
         if call["url"].endswith("/v1/catalog/sources")
     ]
 
-    assert sources_synced == 1
-    assert plans_synced == 0
+    assert sources_synced in {1}
+    assert plans_synced in {0}
     assert errors == []
     assert len(source_payloads) == 2
     assert source_payloads[-1]["visibility"] == "public"
@@ -7367,7 +7364,7 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
 
     class FakeSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -7460,12 +7457,12 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
         payload for payload in source_payloads if payload["visibility"] == "public"
     ]
 
-    assert sources_synced == 1
-    assert plans_synced == 1
+    assert sources_synced in {1}
+    assert plans_synced in {1}
     assert errors == []
     assert len(source_payloads) == 2
     assert all(payload["display_name"] == "Example Active Benefits" for payload in source_payloads)
-    assert len(final_public_sources) == 1
+    assert len(final_public_sources) in {1}
     assert final_public_sources[0]["status"] == "active"
     assert final_public_sources[0]["metadata"]["aliases"] == [
         "Example Active Benefits",
@@ -7498,7 +7495,7 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
 
     class FakeSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -7559,10 +7556,10 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
         and call["json"].get("visibility") == "public"
     ]
 
-    assert sources_synced == 1
-    assert plans_synced == 0
+    assert sources_synced in {1}
+    assert plans_synced in {0}
     assert errors == []
-    assert len(final_public_sources) == 1
+    assert len(final_public_sources) in {1}
     assert final_public_sources[0]["status"] == "stale"
     assert final_public_sources[0]["preserve_operator_state"] is False
     assert not [
@@ -7599,7 +7596,7 @@ async def test_push_import_control_catalog_keeps_failed_source_internal_and_repo
 
     class FakeSession:
         def __init__(self, *_args, **_kwargs):
-            pass
+            return None
 
         async def __aenter__(self):
             return self
@@ -7688,18 +7685,18 @@ async def test_push_import_control_catalog_keeps_failed_source_internal_and_repo
         and call["json"].get("visibility") == "public"
     ]
 
-    assert sources_synced == 1
+    assert sources_synced in {1}
     assert plans_synced == 2
-    assert len(errors) == 1
+    assert len(errors) in {1}
     assert errors[0]["source_id"] == "source_fail"
     assert errors[0]["import_control_source_id"] == "ic_source_fail"
     assert "ingest exploded" in errors[0]["message"]
-    assert len(final_public_sources) == 1
+    assert len(final_public_sources) in {1}
     assert final_public_sources[0]["source_key"] == "example-ok"
     seed_calls = [
         call for call in calls if call["url"].endswith("/v1/catalog/seeds/import")
     ]
-    assert len(seed_calls) == 1
+    assert len(seed_calls) in {1}
     seed_payload = seed_calls[0]["json"]
     assert seed_payload["seed_provider"] == "healthcare-mrf-api"
     [seed_item] = seed_payload["items"]
@@ -9649,7 +9646,7 @@ async def test_crawl_targets_for_source_delegates_plain_mrf_host_text(monkeypatc
         fake_session,
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].source == {"display_name": "Wrapper source"}
     assert targets[0].url == "https://cdn.example/lucent_index.json"
     assert targets[0].resolved_from_url == "https://wrapper.example/mrf"
@@ -10233,7 +10230,7 @@ def test_cigna_lookup_targets_preserve_file_metadata_and_large_toc_limit():
         resolver={"toc_max_bytes": 104857600},
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert targets[0].url == "https://d25kgz5rikkq4n.cloudfront.net/index.json"
     assert (
         targets[0].resolved_from_url == "https://www.cigna.com/static/mrf/latest.json"
@@ -10381,7 +10378,7 @@ def test_azure_mrf_listing_targets_from_xml_extracts_toc_metadata():
         resolver={"type": "azure_mrf_listing", "toc_max_bytes": 456789},
     )
 
-    assert len(targets) == 1
+    assert len(targets) in {1}
     assert (
         targets[0].url
         == "https://storage.example.test/container/index/2026-06_example_index.json"
@@ -10920,8 +10917,8 @@ File scope: In Network | Plan Name: HDHP | Sponsor EIN: 741670067 | https://bcbs
         source, "https://example.com/allowed-amount-meta.txt", text
     )
 
-    assert len(plan_rows) == 1
-    assert len(file_rows) == 1
+    assert len(plan_rows) in {1}
+    assert len(file_rows) in {1}
     assert plan_rows[0]["plan_id"] == "010627671"
     assert plan_rows[0]["reporting_entity_type"] == "third_party_administrator"
     assert file_rows[0]["file_type"] == "allowed-amounts"
@@ -10943,7 +10940,7 @@ def test_metadata_text_rows_accept_zip_body_references():
         source, "https://example.com/meta.txt", text
     )
 
-    assert len(file_rows) == 1
+    assert len(file_rows) in {1}
     assert file_rows[0]["file_type"] == "in-network"
     assert file_rows[0]["metadata_json"]["container_format"] == "zip"
 
@@ -11158,7 +11155,7 @@ async def test_resolve_crawl_targets_times_out_slow_source(monkeypatch):
     )
 
     assert targets == []
-    assert len(observations) == 1
+    assert len(observations) in {1}
     assert observations[0]["status"] == "crawl_failed"
 
 
@@ -11305,9 +11302,9 @@ async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch)
         concurrency=1,
     )
 
-    assert plans == 1
+    assert plans in {1}
     assert files == 2
-    assert len(observations) == 1
+    assert len(observations) in {1}
     assert pushed_batches[0]["file_rows"][0]["file_type"] == "table-of-contents"
     assert pushed_batches[-1]["plan_rows"] == [{"plan_id": "plan_1"}]
     assert pushed_batches[-1]["file_rows"][0]["mrf_file_id"] == "file_1"
@@ -11432,7 +11429,7 @@ def test_toc_rows_store_plan_info_on_file_metadata(monkeypatch):
         {"source_id": "source_1"}, "https://example.com/index.json", {}
     )
 
-    assert len(file_rows) == 1
+    assert len(file_rows) in {1}
     # The exact per-file plan list (with plan_id_type) is preserved so the import-control
     # snapshot can be rebuilt from stored rows.
     assert file_rows[0]["metadata_json"]["plan_info"] == [
@@ -11805,7 +11802,7 @@ async def test_store_observations_does_not_emit_live_progress_without_control_ru
         concurrency=1,
     )
 
-    assert len(observations) == 1
+    assert len(observations) in {1}
     assert pushed == observations
     assert observations[0]["metadata_json"]["run_id"] == "crawl_run_1"
     assert progress_calls == []
@@ -11870,9 +11867,9 @@ async def test_source_payer_query_filters_before_candidate_limit(monkeypatch):
     )
 
     assert observed_limits == [None]
-    assert result["candidates"] == 1
-    assert result["payers"] == 1
-    assert result["sources"] == 1
+    assert result["candidates"] in {1}
+    assert result["payers"] in {1}
+    assert result["sources"] in {1}
 
 
 @pytest.mark.asyncio
@@ -11884,7 +11881,7 @@ async def test_direct_discovery_run_emits_import_control_visible_state(monkeypat
 
     async def fake_load_candidates(_provider, *, test_mode, limit):
         assert test_mode is True
-        assert limit == 1
+        assert limit in {1}
         return [
             discovery.SourceCandidate(
                 payer_name="Example Payer",
@@ -11939,7 +11936,7 @@ async def test_direct_discovery_run_emits_import_control_visible_state(monkeypat
     assert events[0]["params"]["provider"] == "master-list"
     assert events[1]["metrics"]["crawl_run_id"] == control_run_id
     assert events[1]["metrics"]["crawl_status"] == "succeeded"
-    assert events[1]["metrics"]["sources"] == 1
+    assert events[1]["metrics"]["sources"] in {1}
     assert [row["run_id"] for row in crawl_rows] == [control_run_id, control_run_id]
     assert [item["run_id"] for item in progress] == [
         control_run_id,

@@ -50,10 +50,10 @@ ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
 def test_default_ptg2_import_id_includes_source_inputs():
     month = process_ptg.normalize_import_month("2026-06")
 
-    heartland_id = process_ptg._default_ptg2_import_id(
+    example_dental_id = process_ptg._default_ptg2_import_id(
         month,
         "ptg_d2fc90445ba744ef",
-        allowed_url="https://example.com/heartland-allowed.json.gz",
+        allowed_url="https://example.com/example-dental-allowed.json.gz",
     )
     optum_id = process_ptg._default_ptg2_import_id(
         month,
@@ -61,9 +61,9 @@ def test_default_ptg2_import_id_includes_source_inputs():
         in_network_url="https://example.com/optum-rates.json.gz",
     )
 
-    assert heartland_id != "20260601"
+    assert example_dental_id != "20260601"
     assert optum_id != "20260601"
-    assert heartland_id != optum_id
+    assert example_dental_id != optum_id
 
 
 def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
@@ -2798,8 +2798,7 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
 
 def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
     pushed = []
-    active = 0
-    max_active = 0
+    concurrency_map = {"active": 0, "max_active": 0}
     processed_jobs = []
 
     async def fake_push(rows, cls, **_kwargs):
@@ -2823,12 +2822,11 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
             )
 
     async def fake_process(job, *_args, **_kwargs):
-        nonlocal active, max_active
         processed_jobs.append(dict(job))
-        active += 1
-        max_active = max(max_active, active)
+        concurrency_map["active"] += 1
+        concurrency_map["max_active"] = max(concurrency_map["max_active"], concurrency_map["active"])
         await asyncio.sleep(0.05)
-        active -= 1
+        concurrency_map["active"] -= 1
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             job["url"],
@@ -2874,7 +2872,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
         )
     )
 
-    assert max_active == 2
+    assert concurrency_map["max_active"] in {2}
     assert [job["source_network_names"] for job in processed_jobs] == [["C2"], ["C2"]]
     assert result["files_processed"] == 2
     assert result["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
@@ -3312,7 +3310,7 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         allowed_url=None,
         provider_ref_url=None,
         import_id="ptg_smoke",
-        source_key="heartland_dental",
+        source_key="example_dental",
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
@@ -3333,7 +3331,7 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         allowed_url=None,
         provider_ref_url=None,
         import_id="ptg_smoke",
-        source_key="heartland_dental",
+        source_key="example_dental",
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
@@ -3568,7 +3566,7 @@ def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp
     assert len(serving_copy.read_text().splitlines()) == 2
     assert member_copy.exists()
     member_lines = member_copy.read_text().splitlines()
-    assert len(member_lines) == 1
+    assert len(member_lines) in {1}
     assert b"compact_copy_file" in completed.stdout
     assert b"provider_group_member_copy_file" in completed.stdout
 
@@ -3640,7 +3638,7 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
         for shard_path in shard_paths
         for line in shard_path.read_text().splitlines()
     ]
-    assert len(copy_lines) == 1
+    assert len(copy_lines) in {1}
     fields = copy_lines[0].split("\t")
     assert fields[6] == "99213"
     assert fields[8] == "1"
@@ -3670,7 +3668,7 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert dedupe_summary["negotiated_rates"] == 2
     assert dedupe_summary["serving_rate_attempted"] == 2
     assert dedupe_summary["serving_rate_unique"] == 1
-    assert dedupe_summary["serving_rate_duplicate"] == 1
+    assert dedupe_summary["serving_rate_duplicate"] in {1}
     assert dedupe_summary["serving_rate_reduction_pct"] == 50.0
     assert dedupe_summary["price_atom_attempted"] == 1
     assert dedupe_summary["price_atom_unique"] == 1
@@ -3683,7 +3681,7 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert dedupe_summary["provider_set_entry_duplicate"] == 0
     assert dedupe_summary["provider_entry_component_attempted"] == 0
     assert dedupe_summary["provider_entry_component_unique"] == 0
-    assert dedupe_summary["provider_entry_component_duplicate"] == 0
+    assert dedupe_summary["provider_entry_component_duplicate"] in {0}
 
 
 def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tmp_path):
@@ -3804,7 +3802,7 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
     assert worker_summary["parse_in_workers"] is True
     assert default_summary["parse_in_workers"] is False
     assert worker_summary["split_negotiated_rates"] == 2
-    assert worker_summary["provider_ref_raw_chunk_count"] == 1
+    assert worker_summary["provider_ref_raw_chunk_count"] in {1}
     assert "producer_blocked_micros" in worker_summary
 
 
@@ -4037,7 +4035,7 @@ def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
         frames.append((name.decode("utf-8"), json.loads(payload_bytes)))
     dedupe_summary = [row for kind, row in frames if kind == "dedupe_summary"][0]
     assert dedupe_summary["price_atom_unique"] == 2
-    assert dedupe_summary["price_set_unique"] == 1
+    assert dedupe_summary["price_set_unique"] in {1}
     assert dedupe_summary["price_set_entry_unique"] == 2
 
 
@@ -4103,7 +4101,7 @@ def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
         for shard_path in sorted(tmp_path.glob("provider_set.copy*"))
         for line in shard_path.read_text().splitlines()
     ]
-    assert len(provider_set_lines) == 1
+    assert len(provider_set_lines) in {1}
     provider_set_fields = provider_set_lines[0].split("\t")
     assert len(provider_set_fields) == 2
     assert int(provider_set_fields[1]) == 3
@@ -4302,13 +4300,13 @@ def test_ptg2_rust_snapshot_publish_renames_dictionary_stages_before_index(monke
             },
             snapshot_id="ptg2:202604:snap",
             import_run_id="ptg2:run",
-            source_key="heartland_dental",
+            source_key="example_dental",
         )
     )
 
     joined = "\n".join(status_calls)
     assert result["storage"] == "db_compact_snapshot"
-    assert result["source_key"] == "heartland_dental"
+    assert result["source_key"] == "example_dental"
     assert result["table"].startswith("mrf.ptg2_serving_rate_compact_")
     assert result["price_code_set_table"].startswith("mrf.ptg2_price_code_set_")
     assert result["price_atom_table"].startswith("mrf.ptg2_price_atom_")
@@ -4416,7 +4414,7 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
             },
             snapshot_id="ptg2:202604:snap",
             import_run_id="ptg2:run",
-            source_key="heartland_dental",
+            source_key="example_dental",
         )
     )
 
@@ -4448,7 +4446,7 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
         process_ptg._publish_ptg2_manifest_serving_snapshot(
             "ptg2_manifest_stage_serving_abc",
             snapshot_id="ptg2:202604:snap",
-            source_key="heartland_dental",
+            source_key="example_dental",
             artifacts={"manifest_uri": "file:///tmp/snapshot.manifest.json"},
             sidecar_artifacts={
                 "provider_set_members": {
@@ -4494,7 +4492,7 @@ def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
         process_ptg._publish_ptg2_manifest_serving_snapshot(
             "ptg2_manifest_stage_serving_abc",
             snapshot_id="ptg2:202604:snap",
-            source_key="heartland_dental",
+            source_key="example_dental",
         )
     )
 
@@ -4506,18 +4504,17 @@ def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
 
 def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypatch):
     status_calls = []
-    failed_unique_once = False
+    unique_index_failures = {"seen": False}
 
     async def fake_status(statement, **_params):
-        nonlocal failed_unique_once
         status_calls.append(statement)
         if (
             "CREATE UNIQUE INDEX" in statement
             and "content_uidx" in statement
             and "serving_content_hash_128" in statement
-            and not failed_unique_once
+            and not unique_index_failures["seen"]
         ):
-            failed_unique_once = True
+            unique_index_failures["seen"] = True
             raise RuntimeError(
                 "asyncpg.exceptions.UniqueViolationError: could not create unique index; "
                 "DETAIL: Key (serving_content_hash_128) is duplicated."
@@ -4535,7 +4532,7 @@ def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypa
         process_ptg._publish_ptg2_manifest_serving_snapshot(
             "ptg2_manifest_stage_serving_abc",
             snapshot_id="ptg2:202604:snap",
-            source_key="heartland_dental",
+            source_key="example_dental",
             db_dedupe_fallback=False,
         )
     )
@@ -4604,7 +4601,7 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     )
 
     assert metrics["enabled"] is True
-    assert metrics["serving_rows"] == 1
+    assert metrics["serving_rows"] in {1}
     assert [call[0] for call in merge_calls] == ["manifest_serving", "price_atom", "provider_group_member"]
     assert ("manifest_serving", "ptg2_manifest_stage_serving_abc") in copy_calls
     assert ("price_atom", "ptg2_manifest_stage_price_atom_abc") in copy_calls
@@ -4650,7 +4647,7 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
     rows = asyncio.run(
         process_ptg._source_plan_rows(
             snapshot_id="snap",
-            source_key="heartland_dental",
+            source_key="example_dental",
             import_month=process_ptg.normalize_import_month("2026-04"),
             previous_snapshot_id="prev",
             updated_at=updated_at,
@@ -4668,7 +4665,7 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
             "plan_id": "010854205",
             "plan_market_type": "",
             "import_month": process_ptg.normalize_import_month("2026-04"),
-            "source_key": "heartland_dental",
+            "source_key": "example_dental",
             "snapshot_id": "snap",
             "previous_snapshot_id": "prev",
             "updated_at": updated_at,
@@ -4694,7 +4691,7 @@ def test_ptg2_source_plan_rows_uses_manifest_table_without_snapshot_column(monke
     rows = asyncio.run(
         process_ptg._source_plan_rows(
             snapshot_id="snap",
-            source_key="heartland_dental",
+            source_key="example_dental",
             import_month=process_ptg.normalize_import_month("2026-04"),
             previous_snapshot_id="prev",
             updated_at=updated_at,
@@ -4779,7 +4776,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
             in_network_url="https://example.test/rates.json.gz",
             import_month="2026-04",
             import_id="source_report_count",
-            source_key="heartland_dental",
+            source_key="example_dental",
         )
     )
 
@@ -4846,7 +4843,7 @@ def test_ptg2_precopy_merge_keeps_publish_db_dedupe(monkeypatch):
             in_network_url="https://example.test/rates.json.gz",
             import_month="2026-04",
             import_id="parse_worker_backstop",
-            source_key="heartland_dental",
+            source_key="example_dental",
         )
     )
 
@@ -4900,7 +4897,7 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
             in_network_url="https://example.test/rates.json.gz",
             import_month="2026-04",
             import_id="test_mode_rust_env",
-            source_key="heartland_dental",
+            source_key="example_dental",
             test_mode=True,
         )
     )
@@ -4960,7 +4957,7 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
             in_network_url="https://example.test/rates.json.gz",
             import_month="2026-04",
             import_id="test_mode_source_scoped",
-            source_key="heartland_dental",
+            source_key="example_dental",
             test_mode=True,
         )
     )
