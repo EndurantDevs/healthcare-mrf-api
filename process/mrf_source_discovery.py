@@ -1348,6 +1348,11 @@ _BENEFIT_LINE_ALIASES = {
     "health": "medical",
     "healthcare": "medical",
     "dental": "dental",
+    "pediatric_dental": "dental",
+    "paediatric_dental": "dental",
+    "child_dental": "dental",
+    "children_dental": "dental",
+    "children's_dental": "dental",
     "vision": "vision",
     "optical": "vision",
     "mixed": "mixed",
@@ -1394,7 +1399,7 @@ def _infer_benefit_lines_from_text(*values: Any) -> tuple[str, ...]:
     if re.search(r"\b(dental|dentist|orthodont|connection-dental)\b", text):
         lines.append("dental")
     if re.search(
-        r"\b(vision|optical|eyemed|vsp|spectera|davis-vision|superior-vision)\b",
+        r"\b(vision|optical|eyemed|vsp|nva|spectera|davis-vision|superior-vision|versant(?:-health)?)\b",
         text,
     ):
         lines.append("vision")

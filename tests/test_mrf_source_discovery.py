@@ -865,6 +865,21 @@ def test_parse_master_list_preserves_benefit_lines_for_dental_vision_source():
     assert candidate.aliases == ("Example DV",)
 
 
+def test_parse_master_list_normalizes_pediatric_dental_benefit_line():
+    markdown = """
+## Public regional sources
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Example Regional Plan | regional | https://example.test/json | public JSON directory; benefit lines: medical, pediatric dental; aliases: Example Regional |
+"""
+
+    [candidate] = discovery.parse_master_list(markdown)
+
+    assert candidate.payer_name == "Example Regional Plan"
+    assert candidate.benefit_lines == ("medical", "dental")
+    assert candidate.aliases == ("Example Regional",)
+
+
 def test_parse_master_list_preserves_coverage_evidence_metadata():
     markdown = """
 ## Public employer evidence
@@ -1772,6 +1787,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BRMS"].benefit_lines == ("medical", "dental")
     assert "Aetna Dental" in aliases_by_name["Aetna"]
     assert by_name["Aetna"].benefit_lines == ("medical", "dental")
+    assert by_name["AmeriHealth Caritas Next"].benefit_lines == (
+        "medical",
+        "dental",
+    )
     assert "The Standard AHL" in aliases_by_name["Allied Benefit Systems"]
     assert (
         "American Heritage Life Insurance Company"
@@ -1795,6 +1814,21 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Kansas City Life" in by_name["United Healthcare"].aliases
     assert "Kansas City Life Insurance Company" in by_name["United Healthcare"].aliases
     assert by_name["United Healthcare"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
+    assert by_name["UnitedHealthcare"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
+    assert by_name["Elevance Health"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
+    assert by_name["CareFirst BCBS"].benefit_lines == (
         "medical",
         "dental",
         "vision",
@@ -10640,6 +10674,53 @@ def test_toc_rows_infer_dental_benefit_line_from_file_name(monkeypatch):
 
     assert file_rows[0]["metadata_json"]["benefit_lines"] == ["dental"]
     assert file_rows[0]["metadata_json"]["benefit_line"] == "dental"
+
+
+@pytest.mark.parametrize(
+    ("file_label", "description"),
+    [
+        ("EXAMPLE-NVA-IN-NETWORK-RATES", "Example NVA rates"),
+        ("EXAMPLE-VERSANT-HEALTH-IN-NETWORK-RATES", "Example Versant Health rates"),
+    ],
+)
+def test_toc_rows_infer_vision_benefit_line_from_precise_vendor_tokens(
+    monkeypatch, file_label, description
+):
+    monkeypatch.setattr(
+        discovery,
+        "parse_toc_catalog_entries",
+        lambda *_args: [
+            types.SimpleNamespace(
+                source_type="in-network",
+                original_url=f"https://example.com/{file_label}.json.gz",
+                canonical_url=f"https://example.com/{file_label}.json.gz",
+                from_index_url="https://example.com/index.json",
+                description=description,
+                domain="example.com",
+                reporting_entity_name="Example Payer",
+                reporting_entity_type="third_party_administrator",
+                plan_info=(
+                    {
+                        "plan_id": "123",
+                        "plan_market_type": "group",
+                        "plan_name": "Plan A",
+                    },
+                ),
+            )
+        ],
+    )
+
+    _, file_rows = discovery._toc_rows_from_content(
+        {
+            "source_id": "source_1",
+            "metadata_json": {"benefit_lines": ["medical"]},
+        },
+        "https://example.com/index.json",
+        {},
+    )
+
+    assert file_rows[0]["metadata_json"]["benefit_lines"] == ["vision"]
+    assert file_rows[0]["metadata_json"]["benefit_line"] == "vision"
 
 
 def test_toc_rows_truncate_long_schema_version(monkeypatch):
