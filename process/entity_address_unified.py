@@ -2170,12 +2170,20 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
                 SELECT * FROM organization_row_sources
           ) AS row_sources
       GROUP BY source_id, run_id
+    ), eligible_completed_sources AS (
+        SELECT completed.*
+          FROM completed_sources AS completed
+         WHERE EXISTS (
+                SELECT 1
+                  FROM resource_row_sources AS row_source
+                 WHERE row_source.source_id = completed.source_id
+         )
     ), candidate_sources AS (
-        SELECT * FROM completed_sources
+        SELECT * FROM eligible_completed_sources
         UNION ALL
         SELECT resource_row_sources.*
           FROM resource_row_sources
-         WHERE NOT EXISTS (SELECT 1 FROM completed_sources)
+         WHERE NOT EXISTS (SELECT 1 FROM eligible_completed_sources)
     ), projected_sources AS (
         SELECT DISTINCT split_part(pd_rid.rid, ':', 3)::varchar AS source_id
           FROM {entity_address_ref} AS live

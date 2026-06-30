@@ -1219,7 +1219,9 @@ def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resou
     assert "JOIN location_eligible_source_runs AS eligible" in sql
     assert "eligible.source_id = loc.source_id" in sql
     assert "eligible.run_id = loc.last_seen_run_id" in sql
-    assert "WHERE NOT EXISTS (SELECT 1 FROM completed_sources)" in sql
+    assert "eligible_completed_sources AS" in sql
+    assert "row_source.source_id = completed.source_id" in sql
+    assert "WHERE NOT EXISTS (SELECT 1 FROM eligible_completed_sources)" in sql
     assert "projected_sources AS" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "unprojected_sources AS" in sql
