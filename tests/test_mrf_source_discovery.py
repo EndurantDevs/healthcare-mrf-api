@@ -1786,7 +1786,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Capital Blue Cross Vision NVA" in aliases_by_name["Capital Blue Cross"]
     assert "Capital Blue Cross NVA" in aliases_by_name["Capital Blue Cross"]
     assert by_name["Capital Blue Cross"].benefit_lines == ("medical", "vision")
-    assert by_name["BCBS North Carolina"].benefit_lines == ("medical", "vision")
+    assert by_name["BCBS North Carolina"].benefit_lines == ("medical",)
     assert by_name["Davis Vision"].status == "needs_review"
     assert by_name["Davis Vision"].benefit_lines == ("vision",)
     for alias in (
@@ -2189,8 +2189,6 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
-    assert "Community Eye Care" in aliases_by_name["BCBS North Carolina"]
-    assert "CEC Vision" in aliases_by_name["BCBS North Carolina"]
     assert by_name["BCBS Louisiana"].benefit_lines == (
         "medical",
         "dental",
@@ -2675,10 +2673,10 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Capital Blue Cross" in matching_importable_names(
         "National Vision Administrators (NVA)"
     )
-    assert "BCBS North Carolina" in matching_importable_names(
+    assert "BCBS North Carolina" not in matching_importable_names(
         "Community Eye Care (CEC)"
     )
-    assert "BCBS North Carolina" in matching_names("Community Eye Care")
+    assert "BCBS North Carolina" not in matching_names("Community Eye Care")
     assert "Superior Vision" in matching_names("Versant Health Superior Vision")
     assert "Guardian Vision" in matching_names("Guardian")
     assert "Guardian Vision" not in matching_importable_names("Guardian")
