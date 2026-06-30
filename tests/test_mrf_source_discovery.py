@@ -6090,7 +6090,7 @@ def test_highmark_hmhs_script_expands_current_month_index_urls():
     assert targets[1]["region"] == "Pennsylvania"
 
 
-def test_parse_uhc_blob_listing_extracts_index_targets_only():
+def test_parse_uhc_blob_listing_extracts_indexes_and_embedded_vision_direct_files():
     payload = {
         "blobs": [
             {
@@ -6103,14 +6103,25 @@ def test_parse_uhc_blob_listing_extracts_index_targets_only():
                 "downloadUrl": "https://mrfstore.example/public/body.json.gz?sig=abc",
                 "size": 9999,
             },
+            {
+                "name": "2026-06-01_UHC---Embedded-Vision_UHC-Vision_in-network-rates.json.gz",
+                "downloadUrl": "https://mrfstore.example/public/vision.json.gz?sig=abc",
+                "size": 7777,
+            },
         ]
     }
 
-    [target] = discovery._parse_uhc_blob_listing(payload)
+    targets = discovery._parse_uhc_blob_listing(payload)
 
-    assert target["label"] == "Abc Company"
-    assert target["size"] == 1234
-    assert target["url"].endswith("?sig=abc")
+    assert [target["size"] for target in targets] == [1234, 7777]
+    assert targets[0]["label"] == "Abc Company"
+    assert targets[0]["target_kind"] == "toc_json"
+    assert targets[0]["target_file_type"] == "table-of-contents"
+    assert targets[0]["url"].endswith("?sig=abc")
+    assert targets[1]["target_kind"] == "file_reference"
+    assert targets[1]["target_file_type"] == "in-network"
+    assert targets[1]["container_format"] == "gzip"
+    assert targets[1]["label"] == "UHC Vision"
 
 
 def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():

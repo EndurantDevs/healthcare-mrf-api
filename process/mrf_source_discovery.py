@@ -2955,14 +2955,35 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         name = str(blob.get("name") or "").strip()
         url = str(blob.get("downloadUrl") or "").strip()
-        if not name or not url or "_index.json" not in name.lower():
+        if not name or not url:
             continue
+        lower_name = name.lower()
+        direct_embedded_vision = (
+            "uhc---embedded-vision_uhc-vision" in lower_name
+            and _looks_direct_mrf_body_url(url)
+            and _mrf_file_type_from_text(url, name) == "in-network"
+        )
+        if "_index.json" not in lower_name and not direct_embedded_vision:
+            continue
+        target_kind = "file_reference" if direct_embedded_vision else "toc_json"
+        target_file_type = (
+            "in-network"
+            if direct_embedded_vision
+            else "table-of-contents"
+        )
         targets.append(
             {
                 "url": url,
-                "label": _label_from_index_name(name),
+                "label": (
+                    "UHC Vision"
+                    if direct_embedded_vision
+                    else _label_from_index_name(name)
+                ),
                 "name": name,
                 "size": _as_int(blob.get("size")),
+                "target_kind": target_kind,
+                "target_file_type": target_file_type,
+                "container_format": _container_format(url),
             }
         )
     return targets
@@ -10909,6 +10930,9 @@ async def _crawl_targets_for_source(
                             "resolver": resolver_type,
                             "blob_name": target.get("name"),
                             "blob_size": target.get("size"),
+                            "target_kind": target.get("target_kind"),
+                            "target_file_type": target.get("target_file_type"),
+                            "container_format": target.get("container_format"),
                         },
                     )
                 )
