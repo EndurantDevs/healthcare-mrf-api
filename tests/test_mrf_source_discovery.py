@@ -1087,10 +1087,24 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
     assert target.metadata["file_path"].endswith("2026-06-01_222_index.json.gz")
     plan_info = target.metadata["plan_info"]
     assert [plan["plan_name"] for plan in plan_info] == [
-        "Example Packaging HSA Aetna Choice POS II",
-        "Example Packaging Aetna Choice POS II",
+        "HSA Aetna Choice POS II",
+        "Aetna Choice POS II",
+    ]
+    assert [plan["plan_sponsor_name"] for plan in plan_info] == [
+        "Example Packaging",
+        "Example Packaging",
     ]
     assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
+
+
+def test_healthsparq_query_expansion_splits_concatenated_plan_label():
+    plan_name, sponsor_name = discovery._healthsparq_query_plan_label(
+        "Example Water Co. DBA Example PackagingHSA Aetna Choice POS II",
+        "Example Packaging",
+    )
+
+    assert plan_name == "HSA Aetna Choice POS II"
+    assert sponsor_name == "Example Packaging"
 
 
 def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync():

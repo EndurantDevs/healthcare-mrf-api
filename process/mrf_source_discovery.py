@@ -9984,22 +9984,51 @@ def _healthsparq_plan_engine_hash(
     )
 
 
-def _healthsparq_plan_info(file_item: dict[str, Any]) -> list[dict[str, Any]]:
+def _healthsparq_query_plan_label(
+    plan_name: Any, target_query: str | None
+) -> tuple[str | None, str | None]:
+    raw_name = _clean_text(plan_name)
+    query = _clean_text(target_query)
+    if not raw_name:
+        return None, None
+    if not query or not _search_values_match_query([raw_name], query):
+        return raw_name, None
+    tokens = _query_match_tokens(query)
+    if not tokens:
+        return raw_name, query
+    pattern = r".*?" + r"[^a-z0-9]*".join(re.escape(token) for token in tokens)
+    match = re.search(pattern, raw_name, flags=re.I)
+    if not match:
+        return raw_name, query
+    stripped = raw_name[match.end() :].strip(" \t\r\n-_:;|")
+    return (stripped or raw_name), query
+
+
+def _healthsparq_plan_info(
+    file_item: dict[str, Any], *, target_query: str | None = None
+) -> list[dict[str, Any]]:
     reporting_plans = [
         plan
         for plan in (file_item.get("reportingPlans") or [])
         if isinstance(plan, dict)
     ]
-    return [
-        {
+    items: list[dict[str, Any]] = []
+    for plan in reporting_plans:
+        plan_name, sponsor_name = _healthsparq_query_plan_label(
+            plan.get("planName"), target_query
+        )
+        item = {
             "plan_id": plan.get("planId"),
             "plan_id_type": plan.get("planIdType"),
             "plan_market_type": plan.get("planMarketType"),
-            "plan_name": plan.get("planName"),
+            "plan_name": plan_name,
             "engine_plan_hash": _healthsparq_plan_engine_hash(file_item, plan),
         }
-        for plan in reporting_plans
-    ]
+        if sponsor_name:
+            item["plan_sponsor_name"] = sponsor_name
+            item["company_name"] = sponsor_name
+        items.append(item)
+    return items
 
 
 def _healthsparq_file_matches_query(
@@ -10077,7 +10106,9 @@ def _healthsparq_targets_from_metadata(
             "file_path": file_item.get("filePath"),
             "file_schema": file_item.get("fileSchema"),
             "last_updated_on": file_item.get("lastUpdatedOn"),
-            "plan_info": _healthsparq_plan_info(file_item),
+            "plan_info": _healthsparq_plan_info(
+                file_item, target_query=target_query
+            ),
         }
         key = (target_kind, _canonical_or_none(file_url) or file_url)
         targets_by_key[key] = CrawlTarget(
