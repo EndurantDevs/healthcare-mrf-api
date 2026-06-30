@@ -1068,13 +1068,21 @@ async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
             job_deserializer=deserialize_job,
         )
         removed = int(await redis.zrem(queue, job_id) or 0)
-        deleted = int(await redis.delete(f"arq:job:{job_id}") or 0)
+        deleted = int(
+            await redis.delete(
+                f"arq:job:{job_id}",
+                f"arq:retry:{job_id}",
+                f"arq:result:{job_id}",
+            )
+            or 0
+        )
         return {
             "redis": True,
             "queue": queue,
             "job_id": job_id,
             "removed": removed > 0,
             "deleted_job_key": deleted > 0,
+            "deleted_keys": deleted,
         }
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return {"redis": False, "removed": False, "error": str(exc), "queue": queue, "job_id": job_id}

@@ -754,8 +754,12 @@ async def test_remove_queued_job_removes_arq_job(monkeypatch):
         "job_id": "job_1",
         "removed": True,
         "deleted_job_key": True,
+        "deleted_keys": 1,
     }
-    assert calls == [("zrem", ("arq:NPI", "job_1")), ("delete", ("arq:job:job_1",))]
+    assert calls == [
+        ("zrem", ("arq:NPI", "job_1")),
+        ("delete", ("arq:job:job_1", "arq:retry:job_1", "arq:result:job_1")),
+    ]
 
 
 def _load_import_run_migration():
