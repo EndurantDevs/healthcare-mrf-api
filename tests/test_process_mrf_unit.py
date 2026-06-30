@@ -1226,6 +1226,58 @@ async def test_push_objects_retries_deadlock_during_fallback_insert(monkeypatch)
     assert sleep_calls == [0.5]
 
 
+@pytest.mark.asyncio
+async def test_push_objects_retries_transient_closed_connection(monkeypatch):
+    status_attempts = []
+    sleep_calls = []
+
+    class _FakeStmt:
+        def __init__(self):
+            self.chunk = None
+            self.excluded = SimpleNamespace(value="excluded")
+
+        def values(self, chunk):
+            self.chunk = chunk
+            return self
+
+        def on_conflict_do_update(self, index_elements=None, set_=None):
+            self.index_elements = index_elements
+            self.set_dict = set_
+            return self
+
+        async def status(self):
+            status_attempts.append(len(self.chunk))
+            if len(status_attempts) == 1:
+                raise utils_module.SQLAlchemyError(
+                    "ConnectionDoesNotExistError: connection was closed in the middle of operation"
+                )
+
+    async def _sleep(delay):
+        sleep_calls.append(delay)
+
+    fake_columns = [
+        SimpleNamespace(name="id", primary_key=True),
+        SimpleNamespace(name="value", primary_key=False),
+    ]
+    fake_table = SimpleNamespace(schema="mrf", c=fake_columns)
+    fake_cls = SimpleNamespace(
+        __tablename__="transient_retry_table",
+        __table__=fake_table,
+        __my_initial_indexes__=[{"index_elements": ["id"]}],
+    )
+
+    monkeypatch.setattr(utils_module.db, "insert", lambda _table: _FakeStmt())
+    monkeypatch.setattr(utils_module.asyncio, "sleep", _sleep)
+    monkeypatch.setenv("HLTHPRT_DB_DEADLOCK_RETRIES", "2")
+
+    await utils_module.push_objects(
+        [{"id": 1, "value": "a"}], fake_cls, rewrite=True, use_copy=False
+    )
+
+    assert status_attempts == [1, 1]
+    assert sleep_calls == [0.5]
+
+
 def test_parallel_download_disabled_host_matching(monkeypatch):
     monkeypatch.setenv(
         "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",

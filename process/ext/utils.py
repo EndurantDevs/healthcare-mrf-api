@@ -882,6 +882,38 @@ async def push_objects(
             err_text = str(getattr(err, "orig", err)).lower()
             return "deadlock detected" in err_text or "deadlockdetected" in err_text
 
+        def _retryable_db_error_label(err: BaseException) -> str | None:
+            if _is_deadlock_error(err):
+                return "deadlock"
+
+            checked: list[BaseException] = []
+            pending = [err]
+            while pending:
+                current = pending.pop(0)
+                if current is None or any(current is seen for seen in checked):
+                    continue
+                checked.append(current)
+                pending.extend(
+                    candidate
+                    for candidate in (
+                        getattr(current, "orig", None),
+                        getattr(current, "__cause__", None),
+                        getattr(current, "__context__", None),
+                    )
+                    if candidate is not None
+                )
+
+            for current in checked:
+                current_type = type(current).__name__.lower()
+                current_text = str(current).lower()
+                if "connectiondoesnotexisterror" in current_type:
+                    return "transient connection"
+                if "connection was closed in the middle of operation" in current_text:
+                    return "transient connection"
+                if "connectiondoesnotexisterror" in current_text:
+                    return "transient connection"
+            return None
+
         async def _status_with_deadlock_retry(stmt):
             try:
                 max_retries = max(
@@ -894,12 +926,13 @@ async def push_objects(
                 try:
                     return await stmt.status()
                 except (SQLAlchemyError, InterfaceError, PostgresError) as err:
-                    if not _is_deadlock_error(err) or attempt >= max_retries:
+                    retry_label = _retryable_db_error_label(err)
+                    if retry_label is None or attempt >= max_retries:
                         raise
                     attempt += 1
                     delay = min(0.5 * (2 ** (attempt - 1)), 8.0)
                     print(
-                        f"deadlock retry {attempt}/{max_retries} for "
+                        f"{retry_label} retry {attempt}/{max_retries} for "
                         f"{cls.__tablename__}: {_short_error(err)}"
                     )
                     await asyncio.sleep(delay)
