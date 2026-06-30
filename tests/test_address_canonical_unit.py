@@ -1200,6 +1200,9 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
     assert "organization.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
     assert "organization.last_seen_run_id = 'run_123'" in sql
     assert "split_part(pd_rid.rid, ':', 3) = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "OR NOT EXISTS (" in sql
+    assert "FROM mrf.provider_directory_source AS source" in sql
+    assert "source.source_id = split_part(pd_rid.rid, ':', 3)" in sql
 
 
 def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resource_rows():

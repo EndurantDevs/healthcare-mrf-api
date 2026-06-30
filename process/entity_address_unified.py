@@ -2072,18 +2072,30 @@ def _provider_directory_scope_filter_sql(
 
 
 def _provider_directory_live_source_filter_sql(
+    db_schema: str,
     alias: str,
     *,
     source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     if not source_ids:
         return ""
+    selected_source_filter = (
+        f"split_part(pd_rid.rid, ':', 3) = ANY({_string_array_literal(list(source_ids))})"
+    )
     return f"""
        AND EXISTS (
             SELECT 1
               FROM unnest(COALESCE({alias}.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
              WHERE pd_rid.rid LIKE 'provider_directory_fhir:%'
-               AND split_part(pd_rid.rid, ':', 3) = ANY({_string_array_literal(list(source_ids))})
+               AND NULLIF(split_part(pd_rid.rid, ':', 3), '') IS NOT NULL
+               AND (
+                    {selected_source_filter}
+                    OR NOT EXISTS (
+                        SELECT 1
+                          FROM {db_schema}.provider_directory_source AS source
+                         WHERE source.source_id = split_part(pd_rid.rid, ':', 3)
+                    )
+               )
        )"""
 
 
@@ -3364,7 +3376,11 @@ def _prepare_provider_directory_partial_affected_groups_sql(
         _provider_directory_current_group_select_sql(source_select)
         for source_select in provider_selects
     )
-    live_source_filter = _provider_directory_live_source_filter_sql("live", source_ids=source_ids)
+    live_source_filter = _provider_directory_live_source_filter_sql(
+        db_schema,
+        "live",
+        source_ids=source_ids,
+    )
     return f"""
     CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
     SELECT DISTINCT
