@@ -934,6 +934,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "socrata_data_json_mrf_catalog"
     if host.endswith("sapphiremrfhub.com"):
         return "sapphire"
+    if host == "mrf.healthsparq.com" and path.endswith("/latest_metadata.json"):
+        return "healthsparq_direct_metadata"
     if (
         _looks_direct_toc_url(raw)
         and _mrf_file_type_from_text(raw) == "table-of-contents"
@@ -6306,6 +6308,46 @@ def _payercompass_download_url(
     return f"{download_url}?{urlencode({'Id': file_id})}"
 
 
+_PAYERCOMPASS_FILE_ID_KEYS = (
+    "id",
+    "fileId",
+    "fileID",
+    "file_id",
+    "downloadId",
+    "downloadID",
+    "download_id",
+    "guid",
+    "fileGuid",
+    "fileGUID",
+)
+_PAYERCOMPASS_FILE_NAME_KEYS = (
+    "name",
+    "fileName",
+    "filename",
+    "file_name",
+    "displayName",
+    "display_name",
+    "label",
+)
+_PAYERCOMPASS_FILE_SIZE_KEYS = (
+    "size",
+    "fileSize",
+    "file_size",
+    "sizeBytes",
+    "size_bytes",
+    "contentLength",
+    "content_length",
+)
+
+
+def _payercompass_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _payercompass_target_for_file(
     source: dict[str, Any],
     *,
@@ -6314,12 +6356,22 @@ def _payercompass_target_for_file(
     frame: dict[str, Any],
     file_item: dict[str, Any],
 ) -> CrawlTarget | None:
-    file_id = str(file_item.get("id") or frame.get("id") or "").strip()
+    file_id = str(
+        _payercompass_value(file_item, _PAYERCOMPASS_FILE_ID_KEYS)
+        or frame.get("id")
+        or ""
+    ).strip()
     if not file_id:
         return None
-    file_name = str(file_item.get("name") or frame.get("name") or file_id).strip()
+    file_name = str(
+        _payercompass_value(file_item, _PAYERCOMPASS_FILE_NAME_KEYS)
+        or frame.get("name")
+        or file_id
+    ).strip()
     file_type = _payercompass_file_type(frame, file_name)
-    size_bytes = _parse_size_bytes(file_item.get("size"))
+    size_bytes = _parse_size_bytes(
+        _payercompass_value(file_item, _PAYERCOMPASS_FILE_SIZE_KEYS)
+    )
     metadata = {
         "resolver": "payercompass_mrf",
         "target_kind": "file_reference",
@@ -6340,6 +6392,29 @@ def _payercompass_target_for_file(
             key: value for key, value in metadata.items() if value not in (None, "", [])
         },
     )
+
+
+def _payercompass_file_list_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    if _payercompass_value(payload, _PAYERCOMPASS_FILE_ID_KEYS):
+        return [payload]
+    for key in (
+        "files",
+        "fileList",
+        "file_list",
+        "items",
+        "data",
+        "results",
+        "result",
+        "value",
+    ):
+        items = _payercompass_file_list_items(payload.get(key))
+        if items:
+            return items
+    return []
 
 
 def _payercompass_as_list(value: Any) -> list[Any]:
@@ -6654,7 +6729,7 @@ async def _resolve_payercompass_mrf(
             max_bytes=max_bytes,
             session=session,
         )
-        file_lists[timeframe_id] = payload if isinstance(payload, list) else []
+        file_lists[timeframe_id] = _payercompass_file_list_items(payload)
     targets = _payercompass_targets_from_structure(
         source,
         base_url=url,
@@ -7959,6 +8034,8 @@ def _embedded_mrf_host_urls(value: str | None) -> list[str]:
         r"(?P<host>mrf\.healthgram\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>mrfsearch\.meritain\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>transparency-in-coverage\.uhc\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>(?:www\.)?health1\.[a-z0-9.-]+)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]+)?",
+        r"(?P<host>[a-z0-9.-]+\.healthsparq\.com)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]+)?",
         r"(?P<host>(?:www\.)?mymedicalshopper\.com)(?P<path>/(?:mrf-search|mrf)/[A-Za-z0-9_.~%/-]+)",
         r"(?P<host>www\.asrhealthbenefits\.com)(?P<path>/(?:mrf|MRF|umbraco/surface/mrfdownload|home/umbraco/surface/mrfdownload)[A-Za-z0-9_.~%/?=&-]*)",
     )
@@ -8684,9 +8761,18 @@ async def _resolve_html_mrf_with_healthcarebluebook(
                 if existing_nested_max
                 else max_targets
             )
-        nested_targets = await _resolve_healthcarebluebook_mrf(
-            nested_source, link_url, nested_resolver, session
-        )
+        try:
+            nested_targets = await _resolve_healthcarebluebook_mrf(
+                nested_source, link_url, nested_resolver, session
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logging.getLogger(__name__).debug(
+                "failed to resolve nested Healthcare Bluebook MRF %s from %s: %s",
+                link_url,
+                url,
+                exc,
+            )
+            nested_targets = []
         for nested_target in nested_targets:
             metadata = dict(nested_target.metadata or {})
             metadata.update(
@@ -10295,6 +10381,29 @@ def _healthsparq_direct_metadata_url(
     )
 
 
+def _healthsparq_metadata_params_from_url(url: str) -> dict[str, str]:
+    parsed = urlsplit(str(url or "").strip())
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    for index, part in enumerate(parts[:-3]):
+        if part != "prd" or parts[index + 1] != "mrf":
+            continue
+        insurer_code = parts[index + 2].strip()
+        brand_code = parts[index + 3].strip()
+        if insurer_code and brand_code:
+            params_by_key = {"insurerCode": insurer_code, "brandCode": brand_code}
+            params_by_key.update(
+                {
+                    key: value
+                    for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+                    if key and value
+                }
+            )
+            return params_by_key
+    raise ValueError(
+        "HealthSparq metadata URL must include /prd/mrf/{insurerCode}/{brandCode}/"
+    )
+
+
 def _healthsparq_target(
     source: dict[str, Any],
     metadata_url: str,
@@ -10495,6 +10604,34 @@ def _healthsparq_targets_from_metadata(
             metadata=metadata,
         )
     return list(targets_by_key.values())
+
+
+async def _resolve_healthsparq_direct_metadata(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    params = _healthsparq_metadata_params_from_url(url)
+    try:
+        payload = await _fetch_json(
+            url,
+            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            session=session,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return [_healthsparq_target(source, url, url, params)]
+    targets = _healthsparq_targets_from_metadata(
+        source,
+        url,
+        payload,
+        resolved_from_url=url,
+        params=params,
+    )
+    if targets:
+        max_targets = _as_int(resolver.get("max_targets"))
+        return targets[:max_targets] if max_targets else targets
+    return [_healthsparq_target(source, url, url, params)]
 
 
 async def _resolve_healthsparq_public_mrf(
@@ -10846,6 +10983,8 @@ async def _crawl_targets_for_source(
         return await _resolve_auxiant_wordpress_directory(
             source, url, resolver, session
         )
+    if resolver_type == "healthsparq_direct_metadata":
+        return await _resolve_healthsparq_direct_metadata(source, url, resolver, session)
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
     if resolver_type == "providence_mrf_api":
@@ -13097,7 +13236,6 @@ async def _promote_import_control_source(
                     (row.get("metadata_json") or {}).get("plan_names") or []
                 )
             ),
-            "raw": (row.get("metadata_json") or {}).get("raw") or {},
         },
     }
     async with session.post(f"{base}/v1/catalog/sources", json=payload) as resp:

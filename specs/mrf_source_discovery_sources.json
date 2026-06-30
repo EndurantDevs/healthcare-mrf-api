@@ -47,6 +47,10 @@
       "mrf_all_path": "/v2/mrf/all",
       "max_bytes": 134217728
     },
+    "healthsparq_direct_metadata": {
+      "type": "healthsparq_direct_metadata",
+      "max_bytes": 134217728
+    },
     "highmark_hmhs": {
       "type": "highmark_hmhs_script",
       "script_path": "/js/script.js",

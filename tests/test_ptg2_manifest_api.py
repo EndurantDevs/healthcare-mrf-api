@@ -110,7 +110,7 @@ def _write_manifest_snapshot(tmp_path):
         "plans": {
             "010854205": {
                 "plan_id": "010854205",
-                "plan_name": "Heartland",
+                "plan_name": "Example Plan",
             }
         },
         "procedures": {
@@ -169,7 +169,7 @@ def _write_manifest_snapshot_with_binary_sidecars(tmp_path):
         "version": 3,
         "artifact_type": "ptg2_manifest_snapshot",
         "snapshot_id": "snap-manifest-sidecars",
-        "plans": {"010854205": {"plan_name": "Heartland"}},
+        "plans": {"010854205": {"plan_name": "Example Plan"}},
         "procedures": {"CPT:70551": {"name": "MRI brain without contrast"}},
         "providers": {
             provider_id.hex(): {

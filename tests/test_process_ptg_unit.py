@@ -1418,9 +1418,9 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
             {
                 "reporting_plans": [
                     {
-                        "plan_name": "Heartland",
+                        "plan_name": "Example Plan",
                         "plan_id": "010854205",
-                        "plan_sponser_name": "Heartland Co",
+                        "plan_sponser_name": "Example Sponsor Co",
                         "plan_market_type": "group",
                     }
                 ],
@@ -1441,7 +1441,7 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
 
     assert len(in_network_entries) == 1
     assert in_network_entries[0].canonical_url == "https://cdn.test/rates.json.gz?foo=1"
-    assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Heartland Co"
+    assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Example Sponsor Co"
 
 
 def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
@@ -2209,7 +2209,7 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     state = process_ptg._compact_state(batch_rows=1)
     state["snapshot_id"] = "snap"
-    state["plan_fields"] = {"plan_id": "010854205", "plan_name": "Heartland"}
+    state["plan_fields"] = {"plan_id": "010854205", "plan_name": "Example Plan"}
     state["procedure_payloads"] = {
         "proc-a": {
             "billing_code_type": "CPT",
@@ -3138,11 +3138,11 @@ def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_pa
     rows = [
         {
             "plan_id": "010854205",
-            "plan_name": "Heartland",
+            "plan_name": "Example Plan",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
-            "issuer_name": "Heartland",
-            "plan_sponsor_name": "Heartland",
+            "issuer_name": "Example Sponsor",
+            "plan_sponsor_name": "Example Sponsor",
             "billing_code": "70551",
             "billing_code_type": "CPT",
             "procedure_name": "MRI brain",
@@ -3193,11 +3193,11 @@ def test_ptg2_compact_snapshot_artifact_keeps_source_file_version_id(monkeypatch
     rows = [
         {
             "plan_id": "010854205",
-            "plan_name": "Heartland",
+            "plan_name": "Example Plan",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
-            "issuer_name": "Heartland",
-            "plan_sponsor_name": "Heartland",
+            "issuer_name": "Example Sponsor",
+            "plan_sponsor_name": "Example Sponsor",
             "billing_code": "29888",
             "billing_code_type": "CPT",
             "procedure_name": "ACL reconstruction",
@@ -3507,7 +3507,8 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
     assert fields[2] == "plan"
     assert fields[6] == "99213"
     assert fields[8] == "1"
-    assert len(fields) == 11
+    assert fields[11] == "{}"
+    assert len(fields) == 12
 
     assert b"serving_rate_compact" not in completed.stdout
     assert b"compact_copy_file" in completed.stdout

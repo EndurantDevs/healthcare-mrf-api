@@ -780,7 +780,7 @@ def _db_serving_session():
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-db",
                         "plan_id": "010854205",
-                        "plan_name": "Heartland",
+                        "plan_name": "Example Plan",
                         "procedure_code": 123456,
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
@@ -1477,7 +1477,7 @@ async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload
 @pytest.mark.asyncio
 async def test_search_current_ptg2_index_combines_networks_for_multi_network_plan(monkeypatch):
     async def fake_ids(_session, _args):
-        # A Heartland-style plan served by two networks, each with its own snapshot.
+        # A sample plan served by two networks, each with its own snapshot.
         return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
 
     async def fake_one(_session, snapshot_id, _args, pagination):

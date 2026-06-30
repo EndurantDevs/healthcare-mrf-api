@@ -227,6 +227,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["payercompass_mrf"]["type"] == "payercompass_mrf"
     )
     assert (
+        config["platform_resolvers"]["healthsparq_direct_metadata"]["type"]
+        == "healthsparq_direct_metadata"
+    )
+    assert (
         config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"]
         == "cigna_static_mrf_lookup"
     )
@@ -493,6 +497,13 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "machine-readable-transparency-in-coverage"
         )
         == "healthsparq"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/"
+            "EXAMPLE_I/EXAMPLE/latest_metadata.json"
+        )
+        == "healthsparq_direct_metadata"
     )
     for url in (
         "https://www.deancare.com/helpful-links/transparency-in-coverage",
@@ -4818,6 +4829,46 @@ async def test_html_healthcarebluebook_resolver_passes_max_targets_to_nested(
 
 
 @pytest.mark.asyncio
+async def test_html_bluebook_direct_nested_error(
+    monkeypatch,
+):
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Admin",
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://example-admin.test/mrfs/"
+        return """
+          <a href="https://cdn.example.test/2026-06-01_example_index.json">Index</a>
+          <a href="https://mrf.healthcarebluebook.com/ExampleAdmin">Delegated</a>
+        """
+
+    async def fake_resolve_healthcarebluebook_mrf(*_args, **_kwargs):
+        raise ValueError("nested source unavailable")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_resolve_healthcarebluebook_mrf",
+        fake_resolve_healthcarebluebook_mrf,
+    )
+
+    resolved_targets = await discovery._resolve_html_mrf_with_healthcarebluebook(
+        source_dict,
+        "https://example-admin.test/mrfs/",
+        {"type": "html_mrf_with_healthcarebluebook"},
+        None,
+    )
+
+    assert [crawl_target.url for crawl_target in resolved_targets] == [
+        "https://cdn.example.test/2026-06-01_example_index.json"
+    ]
+    assert resolved_targets[0].metadata["target_file_type"] == "table-of-contents"
+
+
+@pytest.mark.asyncio
 async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeypatch):
     source = {
         "source_id": "source_vhp",
@@ -6706,6 +6757,89 @@ async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hs_metadata_expands_files(monkeypatch):
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Health",
+    }
+    metadata_url = (
+        "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/"
+        "EXAMPLE_I/EXAMPLE/latest_metadata.json"
+    )
+
+    async def fake_fetch_json(url, *, max_bytes, session):
+        assert url == metadata_url
+        assert max_bytes == 2048
+        assert session == "session"
+        return {
+            "files": [
+                {
+                    "reportingEntityName": "Example Health",
+                    "reportingEntityType": "Health Insurance Issuer",
+                    "reportingPlans": [
+                        {
+                            "planName": "Example PPO",
+                            "planIdType": "ein",
+                            "planId": "123456789",
+                            "planMarketType": "group",
+                        }
+                    ],
+                    "lastUpdatedOn": "2026-07-01",
+                    "fileSchema": "IN_NETWORK_RATES",
+                    "fileName": "rates.json.gz",
+                    "filePath": "2026-07-01/inNetworkRates/rates.json.gz",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    resolved_targets = await discovery._resolve_healthsparq_direct_metadata(
+        source_dict,
+        metadata_url,
+        {"type": "healthsparq_direct_metadata", "max_bytes": 2048},
+        "session",
+    )
+
+    assert [crawl_target.url for crawl_target in resolved_targets] == [
+        "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/"
+        "EXAMPLE_I/EXAMPLE/2026-07-01/inNetworkRates/rates.json.gz"
+    ]
+    assert resolved_targets[0].metadata["target_file_type"] == "in-network"
+    assert resolved_targets[0].metadata["insurer_code"] == "EXAMPLE_I"
+    assert resolved_targets[0].metadata["brand_code"] == "EXAMPLE"
+    assert resolved_targets[0].metadata["plan_info"][0]["plan_name"] == "Example PPO"
+
+
+@pytest.mark.asyncio
+async def test_hs_metadata_fallback_toc(
+    monkeypatch,
+):
+    source_dict = {"source_id": "source_1", "display_name": "Example Health"}
+    metadata_url = (
+        "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/"
+        "EXAMPLE_I/EXAMPLE/latest_metadata.json"
+    )
+
+    async def fake_fetch_json(*_args, **_kwargs):
+        raise ValueError("not available during discovery")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    resolved_targets = await discovery._resolve_healthsparq_direct_metadata(
+        source_dict,
+        metadata_url,
+        {"type": "healthsparq_direct_metadata"},
+        None,
+    )
+
+    assert [crawl_target.url for crawl_target in resolved_targets] == [metadata_url]
+    assert resolved_targets[0].metadata["target_kind"] == "toc_json"
+    assert resolved_targets[0].metadata["target_file_type"] == "table-of-contents"
+
+
+@pytest.mark.asyncio
 async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypatch):
     source = {
         "source_id": "source_1",
@@ -7176,6 +7310,7 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
                     "vendor_names": ["Example Virtual Health"],
                     "network_names": ["Example National PPO"],
                     "plan_names": ["Example Guided Health Plan"],
+                    "raw": {"target_payer_query": "Example Packaging"},
                 },
             }
         ]
@@ -7204,6 +7339,7 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
     assert source_payloads[-1]["metadata"]["plan_names"] == [
         "Example Guided Health Plan"
     ]
+    assert "raw" not in source_payloads[-1]["metadata"]
 
 
 @pytest.mark.asyncio
@@ -9450,6 +9586,8 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
     <a href="https://bcbsil.com/asomrf?EIN=300088171">BCBS ASO</a>
     <p>MRF Hub: alliedbenefit.sapphiremrfhub.com.</p>
     <p>Delegated TPA: mrf.healthcarebluebook.com/Lucent.</p>
+    <p>Health1 source: health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE_I&amp;brandCode=EXAMPLE/machine-readable-transparency-in-coverage.</p>
+    <p>HealthSparq metadata: mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/EXAMPLE_I/EXAMPLE/latest_metadata.json.</p>
     <p>TALON search: www.mymedicalshopper.com/mrf-search/varipro.</p>
     <p>TALON employer: www.mymedicalshopper.com/mrf/example-varipro-77100.</p>
     <p>ASR groups: www.asrhealthbenefits.com/MRF.</p>
@@ -9466,6 +9604,8 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
         "https://bcbsil.com/asomrf?EIN=300088171",
         "https://alliedbenefit.sapphiremrfhub.com/",
         "https://mrf.healthcarebluebook.com/Lucent",
+        "https://health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE_I&brandCode=EXAMPLE/machine-readable-transparency-in-coverage",
+        "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/EXAMPLE_I/EXAMPLE/latest_metadata.json",
         "https://www.mymedicalshopper.com/mrf-search/varipro",
         "https://www.mymedicalshopper.com/mrf/example-varipro-77100",
         "https://www.asrhealthbenefits.com/MRF",
@@ -10506,6 +10646,121 @@ def test_payercompass_targets_from_structure_use_file_list_download_ids():
         .metadata["payercompass_file_name"]
         .endswith("in-network-rates.json.zip")
     )
+
+
+def test_pc_file_list_wrappers():
+    assert discovery._payercompass_file_list_items(
+        {"files": [{"fileId": "file-1", "fileName": "rates.json.gz"}]}
+    ) == [{"fileId": "file-1", "fileName": "rates.json.gz"}]
+    assert discovery._payercompass_file_list_items(
+        {"data": [{"id": "file-2", "name": "allowed.zip"}]}
+    ) == [{"id": "file-2", "name": "allowed.zip"}]
+    assert discovery._payercompass_file_list_items(
+        {"result": {"items": [{"downloadId": "file-3", "label": "index.zip"}]}}
+    ) == [{"downloadId": "file-3", "label": "index.zip"}]
+
+
+def test_pc_file_key_aliases():
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "PayerCompass Plan",
+    }
+    resolver_dict = {"type": "payercompass_mrf", "download_path": "/api/File/Download"}
+    structure_dict = {
+        "mrfConfig": {
+            "timeFrames": [
+                {
+                    "id": "2026-06-01_1",
+                    "name": "June 01, 2026",
+                    "fileCount": 1,
+                    "fileType": 1,
+                }
+            ]
+        }
+    }
+
+    [crawl_target] = discovery._payercompass_targets_from_structure(
+        source_dict,
+        base_url="https://example.mrf.payercompass.com/",
+        resolver=resolver_dict,
+        structure=structure_dict,
+        file_lists={
+            "2026-06-01_1": [
+                {
+                    "fileId": "alternate-file-id",
+                    "fileName": "2026-06-01_example_in-network-rates.json.gz",
+                    "sizeBytes": 12345,
+                }
+            ]
+        },
+    )
+
+    assert (
+        crawl_target.url
+        == "https://example.mrf.payercompass.com/api/File/Download?Id=alternate-file-id"
+    )
+    assert crawl_target.metadata["payercompass_file_name"].endswith(
+        "in-network-rates.json.gz"
+    )
+    assert crawl_target.metadata["size_bytes"] == 12345
+
+
+@pytest.mark.asyncio
+async def test_pc_resolver_file_list_wrapper(
+    monkeypatch,
+):
+    source_dict = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "PayerCompass Plan",
+    }
+    resolver_dict = {"type": "payercompass_mrf", "download_path": "/api/File/Download"}
+    structure_dict = {
+        "mrfConfig": {
+            "timeFrames": [
+                {
+                    "id": "2026-06-01_1",
+                    "name": "June 01, 2026",
+                    "fileCount": 1,
+                    "fileType": 1,
+                }
+            ]
+        }
+    }
+
+    async def fake_post_json(url, payload, **_kwargs):
+        assert url == "https://example.mrf.payercompass.com/api/Home/GetStructureInfo"
+        assert payload == {}
+        return structure_dict
+
+    async def fake_post_json_value(url, payload, **_kwargs):
+        assert url == "https://example.mrf.payercompass.com/api/File/List"
+        assert payload == {"timeFrameId": "2026-06-01_1"}
+        return {
+            "files": [
+                {
+                    "fileId": "wrapped-file",
+                    "fileName": "2026-06-01_example_in-network-rates.json.gz",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_post_json", fake_post_json)
+    monkeypatch.setattr(discovery, "_post_json_value", fake_post_json_value)
+
+    [crawl_target] = await discovery._resolve_payercompass_mrf(
+        source_dict,
+        "https://example.mrf.payercompass.com/",
+        resolver_dict,
+        None,
+    )
+
+    assert (
+        crawl_target.url
+        == "https://example.mrf.payercompass.com/api/File/Download?Id=wrapped-file"
+    )
+    assert crawl_target.metadata["target_file_type"] == "in-network"
 
 
 @pytest.mark.asyncio
