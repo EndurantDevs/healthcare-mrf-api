@@ -1352,7 +1352,7 @@ def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
 
 def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
     assert discovery._search_values_match_query(
-        ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
+        ["Example Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
     assert discovery._search_values_match_query(
