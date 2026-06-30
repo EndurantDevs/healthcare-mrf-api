@@ -2270,6 +2270,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Independence Blue Cross (QCC Ins. Co.)"
         in by_name["Independence Blue Cross"].aliases
     )
+    assert by_name["Independence Blue Cross"].benefit_lines == ("medical", "vision")
     assert "Medica Insurance Company" in by_name["Medica"].aliases
     assert "UTAH REGENCE BLUE CROSS BLUE SHIELD" in by_name["Regence"].aliases
     assert "First Choice Health Network" in aliases_by_name["First Choice Health"]
