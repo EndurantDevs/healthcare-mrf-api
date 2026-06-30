@@ -3471,10 +3471,14 @@ def _copy_unaffected_live_entity_rows_sql(
     live_table: str,
     stage_table: str,
     affected_group_table: str,
+    replacement_lookup_table: str | None = None,
+    on_conflict: bool = True,
 ) -> str:
     columns = _entity_address_column_names()
     column_list = ", ".join(columns)
     select_list = ", ".join(f"live.{column}" for column in columns)
+    replacement_lookup_table = replacement_lookup_table or stage_table
+    on_conflict_sql = "ON CONFLICT (location_key) DO NOTHING" if on_conflict else ""
     return f"""
     INSERT INTO {db_schema}.{stage_table} ({column_list})
     SELECT {select_list}
@@ -3495,10 +3499,42 @@ def _copy_unaffected_live_entity_rows_sql(
        )
        AND NOT EXISTS (
             SELECT 1
-              FROM {db_schema}.{stage_table} AS replacement
+              FROM {db_schema}.{replacement_lookup_table} AS replacement
              WHERE replacement.location_key = live.location_key
        )
-    ON CONFLICT (location_key) DO NOTHING;
+    {on_conflict_sql};
+    """
+
+
+def _provider_directory_replacement_stage_table_name(stage_table: str) -> str:
+    return _archived_identifier(stage_table, "_pd_replacement")
+
+
+def _create_provider_directory_replacement_stage_sql(
+    db_schema: str,
+    *,
+    replacement_stage_table: str,
+    stage_table: str,
+) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{replacement_stage_table}
+    (LIKE {db_schema}.{stage_table} INCLUDING DEFAULTS);
+    """
+
+
+def _copy_stage_entity_rows_sql(
+    db_schema: str,
+    *,
+    source_stage_table: str,
+    target_stage_table: str,
+) -> str:
+    columns = _entity_address_column_names()
+    column_list = ", ".join(columns)
+    select_list = ", ".join(f"stage.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{target_stage_table} ({column_list})
+    SELECT {select_list}
+      FROM {db_schema}.{source_stage_table} AS stage;
     """
 
 
@@ -10225,12 +10261,45 @@ async def process_data(ctx, task=None):
                 "the live entity_address_unified table to exist."
             )
         await _ensure_entity_address_unified_live_columns(db_schema)
+        replacement_stage_table = _provider_directory_replacement_stage_table_name(stage_table)
+        context["partial_provider_directory_replacement_stage_table"] = replacement_stage_table
+        await _run_sql_phase(
+            f"DROP TABLE IF EXISTS {db_schema}.{replacement_stage_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing Provider Directory replacement heap",
+            unit="tables",
+            done=0,
+            total=1,
+            pct=90,
+            message="dropping stale Provider Directory replacement heap",
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            _create_provider_directory_replacement_stage_sql(
+                db_schema,
+                replacement_stage_table=replacement_stage_table,
+                stage_table=stage_table,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing Provider Directory replacement heap",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=90,
+            message="creating Provider Directory replacement heap",
+            emit_done=True,
+        )
+        await db.status(_disable_autovacuum_sql(db_schema, replacement_stage_table))
         copied_rows = await _run_sql_phase(
             _copy_unaffected_live_entity_rows_sql(
                 db_schema,
                 live_table=EntityAddressUnified.__main_table__,
-                stage_table=stage_table,
+                stage_table=replacement_stage_table,
                 affected_group_table=affected_group_table,
+                replacement_lookup_table=stage_table,
+                on_conflict=False,
             ),
             context=context,
             run_id=run_id,
@@ -10244,6 +10313,51 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         context["partial_provider_directory_unaffected_live_rows_copied"] = int(copied_rows or 0)
+        affected_stage_rows = await _run_sql_phase(
+            _copy_stage_entity_rows_sql(
+                db_schema,
+                source_stage_table=stage_table,
+                target_stage_table=replacement_stage_table,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified copying affected stage rows",
+            unit="rows",
+            done=0,
+            total=1,
+            pct=90,
+            message="copying affected Provider Directory rows into replacement stage",
+            emit_start=True,
+            emit_done=True,
+        )
+        context["partial_provider_directory_affected_stage_rows_copied"] = int(
+            affected_stage_rows or 0
+        )
+        await _run_sql_phase(
+            f"DROP TABLE {db_schema}.{stage_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified swapping Provider Directory replacement stage",
+            unit="tables",
+            done=0,
+            total=1,
+            pct=90,
+            message="dropping affected-only stage",
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified swapping Provider Directory replacement stage",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=90,
+            message="promoting Provider Directory replacement stage",
+            emit_done=True,
+        )
+        await _ensure_stage_primary_key(stage_cls, db_schema, context=context)
         await _run_sql_phase(
             f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};",
             context=context,
@@ -10441,6 +10555,9 @@ async def shutdown(ctx):
                 ),
                 "partial_provider_directory_unaffected_live_rows_copied": int(
                     context.get("partial_provider_directory_unaffected_live_rows_copied") or 0
+                ),
+                "partial_provider_directory_affected_stage_rows_copied": int(
+                    context.get("partial_provider_directory_affected_stage_rows_copied") or 0
                 ),
                 "npi_rows": int(context.get("npi_rows") or 0),
                 "inferred_rows": int(context.get("inferred_rows") or 0),
@@ -10652,6 +10769,9 @@ async def shutdown(ctx):
             ),
             "partial_provider_directory_unaffected_live_rows_copied": int(
                 context.get("partial_provider_directory_unaffected_live_rows_copied") or 0
+            ),
+            "partial_provider_directory_affected_stage_rows_copied": int(
+                context.get("partial_provider_directory_affected_stage_rows_copied") or 0
             ),
             "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
             "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),

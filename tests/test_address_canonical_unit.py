@@ -2544,6 +2544,39 @@ def test_entity_address_unified_provider_directory_replacement_copies_unaffected
     assert "DELETE FROM mrf.entity_address_unified" not in sql
 
 
+def test_entity_address_unified_provider_directory_replacement_can_copy_into_heap():
+    heap_name = entity_address_unified._provider_directory_replacement_stage_table_name(  # pylint: disable=protected-access
+        "entity_address_unified_20260614"
+    )
+    create_sql = entity_address_unified._create_provider_directory_replacement_stage_sql(  # pylint: disable=protected-access
+        "mrf",
+        replacement_stage_table=heap_name,
+        stage_table="entity_address_unified_20260614",
+    )
+    copy_live_sql = entity_address_unified._copy_unaffected_live_entity_rows_sql(  # pylint: disable=protected-access
+        "mrf",
+        live_table="entity_address_unified",
+        stage_table=heap_name,
+        affected_group_table="entity_address_unified_20260614_pd_groups",
+        replacement_lookup_table="entity_address_unified_20260614",
+        on_conflict=False,
+    )
+    copy_stage_sql = entity_address_unified._copy_stage_entity_rows_sql(  # pylint: disable=protected-access
+        "mrf",
+        source_stage_table="entity_address_unified_20260614",
+        target_stage_table=heap_name,
+    )
+
+    assert heap_name.endswith("_pd_replacement")
+    assert f"CREATE UNLOGGED TABLE mrf.{heap_name}" in create_sql
+    assert "(LIKE mrf.entity_address_unified_20260614 INCLUDING DEFAULTS)" in create_sql
+    assert f"INSERT INTO mrf.{heap_name}" in copy_live_sql
+    assert "FROM mrf.entity_address_unified_20260614 AS replacement" in copy_live_sql
+    assert "ON CONFLICT" not in copy_live_sql
+    assert f"INSERT INTO mrf.{heap_name}" in copy_stage_sql
+    assert "FROM mrf.entity_address_unified_20260614 AS stage" in copy_stage_sql
+
+
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
     monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true")
     stage_classes = entity_address_unified._support_stage_classes("20260614")
