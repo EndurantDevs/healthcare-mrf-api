@@ -2544,25 +2544,20 @@ def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids()
     assert "ROW_NUMBER() OVER ())::bigint AS evidence_id" in sql_blob
 
 
-def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affected_rows():
-    statements = entity_address_unified._partial_main_patch_sql(
-        "mrf",
-        live_table="entity_address_unified",
-        stage_table="entity_address_unified_20260614",
-        affected_group_table="entity_address_unified_20260614_ptg_groups",
-    )
-    sql_blob = "\n".join(statement for _, statement in statements)
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_rejects_live_main_patch_publish(monkeypatch):
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    ctx = {
+        "import_date": "20260614",
+        "context": {
+            "run": 1,
+            "refresh_mode": "full",
+            "partial_main_patch_publish": True,
+        },
+    }
 
-    assert "DELETE FROM mrf.entity_address_unified AS live" in sql_blob
-    assert "FROM mrf.entity_address_unified_20260614_ptg_groups AS affected" in sql_blob
-    assert "FROM mrf.entity_address_unified_20260614 AS replacement" in sql_blob
-    assert "replacement.location_key = live.location_key" in sql_blob
-    assert "INSERT INTO mrf.entity_address_unified" in sql_blob
-    assert "SELECT DISTINCT ON (entity_type, entity_id, type, checksum) *" in sql_blob
-    assert "FROM mrf.entity_address_unified_20260614" in sql_blob
-    assert "ON CONFLICT (entity_type, entity_id, type, checksum) DO UPDATE" in sql_blob
-    assert "location_key = EXCLUDED.location_key" in sql_blob
-    assert "checksum = EXCLUDED.checksum" not in sql_blob
+    with pytest.raises(RuntimeError, match="live main-table patch publishing is disabled"):
+        await entity_address_unified.shutdown(ctx)
 
 
 def test_entity_address_unified_provider_directory_replacement_copies_unaffected_live_rows():
@@ -2676,15 +2671,14 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag_name", ["partial_main_patch_publish", "partial_support_patch_publish"])
-async def test_provider_directory_shutdown_rejects_live_delete_patch_flags(monkeypatch, flag_name):
+async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeypatch):
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
     ctx = {
         "import_date": "20260614",
         "context": {
             "run": 1,
             "refresh_mode": "provider-directory-partial",
-            flag_name: True,
+            "partial_support_patch_publish": True,
         },
     }
 
