@@ -601,6 +601,102 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
 
 
 @pytest.mark.asyncio
+async def test_get_all_unified_normal_lookup_can_include_provider_directory_source_summary(monkeypatch):
+    class MappedRow:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+    class ProviderDirectoryMappedConnection:
+        async def all(self, sql, **_params):
+            sql_text = str(sql)
+            if "page_npis AS" in sql_text:
+                return [
+                    MappedRow(
+                        {
+                            "npi_code": 1033213624,
+                            "npi": 1033213624,
+                            "entity_type_code": 2,
+                            "provider_organization_name": "MARY S HARPER GERIATRIC PSY CTR",
+                            "type": "practice",
+                            "first_line": "115 Harper Ct",
+                            "city_name": "Tuscaloosa",
+                            "state_name": "AL",
+                            "postal_code": "35401",
+                            "country_code": "US",
+                            "telephone_number": "+12053663010",
+                            "phone_number": "2053663010",
+                            "address_key": "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
+                            "address_sources": ["provider_directory_fhir"],
+                            "source_record_ids": [
+                                "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
+                            ],
+                            "source_count": 1,
+                        }
+                    )
+                ]
+            return []
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_column_keys() | {
+                "address_precision",
+                "location_key",
+                "source_count",
+                "updated_at",
+                "zip5",
+                "phone_number",
+                "source_record_ids",
+            }
+        return set()
+
+    async def fake_provider_enrichment_summary(*_args, **_kwargs):
+        return {}
+
+    async def fake_source_detail_map(source_ids, **_kwargs):
+        assert source_ids == ["pdfhir_alohr"]
+        return {
+            "pdfhir_alohr": {
+                "source": "provider_directory_fhir",
+                "source_id": "pdfhir_alohr",
+                "org_name": "Blue Cross and Blue Shield of Alabama",
+                "plan_name": "Provider Directory",
+            }
+        }
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
+    monkeypatch.setattr(npi_module, "_fetch_provider_directory_source_detail_map", fake_source_detail_map)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(ProviderDirectoryMappedConnection()))
+
+    request = types.SimpleNamespace(
+        args={
+            "name_like": "harper",
+            "include_sources": "true",
+            "limit": "5",
+            "start": "0",
+            "include_total": "0",
+        }
+    )
+    resp = await get_all(request)
+    row = json.loads(resp.body)["rows"][0]
+
+    assert row["provider_directory_sources"] == [
+        {
+            "source": "provider_directory_fhir",
+            "source_id": "pdfhir_alohr",
+            "org_name": "Blue Cross and Blue Shield of Alabama",
+            "plan_name": "Provider Directory",
+        }
+    ]
+    assert "source_record_ids" not in row
+
+
+@pytest.mark.asyncio
 async def test_get_all_rejects_invalid_npi_filter(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
