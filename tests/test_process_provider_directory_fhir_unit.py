@@ -3327,7 +3327,19 @@ def test_resource_start_url_resolves_relative_endpoint_and_adds_count():
         page_count=250,
     )
 
-    assert url == "https://example.test/fhir/base/Location?address-state=CA&_count=100"
+    assert url == "https://example.test/fhir/base/Location?address-state=CA&_count=250"
+
+
+def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_PAGE_COUNT", "500")
+
+    url = importer._resource_start_url(  # pylint: disable=protected-access
+        {"api_base": "https://example.test/fhir"},
+        "HealthcareService",
+        page_count=1000,
+    )
+
+    assert url == "https://example.test/fhir/HealthcareService?_count=500"
 
 
 def test_resource_start_url_ignores_catalog_annotation_endpoint():

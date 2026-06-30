@@ -611,7 +611,7 @@ catalog, include the upstream `provider-directory-db` retest snapshot
 supplement, include credentialed/auth-required sources when credentials are
 configured, run a full resource refresh (`resource_limit=0`,
 `linked_resource_limit=50000`, `linked_resource_deadline_seconds=1800`,
-`page_limit=0`, `page_count=100`, `stream_batch_size=5000`,
+`page_limit=0`, `page_count=1000`, `stream_batch_size=5000`,
 `bulk_export=true`, `source_concurrency=4`,
 `publish_artifacts=true`, `publish_corroboration=false`), and delete stale rows
 only for completed source/resource scans.

@@ -59,6 +59,7 @@ DEFAULT_SEED_DB_URL = (
 LOGGER = logging.getLogger(__name__)
 MAX_FHIR_JSON_BODY_BYTES = 20 * 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
+DEFAULT_MAX_PAGE_COUNT = 1000
 DEFAULT_RESOURCES = (
     "InsurancePlan",
     "PractitionerRole",
@@ -555,11 +556,25 @@ def _is_placeholder_url(value: str | None) -> bool:
     )
 
 
+def _max_page_count() -> int:
+    raw = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_PAGE_COUNT")
+    if raw is None:
+        return DEFAULT_MAX_PAGE_COUNT
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PAGE_COUNT
+
+
+def _bounded_page_count(page_count: int) -> int:
+    return max(1, min(int(page_count or 1), _max_page_count()))
+
+
 def _url_with_count(url: str, page_count: int) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     if not any(key == "_count" for key, _value in query_items):
-        query_items.append(("_count", str(max(1, min(page_count, 100)))))
+        query_items.append(("_count", str(_bounded_page_count(page_count))))
     query = urllib.parse.urlencode(query_items, doseq=True)
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
 
@@ -667,7 +682,7 @@ def _scan_practitioner_role_reverse_lookup_url(
         f"{api_base}/PractitionerRole",
         {
             search_param: reference,
-            "_count": str(max(1, min(page_count, 100))),
+            "_count": str(_bounded_page_count(page_count)),
         },
     )
 
