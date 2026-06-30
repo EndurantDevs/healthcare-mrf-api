@@ -42,7 +42,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
       - name: Compile service modules
-        run: python -m compileall api process db scripts
+        run: python -m compileall api process db scripts main.py
+      - name: Readability budget
+        run: python scripts/readability_budget.py
       - name: Guard request-time external calls
         run: python scripts/ci/request_time_external_call_guard.py
       - name: Run control-plane unit tests

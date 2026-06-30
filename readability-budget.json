@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "source_roots": [
+    "main.py",
+    "api",
+    "db",
+    "process",
+    "scripts",
+    "support",
+    "tests"
+  ],
+  "include_suffixes": [
+    ".py",
+    ".rs"
+  ],
+  "exclude_globs": [
+    ".git/**",
+    ".venv/**",
+    "venv/**",
+    "venv314/**",
+    ".pytest_cache/**",
+    ".mypy_cache/**",
+    ".ruff_cache/**",
+    ".tox/**",
+    ".nox/**",
+    "**/__pycache__/**",
+    "build/**",
+    "dist/**",
+    "htmlcov/**",
+    "target/**",
+    "support/ptg2_scanner/target/**",
+    "data/**",
+    "logs/**",
+    "restore/**",
+    "service/**",
+    "reports/**",
+    "alembic/versions/**"
+  ],
+  "thresholds": {
+    "max_file_lines": 500,
+    "max_function_lines": 60,
+    "max_nesting_depth": 4
+  },
+  "inline_suppression_patterns": [
+    {
+      "name": "python_noqa",
+      "pattern": "#\\s*noqa\\b"
+    },
+    {
+      "name": "python_type_ignore",
+      "pattern": "#\\s*type:\\s*ignore\\b"
+    },
+    {
+      "name": "python_pylint_disable",
+      "pattern": "#\\s*pylint:\\s*disable\\b"
+    },
+    {
+      "name": "javascript_eslint_disable",
+      "pattern": "eslint-disable"
+    },
+    {
+      "name": "typescript_ts_ignore",
+      "pattern": "@ts-ignore"
+    },
+    {
+      "name": "typescript_ts_expect_error",
+      "pattern": "@ts-expect-error"
+    },
+    {
+      "name": "rust_allow",
+      "pattern": "#\\[allow\\("
+    }
+  ]
+}

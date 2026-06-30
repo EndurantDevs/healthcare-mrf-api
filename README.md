@@ -54,6 +54,10 @@ This repository resolves and processes data from public source websites, includi
 
 See the full source catalog in [docs/data-sources.md](./docs/data-sources.md).
 
+Readability and ownership rules live in `docs/architecture.md` and
+`docs/readability.md`. Run `python scripts/readability_budget.py` before commits
+to confirm a change does not add new readability debt.
+
 ## Importers
 
 Each importer is a separate operational pipeline. Together, they build the canonical data used by the API.
