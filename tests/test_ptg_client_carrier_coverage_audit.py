@@ -107,16 +107,16 @@ def test_audit_carrier_rows_respects_candidate_benefit_lines():
 def test_audit_carrier_rows_uses_confirmed_ancillary_blue_benefit_lines():
     rows = [
         {
-            "MEDICAL_CARRIERS": "Anthem",
-            "DENTAL_CARRIERS": "Anthem\nBlue Cross Blue Shield of Tennessee\nBlue Cross Blue Shield of Texas",
-            "VISION_CARRIERS": "Anthem\nBlue Cross Blue Shield of Texas\nBlue Cross Blue Shield of Illinois\nBlue Cross Blue Shield of Tennessee",
+            "MEDICAL_CARRIERS": "Example All Line",
+            "DENTAL_CARRIERS": "Example All Line\nExample Dental Blue\nExample Vision Blue",
+            "VISION_CARRIERS": "Example All Line\nExample Vision Blue\nExample Prairie Blue\nExample Dental Blue",
         },
     ]
     candidates = [
-        SimpleNamespace(name="Anthem", benefit_lines=("medical", "dental", "vision")),
-        SimpleNamespace(name="Blue Cross Blue Shield of Tennessee", benefit_lines=("medical", "dental")),
-        SimpleNamespace(name="Blue Cross Blue Shield of Texas", benefit_lines=("medical", "vision")),
-        SimpleNamespace(name="Blue Cross Blue Shield of Illinois", benefit_lines=("medical", "vision")),
+        SimpleNamespace(name="Example All Line", benefit_lines=("medical", "dental", "vision")),
+        SimpleNamespace(name="Example Dental Blue", benefit_lines=("medical", "dental")),
+        SimpleNamespace(name="Example Vision Blue", benefit_lines=("medical", "vision")),
+        SimpleNamespace(name="Example Prairie Blue", benefit_lines=("medical", "vision")),
     ]
 
     stats, unmatched = audit_carrier_rows(
@@ -130,5 +130,5 @@ def test_audit_carrier_rows_uses_confirmed_ancillary_blue_benefit_lines():
     assert by_line["medical"].importable_mentions == 1
     assert by_line["dental"].importable_mentions == 2
     assert by_line["vision"].importable_mentions == 3
-    assert unmatched["dental"] == [("Blue Cross Blue Shield of Texas", 1)]
-    assert unmatched["vision"] == [("Blue Cross Blue Shield of Tennessee", 1)]
+    assert unmatched["dental"] == [("Example Vision Blue", 1)]
+    assert unmatched["vision"] == [("Example Dental Blue", 1)]
