@@ -683,6 +683,52 @@ async def _fetch_mapping(conn: asyncpg.Connection, sql: str, *args: Any) -> dict
     return dict(row) if row else {}
 
 
+async def _table_row_estimate(conn: asyncpg.Connection, schema: str, table: str) -> dict[str, Any]:
+    row = await _fetch_mapping(
+        conn,
+        """
+        SELECT n_live_tup::bigint AS row_count,
+               last_analyze,
+               last_autoanalyze
+          FROM pg_stat_user_tables
+         WHERE schemaname = $1
+           AND relname = $2
+        """,
+        schema,
+        table,
+    )
+    row["row_count"] = _int(row.get("row_count"))
+    return row
+
+
+async def _column_distinct_estimate(
+    conn: asyncpg.Connection,
+    schema: str,
+    table: str,
+    column: str,
+    *,
+    row_count: int,
+) -> int | None:
+    value = await conn.fetchval(
+        """
+        SELECT n_distinct
+          FROM pg_stats
+         WHERE schemaname = $1
+           AND tablename = $2
+           AND attname = $3
+        """,
+        schema,
+        table,
+        column,
+    )
+    if value is None:
+        return None
+    distinct = float(value)
+    if distinct < 0:
+        return max(0, int(round(abs(distinct) * row_count)))
+    return max(0, int(round(distinct)))
+
+
 async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False}
@@ -1652,7 +1698,39 @@ async def _capability_status_counts(conn: asyncpg.Connection, schema: str) -> li
     return [dict(row) for row in rows]
 
 
-async def _resource_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
+async def _estimated_resource_summary_row(
+    conn: asyncpg.Connection,
+    schema: str,
+    table: str,
+    *,
+    columns: dict[str, bool],
+) -> dict[str, Any]:
+    estimate = await _table_row_estimate(conn, schema, table)
+    row_count = _int(estimate.get("row_count"))
+    return {
+        "available": True,
+        "estimated": True,
+        "estimate_source": "pg_stat_user_tables/pg_stats",
+        "row_count": row_count,
+        "source_count": await _column_distinct_estimate(
+            conn,
+            schema,
+            table,
+            "source_id",
+            row_count=row_count,
+        ),
+        "last_analyze": estimate.get("last_analyze"),
+        "last_autoanalyze": estimate.get("last_autoanalyze"),
+        "columns": columns,
+    }
+
+
+async def _resource_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    use_estimates: bool = False,
+) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for table in PROVIDER_DIRECTORY_RESOURCE_TABLES:
         if not await _relation_exists(conn, schema, table):
@@ -1664,19 +1742,36 @@ async def _resource_summary(conn: asyncpg.Connection, schema: str) -> dict[str, 
             "telephone_number": await _column_exists(conn, schema, table, "telephone_number"),
             "network_refs": await _column_exists(conn, schema, table, "network_refs"),
         }
-        row = await _fetch_mapping(
-            conn,
-            f"""
-            SELECT
-                count(*)::bigint AS row_count,
-                count(DISTINCT source_id)::bigint AS source_count
-                {", count(*) FILTER (WHERE npi IS NOT NULL)::bigint AS npi_count" if columns["npi"] else ""}
-                {", count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS address_key_count" if columns["address_key"] else ""}
-                {", count(*) FILTER (WHERE telephone_number IS NOT NULL AND BTRIM(telephone_number) <> '')::bigint AS phone_count" if columns["telephone_number"] else ""}
-                {", count(*) FILTER (WHERE jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0)::bigint AS network_ref_row_count" if columns["network_refs"] else ""}
-              FROM {_qt(schema, table)}
-            """,
-        )
+        if use_estimates:
+            summary[table] = await _estimated_resource_summary_row(
+                conn,
+                schema,
+                table,
+                columns=columns,
+            )
+            continue
+        try:
+            row = await _fetch_mapping(
+                conn,
+                f"""
+                SELECT
+                    count(*)::bigint AS row_count,
+                    count(DISTINCT source_id)::bigint AS source_count
+                    {", count(*) FILTER (WHERE npi IS NOT NULL)::bigint AS npi_count" if columns["npi"] else ""}
+                    {", count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS address_key_count" if columns["address_key"] else ""}
+                    {", count(*) FILTER (WHERE telephone_number IS NOT NULL AND BTRIM(telephone_number) <> '')::bigint AS phone_count" if columns["telephone_number"] else ""}
+                    {", count(*) FILTER (WHERE jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0)::bigint AS network_ref_row_count" if columns["network_refs"] else ""}
+                  FROM {_qt(schema, table)}
+                """,
+            )
+        except asyncpg.exceptions.QueryCanceledError as exc:
+            row = await _estimated_resource_summary_row(
+                conn,
+                schema,
+                table,
+                columns=columns,
+            )
+            row["exact_error"] = str(exc)
         row["available"] = True
         row["columns"] = columns
         row_count = _int(row.get("row_count"))
@@ -3332,12 +3427,25 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 sample_limit=args.sample_limit,
             ),
             "capability_status_counts": await _capability_status_counts(conn, schema),
-            "resource_summary": await _resource_summary(conn, schema),
-            "source_resource_coverage_summary": await _source_resource_coverage_summary(
+            "resource_summary": await _resource_summary(
                 conn,
                 schema,
-                sample_limit=args.sample_limit,
-                include_unified=not args.skip_unified,
+                use_estimates=args.pod_safe,
+            ),
+            "source_resource_coverage_summary": (
+                {
+                    "available": False,
+                    "skipped": True,
+                    "reason": "disabled by --pod-safe",
+                    "samples": [],
+                }
+                if args.pod_safe
+                else await _source_resource_coverage_summary(
+                    conn,
+                    schema,
+                    sample_limit=args.sample_limit,
+                    include_unified=not args.skip_unified,
+                )
             ),
             "canonical_resource_summary": (
                 {
@@ -3517,6 +3625,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
         else:
             lines.append("- source/search projection coverage: skipped with unified-address checks")
+    elif source_coverage.get("skipped"):
+        lines.append(f"- source/resource coverage: skipped ({source_coverage.get('reason')})")
     if canonical_resources.get("available"):
         lines.append(
             f"- canonical resource storage: `{canonical_resources.get('canonical_rows')}` canonical row(s), "

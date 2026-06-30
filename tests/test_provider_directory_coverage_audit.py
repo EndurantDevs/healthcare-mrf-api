@@ -1898,6 +1898,12 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
                 "reason": "disabled by --skip-canonical-resource-summary",
                 "resources": [],
             },
+            "source_resource_coverage_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --pod-safe",
+                "samples": [],
+            },
         }
     )
 
@@ -1907,3 +1913,39 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
     assert "- advertised resource/source gaps: skipped (disabled by --skip-advertised-resource-gaps)" in markdown
     assert "- alias fan-out: skipped (disabled by --skip-top-source-yield)" in markdown
     assert "- canonical resource storage: skipped (disabled by --skip-canonical-resource-summary)" in markdown
+    assert "- source/resource coverage: skipped (disabled by --pod-safe)" in markdown
+
+
+@pytest.mark.asyncio
+async def test_resource_estimates_from_stats(monkeypatch):
+    async def is_relation_available(_connection, _schema, name):
+        return name == "provider_directory_practitioner"
+
+    async def has_column(_connection, _schema, table, column):
+        return table == "provider_directory_practitioner" and column == "npi"
+
+    class FakeConn:
+        async def fetchrow(self, sql, *_args):
+            assert "pg_stat_user_tables" in sql
+            return {
+                "row_count": 18_175_884,
+                "last_analyze": None,
+                "last_autoanalyze": "2026-06-30T16:55:33Z",
+            }
+
+        async def fetchval(self, sql, *_args):
+            assert "pg_stats" in sql
+            return 38
+
+    monkeypatch.setattr(audit, "PROVIDER_DIRECTORY_RESOURCE_TABLES", ("provider_directory_practitioner",))
+    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
+    monkeypatch.setattr(audit, "_column_exists", has_column)
+
+    summary = await audit._resource_summary(FakeConn(), "mrf", use_estimates=True)
+    practitioner_summary = summary["provider_directory_practitioner"]
+
+    assert practitioner_summary["available"] is True
+    assert practitioner_summary["estimated"] is True
+    assert practitioner_summary["row_count"] == 18_175_884
+    assert practitioner_summary["source_count"] == 38
+    assert practitioner_summary["columns"]["npi"] is True
