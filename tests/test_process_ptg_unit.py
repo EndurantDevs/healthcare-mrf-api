@@ -537,6 +537,26 @@ def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
 
 
+def test_source_download_tls_override_is_host_scoped(monkeypatch):
+    monkeypatch.delenv(ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, raising=False)
+
+    assert ptg_source_download._request_ssl_kwargs(
+        "https://api.midlandschoice.com/api/v1/fileshare/download?filename=synthetic.json.gz"
+    ) == {"ssl": False}
+    assert (
+        ptg_source_download._request_ssl_kwargs(
+            "https://example.com/api/v1/fileshare/download?filename=synthetic.json.gz"
+        )
+        == {}
+    )
+
+    monkeypatch.setenv(ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, "example.com")
+    assert ptg_source_download._request_ssl_kwargs("https://api.midlandschoice.com/mrf") == {}
+    assert ptg_source_download._request_ssl_kwargs("https://example.com/mrf") == {
+        "ssl": False
+    }
+
+
 def test_source_file_split_keeps_facade_helpers_stable():
     assert process_ptg._maybe_unzip is ptg_source_files._maybe_unzip
     assert process_ptg._extract_metadata_fields is ptg_source_files._extract_metadata_fields

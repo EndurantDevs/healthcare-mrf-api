@@ -94,6 +94,8 @@ MRF_URL_OBSERVATION_NULLABLE_KEYS = (
 )
 _SOURCE_CONFIG_CACHE: dict[str, Any] | None = None
 _SSL_CONTEXT: ssl.SSLContext | None = None
+INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
+DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
 DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "sapphire",
     "aetna_health1",
@@ -221,6 +223,25 @@ def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
         ttl_dns_cache=300,
         ssl=_default_ssl_context(),
     )
+
+
+def _incomplete_tls_chain_hosts() -> set[str]:
+    raw = os.getenv(INCOMPLETE_TLS_CHAIN_HOSTS_ENV)
+    if raw is None:
+        return set(DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS)
+    return {
+        value.strip().lower()
+        for value in re.split(r"[, ]+", raw)
+        if value.strip()
+    }
+
+
+def _request_ssl_kwargs(url: str | None) -> dict[str, Any]:
+    parsed = urlsplit(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and host in _incomplete_tls_chain_hosts():
+        return {"ssl": False}
+    return {}
 
 
 def _source_config() -> dict[str, Any]:
@@ -675,6 +696,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "html_mrf_links"
     if host in {"insightba.net", "www.insightba.net"} and "transparency-in-coverage" in path:
         return "insightba_html_mrf_links"
+    if host == "api.midlandschoice.com" and path.startswith("/mrf"):
+        return "midlandschoice_mrf"
     if host in {"www.vivahealth.com", "vivahealth.com"} and (
         path.startswith("/mrf")
         or path.startswith("/files/mrf/viva-health-commercial-")
@@ -1550,7 +1573,9 @@ async def _fetch_text(
         return b"".join(chunks), resp.charset or "utf-8"
 
     try:
-        async with session.get(url, allow_redirects=True) as resp:
+        async with session.get(
+            url, allow_redirects=True, **_request_ssl_kwargs(url)
+        ) as resp:
             body, charset = await read_response(resp)
     except (aiohttp.ServerDisconnectedError, BrowserFallbackRequired):
         retry_headers = {
@@ -1568,7 +1593,9 @@ async def _fetch_text(
             connector=retry_connector,
             trust_env=False,
         ) as retry_session:
-            async with retry_session.get(url, allow_redirects=True) as resp:
+            async with retry_session.get(
+                url, allow_redirects=True, **_request_ssl_kwargs(url)
+            ) as resp:
                 body, charset = await read_response(resp)
     return _decode_response_body(body, charset=charset)
 
@@ -1596,7 +1623,9 @@ async def _fetch_bytes(
                 max_bytes=max_bytes,
                 session=owned_session,
             )
-    async with session.get(url, allow_redirects=True) as resp:
+    async with session.get(
+        url, allow_redirects=True, **_request_ssl_kwargs(url)
+    ) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
         total = 0
@@ -1775,7 +1804,9 @@ async def _post_json_value(
             return await _post_json_value(
                 url, payload, max_bytes=max_bytes, session=owned_session
             )
-    async with session.post(url, json=payload, allow_redirects=True) as resp:
+    async with session.post(
+        url, json=payload, allow_redirects=True, **_request_ssl_kwargs(url)
+    ) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
         if any(
@@ -1832,6 +1863,7 @@ async def _post_text(
         data=payload,
         headers=headers or {},
         allow_redirects=True,
+        **_request_ssl_kwargs(url),
     ) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
@@ -1915,7 +1947,9 @@ async def _head_url(
                 headers={"User-Agent": USER_AGENT}, timeout=timeout, trust_env=False
             ) as owned_session:
                 return await _head_url(url, owned_session)
-        async with session.head(url, allow_redirects=True) as resp:
+        async with session.head(
+            url, allow_redirects=True, **_request_ssl_kwargs(url)
+        ) as resp:
             await _assert_fetch_url_allowed(str(resp.url))
             length = resp.headers.get("Content-Length")
             return {
@@ -6457,7 +6491,9 @@ async def _resolve_cmstic_keyed_toc_redirect(
     if not _looks_cmstic_keyed_toc_url(url):
         raise ValueError(f"unsupported CMSTIC keyed TOC URL: {url}")
     await _assert_fetch_url_allowed(url)
-    async with session.head(url, allow_redirects=True) as resp:
+    async with session.head(
+        url, allow_redirects=True, **_request_ssl_kwargs(url)
+    ) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         if resp.status >= 400:
             raise ValueError(f"CMSTIC keyed TOC redirect returned HTTP {resp.status}")
@@ -6874,6 +6910,138 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
             row["html_end"] = item.get("html_end")
         normalized.append(row)
     return normalized
+
+
+class _MidlandsChoiceMrfParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[dict[str, str]]] = []
+        self._current_row: list[dict[str, str]] | None = None
+        self._current_cell: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "tr":
+            self._current_row = []
+            return
+        if tag in {"td", "th"} and self._current_row is not None:
+            self._current_cell = {"text_parts": [], "href": ""}
+            return
+        if tag == "a" and self._current_cell is not None:
+            attrs_by_name = {name.lower(): value for name, value in attrs if name}
+            href = str(attrs_by_name.get("href") or "").strip()
+            if href:
+                self._current_cell["href"] = href
+
+    def handle_data(self, data: str) -> None:
+        if self._current_cell is not None and data:
+            self._current_cell["text_parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"td", "th"} and self._current_row is not None and self._current_cell:
+            self._current_row.append(
+                {
+                    "text": _clean_text(" ".join(self._current_cell["text_parts"])),
+                    "href": str(self._current_cell.get("href") or "").strip(),
+                }
+            )
+            self._current_cell = None
+            return
+        if tag == "tr" and self._current_row is not None:
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._current_row = None
+            self._current_cell = None
+
+
+def _parse_midlandschoice_mrf_rows(
+    html_text: str, *, base_url: str
+) -> list[dict[str, str]]:
+    parser = _MidlandsChoiceMrfParser()
+    parser.feed(html_text or "")
+    parser.close()
+    rows: list[dict[str, str]] = []
+    for cells in parser.rows:
+        if len(cells) < 5:
+            continue
+        network_code = _clean_text(cells[0].get("text"))
+        network_name = _clean_text(cells[1].get("text"))
+        file_name = _clean_text(cells[2].get("text"))
+        file_type = _clean_text(cells[3].get("text"))
+        href = _clean_text(cells[4].get("href"))
+        if not href:
+            href = next((_clean_text(cell.get("href")) for cell in cells if cell.get("href")), "")
+        if not href or network_code.lower() == "network":
+            continue
+        file_url = urljoin(base_url, href)
+        target_file_type = (
+            _mrf_body_file_type_from_text(file_url, file_type or file_name)
+            or _metadata_text_file_type(file_type)
+        )
+        if target_file_type not in {"in-network", "allowed-amounts"}:
+            continue
+        rows.append(
+            {
+                "network_code": network_code,
+                "network_name": network_name,
+                "file_name": file_name,
+                "file_type": file_type,
+                "target_file_type": target_file_type,
+                "url": file_url,
+            }
+        )
+    return rows
+
+
+async def _resolve_midlandschoice_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    targets: list[CrawlTarget] = []
+    resolver_type = str(resolver.get("type") or "midlandschoice_mrf")
+    for row in _parse_midlandschoice_mrf_rows(html_text, base_url=url):
+        label = row.get("network_name") or row.get("file_name") or row["network_code"]
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=row["url"],
+                label=label,
+                resolved_from_url=url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": "file_reference",
+                    "target_file_type": row["target_file_type"],
+                    "container_format": _container_format(row["url"]),
+                    "network_code": row["network_code"],
+                    "network_name": row.get("network_name"),
+                    "file_name": row.get("file_name"),
+                    "midlandschoice_file_type": row.get("file_type"),
+                    "reporting_entity_name": source.get("display_name")
+                    or "Midlands Choice",
+                    "reporting_entity_type": "third_party_administrator",
+                    "plan_info": _plan_info_from_label(
+                        label,
+                        plan_id=row["network_code"],
+                        plan_id_type="network_code",
+                    ),
+                },
+            )
+        )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Midlands Choice MRF download rows found for {url}")
+    return targets
 
 
 def _embedded_http_urls(value: str | None) -> list[str]:
@@ -9831,7 +9999,9 @@ async def _fetch_json_with_headers(
     session: aiohttp.ClientSession,
 ) -> dict[str, Any]:
     await _assert_fetch_url_allowed(url)
-    async with session.get(url, headers=headers, allow_redirects=True) as resp:
+    async with session.get(
+        url, headers=headers, allow_redirects=True, **_request_ssl_kwargs(url)
+    ) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
         total = 0
@@ -10042,6 +10212,8 @@ async def _crawl_targets_for_source(
         )
     if resolver_type == "html_delegated_mrf_links":
         return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
+    if resolver_type == "midlandschoice_mrf":
+        return await _resolve_midlandschoice_mrf(source, url, resolver, session)
     if resolver_type == "html_mrf_links":
         return await _resolve_html_mrf_links(source, url, resolver, session)
     if resolver_type == "socrata_data_json_mrf_catalog":

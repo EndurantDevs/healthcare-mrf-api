@@ -108,6 +108,11 @@
       "follow_iframe_links": false,
       "max_targets": 50
     },
+    "midlandschoice_mrf": {
+      "type": "midlandschoice_mrf",
+      "max_bytes": 5242880,
+      "max_targets": 50
+    },
     "bcbs_global_solutions_mrf": {
       "type": "bcbs_global_solutions_mrf",
       "max_bytes": 5242880,

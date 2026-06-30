@@ -70,6 +70,27 @@ _MAX_REDIRECTS = 10
 _GZIP_INTEGRITY_CHUNK_BYTES = 8 * 1024 * 1024
 _GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES"
 _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
+INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
+DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
+
+
+def _incomplete_tls_chain_hosts() -> set[str]:
+    raw = os.getenv(INCOMPLETE_TLS_CHAIN_HOSTS_ENV)
+    if raw is None:
+        return set(DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS)
+    return {
+        value.strip().lower()
+        for value in re.split(r"[, ]+", raw)
+        if value.strip()
+    }
+
+
+def _request_ssl_kwargs(url: str | None) -> dict[str, object]:
+    parsed = urlsplit(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and host in _incomplete_tls_chain_hosts():
+        return {"ssl": False}
+    return {}
 
 
 def _expected_gzip_artifact(url: str, path: str | Path) -> bool:
@@ -128,7 +149,14 @@ async def _open_validated_request(
     current_method = method.upper()
     for _ in range(_MAX_REDIRECTS + 1):
         await assert_safe_url(current_url)
-        response = await session.request(current_method, current_url, allow_redirects=False, **kwargs)
+        request_kwargs = dict(kwargs)
+        request_kwargs.update(_request_ssl_kwargs(current_url))
+        response = await session.request(
+            current_method,
+            current_url,
+            allow_redirects=False,
+            **request_kwargs,
+        )
         if response.status not in _REDIRECT_STATUSES:
             await assert_safe_url(str(response.url))
             return response

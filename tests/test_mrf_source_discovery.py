@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import gzip
 import importlib
 import io
@@ -40,6 +41,7 @@ def test_source_urls_are_loaded_from_registry_file():
     )
     assert config["platform_resolvers"]["insightba_html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["insightba_html_mrf_links"]["include_url_patterns"]
+    assert config["platform_resolvers"]["midlandschoice_mrf"]["type"] == "midlandschoice_mrf"
     assert config["platform_resolvers"]["bcbswy_hmhs_monthly_toc"][
         "file_templates"
     ] == ["{month_start}_Blue_Cross_Blue_Shield_of_Wyoming_index.json"]
@@ -316,6 +318,10 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform("https://mb.mrf.payercompass.com/")
         == "payercompass_mrf"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://api.midlandschoice.com/mrf")
+        == "midlandschoice_mrf"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -714,6 +720,89 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         )
         == "html_mrf_links"
     )
+
+
+def test_midlandschoice_resolver_preserves_network_labels():
+    html = """
+    <table>
+      <tr>
+        <th>Network</th><th>Name</th><th>File Name</th><th>File Type</th><th>Download</th>
+      </tr>
+      <tr>
+        <td>A1</td>
+        <td>Network Alpha</td>
+        <td>alpha_in-network-rates.json.gz</td>
+        <td>In Network Rates</td>
+        <td>
+          <a href="/api/v1/fileshare/download?filename=alpha_in-network-rates.json.gz">Download</a>
+        </td>
+      </tr>
+      <tr>
+        <td>B2</td>
+        <td>Network Beta</td>
+        <td>beta_in-network-rates.json.gz</td>
+        <td>In Network Rates</td>
+        <td>
+          <a href="/api/v1/fileshare/download?filename=beta_in-network-rates.json.gz">Download</a>
+        </td>
+      </tr>
+    </table>
+    """
+    source = {"source_id": "src-midlands", "display_name": "Synthetic Midlands"}
+
+    targets = discovery._parse_midlandschoice_mrf_rows(
+        html, base_url="https://api.midlandschoice.com/mrf"
+    )
+
+    assert [target["network_code"] for target in targets] == ["A1", "B2"]
+    assert [target["network_name"] for target in targets] == [
+        "Network Alpha",
+        "Network Beta",
+    ]
+    assert targets[0]["url"].startswith(
+        "https://api.midlandschoice.com/api/v1/fileshare/download?"
+    )
+
+    async def fake_fetch_text(url, *, max_bytes, session):
+        assert url == "https://api.midlandschoice.com/mrf"
+        assert max_bytes >= 1024
+        assert session is None
+        return html
+
+    original = discovery._fetch_text
+    discovery._fetch_text = fake_fetch_text
+    try:
+        resolved = asyncio.run(
+            discovery._resolve_midlandschoice_mrf(
+                source,
+                "https://api.midlandschoice.com/mrf",
+                {"type": "midlandschoice_mrf"},
+                None,
+            )
+        )
+    finally:
+        discovery._fetch_text = original
+
+    assert [target.label for target in resolved] == ["Network Alpha", "Network Beta"]
+    assert resolved[0].metadata["network_code"] == "A1"
+    assert resolved[0].metadata["target_kind"] == "file_reference"
+    assert resolved[0].metadata["target_file_type"] == "in-network"
+    assert resolved[0].metadata["plan_info"][0]["plan_id"] == "A1"
+    assert resolved[0].metadata["plan_info"][0]["plan_id_type"] == "network_code"
+    assert resolved[0].metadata["plan_info"][0]["plan_name"] == "Network Alpha"
+
+
+def test_discovery_tls_override_is_host_scoped(monkeypatch):
+    monkeypatch.delenv(discovery.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, raising=False)
+
+    assert discovery._request_ssl_kwargs("https://api.midlandschoice.com/mrf") == {
+        "ssl": False
+    }
+    assert discovery._request_ssl_kwargs("https://example.com/mrf") == {}
+
+    monkeypatch.setenv(discovery.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, "example.com")
+    assert discovery._request_ssl_kwargs("https://api.midlandschoice.com/mrf") == {}
+    assert discovery._request_ssl_kwargs("https://example.com/mrf") == {"ssl": False}
 
 
 def test_parse_master_list_preserves_payers_and_urls():
