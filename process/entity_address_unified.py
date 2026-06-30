@@ -3482,7 +3482,16 @@ def _copy_unaffected_live_entity_rows_sql(
      WHERE NOT EXISTS (
             SELECT 1
               FROM {db_schema}.{affected_group_table} AS affected
-             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+             WHERE affected.entity_npi IS NOT NULL
+               AND live.npi IS NOT NULL
+               AND affected.entity_npi = live.npi
+               AND {_entity_address_evidence_group_match_sql("affected", "live")}
+       )
+       AND NOT EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE affected.entity_npi IS NULL
+               AND {_entity_address_evidence_group_match_sql("affected", "live")}
        )
        AND NOT EXISTS (
             SELECT 1

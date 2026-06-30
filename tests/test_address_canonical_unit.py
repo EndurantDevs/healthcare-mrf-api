@@ -2537,6 +2537,8 @@ def test_entity_address_unified_provider_directory_replacement_copies_unaffected
     assert "INSERT INTO mrf.entity_address_unified_20260614" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "FROM mrf.entity_address_unified_20260614_pd_groups AS affected" in sql
+    assert "affected.entity_npi = live.npi" in sql
+    assert "affected.entity_npi IS NULL" in sql
     assert "replacement.location_key = live.location_key" in sql
     assert "ON CONFLICT (location_key) DO NOTHING" in sql
     assert "DELETE FROM mrf.entity_address_unified" not in sql
