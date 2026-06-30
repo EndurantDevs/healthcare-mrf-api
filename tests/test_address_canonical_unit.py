@@ -2526,6 +2526,22 @@ def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affec
     assert "checksum = EXCLUDED.checksum" not in sql_blob
 
 
+def test_entity_address_unified_provider_directory_replacement_copies_unaffected_live_rows():
+    sql = entity_address_unified._copy_unaffected_live_entity_rows_sql(  # pylint: disable=protected-access
+        "mrf",
+        live_table="entity_address_unified",
+        stage_table="entity_address_unified_20260614",
+        affected_group_table="entity_address_unified_20260614_pd_groups",
+    )
+
+    assert "INSERT INTO mrf.entity_address_unified_20260614" in sql
+    assert "FROM mrf.entity_address_unified AS live" in sql
+    assert "FROM mrf.entity_address_unified_20260614_pd_groups AS affected" in sql
+    assert "replacement.location_key = live.location_key" in sql
+    assert "ON CONFLICT (location_key) DO NOTHING" in sql
+    assert "DELETE FROM mrf.entity_address_unified" not in sql
+
+
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
     monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true")
     stage_classes = entity_address_unified._support_stage_classes("20260614")

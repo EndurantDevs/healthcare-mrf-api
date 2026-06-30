@@ -3465,6 +3465,34 @@ def _insert_stage_entity_into_live_sql(db_schema: str, live_table: str, stage_ta
     """
 
 
+def _copy_unaffected_live_entity_rows_sql(
+    db_schema: str,
+    *,
+    live_table: str,
+    stage_table: str,
+    affected_group_table: str,
+) -> str:
+    columns = _entity_address_column_names()
+    column_list = ", ".join(columns)
+    select_list = ", ".join(f"live.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{stage_table} ({column_list})
+    SELECT {select_list}
+      FROM {db_schema}.{live_table} AS live
+     WHERE NOT EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+       )
+       AND NOT EXISTS (
+            SELECT 1
+              FROM {db_schema}.{stage_table} AS replacement
+             WHERE replacement.location_key = live.location_key
+       )
+    ON CONFLICT (location_key) DO NOTHING;
+    """
+
+
 def _partial_main_patch_sql(
     db_schema: str,
     *,
@@ -9248,8 +9276,9 @@ async def process_data(ctx, task=None):
                 "available Provider Directory source tables."
             )
         context["partial_provider_directory_source_selects"] = len(source_selects)
-        context["partial_provider_directory_main_patch_publish"] = True
-        context["partial_main_patch_publish"] = True
+        context["partial_provider_directory_replacement_publish"] = True
+        context["partial_provider_directory_main_patch_publish"] = False
+        context["partial_main_patch_publish"] = False
     source_table_shards = _env_int(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_TABLE_SHARDS",
         DEFAULT_SOURCE_TABLE_SHARDS,
@@ -10131,6 +10160,7 @@ async def process_data(ctx, task=None):
         affected_group_table
         and not context.get("partial_support_patch_publish")
         and not context.get("partial_main_patch_publish")
+        and not context.get("partial_provider_directory_replacement_publish")
     ):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
@@ -10173,6 +10203,50 @@ async def process_data(ctx, task=None):
                 pct=89,
                 message=f"compacted {compacted_rows:,} hot rows",
             )
+
+    if partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
+        if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial replacement publish requires "
+                "the affected group table while composing the replacement stage."
+            )
+        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial replacement publish requires "
+                "the live entity_address_unified table to exist."
+            )
+        await _ensure_entity_address_unified_live_columns(db_schema)
+        copied_rows = await _run_sql_phase(
+            _copy_unaffected_live_entity_rows_sql(
+                db_schema,
+                live_table=EntityAddressUnified.__main_table__,
+                stage_table=stage_table,
+                affected_group_table=affected_group_table,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified copying unaffected live rows",
+            unit="rows",
+            done=0,
+            total=1,
+            pct=90,
+            message="copying unaffected live rows into replacement stage",
+            emit_start=True,
+            emit_done=True,
+        )
+        context["partial_provider_directory_unaffected_live_rows_copied"] = int(copied_rows or 0)
+        await _run_sql_phase(
+            f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified dropping affected Provider Directory groups",
+            unit="tables",
+            done=1,
+            total=1,
+            pct=90,
+            message="dropping affected Provider Directory groups",
+            emit_done=True,
+        )
 
     if (
         not ctx["context"].get("stage_indexes_prepared")
@@ -10352,6 +10426,12 @@ async def shutdown(ctx):
                 ),
                 "partial_provider_directory_patched_rows": int(
                     context.get("partial_provider_directory_patched_rows") or 0
+                ),
+                "partial_provider_directory_replacement_publish": bool(
+                    context.get("partial_provider_directory_replacement_publish")
+                ),
+                "partial_provider_directory_unaffected_live_rows_copied": int(
+                    context.get("partial_provider_directory_unaffected_live_rows_copied") or 0
                 ),
                 "npi_rows": int(context.get("npi_rows") or 0),
                 "inferred_rows": int(context.get("inferred_rows") or 0),
@@ -10557,6 +10637,12 @@ async def shutdown(ctx):
             ),
             "partial_provider_directory_patched_rows": int(
                 context.get("partial_provider_directory_patched_rows") or 0
+            ),
+            "partial_provider_directory_replacement_publish": bool(
+                context.get("partial_provider_directory_replacement_publish")
+            ),
+            "partial_provider_directory_unaffected_live_rows_copied": int(
+                context.get("partial_provider_directory_unaffected_live_rows_copied") or 0
             ),
             "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
             "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),
