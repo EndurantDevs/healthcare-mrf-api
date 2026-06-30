@@ -4184,7 +4184,10 @@ class EntityAddressUnified(Base, JSONOutputMixin):
                 "npi",
             ),
             "name": "service_phone_digits_npi",
-            "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
+            ),
         },
         {
             "index_elements": ("phone_number", "npi"),
@@ -4193,6 +4196,11 @@ class EntityAddressUnified(Base, JSONOutputMixin):
                 "type IN ('primary', 'secondary', 'practice', 'site') "
                 "AND phone_number IS NOT NULL AND phone_number <> ''"
             ),
+        },
+        {
+            "index_elements": ("address_key", "npi"),
+            "name": "service_address_key_npi",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
         },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},

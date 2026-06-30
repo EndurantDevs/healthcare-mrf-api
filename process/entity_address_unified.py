@@ -109,6 +109,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "primary_phone_npi",
     "service_phone_digits_npi",
     "service_phone_number_npi",
+    "service_address_key_npi",
     "taxonomy_plans_network",
     "procedures_array",
     "medications_array",

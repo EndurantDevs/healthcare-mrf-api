@@ -1,7 +1,7 @@
-"""Add unified service-location phone indexes.
+"""Constrain service phone index and add address-key lookup.
 
-Revision ID: 20260630110000_entity_address_unified_service_phone_indexes
-Revises: 20260629205000_retire_ptg_address_leftovers
+Revision ID: 20260630134000_fix_service_phone_digits_index
+Revises: 20260630112000_provider_directory_role_affiliation_run_indexes
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from alembic import op
 from sqlalchemy import text
 
 
-revision = "20260630110000_entity_address_unified_service_phone_indexes"
-down_revision = "20260629205000_retire_ptg_address_leftovers"
+revision = "20260630134000_fix_service_phone_digits_index"
+down_revision = "20260630112000_provider_directory_role_affiliation_run_indexes"
 branch_labels = None
 depends_on = None
 
@@ -46,6 +46,9 @@ def upgrade():
         return
     with op.get_context().autocommit_block():
         bind.exec_driver_sql(
+            f"DROP INDEX CONCURRENTLY IF EXISTS {_q(schema)}.entity_address_unified_idx_service_phone_digits_npi;"
+        )
+        bind.exec_driver_sql(
             f"""
             CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_service_phone_digits_npi
             ON {_qt(schema, "entity_address_unified")}
@@ -59,15 +62,6 @@ def upgrade():
         )
         bind.exec_driver_sql(
             f"""
-            CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_service_phone_number_npi
-            ON {_qt(schema, "entity_address_unified")} (phone_number, npi)
-            WHERE type IN ('primary', 'secondary', 'practice', 'site')
-              AND phone_number IS NOT NULL
-              AND phone_number <> '';
-            """
-        )
-        bind.exec_driver_sql(
-            f"""
             CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_service_address_key_npi
             ON {_qt(schema, "entity_address_unified")} (address_key, npi)
             WHERE type IN ('primary', 'secondary', 'practice', 'site')
@@ -77,14 +71,23 @@ def upgrade():
 
 
 def downgrade():
+    bind = op.get_bind()
     schema = _schema()
     with op.get_context().autocommit_block():
-        op.get_bind().exec_driver_sql(
-            f"DROP INDEX CONCURRENTLY IF EXISTS {_q(schema)}.entity_address_unified_idx_service_phone_number_npi;"
-        )
-        op.get_bind().exec_driver_sql(
+        bind.exec_driver_sql(
             f"DROP INDEX CONCURRENTLY IF EXISTS {_q(schema)}.entity_address_unified_idx_service_address_key_npi;"
         )
-        op.get_bind().exec_driver_sql(
+        bind.exec_driver_sql(
             f"DROP INDEX CONCURRENTLY IF EXISTS {_q(schema)}.entity_address_unified_idx_service_phone_digits_npi;"
+        )
+        bind.exec_driver_sql(
+            f"""
+            CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_service_phone_digits_npi
+            ON {_qt(schema, "entity_address_unified")}
+            (
+                regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'),
+                npi
+            )
+            WHERE type IN ('primary', 'secondary', 'practice', 'site');
+            """
         )

@@ -2834,7 +2834,10 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
                     "npi",
                 ),
                 "name": "service_phone_digits_npi",
-                "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+                "where": (
+                    "type IN ('primary', 'secondary', 'practice', 'site') "
+                    "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
+                ),
             },
             {
                 "index_elements": ("phone_number", "npi"),
@@ -2843,6 +2846,11 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
                     "type IN ('primary', 'secondary', 'practice', 'site') "
                     "AND phone_number IS NOT NULL AND phone_number <> ''"
                 ),
+            },
+            {
+                "index_elements": ("address_key", "npi"),
+                "name": "service_address_key_npi",
+                "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
             },
             {"index_elements": ("row_origin",), "name": "row_origin"},
             {"index_elements": ("zip5",), "name": "zip5"},
@@ -2874,6 +2882,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_primary_phone_npi" in joined
     assert "idx_service_phone_digits_npi" in joined
     assert "idx_service_phone_number_npi" in joined
+    assert "idx_service_address_key_npi" in joined
     assert "idx_primary_phone_digits_npi" not in joined
     assert "idx_geo_idx" not in joined
     assert "idx_inferred_npi" not in joined
@@ -3155,7 +3164,10 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "npi",
         ),
         "name": "service_phone_digits_npi",
-        "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
+        ),
     }
     assert indexes["service_phone_number_npi"] == {
         "index_elements": ("phone_number", "npi"),
@@ -3164,6 +3176,11 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
             "type IN ('primary', 'secondary', 'practice', 'site') "
             "AND phone_number IS NOT NULL AND phone_number <> ''"
         ),
+    }
+    assert indexes["service_address_key_npi"] == {
+        "index_elements": ("address_key", "npi"),
+        "name": "service_address_key_npi",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
     }
     assert indexes["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),
