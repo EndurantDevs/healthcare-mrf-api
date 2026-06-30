@@ -2420,8 +2420,9 @@ def _toc_rows_from_content(
     file_rows: list[dict[str, Any]] = []
     entries = parse_toc_catalog_entries(toc, str(url))
     schema_version = _truncate_text(toc.get("version"), 32)
+    target_query = _source_target_payer_query(source)
     for entry in entries:
-        plan_info = list(entry.plan_info or ())
+        plan_info = _query_expanded_plan_info(entry.plan_info or (), target_query)
         for plan in plan_info:
             plan_id = str(plan.get("plan_id") or "").strip()
             plan_name = plan.get("plan_name")
@@ -3964,7 +3965,12 @@ def _merge_crawl_target_plan_info(
             continue
         next_plan = dict(plan)
         target_plan = target_by_key.get(_plan_info_match_key(next_plan)) or {}
-        for key in ("engine_plan_hash", "issuer_name", "plan_sponsor_name"):
+        for key in (
+            "engine_plan_hash",
+            "issuer_name",
+            "plan_sponsor_name",
+            "company_name",
+        ):
             if not next_plan.get(key) and target_plan.get(key):
                 next_plan[key] = target_plan[key]
                 changed = True
@@ -10012,6 +10018,27 @@ def _healthsparq_query_plan_label(
         return raw_name, query
     stripped = raw_name[match.end() :].strip(" \t\r\n-_:;|")
     return (stripped or raw_name), query
+
+
+def _query_expanded_plan_info(
+    plan_info: Iterable[dict[str, Any]], target_query: str | None
+) -> list[dict[str, Any]]:
+    query = _clean_text(target_query)
+    items: list[dict[str, Any]] = []
+    for raw_plan in plan_info:
+        if not isinstance(raw_plan, dict):
+            continue
+        item = dict(raw_plan)
+        plan_name, sponsor_name = _healthsparq_query_plan_label(
+            item.get("plan_name") or item.get("planName"), query
+        )
+        if plan_name:
+            item["plan_name"] = plan_name
+        if sponsor_name:
+            item.setdefault("plan_sponsor_name", sponsor_name)
+            item.setdefault("company_name", sponsor_name)
+        items.append(item)
+    return items
 
 
 def _healthsparq_plan_info(

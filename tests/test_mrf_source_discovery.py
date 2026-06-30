@@ -1255,6 +1255,101 @@ def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
     ]
 
 
+def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
+    source = {
+        "source_id": "src_aetna",
+        "display_name": "Example Carrier",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging",
+                "query_expansion_source": True,
+            }
+        },
+    }
+    toc = {
+        "reporting_entity_name": "Example Reporting Entity",
+        "reporting_entity_type": "Third Party Administrator",
+        "version": "1.0.0",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "Example Water Co. DBA Example PackagingHSA Choice Plan",
+                        "plan_id_type": "ein",
+                        "plan_id": "222222222",
+                        "plan_market_type": "group",
+                    },
+                    {
+                        "plan_name": "Example Water Co. DBA Example PackagingChoice Plan",
+                        "plan_id_type": "ein",
+                        "plan_id": "222222222",
+                        "plan_market_type": "group",
+                    },
+                ],
+                "in_network_files": [
+                    {
+                        "description": "in network file",
+                        "location": "https://example.test/in-network.json.gz",
+                    }
+                ],
+            }
+        ],
+    }
+    target = discovery.CrawlTarget(
+        source=source,
+        url="https://example.test/index.json",
+        label="Example Packaging TOC",
+        resolved_from_url="https://example.test/latest_metadata.json",
+        metadata={
+            "plan_info": [
+                {
+                    "plan_id": "222222222",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "HSA Choice Plan",
+                    "engine_plan_hash": "hash-hsa",
+                    "company_name": "Example Packaging",
+                },
+                {
+                    "plan_id": "222222222",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "Choice Plan",
+                    "engine_plan_hash": "hash-choice",
+                    "company_name": "Example Packaging",
+                },
+            ]
+        },
+    )
+
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        source, "https://example.test/index.json", toc
+    )
+
+    assert [row["plan_name"] for row in plan_rows] == [
+        "HSA Choice Plan",
+        "Choice Plan",
+    ]
+    [file_row] = file_rows
+    plan_info = file_row["metadata_json"]["plan_info"]
+    assert [plan["plan_name"] for plan in plan_info] == [
+        "HSA Choice Plan",
+        "Choice Plan",
+    ]
+    assert {plan["company_name"] for plan in plan_info} == {"Example Packaging"}
+
+    [annotated] = discovery._apply_crawl_target_context_to_file_rows(
+        [file_row], target
+    )
+
+    merged = annotated["metadata_json"]["plan_info"]
+    assert [plan["engine_plan_hash"] for plan in merged] == [
+        "hash-hsa",
+        "hash-choice",
+    ]
+    assert {plan["company_name"] for plan in merged} == {"Example Packaging"}
+
+
 def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
     assert discovery._search_values_match_query(
         ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
