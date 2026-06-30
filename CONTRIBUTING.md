@@ -20,6 +20,16 @@ pull request.
 Use `type/short-slug` names: `feature/<slug>`, `fix/<slug>`,
 `docs/<slug>`, `test/<slug>`, or `chore/<slug>`.
 
+## Commit Messages
+
+Use `type(scope): imperative summary` subjects so history is readable during
+rollbacks, reviews, and deploy audits. See `docs/commit-messages.md` for the
+allowed types and examples, and run this before pushing hand-written commits:
+
+```bash
+python3 scripts/check_commit_messages.py --last 1
+```
+
 ## Tests and Smoke Runs
 
 Run the regular suite with:

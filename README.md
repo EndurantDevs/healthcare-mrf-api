@@ -56,7 +56,9 @@ See the full source catalog in [docs/data-sources.md](./docs/data-sources.md).
 
 Readability and ownership rules live in `docs/architecture.md` and
 `docs/readability.md`. Run `python scripts/readability_budget.py` before commits
-to confirm a change does not add new readability debt.
+to confirm a change does not add new readability debt. Commit message rules live
+in `docs/commit-messages.md`; run `python3 scripts/check_commit_messages.py --last 1`
+before pushing hand-written commits.
 
 ## Importers
 
