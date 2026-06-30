@@ -2937,8 +2937,8 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     current_rows = [row for cls_name, row in pushed if cls_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
-    assert import_run_rows[-1]["report"]["files_processed"] == 0
-    assert import_run_rows[-1]["report"]["files_failed"] == 1
+    assert import_run_rows[-1]["report"]["files_processed"] in {0}
+    assert import_run_rows[-1]["report"]["files_failed"] in {1}
     assert "download failed" in import_run_rows[-1]["report"]["failed_files"][0]["error"]
     assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert current_rows == []
@@ -3004,14 +3004,14 @@ def test_ptg2_main_publishes_allowed_amount_only_metadata_snapshot(monkeypatch):
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_VALIDATED
     assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_PUBLISHED
-    assert final_report["files_processed"] == 1
-    assert final_report["files_failed"] == 0
+    assert final_report["files_processed"] in {1}
+    assert final_report["files_failed"] in {0}
     assert final_report["serving_index"]["type"] == "allowed_amounts_only"
     assert final_report["serving_rates"] == 0
     assert snapshot_rows[-1]["manifest"]["successful_files"][0]["source_type"] == "allowed_amounts"
     assert current_rows == []
-    assert publish_serving.await_count == 0
-    assert publish_source_pointers.await_count == 0
+    assert publish_serving.await_count in {0}
+    assert publish_source_pointers.await_count in {0}
     assert "manifest_stage" in dropped_tables
 
 
@@ -3074,8 +3074,8 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert "failed 1 of 2 attempted" in import_run_rows[-1]["error"]
-    assert import_run_rows[-1]["report"]["files_processed"] == 1
-    assert import_run_rows[-1]["report"]["files_failed"] == 1
+    assert import_run_rows[-1]["report"]["files_processed"] in {1}
+    assert import_run_rows[-1]["report"]["files_failed"] in {1}
     assert current_rows == []
 
 
@@ -3115,7 +3115,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
     current_rows = [row for cls_name, row in pushed if cls_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
-    assert import_run_rows[-1]["report"]["jobs_discovered"] == 0
+    assert import_run_rows[-1]["report"]["jobs_discovered"] in {0}
     assert import_run_rows[-1]["report"]["toc_failures"][0]["error"] == "409 public access denied"
     assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert current_rows == []
@@ -3180,7 +3180,7 @@ def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_pa
 
     result = asyncio.run(process_ptg.build_ptg2_snapshot_index_artifact(classes, "snap-test", "run-test"))
 
-    assert result["plan_count"] == 1
+    assert result["plan_count"] in {1}
     artifact_path = tmp_path / "snapshot_index" / "snap-test.json"
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert payload["rates"]["010854205"]["70551"][0]["prices"][0]["negotiated_rate"] == 450
@@ -3369,7 +3369,7 @@ def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
         "in_network",
         "in_network",
     ]
-    assert json.loads(rows[0][1])["provider_group_id"] == 1
+    assert json.loads(rows[0][1])["provider_group_id"] in {1}
     assert json.loads(rows[-1][1])["billing_code"] == "70551"
 
 
@@ -3447,7 +3447,7 @@ def test_ptg2_rust_compact_serving_mode_emits_copy_oriented_rows(tmp_path):
     assert compact_row["snapshot_id"] == "snapshot"
     assert compact_row["plan_id"] == "plan"
     assert compact_row["billing_code"] == "99213"
-    assert compact_row["provider_count"] == 1
+    assert compact_row["provider_count"] in {1}
     assert b"PTG2_SCANNER_PROGRESS" in completed.stderr
 
 
@@ -3499,7 +3499,7 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
 
     assert copy_path.exists()
     copy_lines = copy_path.read_text().splitlines()
-    assert len(copy_lines) == 1
+    assert len(copy_lines) in {1}
     fields = copy_lines[0].split("\t")
     assert fields[1] == "snapshot"
     assert fields[2] == "plan"
@@ -3667,10 +3667,10 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert all(str(row["path"]).endswith(".ready") for row in rotated_copy_events)
     assert dedupe_summary["negotiated_rates"] == 2
     assert dedupe_summary["serving_rate_attempted"] == 2
-    assert dedupe_summary["serving_rate_unique"] == 1
+    assert dedupe_summary["serving_rate_unique"] in {1}
     assert dedupe_summary["serving_rate_duplicate"] in {1}
     assert dedupe_summary["serving_rate_reduction_pct"] == 50.0
-    assert dedupe_summary["price_atom_attempted"] == 1
+    assert dedupe_summary["price_atom_attempted"] in {1}
     assert dedupe_summary["price_atom_unique"] == 1
     assert dedupe_summary["price_atom_duplicate"] == 0
     assert dedupe_summary["price_set_entry_attempted"] == 0
