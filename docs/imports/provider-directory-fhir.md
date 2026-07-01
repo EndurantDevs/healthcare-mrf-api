@@ -522,7 +522,10 @@ When SCAN roles are requested with practitioners, organizations, or locations,
 the importer reverse-lookups roles from those fetched resource ids, such as
 `PractitionerRole?practitioner=Practitioner/{id}`, and records
 `scan_practitioner_role_requires_reverse_lookup` only when no seed resources are
-available for that reverse lookup.
+available for that reverse lookup. The reverse-lookup path uses the same
+streaming flush behavior as direct resource reads and honors the configured
+`linked_resource_deadline_seconds`; when the deadline is reached, stale cleanup
+for SCAN roles is skipped because the resource is incomplete.
 
 ## Self-Harness
 

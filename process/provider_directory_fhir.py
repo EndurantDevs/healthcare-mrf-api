@@ -7239,6 +7239,12 @@ async def _fetch_scan_practitioner_role_rows(
     page_count: int,
     timeout: int,
     run_id: str | None,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None = None,
+    row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
+    retain_rows: bool = True,
+    cancel_ctx: dict[str, Any] | None = None,
+    cancel_task: dict[str, Any] | None = None,
+    deadline_seconds: int = 0,
 ) -> ResourceFetchResult:
     model = ProviderDirectoryPractitionerRole
     seeds = _scan_practitioner_role_seed_rows(rows_by_resource)
@@ -7268,10 +7274,28 @@ async def _fetch_scan_practitioner_role_rows(
     next_url_remaining = False
     error_message: str | None = None
     reverse_error_count = 0
+    rows_written = 0
+    pending_rows: list[dict[str, Any]] = []
+    deadline_reached = False
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
 
+    async def flush_pending_rows() -> None:
+        nonlocal rows_written
+        if not row_batch_handler or not pending_rows:
+            return
+        pending_rows_list = list(pending_rows)
+        pending_rows.clear()
+        rows_written += await row_batch_handler(model, pending_rows_list)
+
     for search_param, seed_resource_type, seed_resource_id in seeds:
+        if cancel_ctx is not None:
+            await raise_if_cancelled(cancel_ctx, cancel_task)
         if not _limit_allows_more(rows_fetched, per_resource_limit):
+            break
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            deadline_reached = True
+            next_url_remaining = True
             break
         url = _scan_practitioner_role_reverse_lookup_url(
             source,
@@ -7281,6 +7305,12 @@ async def _fetch_scan_practitioner_role_rows(
             page_count=page_count,
         )
         while url and _limit_allows_more(rows_fetched, per_resource_limit):
+            if cancel_ctx is not None:
+                await raise_if_cancelled(cancel_ctx, cancel_task)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                deadline_reached = True
+                next_url_remaining = True
+                break
             if page_limit > 0 and pages >= page_limit:
                 page_limit_reached = True
                 next_url_remaining = True
@@ -7317,7 +7347,12 @@ async def _fetch_scan_practitioner_role_rows(
                 if not role_id or role_id in seen_role_ids:
                     continue
                 seen_role_ids.add(role_id)
-                rows.append(row)
+                if retain_rows:
+                    rows.append(row)
+                if row_batch_handler:
+                    pending_rows.append(row)
+                    if len(pending_rows) >= max(1, row_batch_size):
+                        await flush_pending_rows()
                 rows_fetched += 1
                 if not _limit_allows_more(rows_fetched, per_resource_limit):
                     row_limit_reached = entry_index < len(entries) - 1
@@ -7330,26 +7365,30 @@ async def _fetch_scan_practitioner_role_rows(
                 break
         if row_limit_reached or page_limit_reached or hard_page_limit_reached:
             break
+        if deadline_reached:
+            break
 
+    await flush_pending_rows()
     complete = (
         not error_message
         and not row_limit_reached
         and not page_limit_reached
         and not hard_page_limit_reached
+        and not deadline_reached
         and not next_url_remaining
     )
     return ResourceFetchResult(
         model=model,
         rows=rows,
         rows_fetched=rows_fetched,
-        rows_written=0,
+        rows_written=rows_written,
         pages_fetched=pages,
         complete=complete,
         row_limit_reached=row_limit_reached,
         page_limit_reached=page_limit_reached,
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining,
-        error=error_message,
+        error=error_message or ("deadline_reached" if deadline_reached else None),
         fetch_mode="source_specific_reverse_lookup",
     )
 
@@ -8583,6 +8622,21 @@ async def _import_resources(
                 active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
                 active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
+            use_streaming = stream_batch_size > 0
+
+            async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                written = await _upsert_resource_rows(
+                    model,
+                    _copy_rows_for_source_ids(rows, source_ids),
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                    source_ids=source_ids,
+                )
+                await maybe_report_partial_progress(group_key, "PractitionerRole", written)
+                return written
+
             result = await _fetch_scan_practitioner_role_rows(
                 source,
                 rows_by_resource,
@@ -8591,17 +8645,27 @@ async def _import_resources(
                 page_count=page_count,
                 timeout=timeout,
                 run_id=run_id,
+                row_batch_handler=scan_role_row_batch_handler if use_streaming else None,
+                row_batch_size=stream_batch_size,
+                retain_rows=linked_resource_limit > 0 or not use_streaming,
+                cancel_ctx=cancel_ctx,
+                cancel_task=cancel_task,
+                deadline_seconds=linked_resource_deadline_seconds,
             )
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", result)
-            written_total = await _upsert_resource_rows(
-                result.model,
-                _copy_rows_for_source_ids(result.rows, source_ids),
-                run_id=run_id,
-                track_seen=stale_cleanup,
-                seen_table=seen_stage_table,
-                canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                source_ids=source_ids,
+            written_total = (
+                result.rows_written
+                if use_streaming
+                else await _upsert_resource_rows(
+                    result.model,
+                    _copy_rows_for_source_ids(result.rows, source_ids),
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                    source_ids=source_ids,
+                )
             )
             source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + written_total
             rows_by_resource["PractitionerRole"] = result.rows

@@ -4761,6 +4761,59 @@ async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitione
 
 
 @pytest.mark.asyncio
+async def test_fetch_scan_practitioner_role_rows_streams_reverse_lookup(monkeypatch):
+    async def fake_fetch_json(_source, _url, *, timeout):
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "fullUrl": "https://providerdirectory.scanhealthplan.com/PractitionerRole/role-1",
+                        "resource": {
+                            "resourceType": "PractitionerRole",
+                            "id": "role-1",
+                            "practitioner": {"reference": "Practitioner/prac-1"},
+                        },
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    streamed: list[list[dict[str, object]]] = []
+
+    async def row_batch_handler(_model, rows):
+        streamed.append(rows)
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {
+            "source_id": "scan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        },
+        {"Practitioner": [{"resource_id": "prac-1"}]},
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        row_batch_handler=row_batch_handler,
+        row_batch_size=1,
+        retain_rows=False,
+    )
+
+    assert result.rows == []
+    assert result.rows_fetched == 1
+    assert result.rows_written == 1
+    assert streamed[0][0]["resource_id"] == "role-1"
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
