@@ -1782,10 +1782,10 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_allows_scoped_group_plan_office_visit(monkeypatch):
-    seen_args = {}
+    captured_search_args_map = {}
 
     async def fake_search(_session, args, pagination):
-        seen_args.update(args)
+        captured_search_args_map.update(args)
         return {
             "items": [],
             "pagination": {
@@ -1814,8 +1814,8 @@ async def test_list_providers_by_procedure_allows_scoped_group_plan_office_visit
 
     await list_providers_by_procedure(request)
 
-    assert seen_args["code"] == "99213"
-    assert seen_args["classification"] == "Family Medicine"
+    assert captured_search_args_map["code"] == "99213"
+    assert captured_search_args_map["classification"] == "Family Medicine"
 
 
 @pytest.mark.asyncio

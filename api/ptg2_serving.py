@@ -4670,9 +4670,10 @@ async def _search_multi_ptg2_snapshots(
             base_query = dict(payload.get("query") or {})
         page_info = payload.get("pagination") or {}
         try:
-            total += int(page_info.get("total") or 0)
+            page_total = int(page_info.get("total") or 0)
         except (TypeError, ValueError):
-            pass
+            page_total = 0
+        total += page_total
         items = payload.get("items") or []
         if items:
             matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})

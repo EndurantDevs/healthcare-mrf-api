@@ -834,19 +834,19 @@ def _is_broad_office_visit_cpt(code_system: Any, code: Any) -> bool:
 
 def _reject_broad_group_plan_provider_expansion(
     args: Mapping[str, Any],
-    *,
-    code: str,
-    code_system: Any,
-    plan_id: str,
-    plan_external_id: str,
-    plan_market_type: str,
-    state: str,
-    city: str,
-    zip5: str,
-    latitude: float | None,
-    longitude: float | None,
-    npi: int | None,
+    context: Mapping[str, Any],
 ) -> None:
+    code = str(context.get("code") or "")
+    code_system = context.get("code_system")
+    plan_id = str(context.get("plan_id") or "")
+    plan_external_id = str(context.get("plan_external_id") or "")
+    plan_market_type = str(context.get("plan_market_type") or "")
+    state = str(context.get("state") or "")
+    city = str(context.get("city") or "")
+    zip5 = str(context.get("zip5") or "")
+    latitude = context.get("latitude")
+    longitude = context.get("longitude")
+    npi = context.get("npi")
     if plan_market_type != "group":
         return
     if not (plan_id or plan_external_id):
@@ -866,7 +866,7 @@ def _reject_broad_group_plan_provider_expansion(
     )
     if not has_location:
         return
-    if npi is not None:
+    if _parse_int(npi, "npi", minimum=1) is not None:
         return
     specialty_filter = resolve_provider_specialty_filter(args)
     if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
@@ -7185,17 +7185,19 @@ async def list_providers_by_procedure(request):
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
     _reject_broad_group_plan_provider_expansion(
         args,
-        code=code,
-        code_system=args.get("code_system"),
-        plan_id=plan_id,
-        plan_external_id=plan_external_id,
-        plan_market_type=plan_market_type,
-        state=state,
-        city=city,
-        zip5=zip5,
-        latitude=latitude,
-        longitude=longitude,
-        npi=npi,
+        {
+            "code": code,
+            "code_system": args.get("code_system"),
+            "plan_id": plan_id,
+            "plan_external_id": plan_external_id,
+            "plan_market_type": plan_market_type,
+            "state": state,
+            "city": city,
+            "zip5": zip5,
+            "latitude": latitude,
+            "longitude": longitude,
+            "npi": npi,
+        },
     )
     if mode:
         try:
