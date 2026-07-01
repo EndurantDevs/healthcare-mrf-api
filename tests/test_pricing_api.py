@@ -290,6 +290,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         "state": "IL",
         "zip5": "60626",
         "include_mail_addresses": False,
+        "address_source": "npi",
         "address_types": ["primary", "secondary"],
     }
     assert payload["providers"]["total_distinct"] == 1
@@ -315,6 +316,88 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     assert params["location_city"] == "chicago"
     assert params["location_state"] == "IL"
     assert params["location_zip5"] == "60626"
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_uses_unified_service_locations_when_configured(monkeypatch):
+    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+        return "ptg2:test"
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+
+    async def fake_group_plan_provider_address_source(_session):
+        return "mrf.entity_address_unified", True, True, True
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_id_for_plan",
+        fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    monkeypatch.setattr(
+        pricing_module,
+        "_group_plan_provider_address_source",
+        fake_group_plan_provider_address_source,
+    )
+    request = make_request(
+        [
+            FakeResult(rows=[types.SimpleNamespace(npi=1003362153)]),
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1003362153,
+                        "type": "practice",
+                        "first_line": "2335 S MICHIGAN AVE",
+                        "second_line": None,
+                        "city_name": "CHICAGO",
+                        "state_name": "IL",
+                        "postal_code": "606160000",
+                        "zip5": "60616",
+                        "phone_number": "3125550100",
+                        "address_precision": "street",
+                        "plan_coverage_match": False,
+                    }
+                ]
+            ),
+        ],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "classification": "Family Medicine",
+            "city": "Chicago",
+            "state": "IL",
+            "enrich": "0",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    payload = json.loads(response.body)
+
+    assert payload["location_filter"]["address_source"] == "unified"
+    assert payload["location_filter"]["address_types"] == ["practice", "site", "primary", "secondary"]
+    assert payload["providers"]["items"][0]["address"] == {
+        "type": "practice",
+        "first_line": "2335 S MICHIGAN AVE",
+        "second_line": None,
+        "city": "CHICAGO",
+        "state": "IL",
+        "postal_code": "606160000",
+        "zip5": "60616",
+        "phone_number": "3125550100",
+        "address_precision": "street",
+        "plan_coverage_match": False,
+    }
+    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
+    address_sql = str(request.ctx.sa_session.executions[1][0][0])
+    assert "mrf.entity_address_unified addr" in provider_sql
+    assert "addr.type IN ('practice', 'site', 'primary', 'secondary')" in provider_sql
+    assert "UPPER(COALESCE(addr.state_code, addr.state_name, '')) = :location_state" in provider_sql
+    assert "mrf.entity_address_unified addr" in address_sql
+    assert "addr.group_plan_array @> ARRAY[:plan_id]::varchar[]" in address_sql
+    assert "mrf.entity_address_plan_bridge eapb" in address_sql
+    assert "CASE addr.type WHEN 'practice' THEN 0" in address_sql
 
 
 @pytest.mark.asyncio

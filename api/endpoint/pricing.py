@@ -268,6 +268,20 @@ def _parse_pricing_default_year() -> int | None:
 
 PRICING_DEFAULT_YEAR = _parse_pricing_default_year()
 PRICING_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
+GROUP_PLAN_LEGACY_ADDRESS_TYPES = ("primary", "secondary")
+GROUP_PLAN_UNIFIED_ADDRESS_TYPES = ("practice", "site", "primary", "secondary")
+GROUP_PLAN_UNIFIED_BASE_ADDRESS_COLUMNS = {
+    "npi",
+    "type",
+    "city_name",
+    "state_name",
+    "postal_code",
+    "first_line",
+    "second_line",
+    "phone_number",
+}
 quality_score_table = Table(
     QUALITY_SCORE_TABLE_NAME,
     MetaData(),
@@ -1485,6 +1499,56 @@ async def _table_columns(session, table_name: str) -> set[str]:
     if ENABLE_PRICING_SCHEMA_CACHE:
         _PRICING_TABLE_COLUMNS_CACHE[qualified_name] = (time.monotonic(), columns)
     return set(columns)
+
+
+def _address_serving_unified_requested() -> bool:
+    raw = str(os.getenv(ADDRESS_SERVING_SOURCE_ENV, "")).strip().lower()
+    if not raw:
+        return False
+    return raw == ADDRESS_SERVING_SOURCE_UNIFIED or raw.endswith(f".{ADDRESS_SERVING_SOURCE_UNIFIED}")
+
+
+async def _group_plan_provider_address_source(session) -> tuple[str, bool, bool, bool]:
+    legacy_table = f"{PRICING_SCHEMA}.npi_address"
+    if not _address_serving_unified_requested():
+        return legacy_table, False, False, False
+
+    unified_table = f"{PRICING_SCHEMA}.entity_address_unified"
+    columns = await _table_columns(session, EntityAddressUnified.__tablename__)
+    if not GROUP_PLAN_UNIFIED_BASE_ADDRESS_COLUMNS.issubset(columns):
+        return legacy_table, False, False, False
+
+    coverage_supported = {"group_plan_array", "ptg_plan_array"}.issubset(columns)
+    plan_bridge_supported = "location_key" in columns and await _table_exists(session, "entity_address_plan_bridge")
+    return unified_table, True, coverage_supported, plan_bridge_supported
+
+
+def _group_plan_provider_coverage_match_sql(
+    address_alias: str,
+    *,
+    array_coverage_supported: bool,
+    plan_bridge_supported: bool,
+) -> str:
+    clauses: list[str] = []
+    if array_coverage_supported:
+        clauses.extend((
+            f"{address_alias}.group_plan_array @> ARRAY[:plan_id]::varchar[]",
+            f"{address_alias}.ptg_plan_array @> ARRAY[:plan_id]::varchar[]",
+        ))
+    if plan_bridge_supported:
+        clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {PRICING_SCHEMA}.entity_address_plan_bridge eapb
+                 WHERE eapb.location_key = {address_alias}.location_key
+                   AND eapb.plan_id = :plan_id
+            )"""
+        )
+    return "(" + " OR ".join(clauses) + ")" if clauses else "FALSE"
+
+
+def _group_plan_provider_address_type_sql(address_types: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in address_types)
 
 
 def _normalize_term_key(value: Any) -> str:
@@ -4445,6 +4509,7 @@ async def group_plan_providers(request):
         "limit": limit,
         "npi_min": NPI_MIN,
         "npi_max": NPI_MAX,
+        "plan_id": plan_id,
     }
     taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
         "gm.npi",
@@ -4453,25 +4518,47 @@ async def group_plan_providers(request):
         specialty_filter,
     ) if specialty_filter.active else ""
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
+    location_filter_active = bool(city or state or zip5)
+    address_table = f"{PRICING_SCHEMA}.npi_address"
+    using_unified_addresses = False
+    array_coverage_supported = False
+    plan_bridge_supported = False
+    if location_filter_active:
+        (
+            address_table,
+            using_unified_addresses,
+            array_coverage_supported,
+            plan_bridge_supported,
+        ) = await _group_plan_provider_address_source(session)
+    address_types = GROUP_PLAN_UNIFIED_ADDRESS_TYPES if using_unified_addresses else GROUP_PLAN_LEGACY_ADDRESS_TYPES
+    state_expr = (
+        "UPPER(COALESCE(addr.state_code, addr.state_name, ''))"
+        if using_unified_addresses
+        else "UPPER(COALESCE(addr.state_name, ''))"
+    )
+    zip5_expr = (
+        "COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5))"
+        if using_unified_addresses
+        else "LEFT(COALESCE(addr.postal_code, ''), 5)"
+    )
     location_clauses: list[str] = ["addr.npi = gm.npi"]
     if not include_mail_addresses:
-        location_clauses.append("addr.type IN ('primary', 'secondary')")
+        location_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
     if city:
         params["location_city"] = city
         location_clauses.append("LOWER(COALESCE(addr.city_name, '')) = :location_city")
     if state:
         params["location_state"] = state
-        location_clauses.append("UPPER(COALESCE(addr.state_name, '')) = :location_state")
+        location_clauses.append(f"{state_expr} = :location_state")
     if zip5:
         params["location_zip5"] = zip5
-        location_clauses.append("LEFT(COALESCE(addr.postal_code, ''), 5) = :location_zip5")
-    location_filter_active = bool(city or state or zip5)
+        location_clauses.append(f"{zip5_expr} = :location_zip5")
     location_predicate = ""
     if location_filter_active:
         location_where = "\n                      AND ".join(location_clauses)
         location_predicate = f"""EXISTS (
                     SELECT 1
-                      FROM mrf.npi_address addr
+                      FROM {address_table} addr
                      WHERE {location_where}
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
@@ -4507,37 +4594,71 @@ async def group_plan_providers(request):
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
     if location_filter_active and npis:
-        address_params: dict[str, Any] = {"npis": npis}
-        address_clauses = ["npi = ANY(:npis)"]
+        address_params: dict[str, Any] = {"npis": npis, "plan_id": plan_id}
+        address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
-            address_clauses.append("type IN ('primary', 'secondary')")
+            address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
         if city:
             address_params["location_city"] = city
-            address_clauses.append("LOWER(COALESCE(city_name, '')) = :location_city")
+            address_clauses.append("LOWER(COALESCE(addr.city_name, '')) = :location_city")
         if state:
             address_params["location_state"] = state
-            address_clauses.append("UPPER(COALESCE(state_name, '')) = :location_state")
+            address_clauses.append(f"{state_expr} = :location_state")
         if zip5:
             address_params["location_zip5"] = zip5
-            address_clauses.append("LEFT(COALESCE(postal_code, ''), 5) = :location_zip5")
+            address_clauses.append(f"{zip5_expr} = :location_zip5")
         address_where = "\n                   AND ".join(address_clauses)
+        coverage_match_sql = _group_plan_provider_coverage_match_sql(
+            "addr",
+            array_coverage_supported=array_coverage_supported,
+            plan_bridge_supported=plan_bridge_supported,
+        )
+        state_select_sql = (
+            "COALESCE(addr.state_code, addr.state_name) AS state_name"
+            if using_unified_addresses
+            else "addr.state_name AS state_name"
+        )
+        zip5_select_sql = (
+            "COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)) AS zip5"
+            if using_unified_addresses
+            else "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5"
+        )
+        phone_select_sql = (
+            "COALESCE(addr.phone_number, addr.telephone_number) AS phone_number"
+            if using_unified_addresses
+            else "addr.phone_number AS phone_number"
+        )
+        precision_select_sql = (
+            "addr.address_precision AS address_precision,"
+            if using_unified_addresses
+            else "NULL::varchar AS address_precision,"
+        )
+        type_rank_sql = (
+            "CASE addr.type WHEN 'practice' THEN 0 WHEN 'site' THEN 1 WHEN 'primary' THEN 2 WHEN 'secondary' THEN 3 ELSE 4 END"
+            if using_unified_addresses
+            else "CASE addr.type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END"
+        )
         address_rows = (await session.execute(
             text(
                 f"""
-                SELECT npi,
-                       type,
-                       first_line,
-                       second_line,
-                       city_name,
-                       state_name,
-                       postal_code,
-                       phone_number
-                  FROM mrf.npi_address
+                SELECT addr.npi,
+                       addr.type,
+                       addr.first_line,
+                       addr.second_line,
+                       addr.city_name,
+                       {state_select_sql},
+                       addr.postal_code,
+                       {zip5_select_sql},
+                       {phone_select_sql},
+                       {precision_select_sql}
+                       {coverage_match_sql} AS plan_coverage_match
+                  FROM {address_table} addr
                  WHERE {address_where}
-                 ORDER BY npi,
-                          CASE type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
-                          postal_code,
-                          first_line
+                 ORDER BY addr.npi,
+                          CASE WHEN {coverage_match_sql} THEN 0 ELSE 1 END,
+                          {type_rank_sql},
+                          addr.postal_code,
+                          addr.first_line
                 """
             ),
             address_params,
@@ -4550,9 +4671,12 @@ async def group_plan_providers(request):
                 "city": row.get("city_name"),
                 "state": row.get("state_name"),
                 "postal_code": row.get("postal_code"),
-                "zip5": str(row.get("postal_code") or "")[:5] or None,
+                "zip5": row.get("zip5") or str(row.get("postal_code") or "")[:5] or None,
                 "phone_number": row.get("phone_number"),
             }
+            if using_unified_addresses:
+                address["address_precision"] = row.get("address_precision")
+                address["plan_coverage_match"] = bool(row.get("plan_coverage_match"))
             addresses_by_npi.setdefault(int(row["npi"]), []).append(address)
     if enrich and npis:
         enrich_rows = (await session.execute(
@@ -4594,7 +4718,10 @@ async def group_plan_providers(request):
             "state": state or None,
             "zip5": zip5 or None,
             "include_mail_addresses": include_mail_addresses,
-            "address_types": ["primary", "secondary"] if location_filter_active and not include_mail_addresses else None,
+            "address_source": "unified" if location_filter_active and using_unified_addresses else (
+                "npi" if location_filter_active else None
+            ),
+            "address_types": list(address_types) if location_filter_active and not include_mail_addresses else None,
         },
         "providers": {
             "count": len(items),
