@@ -2662,11 +2662,13 @@ async def test_master_list_keeps_high_value_public_aliases():
         "HealthPartners Dental Coverage": ("dental",),
         "Guardian Dental": ("dental",),
         "Guardian Vision": ("vision",),
+        "Healthgram Dental and Vision Coverage": ("dental", "vision"),
         "Highmark Dental and Vision Coverage": ("dental", "vision"),
         "HNAS Dental Network Coverage": ("dental",),
         "HRI Dental and Vision": ("dental", "vision"),
         "Humana Dental": ("dental",),
         "Humana Vision": ("vision",),
+        "IAEC Dental and Vision Plans": ("dental", "vision"),
         "International Medical Solutions Coverage": ("medical", "dental", "vision"),
         "LIBERTY Dental Plan": ("dental",),
         "Loomis Dental Coverage": ("dental",),
@@ -2922,6 +2924,12 @@ async def test_master_list_keeps_high_value_public_aliases():
         "HealthPartners Dental"
         in ancillary_by_name["HealthPartners Dental Coverage"].aliases
     )
+    assert (
+        "Healthgram Dental"
+        in ancillary_by_name["Healthgram Dental and Vision Coverage"].aliases
+    )
+    assert "IAEC Dental Plan" in ancillary_by_name["IAEC Dental and Vision Plans"].aliases
+    assert "IAEC Vision Plan" in ancillary_by_name["IAEC Dental and Vision Plans"].aliases
     assert (
         "Blue Edge Dental"
         in ancillary_by_name["Highmark Dental and Vision Coverage"].aliases
