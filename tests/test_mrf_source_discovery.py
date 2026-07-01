@@ -192,6 +192,10 @@ def test_source_urls_are_loaded_from_registry_file():
         == "monthly_toc_templates"
     )
     assert (
+        config["platform_resolvers"]["oscar_s3_monthly_toc"]["type"]
+        == "monthly_toc_templates"
+    )
+    assert (
         config["platform_resolvers"]["uha_monthly_toc"]["type"]
         == "monthly_toc_templates"
     )
@@ -373,6 +377,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency"
         )
         == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.hioscar.com/transparency-in-coverage-files/oscar"
+        )
+        == "oscar_s3_monthly_toc"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -2359,6 +2369,36 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert len(mercycare) == 2
     assert {candidate.hosting_platform for candidate in mercycare} == {"html_mrf_links"}
     assert all(candidate.benefit_lines == ("medical",) for candidate in mercycare)
+
+
+@pytest.mark.asyncio
+async def test_master_list_uses_current_public_source_urls_for_selected_payers():
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+    by_name = {}
+    for candidate in candidates:
+        by_name.setdefault(candidate.payer_name, []).append(candidate)
+
+    healthfirst = by_name["Healthfirst"]
+    assert {candidate.index_url for candidate in healthfirst} == {
+        "https://tic.healthfirst.org/table-of-contents-hixplan.json",
+        "https://tic.healthfirst.org/table-of-contents-hixplan-prof.json",
+        "https://tic.healthfirst.org/table-of-contents-hixplan-inst.json",
+    }
+    assert {candidate.hosting_platform for candidate in healthfirst} == {"direct_toc"}
+
+    assert by_name["Oscar Health"][0].hosting_platform == "oscar_s3_monthly_toc"
+    assert by_name["MetroPlus Health"][0].index_url == (
+        "https://metroplus.org/machine-readable-files/"
+    )
+    assert by_name["MetroPlus Health"][0].hosting_platform == "html_mrf_links"
+    assert by_name["Tufts Health Plan"][0].index_url == (
+        "https://tuftshealthplan.com/legal-notices/machine-readable-files"
+    )
+    assert by_name["Tufts Health Plan"][0].hosting_platform == (
+        "point32_azure_mrf_directory"
+    )
 
 
 @pytest.mark.asyncio
@@ -11102,6 +11142,32 @@ def test_bcbsmn_monthly_toc_template_generates_public_index_targets():
     ]
     assert targets[0].metadata["resolver"] == "monthly_toc_templates"
     assert targets[0].metadata["target_file_type"] == "table-of-contents"
+
+
+def test_oscar_monthly_toc_template_uses_compact_month_start():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Direct Plan",
+    }
+    resolver = discovery._source_config()["platform_resolvers"][
+        "oscar_s3_monthly_toc"
+    ]
+
+    targets = discovery._monthly_toc_targets(
+        source,
+        "https://www.hioscar.com/transparency-in-coverage-files/oscar",
+        resolver,
+        now=discovery.dt.datetime(2026, 7, 23, 12, 0, 0),
+    )
+
+    assert [target.url for target in targets] == [
+        "https://hioscar-cms-tic-us-east-1.s3.amazonaws.com/oscar/"
+        "20260701_oscar_index.json",
+        "https://hioscar-cms-tic-us-east-1.s3.amazonaws.com/oscar/"
+        "20260601_oscar_index.json",
+    ]
+    assert targets[0].metadata["month_start"] == "2026-07-01"
 
 
 def test_sutter_monthly_toc_template_generates_sitecore_index_target():

@@ -1122,6 +1122,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if (
+        host in {"www.hioscar.com", "hioscar.com"}
+        and "transparency-in-coverage-files" in path
+    ):
+        return "oscar_s3_monthly_toc"
+    if (
         host in {"thealliance.health", "www.thealliance.health"}
         and "transparency-in-coverage-cms-9915-machine-readable-files" in path
     ):
@@ -9909,6 +9914,7 @@ def _monthly_toc_targets(
             "year": month_date.strftime("%Y"),
             "month": month_date.strftime("%m"),
             "month_start": month_date.strftime("%Y-%m-01"),
+            "month_start_compact": month_date.strftime("%Y%m01"),
             "month_prefix": month_date.strftime("%Y-%m"),
             "yyyymm": month_date.strftime("%Y%m"),
         }

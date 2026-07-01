@@ -124,7 +124,7 @@ Last one-time research refresh: 2026-06-05.
 | Devoted Health | dtc | https://www.devoted.com/plan-documents/ | public transparency URL |
 | Firefly Health | dtc | https://www.fireflyhealth.com/pricing-transparency/ | public price-transparency page points to Opyn Health member portal, not a public pricing MRF TOC; source tier: coverage_evidence; benefit lines: medical; source coverage: Firefly price-transparency and member portal evidence; vendor names: Firefly Health, Opyn Health; plan names: Firefly Health Plan; aliases: Firefly, Firefly Health Plan |
 | Gravie | dtc | https://www.gravie.com/compliance/transparency-in-coverage/ | public transparency URL |
-| Oscar Health | dtc | https://www.hioscar.com/transparency-in-coverage-files/oscar | curated source row |
+| Oscar Health | dtc | https://www.hioscar.com/transparency-in-coverage-files/oscar | public Oscar transparency page resolves to current monthly S3 table of contents; aliases: Oscar, Oscar Health Plan |
 | Sidecar Health | dtc | https://sidecarhealth.com/transparency-in-coverage/ | public transparency URL |
 | Alameda Alliance / CalOptima / CalViva / Central CA Alliance / Contra Costa / Partnership HealthPlan / Health Plan of San Mateo / Denver Health / Hennepin Health | medicaid_mco | - | needs official source URL |
 | Alameda Alliance for Health | medicaid_mco | https://alamedaalliance.org/about/pricing-transparency/ | public transparency URL |
@@ -135,13 +135,14 @@ Last one-time research refresh: 2026-06-05.
 | Central California Alliance for Health | medicaid_mco | https://thealliance.health/about-the-alliance/transparency-in-coverage-cms-9915-machine-readable-files/ | public transparency URL |
 | Community Care of NC | medicaid_mco | - | needs official source URL |
 | Health Alliance Plan | medicaid_mco | - | represented by HAP public MRF page alias |
-| Healthfirst | medicaid_mco | https://healthfirst.org/machine-readable-files/ | curated source row |
+| Healthfirst | medicaid_mco | https://tic.healthfirst.org/table-of-contents-hixplan.json | public direct Healthfirst table of contents; benefit lines: medical; aliases: Healthfirst NY, Healthfirst PHSP |
+| Healthfirst | medicaid_mco | https://tic.healthfirst.org/table-of-contents-hixplan-prof.json | public direct Healthfirst professional table of contents; benefit lines: medical; aliases: Healthfirst NY, Healthfirst PHSP |
+| Healthfirst | medicaid_mco | https://tic.healthfirst.org/table-of-contents-hixplan-inst.json | public direct Healthfirst institutional table of contents; benefit lines: medical; aliases: Healthfirst NY, Healthfirst PHSP |
 | Highmark Independence National Alliance | medicaid_mco | - | needs official source URL |
 | Inland Empire Health Plan | medicaid_mco | - | needs official source URL |
 | LA Care Health Plan | medicaid_mco | https://www.lacare.org/transparency-coverage-machine-readable-files | public transparency URL |
 | Meridian | medicaid_mco | - | needs official source URL |
-| MetroPlus Health | medicaid_mco | https://www.metroplus.org/provider/provider-resources/price-transparency | curated source row |
-| MetroPlus Health | medicaid_mco | https://metroplus.org/machine-readable-files/ | public transparency URL |
+| MetroPlus Health | medicaid_mco | https://metroplus.org/machine-readable-files/ | current public machine-readable files page with direct Azure JSON files; aliases: MetroPlus, MetroPlusHealth |
 | Molina | medicaid_mco | - | needs official source URL |
 | Molina Healthcare | medicaid_mco | https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency | observed current; 719 plans; 7,776 files |
 | Neighborhood Health Plan RI | medicaid_mco | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | curated source row |
@@ -404,7 +405,7 @@ Last one-time research refresh: 2026-06-05.
 | The Health Plan | regional | https://www.healthplan.org/machine_readable_files | public parent MRF page with network-specific directories; aliases: The Health Plan of West Virginia, The Health Plan of WV, The Health Plan of the Upper Ohio Valley, THP |
 | The Health Plan of the Upper Ohio Valley | regional | - | represented by The Health Plan public parent MRF page alias |
 | The Jefferson Health Plan | regional | - | needs official source URL |
-| Tufts Health Plan | regional | https://tuftshealthplan.com/visitor/legal-notices/machine-readable-files | curated source row |
+| Tufts Health Plan | regional | https://tuftshealthplan.com/legal-notices/machine-readable-files | current public Tufts machine-readable files page backed by Point32 Azure directory |
 | UHA Health Insurance | regional | https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview | curated source row; aliases: UHA |
 | UHA Dental Coverage | regional | https://www.uhahealth.com/wp-content/uploads/dental-hds-benefits-1500.pdf | official UHA-hosted Hawaii Dental Service benefit summary; source tier: coverage evidence; benefit lines: dental; aliases: UHA, UHA Health Insurance, Hawaii Dental Service, HDS |
 | UHA Vision Coverage | regional | https://www.uhahealth.com/our-plans | official UHA group health plan page states vision is built into plans; source tier: coverage evidence; benefit lines: vision; aliases: UHA, UHA Health Insurance, UHA Vision |
