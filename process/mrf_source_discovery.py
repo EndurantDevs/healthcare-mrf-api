@@ -1141,6 +1141,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-files" in path
     ):
         return "html_mrf_links"
+    if (
+        host in {"www.amerihealthcaritas.com", "amerihealthcaritas.com"}
+        and "price-transparency" in path
+    ):
+        return "html_mrf_links"
     if host == "sisconosurprise.com" and path.startswith("/ppo/"):
         return "html_mrf_links"
     if host == "caa.imagine360.com" and path.endswith("/index.html"):
@@ -1444,6 +1449,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host in {"alliantplans.com", "www.alliantplans.com"} and path.startswith(
         "/json/pt/"
     ):
+        return "html_mrf_links"
+    if host in {"aultcare.com", "www.aultcare.com"} and "price-transparency" in path:
         return "html_mrf_links"
     if host in {"www.bcbst.com", "bcbst.com"} and path.startswith("/tcr"):
         return "json_mrf_directory_links"

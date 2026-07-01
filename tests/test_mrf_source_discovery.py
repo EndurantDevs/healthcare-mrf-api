@@ -352,6 +352,16 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.amerihealthcaritas.com/price-transparency/"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://aultcare.com/price-transparency")
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency"
         )
         == "html_mrf_links"
