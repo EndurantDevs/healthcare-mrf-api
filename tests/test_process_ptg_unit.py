@@ -5165,3 +5165,14 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
     assert logical.member_name == "nested/rates.json"
     assert logical.logical_path != str(raw_path)
     assert Path(logical.logical_path).read_bytes() == expected
+
+
+def test_scanner_error_labels_sigterm():
+    message = ptg_rust_scanner._scanner_error_message(
+        "PTG2 Rust compact scanner",
+        -15,
+        ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+    )
+
+    assert "signal 15 (SIGTERM)" in message
+    assert "PTG2_DEDUPE_SUMMARY" in message

@@ -113,7 +113,7 @@ def _log_ptg2_rust_scanner_binary(binary: Path) -> None:
 
 
 def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]) -> str:
-    return f"{prefix} failed with exit code {return_code}: {chr(10).join(stderr_tail)[-1000:]}"
+    return f"{prefix} failed with {_scanner_return_code_label(return_code)}: {chr(10).join(stderr_tail)[-1000:]}"
 
 
 def _scanner_progress_fields(line: str) -> dict[str, str] | None:
@@ -551,3 +551,16 @@ async def _aiter_compact_serving_records_rust(
                     if "generator already executing" not in str(exc):
                         raise
             reader_thread.join(timeout=5)
+
+
+def _scanner_return_code_label(return_code: int) -> str:
+    if return_code >= 0:
+        return f"exit code {return_code}"
+    signal_number = -return_code
+    try:
+        import signal
+
+        signal_name = signal.Signals(signal_number).name
+    except ValueError:
+        return f"signal {signal_number}"
+    return f"signal {signal_number} ({signal_name})"

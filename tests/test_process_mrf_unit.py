@@ -1605,3 +1605,51 @@ async def test_save_mrf_data_skips_mrf_address_aggregate_ingest(monkeypatch):
     )
 
     assert calls == [("mrf_address_evidence_20260612", [{"evidence_checksum": 2}], {})]
+
+
+def test_ptg_timeout_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_JOB_TIMEOUT", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG_HUGE_JOB_TIMEOUT", raising=False)
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTGHuge.job_timeout == 172800
+        assert reloaded.PTGHuge.functions[0].name == "ptg_control_start"
+        assert reloaded.PTGHuge.functions[0].timeout_s == 172800
+    finally:
+        importlib.reload(process_pkg)
+
+
+def test_ptg_timeout_override(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG_JOB_TIMEOUT", "3456")
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTG.job_timeout == 3456
+        assert reloaded.PTG.functions[0].timeout_s == 3456
+        assert reloaded.PTGSmall.functions[0].timeout_s == 3456
+        assert reloaded.PTGNormal.functions[0].timeout_s == 3456
+        assert reloaded.PTGLarge.functions[0].timeout_s == 3456
+        assert reloaded.PTGHuge.functions[0].timeout_s == 3456
+    finally:
+        monkeypatch.delenv("HLTHPRT_PTG_JOB_TIMEOUT", raising=False)
+        importlib.reload(process_pkg)
+
+
+def test_ptg_lane_timeout_override(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG_JOB_TIMEOUT", "3456")
+    monkeypatch.setenv("HLTHPRT_PTG_HUGE_JOB_TIMEOUT", "7890")
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTGLarge.job_timeout == 3456
+        assert reloaded.PTGLarge.functions[0].timeout_s == 3456
+        assert reloaded.PTGHuge.job_timeout == 7890
+        assert reloaded.PTGHuge.functions[0].timeout_s == 7890
+    finally:
+        monkeypatch.delenv("HLTHPRT_PTG_JOB_TIMEOUT", raising=False)
+        monkeypatch.delenv("HLTHPRT_PTG_HUGE_JOB_TIMEOUT", raising=False)
+        importlib.reload(process_pkg)

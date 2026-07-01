@@ -176,8 +176,20 @@ def _ptg_queue_read_limit(name: str, max_jobs: int) -> int:
     return max(16, 4 * max_jobs)
 
 
+def _ptg_job_timeout(name: str | None = None) -> int:
+    default = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    if name:
+        return max(_worker_int_env(name, default), 1)
+    return max(default, 1)
+
+
+def _ptg_control_functions(timeout: int):
+    from arq.worker import func as arq_func
+
+    return [arq_func(ptg_control_start, timeout=timeout)]
+
+
 class PTG:
-    functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PTG_JOBS")) if os.environ.get("HLTHPRT_MAX_PTG_JOBS") else 1
     queue_read_limit = (
@@ -185,7 +197,8 @@ class PTG:
         if os.environ.get("HLTHPRT_PTG_QUEUE_READ_LIMIT")
         else max(16, 4 * max_jobs)
     )
-    job_timeout = int(os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT") else 172800
+    job_timeout = _ptg_job_timeout()
+    functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTG"
     redis_settings = build_redis_settings()
@@ -194,11 +207,11 @@ class PTG:
 
 
 class PTGSmall:
-    functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_SMALL_JOBS", 16)
     queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_SMALL_QUEUE_READ_LIMIT", max_jobs)
-    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    job_timeout = _ptg_job_timeout("HLTHPRT_PTG_SMALL_JOB_TIMEOUT")
+    functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTGSmall"
     redis_settings = build_redis_settings()
@@ -207,11 +220,11 @@ class PTGSmall:
 
 
 class PTGNormal:
-    functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_NORMAL_JOBS", 8)
     queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_NORMAL_QUEUE_READ_LIMIT", max_jobs)
-    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    job_timeout = _ptg_job_timeout("HLTHPRT_PTG_NORMAL_JOB_TIMEOUT")
+    functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTGNormal"
     redis_settings = build_redis_settings()
@@ -220,11 +233,11 @@ class PTGNormal:
 
 
 class PTGLarge:
-    functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_LARGE_JOBS", 3)
     queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_LARGE_QUEUE_READ_LIMIT", max_jobs)
-    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    job_timeout = _ptg_job_timeout("HLTHPRT_PTG_LARGE_JOB_TIMEOUT")
+    functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTGLarge"
     redis_settings = build_redis_settings()
@@ -233,11 +246,11 @@ class PTGLarge:
 
 
 class PTGHuge:
-    functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_HUGE_JOBS", 1)
     queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_HUGE_QUEUE_READ_LIMIT", max_jobs)
-    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    job_timeout = _ptg_job_timeout("HLTHPRT_PTG_HUGE_JOB_TIMEOUT")
+    functions = _ptg_control_functions(job_timeout)
     burst = True
     queue_name = "arq:PTGHuge"
     redis_settings = build_redis_settings()
