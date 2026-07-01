@@ -2338,6 +2338,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         )
     benefit_lines_by_ancillary_name = {
         "Auxiant Ancillary Benefits": ("dental", "vision"),
+        "ASR Health Benefits Dental and Vision Coverage": ("dental", "vision"),
         "BCBS Alabama Dental Coverage": ("dental",),
         "BCBS Arizona Dental Coverage": ("dental",),
         "BCBS Kansas City Dental and Vision Coverage": ("dental", "vision"),
@@ -2347,15 +2348,23 @@ async def test_master_list_keeps_high_value_public_aliases():
         "BCBS South Carolina Vision Coverage": ("vision",),
         "BCBS Tennessee Dental and Vision Coverage": ("dental", "vision"),
         "Beam Benefits Ancillary Coverage": ("dental", "vision"),
+        "BEST Life Dental and Vision Coverage": ("dental", "vision"),
         "CBA Blue Dental Coverage": ("dental",),
         "Consociate Health Ancillary Benefits": ("dental", "vision"),
+        "Direct Dental Coverage": ("dental",),
         "EBPA Medical and Dental Coverage": ("dental",),
         "EMI Health Vision Coverage": ("vision",),
         "HealthPartners Dental Coverage": ("dental",),
+        "HNAS Dental Network Coverage": ("dental",),
         "HRI Dental and Vision": ("dental", "vision"),
+        "Loomis Dental Coverage": ("dental",),
         "MetLife Dental Coverage": ("dental",),
+        "MedBen Dental and Vision Coverage": ("dental", "vision"),
         "Reliance Matrix Dental and Vision": ("dental", "vision"),
         "Tall Tree Dental Coverage": ("dental",),
+        "UHA Dental Coverage": ("dental",),
+        "UHA Vision Coverage": ("vision",),
+        "UPMC Dental and Vision Coverage": ("dental", "vision"),
         "Wellmark Blue Dental Coverage": ("dental",),
     }
     ancillary_by_name = {
@@ -2447,6 +2456,8 @@ async def test_master_list_keeps_high_value_public_aliases():
         "dental",
         "vision",
     )
+    assert "Empire BlueCross BlueShield" in by_name["Anthem"].aliases
+    assert "Empire HealthChoice HMO, Inc." in by_name["Anthem"].aliases
     assert by_name["CareFirst BCBS"].benefit_lines == (
         "medical",
         "dental",
@@ -2515,12 +2526,24 @@ async def test_master_list_keeps_high_value_public_aliases():
         in ancillary_by_name["BCBS Tennessee Dental and Vision Coverage"].aliases
     )
     assert "Dental Blue Network" in ancillary_by_name["CBA Blue Dental Coverage"].aliases
+    assert "Direct Dental Administrators" in ancillary_by_name["Direct Dental Coverage"].aliases
     assert "VSP Choice" in ancillary_by_name["EMI Health Vision Coverage"].aliases
     assert (
         "HealthPartners Dental"
         in ancillary_by_name["HealthPartners Dental Coverage"].aliases
     )
+    assert "ASR Vision" in ancillary_by_name["ASR Health Benefits Dental and Vision Coverage"].aliases
+    assert (
+        "BEST Life and Health Insurance Company"
+        in ancillary_by_name["BEST Life Dental and Vision Coverage"].aliases
+    )
+    assert "HealthNow Administrative Services Dental" in ancillary_by_name["HNAS Dental Network Coverage"].aliases
+    assert "Loomis Benefit Administrators" in ancillary_by_name["Loomis Dental Coverage"].aliases
+    assert "MedBen VisionPlus" in ancillary_by_name["MedBen Dental and Vision Coverage"].aliases
     assert "Met Life Dental" in ancillary_by_name["MetLife Dental Coverage"].aliases
+    assert "Hawaii Dental Service" in ancillary_by_name["UHA Dental Coverage"].aliases
+    assert "UHA Vision" in ancillary_by_name["UHA Vision Coverage"].aliases
+    assert "UPMC Dental Advantage" in ancillary_by_name["UPMC Dental and Vision Coverage"].aliases
     assert (
         "Wellmark Blue Dental"
         in ancillary_by_name["Wellmark Blue Dental Coverage"].aliases
