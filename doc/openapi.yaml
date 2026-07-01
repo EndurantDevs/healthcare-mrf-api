@@ -2510,6 +2510,29 @@ paths:
           schema:
             type: boolean
           description: Include total distinct provider count.
+        - name: city
+          in: query
+          schema:
+            type: string
+          description: Filter providers to practice addresses in this city.
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Filter providers to practice addresses in this state.
+        - name: zip5
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{5}$'
+          description: Filter providers to practice addresses in this ZIP code.
+        - name: include_mail_addresses
+          in: query
+          schema:
+            type: boolean
+          description: Include mailing addresses when applying location filters.
       responses:
         '200':
           description: Group plan provider page
