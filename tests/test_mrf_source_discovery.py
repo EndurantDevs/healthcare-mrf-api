@@ -2686,6 +2686,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Sun Life Dental": ("dental",),
         "Sun Life Vision": ("vision",),
         "Tall Tree Dental Coverage": ("dental",),
+        "Tall Tree Vision Coverage": ("vision",),
         "The Standard Dental": ("dental",),
         "The Standard Vision": ("vision",),
         "TruAssure Dental": ("dental",),
@@ -2902,6 +2903,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Crescent Employee Benefits"
         in ancillary_by_name["Crescent Dental Coverage"].aliases
     )
+    assert "Tall Tree" in ancillary_by_name["Tall Tree Vision Coverage"].aliases
     assert "Benefit Allocation Systems" in ancillary_by_name["BAS Ancillary Benefits"].aliases
     assert "MyEnroll360" in ancillary_by_name["BAS Ancillary Benefits"].aliases
     assert "Choose ByWater" in ancillary_by_name["ByWater Ancillary Benefits"].aliases
@@ -3285,6 +3287,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "The Standard Dental",
         "Pacific Life Dental",
         "Renaissance Dental",
+        "Transwestern Dental",
         "Willamette Dental Group",
     ):
         assert by_name[coverage_evidence_dental_name].entity_type == "dental"
@@ -3387,9 +3390,14 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert by_name["Transwestern Dental"].entity_type == "dental"
     assert by_name["Transwestern Dental"].benefit_lines == ("dental",)
-    assert by_name["Transwestern Dental"].status == "needs_review"
-    assert by_name["Transwestern Dental"].index_url is None
+    assert by_name["Transwestern Dental"].status == "active"
+    assert by_name["Transwestern Dental"].source_tier == "coverage_evidence"
+    assert by_name["Transwestern Dental"].index_url
     assert "TRANSWESTERN DENTAL" in by_name["Transwestern Dental"].aliases
+    assert (
+        "Transwestern Insurance Administrators Dental"
+        in by_name["Transwestern Dental"].aliases
+    )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
