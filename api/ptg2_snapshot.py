@@ -13,6 +13,7 @@ from api.ptg2_index_cache import (_PTG2_INDEX_CACHE,
                                   PTG2_ARTIFACT_KIND_SNAPSHOT_INDEX,
                                   PTG2_INDEX_CACHE_TTL_SECONDS, _artifact_root,
                                   _path_from_uri, load_ptg2_index_from_path)
+from api.ptg2_serving_utils import ein_plan_id_variants
 from api.ptg2_types import PTG2ServingIndex
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -60,14 +61,15 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     if not requested_plan:
         return None
+    plan_variants = ein_plan_id_variants(requested_plan)
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
-    cache_key = ("source_plan", requested_plan, market_type, source_key)
+    cache_key = ("source_plan", tuple(plan_variants), market_type, source_key)
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
             return cached
-    params: dict[str, object] = {"plan_id": requested_plan}
+    params: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
         params["plan_market_type"] = market_type
@@ -80,10 +82,10 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
         result = await session.execute(
             text(
                 f"""
-                SELECT cps.snapshot_id
+                 SELECT cps.snapshot_id
                   FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
                   JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
-                 WHERE cps.plan_id = :plan_id
+                 WHERE cps.plan_id = ANY(CAST(:plan_ids AS text[]))
                    {market_sql}
                    {source_sql}
                    AND s.status = 'published'
@@ -132,14 +134,15 @@ async def current_source_snapshot_ids_for_plan(
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     if not requested_plan:
         return []
+    plan_variants = ein_plan_id_variants(requested_plan)
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
-    cache_key = ("source_plan_all", requested_plan, market_type, source_key)
+    cache_key = ("source_plan_all", tuple(plan_variants), market_type, source_key)
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
             return [tuple(pair) for pair in cached]
-    params: dict[str, object] = {"plan_id": requested_plan}
+    params: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
         params["plan_market_type"] = market_type
@@ -152,10 +155,10 @@ async def current_source_snapshot_ids_for_plan(
         result = await session.execute(
             text(
                 f"""
-                SELECT DISTINCT ON (cps.source_key) cps.source_key, cps.snapshot_id
+                 SELECT DISTINCT ON (cps.source_key) cps.source_key, cps.snapshot_id
                   FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
                   JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
-                 WHERE cps.plan_id = :plan_id
+                 WHERE cps.plan_id = ANY(CAST(:plan_ids AS text[]))
                    {market_sql}
                    {source_sql}
                    AND s.status = 'published'

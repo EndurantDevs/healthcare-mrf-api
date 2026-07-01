@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import re
 from typing import Any
 from uuid import UUID
 
@@ -18,6 +19,19 @@ from api.ptg2_types import PTG2ServingIndex
 def _normalize_zip5(value: Any) -> str | None:
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
     return digits[:5] if len(digits) >= 5 else None
+
+
+def ein_plan_id_variants(value: Any) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 9:
+        for candidate in (digits, f"{digits[:2]}-{digits[2:]}"):
+            if candidate not in variants:
+                variants.append(candidate)
+    return variants
 
 
 def _provider_payload(index: PTG2ServingIndex, ordinal: Any) -> dict[str, Any]:

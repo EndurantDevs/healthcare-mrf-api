@@ -79,6 +79,10 @@ def make_request(results, args=None):
     )
 
 
+async def fake_current_source_snapshot_ids_for_plan(_session, _plan_fields):
+    return [("ptg_test", "ptg2:test")]
+
+
 @pytest.mark.asyncio
 async def test_list_pricing_providers_success():
     request = make_request(
@@ -138,6 +142,11 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
         "current_source_snapshot_id_for_plan",
         fake_current_source_snapshot_id_for_plan,
     )
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_current_source_snapshot_ids_for_plan,
+    )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [
@@ -173,6 +182,11 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
         pricing_module,
         "current_source_snapshot_id_for_plan",
         fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_current_source_snapshot_ids_for_plan,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -214,6 +228,11 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
         "current_source_snapshot_id_for_plan",
         fake_current_source_snapshot_id_for_plan,
     )
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_current_source_snapshot_ids_for_plan,
+    )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1003000530)])],
@@ -250,6 +269,11 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         pricing_module,
         "current_source_snapshot_id_for_plan",
         fake_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_current_source_snapshot_ids_for_plan,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -339,6 +363,11 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
         pricing_module,
         "current_source_snapshot_id_for_plan",
         fake_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_ids_for_plan",
+        fake_current_source_snapshot_ids_for_plan,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(
@@ -2128,6 +2157,34 @@ async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_ma
     assert payload["pagination"]["total"] == 0
     assert payload["query"]["source"] == "ptg2"
     assert payload["query"]["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_list_providers_by_procedure_no_ptg_route_reports_reason(monkeypatch):
+    async def fake_search(_session, _args, _pagination):
+        return None
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "010854205",
+            "plan_id_type": "EIN",
+            "market_type": "group",
+            "code": "29888",
+            "year": "2023",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["resolved"] is False
+    assert payload["reason"] == "no published serving snapshot for this plan_id + market_type"
+    assert payload["pagination"]["total"] == 0
+    assert payload["query"]["status"] == "no_route"
+    assert payload["query"]["plan_id_type"] == "ein"
+    assert payload["query"]["ignored_params"] == ["year"]
 
 
 @pytest.mark.asyncio

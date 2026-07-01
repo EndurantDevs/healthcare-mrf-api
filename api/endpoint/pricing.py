@@ -20,7 +20,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
-from api.ptg2_snapshot import current_source_snapshot_id_for_plan
+from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_source_snapshot_ids_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_specialty_filters import (
@@ -4434,6 +4434,20 @@ def _apply_prescription_code_preferences(
         item["preferred_prescription_code"] = preferred_code
 
 
+async def _current_source_snapshot_pairs_for_plan(session, plan_fields: dict[str, object]) -> list[tuple[str, str]]:
+    try:
+        snapshot_pairs = await current_source_snapshot_ids_for_plan(session, plan_fields)
+    except Exception:
+        snapshot_pairs = []
+    if snapshot_pairs:
+        return snapshot_pairs
+    snapshot_id = await current_source_snapshot_id_for_plan(session, plan_fields)
+    if not snapshot_id:
+        return []
+    source_key = str(plan_fields.get("source_key") or "").strip().lower()
+    return [(source_key, str(snapshot_id))]
+
+
 @blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
 async def group_plan_providers(request):
     """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
@@ -4471,10 +4485,11 @@ async def group_plan_providers(request):
     )
     specialty_filter = resolve_provider_specialty_filter(request.args)
 
-    snapshot_id = await current_source_snapshot_id_for_plan(
-        session, {"plan_id": plan_id, "plan_market_type": market_type}
+    requested_source_key = (request.args.get("source_key") or "").strip().lower()
+    snapshot_pairs = await _current_source_snapshot_pairs_for_plan(
+        session, {"plan_id": plan_id, "plan_market_type": market_type, "source_key": requested_source_key or None}
     )
-    if not snapshot_id:
+    if not snapshot_pairs:
         return response.json({
             "ok": True, "plan_id": plan_id, "market_type": market_type,
             "snapshot_id": None, "resolved": False,
@@ -4483,6 +4498,8 @@ async def group_plan_providers(request):
             "taxonomy_filter": specialty_filter.response_payload(),
             "exhausted": True,
         })
+    selected_source_key, snapshot_id = snapshot_pairs[0]
+    snapshots = [{"source_key": source_key, "snapshot_id": snapshot} for source_key, snapshot in snapshot_pairs]
 
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
     group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
@@ -4494,7 +4511,7 @@ async def group_plan_providers(request):
             "serving_table": _safe_table_name(serving_tables.serving_table),
         }, status=501)
 
-    # current_source_snapshot_id_for_plan resolves the plan's per-SOURCE serving
+    # current_source_snapshot_ids_for_plan resolves the plan's per-SOURCE serving
     # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
     # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
     # the snapshot's provider_group_member table holds exactly this plan's
@@ -4714,6 +4731,8 @@ async def group_plan_providers(request):
         "plan_id": plan_id,
         "market_type": market_type,
         "snapshot_id": snapshot_id,
+        "source_key": selected_source_key,
+        "snapshots": snapshots,
         "resolved": True,
         "taxonomy_filter": specialty_filter.response_payload(),
         "location_filter": {
@@ -4732,6 +4751,7 @@ async def group_plan_providers(request):
         "providers": {
             "count": len(provider_items),
             "total_distinct": total_distinct,
+            "total": total_distinct,
             "items": provider_items,
             "next_cursor": next_cursor,
         },
@@ -5379,6 +5399,9 @@ async def list_provider_procedures(request, npi: str):
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
+    plan_id_type = str(args.get("plan_id_type") or "").strip().lower()
+    if plan_id_type and plan_id_type not in {"ein", "hios"}:
+        raise InvalidUsage("Parameter 'plan_id_type' must be one of: ein, hios")
     plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
@@ -5396,6 +5419,7 @@ async def list_provider_procedures(request, npi: str):
             {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
                 "snapshot_id": snapshot_id or None,
@@ -5418,9 +5442,31 @@ async def list_provider_procedures(request, npi: str):
             pagination,
         )
         if ptg2_payload is None:
-            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "snapshot_not_loaded"
+            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
+            query_payload = {
+                "npi": provider_npi,
+                "plan_id": plan_id or None,
+                "plan_external_id": plan_external_id or None,
+                "plan_id_type": plan_id_type or None,
+                "plan_market_type": plan_market_type or None,
+                "source_key": source_key or None,
+                "snapshot_id": snapshot_id or None,
+                "mode": mode or "product_search",
+                "code": code or reported_code or None,
+                "q": q or service_name or None,
+                "source": "ptg2",
+                "status": ptg_empty_status,
+            }
+            if year is not None:
+                query_payload["ignored_params"] = ["year"]
             return response.json(
                 {
+                    "resolved": ptg_empty_status == "no_match",
+                    **(
+                        {"reason": "no published serving snapshot for this plan_id + market_type"}
+                        if ptg_empty_status == "no_route"
+                        else {}
+                    ),
                     "items": [],
                     "pagination": {
                         "total": 0,
@@ -5428,21 +5474,18 @@ async def list_provider_procedures(request, npi: str):
                         "offset": pagination.offset,
                         "page": pagination.page,
                     },
-                    "query": {
-                        "npi": provider_npi,
-                        "plan_id": plan_id or None,
-                        "plan_external_id": plan_external_id or None,
-                        "plan_market_type": plan_market_type or None,
-                        "source_key": source_key or None,
-                        "snapshot_id": snapshot_id or None,
-                        "mode": mode or "product_search",
-                        "code": code or reported_code or None,
-                        "q": q or service_name or None,
-                        "source": "ptg2",
-                        "status": ptg_empty_status,
-                    },
+                    "query": query_payload,
                 }
             )
+        if isinstance(ptg2_payload, dict):
+            query_payload = ptg2_payload.setdefault("query", {})
+            if isinstance(query_payload, dict):
+                if plan_id_type:
+                    query_payload.setdefault("plan_id_type", plan_id_type)
+                if year is not None and (plan_id or plan_external_id or snapshot_id):
+                    ignored = query_payload.setdefault("ignored_params", [])
+                    if isinstance(ignored, list) and "year" not in ignored:
+                        ignored.append("year")
         return response.json(ptg2_payload)
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
@@ -7397,6 +7440,9 @@ async def list_providers_by_procedure(request):
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
+    plan_id_type = str(args.get("plan_id_type") or "").strip().lower()
+    if plan_id_type and plan_id_type not in {"ein", "hios"}:
+        raise InvalidUsage("Parameter 'plan_id_type' must be one of: ein, hios")
     plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
@@ -7450,6 +7496,7 @@ async def list_providers_by_procedure(request):
             {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_id_type": plan_id_type or None,
                 "plan_market_type": plan_market_type or None,
                 "source_key": source_key or None,
                 "snapshot_id": snapshot_id or None,
@@ -7494,9 +7541,40 @@ async def list_providers_by_procedure(request):
             pagination,
         )
         if ptg2_payload is None:
-            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "snapshot_not_loaded"
+            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
+            query_payload = {
+                "plan_id": plan_id or None,
+                "plan_external_id": plan_external_id or None,
+                "plan_id_type": plan_id_type or None,
+                "plan_market_type": plan_market_type or None,
+                "source_key": source_key or None,
+                "snapshot_id": snapshot_id or None,
+                "mode": mode or "product_search",
+                "code": code or None,
+                "q": q or None,
+                "specialty": specialty or None,
+                "taxonomy_code": args.get("taxonomy_code") or None,
+                "taxonomy_classification": args.get("taxonomy_classification") or None,
+                "taxonomy_specialization": args.get("taxonomy_specialization") or None,
+                "taxonomy_section": args.get("taxonomy_section") or None,
+                "state": state or None,
+                "city": city or None,
+                "zip5": zip5 or None,
+                "zip_radius_miles": zip_radius_miles if zip5 else None,
+                "npi": npi,
+                "source": "ptg2",
+                "status": ptg_empty_status,
+            }
+            if year is not None:
+                query_payload["ignored_params"] = ["year"]
             return response.json(
                 {
+                    "resolved": ptg_empty_status == "no_match",
+                    **(
+                        {"reason": "no published serving snapshot for this plan_id + market_type"}
+                        if ptg_empty_status == "no_route"
+                        else {}
+                    ),
                     "items": [],
                     "pagination": {
                         "total": 0,
@@ -7504,30 +7582,18 @@ async def list_providers_by_procedure(request):
                         "offset": pagination.offset,
                         "page": pagination.page,
                     },
-                    "query": {
-                        "plan_id": plan_id or None,
-                        "plan_external_id": plan_external_id or None,
-                        "plan_market_type": plan_market_type or None,
-                        "source_key": source_key or None,
-                        "snapshot_id": snapshot_id or None,
-                        "mode": mode or "product_search",
-                        "code": code or None,
-                        "q": q or None,
-                        "specialty": specialty or None,
-                        "taxonomy_code": args.get("taxonomy_code") or None,
-                        "taxonomy_classification": args.get("taxonomy_classification") or None,
-                        "taxonomy_specialization": args.get("taxonomy_specialization") or None,
-                        "taxonomy_section": args.get("taxonomy_section") or None,
-                        "state": state or None,
-                        "city": city or None,
-                        "zip5": zip5 or None,
-                        "zip_radius_miles": zip_radius_miles if zip5 else None,
-                        "npi": npi,
-                        "source": "ptg2",
-                        "status": ptg_empty_status,
-                    },
+                    "query": query_payload,
                 }
             )
+        if isinstance(ptg2_payload, dict):
+            query_payload = ptg2_payload.setdefault("query", {})
+            if isinstance(query_payload, dict):
+                if plan_id_type:
+                    query_payload.setdefault("plan_id_type", plan_id_type)
+                if year is not None and (plan_id or plan_external_id or snapshot_id):
+                    ignored = query_payload.setdefault("ignored_params", [])
+                    if isinstance(ignored, list) and "year" not in ignored:
+                        ignored.append("year")
         return response.json(ptg2_payload)
     if order_by == "cost_index":
         if not code:

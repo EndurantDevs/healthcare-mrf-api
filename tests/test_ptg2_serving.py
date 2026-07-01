@@ -1635,10 +1635,12 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     params = session.calls[0][0][1]
     assert "ptg2_current_plan_source" in sql
     assert "JOIN mrf.ptg2_snapshot" in sql
+    assert "cps.plan_id = ANY(CAST(:plan_ids AS text[]))" in sql
     assert "cps.plan_market_type = :plan_market_type" in sql
     assert "cps.source_key = :source_key" in sql
     assert "s.status = 'published'" in sql
     assert "serving_index" in sql
+    assert params["plan_ids"] == ["010854205", "01-0854205"]
     assert params["source_key"] == "example_dental"
 
 
