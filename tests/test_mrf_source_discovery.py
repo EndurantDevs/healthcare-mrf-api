@@ -2342,16 +2342,21 @@ async def test_master_list_keeps_high_value_public_aliases():
         "BCBS Arizona Dental Coverage": ("dental",),
         "BCBS Kansas City Dental and Vision Coverage": ("dental", "vision"),
         "BCBS North Carolina Dental Coverage": ("dental",),
+        "BCBS North Carolina Vision Coverage": ("vision",),
         "BCBS South Carolina Dental Coverage": ("dental",),
         "BCBS South Carolina Vision Coverage": ("vision",),
         "BCBS Tennessee Dental and Vision Coverage": ("dental", "vision"),
         "Beam Benefits Ancillary Coverage": ("dental", "vision"),
+        "CBA Blue Dental Coverage": ("dental",),
         "Consociate Health Ancillary Benefits": ("dental", "vision"),
         "EBPA Medical and Dental Coverage": ("dental",),
         "EMI Health Vision Coverage": ("vision",),
+        "HealthPartners Dental Coverage": ("dental",),
         "HRI Dental and Vision": ("dental", "vision"),
+        "MetLife Dental Coverage": ("dental",),
         "Reliance Matrix Dental and Vision": ("dental", "vision"),
         "Tall Tree Dental Coverage": ("dental",),
+        "Wellmark Blue Dental Coverage": ("dental",),
     }
     ancillary_by_name = {
         candidate.payer_name: candidate
@@ -2498,6 +2503,10 @@ async def test_master_list_keeps_high_value_public_aliases():
         in ancillary_by_name["BCBS North Carolina Dental Coverage"].aliases
     )
     assert (
+        "Blue 20/20"
+        in ancillary_by_name["BCBS North Carolina Vision Coverage"].aliases
+    )
+    assert (
         "Healthy Vision"
         in ancillary_by_name["BCBS South Carolina Vision Coverage"].aliases
     )
@@ -2505,7 +2514,17 @@ async def test_master_list_keeps_high_value_public_aliases():
         "BlueCross Dental"
         in ancillary_by_name["BCBS Tennessee Dental and Vision Coverage"].aliases
     )
+    assert "Dental Blue Network" in ancillary_by_name["CBA Blue Dental Coverage"].aliases
     assert "VSP Choice" in ancillary_by_name["EMI Health Vision Coverage"].aliases
+    assert (
+        "HealthPartners Dental"
+        in ancillary_by_name["HealthPartners Dental Coverage"].aliases
+    )
+    assert "Met Life Dental" in ancillary_by_name["MetLife Dental Coverage"].aliases
+    assert (
+        "Wellmark Blue Dental"
+        in ancillary_by_name["Wellmark Blue Dental Coverage"].aliases
+    )
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
     assert "NVA" in aliases_by_name["Capital Blue Cross"]
     assert "National Vision Administrators" in aliases_by_name["Capital Blue Cross"]
