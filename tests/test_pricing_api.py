@@ -238,7 +238,9 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
 
 @pytest.mark.asyncio
 async def test_group_plan_providers_applies_location_filter_and_returns_addresses(monkeypatch):
-    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+    """Location filters should constrain group-plan provider NPIs and return addresses."""
+
+    async def fake_snapshot_id_for_plan(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
@@ -247,7 +249,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_id_for_plan",
-        fake_current_source_snapshot_id_for_plan,
+        fake_snapshot_id_for_plan,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -322,7 +324,9 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
 
 @pytest.mark.asyncio
 async def test_group_plan_providers_uses_unified_service_locations_when_configured(monkeypatch):
-    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+    """Unified address serving should use service-location rows for group-plan filters."""
+
+    async def fake_snapshot_id_for_plan(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
@@ -334,7 +338,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_id_for_plan",
-        fake_current_source_snapshot_id_for_plan,
+        fake_snapshot_id_for_plan,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(
@@ -1959,10 +1963,10 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_office_visit(monkeypatch):
-    seen_args = {}
+    observed_search_args = {}
 
     async def fake_search(_session, args, pagination):
-        seen_args.update(args)
+        observed_search_args.update(args)
         return {
             "items": [],
             "pagination": {
@@ -1993,8 +1997,8 @@ async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_off
     payload = json.loads(response.body)
 
     assert payload["query"]["source"] == "ptg2"
-    assert seen_args["classification"] == "Family Medicine"
-    assert seen_args["include_providers"] == "true"
+    assert observed_search_args["classification"] == "Family Medicine"
+    assert observed_search_args["include_providers"] == "true"
 
 
 @pytest.mark.asyncio

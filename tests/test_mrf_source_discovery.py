@@ -928,12 +928,13 @@ def test_wordpress_elfinder_hash_path_decodes_file_path():
 
 @pytest.mark.asyncio
 async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
-    source = {
+    """WordPress elFinder pages can expose MRF files only after opening a child folder."""
+    discovery_source = {
         "source_id": "source_example_elfinder",
         "display_name": "Example elFinder",
         "hosting_platform": "wordpress_elfinder_mrf_links",
     }
-    html = """
+    page_html = """
     <div id="wp_file_manager_front123"></div>
     <script>
       jQuery("#wp_file_manager_front123").elfinder({
@@ -949,25 +950,25 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
     file_hash = (
         "l1_Y2xpZW50X2EvMjAyNi0wNy0wMV9leGFtcGxlX2FsbG93ZWQtYW1vdW50cy5jc3Y"
     )
-    calls = []
+    form_calls = []
 
     async def fake_fetch_text(url, *, max_bytes, session):
         assert url == "https://example.test/machine-readable-files/"
         assert max_bytes == 1024
         assert session.headers["User-Agent"].startswith("Mozilla/5.0")
-        return html
+        return page_html
 
-    async def fake_post_form_json_value(url, data, *, max_bytes, session):
-        calls.append(dict(data))
+    async def fake_post_form_json_value(url, form_fields, *, max_bytes, session):
+        form_calls.append(dict(form_fields))
         assert (
             url
             == "https://example.test/wp-admin/admin-ajax.php?action=mk_file_folder_manager_shortcode"
         )
         assert max_bytes == 2048
         assert session.headers["User-Agent"].startswith("Mozilla/5.0")
-        assert data["_wpnonce"] == "nonce-123"
-        assert data["data_key"] == "key-123"
-        if data.get("init") == "1":
+        assert form_fields["_wpnonce"] == "nonce-123"
+        assert form_fields["data_key"] == "key-123"
+        if form_fields.get("init") == "1":
             return {
                 "cwd": {
                     "options": {
@@ -989,7 +990,7 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
                     },
                 ],
             }
-        assert data["target"] == directory_hash
+        assert form_fields["target"] == directory_hash
         return {
             "files": [
                 {
@@ -1007,8 +1008,8 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
         discovery, "_post_form_json_value", fake_post_form_json_value
     )
 
-    targets = await discovery._resolve_wordpress_elfinder_mrf_links(
-        source,
+    crawl_targets = await discovery._resolve_wordpress_elfinder_mrf_links(
+        discovery_source,
         "https://example.test/machine-readable-files/",
         {
             "type": "wordpress_elfinder_mrf_links",
@@ -1019,19 +1020,19 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
         session=object(),
     )
 
-    assert [call["cmd"] for call in calls] == ["open", "open"]
-    assert targets[0].url == (
+    assert [call["cmd"] for call in form_calls] == ["open", "open"]
+    assert crawl_targets[0].url == (
         "https://files.example.test/root/client_a/"
         "2026-07-01_example_allowed-amounts.csv"
     )
-    assert targets[0].label == "2026-07-01_example_allowed-amounts.csv"
-    assert targets[0].metadata["resolver"] == "wordpress_elfinder_mrf_links"
-    assert targets[0].metadata["target_kind"] == "file_reference"
-    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
-    assert targets[0].metadata["wordpress_elfinder_path"] == (
+    assert crawl_targets[0].label == "2026-07-01_example_allowed-amounts.csv"
+    assert crawl_targets[0].metadata["resolver"] == "wordpress_elfinder_mrf_links"
+    assert crawl_targets[0].metadata["target_kind"] == "file_reference"
+    assert crawl_targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert crawl_targets[0].metadata["wordpress_elfinder_path"] == (
         "client_a/2026-07-01_example_allowed-amounts.csv"
     )
-    assert targets[0].metadata["wordpress_elfinder_file_manager_id"] == "123"
+    assert crawl_targets[0].metadata["wordpress_elfinder_file_manager_id"] == "123"
 
 
 def test_discovery_tls_override_is_host_scoped(monkeypatch):
@@ -4096,7 +4097,7 @@ async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch
         raise AssertionError("direct TOCs should be cataloged without HTML fetching")
 
     monkeypatch.setattr(discovery, "_fetch_text", fail_fetch)
-    source = {
+    direct_toc_source = {
         "source_id": "source_bcbsnc",
         "payer_id": "payer_bcbsnc",
         "display_name": "BCBS North Carolina",
@@ -4106,13 +4107,13 @@ async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch
         "2026-05-27_blue-cross-and-blue-shield-of-north-carolina_index.json"
     )
 
-    [target] = await discovery._crawl_targets_for_source(source, url, None)
+    [toc_target] = await discovery._crawl_targets_for_source(direct_toc_source, url, None)
 
-    assert target.url == url
-    assert target.label == "BCBS North Carolina"
-    assert target.metadata["resolver"] == "direct_toc"
-    assert target.metadata["target_kind"] == "toc_json"
-    assert target.metadata["target_file_type"] == "table-of-contents"
+    assert toc_target.url == url
+    assert toc_target.label == "BCBS North Carolina"
+    assert toc_target.metadata["resolver"] == "direct_toc"
+    assert toc_target.metadata["target_kind"] == "toc_json"
+    assert toc_target.metadata["target_file_type"] == "table-of-contents"
 
     hmaa_source = {
         "source_id": "source_hmaa",

@@ -1501,7 +1501,7 @@ async def _table_columns(session, table_name: str) -> set[str]:
     return set(columns)
 
 
-def _address_serving_unified_requested() -> bool:
+def _is_address_serving_unified_requested() -> bool:
     raw = str(os.getenv(ADDRESS_SERVING_SOURCE_ENV, "")).strip().lower()
     if not raw:
         return False
@@ -1510,7 +1510,7 @@ def _address_serving_unified_requested() -> bool:
 
 async def _group_plan_provider_address_source(session) -> tuple[str, bool, bool, bool]:
     legacy_table = f"{PRICING_SCHEMA}.npi_address"
-    if not _address_serving_unified_requested():
+    if not _is_address_serving_unified_requested():
         return legacy_table, False, False, False
 
     unified_table = f"{PRICING_SCHEMA}.entity_address_unified"
@@ -4518,27 +4518,27 @@ async def group_plan_providers(request):
         specialty_filter,
     ) if specialty_filter.active else ""
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
-    location_filter_active = bool(city or state or zip5)
+    has_location_filter = bool(city or state or zip5)
     address_table = f"{PRICING_SCHEMA}.npi_address"
-    using_unified_addresses = False
-    array_coverage_supported = False
-    plan_bridge_supported = False
-    if location_filter_active:
+    uses_unified_addresses = False
+    supports_array_coverage = False
+    supports_plan_bridge = False
+    if has_location_filter:
         (
             address_table,
-            using_unified_addresses,
-            array_coverage_supported,
-            plan_bridge_supported,
+            uses_unified_addresses,
+            supports_array_coverage,
+            supports_plan_bridge,
         ) = await _group_plan_provider_address_source(session)
-    address_types = GROUP_PLAN_UNIFIED_ADDRESS_TYPES if using_unified_addresses else GROUP_PLAN_LEGACY_ADDRESS_TYPES
+    address_types = GROUP_PLAN_UNIFIED_ADDRESS_TYPES if uses_unified_addresses else GROUP_PLAN_LEGACY_ADDRESS_TYPES
     state_expr = (
         "UPPER(COALESCE(addr.state_code, addr.state_name, ''))"
-        if using_unified_addresses
+        if uses_unified_addresses
         else "UPPER(COALESCE(addr.state_name, ''))"
     )
     zip5_expr = (
         "COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5))"
-        if using_unified_addresses
+        if uses_unified_addresses
         else "LEFT(COALESCE(addr.postal_code, ''), 5)"
     )
     location_clauses: list[str] = ["addr.npi = gm.npi"]
@@ -4554,7 +4554,7 @@ async def group_plan_providers(request):
         params["location_zip5"] = zip5
         location_clauses.append(f"{zip5_expr} = :location_zip5")
     location_predicate = ""
-    if location_filter_active:
+    if has_location_filter:
         location_where = "\n                      AND ".join(location_clauses)
         location_predicate = f"""EXISTS (
                     SELECT 1
@@ -4563,7 +4563,7 @@ async def group_plan_providers(request):
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
 
-    rows = (await session.execute(
+    provider_rows = (await session.execute(
         text(
             f"""
             SELECT DISTINCT gm.npi
@@ -4576,12 +4576,12 @@ async def group_plan_providers(request):
         ),
         params,
     )).fetchall()
-    npis = [int(row.npi) for row in rows if row.npi is not None]
+    provider_npis = [int(row.npi) for row in provider_rows if row.npi is not None]
 
     total_distinct = None
-    count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
-    skip_exact_count = bool(location_filter_active and using_unified_addresses)
-    if count_requested and not skip_exact_count:
+    is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
+    should_skip_exact_count = bool(has_location_filter and uses_unified_addresses)
+    if is_count_requested and not should_skip_exact_count:
         total_distinct = int((await session.execute(
             text(
                 f"""
@@ -4593,10 +4593,10 @@ async def group_plan_providers(request):
             params,
         )).scalar() or 0)
 
-    items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
+    provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
-    if location_filter_active and npis:
-        address_params: dict[str, Any] = {"npis": npis, "plan_id": plan_id}
+    if has_location_filter and provider_npis:
+        address_params: dict[str, Any] = {"npis": provider_npis, "plan_id": plan_id}
         address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
             address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
@@ -4612,32 +4612,32 @@ async def group_plan_providers(request):
         address_where = "\n                   AND ".join(address_clauses)
         coverage_match_sql = _group_plan_provider_coverage_match_sql(
             "addr",
-            array_coverage_supported=array_coverage_supported,
-            plan_bridge_supported=plan_bridge_supported,
+            array_coverage_supported=supports_array_coverage,
+            plan_bridge_supported=supports_plan_bridge,
         )
         state_select_sql = (
             "COALESCE(addr.state_code, addr.state_name) AS state_name"
-            if using_unified_addresses
+            if uses_unified_addresses
             else "addr.state_name AS state_name"
         )
         zip5_select_sql = (
             "COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)) AS zip5"
-            if using_unified_addresses
+            if uses_unified_addresses
             else "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5"
         )
         phone_select_sql = (
             "COALESCE(addr.phone_number, addr.telephone_number) AS phone_number"
-            if using_unified_addresses
+            if uses_unified_addresses
             else "addr.phone_number AS phone_number"
         )
         precision_select_sql = (
             "addr.address_precision AS address_precision,"
-            if using_unified_addresses
+            if uses_unified_addresses
             else "NULL::varchar AS address_precision,"
         )
         type_rank_sql = (
             "CASE addr.type WHEN 'practice' THEN 0 WHEN 'site' THEN 1 WHEN 'primary' THEN 2 WHEN 'secondary' THEN 3 ELSE 4 END"
-            if using_unified_addresses
+            if uses_unified_addresses
             else "CASE addr.type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END"
         )
         address_rows = (await session.execute(
@@ -4665,22 +4665,22 @@ async def group_plan_providers(request):
             ),
             address_params,
         )).mappings().all()
-        for row in address_rows:
-            address = {
-                "type": row.get("type"),
-                "first_line": row.get("first_line"),
-                "second_line": row.get("second_line"),
-                "city": row.get("city_name"),
-                "state": row.get("state_name"),
-                "postal_code": row.get("postal_code"),
-                "zip5": row.get("zip5") or str(row.get("postal_code") or "")[:5] or None,
-                "phone_number": row.get("phone_number"),
+        for address_row in address_rows:
+            provider_address = {
+                "type": address_row.get("type"),
+                "first_line": address_row.get("first_line"),
+                "second_line": address_row.get("second_line"),
+                "city": address_row.get("city_name"),
+                "state": address_row.get("state_name"),
+                "postal_code": address_row.get("postal_code"),
+                "zip5": address_row.get("zip5") or str(address_row.get("postal_code") or "")[:5] or None,
+                "phone_number": address_row.get("phone_number"),
             }
-            if using_unified_addresses:
-                address["address_precision"] = row.get("address_precision")
-                address["plan_coverage_match"] = bool(row.get("plan_coverage_match"))
-            addresses_by_npi.setdefault(int(row["npi"]), []).append(address)
-    if enrich and npis:
+            if uses_unified_addresses:
+                provider_address["address_precision"] = address_row.get("address_precision")
+                provider_address["plan_coverage_match"] = bool(address_row.get("plan_coverage_match"))
+            addresses_by_npi.setdefault(int(address_row["npi"]), []).append(provider_address)
+    if enrich and provider_npis:
         enrich_rows = (await session.execute(
             select(
                 npi_data_table.c.npi,
@@ -4689,24 +4689,26 @@ async def group_plan_providers(request):
                 npi_data_table.c.provider_organization_name,
                 npi_data_table.c.provider_credential_text,
                 npi_data_table.c.entity_type_code,
-            ).where(npi_data_table.c.npi.in_(npis))
+            ).where(npi_data_table.c.npi.in_(provider_npis))
         )).fetchall()
         by_npi = {int(r.npi): r for r in enrich_rows}
-        for item in items:
-            r = by_npi.get(item["npi"])
-            if r is None:
+        for provider_item in provider_items:
+            npi_row = by_npi.get(provider_item["npi"])
+            if npi_row is None:
                 continue
-            person = " ".join(p for p in [r.provider_first_name, r.provider_last_name] if p)
-            item["name"] = person or (r.provider_organization_name or None)
-            item["credential"] = r.provider_credential_text
-            item["entity_type_code"] = r.entity_type_code
-    for item in items:
-        item_addresses = addresses_by_npi.get(item["npi"])
+            person = " ".join(
+                p for p in [npi_row.provider_first_name, npi_row.provider_last_name] if p
+            )
+            provider_item["name"] = person or (npi_row.provider_organization_name or None)
+            provider_item["credential"] = npi_row.provider_credential_text
+            provider_item["entity_type_code"] = npi_row.entity_type_code
+    for provider_item in provider_items:
+        item_addresses = addresses_by_npi.get(provider_item["npi"])
         if item_addresses:
-            item["addresses"] = item_addresses
-            item["address"] = item_addresses[0]
+            provider_item["addresses"] = item_addresses
+            provider_item["address"] = item_addresses[0]
 
-    next_cursor = str(npis[-1]) if len(npis) == limit else None
+    next_cursor = str(provider_npis[-1]) if len(provider_npis) == limit else None
     return response.json({
         "ok": True,
         "plan_id": plan_id,
@@ -4715,22 +4717,22 @@ async def group_plan_providers(request):
         "resolved": True,
         "taxonomy_filter": specialty_filter.response_payload(),
         "location_filter": {
-            "requested": location_filter_active,
+            "requested": has_location_filter,
             "city": city or None,
             "state": state or None,
             "zip5": zip5 or None,
             "include_mail_addresses": include_mail_addresses,
-            "address_source": "unified" if location_filter_active and using_unified_addresses else (
-                "npi" if location_filter_active else None
+            "address_source": "unified" if has_location_filter and uses_unified_addresses else (
+                "npi" if has_location_filter else None
             ),
-            "address_types": list(address_types) if location_filter_active and not include_mail_addresses else None,
-            "count_requested": count_requested,
-            "count_exact": count_requested and not skip_exact_count,
+            "address_types": list(address_types) if has_location_filter and not include_mail_addresses else None,
+            "count_requested": is_count_requested,
+            "count_exact": is_count_requested and not should_skip_exact_count,
         },
         "providers": {
-            "count": len(items),
+            "count": len(provider_items),
             "total_distinct": total_distinct,
-            "items": items,
+            "items": provider_items,
             "next_cursor": next_cursor,
         },
         "exhausted": next_cursor is None,

@@ -2103,7 +2103,7 @@ async def _fetch_json(
 
 async def _post_form_json_value(
     url: str,
-    data: dict[str, Any],
+    form_fields: dict[str, Any],
     *,
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
     session: aiohttp.ClientSession | None = None,
@@ -2121,13 +2121,13 @@ async def _post_form_json_value(
             trust_env=False,
         ) as owned_session:
             return await _post_form_json_value(
-                url, data, max_bytes=max_bytes, session=owned_session
+                url, form_fields, max_bytes=max_bytes, session=owned_session
             )
     chunks: list[bytes] = []
     total = 0
     async with session.post(
         url,
-        data=data,
+        data=form_fields,
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
@@ -6039,8 +6039,8 @@ def _wordpress_elfinder_configs_from_html(
     html_text: str, *, base_url: str
 ) -> list[dict[str, str]]:
     text = html.unescape(str(html_text or ""))
-    configs: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    manager_configs: list[dict[str, str]] = []
+    seen_manager_keys: set[tuple[str, str]] = set()
     data_key_pattern = re.compile(
         r"['\"]?data_key['\"]?\s*:\s*(?P<quote>['\"])(?P<value>[^'\"]+)(?P=quote)",
         flags=re.I,
@@ -6068,20 +6068,20 @@ def _wordpress_elfinder_configs_from_html(
         nonce = _wordpress_elfinder_js_string(nonce_matches[-1].group("value"))
         if not service_url or not data_key or not nonce:
             continue
-        key = (service_url, data_key)
-        if key in seen:
+        manager_key = (service_url, data_key)
+        if manager_key in seen_manager_keys:
             continue
-        seen.add(key)
+        seen_manager_keys.add(manager_key)
         file_manager_matches = list(file_manager_pattern.finditer(prefix))
-        config = {
+        manager_config = {
             "url": service_url,
             "data_key": data_key,
             "nonce": nonce,
         }
         if file_manager_matches:
-            config["file_manager_id"] = file_manager_matches[-1].group(1)
-        configs.append(config)
-    return configs
+            manager_config["file_manager_id"] = file_manager_matches[-1].group(1)
+        manager_configs.append(manager_config)
+    return manager_configs
 
 
 def _wordpress_elfinder_hash_path(hash_value: str | None) -> str | None:
@@ -6128,17 +6128,21 @@ def _wordpress_elfinder_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _wordpress_elfinder_directory_hashes(payload: dict[str, Any]) -> list[str]:
-    hashes: list[str] = []
-    seen: set[str] = set()
-    for item in _wordpress_elfinder_files(payload):
-        if str(item.get("mime") or "").lower() != "directory":
+    directory_hashes: list[str] = []
+    seen_directory_hashes: set[str] = set()
+    for file_entry in _wordpress_elfinder_files(payload):
+        if str(file_entry.get("mime") or "").lower() != "directory":
             continue
-        directory_hash = str(item.get("hash") or "").strip()
-        if not directory_hash or not item.get("phash") or directory_hash in seen:
+        directory_hash = str(file_entry.get("hash") or "").strip()
+        if (
+            not directory_hash
+            or not file_entry.get("phash")
+            or directory_hash in seen_directory_hashes
+        ):
             continue
-        seen.add(directory_hash)
-        hashes.append(directory_hash)
-    return hashes
+        seen_directory_hashes.add(directory_hash)
+        directory_hashes.append(directory_hash)
+    return directory_hashes
 
 
 def _wordpress_elfinder_targets_from_payload(
@@ -6150,30 +6154,30 @@ def _wordpress_elfinder_targets_from_payload(
     resolver_type: str,
     file_manager_id: str | None,
 ) -> list[CrawlTarget]:
-    targets: list[CrawlTarget] = []
-    for item in _wordpress_elfinder_files(payload):
-        if str(item.get("mime") or "").lower() == "directory":
+    crawl_targets: list[CrawlTarget] = []
+    for file_entry in _wordpress_elfinder_files(payload):
+        if str(file_entry.get("mime") or "").lower() == "directory":
             continue
-        file_name = _clean_text(item.get("name")) or "MRF file"
-        file_url = _wordpress_elfinder_file_url(root_url, item)
+        file_name = _clean_text(file_entry.get("name")) or "MRF file"
+        file_url = _wordpress_elfinder_file_url(root_url, file_entry)
         if not file_url:
             continue
         file_type = _mrf_body_file_type_from_text(file_url, file_name)
         if not file_type:
             continue
-        file_path = _wordpress_elfinder_hash_path(str(item.get("hash") or ""))
+        file_path = _wordpress_elfinder_hash_path(str(file_entry.get("hash") or ""))
         metadata = {
             "resolver": resolver_type,
             "target_kind": "file_reference",
             "target_file_type": file_type,
             "container_format": _container_format(file_url),
-            "wordpress_elfinder_hash": item.get("hash"),
+            "wordpress_elfinder_hash": file_entry.get("hash"),
             "wordpress_elfinder_path": file_path,
-            "wordpress_elfinder_mime": item.get("mime"),
-            "wordpress_elfinder_size": item.get("size"),
+            "wordpress_elfinder_mime": file_entry.get("mime"),
+            "wordpress_elfinder_size": file_entry.get("size"),
             "wordpress_elfinder_file_manager_id": file_manager_id,
         }
-        targets.append(
+        crawl_targets.append(
             CrawlTarget(
                 source=source,
                 url=file_url,
@@ -6186,7 +6190,7 @@ def _wordpress_elfinder_targets_from_payload(
                 },
             )
         )
-    return targets
+    return crawl_targets
 
 
 def _wordpress_elfinder_target_sort_key(target: CrawlTarget) -> tuple[int, int, str]:
@@ -6209,6 +6213,7 @@ async def _resolve_wordpress_elfinder_mrf_links(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve WordPress elFinder AJAX listings into direct MRF file targets."""
     resolver_type = str(resolver.get("type") or "wordpress_elfinder_mrf_links")
     timeout = getattr(session, "timeout", None) or aiohttp.ClientTimeout(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
@@ -6228,8 +6233,8 @@ async def _resolve_wordpress_elfinder_mrf_links(
             max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
             session=browser_session,
         )
-        configs = _wordpress_elfinder_configs_from_html(html_text, base_url=url)
-        max_file_managers = _as_int(resolver.get("max_file_managers")) or len(configs)
+        manager_configs = _wordpress_elfinder_configs_from_html(html_text, base_url=url)
+        max_file_managers = _as_int(resolver.get("max_file_managers")) or len(manager_configs)
         ajax_max_bytes = int(
             resolver.get("ajax_max_bytes")
             or resolver.get("directory_max_bytes")
@@ -6238,16 +6243,16 @@ async def _resolve_wordpress_elfinder_mrf_links(
         )
         max_directories = _as_int(resolver.get("max_directories")) or 100
         max_targets = _as_int(resolver.get("max_targets"))
-        targets: list[CrawlTarget] = []
+        crawl_targets: list[CrawlTarget] = []
         opened_directories = 0
         last_error: Exception | None = None
-        for config in configs[:max_file_managers]:
+        for manager_config in manager_configs[:max_file_managers]:
             try:
                 root_payload = await _post_form_json_value(
-                    config["url"],
+                    manager_config["url"],
                     {
-                        "_wpnonce": config["nonce"],
-                        "data_key": config["data_key"],
+                        "_wpnonce": manager_config["nonce"],
+                        "data_key": manager_config["data_key"],
                         "cmd": "open",
                         "init": "1",
                         "tree": "1",
@@ -6261,14 +6266,14 @@ async def _resolve_wordpress_elfinder_mrf_links(
             if not isinstance(root_payload, dict):
                 continue
             root_url = _wordpress_elfinder_root_url(root_payload)
-            targets.extend(
+            crawl_targets.extend(
                 _wordpress_elfinder_targets_from_payload(
                     source,
                     root_payload,
                     root_url=root_url,
-                    resolved_from_url=config["url"],
+                    resolved_from_url=manager_config["url"],
                     resolver_type=resolver_type,
-                    file_manager_id=config.get("file_manager_id"),
+                    file_manager_id=manager_config.get("file_manager_id"),
                 )
             )
             for directory_hash in _wordpress_elfinder_directory_hashes(root_payload):
@@ -6277,10 +6282,10 @@ async def _resolve_wordpress_elfinder_mrf_links(
                 opened_directories += 1
                 try:
                     directory_payload = await _post_form_json_value(
-                        config["url"],
+                        manager_config["url"],
                         {
-                            "_wpnonce": config["nonce"],
-                            "data_key": config["data_key"],
+                            "_wpnonce": manager_config["nonce"],
+                            "data_key": manager_config["data_key"],
                             "cmd": "open",
                             "target": directory_hash,
                         },
@@ -6292,25 +6297,25 @@ async def _resolve_wordpress_elfinder_mrf_links(
                     continue
                 if not isinstance(directory_payload, dict):
                     continue
-                targets.extend(
+                crawl_targets.extend(
                     _wordpress_elfinder_targets_from_payload(
                         source,
                         directory_payload,
                         root_url=root_url,
-                        resolved_from_url=config["url"],
+                        resolved_from_url=manager_config["url"],
                         resolver_type=resolver_type,
-                        file_manager_id=config.get("file_manager_id"),
+                        file_manager_id=manager_config.get("file_manager_id"),
                     )
                 )
-        targets = _dedupe_crawl_targets_by_url(targets)
-        targets = _filter_crawl_targets_by_resolver_patterns(targets, resolver)
-        targets = sorted(targets, key=_wordpress_elfinder_target_sort_key)
+        crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
+        crawl_targets = _filter_crawl_targets_by_resolver_patterns(crawl_targets, resolver)
+        crawl_targets = sorted(crawl_targets, key=_wordpress_elfinder_target_sort_key)
         if max_targets and max_targets > 0:
-            targets = targets[:max_targets]
-        if not targets:
+            crawl_targets = crawl_targets[:max_targets]
+        if not crawl_targets:
             detail = f": {last_error}" if last_error else ""
             raise ValueError(f"no WordPress elFinder MRF links found for {url}{detail}")
-        return targets
+        return crawl_targets
 
 
 def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, str]]:
@@ -14077,9 +14082,11 @@ async def _push_import_control_catalog(
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
         return (0, 0, [])
-    eligible_groups_map: dict[str, list[dict[str, Any]]] = {}
+    eligible_rows_by_identity: dict[str, list[dict[str, Any]]] = {}
     for row in eligible:
-        eligible_groups_map.setdefault(_import_control_source_identity_key(row), []).append(row)
+        eligible_rows_by_identity.setdefault(
+            _import_control_source_identity_key(row), []
+        ).append(row)
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     headers = {
@@ -14093,7 +14100,7 @@ async def _push_import_control_catalog(
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
-        for group_rows in eligible_groups_map.values():
+        for group_rows in eligible_rows_by_identity.values():
             snapshot_source_ids = [
                 str(row.get("source_id") or "")
                 for row in group_rows
