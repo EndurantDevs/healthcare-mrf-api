@@ -8683,7 +8683,7 @@ async def _import_resources(
                     run_id=run_id,
                     row_batch_handler=scan_role_row_batch_handler if use_streaming else None,
                     row_batch_size=stream_batch_size,
-                    retain_rows=linked_resource_limit > 0 or not use_streaming,
+                    retain_rows=not use_streaming,
                     cancel_ctx=cancel_ctx,
                     cancel_task=cancel_task,
                     deadline_seconds=linked_resource_deadline_seconds,

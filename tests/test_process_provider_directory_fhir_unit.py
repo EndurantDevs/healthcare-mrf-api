@@ -4908,6 +4908,84 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
     assert resource_fetch_stats["PractitionerRole"]["rows_fetched"] == 1
 
 
+@pytest.mark.asyncio
+async def test_import_resources_does_not_retain_streamed_scan_roles_for_linked_fallback(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+
+    async def fake_fetch_resource_rows(source, resource_type, **kwargs):
+        if resource_type == "PractitionerRole":
+            raise AssertionError("SCAN PractitionerRole should be reverse-looked-up after practitioners")
+        if resource_type != "Practitioner":
+            return None
+        row_batch_handler = kwargs.get("row_batch_handler")
+        rows = [{"source_id": source["source_id"], "resource_id": "prac-1", "npi": "1234567890"}]
+        rows_written = await row_batch_handler(ProviderDirectoryPractitioner, rows) if row_batch_handler else 0
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitioner,
+            rows=[] if row_batch_handler else rows,
+            rows_fetched=1,
+            rows_written=rows_written,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+    scan_options: importer.ScanPractitionerRoleFetchOptions | None = None
+
+    async def fake_fetch_scan_practitioner_role_rows(_source, _rows_by_resource, options):
+        nonlocal scan_options
+        scan_options = options
+        await options.row_batch_handler(
+            ProviderDirectoryPractitionerRole,
+            [{"source_id": "scan", "resource_id": "role-1"}],
+        )
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitionerRole,
+            rows=[],
+            rows_fetched=1,
+            rows_written=1,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            fetch_mode="source_specific_reverse_lookup",
+        )
+
+    async def fake_upsert_resource_rows(_model, rows, **_kwargs):
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_fetch_scan_practitioner_role_rows", fake_fetch_scan_practitioner_role_rows)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
+
+    counts = await importer._import_resources(
+        [
+            {
+                "source_id": "scan",
+                "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+                "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            }
+        ],
+        resources=["PractitionerRole", "Practitioner"],
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        linked_resource_limit=50000,
+        stream_batch_size=5000,
+    )
+
+    assert counts == {"PractitionerRole": 1, "Practitioner": 1}
+    assert scan_options is not None
+    assert scan_options.retain_rows is False
+
+
 def test_bulk_export_start_url_uses_base_export_operation():
     url = importer._bulk_export_start_url(
         {"api_base": "https://example.test/fhir/"},
