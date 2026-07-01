@@ -4382,6 +4382,7 @@ async def _ensure_provider_directory_tables() -> None:
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         await db.create_table(model.__table__, checkfirst=True)
         await _ensure_provider_directory_model_columns(model, schema)
+    await _ensure_provider_directory_source_column_types(schema)
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         for index in getattr(model, "__my_additional_indexes__", []) or []:
             name = index.get("name") or "_".join(index.get("index_elements", ()))
@@ -4394,6 +4395,15 @@ async def _ensure_provider_directory_tables() -> None:
                 f"ON {_qt(schema, model.__tablename__)} {using}({elements}){where};"
             )
     await _ensure_provider_directory_import_seen_table(schema)
+
+
+async def _ensure_provider_directory_source_column_types(schema: str) -> None:
+    await db.status(
+        f"""
+        ALTER TABLE IF EXISTS {_qt(schema, "provider_directory_source")}
+            ALTER COLUMN data_quality_checked TYPE text;
+        """
+    )
 
 
 async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> None:

@@ -1696,6 +1696,19 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
     assert "VARCHAR(15)" in sql
 
 
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_source_column_types_widens_data_quality_checked(monkeypatch):
+    status_mock = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    await importer._ensure_provider_directory_source_column_types("mrf")
+
+    status_mock.assert_awaited_once()
+    sql = status_mock.await_args.args[0]
+    assert 'ALTER TABLE IF EXISTS "mrf"."provider_directory_source"' in sql
+    assert "ALTER COLUMN data_quality_checked TYPE text" in sql
+
+
 def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
     assert importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,

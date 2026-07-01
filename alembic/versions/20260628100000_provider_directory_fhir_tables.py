@@ -57,7 +57,7 @@ def _create_tables(bind, schema: str) -> None:
             data_quality_flag varchar(64),
             data_quality_sample_npi varchar(32),
             data_quality_practitioner_count varchar(64),
-            data_quality_checked varchar(64),
+            data_quality_checked text,
             is_medicare_advantage boolean,
             is_medicaid_mco boolean,
             is_chip boolean,
