@@ -1781,23 +1781,11 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_allows_scoped_group_plan_office_visit(monkeypatch):
-    captured_search_args_map = {}
+async def test_list_providers_by_procedure_rejects_taxonomy_scoped_group_plan_office_visit(monkeypatch):
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("office-visit provider-directory request should fail before PTG search")
 
-    async def fake_search(_session, args, pagination):
-        captured_search_args_map.update(args)
-        return {
-            "items": [],
-            "pagination": {
-                "total": 0,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {"source": "ptg2"},
-        }
-
-    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
     request = make_request(
         [],
         args={
@@ -1812,10 +1800,8 @@ async def test_list_providers_by_procedure_allows_scoped_group_plan_office_visit
         },
     )
 
-    await list_providers_by_procedure(request)
-
-    assert captured_search_args_map["code"] == "99213"
-    assert captured_search_args_map["classification"] == "Family Medicine"
+    with pytest.raises(pricing_module.InvalidUsage, match="provider-directory request"):
+        await list_providers_by_procedure(request)
 
 
 @pytest.mark.asyncio

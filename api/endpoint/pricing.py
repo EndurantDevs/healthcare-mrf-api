@@ -868,13 +868,10 @@ def _reject_broad_group_plan_provider_expansion(
         return
     if _parse_int(npi, "npi", minimum=1) is not None:
         return
-    specialty_filter = resolve_provider_specialty_filter(args)
-    if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
-        return
     raise InvalidUsage(
         "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
-        "use /api/v1/pricing/group-plan-providers with specialty/classification filters, or add "
-        "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost"
+        "use /api/v1/pricing/group-plan-providers with specialty/classification filters, then verify location with "
+        "/npi/all or getNpiNear. Add npi for one-provider office-visit pricing."
     )
 
 
