@@ -299,7 +299,7 @@ Last one-time research refresh: 2026-06-05.
 | Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | public MRF page with direct Sharp CAP/FFS files; aliases: Sharp Health Plan of San Diego |
 | SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
 | Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL; aliases: Sutter Health Plus |
-| University of Utah HP | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
+| University of Utah HP | provider_sponsored | https://uhealthplan.utah.edu/machine-readable-data | official University of Utah Health Plans machine-readable data page with current medical TOC and file links; aliases: University of Utah Health Plans, U of U Health Plans |
 | UPMC Health Plan | provider_sponsored | https://www.upmchealthplan.com/transparency-in-coverage/mrf/ | curated source row |
 | UPMC Dental and Vision Coverage | provider_sponsored | https://www.upmchealthplan.com/fehb/additional-benefits/dental-vision-hearing | official UPMC Health Plan dental and vision benefit page; source tier: coverage evidence; benefit lines: dental, vision; aliases: UPMC, UPMC Health Plan, UPMC Dental Advantage, UPMC Vision Care |
 | UPMC Health System | provider_sponsored | - | needs official source URL |

@@ -563,6 +563,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         == "html_mrf_links"
     )
     assert (
+        discovery.classify_hosting_platform(
+            "https://uhealthplan.utah.edu/machine-readable-data"
+        )
+        == "html_mrf_links"
+    )
+    assert (
         discovery.classify_hosting_platform("https://www.healthplan.org/multiplan_mrfs")
         == "healthplan_html_mrf_links"
     )
@@ -2399,6 +2405,10 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
     assert by_name["Tufts Health Plan"][0].hosting_platform == (
         "point32_azure_mrf_directory"
     )
+    assert by_name["University of Utah HP"][0].index_url == (
+        "https://uhealthplan.utah.edu/machine-readable-data"
+    )
+    assert by_name["University of Utah HP"][0].hosting_platform == "html_mrf_links"
 
 
 @pytest.mark.asyncio
