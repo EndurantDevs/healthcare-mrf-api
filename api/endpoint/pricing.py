@@ -9,7 +9,7 @@ import math
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -819,6 +819,63 @@ def _parse_bool(raw: Any, param: str, default: bool = False) -> bool:
 def _normalize_code_system(raw: Any) -> str:
     text = str(raw or INTERNAL_CODE_SYSTEM).strip().upper()
     return text or INTERNAL_CODE_SYSTEM
+
+
+def _is_broad_office_visit_cpt(code_system: Any, code: Any) -> bool:
+    system = _normalize_code_system(code_system or _reported_procedure_code_system(code))
+    if system != "CPT":
+        return False
+    try:
+        value = int(str(code or "").strip())
+    except (TypeError, ValueError):
+        return False
+    return 99202 <= value <= 99215
+
+
+def _reject_broad_group_plan_provider_expansion(
+    args: Mapping[str, Any],
+    *,
+    code: str,
+    code_system: Any,
+    plan_id: str,
+    plan_external_id: str,
+    plan_market_type: str,
+    state: str,
+    city: str,
+    zip5: str,
+    latitude: float | None,
+    longitude: float | None,
+    npi: int | None,
+) -> None:
+    if plan_market_type != "group":
+        return
+    if not (plan_id or plan_external_id):
+        return
+    if not _parse_bool(args.get("include_providers"), "include_providers", default=False):
+        return
+    if not _is_broad_office_visit_cpt(code_system, code):
+        return
+    has_location = bool(
+        state
+        or city
+        or zip5
+        or latitude is not None
+        or longitude is not None
+        or args.get("radius_miles") not in (None, "", "null")
+        or args.get("radius") not in (None, "", "null")
+    )
+    if not has_location:
+        return
+    if npi is not None:
+        return
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
+        return
+    raise InvalidUsage(
+        "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
+        "use /api/v1/pricing/group-plan-providers with specialty/classification filters, or add "
+        "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost"
+    )
 
 
 def _parse_procedure_override_code_system(raw: Any, param_name: str = "procedure_code_system") -> str:
@@ -7126,6 +7183,20 @@ async def list_providers_by_procedure(request):
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
+    _reject_broad_group_plan_provider_expansion(
+        args,
+        code=code,
+        code_system=args.get("code_system"),
+        plan_id=plan_id,
+        plan_external_id=plan_external_id,
+        plan_market_type=plan_market_type,
+        state=state,
+        city=city,
+        zip5=zip5,
+        latitude=latitude,
+        longitude=longitude,
+        npi=npi,
+    )
     if mode:
         try:
             normalize_ptg2_mode(mode)

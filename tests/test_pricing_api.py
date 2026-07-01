@@ -1756,6 +1756,69 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit(monkeypatch):
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("broad provider-directory request should fail before PTG search")
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "010854205",
+            "plan_id_type": "EIN",
+            "market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "include_providers": "true",
+            "limit": "50",
+        },
+    )
+
+    with pytest.raises(pricing_module.InvalidUsage, match="provider-directory request"):
+        await list_providers_by_procedure(request)
+
+
+@pytest.mark.asyncio
+async def test_list_providers_by_procedure_allows_scoped_group_plan_office_visit(monkeypatch):
+    seen_args = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_args.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "99213",
+            "code_system": "CPT",
+            "state": "IL",
+            "city": "Chicago",
+            "include_providers": "true",
+            "classification": "Family Medicine",
+        },
+    )
+
+    await list_providers_by_procedure(request)
+
+    assert seen_args["code"] == "99213"
+    assert seen_args["classification"] == "Family Medicine"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(monkeypatch):
     seen_args = {}
 

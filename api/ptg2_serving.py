@@ -1940,14 +1940,18 @@ def _ptg2_manifest_rate_candidate_limit(
     if expand_providers and location_filter_requested:
         # Bound the nearby-candidate pool the location expansion materializes.
         # The downstream provider_group_member fan-out + per-row enrichment cost
-        # scales with this pool, so a dense metro (thousands of in-radius
-        # in-network providers) used to blow past the request timeout at the old
-        # limit*200 (=2000-4000) fetch. limit*40 (floored at 500, env-capped)
-        # keeps a generous nearest-first pool -- results stay "cheapest among the
-        # N nearest" -- while staying well under the wall in the densest metros.
+        # scales with this pool. Keep the default close to the requested page,
+        # and make the overfetch/floor tunable for dense metros without a code
+        # deploy.
+        candidate_multiplier = _ptg2_manifest_location_candidate_multiplier()
+        candidate_floor = _ptg2_manifest_location_candidate_floor()
         return min(
             _ptg2_manifest_location_match_limit(),
-            max(requested_limit * 40, requested_offset + requested_limit, 500),
+            max(
+                requested_limit * candidate_multiplier,
+                requested_offset + requested_limit,
+                candidate_floor,
+            ),
         )
     if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
         return min(
@@ -2247,6 +2251,22 @@ def _ptg2_manifest_location_match_limit() -> int:
         return max(int(raw_value), 1)
     except ValueError:
         return 5000
+
+
+def _ptg2_manifest_location_candidate_multiplier() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", "2")
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return 2
+
+
+def _ptg2_manifest_location_candidate_floor() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", "100")
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return 100
 
 
 async def _ptg2_manifest_location_provider_matches(

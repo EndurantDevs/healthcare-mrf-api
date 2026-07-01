@@ -638,13 +638,53 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
     assert payload["items"][0]["telephone_number"] == "2175551212"
     assert payload["items"][0]["fax_number"] == "2175551213"
     assert payload["items"][0]["address"]["telephone_number"] == "2175551212"
-    assert seen_candidate_limit["value"] >= 500
+    assert seen_candidate_limit["value"] == 100
     row_sql = str(session.calls[1][0][0])
     row_params = session.calls[1][0][1]
     assert "LIMIT :rate_candidate_limit" in row_sql
     assert row_params["limit"] == 1
     assert row_params["rate_candidate_limit"] == seen_candidate_limit["value"]
     assert row_params["rate_candidate_limit"] > row_params["limit"]
+
+
+def test_manifest_location_candidate_window_defaults_to_double_page_floor(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_MATCH_LIMIT", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False)
+
+    class LimitFiftyPagination:
+        limit = 50
+        offset = 0
+
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            LimitFiftyPagination(),
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 100
+    )
+
+
+def test_manifest_location_candidate_window_honors_env_multiplier(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_MATCH_LIMIT", raising=False)
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", "3")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", "25")
+
+    class LimitFiftyPagination:
+        limit = 50
+        offset = 0
+
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            LimitFiftyPagination(),
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 150
+    )
 
 
 @pytest.mark.asyncio
