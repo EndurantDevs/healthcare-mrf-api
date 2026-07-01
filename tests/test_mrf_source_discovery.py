@@ -3324,6 +3324,14 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "UTAH REGENCE BLUE CROSS BLUE SHIELD" in by_name["Regence"].aliases
     assert "First Choice Health Network" in aliases_by_name["First Choice Health"]
     assert "Health Plan of Nevada, Inc." in by_name["Health Plan of Nevada"].aliases
+    assert by_name["Health Plan of Nevada"].status == "stale"
+    assert "Health Plan of Nevada" in by_name["United Healthcare"].aliases
+    assert "HPN" in by_name["United Healthcare"].aliases
+    assert by_name["CalOptima"].status == "stale"
+    assert "CalOptima" in by_name["Blue Shield of California"].aliases
+    assert "CalOptima" in by_name["Kaiser Permanente"].aliases
+    assert by_name["CalViva Health"].status == "stale"
+    assert "CalViva Health" in by_name["Centene"].aliases
     assert "PCMI" in by_name["Pinnacle Claims Management"].aliases
     assert (
         "Robbins Regency Employee Benefits"
@@ -3547,6 +3555,15 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Firefly Health" not in matching_importable_names("Firefly Health")
     assert "First Choice Health" in matching_names("First Choice Health Network")
     assert "Health Plan of Nevada" in matching_names("Health Plan of Nevada, Inc.")
+    assert "Health Plan of Nevada" not in matching_importable_names(
+        "Health Plan of Nevada, Inc."
+    )
+    assert "United Healthcare" in matching_importable_names("Health Plan of Nevada")
+    assert "Blue Shield of California" in matching_importable_names("CalOptima")
+    assert "Kaiser Permanente" in matching_importable_names("CalOptima")
+    assert "CalOptima" not in matching_importable_names("CalOptima")
+    assert "Centene" in matching_importable_names("CalViva Health")
+    assert "CalViva Health" not in matching_importable_names("CalViva Health")
     assert "Allegiance Benefit Plan Management" in matching_names(
         "ALLEGIANCE BENEFIT PLAN MANAGEMENT INC."
     )
