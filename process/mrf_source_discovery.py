@@ -11346,8 +11346,8 @@ async def _resolve_healthsparq_public_mrf(
     params = _healthsparq_public_params(url)
     metadata_url = _healthsparq_direct_metadata_url(resolver, params)
     if metadata_url:
-        await _assert_fetch_url_allowed(metadata_url)
         try:
+            await _assert_fetch_url_allowed(metadata_url)
             payload = await _fetch_json(
                 metadata_url,
                 max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),

@@ -7752,6 +7752,51 @@ async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_healthsparq_resolver_falls_back_when_metadata_url_is_blocked(
+    monkeypatch,
+):
+    healthsparq_public_url = (
+        "https://univerahc.healthsparq.com/healthsparq/public/#/one/"
+        "insurerCode=UNVRA_I&brandCode=UNVRA/machine-readable-transparency-in-coverage"
+    )
+    metadata_url = (
+        "https://mrf.healthsparq.com/unvra-egress.nophi.kyruushsq.com/prd/mrf/"
+        "UNVRA_I/UNVRA/latest_metadata.json"
+    )
+
+    async def fake_fetch_json(_url, **_kwargs):
+        raise AssertionError("metadata fetch should not run after URL preflight fails")
+
+    async def block_url(url):
+        assert url == metadata_url
+        raise ValueError("URL resolves to a non-public address: 127.0.0.1")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", block_url)
+
+    resolved_crawl_targets = await discovery._resolve_healthsparq_public_mrf(
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "display_name": "Univera Healthcare",
+        },
+        healthsparq_public_url,
+        discovery._source_config()["platform_resolvers"]["healthsparq"],
+        None,
+    )
+
+    assert len(resolved_crawl_targets) == 1
+    assert resolved_crawl_targets[0].url == healthsparq_public_url
+    assert resolved_crawl_targets[0].metadata["metadata_url"] == metadata_url
+    assert resolved_crawl_targets[0].metadata["target_kind"] == "source_landing_page"
+    assert resolved_crawl_targets[0].metadata["target_file_type"] == "source-landing-page"
+    assert (
+        resolved_crawl_targets[0].metadata["landing_reason"]
+        == "healthsparq_metadata_unexpanded"
+    )
+
+
+@pytest.mark.asyncio
 async def test_hs_metadata_expands_files(monkeypatch):
     source_dict = {
         "source_id": "source_1",
