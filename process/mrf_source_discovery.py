@@ -987,10 +987,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "sapphire"
     if host == "mrf.healthsparq.com" and path.endswith("/latest_metadata.json"):
         return "healthsparq_direct_metadata"
-    if (
-        _looks_direct_toc_url(raw)
-        and _mrf_file_type_from_text(raw) == "table-of-contents"
-    ):
+    if _looks_direct_toc_url(raw):
         return "direct_toc"
     if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
         return "direct_mrf_body"
@@ -11569,6 +11566,8 @@ def _looks_direct_toc_url(url: str | None) -> bool:
     query = parsed.query.lower()
     if host == "d3oz7y1cwsecds.cloudfront.net" and path == "/member-prod/bcbsal":
         return True
+    if host in {"www.hmaa.com", "hmaa.com"} and path.endswith("/mrf_hmaa.zip"):
+        return True
     if path.endswith((".json", ".json.gz")) and (
         _mrf_file_type_from_text(url) == "table-of-contents"
     ):
@@ -11680,7 +11679,12 @@ async def _crawl_targets_for_source(
             source, url, resolver, session
         )
     if resolver_type == "direct_toc":
-        target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
+        target = _direct_toc_crawl_target(
+            source,
+            url,
+            resolver=resolver_type,
+            target_max_bytes=_parse_size_bytes(resolver.get("toc_max_bytes")),
+        )
         if target:
             return [target]
         raise ValueError(f"no direct MRF TOC target found for {url}")
@@ -11872,7 +11876,12 @@ async def _crawl_targets_for_source(
             source, url, resolver, session
         )
     if resolver_type == "direct_toc":
-        target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
+        target = _direct_toc_crawl_target(
+            source,
+            url,
+            resolver=resolver_type,
+            target_max_bytes=_parse_size_bytes(resolver.get("toc_max_bytes")),
+        )
         if target:
             return [target]
         raise ValueError(f"no direct MRF TOC target found for {url}")
@@ -12293,21 +12302,28 @@ def _direct_mrf_body_crawl_target(
 
 
 def _direct_toc_crawl_target(
-    source: dict[str, Any], url: str, *, resolver: str = "direct_toc"
+    source: dict[str, Any],
+    url: str,
+    *,
+    resolver: str = "direct_toc",
+    target_max_bytes: int | None = None,
 ) -> CrawlTarget | None:
     if not _looks_direct_toc_url(url):
         return None
+    metadata = {
+        "resolver": resolver,
+        "target_kind": "toc_json",
+        "target_file_type": "table-of-contents",
+        "file_name": Path(urlsplit(str(url or "")).path).name,
+        "payer_name": source.get("display_name"),
+    }
+    if target_max_bytes:
+        metadata["target_max_bytes"] = target_max_bytes
     return CrawlTarget(
         source=source,
         url=url,
         label=str(source.get("display_name") or ""),
-        metadata={
-            "resolver": resolver,
-            "target_kind": "toc_json",
-            "target_file_type": "table-of-contents",
-            "file_name": Path(urlsplit(str(url or "")).path).name,
-            "payer_name": source.get("display_name"),
-        },
+        metadata=metadata,
     )
 
 

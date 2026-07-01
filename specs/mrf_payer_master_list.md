@@ -255,11 +255,11 @@ Last one-time research refresh: 2026-06-05.
 | HRI Dental and Vision | dental | https://www.insuringsmiles.com/ | official HRI Dental & Vision page describes dental and vision coverage for employer groups and individuals; source tier: coverage evidence; benefit lines: dental, vision; aliases: HRI Dental, HRI/Paramount Dental, HRI Dental & Vision, Paramount Dental, HRI Vision, Paramount Vision |
 | Willamette Dental Group | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: Willamette Dental Group |
 | AllWays | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
-| Avera Health Plans | provider_sponsored | https://portaldocs.dakotacare.com/MachineReadableFiles/Avera | curated source row |
+| Avera Health Plans | provider_sponsored | https://www.averahealthplans.com/insurance/about/legal-privacy-notices/transparency-in-coverage/ | official transparency page confirms machine-readable files but does not expose direct automated file URLs; source tier: coverage evidence; benefit lines: medical; aliases: Avera, DakotaCare |
 | Baylor Scott & White HP | provider_sponsored | https://www.bswhealthplan.com/transparency | curated source row |
 | Baylor Scott and White Health Plan | provider_sponsored | https://www.bswhealthplan.com/transparency | public transparency URL |
-| Children's Community HP | provider_sponsored | - | needs official source URL |
-| Children's/VNS Health | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
+| Children's Community HP | provider_sponsored | - | represented by Chorus Community Health Plans public source; aliases: Children's Community Health Plan, CCHP |
+| Children's/VNS Health | provider_sponsored | - | needs verified source URL; previous Hopkins URL belongs Johns Hopkins HealthCare, not Children's/VNS |
 | CHRISTUS Health Plan | provider_sponsored | https://chppayment.christushealth.org/documents/ATEX/ | public MRF directory |
 | Cook Children's HP | provider_sponsored | - | needs official source URL |
 | Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq MRF route linked from Dean transparency page |
@@ -286,7 +286,7 @@ Last one-time research refresh: 2026-06-05.
 | Paramount Health Care | provider_sponsored | https://paramount.healthsparq.com/healthsparq/public/#/one/insurerCode=PARAMOUNT_I&brandCode=PARAMOUNT/machine-readable-transparency-in-coverage | official Paramount Legal page links this HealthSparq machine-readable source; aliases: Paramount |
 | Physicians Health Plan | provider_sponsored | https://www.uofmhealthplan.org/members/price-transparency-and-interoperability | public U-M Health Plan price-transparency page exposes current Physicians Health Plan table-of-contents links; aliases: U-M Health Plan, UM Health Plan, University of Michigan Health Plan, Physicians Health Plan of Michigan |
 | Physicians Health Plan of N. Indiana | provider_sponsored | https://services.phpni.com/machine-readable-files/files/phpni/phpni | public PHPNI machine-readable-files service linked from the PHPNI MRF page; aliases: PHPNI, PHP Northern Indiana, Physicians Health Plan Northern Indiana |
-| Presbyterian Health Plan | provider_sponsored | https://www.phs.org/tools-resources/member/Pages/applicable-rates.aspx | curated source row |
+| Presbyterian Health Plan | provider_sponsored | https://www.phs.org/tools-resources/member/Pages/applicable-rates.aspx | official applicable-rates page but no direct automated MRF URLs verified; source tier: coverage evidence |
 | Prevea360 | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
 | Priority Health | provider_sponsored | https://www.priorityhealth.com/landing/transparency | curated source row; aliases: Priority Health of Michigan |
 | ProMedica | provider_sponsored | - | needs official source URL |
@@ -323,10 +323,10 @@ Last one-time research refresh: 2026-06-05.
 | CalViva Health | regional | https://www.calvivahealth.org/interoperability/ | observed stale; delegated transparency page points to Health Net/Centene MRF sources |
 | CDPHP | regional | https://www.cdphp.com/interoperability/machine-readable-pricing-data-files | curated source row |
 | CDPHP | regional | https://www.cdphp.com/interoperability/machine-readable-pricing-data-files#:~:text=Monthly%20Pricing%20Files%20As%20mandated%20by%20the%20Centers,negotiated%20payment%20rates%20and%20historical%20out-of-network%20allowed%20amounts | duplicate of current direct MRF file-link page |
-| Chinese Community Health Plan | regional | https://cchphealthplan.com/interoperability-patient-access-mrf/ | public transparency URL |
+| Chinese Community Health Plan | regional | https://cchphealthplan.com/interoperability-patient-access-mrf/ | official interoperability/MRF page but no direct automated pricing file URLs verified; source tier: coverage evidence; aliases: Chinese Community HP, CCHP San Francisco |
 | Chinese Community HP | regional | - | needs official source URL |
-| Chorus Community Health Plans | regional | https://chorushealthplans.org/ifp/past-ifp-member-resources/transparency-in-coverage | public transparency URL |
-| Chorus Community HP | regional | - | needs official source URL |
+| Chorus Community Health Plans | regional | https://chorushealthplans.org/ifp/past-ifp-member-resources/transparency-in-coverage | public transparency URL; aliases: Chorus Community HP, Children's Community Health Plan, Children's Community HP, CCHP, Together with CCHP |
+| Chorus Community HP | regional | - | represented by Chorus Community Health Plans public source; aliases: Children's Community Health Plan, Children's Community HP, CCHP |
 | Common Ground Healthcare | regional | - | needs official source URL |
 | Community Care of North Carolina | regional | - | needs official source URL |
 | Community Care of Oklahoma | regional | - | needs official source URL |
@@ -349,8 +349,8 @@ Last one-time research refresh: 2026-06-05.
 | Fallon Health | regional | https://fallon.sapphiremrfhub.com/ | curated source row |
 | Farm Bureau Health Plans | regional | https://fbhealthplans.com/forms-resources/ | observed unsupported; forms and resources page, not a payer TiC pricing MRF source |
 | Fidelis | regional | - | needs official source URL |
-| First Choice Health | regional | https://www.fchn.com/machine-readable-files | curated source row; aliases: First Choice Health Network |
-| First Choice Health | regional | https://www.fchn.com/PayorSearch | public transparency URL |
+| First Choice Health | regional | https://www.fchn.com/machine-readable-files | official FCHN MRF page, but Cloudflare blocks automated import from the current crawler; source tier: coverage evidence; aliases: First Choice Health Network |
+| First Choice Health | regional | https://www.fchn.com/PayorSearch | official FCHN payor search exposes MRF details in browsers, but Cloudflare blocks automated import from the current crawler; source tier: coverage evidence; aliases: First Choice Health Network |
 | First Choice Next | regional | https://www.firstchoicenext.com/json | public transparency URL |
 | First Health | regional | https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/machine-readable-transparency-in-coverage | observed current; 1,441 plans; 1,438 files |
 | First Medical | regional | - | needs official source URL |
@@ -367,10 +367,10 @@ Last one-time research refresh: 2026-06-05.
 | HealthNet | regional | - | needs official source URL |
 | HealthNow New York | regional | - | needs official source URL |
 | Hennepin Health Plan | regional | - | needs official source URL |
-| HMAA | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | curated source row |
+| HMAA | regional | https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip | public HMAA MRF ZIP containing table-of-contents JSON; aliases: Hawaii Medical Assurance Association |
 | HMAA Hawaii Management | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | observed stale |
 | Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq machine-readable files route linked from Independent Health transparency page |
-| Indiana University Health Plans | regional | https://www.iuhealthplans.org/price-transparency-information | public transparency URL |
+| Indiana University Health Plans | regional | https://www.iuhealthplans.org/price-transparency-information | observed stale; public transparency page now returns no automated MRF targets |
 | LA Care Health Plan | regional | - | needs official source URL |
 | Lifewise Assurance Company | regional | https://lifewise.healthsparq.com/healthsparq/public/#/one/insurerCode=LIFEWISE_I&brandCode=LIFEWISE/machine-readable-transparency-in-coverage | curated HealthSparq metadata source |
 | Managed Health Network | regional | - | needs official source URL |
@@ -396,7 +396,7 @@ Last one-time research refresh: 2026-06-05.
 | Paramount | regional | - | needs official source URL |
 | Partnership HealthPlan | regional | - | needs official source URL; previous healthplan.org source belongs to The Health Plan |
 | PEHP | regional | https://www.pehp.org/machinereadablefiles | public PEHP machine-readable file page with opaque JSON downloads; aliases: Public Employee Health Plan, PUBLIC EMPLOYEE HEALTH PLAN (PEHP) |
-| Piedmont Health Plan | regional | https://pchp.net/index.php/transparency-in-coverage.html | public transparency URL |
+| Piedmont Health Plan | regional | https://pchp.net/index.php/transparency-in-coverage.html | observed stale; Piedmont Community Health Plan indicates coverage ended effective 2025 and no current automated MRF source is verified |
 | Point 72 Health | regional | - | needs official source URL |
 | ProMedica Health System | regional | - | needs official source URL |
 | QualChoice | regional | - | needs official source URL |

@@ -88,6 +88,7 @@ def test_source_urls_are_loaded_from_registry_file():
     )
     assert config["platform_resolvers"]["direct_mrf_body"]["type"] == "direct_mrf_body"
     assert config["platform_resolvers"]["direct_toc"]["type"] == "direct_toc"
+    assert config["platform_resolvers"]["direct_toc"]["toc_max_bytes"] == 200 * 1024 * 1024
     assert (
         config["platform_resolvers"]["socrata_data_json_mrf_catalog"]["type"]
         == "socrata_data_json_mrf_catalog"
@@ -633,6 +634,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform(
             "https://d3oz7y1cwsecds.cloudfront.net/member-prod/bcbsal"
+        )
+        == "direct_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip"
         )
         == "direct_toc"
     )
@@ -4096,6 +4103,20 @@ async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch
     assert target.metadata["resolver"] == "direct_toc"
     assert target.metadata["target_kind"] == "toc_json"
     assert target.metadata["target_file_type"] == "table-of-contents"
+
+    hmaa_source = {
+        "source_id": "source_hmaa",
+        "payer_id": "payer_hmaa",
+        "display_name": "HMAA",
+    }
+    hmaa_url = "https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip"
+
+    [hmaa_target] = await discovery._crawl_targets_for_source(hmaa_source, hmaa_url, None)
+
+    assert hmaa_target.url == hmaa_url
+    assert hmaa_target.metadata["resolver"] == "direct_toc"
+    assert hmaa_target.metadata["target_kind"] == "toc_json"
+    assert hmaa_target.metadata["target_max_bytes"] == 200 * 1024 * 1024
 
 
 @pytest.mark.asyncio
@@ -11019,6 +11040,9 @@ def test_direct_toc_url_accepts_no_extension_mrf_index():
     assert discovery._looks_direct_toc_url(
         "https://mrf.secure.bcbsks.com/api/filedownloadhttptrigger?name=table-of-contents&ext=json"
     )
+    assert discovery._looks_direct_toc_url(
+        "https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip"
+    )
 
 
 def test_direct_toc_url_rejects_provider_directory_indexes():
@@ -12189,6 +12213,12 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
 | McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public HTML MRF files |
 | AmeriHealth Caritas Next | regional | https://www.amerihealthcaritasnext.com/json | public HTML MRF files |
 | AvMed | regional | https://www.avmed.org/en/for-developers | public AvMed developer page |
+| HMAA | regional | https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip | public HMAA MRF ZIP containing table-of-contents JSON; aliases: Hawaii Medical Assurance Association |
+| Avera Health Plans | provider_sponsored | https://www.averahealthplans.com/insurance/about/legal-privacy-notices/transparency-in-coverage/ | official transparency page confirms machine-readable files but does not expose direct automated file URLs; source tier: coverage evidence; aliases: Avera, DakotaCare |
+| Chorus Community Health Plans | regional | https://chorushealthplans.org/ifp/past-ifp-member-resources/transparency-in-coverage | public transparency URL; aliases: Chorus Community HP, Children's Community Health Plan, Children's Community HP, CCHP, Together with CCHP |
+| Children's Community HP | provider_sponsored | - | represented by Chorus Community Health Plans public source; aliases: Children's Community Health Plan, CCHP |
+| First Choice Health | regional | https://www.fchn.com/machine-readable-files | official FCHN MRF page, but Cloudflare blocks automated import from the current crawler; source tier: coverage evidence; aliases: First Choice Health Network |
+| Piedmont Health Plan | regional | https://pchp.net/index.php/transparency-in-coverage.html | observed stale; no current automated MRF source is verified |
 """
     by_name = {candidate.payer_name: candidate for candidate in discovery.parse_master_list(markdown)}
 
@@ -12210,6 +12240,15 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
     assert by_name["McLaren Health Plan"].hosting_platform == "html_mrf_links"
     assert by_name["AmeriHealth Caritas Next"].hosting_platform == "html_mrf_links"
     assert by_name["AvMed"].hosting_platform == "avmed_html_mrf_links"
+    assert by_name["HMAA"].hosting_platform == "direct_toc"
+    assert by_name["HMAA"].source_tier == "mrf_importable"
+    assert "Hawaii Medical Assurance Association" in by_name["HMAA"].aliases
+    assert by_name["Avera Health Plans"].source_tier == "coverage_evidence"
+    assert "DakotaCare" in by_name["Avera Health Plans"].aliases
+    assert "Children's Community Health Plan" in by_name["Chorus Community Health Plans"].aliases
+    assert by_name["Children's Community HP"].status == "needs_review"
+    assert by_name["First Choice Health"].source_tier == "coverage_evidence"
+    assert by_name["Piedmont Health Plan"].status == "stale"
 
 
 def test_toc_target_file_row_keeps_index_provenance():

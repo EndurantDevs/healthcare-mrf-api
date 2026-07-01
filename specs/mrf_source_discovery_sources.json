@@ -186,7 +186,8 @@
       "type": "direct_mrf_body"
     },
     "direct_toc": {
-      "type": "direct_toc"
+      "type": "direct_toc",
+      "toc_max_bytes": 209715200
     },
     "socrata_data_json_mrf_catalog": {
       "type": "socrata_data_json_mrf_catalog",
