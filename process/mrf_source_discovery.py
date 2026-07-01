@@ -1911,15 +1911,25 @@ async def _fetch_text(
     class BrowserFallbackRequired(Exception):
         """Retry this public JSON URL with browser-compatible request headers."""
 
-    async def read_response(resp: aiohttp.ClientResponse) -> tuple[bytes, str]:
+    async def read_response(
+        resp: aiohttp.ClientResponse,
+        *,
+        allow_browser_fallback: bool,
+    ) -> tuple[bytes, str]:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
-        if expect_json and resp.status in _BROWSER_FALLBACK_HTTP_STATUSES:
+        if (
+            expect_json
+            and allow_browser_fallback
+            and resp.status in _BROWSER_FALLBACK_HTTP_STATUSES
+        ):
             raise BrowserFallbackRequired()
         if expect_json and any(
             marker in content_type
             for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
         ):
+            if allow_browser_fallback:
+                raise BrowserFallbackRequired()
             raise ValueError(
                 f"response content-type is not JSON: {content_type or 'unknown'}"
             )
@@ -1932,6 +1942,8 @@ async def _fetch_text(
             if expect_json and not chunks:
                 prefix = chunk.lstrip()[:64].lower()
                 if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
+                    if allow_browser_fallback:
+                        raise BrowserFallbackRequired()
                     raise ValueError("response body is not JSON")
             chunks.append(chunk)
         return b"".join(chunks), resp.charset or "utf-8"
@@ -1940,7 +1952,7 @@ async def _fetch_text(
         async with session.get(
             url, allow_redirects=True, **_request_ssl_kwargs(url)
         ) as resp:
-            body, charset = await read_response(resp)
+            body, charset = await read_response(resp, allow_browser_fallback=True)
     except (aiohttp.ServerDisconnectedError, BrowserFallbackRequired):
         retry_headers = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
@@ -1960,7 +1972,7 @@ async def _fetch_text(
             async with retry_session.get(
                 url, allow_redirects=True, **_request_ssl_kwargs(url)
             ) as resp:
-                body, charset = await read_response(resp)
+                body, charset = await read_response(resp, allow_browser_fallback=False)
     return _decode_response_body(body, charset=charset)
 
 
@@ -10686,17 +10698,22 @@ def _healthsparq_target(
 ) -> CrawlTarget:
     return CrawlTarget(
         source=source,
-        url=metadata_url,
+        url=resolved_from_url if resolved_from_url else metadata_url,
         label=str(source.get("display_name") or params["brandCode"]),
         resolved_from_url=resolved_from_url,
         metadata={
             "resolver": "healthsparq_public_mrf",
-            "target_kind": "toc_json",
-            "target_file_type": "table-of-contents",
+            "target_kind": "source_landing_page",
+            "target_file_type": "source-landing-page",
             "insurer_code": params["insurerCode"],
             "brand_code": params["brandCode"],
             "reporting_entity_type": params.get("reportingEntityType"),
             "search_term": params.get("searchTerm"),
+            "source_format": "healthsparq_metadata",
+            "metadata_url": metadata_url,
+            "external_source_url": metadata_url,
+            "external_hosting_platform": classify_hosting_platform(metadata_url),
+            "landing_reason": "healthsparq_metadata_unexpanded",
         },
     )
 

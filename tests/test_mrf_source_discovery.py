@@ -7023,7 +7023,7 @@ def test_import_control_source_urls_use_healthsparq_metadata_url():
     assert medmutual_official_url == medmutual_public_url
 
 
-def test_healthsparq_target_marks_metadata_url_as_toc_target():
+def test_healthsparq_target_is_landing():
     target = discovery._healthsparq_target(
         {"source_id": "source_1", "display_name": "Priority Health"},
         "https://mrf.healthsparq.com/ph/prd/mrf/PH_I/PH/latest_metadata.json",
@@ -7031,8 +7031,12 @@ def test_healthsparq_target_marks_metadata_url_as_toc_target():
         {"insurerCode": "PH_I", "brandCode": "PH"},
     )
 
-    assert target.metadata["target_kind"] == "toc_json"
-    assert target.metadata["target_file_type"] == "table-of-contents"
+    assert target.url == "https://web.healthsparq.com/healthsparq/public/"
+    assert target.metadata["target_kind"] == "source_landing_page"
+    assert target.metadata["target_file_type"] == "source-landing-page"
+    assert (
+        target.metadata["landing_reason"] == "healthsparq_metadata_unexpanded"
+    )
 
 
 def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
@@ -7204,29 +7208,23 @@ async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
 
-    targets = await discovery._resolve_healthsparq_public_mrf(
+    resolved_crawl_targets = await discovery._resolve_healthsparq_public_mrf(
         source, source_url, resolver, None
     )
 
-    assert len(targets) in {1}
-    assert targets[0].url == (
+    assert len(resolved_crawl_targets) in {1}
+    assert resolved_crawl_targets[0].url == (
         "https://mrf.healthsparq.com/unvra-egress.nophi.kyruushsq.com/prd/mrf/"
         "UNVRA_I/UNVRA/2026-07-01/inNetworkRates/rates.json.zip"
     )
-    assert targets[0].resolved_from_url == metadata_url
-    assert targets[0].metadata["target_kind"] == "file_reference"
-    assert targets[0].metadata["plan_info"][0]["plan_id"] == "123456789"
+    assert resolved_crawl_targets[0].resolved_from_url == metadata_url
+    assert resolved_crawl_targets[0].metadata["target_kind"] == "file_reference"
+    assert resolved_crawl_targets[0].metadata["plan_info"][0]["plan_id"] == "123456789"
 
 
 @pytest.mark.asyncio
 async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
-    source = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "Univera Healthcare",
-    }
-    resolver = discovery._source_config()["platform_resolvers"]["healthsparq"]
-    source_url = (
+    healthsparq_public_url = (
         "https://univerahc.healthsparq.com/healthsparq/public/#/one/"
         "insurerCode=UNVRA_I&brandCode=UNVRA/machine-readable-transparency-in-coverage"
     )
@@ -7240,14 +7238,28 @@ async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
 
-    targets = await discovery._resolve_healthsparq_public_mrf(
-        source, source_url, resolver, None
+    resolved_crawl_targets = await discovery._resolve_healthsparq_public_mrf(
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "display_name": "Univera Healthcare",
+        },
+        healthsparq_public_url,
+        discovery._source_config()["platform_resolvers"]["healthsparq"],
+        None,
     )
 
-    assert len(targets) in {1}
-    assert targets[0].url.endswith("/UNVRA_I/UNVRA/latest_metadata.json")
-    assert targets[0].metadata["target_kind"] == "toc_json"
-    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert len(resolved_crawl_targets) in {1}
+    assert resolved_crawl_targets[0].url == healthsparq_public_url
+    assert resolved_crawl_targets[0].metadata["metadata_url"].endswith(
+        "/UNVRA_I/UNVRA/latest_metadata.json"
+    )
+    assert resolved_crawl_targets[0].metadata["target_kind"] == "source_landing_page"
+    assert resolved_crawl_targets[0].metadata["target_file_type"] == "source-landing-page"
+    assert (
+        resolved_crawl_targets[0].metadata["landing_reason"]
+        == "healthsparq_metadata_unexpanded"
+    )
 
 
 @pytest.mark.asyncio
@@ -7307,7 +7319,7 @@ async def test_hs_metadata_expands_files(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hs_metadata_fallback_toc(
+async def test_hs_metadata_fallback_landing(
     monkeypatch,
 ):
     source_dict = {"source_id": "source_1", "display_name": "Example Health"}
@@ -7329,8 +7341,12 @@ async def test_hs_metadata_fallback_toc(
     )
 
     assert [crawl_target.url for crawl_target in resolved_targets] == [metadata_url]
-    assert resolved_targets[0].metadata["target_kind"] == "toc_json"
-    assert resolved_targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert resolved_targets[0].metadata["target_kind"] == "source_landing_page"
+    assert resolved_targets[0].metadata["target_file_type"] == "source-landing-page"
+    assert (
+        resolved_targets[0].metadata["landing_reason"]
+        == "healthsparq_metadata_unexpanded"
+    )
 
 
 @pytest.mark.asyncio
