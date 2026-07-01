@@ -13,6 +13,7 @@ sys.modules[SPEC.name] = readability_budget
 SPEC.loader.exec_module(readability_budget)
 
 NOQA_FIXTURE = "# no" + "qa: E123"
+COMMENT_NOISE_FIXTURE = "# return" + " result"
 
 
 def _write_config(repo_root: Path) -> None:
@@ -123,6 +124,60 @@ def test_readability_budget_reports_long_functions(tmp_path):
     assert snapshot["issues"]["long_functions"][0]["function"] == "too_long"
 
 
+def test_readability_budget_attributes_nonlocal_to_nested_scope_only(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text(
+        textwrap.dedent(
+            """
+            def outer():
+                count = 0
+
+                def inner():
+                    nonlocal count
+                    count += 1
+            """
+        ),
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+
+    snapshot = readability_budget.build_snapshot(
+        repo_root,
+        json.loads((repo_root / "readability-budget.json").read_text(encoding="utf-8")),
+    )
+
+    assert snapshot["issue_counts"]["global_state_usage"] == 1
+    assert snapshot["issues"]["global_state_usage"][0]["function"] == "outer.inner"
+
+
+def test_readability_budget_ignores_response_factory_calls(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text(
+        textwrap.dedent(
+            """
+            def _route_response(response):
+                response_headers_by_name = {"Allow": "OPTIONS"}
+                preflight_response = response.empty(status=204, headers=response_headers_by_name)
+                return preflight_response
+            """
+        ),
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+
+    snapshot = readability_budget.build_snapshot(
+        repo_root,
+        json.loads((repo_root / "readability-budget.json").read_text(encoding="utf-8")),
+    )
+
+    assert snapshot["issue_counts"]["boolean_name_mismatch"] == 0
+    assert snapshot["issue_counts"]["collection_name_mismatch"] == 0
+
+
 def test_readability_budget_does_not_parse_non_python_files(tmp_path):
     repo_root = tmp_path
     package = repo_root / "pkg"
@@ -160,16 +215,16 @@ def test_readability_budget_reports_naming_and_contract_debt(tmp_path):
                 pass
 
             def process_data(a, b, c, d):
-                # return result
+                {comment_noise_fixture}
                 data = [1, 2, 3]
-                row = {"a": 1}
+                row = {{"a": 1}}
                 result = a == b
                 l = 1
                 extra = 2
                 another = 3
                 return result
             """
-        ),
+        ).format(comment_noise_fixture=COMMENT_NOISE_FIXTURE),
         encoding="utf-8",
     )
     _write_config(repo_root)
