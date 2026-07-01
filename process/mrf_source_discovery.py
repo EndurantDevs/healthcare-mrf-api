@@ -2584,12 +2584,14 @@ async def _store_observations(
 
 
 def _healthsparq_file_type(file_schema: Any) -> str:
-    normalized = str(file_schema or "").strip().lower().replace("-", "_")
-    if normalized == "in_network_rates":
+    normalized = re.sub(
+        r"[^a-z0-9]+", "_", str(file_schema or "").strip().lower()
+    ).strip("_")
+    if normalized in {"in_network_rates", "in_network"}:
         return "in-network"
     if normalized in {"allowed_amounts", "allowed_amount"}:
         return "allowed-amounts"
-    if normalized == "table_of_contents":
+    if normalized in {"table_of_contents", "toc"}:
         return "table-of-contents"
     if "drug" in normalized:
         return "payer-drug"
@@ -2605,34 +2607,117 @@ def _healthsparq_file_url(metadata_url: str, file_path: Any) -> str:
     return urljoin(metadata_url.rsplit("/", 1)[0] + "/", path)
 
 
+def _healthsparq_metadata_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    containers: list[Any] = [payload]
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        containers.append(data)
+    elif isinstance(data, list):
+        containers.append({"items": data})
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ("files", "items", "results"):
+            files = container.get(key)
+            if isinstance(files, list):
+                return [item for item in files if isinstance(item, dict)]
+    return []
+
+
+def _healthsparq_value(file_item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = file_item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _healthsparq_reporting_plans(file_item: dict[str, Any]) -> list[dict[str, Any]]:
+    plans = _healthsparq_value(
+        file_item,
+        "reportingPlans",
+        "reporting_plans",
+        "plans",
+        "planInfo",
+        "plan_info",
+    )
+    return [plan for plan in (plans or []) if isinstance(plan, dict)]
+
+
+def _healthsparq_plan_value(plan: dict[str, Any], *keys: str) -> Any:
+    return _healthsparq_value(plan, *keys)
+
+
+def _healthsparq_file_name(file_item: dict[str, Any]) -> str | None:
+    return _clean_text(
+        _healthsparq_value(file_item, "fileName", "file_name", "filename", "name")
+    )
+
+
+def _healthsparq_file_path(file_item: dict[str, Any]) -> Any:
+    return _healthsparq_value(
+        file_item,
+        "filePath",
+        "file_path",
+        "path",
+        "location",
+        "url",
+        "downloadUrl",
+        "download_url",
+        "href",
+    )
+
+
+def _healthsparq_file_schema(file_item: dict[str, Any]) -> Any:
+    return _healthsparq_value(
+        file_item, "fileSchema", "file_schema", "schema", "fileType", "file_type"
+    )
+
+
+def _healthsparq_reporting_entity_name(file_item: dict[str, Any]) -> Any:
+    return _healthsparq_value(
+        file_item, "reportingEntityName", "reporting_entity_name", "reportingEntity"
+    )
+
+
+def _healthsparq_reporting_entity_type(file_item: dict[str, Any]) -> Any:
+    return _healthsparq_value(
+        file_item, "reportingEntityType", "reporting_entity_type"
+    )
+
+
+def _healthsparq_last_updated_on(file_item: dict[str, Any]) -> Any:
+    return _healthsparq_value(
+        file_item, "lastUpdatedOn", "last_updated_on", "updatedAt", "updated_at"
+    )
+
+
 def _healthsparq_rows_from_metadata(
     source: dict[str, Any], metadata_url: str, payload: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, list):
-        return [], []
+    files = _healthsparq_metadata_files(payload if isinstance(payload, dict) else {})
     now = _utc_now()
     target_query = _source_target_payer_query(source)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows_by_id: dict[str, dict[str, Any]] = {}
     for file_item in files:
-        if not isinstance(file_item, dict):
-            continue
-        file_url = _healthsparq_file_url(metadata_url, file_item.get("filePath"))
+        file_url = _healthsparq_file_url(metadata_url, _healthsparq_file_path(file_item))
         if not file_url:
             continue
-        reporting_plans = [
-            plan
-            for plan in (file_item.get("reportingPlans") or [])
-            if isinstance(plan, dict)
-        ]
+        reporting_plans = _healthsparq_reporting_plans(file_item)
         normalized_plan_info = _healthsparq_plan_info(
             file_item, target_query=target_query
         )
         for plan, normalized_plan in zip(reporting_plans, normalized_plan_info):
-            plan_id = str(plan.get("planId") or "").strip()
-            plan_name = normalized_plan.get("plan_name") or plan.get("planName")
-            market_type = plan.get("planMarketType")
+            plan_id = str(
+                _healthsparq_plan_value(plan, "planId", "plan_id") or ""
+            ).strip()
+            plan_name = normalized_plan.get("plan_name") or _healthsparq_plan_value(
+                plan, "planName", "plan_name", "name"
+            )
+            market_type = _healthsparq_plan_value(
+                plan, "planMarketType", "plan_market_type", "marketType"
+            )
             plan_row_id = _id(
                 "mrfplan",
                 {
@@ -2647,11 +2732,13 @@ def _healthsparq_rows_from_metadata(
                 "payer_id": source.get("payer_id"),
                 "source_id": source["source_id"],
                 "plan_id": plan_id or None,
-                "plan_id_type": plan.get("planIdType"),
+                "plan_id_type": _healthsparq_plan_value(
+                    plan, "planIdType", "plan_id_type"
+                ),
                 "plan_name": plan_name,
                 "market_type": market_type,
-                "reporting_entity_name": file_item.get("reportingEntityName"),
-                "reporting_entity_type": file_item.get("reportingEntityType"),
+                "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
+                "reporting_entity_type": _healthsparq_reporting_entity_type(file_item),
                 "metadata_json": {
                     "raw_plan": plan,
                     "resolver": "healthsparq_public_mrf",
@@ -2661,7 +2748,7 @@ def _healthsparq_rows_from_metadata(
                 "first_seen_at": now,
                 "last_seen_at": now,
             }
-        file_type = _healthsparq_file_type(file_item.get("fileSchema"))
+        file_type = _healthsparq_file_type(_healthsparq_file_schema(file_item))
         canonical_url = _canonical_or_none(file_url) or file_url
         file_row_id = _id(
             "mrffile",
@@ -2675,8 +2762,8 @@ def _healthsparq_rows_from_metadata(
             "url": file_url,
             "canonical_url": canonical_url,
             "from_index_url": metadata_url,
-            "description": file_item.get("fileName"),
-            "network_name": file_item.get("fileName"),
+            "description": _healthsparq_file_name(file_item),
+            "network_name": _healthsparq_file_name(file_item),
             "plan_ids": [
                 plan.get("plan_id")
                 for plan in normalized_plan_info
@@ -2703,13 +2790,13 @@ def _healthsparq_rows_from_metadata(
                 **_file_benefit_metadata(
                     source,
                     file_url,
-                    file_item.get("fileName"),
-                    file_item.get("reportingEntityName"),
+                    _healthsparq_file_name(file_item),
+                    _healthsparq_reporting_entity_name(file_item),
                 ),
-                "file_path": file_item.get("filePath"),
-                "file_schema": file_item.get("fileSchema"),
-                "last_updated_on": file_item.get("lastUpdatedOn"),
-                "reporting_entity_name": file_item.get("reportingEntityName"),
+                "file_path": _healthsparq_file_path(file_item),
+                "file_schema": _healthsparq_file_schema(file_item),
+                "last_updated_on": _healthsparq_last_updated_on(file_item),
+                "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
                 # Normalized to the import-control preview plan shape (snake_case keys).
                 "plan_info": normalized_plan_info,
             },
@@ -10601,17 +10688,26 @@ def _healthsparq_target(
 def _healthsparq_plan_engine_hash(
     file_item: dict[str, Any], plan: dict[str, Any]
 ) -> str | None:
-    plan_name = _clean_text(plan.get("planName"))
-    plan_id = str(plan.get("planId") or "").strip()
-    market_type = str(plan.get("planMarketType") or "").strip()
+    plan_name = _clean_text(
+        _healthsparq_plan_value(plan, "planName", "plan_name", "name")
+    )
+    plan_id = str(
+        _healthsparq_plan_value(plan, "planId", "plan_id") or ""
+    ).strip()
+    market_type = str(
+        _healthsparq_plan_value(plan, "planMarketType", "plan_market_type", "marketType")
+        or ""
+    ).strip()
     if not plan_name or not plan_id or not market_type:
         return None
     return semantic_hash(
         {
-            "reporting_entity_name": file_item.get("reportingEntityName"),
-            "reporting_entity_type": file_item.get("reportingEntityType"),
+            "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
+            "reporting_entity_type": _healthsparq_reporting_entity_type(file_item),
             "plan_id": plan_id,
-            "plan_id_type": plan.get("planIdType"),
+            "plan_id_type": _healthsparq_plan_value(
+                plan, "planIdType", "plan_id_type"
+            ),
             "market_type": market_type,
             "plan_name": plan_name,
         },
@@ -10663,20 +10759,19 @@ def _query_expanded_plan_info(
 def _healthsparq_plan_info(
     file_item: dict[str, Any], *, target_query: str | None = None
 ) -> list[dict[str, Any]]:
-    reporting_plans = [
-        plan
-        for plan in (file_item.get("reportingPlans") or [])
-        if isinstance(plan, dict)
-    ]
+    reporting_plans = _healthsparq_reporting_plans(file_item)
     items: list[dict[str, Any]] = []
     for plan in reporting_plans:
         plan_name, sponsor_name = _healthsparq_query_plan_label(
-            plan.get("planName"), target_query
+            _healthsparq_plan_value(plan, "planName", "plan_name", "name"),
+            target_query,
         )
         item = {
-            "plan_id": plan.get("planId"),
-            "plan_id_type": plan.get("planIdType"),
-            "plan_market_type": plan.get("planMarketType"),
+            "plan_id": _healthsparq_plan_value(plan, "planId", "plan_id"),
+            "plan_id_type": _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
+            "plan_market_type": _healthsparq_plan_value(
+                plan, "planMarketType", "plan_market_type", "marketType"
+            ),
             "plan_name": plan_name,
             "engine_plan_hash": _healthsparq_plan_engine_hash(file_item, plan),
         }
@@ -10694,19 +10789,20 @@ def _healthsparq_file_matches_query(
         return True
     return _search_values_match_query(
         [
-            file_item.get("fileName"),
-            file_item.get("filePath"),
-            file_item.get("reportingEntityName"),
-            file_item.get("reportingEntityType"),
+            _healthsparq_file_name(file_item),
+            _healthsparq_file_path(file_item),
+            _healthsparq_reporting_entity_name(file_item),
+            _healthsparq_reporting_entity_type(file_item),
             *(
                 value
-                for plan in (file_item.get("reportingPlans") or [])
-                if isinstance(plan, dict)
+                for plan in _healthsparq_reporting_plans(file_item)
                 for value in (
-                    plan.get("planName"),
-                    plan.get("planId"),
-                    plan.get("planIdType"),
-                    plan.get("planMarketType"),
+                    _healthsparq_plan_value(plan, "planName", "plan_name", "name"),
+                    _healthsparq_plan_value(plan, "planId", "plan_id"),
+                    _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
+                    _healthsparq_plan_value(
+                        plan, "planMarketType", "plan_market_type", "marketType"
+                    ),
                 )
             ),
         ],
@@ -10722,27 +10818,23 @@ def _healthsparq_targets_from_metadata(
     resolved_from_url: str,
     params: dict[str, str],
 ) -> list[CrawlTarget]:
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, list):
-        return []
+    files = _healthsparq_metadata_files(payload if isinstance(payload, dict) else {})
     target_query = _source_target_payer_query(source)
     targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
     for file_item in files:
-        if not isinstance(file_item, dict):
-            continue
         if not _healthsparq_file_matches_query(file_item, target_query):
             continue
-        file_url = _healthsparq_file_url(metadata_url, file_item.get("filePath"))
+        file_url = _healthsparq_file_url(metadata_url, _healthsparq_file_path(file_item))
         if not file_url:
             continue
-        file_type = _healthsparq_file_type(file_item.get("fileSchema"))
+        file_type = _healthsparq_file_type(_healthsparq_file_schema(file_item))
         if not file_type or file_type == "unknown":
             continue
         target_kind = "file_reference"
-        file_name = _clean_text(file_item.get("fileName"))
+        file_name = _healthsparq_file_name(file_item)
         label = (
             file_name
-            or _clean_text(file_item.get("reportingEntityName"))
+            or _clean_text(_healthsparq_reporting_entity_name(file_item))
             or str(source.get("display_name") or params["brandCode"])
         )
         metadata = {
@@ -10752,16 +10844,16 @@ def _healthsparq_targets_from_metadata(
             "container_format": _container_format(file_url),
             "insurer_code": params["insurerCode"],
             "brand_code": params["brandCode"],
-            "reporting_entity_type": file_item.get("reportingEntityType")
+            "reporting_entity_type": _healthsparq_reporting_entity_type(file_item)
             or params.get("reportingEntityType"),
-            "reporting_entity_name": file_item.get("reportingEntityName"),
+            "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
             "search_term": params.get("searchTerm"),
             "source_format": "healthsparq_metadata",
             "metadata_url": metadata_url,
             "healthsparq_public_url": resolved_from_url,
-            "file_path": file_item.get("filePath"),
-            "file_schema": file_item.get("fileSchema"),
-            "last_updated_on": file_item.get("lastUpdatedOn"),
+            "file_path": _healthsparq_file_path(file_item),
+            "file_schema": _healthsparq_file_schema(file_item),
+            "last_updated_on": _healthsparq_last_updated_on(file_item),
             "plan_info": _healthsparq_plan_info(
                 file_item, target_query=target_query
             ),

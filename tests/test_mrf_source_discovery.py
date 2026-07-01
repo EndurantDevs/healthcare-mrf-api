@@ -1477,6 +1477,66 @@ def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync(
     assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
 
 
+def test_healthsparq_reads_nested_manifest():
+    source_by_id = {
+        "source_id": "src_example",
+        "payer_id": "payer_example",
+        "display_name": "Example Carrier",
+    }
+    metadata_url = (
+        "https://mrf.healthsparq.com/example/prd/mrf/EXAMPLE_I/EXAMPLE/"
+        "latest_metadata.json"
+    )
+    manifest_by_section = {
+        "data": {
+            "items": [
+                {
+                    "reporting_entity_name": "Example Reporting Entity",
+                    "reporting_entity_type": "Health Insurance Issuer",
+                    "plans": [
+                        {
+                            "plan_name": "Example Nested Choice",
+                            "plan_id_type": "ein",
+                            "plan_id": "123456789",
+                            "plan_market_type": "group",
+                        }
+                    ],
+                    "updated_at": "2026-07-01",
+                    "schema": "in network rates",
+                    "name": "nested-rates.json.gz",
+                    "downloadUrl": "https://cdn.example.test/nested-rates.json.gz",
+                }
+            ]
+        }
+    }
+
+    catalog_plan_rows, catalog_file_rows = discovery._healthsparq_rows_from_metadata(
+        source_by_id, metadata_url, manifest_by_section
+    )
+    crawl_targets = discovery._healthsparq_targets_from_metadata(
+        source_by_id,
+        metadata_url,
+        manifest_by_section,
+        resolved_from_url="https://example.healthsparq.com/healthsparq/public/",
+        params={"insurerCode": "EXAMPLE_I", "brandCode": "EXAMPLE"},
+    )
+
+    assert [plan_row["plan_name"] for plan_row in catalog_plan_rows] == [
+        "Example Nested Choice"
+    ]
+    assert [file_row["file_type"] for file_row in catalog_file_rows] == ["in-network"]
+    assert (
+        catalog_file_rows[0]["url"] == "https://cdn.example.test/nested-rates.json.gz"
+    )
+    assert catalog_file_rows[0]["metadata_json"]["file_schema"] == "in network rates"
+    assert catalog_file_rows[0]["metadata_json"]["plan_info"][0]["engine_plan_hash"]
+    assert [crawl_target.url for crawl_target in crawl_targets] == [
+        "https://cdn.example.test/nested-rates.json.gz"
+    ]
+    assert crawl_targets[0].metadata["target_file_type"] == "in-network"
+    assert crawl_targets[0].metadata["plan_info"][0]["plan_id"] == "123456789"
+
+
 def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
     target = discovery.CrawlTarget(
         source={"source_id": "src_aetna", "display_name": "Example Carrier"},
