@@ -1271,6 +1271,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if (
+        host in {"ghcscw.com", "www.ghcscw.com"}
+        and "transparency-in-coverage" in path
+    ):
+        return "ghcscw_azure_mrf_listing"
+    if (
         host in {"www.ucare.org", "ucare.org"}
         and "transparency-in-coverage" in path
     ):

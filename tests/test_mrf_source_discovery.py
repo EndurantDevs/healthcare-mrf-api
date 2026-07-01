@@ -218,6 +218,10 @@ def test_source_urls_are_loaded_from_registry_file():
         is True
     )
     assert (
+        config["platform_resolvers"]["ghcscw_azure_mrf_listing"]["type"]
+        == "azure_mrf_listing"
+    )
+    assert (
         config["platform_resolvers"]["pacificsource_azure_mrf_listing"]["type"]
         == "azure_mrf_listing"
     )
@@ -4386,6 +4390,12 @@ def test_classify_hosting_platforms():
             "https://hostedjson.blob.core.windows.net/transparencyfiles?restype=container&comp=list"
         )
         == "hostedjson_azure_mrf_listing"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://ghcscw.com/transparency-in-coverage"
+        )
+        == "ghcscw_azure_mrf_listing"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -11244,6 +11254,50 @@ def test_azure_mrf_listing_targets_from_xml_extracts_hostedjson_files():
         "in-network",
         "allowed-amounts",
     ]
+
+
+def test_azure_mrf_listing_targets_from_xml_extracts_group_health_coop_files():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Group Health Cooperative",
+    }
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+    <EnumerationResults ContainerName="https://transparencyincoverage.blob.core.windows.net/public">
+      <Blobs>
+        <Blob>
+          <Name>2026-05-27_GHC-SCW_index.json</Name>
+          <Url>https://transparencyincoverage.blob.core.windows.net/public/2026-05-27_GHC-SCW_index.json</Url>
+          <Properties><Content-Length>123</Content-Length></Properties>
+        </Blob>
+        <Blob>
+          <Name>2026-05-27_GHC-SCW_999000-SELF-FUNDED_in-network-rates.json</Name>
+          <Url>https://transparencyincoverage.blob.core.windows.net/public/2026-05-27_GHC-SCW_999000-SELF-FUNDED_in-network-rates.json</Url>
+          <Properties><Content-Length>456</Content-Length></Properties>
+        </Blob>
+      </Blobs>
+    </EnumerationResults>
+    """
+
+    targets = discovery._azure_mrf_listing_targets_from_xml(
+        source,
+        xml,
+        listing_url=(
+            "https://transparencyincoverage.blob.core.windows.net/public"
+            "?restype=container&comp=list&prefix=2026"
+        ),
+        resolver={
+            "type": "azure_mrf_listing",
+            "toc_max_bytes": 52428800,
+        },
+    )
+
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "table-of-contents",
+        "in-network",
+    ]
+    assert targets[0].url.endswith("2026-05-27_GHC-SCW_index.json")
+    assert targets[0].metadata["target_kind"] == "toc_json"
 
 
 def test_triples_mtt_targets_keep_latest_month_files():
