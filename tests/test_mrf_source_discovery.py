@@ -9513,6 +9513,56 @@ def test_parse_html_mrf_links_ignores_provider_formulary_indexes():
     assert targets == []
 
 
+def test_mrf_body_rejects_fee_schedule():
+    assert (
+        discovery._mrf_body_file_type_from_text(
+            "https://files.example.test/mrf/medical-fee-schedule.csv",
+            "In-network rates",
+        )
+        is None
+    )
+    assert (
+        discovery._mrf_body_file_type_from_text(
+            "https://files.example.test/mrf/example-fee-schedule.xlsx",
+            "Negotiated rates",
+        )
+        is None
+    )
+    assert (
+        discovery._mrf_body_file_type_from_text(
+            "https://files.example.test/mrf/example-in-network-rates.csv",
+            "In-network rates",
+        )
+        == "in-network"
+    )
+
+
+def test_html_mrf_rejects_fee_schedule():
+    html = """
+    <section>
+      <h2>In Network Rates</h2>
+      <a href="/mrf/example-medical-fee-schedule.csv">In-network fee schedule</a>
+      <a href="/mrf/example-dental-fee-schedule.xlsx">Negotiated rates workbook</a>
+      <a href="/mrf/example-in-network-rates.json.gz">In-network rates</a>
+    </section>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://example.test/machine-readable-files"
+    )
+
+    assert [
+        (target["url"], target["target_file_type"], target["target_kind"])
+        for target in targets
+    ] == [
+        (
+            "https://example.test/mrf/example-in-network-rates.json.gz",
+            "in-network",
+            "file_reference",
+        )
+    ]
+
+
 def test_html_mrf_directory_urls_extracts_clear_directory_links():
     html = """
     <a href="https://files.example.test/mrf/plan/TOC/">TOC</a>

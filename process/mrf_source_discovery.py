@@ -803,11 +803,27 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
     path = parsed.path.lower().replace("_", "-")
     file_name = Path(path).name
     text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
+    compact_text = re.sub(r"[^a-z0-9]+", "", text)
     if (
-        file_name.endswith((".css", ".css.gz", ".js", ".js.gz", ".map", ".map.gz"))
+        file_name.endswith(
+            (
+                ".css",
+                ".css.gz",
+                ".js",
+                ".js.gz",
+                ".map",
+                ".map.gz",
+                ".xls",
+                ".xlsx",
+                ".xlsm",
+                ".xlsb",
+            )
+        )
         or ".min.js" in file_name
         or ".bundle.js" in file_name
     ):
+        return True
+    if "fee-schedule" in text or "feeschedule" in compact_text:
         return True
     if any(token in text for token in ("balance-billing", "out-of-network-liability")):
         return True
