@@ -379,7 +379,7 @@ def _load_toc_urls_from_file(path: str) -> list[str]:
                     elif isinstance(entry, list):
                         urls.extend([str(v).strip() for v in entry if str(v).strip()])
         except json.JSONDecodeError:
-            pass
+            return urls
     else:
         for line in text.splitlines():
             line = line.strip()

@@ -9,7 +9,6 @@ import os
 import subprocess
 import threading
 import time
-import zipfile
 from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
@@ -1110,31 +1109,6 @@ def test_filter_reporting_plans_matches_name_contains_case_insensitive():
     )
 
     assert result == plans
-
-
-def test_filter_reporting_plans_name_contains_ignores_issuer_and_reporting_entity():
-    plans = [
-        {
-            "plan_name": "Small Business PPO",
-            "plan_id": "59-1031071",
-            "issuer_name": "Cigna Health Life Insurance Company",
-            "reporting_entity_name": "Cigna",
-            "plan_market_type": "group",
-        },
-        {
-            "plan_name": "Cigna MVP Health Care, Inc",
-            "plan_id": "123",
-            "plan_market_type": "group",
-        },
-    ]
-
-    result = process_ptg._filter_reporting_plans(
-        plans,
-        plan_name_contains=["cigna"],
-        plan_market_types=["group"],
-    )
-
-    assert result == [plans[1]]
 
 
 def test_filter_reporting_plans_returns_original_without_filters():
@@ -2650,39 +2624,6 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
     assert not list(tmp_path.glob("*_logical.json"))
     with process_ptg.open_json_artifact_stream(raw_path) as fp:
         assert fp.read() == expected
-
-
-def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_requested(tmp_path, monkeypatch):
-    raw_path = tmp_path / "rates.zip"
-    expected = b'{"in_network":[]}'
-    with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
-        zip_ref.writestr("nested/rates.json", expected)
-    raw_sha256, byte_count = process_ptg.sha256_file(raw_path)
-
-    async def fake_download_raw_artifact(url, **_kwargs):
-        return process_ptg.PTG2RawArtifact(
-            original_url=url,
-            canonical_url=url,
-            raw_path=str(raw_path),
-            raw_storage_uri=f"file://{raw_path}",
-            raw_sha256=raw_sha256,
-            byte_count=byte_count,
-        )
-
-    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
-
-    _raw, logical = asyncio.run(
-        process_ptg.materialize_json_source(
-            "https://example.test/rates.zip",
-            tmp_path / "logical",
-            materialize_logical=False,
-        )
-    )
-
-    assert logical.compression == "zip"
-    assert logical.member_name == "nested/rates.json"
-    assert logical.logical_path != str(raw_path)
-    assert Path(logical.logical_path).read_bytes() == expected
 
 
 def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
@@ -5164,3 +5105,63 @@ def test_download_raw_artifact_aborts_oversize_body(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="max-bytes guard exceeded"):
         asyncio.run(run_download())
+
+
+def test_filter_plans_ignores_issuer_names():
+    plans = [
+        {
+            "plan_name": "Small Business PPO",
+            "plan_id": "59-1031071",
+            "issuer_name": "Cigna Health Life Insurance Company",
+            "reporting_entity_name": "Cigna",
+            "plan_market_type": "group",
+        },
+        {
+            "plan_name": "Cigna MVP Health Care, Inc",
+            "plan_id": "123",
+            "plan_market_type": "group",
+        },
+    ]
+
+    result = process_ptg._filter_reporting_plans(
+        plans,
+        plan_name_contains=["cigna"],
+        plan_market_types=["group"],
+    )
+
+    assert result == [plans[1]]
+
+
+def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
+    import zipfile
+
+    raw_path = tmp_path / "rates.zip"
+    expected = b'{"in_network":[]}'
+    with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
+        zip_ref.writestr("nested/rates.json", expected)
+    raw_sha256, byte_count = process_ptg.sha256_file(raw_path)
+
+    async def fake_download_raw_artifact(url, **_kwargs):
+        return process_ptg.PTG2RawArtifact(
+            original_url=url,
+            canonical_url=url,
+            raw_path=str(raw_path),
+            raw_storage_uri=f"file://{raw_path}",
+            raw_sha256=raw_sha256,
+            byte_count=byte_count,
+        )
+
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
+
+    _raw, logical = asyncio.run(
+        process_ptg.materialize_json_source(
+            "https://example.test/rates.zip",
+            tmp_path / "logical",
+            materialize_logical=False,
+        )
+    )
+
+    assert logical.compression == "zip"
+    assert logical.member_name == "nested/rates.json"
+    assert logical.logical_path != str(raw_path)
+    assert Path(logical.logical_path).read_bytes() == expected

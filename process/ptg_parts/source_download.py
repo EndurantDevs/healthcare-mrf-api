@@ -248,13 +248,6 @@ def _safe_download_label(url: str) -> str:
     return str(url)[:128]
 
 
-def _must_materialize_logical_artifact(raw_path: str | Path) -> bool:
-    try:
-        return zipfile.is_zipfile(raw_path)
-    except OSError:
-        return False
-
-
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(timeout_seconds, 10))
@@ -327,7 +320,6 @@ async def _download_raw_artifact_ranges(
     lock = asyncio.Lock()
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
     pending_ranges = [item for item in ranges if item not in completed]
-
     async def fetch_range(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
         nonlocal completed_bytes, next_progress_bytes
         start, end = item
@@ -723,7 +715,7 @@ async def materialize_json_source(
     )
     logical_artifact = (
         stream_logical_artifact(raw_artifact.raw_path, output_dir=output_dir)
-        if materialize_logical or _must_materialize_logical_artifact(raw_artifact.raw_path)
+        if materialize_logical or _should_materialize_logical_artifact(raw_artifact.raw_path)
         else logical_artifact_identity(
             raw_artifact.raw_path,
             raw_sha256=raw_artifact.raw_sha256,
@@ -732,6 +724,13 @@ async def materialize_json_source(
         )
     )
     return raw_artifact, logical_artifact
+
+
+def _should_materialize_logical_artifact(raw_path: str | Path) -> bool:
+    try:
+        return zipfile.is_zipfile(raw_path)
+    except OSError:
+        return False
 
 def _materialize_json_source_from_facade():
     ptg_module = sys.modules.get("process.ptg")
