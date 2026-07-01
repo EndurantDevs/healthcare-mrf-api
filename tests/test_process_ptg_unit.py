@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
@@ -594,6 +595,43 @@ def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(tmp_pat
     assert Path(downloaded.logical_artifact.logical_path).exists()
     assert artifact_root in Path(downloaded.logical_artifact.logical_path).parents
     assert json.loads(Path(downloaded.logical_artifact.logical_path).read_text()) == {"in_network": []}
+
+
+def test_materialize_json_source_keeps_zip_logical_path_outside_tempdir(tmp_path, monkeypatch):
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+
+    raw_zip = tmp_path / "rates.zip"
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("rates.json", json.dumps({"in_network": []}))
+    raw_sha256, raw_size = ptg_artifacts.sha256_file(raw_zip)
+
+    async def fake_download_raw_artifact(*_args, **_kwargs):
+        store = ptg_artifacts.PTG2ArtifactStore()
+        return ptg_domain.PTG2RawArtifact(
+            original_url="https://example.com/rates.zip",
+            canonical_url="https://example.com/rates.zip",
+            raw_path=str(raw_zip),
+            raw_storage_uri=store.storage_uri(raw_zip),
+            raw_sha256=raw_sha256,
+            byte_count=raw_size,
+        )
+
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
+
+    with tempfile.TemporaryDirectory(dir=tmp_path) as tempdir:
+        _raw_artifact, logical_artifact = asyncio.run(
+            ptg_source_download.materialize_json_source(
+                "https://example.com/rates.zip",
+                tempdir,
+                materialize_logical=False,
+            )
+        )
+
+    logical_path = Path(logical_artifact.logical_path)
+    assert logical_path.exists()
+    assert artifact_root in logical_path.parents
+    assert json.loads(logical_path.read_text()) == {"in_network": []}
 
 
 def test_source_file_split_keeps_facade_helpers_stable():

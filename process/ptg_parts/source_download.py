@@ -713,9 +713,13 @@ async def materialize_json_source(
         max_bytes=max_bytes,
         keep_partial_artifacts=keep_partial_artifacts,
     )
+    materialize_output_dir = output_dir
+    raw_is_zip = _should_materialize_logical_artifact(raw_artifact.raw_path)
+    if raw_is_zip:
+        materialize_output_dir = _retained_logical_artifact_dir(PTG2ArtifactStore(), raw_artifact)
     logical_artifact = (
-        stream_logical_artifact(raw_artifact.raw_path, output_dir=output_dir)
-        if materialize_logical or _should_materialize_logical_artifact(raw_artifact.raw_path)
+        stream_logical_artifact(raw_artifact.raw_path, output_dir=materialize_output_dir)
+        if materialize_logical or raw_is_zip
         else logical_artifact_identity(
             raw_artifact.raw_path,
             raw_sha256=raw_artifact.raw_sha256,
@@ -826,7 +830,7 @@ async def _iter_downloaded_ptg_jobs(
             pending.add(
                 asyncio.wrap_future(
                     executor.submit(
-                        _download_ptg_job_artifact_sync_from_facade,
+                        _download_ptg_job_artifact_sync,
                         job,
                         reuse_raw_artifacts=reuse_raw_artifacts,
                         max_bytes=max_bytes,
