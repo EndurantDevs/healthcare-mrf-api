@@ -14077,23 +14077,9 @@ async def _push_import_control_catalog(
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
         return (0, 0, [])
-    snapshot_source_ids = [
-        str(row.get("source_id") or "")
-        for row in eligible
-        if _source_row_is_importable(row)
-    ]
-    snapshot = (
-        await _import_control_snapshot_items(snapshot_source_ids)
-        if snapshot_source_ids
-        else {}
-    )
-    eligible = _dedupe_import_control_source_rows(eligible, snapshot)
-    if not snapshot and all(
-        str(row.get("status") or "active").strip().lower() == "active"
-        and _source_row_is_importable(row)
-        for row in eligible
-    ):
-        return (0, 0, [])
+    eligible_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in eligible:
+        eligible_groups.setdefault(_import_control_source_identity_key(row), []).append(row)
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     headers = {
@@ -14107,73 +14093,91 @@ async def _push_import_control_catalog(
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
-        for row in eligible:
-            source_id = str(row.get("source_id") or "")
-            items = snapshot.get(source_id) or []
-            source_status = str(row.get("status") or "active").strip() or "active"
-            evidence_only = not _source_row_is_importable(row)
-            if not items and source_status.lower() == "active" and not evidence_only:
+        for group_rows in eligible_groups.values():
+            snapshot_source_ids = [
+                str(row.get("source_id") or "")
+                for row in group_rows
+                if _source_row_is_importable(row)
+            ]
+            snapshot = (
+                await _import_control_snapshot_items(snapshot_source_ids)
+                if snapshot_source_ids
+                else {}
+            )
+            rows_to_sync = _dedupe_import_control_source_rows(group_rows, snapshot)
+            if not snapshot and all(
+                str(row.get("status") or "active").strip().lower() == "active"
+                and _source_row_is_importable(row)
+                for row in rows_to_sync
+            ):
                 continue
-            ic_source_id: str | None = None
-            try:
-                # Stage the source non-public first so a mid-sync failure never leaves a
-                # public source with an incomplete plan catalog.
-                ic_source_id = await _promote_import_control_source(
-                    session,
-                    base,
-                    row,
-                    visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
-                    status=_IMPORT_CONTROL_STAGED_STATUS,
-                )
-                if not ic_source_id:
+            for row in rows_to_sync:
+                source_id = str(row.get("source_id") or "")
+                items = snapshot.get(source_id) or []
+                source_status = str(row.get("status") or "active").strip() or "active"
+                evidence_only = not _source_row_is_importable(row)
+                if not items and source_status.lower() == "active" and not evidence_only:
                     continue
-                stored = await _fetch_import_control_source(session, base, ic_source_id)
-                # Flip staged rows public after ingest. Also let an active registry row with
-                # crawled files clear a stale state left by an older duplicate URL row.
-                staged = stored is None or (
-                    str(stored.get("visibility") or "")
-                    == _IMPORT_CONTROL_STAGED_VISIBILITY
-                    and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
-                )
-                stored_status = str((stored or {}).get("status") or "").lower()
-                source_status_lower = source_status.lower()
-                source_plans = 0
-                if items and not evidence_only:
-                    for batch in _chunked(_split_preview_items(items), 100):
-                        source_plans += await _ingest_import_control_preview(
-                            session, base, ic_source_id, batch
-                        )
-                    await _mark_import_control_seed_promoted(
-                        session, base, row, ic_source_id
-                    )
-                elif evidence_only:
-                    await _mark_import_control_seed_promoted(
-                        session, base, row, ic_source_id
-                    )
-                if (
-                    staged
-                    or source_status_lower != "active"
-                    or (items and stored_status == "stale")
-                ):
-                    await _promote_import_control_source(
+                ic_source_id: str | None = None
+                try:
+                    # Stage the source non-public first so a mid-sync failure never leaves a
+                    # public source with an incomplete plan catalog.
+                    ic_source_id = await _promote_import_control_source(
                         session,
                         base,
                         row,
-                        visibility="public",
-                        status=source_status,
-                        preserve_operator_state=False,
+                        visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
+                        status=_IMPORT_CONTROL_STAGED_STATUS,
                     )
-                sources_synced += 1
-                plans_synced += source_plans
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                errors.append(
-                    {
-                        "source_id": source_id or None,
-                        "import_control_source_id": ic_source_id,
-                        "message": str(exc),
-                    }
-                )
-                continue
+                    if not ic_source_id:
+                        continue
+                    stored = await _fetch_import_control_source(session, base, ic_source_id)
+                    # Flip staged rows public after ingest. Also let an active registry row with
+                    # crawled files clear a stale state left by an older duplicate URL row.
+                    staged = stored is None or (
+                        str(stored.get("visibility") or "")
+                        == _IMPORT_CONTROL_STAGED_VISIBILITY
+                        and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
+                    )
+                    stored_status = str((stored or {}).get("status") or "").lower()
+                    source_status_lower = source_status.lower()
+                    source_plans = 0
+                    if items and not evidence_only:
+                        for batch in _chunked(_split_preview_items(items), 100):
+                            source_plans += await _ingest_import_control_preview(
+                                session, base, ic_source_id, batch
+                            )
+                        await _mark_import_control_seed_promoted(
+                            session, base, row, ic_source_id
+                        )
+                    elif evidence_only:
+                        await _mark_import_control_seed_promoted(
+                            session, base, row, ic_source_id
+                        )
+                    if (
+                        staged
+                        or source_status_lower != "active"
+                        or (items and stored_status == "stale")
+                    ):
+                        await _promote_import_control_source(
+                            session,
+                            base,
+                            row,
+                            visibility="public",
+                            status=source_status,
+                            preserve_operator_state=False,
+                        )
+                    sources_synced += 1
+                    plans_synced += source_plans
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    errors.append(
+                        {
+                            "source_id": source_id or None,
+                            "import_control_source_id": ic_source_id,
+                            "message": str(exc),
+                        }
+                    )
+                    continue
     if errors and not sources_synced:
         raise RuntimeError(
             f"import-control catalog sync failed for all {len(errors)} source(s): "
