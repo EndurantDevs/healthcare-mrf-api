@@ -122,8 +122,33 @@ def candidate_supports_benefit_line(candidate: Any, line: str) -> bool:
     return False
 
 
+def _iter_carrier_mentions(
+    client_rows: Iterable[Mapping[str, str]], column: str
+) -> Iterable[tuple[str, str, bool]]:
+    for client_row in client_rows:
+        for carrier_label in split_carrier_cell(client_row.get(column)):
+            if is_placeholder_carrier(carrier_label):
+                yield carrier_label, "", True
+                continue
+            yield carrier_label, normalize_carrier(carrier_label), False
+
+
+def _has_cached_carrier_match(
+    cache_by_carrier: dict[str, bool],
+    carrier_key: str,
+    carrier_label: str,
+    source_candidates: Sequence[Any],
+    matcher: Matcher,
+) -> bool:
+    if carrier_key not in cache_by_carrier:
+        cache_by_carrier[carrier_key] = any(
+            matcher(candidate, carrier_label) for candidate in source_candidates
+        )
+    return cache_by_carrier[carrier_key]
+
+
 def audit_carrier_rows(
-    rows: Iterable[Mapping[str, str]],
+    client_rows: Iterable[Mapping[str, str]],
     *,
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
@@ -132,7 +157,7 @@ def audit_carrier_rows(
 ) -> tuple[list[CarrierCoverageStats], dict[str, list[tuple[str, int]]]]:
     stats_by_line: list[CarrierCoverageStats] = []
     unmatched_by_line: dict[str, list[tuple[str, int]]] = {}
-    rows_list = list(rows)
+    csv_rows = list(client_rows)
 
     for line, column in line_columns:
         line_all_candidates = [
@@ -153,27 +178,45 @@ def audit_carrier_rows(
         distinct: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"label": "", "count": 0, "importable": False, "catalog": False}
         )
+        importable_match_cache_by_carrier: dict[str, bool] = {}
+        catalog_match_cache_by_carrier: dict[str, bool] = {}
 
-        for row in rows_list:
-            for carrier in split_carrier_cell(row.get(column)):
-                mentions_total += 1
-                if is_placeholder_carrier(carrier):
-                    placeholders += 1
-                    continue
-                key = normalize_carrier(carrier)
-                entry = distinct[key]
-                entry["label"] = entry["label"] or carrier
-                entry["count"] += 1
-                importable = any(matcher(candidate, carrier) for candidate in line_importable_candidates)
-                catalog = importable or any(matcher(candidate, carrier) for candidate in line_all_candidates)
-                if importable:
-                    importable_mentions += 1
-                    entry["importable"] = True
-                if catalog:
-                    catalog_mentions += 1
-                    entry["catalog"] = True
-                if not catalog:
-                    unmatched_mentions += 1
+        for carrier_label, carrier_key, is_placeholder in _iter_carrier_mentions(
+            csv_rows, column
+        ):
+            mentions_total += 1
+            if is_placeholder:
+                placeholders += 1
+                continue
+            entry = distinct[carrier_key]
+            entry["label"] = entry["label"] or carrier_label
+            entry["count"] += 1
+            has_importable_match = _has_cached_carrier_match(
+                importable_match_cache_by_carrier,
+                carrier_key,
+                carrier_label,
+                line_importable_candidates,
+                matcher,
+            )
+            if has_importable_match:
+                catalog_match_cache_by_carrier[carrier_key] = True
+            has_catalog_match = catalog_match_cache_by_carrier.get(carrier_key)
+            if has_catalog_match is None:
+                has_catalog_match = _has_cached_carrier_match(
+                    catalog_match_cache_by_carrier,
+                    carrier_key,
+                    carrier_label,
+                    line_all_candidates,
+                    matcher,
+                )
+            if has_importable_match:
+                importable_mentions += 1
+                entry["importable"] = True
+            if has_catalog_match:
+                catalog_mentions += 1
+                entry["catalog"] = True
+            if not has_catalog_match:
+                unmatched_mentions += 1
 
         distinct_importable = sum(1 for entry in distinct.values() if entry["importable"])
         distinct_catalog = sum(1 for entry in distinct.values() if entry["catalog"])

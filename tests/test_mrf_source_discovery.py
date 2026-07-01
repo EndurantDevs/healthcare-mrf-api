@@ -1131,6 +1131,70 @@ async def test_private_query_context_expands_supported_public_sources(
     assert not any(candidate.payer_name == "Example Direct" for candidate in expanded)
 
 
+def _example_query_source_candidate(
+    payer_name: str, insurer_code: str
+) -> discovery.SourceCandidate:
+    return discovery.SourceCandidate(
+        payer_name=payer_name,
+        provider="master-list",
+        index_url=(
+            "https://health1.aetna.com/app/public/#/one/"
+            f"insurerCode={insurer_code}&brandCode=ALICSI/"
+            "machine-readable-transparency-in-coverage"
+        ),
+        hosting_platform="aetna_health1",
+        aliases=("Example Carrier",),
+        benefit_lines=("medical",),
+        status="active",
+    )
+
+
+def test_private_context_caches_carrier_matching(tmp_path, monkeypatch):
+    private_path = tmp_path / "private-context.csv"
+    private_path.write_text(
+        "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
+        "Example Packaging,Example Carrier,,\n"
+        "Example Forge,Example Carrier,,\n"
+        "Example Circuit,Example Carrier,,\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "platform_resolvers": {
+                    "aetna_health1": {"type": "healthsparq_public_mrf"},
+                },
+                "source_query_expansion_platforms": ["aetna_health1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    candidates = [
+        _example_query_source_candidate("Example Public Carrier", "EXAMPLE"),
+        _example_query_source_candidate("Example Public Network", "EXAMPLE2"),
+    ]
+    matcher_calls = []
+
+    def fake_matches(candidate, *, entity_types, payer_query):
+        matcher_calls.append((candidate.payer_name, tuple(entity_types), payer_query))
+        return "match" if payer_query == "Example Carrier" else ""
+
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setenv(discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+    monkeypatch.setattr(discovery, "_candidate_matches_text_filters", fake_matches)
+
+    expanded = discovery._private_query_expanded_candidates(candidates)
+
+    assert len(expanded) == 6
+    assert [call[0] for call in matcher_calls] == [
+        "Example Public Carrier",
+        "Example Public Network",
+    ]
+
+
 def test_query_expansion_sources_have_query_specific_source_identity():
     base = discovery.SourceCandidate(
         payer_name="Example Aetna",
@@ -5875,6 +5939,137 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
             },
         ]
     }
+
+
+def _mms_fallback_config_messages():
+    return [
+        {
+            "collection": "thirdPartyAdministrators",
+            "fields": {
+                "slug": "example-tpa",
+                "name": "Example TPA",
+                "machineReadableFiles": {"allEmployersSearchable": True},
+            },
+        }
+    ]
+
+
+def _mms_fallback_table_messages(selector):
+    if "$and" in selector:
+        return [
+            {
+                "collection": "tabular_records",
+                "id": "EntityMRFEmployers",
+                "fields": {"ids": [], "recordsTotal": 2, "recordsFiltered": 0},
+            }
+        ]
+    return [
+        {
+            "collection": "tabular_records",
+            "id": "EntityMRFEmployers",
+            "fields": {
+                "ids": [
+                    {"$type": "oid", "$value": "61a"},
+                    {"$type": "oid", "$value": "61b"},
+                ],
+                "recordsTotal": 2,
+                "recordsFiltered": 2,
+            },
+        }
+    ]
+
+
+def _mms_fallback_employer_messages():
+    return [
+        {
+            "msg": "added",
+            "collection": "employers",
+            "id": "61a",
+            "fields": {
+                "name": "Example Packaging",
+                "slug": "example-packaging-example-tpa-10001",
+                "status": "Enabled",
+            },
+        },
+        {
+            "msg": "added",
+            "collection": "employers",
+            "id": "61b",
+            "fields": {
+                "name": "Example Forge",
+                "slug": "example-forge-example-tpa-10002",
+                "status": "Enabled",
+            },
+        },
+    ]
+
+
+def _mms_fallback_messages(name, params):
+    if name == "entityMRFsConfig":
+        return _mms_fallback_config_messages()
+    if name == "tabular_getInfo":
+        return _mms_fallback_table_messages(params[1])
+    if name == "entityMRFEmployers":
+        return _mms_fallback_employer_messages()
+    raise AssertionError(f"unexpected subscription: {name}")
+
+
+@pytest.mark.asyncio
+async def test_mms_query_fallback_filters_employers(monkeypatch):
+    calls = []
+
+    async def fake_subscribe_collect(
+        _ws, *, name, params, sub_id, timeout_seconds
+    ):
+        calls.append(
+            {
+                "name": name,
+                "params": params,
+                "sub_id": sub_id,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return _mms_fallback_messages(name, params)
+
+    monkeypatch.setattr(
+        discovery, "_mymedicalshopper_ddp_subscribe_collect", fake_subscribe_collect
+    )
+    source_payload_dict = {
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Forge",
+                "query_expansion_source": True,
+            }
+        }
+    }
+
+    employers = await discovery._mymedicalshopper_entity_employers(
+        object(),
+        source=source_payload_dict,
+        entity_slug="example-tpa",
+        resolver={
+            "page_size": 2,
+            "max_employers": 10,
+            "query_search_fallback_max_employers": 3,
+        },
+        timeout_seconds=5,
+    )
+
+    assert employers == [
+        {
+            "_id": "61b",
+            "name": "Example Forge",
+            "slug": "example-forge-example-tpa-10002",
+            "status": "Enabled",
+            "tpaSlug": "example-tpa",
+            "tpaName": "Example TPA",
+        }
+    ]
+    info_selectors = [
+        call["params"][1] for call in calls if call["name"] == "tabular_getInfo"
+    ]
+    assert "$and" in info_selectors[0]
+    assert info_selectors[1] == {"tpaSlug": "example-tpa", "status": "Enabled"}
 
 
 def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():

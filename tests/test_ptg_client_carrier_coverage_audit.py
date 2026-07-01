@@ -132,3 +132,42 @@ def test_audit_carrier_rows_uses_confirmed_ancillary_blue_benefit_lines():
     assert by_line["vision"].importable_mentions == 3
     assert unmatched["dental"] == [("Example Vision Blue", 1)]
     assert unmatched["vision"] == [("Example Dental Blue", 1)]
+
+
+def test_audit_cache_reuses_carrier_match():
+    client_rows = [
+        {
+            "MEDICAL_CARRIERS": "Repeated Carrier",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        },
+        {
+            "MEDICAL_CARRIERS": "Repeated Carrier",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        },
+        {
+            "MEDICAL_CARRIERS": "REPEATED  CARRIER",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        },
+    ]
+    matcher_calls = []
+
+    def matcher(candidate, carrier):
+        matcher_calls.append((candidate.name, carrier))
+        return "match" if candidate.name == "Repeated Carrier" else ""
+
+    stats, unmatched = audit_carrier_rows(
+        client_rows,
+        all_candidates=[SimpleNamespace(name="Repeated Carrier")],
+        importable_candidates=[SimpleNamespace(name="Repeated Carrier")],
+        matcher=matcher,
+    )
+
+    by_line = {coverage_stat.line: coverage_stat for coverage_stat in stats}
+    expected_distinct_importable = 1
+    assert by_line["medical"].importable_mentions == 3
+    assert by_line["medical"].distinct_importable == expected_distinct_importable
+    assert unmatched["medical"] == []
+    assert matcher_calls == [("Repeated Carrier", "Repeated Carrier")]

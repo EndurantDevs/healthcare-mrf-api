@@ -493,6 +493,13 @@ def _private_query_context_limit() -> int:
         return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
 
 
+def _private_context_candidate_match_cache_key(entry: dict[str, str]) -> tuple[str, str]:
+    return (
+        _clean_text(entry.get("benefit_line")).lower(),
+        _clean_text(entry.get("carrier_query")).lower(),
+    )
+
+
 def _private_query_expanded_candidates(
     candidates: list[SourceCandidate],
 ) -> list[SourceCandidate]:
@@ -508,16 +515,23 @@ def _private_query_expanded_candidates(
         if _candidate_is_importable_source(candidate)
         and _candidate_supports_source_query_expansion(candidate)
     ]
+    match_cache_by_context: dict[tuple[str, str], list[SourceCandidate]] = {}
     for entry in entries:
-        for candidate in base_candidates:
-            if not _candidate_supports_benefit_line(candidate, entry["benefit_line"]):
-                continue
-            if not _candidate_matches_text_filters(
-                candidate,
-                entity_types=(),
-                payer_query=entry["carrier_query"],
-            ):
-                continue
+        match_key = _private_context_candidate_match_cache_key(entry)
+        if match_key not in match_cache_by_context:
+            match_cache_by_context[match_key] = [
+                candidate
+                for candidate in base_candidates
+                if _candidate_supports_benefit_line(
+                    candidate, entry["benefit_line"]
+                )
+                and _candidate_matches_text_filters(
+                    candidate,
+                    entity_types=(),
+                    payer_query=entry["carrier_query"],
+                )
+            ]
+        for candidate in match_cache_by_context[match_key]:
             key = _candidate_private_query_context_key(candidate, entry)
             if key in seen:
                 continue
@@ -3473,6 +3487,139 @@ def _mymedicalshopper_employer_docs_from_messages(
     return list(employers.values())
 
 
+def _mymedicalshopper_employer_search_values(employer: dict[str, Any]) -> list[Any]:
+    return [
+        employer.get("name"),
+        employer.get("slug"),
+        employer.get("groupId"),
+        employer.get("group_id"),
+        employer.get("ein"),
+        employer.get("tpaName"),
+        employer.get("tpa_name"),
+    ]
+
+
+def _has_mymedicalshopper_employer_query_match(
+    employer: dict[str, Any], query: str | None
+) -> bool:
+    return _search_values_match_query(
+        _mymedicalshopper_employer_search_values(employer), query
+    )
+
+
+def _mymedicalshopper_query_fallback_max_employers(
+    resolver: dict[str, Any],
+    max_employers: int,
+) -> int:
+    configured = _as_int(resolver.get("query_search_fallback_max_employers"))
+    fallback_max = configured if configured and configured > 0 else 500
+    return max(1, min(max_employers, fallback_max))
+
+
+@dataclass(frozen=True)
+class _MmsEmployerQuery:
+    entity_slug: str
+    selector: dict[str, Any]
+    selector_label: str
+    fields: dict[str, int]
+    page_size: int
+    max_employers: int
+    tpa_name: str | None
+    timeout_seconds: float
+    query_filter: str | None = None
+
+
+async def _mymedicalshopper_entity_employer_page(
+    ws: aiohttp.ClientWebSocketResponse,
+    employer_query: _MmsEmployerQuery,
+    offset: int,
+    batch_size: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    info_messages = await _mymedicalshopper_ddp_subscribe_collect(
+        ws,
+        name="tabular_getInfo",
+        params=[
+            "EntityMRFEmployers",
+            employer_query.selector,
+            [["name", "asc"]],
+            offset,
+            batch_size,
+        ],
+        sub_id=(
+            "mms-info-"
+            f"{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"
+        ),
+        timeout_seconds=employer_query.timeout_seconds,
+    )
+    table_info = _mymedicalshopper_tabular_info_from_messages(info_messages)
+    employer_ids = [
+        employer_id for employer_id in table_info.get("ids") or [] if employer_id
+    ]
+    if not employer_ids:
+        return table_info, [], 0
+    doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
+        ws,
+        name="entityMRFEmployers",
+        params=["EntityMRFEmployers", employer_ids, employer_query.fields],
+        sub_id=(
+            "mms-employers-"
+            f"{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"
+        ),
+        timeout_seconds=employer_query.timeout_seconds,
+    )
+    return (
+        table_info,
+        _mymedicalshopper_employer_docs_from_messages(doc_messages),
+        len(employer_ids),
+    )
+
+
+async def _mymedicalshopper_entity_employers_for_query(
+    ws: aiohttp.ClientWebSocketResponse,
+    employer_query: _MmsEmployerQuery,
+) -> dict[str, dict[str, Any]]:
+    employers_by_slug: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while (
+        offset < employer_query.max_employers
+        and len(employers_by_slug) < employer_query.max_employers
+    ):
+        batch_size = min(
+            employer_query.page_size,
+            employer_query.max_employers - len(employers_by_slug),
+        )
+        table_info, employer_docs, employer_id_count = (
+            await _mymedicalshopper_entity_employer_page(
+                ws, employer_query, offset, batch_size
+            )
+        )
+        if not employer_docs:
+            break
+        for employer in employer_docs:
+            if (
+                employer_query.query_filter
+                and not _has_mymedicalshopper_employer_query_match(
+                    employer, employer_query.query_filter
+                )
+            ):
+                continue
+            slug = str(employer.get("slug") or "").strip()
+            if slug:
+                employer_payload_dict = dict(employer)
+                employer_payload_dict.setdefault("tpaSlug", employer_query.entity_slug)
+                if employer_query.tpa_name:
+                    employer_payload_dict.setdefault(
+                        "tpaName", employer_query.tpa_name
+                    )
+                employers_by_slug[slug] = employer_payload_dict
+        offset += employer_id_count
+        if offset >= (
+            _as_int(table_info.get("records_filtered")) or employer_id_count
+        ):
+            break
+    return employers_by_slug
+
+
 async def _mymedicalshopper_entity_employers(
     ws: aiohttp.ClientWebSocketResponse,
     *,
@@ -3495,11 +3642,19 @@ async def _mymedicalshopper_entity_employers(
         if isinstance(config.get("machineReadableFiles"), dict)
         else {}
     )
+    all_employers_searchable = bool(
+        machine_readable_files.get("allEmployersSearchable")
+    )
+    target_query = _source_target_payer_query(source or {})
+    base_selector = _mymedicalshopper_employer_selector(
+        entity_slug, all_employers_searchable=all_employers_searchable
+    )
+    search_selector = _mymedicalshopper_employer_search_selector(
+        base_selector, target_query
+    )
     selectors = _mymedicalshopper_entity_employer_selectors(
         entity_slug,
-        all_employers_searchable=bool(
-            machine_readable_files.get("allEmployersSearchable")
-        ),
+        all_employers_searchable=all_employers_searchable,
         source=source,
         resolver=resolver,
     )
@@ -3519,44 +3674,46 @@ async def _mymedicalshopper_entity_employers(
     }
     employers: dict[str, dict[str, Any]] = {}
     for selector_index, selector in enumerate(selectors):
-        offset = 0
-        while offset < max_employers and len(employers) < max_employers:
-            batch_size = min(page_size, max_employers - len(employers))
-            info_messages = await _mymedicalshopper_ddp_subscribe_collect(
+        employers.update(
+            await _mymedicalshopper_entity_employers_for_query(
                 ws,
-                name="tabular_getInfo",
-                params=[
-                    "EntityMRFEmployers",
-                    selector,
-                    [["name", "asc"]],
-                    offset,
-                    batch_size,
-                ],
-                sub_id=f"mms-info-{entity_slug}-{selector_index}-{offset}",
-                timeout_seconds=timeout_seconds,
+                _MmsEmployerQuery(
+                    entity_slug=entity_slug,
+                    selector=selector,
+                    selector_label=str(selector_index),
+                    fields=fields,
+                    page_size=page_size,
+                    max_employers=max_employers,
+                    tpa_name=tpa_name,
+                    timeout_seconds=timeout_seconds,
+                ),
             )
-            info = _mymedicalshopper_tabular_info_from_messages(info_messages)
-            ids = [item for item in info.get("ids") or [] if item]
-            if not ids:
-                break
-            doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
+        )
+    if (
+        not employers
+        and target_query
+        and search_selector is not None
+        and not resolver.get("query_search_include_full_table")
+    ):
+        fallback_max_employers = _mymedicalshopper_query_fallback_max_employers(
+            resolver, max_employers
+        )
+        employers.update(
+            await _mymedicalshopper_entity_employers_for_query(
                 ws,
-                name="entityMRFEmployers",
-                params=["EntityMRFEmployers", ids, fields],
-                sub_id=f"mms-employers-{entity_slug}-{selector_index}-{offset}",
-                timeout_seconds=timeout_seconds,
+                _MmsEmployerQuery(
+                    entity_slug=entity_slug,
+                    selector=base_selector,
+                    selector_label="query-fallback",
+                    fields=fields,
+                    page_size=min(page_size, fallback_max_employers),
+                    max_employers=fallback_max_employers,
+                    tpa_name=tpa_name,
+                    timeout_seconds=timeout_seconds,
+                    query_filter=target_query,
+                ),
             )
-            for employer in _mymedicalshopper_employer_docs_from_messages(doc_messages):
-                slug = str(employer.get("slug") or "").strip()
-                if slug:
-                    employer = dict(employer)
-                    employer.setdefault("tpaSlug", entity_slug)
-                    if tpa_name:
-                        employer.setdefault("tpaName", tpa_name)
-                    employers[slug] = employer
-            offset += len(ids)
-            if offset >= (_as_int(info.get("records_filtered")) or len(ids)):
-                break
+        )
     return list(employers.values())
 
 
