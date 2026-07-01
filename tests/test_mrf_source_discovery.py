@@ -2650,6 +2650,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "CarePlus Dental Plans Coverage": ("dental",),
         "ClaimChoice Administrators Coverage": ("medical",),
         "Consociate Health Ancillary Benefits": ("dental", "vision"),
+        "Crescent Dental Coverage": ("dental",),
         "Direct Dental Coverage": ("dental",),
         "Diversified Group Ancillary Coverage": ("dental", "vision"),
         "Dominion National Dental": ("dental",),
@@ -2669,6 +2670,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "International Medical Solutions Coverage": ("medical", "dental", "vision"),
         "LIBERTY Dental Plan": ("dental",),
         "Loomis Dental Coverage": ("dental",),
+        "Lucent Health Ancillary Coverage": ("dental", "vision"),
         "MetLife Dental Coverage": ("dental",),
         "MedBen Dental and Vision Coverage": ("dental", "vision"),
         "Meritain Health Vision Coverage": ("vision",),
@@ -2680,6 +2682,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Renaissance Dental": ("dental",),
         "Renaissance Vision": ("vision",),
         "Reliance Matrix Dental and Vision": ("dental", "vision"),
+        "Smile Brands Ancillary Coverage": ("dental", "vision"),
         "Sun Life Dental": ("dental",),
         "Sun Life Vision": ("vision",),
         "Tall Tree Dental Coverage": ("dental",),
@@ -2895,11 +2898,19 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Claim Choice" in ancillary_by_name["ClaimChoice Administrators Coverage"].aliases
     assert "Care Plus" in ancillary_by_name["CarePlus Dental Plans Coverage"].aliases
+    assert (
+        "Crescent Employee Benefits"
+        in ancillary_by_name["Crescent Dental Coverage"].aliases
+    )
     assert "Benefit Allocation Systems" in ancillary_by_name["BAS Ancillary Benefits"].aliases
     assert "MyEnroll360" in ancillary_by_name["BAS Ancillary Benefits"].aliases
     assert "Choose ByWater" in ancillary_by_name["ByWater Ancillary Benefits"].aliases
     assert "Dental Blue Network" in ancillary_by_name["CBA Blue Dental Coverage"].aliases
     assert "Direct Dental Administrators" in ancillary_by_name["Direct Dental Coverage"].aliases
+    assert (
+        "Lucent Health Solutions"
+        in ancillary_by_name["Lucent Health Ancillary Coverage"].aliases
+    )
     assert (
         "Diversified Group Brokerage"
         in ancillary_by_name["Diversified Group Ancillary Coverage"].aliases
@@ -3194,9 +3205,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Guardian Vision with Avesis" in by_name["Avesis"].aliases
     for coverage_evidence_vision_name in (
         "Dominion National Vision",
+        "Group Vision Service",
         "SecureCare Vision",
+        "Vision Care Direct",
         "Humana Vision",
         "Guardian Vision",
+        "MetLife Vision",
         "Principal Vision",
         "Ameritas Vision",
         "Sun Life Vision",
@@ -3212,9 +3226,6 @@ async def test_master_list_keeps_high_value_public_aliases():
         assert by_name[coverage_evidence_vision_name].source_tier == "coverage_evidence"
         assert by_name[coverage_evidence_vision_name].index_url
     for review_only_name in (
-        "Group Vision Service",
-        "Vision Care Direct",
-        "MetLife Vision",
         "HMSA Vision",
         "Anthem Vision Plan",
         "Best Life Vision",
@@ -3256,6 +3267,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Delta Dental of Missouri" in by_name["Delta Dental"].aliases
     for coverage_evidence_dental_name in (
         "Dominion National Dental",
+        "Florida Combined Life Dental",
         "HMSA Dental",
         "Delta Dental",
         "Guardian Dental",
@@ -3268,6 +3280,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "LIBERTY Dental Plan",
         "TruAssure Dental",
         "Equitable Dental",
+        "Superior Dental Care",
         "Unum Dental / Starmount Life",
         "The Standard Dental",
         "Pacific Life Dental",
@@ -3284,11 +3297,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Solstice Dental"].status == "active"
     assert by_name["Solstice Dental"].source_tier == "coverage_evidence"
     assert by_name["Solstice Dental"].index_url
+    assert by_name["Premier Access Dental"].entity_type == "dental"
+    assert by_name["Premier Access Dental"].benefit_lines == ("dental", "vision")
+    assert by_name["Premier Access Dental"].status == "active"
+    assert by_name["Premier Access Dental"].source_tier == "coverage_evidence"
+    assert by_name["Premier Access Dental"].index_url
     for review_only_name in (
-        "Florida Combined Life Dental",
         "Highmark Blue Edge Dental",
-        "Premier Access Dental",
-        "Superior Dental Care",
     ):
         assert by_name[review_only_name].entity_type == "dental"
         assert by_name[review_only_name].benefit_lines == ("dental",)
