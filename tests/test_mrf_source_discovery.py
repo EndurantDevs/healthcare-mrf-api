@@ -2605,6 +2605,14 @@ async def test_master_list_keeps_high_value_public_aliases():
         "master-list", test_mode=True, limit=2000
     )
     by_name = {candidate.payer_name: candidate for candidate in candidates}
+    [active_humana] = [
+        candidate
+        for candidate in candidates
+        if candidate.payer_name == "Humana" and candidate.status == "active"
+    ]
+    assert active_humana.source_tier == "coverage_evidence"
+    assert active_humana.benefit_lines == ("medical", "dental", "vision")
+    assert not discovery._candidate_is_importable_source(active_humana)
     aliases_by_name = {}
     for candidate in candidates:
         aliases_by_name.setdefault(candidate.payer_name, set()).update(
