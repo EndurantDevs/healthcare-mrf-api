@@ -2336,6 +2336,20 @@ async def test_master_list_keeps_high_value_public_aliases():
         aliases_by_name.setdefault(candidate.payer_name, set()).update(
             candidate.aliases
         )
+    ancillary_by_name = {
+        candidate.payer_name: candidate
+        for candidate in candidates
+        if candidate.payer_name
+        in {
+            "Auxiant Ancillary Benefits",
+            "Beam Benefits Ancillary Coverage",
+            "Consociate Health Ancillary Benefits",
+            "EBPA Medical and Dental Coverage",
+            "HRI Dental and Vision",
+            "Reliance Matrix Dental and Vision",
+            "Tall Tree Dental Coverage",
+        }
+    }
 
     assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
     assert "Wellmark Health Plan of Iowa, Inc." in by_name["Wellmark"].aliases
@@ -2458,6 +2472,31 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "YUZU HEALTH INC." in by_name["Cigna"].aliases
     assert "Cigna Shared Administration PPO - Yuzu" in by_name["Cigna"].aliases
     assert by_name["Cigna"].benefit_lines == ("medical", "dental")
+    assert set(ancillary_by_name) == {
+        "Auxiant Ancillary Benefits",
+        "Beam Benefits Ancillary Coverage",
+        "Consociate Health Ancillary Benefits",
+        "EBPA Medical and Dental Coverage",
+        "HRI Dental and Vision",
+        "Reliance Matrix Dental and Vision",
+        "Tall Tree Dental Coverage",
+    }
+    assert all(
+        candidate.source_tier == "coverage_evidence"
+        for candidate in ancillary_by_name.values()
+    )
+    assert ancillary_by_name["EBPA Medical and Dental Coverage"].benefit_lines == (
+        "dental",
+    )
+    assert ancillary_by_name["Tall Tree Dental Coverage"].benefit_lines == ("dental",)
+    assert ancillary_by_name["HRI Dental and Vision"].benefit_lines == (
+        "dental",
+        "vision",
+    )
+    assert ancillary_by_name["Reliance Matrix Dental and Vision"].benefit_lines == (
+        "dental",
+        "vision",
+    )
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
     assert "NVA" in aliases_by_name["Capital Blue Cross"]
     assert "National Vision Administrators" in aliases_by_name["Capital Blue Cross"]
