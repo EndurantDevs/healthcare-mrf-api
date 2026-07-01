@@ -4027,13 +4027,16 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="active",
         )
     )
-    assert discovery._candidate_is_importable_source(
+    assert not discovery._candidate_is_importable_source(
         discovery.SourceCandidate(
             payer_name="Stale",
             provider="master-list",
             index_url="https://example.com/stale.json",
             status="stale",
         )
+    )
+    assert not discovery._source_row_is_importable(
+        {"source_tier": "mrf_importable", "status": "stale"}
     )
     assert not discovery._candidate_is_importable_source(
         discovery.SourceCandidate(

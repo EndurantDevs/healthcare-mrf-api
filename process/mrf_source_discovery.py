@@ -111,6 +111,12 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "payercompass_mrf",
 )
 DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT = 5000
+NON_IMPORTABLE_SOURCE_STATUSES = {
+    "archived",
+    "needs_review",
+    "stale",
+    "unsupported",
+}
 LEGAL_ENTITY_QUERY_STOPWORDS = {
     "co",
     "company",
@@ -12261,11 +12267,7 @@ def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
         return False
     if _normalize_source_tier(candidate.source_tier) != "mrf_importable":
         return False
-    return str(candidate.status or "").lower() not in {
-        "archived",
-        "needs_review",
-        "unsupported",
-    }
+    return str(candidate.status or "").lower() not in NON_IMPORTABLE_SOURCE_STATUSES
 
 
 def _candidate_has_catalog_source(candidate: SourceCandidate) -> bool:
@@ -12954,7 +12956,11 @@ def _source_row_source_tier(row: dict[str, Any]) -> str:
 
 
 def _source_row_is_importable(row: dict[str, Any]) -> bool:
-    return _source_row_source_tier(row) == "mrf_importable"
+    status = str(row.get("status") or "active").strip().lower()
+    return (
+        _source_row_source_tier(row) == "mrf_importable"
+        and status not in NON_IMPORTABLE_SOURCE_STATUSES
+    )
 
 
 def _eligible_for_public_promotion(row: dict[str, Any]) -> bool:
@@ -13742,7 +13748,7 @@ async def _push_import_control_catalog(
                 stored_status = str((stored or {}).get("status") or "").lower()
                 source_status_lower = source_status.lower()
                 source_plans = 0
-                if items:
+                if items and not evidence_only:
                     for batch in _chunked(_split_preview_items(items), 100):
                         source_plans += await _ingest_import_control_preview(
                             session, base, ic_source_id, batch
