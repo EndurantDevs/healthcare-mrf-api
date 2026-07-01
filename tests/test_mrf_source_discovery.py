@@ -8324,9 +8324,8 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
                 )
             return FakeResponse({}, status=404)
 
-    async def fake_snapshot(source_ids):
-        assert source_ids == ["source_evidence"]
-        return {}
+    async def fake_snapshot(_source_ids):
+        raise AssertionError("coverage evidence should not load preview snapshots")
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
@@ -8441,7 +8440,7 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
             return FakeResponse({}, status=404)
 
     async def fake_snapshot(source_ids):
-        assert source_ids == ["source_active", "source_stale"]
+        assert source_ids == ["source_active"]
         return {
             "source_active": [
                 {
@@ -8517,6 +8516,119 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_push_import_control_catalog_snapshots_importable_sources_only(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                return FakeResponse({"source_id": f"ic_{json['source_key']}"})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                return FakeResponse({"counts": {"plans": 1}})
+            if url.endswith("/v1/catalog/seeds/import"):
+                return FakeResponse({"count": 1, "items": json.get("items") or []})
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            calls.append({"url": url, "json": None})
+            if "/v1/catalog/sources/ic_" in url:
+                return FakeResponse(
+                    {
+                        "visibility": "internal",
+                        "status": "needs_review",
+                    }
+                )
+            return FakeResponse({}, status=404)
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_importable"]
+        return {
+            "source_importable": [
+                {
+                    "canonical_url": "https://example.com/rates.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Importable",
+                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_importable",
+                "index_url": "https://example.com/index.json",
+                "display_name": "Example Importable",
+                "source_key": "example-importable",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+            {
+                "source_id": "source_evidence",
+                "index_url": "https://example.com/benefits",
+                "display_name": "Example Evidence",
+                "source_key": "example-evidence",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "coverage_evidence",
+                "metadata_json": {"source_tier": "coverage_evidence"},
+            },
+        ]
+    )
+
+    source_payloads = [
+        call["json"]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+        and call["json"].get("visibility") == "public"
+    ]
+
+    assert sources_synced == 2
+    assert plans_synced == 1
+    assert errors == []
+    assert {payload["source_key"] for payload in source_payloads} == {
+        "example-importable",
+        "example-evidence",
+    }
+
+
+@pytest.mark.asyncio
 async def test_push_import_control_catalog_preserves_registry_stale_status(
     monkeypatch,
 ):
@@ -8571,9 +8683,8 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
                 )
             return FakeResponse({}, status=404)
 
-    async def fake_snapshot(source_ids):
-        assert source_ids == ["source_stale"]
-        return {}
+    async def fake_snapshot(_source_ids):
+        raise AssertionError("stale source should not load preview snapshots")
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")

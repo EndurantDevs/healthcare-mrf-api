@@ -14077,8 +14077,15 @@ async def _push_import_control_catalog(
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
         return (0, 0, [])
-    snapshot = await _import_control_snapshot_items(
-        [str(row.get("source_id") or "") for row in eligible]
+    snapshot_source_ids = [
+        str(row.get("source_id") or "")
+        for row in eligible
+        if _source_row_is_importable(row)
+    ]
+    snapshot = (
+        await _import_control_snapshot_items(snapshot_source_ids)
+        if snapshot_source_ids
+        else {}
     )
     eligible = _dedupe_import_control_source_rows(eligible, snapshot)
     if not snapshot and all(
