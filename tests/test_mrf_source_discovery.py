@@ -2729,6 +2729,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Aetna Vision Preferred" in by_name["EyeMed"].aliases
     assert "Aetna Vision with EyeMed" in by_name["EyeMed"].aliases
     assert "Aetna Vision EyeMed" in by_name["EyeMed"].aliases
+    assert "Meritain Health Vision" in by_name["EyeMed"].aliases
+    assert "Meritain Health Aetna Vision Preferred" in by_name["EyeMed"].aliases
+    assert "Meritain Health, An Aetna Company" in by_name["EyeMed"].aliases
     assert "Ameritas Vision EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas Vision with EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
@@ -2787,6 +2790,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Vision Plan Service VSP" in by_name["VSP Vision"].aliases
     assert "Vision Serivce Plan (VSP)" in by_name["VSP Vision"].aliases
     assert "VSP Choice Network" in by_name["VSP Vision"].aliases
+    assert "EMI Health" in by_name["VSP Vision"].aliases
+    assert "EMI Health Vision" in by_name["VSP Vision"].aliases
+    assert "EMI Health VSP" in by_name["VSP Vision"].aliases
     assert "Community Eye Care" in by_name["VSP Vision"].aliases
     assert "CEC Community Eye Care" in by_name["VSP Vision"].aliases
     assert "CEC Vision" in by_name["VSP Vision"].aliases
