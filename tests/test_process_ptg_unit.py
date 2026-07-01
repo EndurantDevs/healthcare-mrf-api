@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+import zipfile
 from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
@@ -555,6 +556,44 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
     assert ptg_source_download._request_ssl_kwargs("https://example.com/mrf") == {
         "ssl": False
     }
+
+
+def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(tmp_path, monkeypatch):
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+
+    raw_zip = tmp_path / "rates.zip"
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("rates.json", json.dumps({"in_network": []}))
+    raw_sha256, raw_size = ptg_artifacts.sha256_file(raw_zip)
+
+    async def fake_download_raw_artifact(*_args, store=None, **_kwargs):
+        store = store or ptg_artifacts.PTG2ArtifactStore()
+        return ptg_domain.PTG2RawArtifact(
+            original_url="https://example.com/rates.zip",
+            canonical_url="https://example.com/rates.zip",
+            raw_path=str(raw_zip),
+            raw_storage_uri=store.storage_uri(raw_zip),
+            raw_sha256=raw_sha256,
+            byte_count=raw_size,
+        )
+
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
+
+    downloaded = asyncio.run(
+        ptg_source_download._download_ptg_job_artifact(
+            {"type": "in_network", "url": "https://example.com/rates.zip"},
+            reuse_raw_artifacts=True,
+            max_bytes=None,
+            keep_partial_artifacts=True,
+        )
+    )
+
+    assert downloaded.error is None
+    assert downloaded.logical_artifact is not None
+    assert Path(downloaded.logical_artifact.logical_path).exists()
+    assert artifact_root in Path(downloaded.logical_artifact.logical_path).parents
+    assert json.loads(Path(downloaded.logical_artifact.logical_path).read_text()) == {"in_network": []}
 
 
 def test_source_file_split_keeps_facade_helpers_stable():
@@ -2641,6 +2680,45 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
     assert not list(tmp_path.glob("*_logical.json"))
     with process_ptg.open_json_artifact_stream(raw_path) as fp:
         assert fp.read() == expected
+
+
+def test_ptg2_stream_logical_artifact_falls_back_to_unzip(tmp_path, monkeypatch):
+    raw_path = tmp_path / "rates.zip"
+    expected = b'{"in_network":[]}'
+    with zipfile.ZipFile(raw_path, "w") as archive:
+        archive.writestr("rates.json", b"unused")
+
+    original_open = ptg_artifact_streams.zipfile.ZipFile.open
+
+    def fake_open(self, name, *args, **kwargs):
+        if name == "rates.json":
+            raise NotImplementedError("That compression method is not supported")
+        return original_open(self, name, *args, **kwargs)
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(expected)
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self):
+            return 0
+
+    calls = []
+
+    def fake_popen(args, **_kwargs):
+        calls.append(args)
+        return FakeProcess()
+
+    monkeypatch.setattr(ptg_artifact_streams.zipfile.ZipFile, "open", fake_open)
+    monkeypatch.setattr(ptg_artifact_streams.shutil, "which", lambda name: "/usr/bin/unzip" if name == "unzip" else None)
+    monkeypatch.setattr(ptg_artifact_streams.subprocess, "Popen", fake_popen)
+
+    logical = process_ptg.stream_logical_artifact(raw_path, output_dir=tmp_path)
+
+    assert logical.compression == "zip"
+    assert logical.member_name == "rates.json"
+    assert Path(logical.logical_path).read_bytes() == expected
+    assert calls == [["/usr/bin/unzip", "-p", str(raw_path), "rates.json"]]
 
 
 def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):

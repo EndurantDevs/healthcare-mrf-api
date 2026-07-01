@@ -732,6 +732,14 @@ def _should_materialize_logical_artifact(raw_path: str | Path) -> bool:
     except OSError:
         return False
 
+
+def _retained_logical_artifact_dir(store: PTG2ArtifactStore, raw_artifact: PTG2RawArtifact) -> Path:
+    digest = raw_artifact.raw_sha256
+    path = store.root / "logical" / digest[:2] / digest[2:4] / digest
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _materialize_json_source_from_facade():
     ptg_module = sys.modules.get("process.ptg")
     return getattr(ptg_module, "materialize_json_source", materialize_json_source)
@@ -751,15 +759,27 @@ async def _download_ptg_job_artifact(
     keep_partial_artifacts: bool | None,
 ) -> PTG2DownloadedJob:
     try:
-        with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
-            raw_artifact, logical_artifact = await _materialize_json_source_from_facade()(
-                job["url"],
-                tmpdir,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                materialize_logical=False,
-                keep_partial_artifacts=keep_partial_artifacts,
+        store = PTG2ArtifactStore()
+        raw_artifact = await download_raw_artifact(
+            job["url"],
+            store=store,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            max_bytes=max_bytes,
+            keep_partial_artifacts=keep_partial_artifacts,
+        )
+        logical_artifact = (
+            stream_logical_artifact(
+                raw_artifact.raw_path,
+                output_dir=_retained_logical_artifact_dir(store, raw_artifact),
             )
+            if _should_materialize_logical_artifact(raw_artifact.raw_path)
+            else logical_artifact_identity(
+                raw_artifact.raw_path,
+                raw_sha256=raw_artifact.raw_sha256,
+                raw_byte_count=raw_artifact.byte_count,
+                allow_deferred=True,
+            )
+        )
         return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
     except Exception as exc:
         return PTG2DownloadedJob(job=job, error=str(exc))

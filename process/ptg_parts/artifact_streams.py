@@ -7,6 +7,8 @@ import gzip
 import hashlib
 import io
 import json
+import shutil
+import subprocess
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +59,46 @@ def _first_zip_member(path: str | Path) -> str | None:
     return None
 
 
+def _should_fallback_to_unzip(exc: BaseException) -> bool:
+    return "compression method is not supported" in str(exc).lower()
+
+
+@contextmanager
+def _open_zip_member_stream(path: str | Path, member_name: str):
+    try:
+        with zipfile.ZipFile(path, "r") as zip_ref:
+            with zip_ref.open(member_name, "r") as fp:
+                yield fp
+        return
+    except NotImplementedError as exc:
+        if not _should_fallback_to_unzip(exc):
+            raise
+
+    unzip_bin = shutil.which("unzip")
+    if not unzip_bin:
+        raise RuntimeError(
+            f"Zip member {member_name!r} in {path} uses a compression method "
+            "Python cannot read and system unzip is not installed"
+        )
+    process = subprocess.Popen(
+        [unzip_bin, "-p", str(path), member_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    try:
+        yield process.stdout
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr is not None else ""
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                f"unzip failed for member {member_name!r} in {path}: {stderr.strip()}"
+            )
+
+
 @contextmanager
 def open_json_artifact_stream(path: str | Path):
     path_obj = Path(path)
@@ -71,9 +113,8 @@ def open_json_artifact_stream(path: str | Path):
         member_name = _first_zip_member(path_obj)
         if not member_name:
             raise RuntimeError(f"No file members found in zip artifact {path_obj}")
-        with zipfile.ZipFile(path_obj, "r") as zip_ref:
-            with zip_ref.open(member_name, "r") as fp:
-                yield fp
+        with _open_zip_member_stream(path_obj, member_name) as fp:
+            yield fp
         return
     with open(path_obj, "rb") as fp:
         yield fp
@@ -136,7 +177,7 @@ def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None 
                 if name.endswith("/"):
                     continue
                 target = output_root / Path(name).name
-                with zip_ref.open(name, "r") as src, open(target, "wb") as dst:
+                with _open_zip_member_stream(raw_path_obj, name) as src, open(target, "wb") as dst:
                     digest, total = _stream_copy_with_hash(src, dst)
                 return PTG2LogicalArtifact(str(target), digest, total, compression="zip", member_name=name)
         raise RuntimeError(f"No file members found in zip artifact {raw_path_obj}")
