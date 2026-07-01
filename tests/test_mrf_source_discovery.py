@@ -2055,7 +2055,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | aliases: ISI |
 | Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | aliases: Kapnick |
 | Insight Benefit Administrators | tpa | https://insightba.net/transparency-in-coverage-resources/ | aliases: Insight Benefit Admininistrators, Insight BA |
-| Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | aliases: Imagine 360 |
+| Imagine360 | tpa | https://caa.imagine360.com/ExternalINNFiles/Imagine/index.html | aliases: Imagine 360 |
 | Patient Advocates | tpa | https://www.mymedicalshopper.com/mrf-search/patient-advocates | aliases: Patient Advocates LLC |
 | Planned Administrators Inc | tpa | https://www.paisc.com/compliance-machine-readable-files-mrfs | aliases: PAI, Planned Administrators |
 | Prodegi | tpa | https://www.mymedicalshopper.com/mrf-search/prodegi | benefit lines: medical, dental, vision; aliases: Prodegi Benefits |
@@ -2237,6 +2237,10 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "Insight BA",
     )
     assert by_name["Imagine360"].hosting_platform == "html_mrf_links"
+    assert (
+        by_name["Imagine360"].index_url
+        == "https://caa.imagine360.com/ExternalINNFiles/Imagine/index.html"
+    )
     assert by_name["Imagine360"].aliases == ("Imagine 360",)
     assert by_name["Patient Advocates"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Planned Administrators Inc"].hosting_platform == "html_mrf_links"
@@ -11981,7 +11985,8 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
 |---|---|---|---|
 | CareSource | medicaid_mco | https://www.caresource.com/vendor/tic/tic-data-index.json | public direct TOC |
 | Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
-| Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | public direct TOC |
+| Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | public direct TOC; aliases: Froedtert Health Plan, Froedtert ThedaCare |
+| Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | observed stale; represented by Network Health direct table of contents |
 | Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
 | McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public HTML MRF files |
 | AmeriHealth Caritas Next | regional | https://www.amerihealthcaritasnext.com/json | public HTML MRF files |
@@ -11992,6 +11997,8 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
     assert by_name["CareSource"].hosting_platform == "direct_toc"
     assert by_name["Independent Health"].hosting_platform == "healthsparq"
     assert by_name["Network Health"].hosting_platform == "direct_toc"
+    assert "Froedtert Health Plan" in by_name["Network Health"].aliases
+    assert by_name["Froedtert Health Plan"].status == "stale"
     assert by_name["Dean Health Plan"].hosting_platform == "healthsparq"
     assert by_name["McLaren Health Plan"].hosting_platform == "html_mrf_links"
     assert by_name["AmeriHealth Caritas Next"].hosting_platform == "html_mrf_links"
