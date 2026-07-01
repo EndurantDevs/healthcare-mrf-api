@@ -594,6 +594,18 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://example.test/acadirectory/97176/97176Index.json"
+        )
+        is None
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://mydental.guardianlife.com/secure/json/index.json"
+        )
+        is None
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/"
         )
         == "hmsa_monthly_toc"
@@ -2657,6 +2669,17 @@ async def test_master_list_keeps_high_value_public_aliases():
         in ancillary_by_name["Wellmark Blue Dental Coverage"].aliases
     )
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
+    assert by_name["HMSA"].benefit_lines == ("medical", "vision")
+    assert "HMSA Vision" in by_name["HMSA"].aliases
+    assert by_name["Independence Blue Cross"].benefit_lines == ("medical", "vision")
+    for alias in (
+        "Davis Vision",
+        "Davis Vision Network",
+        "Davis Vision by MetLife",
+        "MetLife Davis Vision",
+        "MetLife Vision with Davis Vision",
+    ):
+        assert alias in by_name["Independence Blue Cross"].aliases
     assert "NVA" in aliases_by_name["Capital Blue Cross"]
     assert "National Vision Administrators" in aliases_by_name["Capital Blue Cross"]
     assert (

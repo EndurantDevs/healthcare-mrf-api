@@ -800,6 +800,7 @@ _MONTH_NAME_TO_NUMBER = {
 
 def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
     parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
     path = parsed.path.lower().replace("_", "-")
     file_name = Path(path).name
     text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
@@ -826,6 +827,12 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
     if "fee-schedule" in text or "feeschedule" in compact_text:
         return True
     if any(token in text for token in ("balance-billing", "out-of-network-liability")):
+        return True
+    if "/acadirectory/" in path:
+        return True
+    if host in {"dentalexchange.guardiandirect.com", "mydental.guardianlife.com"} and (
+        path == "/secure/json/index.json"
+    ):
         return True
     if "cms-data-index" in path:
         return True
@@ -953,6 +960,12 @@ def classify_hosting_platform(url: str | None) -> str | None:
     host = _domain(url) or ""
     raw = str(url or "").lower()
     path = urlsplit(str(url or "")).path.lower()
+    if "/acadirectory/" in path:
+        return None
+    if host in {"dentalexchange.guardiandirect.com", "mydental.guardianlife.com"} and (
+        path == "/secure/json/index.json"
+    ):
+        return None
     if host == "mrfsearch.meritain.com":
         return "meritain_mrf_search"
     if host == "mrf.healthcarebluebook.com":

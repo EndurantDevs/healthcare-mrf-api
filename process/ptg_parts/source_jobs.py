@@ -114,6 +114,12 @@ def _normalize_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _is_provider_directory_index_payload(payload: dict[str, Any]) -> bool:
+    if payload.get("reporting_structure"):
+        return False
+    return any(key in payload for key in ("provider_urls", "plan_urls"))
+
+
 _TOC_BODY_FILE_PLACEHOLDERS = {
     "missing file",
     "n/a",
@@ -235,6 +241,8 @@ def parse_toc_catalog_entries(
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
 ) -> list[PTG2SourceCatalogEntry]:
+    if _is_provider_directory_index_payload(toc_content):
+        return []
     toc_meta = {
         "reporting_entity_name": toc_content.get("reporting_entity_name"),
         "reporting_entity_type": toc_content.get("reporting_entity_type"),

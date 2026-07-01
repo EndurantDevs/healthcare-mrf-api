@@ -1473,6 +1473,23 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
     assert entries[3].description == "Allowed 2"
 
 
+def test_ptg2_toc_parser_rejects_non_pricing_payload():
+    payload = {
+        "provider_urls": [
+            "https://example.test/acadirectory/individualprovidersfile.json",
+        ],
+        "plan_urls": [
+            "https://example.test/acadirectory/plansfile.json",
+        ],
+    }
+
+    entries = process_ptg.parse_toc_catalog_entries(
+        payload, "https://example.test/acadirectory/97176Index.json"
+    )
+
+    assert entries == []
+
+
 def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
     toc = {
         "reporting_entity_name": "BCBS",
