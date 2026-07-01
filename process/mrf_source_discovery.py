@@ -104,6 +104,7 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "aetna_health1",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
+    "mymedicalshopper_talon_bounded",
     "healthcarebluebook_mrf",
     "html_mrf_with_healthcarebluebook",
     "auxiant_wordpress",

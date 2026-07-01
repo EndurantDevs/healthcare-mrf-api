@@ -143,6 +143,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["mymedicalshopper_talon_bounded"]["type"]
         == "mymedicalshopper_talon_mrf"
     )
+    assert (
+        "mymedicalshopper_talon_bounded"
+        in config["source_query_expansion_platforms"]
+    )
     assert config["platform_resolvers"]["mymedicalshopper_talon_bounded"][
         "max_targets"
     ] == 20
@@ -998,6 +1002,18 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
         index_url="https://example.mrf.payercompass.com/",
         hosting_platform="payercompass_mrf",
     )
+    mymedicalshopper = discovery.SourceCandidate(
+        payer_name="Example Talon TPA",
+        provider="master-list",
+        index_url="https://www.mymedicalshopper.com/mrf-search/example-tpa",
+        hosting_platform="mymedicalshopper_talon",
+    )
+    bounded_mymedicalshopper = discovery.SourceCandidate(
+        payer_name="Example Bounded Talon TPA",
+        provider="master-list",
+        index_url="https://www.mymedicalshopper.com/mrf-search/example-bounded-tpa",
+        hosting_platform="mymedicalshopper_talon_bounded",
+    )
     delegated_healthcarebluebook = discovery.SourceCandidate(
         payer_name="Example Delegated TPA",
         provider="master-list",
@@ -1021,6 +1037,10 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert discovery._candidate_supports_source_query_expansion(aetna)
     assert discovery._candidate_supports_source_query_expansion(healthcarebluebook)
     assert discovery._candidate_supports_source_query_expansion(payercompass)
+    assert discovery._candidate_supports_source_query_expansion(mymedicalshopper)
+    assert discovery._candidate_supports_source_query_expansion(
+        bounded_mymedicalshopper
+    )
     assert discovery._candidate_supports_source_query_expansion(
         delegated_healthcarebluebook
     )
@@ -1066,6 +1086,14 @@ async def test_private_query_context_expands_supported_public_sources(
                     "| Example PayerCompass | tpa | https://example.mrf.payercompass.com/ | "
                     "aliases: Example Dental Network; benefit_lines: dental |"
                 ),
+                (
+                    "| Example Talon TPA | tpa | https://www.mymedicalshopper.com/mrf-search/example-tpa | "
+                    "aliases: Example Talon; benefit_lines: medical |"
+                ),
+                (
+                    "| Example Bounded Talon TPA | tpa | https://www.mymedicalshopper.com/mrf-search/example-bounded-tpa | "
+                    "aliases: Example Bounded Talon; benefit_lines: medical |"
+                ),
             ]
         ),
         encoding="utf-8",
@@ -1073,7 +1101,7 @@ async def test_private_query_context_expands_supported_public_sources(
     private_path = tmp_path / "private-context.csv"
     private_path.write_text(
         "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
-        "Example Packaging,\"Aetna; Example TPA\",\"Aetna Dental; Example Dental Network\",\n",
+        "Example Packaging,\"Aetna; Example TPA; Example Talon; Example Bounded Talon\",\"Aetna Dental; Example Dental Network\",\n",
         encoding="utf-8",
     )
     config_path = tmp_path / "sources.json"
@@ -1091,11 +1119,19 @@ async def test_private_query_context_expands_supported_public_sources(
                 "platform_resolvers": {
                     "aetna_health1": {"type": "healthsparq_public_mrf"},
                     "healthcarebluebook_mrf": {"type": "healthcarebluebook_mrf"},
+                    "mymedicalshopper_talon": {
+                        "type": "mymedicalshopper_talon_mrf"
+                    },
+                    "mymedicalshopper_talon_bounded": {
+                        "type": "mymedicalshopper_talon_mrf"
+                    },
                     "payercompass_mrf": {"type": "payercompass_mrf"},
                 },
                 "source_query_expansion_platforms": [
                     "aetna_health1",
                     "healthcarebluebook_mrf",
+                    "mymedicalshopper_talon",
+                    "mymedicalshopper_talon_bounded",
                     "payercompass_mrf",
                 ],
             }
@@ -1118,6 +1154,8 @@ async def test_private_query_context_expands_supported_public_sources(
     assert [candidate.payer_name for candidate in expanded] == [
         "Example Aetna",
         "Example Directory TPA",
+        "Example Talon TPA",
+        "Example Bounded Talon TPA",
         "Example Dental",
         "Example PayerCompass",
     ]
