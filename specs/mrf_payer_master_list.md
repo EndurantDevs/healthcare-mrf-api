@@ -120,8 +120,9 @@ Last one-time research refresh: 2026-06-05.
 | Triple-S Salud | blue | https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/ | public transparency page backed by public MTT API; aliases: Triple-S, Triple S, Blue Cross Blue Shield Triple-S, Triple-S Salud Care Plus ELA, Care Plus ELA |
 | Wellmark | blue | https://web.healthsparq.com/app/public/#/one/insurerCode=WMRK_I&brandCode=WELLMARK/ | curated source row; aliases: Wellmark Blue Cross and Blue Shield, Wellmark Blue Cross Blue Shield of IA, Wellmark Blue Cross Blue Shield of Iowa and SD, Wellmark of Iowa, "Wellmark Health Plan of Iowa, Inc.", Wellmark Blue Dental |
 | Bright HealthCare | dtc | - | needs official source URL |
-| Clover Health | dtc | https://www.cloverhealth.com/members/plan-documents | public transparency URL |
-| Devoted Health | dtc | https://www.devoted.com/plan-documents/ | public transparency URL |
+| Clover Health | dtc | https://www.cloverhealth.com/members/plan-documents | observed stale; member plan-documents page, not a payer TiC pricing MRF source; employer health-plan MRFs are represented by the Clover Health Employee Benefits delegated row |
+| Clover Health Employee Benefits | group | https://transparency-in-coverage.uhc.com/ | public Clover careers page delegates employee health-plan MRFs to UnitedHealthcare, UMR, and HealthSCOPE Benefits; target payer query: Clover Health; benefit lines: medical, dental, vision; aliases: Clover Health, Clover Health Benefits |
+| Devoted Health | dtc | https://www.devoted.com/plan-documents/ | observed stale; member plan-documents page, not a payer TiC pricing MRF source |
 | Firefly Health | dtc | https://www.fireflyhealth.com/pricing-transparency/ | public price-transparency page points to Opyn Health member portal, not a public pricing MRF TOC; source tier: coverage_evidence; benefit lines: medical; source coverage: Firefly price-transparency and member portal evidence; vendor names: Firefly Health, Opyn Health; plan names: Firefly Health Plan; aliases: Firefly, Firefly Health Plan |
 | Gravie | dtc | https://www.gravie.com/compliance/transparency-in-coverage/ | public transparency URL |
 | Oscar Health | dtc | https://www.hioscar.com/transparency-in-coverage-files/oscar | public Oscar transparency page resolves to current monthly S3 table of contents; aliases: Oscar, Oscar Health Plan |
@@ -264,7 +265,7 @@ Last one-time research refresh: 2026-06-05.
 | Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq MRF route linked from Dean transparency page |
 | Dean Health Plan | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | observed stale; replaced by direct Dean HealthSparq MRF route |
 | Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | observed stale; hospital price-transparency page, not a payer TiC MRF source; represented by Network Health direct table of contents |
-| Geisinger Health Plan | provider_sponsored | https://www.geisinger.org/health-plan/no-surprises-act | curated source row |
+| Geisinger Health Plan | provider_sponsored | https://www.geisinger.org/health-plan/no-surprises-act | observed unsupported; public page is protected and no direct MRF or TOC URL is verified for automated import |
 | Hally/Health Alliance | provider_sponsored | - | needs official source URL |
 | HAP | provider_sponsored | https://hap.healthsparq.com/healthsparq/public/#/one/insurerCode=HAP_I&brandCode=HAP/machine-readable-transparency-in-coverage | public HAP HealthSparq MRF route linked from the HAP transparency page; aliases: Health Alliance Plan, Health Alliance Plan of Michigan, Alliance Health and Life Insurance Company |
 | Peak Health | regional | https://peakhealth.org/transparency/ | public Peak Health transparency page with current monthly index and in-network ZIP links; aliases: Peak Health Plan |
@@ -281,7 +282,7 @@ Last one-time research refresh: 2026-06-05.
 | Mercy/MercyCare | provider_sponsored | https://stmercycaremrf.z14.web.core.windows.net/OON.html | public MercyCare out-of-network allowed amount files page linked from official MercyCare transparency page; benefit lines: medical; aliases: MercyCare Health Plans, Mercyhealth |
 | Ohio Health Choice | provider_sponsored | - | needs official source URL |
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
-| OSF HealthCare | provider_sponsored | https://www.osfhealthcare.org/patients-visitors/billing-insurance/price-transparency | public transparency URL |
+| OSF HealthCare | provider_sponsored | https://www.osfhealthcare.org/patients-visitors/billing-insurance/price-transparency | observed stale; hospital standard-charge price-transparency page, not a payer TiC pricing MRF source |
 | Paramount Health Care | provider_sponsored | https://paramount.healthsparq.com/healthsparq/public/#/one/insurerCode=PARAMOUNT_I&brandCode=PARAMOUNT/machine-readable-transparency-in-coverage | official Paramount Legal page links this HealthSparq machine-readable source; aliases: Paramount |
 | Physicians Health Plan | provider_sponsored | https://www.uofmhealthplan.org/members/price-transparency-and-interoperability | public U-M Health Plan price-transparency page exposes current Physicians Health Plan table-of-contents links; aliases: U-M Health Plan, UM Health Plan, University of Michigan Health Plan, Physicians Health Plan of Michigan |
 | Physicians Health Plan of N. Indiana | provider_sponsored | https://services.phpni.com/machine-readable-files/files/phpni/phpni | public PHPNI machine-readable-files service linked from the PHPNI MRF page; aliases: PHPNI, PHP Northern Indiana, Physicians Health Plan Northern Indiana |
@@ -289,7 +290,7 @@ Last one-time research refresh: 2026-06-05.
 | Prevea360 | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
 | Priority Health | provider_sponsored | https://www.priorityhealth.com/landing/transparency | curated source row; aliases: Priority Health of Michigan |
 | ProMedica | provider_sponsored | - | needs official source URL |
-| Providence Health Plan | provider_sponsored | https://mrfhub.providencehealthplan.com/ | curated source row |
+| Providence Health Plan | provider_sponsored | https://mrfhub.providencehealthplan.com/ | observed stale; public MRF hub currently returns no targets because the upstream Providence API reports an expired service account |
 | Quartz Benefits | provider_sponsored | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/ | curated source row |
 | Sanford Health Plan | provider_sponsored | https://www.sanfordhealthplan.com/transparency-in-coverage-rule | curated source row |
 | Scripps Health Plan | provider_sponsored | https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7 | public transparency URL |
@@ -297,7 +298,7 @@ Last one-time research refresh: 2026-06-05.
 | SelectHealth | provider_sponsored | https://ebu.intermountainhealthcare.org/selecthealth/transparencyincoverage/ | public MRF directory |
 | Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row; aliases: Sentara Health, Sentara Health Plans |
 | Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | public MRF page with direct Sharp CAP/FFS files; aliases: Sharp Health Plan of San Diego |
-| SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
+| SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | observed stale; hospital standard-charge price-transparency page, not a payer TiC pricing MRF source |
 | Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL; aliases: Sutter Health Plus |
 | University of Utah HP | provider_sponsored | https://uhealthplan.utah.edu/machine-readable-data | official University of Utah Health Plans machine-readable data page with current medical TOC and file links; aliases: University of Utah Health Plans, U of U Health Plans |
 | UPMC Health Plan | provider_sponsored | https://www.upmchealthplan.com/transparency-in-coverage/mrf/ | curated source row |
@@ -346,7 +347,7 @@ Last one-time research refresh: 2026-06-05.
 | Excellus | regional | https://excellusbcbs.healthsparq.com/app/public/#/one/insurerCode=EXC_I&brandCode=EXC/machine-readable-transparency-in-coverage | observed current; 3,288 plans; 34,862 files |
 | Excellus BlueCross BlueShield | regional | - | needs official source URL |
 | Fallon Health | regional | https://fallon.sapphiremrfhub.com/ | curated source row |
-| Farm Bureau Health Plans | regional | https://fbhealthplans.com/forms-resources/ | public transparency URL |
+| Farm Bureau Health Plans | regional | https://fbhealthplans.com/forms-resources/ | observed unsupported; forms and resources page, not a payer TiC pricing MRF source |
 | Fidelis | regional | - | needs official source URL |
 | First Choice Health | regional | https://www.fchn.com/machine-readable-files | curated source row; aliases: First Choice Health Network |
 | First Choice Health | regional | https://www.fchn.com/PayorSearch | public transparency URL |

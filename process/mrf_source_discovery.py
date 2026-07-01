@@ -1647,6 +1647,13 @@ def _master_list_aliases(notes: str) -> tuple[str, ...]:
     return _master_list_note_values(notes, r"aliases?")
 
 
+def _master_list_target_payer_query(notes: str) -> str | None:
+    values = _master_list_note_values(
+        notes, r"target[-_\s]*(?:payer[-_\s]*)?quer(?:y|ies)"
+    )
+    return values[0] if values else None
+
+
 def _master_list_note_values(notes: str, label_pattern: str) -> tuple[str, ...]:
     match = re.search(
         rf"\b{label_pattern}\s*:\s*(?P<values>[^;]+)",
@@ -1814,6 +1821,15 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
         ) or (None,)
         parent_group = _infer_parent_group(current_section, payer_name)
         for url in urls:
+            target_payer_query = _master_list_target_payer_query(notes_text)
+            raw_payload = {
+                "section": current_section,
+                "raw_payer_name": raw_payer_name,
+                "url_cell": url_cell,
+                "notes": notes_text,
+            }
+            if target_payer_query:
+                raw_payload["target_payer_query"] = target_payer_query
             candidates.append(
                 SourceCandidate(
                     payer_name=payer_name,
@@ -1845,12 +1861,7 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
                     confidence=85 if url else 45,
                     license_status="curated_public_research",
                     review_status="pending",
-                    raw_payload={
-                        "section": current_section,
-                        "raw_payer_name": raw_payer_name,
-                        "url_cell": url_cell,
-                        "notes": notes_text,
-                    },
+                    raw_payload=raw_payload,
                 )
             )
     return _dedupe_candidates(candidates)

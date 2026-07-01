@@ -965,7 +965,7 @@ def test_parse_master_list_preserves_coverage_evidence_metadata():
 ## Public employer evidence
 | Payer | Type | Public MRF TOC / landing URL | Notes |
 |---|---|---|---|
-| Example Packaging Benefits | group | https://benefits.example.test/find-a-provider | public employer benefits page; source tier: coverage_evidence; benefit lines: medical; source coverage: Example Packaging medical choices; vendor names: Example Virtual Health; network names: Example National PPO; plan names: Example Guided Health Plan; aliases: Example Packaging |
+| Example Packaging Benefits | group | https://benefits.example.test/find-a-provider | public employer benefits page; source tier: coverage_evidence; target payer query: Example Packaging; benefit lines: medical; source coverage: Example Packaging medical choices; vendor names: Example Virtual Health; network names: Example National PPO; plan names: Example Guided Health Plan; aliases: Example Packaging |
 """
 
     [candidate] = discovery.parse_master_list(markdown)
@@ -979,6 +979,7 @@ def test_parse_master_list_preserves_coverage_evidence_metadata():
     assert candidate.network_names == ("Example National PPO",)
     assert candidate.plan_names == ("Example Guided Health Plan",)
     assert candidate.aliases == ("Example Packaging",)
+    assert candidate.raw_payload["target_payer_query"] == "Example Packaging"
 
 
 def test_parse_master_list_preserves_legacy_public_aliases_for_active_sources():
@@ -2555,6 +2556,28 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Firefly Health"].status == "active"
     assert by_name["Firefly Health"].index_url == "https://www.fireflyhealth.com/pricing-transparency/"
     assert "Firefly Health Plan" in by_name["Firefly Health"].aliases
+    assert by_name["Clover Health"].status == "stale"
+    assert by_name["Clover Health Employee Benefits"].entity_type == "group"
+    assert (
+        by_name["Clover Health Employee Benefits"].hosting_platform
+        == "uhc_public_blobs"
+    )
+    assert by_name["Clover Health Employee Benefits"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
+    assert (
+        by_name["Clover Health Employee Benefits"].raw_payload["target_payer_query"]
+        == "Clover Health"
+    )
+    assert "Clover Health" in by_name["Clover Health Employee Benefits"].aliases
+    assert by_name["Devoted Health"].status == "stale"
+    assert by_name["Geisinger Health Plan"].status == "unsupported"
+    assert by_name["OSF HealthCare"].status == "stale"
+    assert by_name["Providence Health Plan"].status == "stale"
+    assert by_name["SSM Health Plan"].status == "stale"
+    assert by_name["Farm Bureau Health Plans"].status == "unsupported"
     assert "The Standard AHL" in aliases_by_name["Meritain Health"]
     assert "American Heritage Life" in aliases_by_name["Meritain Health"]
     assert (
