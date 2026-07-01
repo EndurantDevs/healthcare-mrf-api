@@ -2356,22 +2356,43 @@ async def test_master_list_keeps_high_value_public_aliases():
         "ClaimChoice Administrators Coverage": ("medical",),
         "Consociate Health Ancillary Benefits": ("dental", "vision"),
         "Direct Dental Coverage": ("dental",),
+        "Dominion National Dental": ("dental",),
+        "Dominion National Vision": ("vision",),
         "EBPA Medical and Dental Coverage": ("dental",),
         "EMI Health Vision Coverage": ("vision",),
+        "Ameritas Dental": ("dental",),
+        "Ameritas Vision": ("vision",),
         "HealthPartners Dental Coverage": ("dental",),
+        "Guardian Dental": ("dental",),
+        "Guardian Vision": ("vision",),
         "Highmark Dental and Vision Coverage": ("dental", "vision"),
         "HNAS Dental Network Coverage": ("dental",),
         "HRI Dental and Vision": ("dental", "vision"),
+        "Humana Dental": ("dental",),
+        "Humana Vision": ("vision",),
         "International Medical Solutions Coverage": ("medical", "dental", "vision"),
+        "LIBERTY Dental Plan": ("dental",),
         "Loomis Dental Coverage": ("dental",),
         "MetLife Dental Coverage": ("dental",),
         "MedBen Dental and Vision Coverage": ("dental", "vision"),
         "Meritain Health Vision Coverage": ("vision",),
+        "Mutual of Omaha Dental": ("dental",),
+        "Mutual of Omaha Vision": ("vision",),
         "PacificSource Vision Coverage": ("vision",),
+        "Principal Dental": ("dental",),
+        "Principal Vision": ("vision",),
+        "Renaissance Dental": ("dental",),
+        "Renaissance Vision": ("vision",),
         "Reliance Matrix Dental and Vision": ("dental", "vision"),
+        "Sun Life Dental": ("dental",),
+        "Sun Life Vision": ("vision",),
         "Tall Tree Dental Coverage": ("dental",),
+        "The Standard Dental": ("dental",),
+        "The Standard Vision": ("vision",),
+        "TruAssure Dental": ("dental",),
         "UHA Dental Coverage": ("dental",),
         "UHA Vision Coverage": ("vision",),
+        "United Concordia Dental": ("dental",),
         "UPMC Dental and Vision Coverage": ("dental", "vision"),
         "Wellmark Blue Dental Coverage": ("dental",),
     }
@@ -2573,6 +2594,43 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert (
         "BEST Life and Health Insurance Company"
         in ancillary_by_name["BEST Life Dental and Vision Coverage"].aliases
+    )
+    assert "Dominion National" in ancillary_by_name["Dominion National Dental"].aliases
+    assert "Dominion National" in ancillary_by_name["Dominion National Vision"].aliases
+    assert "Guardian Dental" in ancillary_by_name["Guardian Dental"].aliases
+    assert "Guardian Life Insurance Company" in ancillary_by_name["Guardian Vision"].aliases
+    assert "HumanaDental Insurance Company" in ancillary_by_name["Humana Dental"].aliases
+    assert "CompBenefits Vision" in ancillary_by_name["Humana Vision"].aliases
+    assert "Principal Financial Group Dental" in ancillary_by_name["Principal Dental"].aliases
+    assert "Principal Financial Group" in ancillary_by_name["Principal Vision"].aliases
+    assert "Ameritas Dental" in ancillary_by_name["Ameritas Dental"].aliases
+    assert "Fusion Vision" in ancillary_by_name["Ameritas Vision"].aliases
+    assert "SunLife Dental" in ancillary_by_name["Sun Life Dental"].aliases
+    assert "Sunlife Financial" in ancillary_by_name["Sun Life Vision"].aliases
+    assert "Standard Dental" in ancillary_by_name["The Standard Dental"].aliases
+    assert "Standard Vision" in ancillary_by_name["The Standard Vision"].aliases
+    assert "TruAssure Dental" in ancillary_by_name["TruAssure Dental"].aliases
+    assert (
+        "United Concordia Companies"
+        in ancillary_by_name["United Concordia Dental"].aliases
+    )
+    assert "Liberty Dental" in ancillary_by_name["LIBERTY Dental Plan"].aliases
+    assert "Liberty Dental Plan" in ancillary_by_name["LIBERTY Dental Plan"].aliases
+    assert (
+        "Mutual of Omaha Insurance Company"
+        in ancillary_by_name["Mutual of Omaha Dental"].aliases
+    )
+    assert (
+        "United of Omaha Life Insurance Company"
+        in ancillary_by_name["Mutual of Omaha Vision"].aliases
+    )
+    assert (
+        "Renaissance Life & Health Insurance Company"
+        in ancillary_by_name["Renaissance Dental"].aliases
+    )
+    assert (
+        "Renaissance Life & Health Insurance Company"
+        in ancillary_by_name["Renaissance Vision"].aliases
     )
     assert "HealthNow Administrative Services Dental" in ancillary_by_name["HNAS Dental Network Coverage"].aliases
     assert "Loomis Benefit Administrators" in ancillary_by_name["Loomis Dental Coverage"].aliases
@@ -2785,20 +2843,28 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Avesis Vision Network" in by_name["Avesis"].aliases
     assert "Guardian Vision Avesis" in by_name["Avesis"].aliases
     assert "Guardian Vision with Avesis" in by_name["Avesis"].aliases
-    for review_only_name in (
+    for coverage_evidence_vision_name in (
         "Dominion National Vision",
-        "Group Vision Service",
         "Humana Vision",
-        "SecureCare Vision",
-        "Vision Care Direct",
         "Guardian Vision",
-        "MetLife Vision",
         "Principal Vision",
         "Ameritas Vision",
         "Sun Life Vision",
-        "Equitable Vision",
         "The Standard Vision",
         "Renaissance Vision",
+        "Mutual of Omaha Vision",
+    ):
+        assert by_name[coverage_evidence_vision_name].entity_type == "vision"
+        assert by_name[coverage_evidence_vision_name].benefit_lines == ("vision",)
+        assert by_name[coverage_evidence_vision_name].status == "active"
+        assert by_name[coverage_evidence_vision_name].source_tier == "coverage_evidence"
+        assert by_name[coverage_evidence_vision_name].index_url
+    for review_only_name in (
+        "Group Vision Service",
+        "SecureCare Vision",
+        "Vision Care Direct",
+        "MetLife Vision",
+        "Equitable Vision",
         "Pacific Life Vision",
         "HMSA Vision",
         "Anthem Vision Plan",
@@ -2838,16 +2904,32 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "DeltaDental" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Iowa" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Missouri" in by_name["Delta Dental"].aliases
-    for review_only_name in (
+    for coverage_evidence_dental_name in (
         "Dominion National Dental",
+        "Guardian Dental",
+        "Humana Dental",
+        "Principal Dental",
+        "Mutual of Omaha Dental",
+        "Ameritas Dental",
+        "Sun Life Dental",
+        "LIBERTY Dental Plan",
+        "United Concordia Dental",
+        "TruAssure Dental",
+        "The Standard Dental",
+        "Renaissance Dental",
+    ):
+        assert by_name[coverage_evidence_dental_name].entity_type == "dental"
+        assert by_name[coverage_evidence_dental_name].benefit_lines == ("dental",)
+        assert by_name[coverage_evidence_dental_name].status == "active"
+        assert by_name[coverage_evidence_dental_name].source_tier == "coverage_evidence"
+        assert by_name[coverage_evidence_dental_name].index_url
+    for review_only_name in (
         "Florida Combined Life Dental",
         "Highmark Blue Edge Dental",
-        "Humana Dental",
         "Premier Access Dental",
         "SecureCare Dental",
         "Superior Dental Care",
         "Solstice Dental",
-        "TruAssure Dental",
     ):
         assert by_name[review_only_name].entity_type == "dental"
         assert by_name[review_only_name].benefit_lines == ("dental",)
@@ -2864,8 +2946,6 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "TruAssure" in by_name["TruAssure Dental"].aliases
     assert by_name["Guardian Dental"].entity_type == "dental"
     assert by_name["Guardian Dental"].benefit_lines == ("dental",)
-    assert by_name["Guardian Dental"].status == "needs_review"
-    assert by_name["Guardian Dental"].index_url is None
     assert "Guardian" in by_name["Guardian Dental"].aliases
     assert "Guaridan" in by_name["Guardian Dental"].aliases
     assert "Guardian Life Insurance Company of America" in by_name["Guardian Dental"].aliases
@@ -2874,21 +2954,17 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "MetLife" in by_name["MetLife Dental"].aliases
     assert "Metlife DPPO" in by_name["MetLife Dental"].aliases
     assert "Metropolitan Life Insurance Company" in by_name["MetLife Dental"].aliases
-    assert by_name["Principal Dental"].status == "needs_review"
     assert "Principal" in by_name["Principal Dental"].aliases
     assert "Principle" in by_name["Principal Dental"].aliases
     assert "Principal Financial Group" in by_name["Principal Dental"].aliases
-    assert by_name["Mutual of Omaha Dental"].status == "needs_review"
     assert "United of Omaha Life Insurance Company" in (
         by_name["Mutual of Omaha Dental"].aliases
     )
-    assert by_name["Ameritas Dental"].status == "needs_review"
     assert "Ameritas" in by_name["Ameritas Dental"].aliases
     assert "The Business Council" in by_name["Ameritas Dental"].aliases
     assert "First Ameritas Life Insurance Corp. of New York" in (
         by_name["Ameritas Dental"].aliases
     )
-    assert by_name["Sun Life Dental"].status == "needs_review"
     assert "SunLife" in by_name["Sun Life Dental"].aliases
     assert "SunLife Financail" in by_name["Sun Life Dental"].aliases
     assert by_name["Equitable Dental"].status == "needs_review"
@@ -2906,22 +2982,16 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Lincoln" in by_name["Lincoln Financial DentalConnect"].aliases
     assert by_name["LIBERTY Dental Plan"].entity_type == "dental"
     assert by_name["LIBERTY Dental Plan"].benefit_lines == ("dental",)
-    assert by_name["LIBERTY Dental Plan"].status == "needs_review"
-    assert by_name["LIBERTY Dental Plan"].index_url is None
     assert "Liberty Dental" in by_name["LIBERTY Dental Plan"].aliases
     assert by_name["United Concordia Dental"].entity_type == "dental"
     assert by_name["United Concordia Dental"].benefit_lines == ("dental",)
-    assert by_name["United Concordia Dental"].status == "needs_review"
-    assert by_name["United Concordia Dental"].index_url is None
     assert "United Concordia" in by_name["United Concordia Dental"].aliases
     assert "United Concorida" in by_name["United Concordia Dental"].aliases
     assert by_name["Unum Dental / Starmount Life"].entity_type == "dental"
     assert by_name["Unum Dental / Starmount Life"].benefit_lines == ("dental",)
     for review_only_name in (
         "HMSA Dental",
-        "The Standard Dental",
         "Pacific Life Dental",
-        "Renaissance Dental",
         "HRI / Paramount Dental",
         "Willamette Dental Group",
     ):
