@@ -2409,6 +2409,21 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
         "https://uhealthplan.utah.edu/machine-readable-data"
     )
     assert by_name["University of Utah HP"][0].hosting_platform == "html_mrf_links"
+    molina = by_name["Molina Healthcare"]
+    assert any(
+        candidate.index_url
+        == "https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency"
+        and candidate.status == "active"
+        and discovery._candidate_is_importable_source(candidate)
+        for candidate in molina
+    )
+    assert any(
+        candidate.index_url
+        == "https://www.molinahealthcare.com/members/common/mrf.aspx"
+        and candidate.status == "unsupported"
+        and not discovery._candidate_is_importable_source(candidate)
+        for candidate in molina
+    )
 
 
 @pytest.mark.asyncio

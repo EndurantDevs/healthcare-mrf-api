@@ -177,7 +177,7 @@ Last one-time research refresh: 2026-06-05.
 | Humana | national | https://developers.humana.com/cost-transparency | curated source row |
 | Humana | national | https://developers.humana.com/syntheticdata/Resource/PCTFilesList?fileType=innetwork | observed archived |
 | Kaiser Permanente | national | https://healthy.kaiserpermanente.org/front-door/machine-readable | curated source row; aliases: Kaiser, Kasier Permanente, Kaiser Hawaii, Kaiser Permanente Insurance Company, Kaiser Permanente of Northern CA, Kaiser Permanente of Southern CA, Kaiser Foundation Health Plan, Kaiser Foundation Health Plan Inc, "Kaiser Foundation Health Plan, Inc.", Kaiser Foundation Health Plan of N CA Region, Kaiser Foundation Health Plan of S CA Region, Kaiser Foundation Health Plan of the Northwest, Kaiser Foundation Health Plan of the Mid-Atlantic States Inc, "Kaiser Foundation Health Plan of the Mid-Atlantic States, Inc.", Kaiser Foundation Health Plan of the Mid-Atlantic States, Kaiser Foundation Health Plan of Hawaii, Kaiser Foundation Health Plan of Georgia, Kaiser Foundation Health Plan of Colorado, Kaiser Foundation Health Plan of Washington |
-| Molina Healthcare | national | https://www.molinahealthcare.com/members/common/mrf.aspx | curated source row |
+| Molina Healthcare | national | https://www.molinahealthcare.com/members/common/mrf.aspx | observed unsupported; provider and pharmacy directory page, not a pricing MRF source; replaced by Molina Marketplace pricing transparency row |
 | Optum | national | https://transparency-in-coverage.optum.com/ | curated source row |
 | PreferredOne | national | - | needs official source URL |
 | UMR | national | - | needs official source URL |
