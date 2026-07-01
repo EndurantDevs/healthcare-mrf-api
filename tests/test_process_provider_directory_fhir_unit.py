@@ -4736,32 +4736,34 @@ async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitione
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_scan_practitioner_role_rows(
+    reverse_lookup_result = await importer._fetch_scan_practitioner_role_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
             "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
         },
         {"Practitioner": [{"resource_id": "prac-1"}]},
-        per_resource_limit=5,
-        page_limit=0,
-        page_count=25,
-        timeout=3,
-        run_id="run_1",
+        importer.ScanPractitionerRoleFetchOptions(
+            per_resource_limit=5,
+            page_limit=0,
+            page_count=25,
+            timeout=3,
+            run_id="run_1",
+        ),
     )
 
     assert calls == [
         "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
     ]
-    assert result.model is ProviderDirectoryPractitionerRole
-    assert result.rows_fetched == 1
-    assert result.rows[0]["resource_id"] == "role-1"
-    assert result.rows[0]["practitioner_ref"] == "Practitioner/prac-1"
-    assert result.fetch_mode == "source_specific_reverse_lookup"
+    assert reverse_lookup_result.model is ProviderDirectoryPractitionerRole
+    assert reverse_lookup_result.rows_fetched == 1
+    assert reverse_lookup_result.rows[0]["resource_id"] == "role-1"
+    assert reverse_lookup_result.rows[0]["practitioner_ref"] == "Practitioner/prac-1"
+    assert reverse_lookup_result.fetch_mode == "source_specific_reverse_lookup"
 
 
 @pytest.mark.asyncio
-async def test_fetch_scan_practitioner_role_rows_streams_reverse_lookup(monkeypatch):
+async def test_scan_practitioner_role_reverse_lookup_writes_row_batches(monkeypatch):
     async def fake_fetch_json(_source, _url, *, timeout):
         return (
             200,
@@ -4782,35 +4784,37 @@ async def test_fetch_scan_practitioner_role_rows_streams_reverse_lookup(monkeypa
             5,
         )
 
-    streamed: list[list[dict[str, object]]] = []
+    streamed_row_batches: list[list[dict[str, object]]] = []
 
-    async def row_batch_handler(_model, rows):
-        streamed.append(rows)
-        return len(rows)
+    async def row_batch_handler(_model, row_batch):
+        streamed_row_batches.append(row_batch)
+        return len(row_batch)
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_scan_practitioner_role_rows(
+    reverse_lookup_batch_result = await importer._fetch_scan_practitioner_role_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
             "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
         },
         {"Practitioner": [{"resource_id": "prac-1"}]},
-        per_resource_limit=5,
-        page_limit=0,
-        page_count=25,
-        timeout=3,
-        run_id="run_1",
-        row_batch_handler=row_batch_handler,
-        row_batch_size=1,
-        retain_rows=False,
+        importer.ScanPractitionerRoleFetchOptions(
+            per_resource_limit=5,
+            page_limit=0,
+            page_count=25,
+            timeout=3,
+            run_id="run_1",
+            row_batch_handler=row_batch_handler,
+            row_batch_size=1,
+            retain_rows=False,
+        ),
     )
 
-    assert result.rows == []
-    assert result.rows_fetched == 1
-    assert result.rows_written == 1
-    assert streamed[0][0]["resource_id"] == "role-1"
+    assert reverse_lookup_batch_result.rows == []
+    assert reverse_lookup_batch_result.rows_fetched == 1
+    assert reverse_lookup_batch_result.rows_written == 1
+    assert streamed_row_batches[0][0]["resource_id"] == "role-1"
 
 
 @pytest.mark.asyncio

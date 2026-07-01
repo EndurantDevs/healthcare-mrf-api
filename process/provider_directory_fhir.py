@@ -421,6 +421,50 @@ class ResourceFetchResult:
         return self.row_limit_reached or self.page_limit_reached or self.hard_page_limit_reached
 
 
+@dataclass(frozen=True)
+class ScanPractitionerRoleFetchOptions:
+    """Runtime controls for SCAN PractitionerRole reverse lookups."""
+
+    per_resource_limit: int
+    page_limit: int
+    page_count: int
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None = None
+    row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE
+    retain_rows: bool = True
+    cancel_ctx: dict[str, Any] | None = None
+    cancel_task: dict[str, Any] | None = None
+    deadline_seconds: int = 0
+
+
+@dataclass
+class _StreamedResourceRowBuffer:
+    """Buffer resource rows before sending them to the streaming writer."""
+
+    model: type
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    row_batch_size: int
+    pending_row_items: list[dict[str, Any]]
+    rows_written: int = 0
+
+    async def add(self, row: dict[str, Any]) -> None:
+        """Add one row and flush when the configured batch size is reached."""
+        if not self.row_batch_handler:
+            return
+        self.pending_row_items.append(row)
+        if len(self.pending_row_items) >= max(1, self.row_batch_size):
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Flush buffered rows to the streaming writer."""
+        if not self.row_batch_handler or not self.pending_row_items:
+            return
+        row_items = list(self.pending_row_items)
+        self.pending_row_items.clear()
+        self.rows_written += await self.row_batch_handler(self.model, row_items)
+
+
 def _schema() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 
@@ -7233,18 +7277,7 @@ async def _fetch_resource_rows(
 async def _fetch_scan_practitioner_role_rows(
     source: dict[str, Any],
     rows_by_resource: dict[str, list[dict[str, Any]]],
-    *,
-    per_resource_limit: int,
-    page_limit: int,
-    page_count: int,
-    timeout: int,
-    run_id: str | None,
-    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None = None,
-    row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
-    retain_rows: bool = True,
-    cancel_ctx: dict[str, Any] | None = None,
-    cancel_task: dict[str, Any] | None = None,
-    deadline_seconds: int = 0,
+    options: ScanPractitionerRoleFetchOptions,
 ) -> ResourceFetchResult:
     model = ProviderDirectoryPractitionerRole
     seeds = _scan_practitioner_role_seed_rows(rows_by_resource)
@@ -7274,27 +7307,27 @@ async def _fetch_scan_practitioner_role_rows(
     next_url_remaining = False
     error_message: str | None = None
     reverse_error_count = 0
-    rows_written = 0
-    pending_rows: list[dict[str, Any]] = []
-    deadline_reached = False
-    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    stream_buffer = _StreamedResourceRowBuffer(
+        model=model,
+        row_batch_handler=options.row_batch_handler,
+        row_batch_size=options.row_batch_size,
+        pending_row_items=[],
+    )
+    is_deadline_reached = False
+    deadline_at = (
+        time.monotonic() + options.deadline_seconds
+        if options.deadline_seconds > 0
+        else None
+    )
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
 
-    async def flush_pending_rows() -> None:
-        nonlocal rows_written
-        if not row_batch_handler or not pending_rows:
-            return
-        pending_rows_list = list(pending_rows)
-        pending_rows.clear()
-        rows_written += await row_batch_handler(model, pending_rows_list)
-
     for search_param, seed_resource_type, seed_resource_id in seeds:
-        if cancel_ctx is not None:
-            await raise_if_cancelled(cancel_ctx, cancel_task)
-        if not _limit_allows_more(rows_fetched, per_resource_limit):
+        if options.cancel_ctx is not None:
+            await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
+        if not _limit_allows_more(rows_fetched, options.per_resource_limit):
             break
         if deadline_at is not None and time.monotonic() >= deadline_at:
-            deadline_reached = True
+            is_deadline_reached = True
             next_url_remaining = True
             break
         url = _scan_practitioner_role_reverse_lookup_url(
@@ -7302,16 +7335,16 @@ async def _fetch_scan_practitioner_role_rows(
             search_param,
             seed_resource_type,
             seed_resource_id,
-            page_count=page_count,
+            page_count=options.page_count,
         )
-        while url and _limit_allows_more(rows_fetched, per_resource_limit):
-            if cancel_ctx is not None:
-                await raise_if_cancelled(cancel_ctx, cancel_task)
+        while url and _limit_allows_more(rows_fetched, options.per_resource_limit):
+            if options.cancel_ctx is not None:
+                await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
-                deadline_reached = True
+                is_deadline_reached = True
                 next_url_remaining = True
                 break
-            if page_limit > 0 and pages >= page_limit:
+            if options.page_limit > 0 and pages >= options.page_limit:
                 page_limit_reached = True
                 next_url_remaining = True
                 break
@@ -7319,7 +7352,11 @@ async def _fetch_scan_practitioner_role_rows(
                 hard_page_limit_reached = True
                 next_url_remaining = True
                 break
-            status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
+            status_code, payload, error, _elapsed = await _fetch_source_json(
+                source,
+                url,
+                timeout=options.timeout,
+            )
             if status_code != 200 or error:
                 current_error = error or f"http_{status_code}"
                 reverse_error_count += 1
@@ -7336,7 +7373,7 @@ async def _fetch_scan_practitioner_role_rows(
                     source["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
-                    run_id=run_id,
+                    run_id=options.run_id,
                 )
                 if not parsed:
                     continue
@@ -7347,48 +7384,45 @@ async def _fetch_scan_practitioner_role_rows(
                 if not role_id or role_id in seen_role_ids:
                     continue
                 seen_role_ids.add(role_id)
-                if retain_rows:
+                if options.retain_rows:
                     rows.append(row)
-                if row_batch_handler:
-                    pending_rows.append(row)
-                    if len(pending_rows) >= max(1, row_batch_size):
-                        await flush_pending_rows()
+                await stream_buffer.add(row)
                 rows_fetched += 1
-                if not _limit_allows_more(rows_fetched, per_resource_limit):
+                if not _limit_allows_more(rows_fetched, options.per_resource_limit):
                     row_limit_reached = entry_index < len(entries) - 1
                     break
             next_url = _next_link(payload)
             url = urllib.parse.urljoin(url, next_url) if next_url else None
-            if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
+            if not _limit_allows_more(rows_fetched, options.per_resource_limit) and url:
                 row_limit_reached = True
                 next_url_remaining = True
                 break
         if row_limit_reached or page_limit_reached or hard_page_limit_reached:
             break
-        if deadline_reached:
+        if is_deadline_reached:
             break
 
-    await flush_pending_rows()
+    await stream_buffer.flush()
     complete = (
         not error_message
         and not row_limit_reached
         and not page_limit_reached
         and not hard_page_limit_reached
-        and not deadline_reached
+        and not is_deadline_reached
         and not next_url_remaining
     )
     return ResourceFetchResult(
         model=model,
         rows=rows,
         rows_fetched=rows_fetched,
-        rows_written=rows_written,
+        rows_written=stream_buffer.rows_written,
         pages_fetched=pages,
         complete=complete,
         row_limit_reached=row_limit_reached,
         page_limit_reached=page_limit_reached,
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining,
-        error=error_message or ("deadline_reached" if deadline_reached else None),
+        error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="source_specific_reverse_lookup",
     )
 
@@ -8625,6 +8659,7 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                """Write streamed SCAN PractitionerRole rows for each mirrored source."""
                 written = await _upsert_resource_rows(
                     model,
                     _copy_rows_for_source_ids(rows, source_ids),
@@ -8640,17 +8675,19 @@ async def _import_resources(
             result = await _fetch_scan_practitioner_role_rows(
                 source,
                 rows_by_resource,
-                per_resource_limit=per_resource_limit,
-                page_limit=page_limit,
-                page_count=page_count,
-                timeout=timeout,
-                run_id=run_id,
-                row_batch_handler=scan_role_row_batch_handler if use_streaming else None,
-                row_batch_size=stream_batch_size,
-                retain_rows=linked_resource_limit > 0 or not use_streaming,
-                cancel_ctx=cancel_ctx,
-                cancel_task=cancel_task,
-                deadline_seconds=linked_resource_deadline_seconds,
+                ScanPractitionerRoleFetchOptions(
+                    per_resource_limit=per_resource_limit,
+                    page_limit=page_limit,
+                    page_count=page_count,
+                    timeout=timeout,
+                    run_id=run_id,
+                    row_batch_handler=scan_role_row_batch_handler if use_streaming else None,
+                    row_batch_size=stream_batch_size,
+                    retain_rows=linked_resource_limit > 0 or not use_streaming,
+                    cancel_ctx=cancel_ctx,
+                    cancel_task=cancel_task,
+                    deadline_seconds=linked_resource_deadline_seconds,
+                ),
             )
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", result)
