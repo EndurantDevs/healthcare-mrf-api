@@ -8322,18 +8322,22 @@ def _crawl_targets_from_html_mrf_links(
     return targets
 
 
-def _embedded_mrf_host_urls(value: str | None) -> list[str]:
-    text = html.unescape(str(value or ""))
+def _embedded_mrf_host_urls(raw_html_text: str | None) -> list[str]:
+    text = html.unescape(str(raw_html_text or ""))
     host_patterns = (
         r"(?P<host>[a-z0-9.-]+\.sapphiremrfhub\.com)(?P<path>/[^\s\"'<>)]*)?",
         r"(?P<host>mrf\.healthcarebluebook\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>mrf\.healthgram\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>[a-z0-9.-]+\.mrf\.payercompass\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>mrfsearch\.meritain\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>transparency-in-coverage\.uhc\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>(?:www\.)?cigna\.com)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]*(?:machine-readable|static/mrf)[A-Za-z0-9_.~%/?=&:#-]*)",
+        r"(?P<host>(?:www\.)?(?:ibx|amerihealth|amerihealthnj)\.com)(?P<path>/cmstic[A-Za-z0-9_.~%/?=&:#-]*)",
         r"(?P<host>(?:www\.)?health1\.[a-z0-9.-]+)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]+)?",
         r"(?P<host>[a-z0-9.-]+\.healthsparq\.com)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]+)?",
         r"(?P<host>(?:www\.)?mymedicalshopper\.com)(?P<path>/(?:mrf-search|mrf)/[A-Za-z0-9_.~%/-]+)",
         r"(?P<host>www\.asrhealthbenefits\.com)(?P<path>/(?:mrf|MRF|umbraco/surface/mrfdownload|home/umbraco/surface/mrfdownload)[A-Za-z0-9_.~%/?=&-]*)",
+        r"(?P<host>price-transparency\.webtpa\.com)(?P<path>/[A-Za-z0-9_.~%/?=&:#-]*)?",
     )
     urls: list[str] = []
     seen: set[str] = set()
@@ -8342,10 +8346,10 @@ def _embedded_mrf_host_urls(value: str | None) -> list[str]:
             host = str(match.group("host") or "").rstrip(".").lower()
             path = str(match.groupdict().get("path") or "/").rstrip(".,;")
             url = f"https://{host}{path or '/'}"
-            key = _canonical_or_none(url) or url
-            if key in seen:
+            canonical_url_key = _canonical_or_none(url) or url
+            if canonical_url_key in seen:
                 continue
-            seen.add(key)
+            seen.add(canonical_url_key)
             urls.append(url)
     return urls
 

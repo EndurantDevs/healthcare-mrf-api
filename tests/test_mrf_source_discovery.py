@@ -2355,16 +2355,24 @@ async def test_master_list_keeps_high_value_public_aliases():
         "ASR Health Benefits Dental and Vision Coverage": ("dental", "vision"),
         "BCBS Alabama Dental Coverage": ("dental",),
         "BCBS Arizona Dental Coverage": ("dental",),
+        "BCBS Illinois Dental Coverage": ("dental",),
         "BCBS Kansas Dental and Vision Coverage": ("dental", "vision"),
         "BCBS Kansas City Dental and Vision Coverage": ("dental", "vision"),
         "BCBS Massachusetts Vision Coverage": ("vision",),
+        "BCBS Montana Dental Coverage": ("dental",),
+        "BCBS Montana Vision Coverage": ("vision",),
+        "BCBS New Mexico Dental Coverage": ("dental",),
         "BCBS North Carolina Dental Coverage": ("dental",),
         "BCBS North Carolina Vision Coverage": ("vision",),
+        "BCBS Oklahoma Dental Coverage": ("dental",),
         "BCBS South Carolina Dental Coverage": ("dental",),
         "BCBS South Carolina Vision Coverage": ("vision",),
         "BCBS Tennessee Dental and Vision Coverage": ("dental", "vision"),
+        "BCBS Texas Dental Coverage": ("dental",),
+        "BAS Ancillary Benefits": ("dental", "vision"),
         "Beam Benefits Ancillary Coverage": ("dental", "vision"),
         "BEST Life Dental and Vision Coverage": ("dental", "vision"),
+        "ByWater Ancillary Benefits": ("dental", "vision"),
         "CBA Blue Dental Coverage": ("dental",),
         "CarePlus Dental Plans Coverage": ("dental",),
         "ClaimChoice Administrators Coverage": ("medical",),
@@ -2407,7 +2415,6 @@ async def test_master_list_keeps_high_value_public_aliases():
         "TruAssure Dental": ("dental",),
         "UHA Dental Coverage": ("dental",),
         "UHA Vision Coverage": ("vision",),
-        "United Concordia Dental": ("dental",),
         "UPMC Dental and Vision Coverage": ("dental", "vision"),
         "Wellmark Blue Dental Coverage": ("dental",),
     }
@@ -2593,6 +2600,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Claim Choice" in ancillary_by_name["ClaimChoice Administrators Coverage"].aliases
     assert "Care Plus" in ancillary_by_name["CarePlus Dental Plans Coverage"].aliases
+    assert "Benefit Allocation Systems" in ancillary_by_name["BAS Ancillary Benefits"].aliases
+    assert "MyEnroll360" in ancillary_by_name["BAS Ancillary Benefits"].aliases
+    assert "Choose ByWater" in ancillary_by_name["ByWater Ancillary Benefits"].aliases
     assert "Dental Blue Network" in ancillary_by_name["CBA Blue Dental Coverage"].aliases
     assert "Direct Dental Administrators" in ancillary_by_name["Direct Dental Coverage"].aliases
     assert (
@@ -2635,10 +2645,6 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Standard Dental" in ancillary_by_name["The Standard Dental"].aliases
     assert "Standard Vision" in ancillary_by_name["The Standard Vision"].aliases
     assert "TruAssure Dental" in ancillary_by_name["TruAssure Dental"].aliases
-    assert (
-        "United Concordia Companies"
-        in ancillary_by_name["United Concordia Dental"].aliases
-    )
     assert "Liberty Dental" in ancillary_by_name["LIBERTY Dental Plan"].aliases
     assert "Liberty Dental Plan" in ancillary_by_name["LIBERTY Dental Plan"].aliases
     assert (
@@ -2691,7 +2697,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Capital Blue Cross NVA" in aliases_by_name["Capital Blue Cross"]
     assert by_name["Capital Blue Cross"].benefit_lines == ("medical", "vision")
     assert by_name["BCBS North Carolina"].benefit_lines == ("medical",)
-    assert by_name["Davis Vision"].status == "needs_review"
+    assert by_name["Davis Vision"].status == "active"
+    assert by_name["Davis Vision"].index_url == "https://www.ibx.com/cmstic/?brand=qcc"
+    assert by_name["Davis Vision"].hosting_platform == "cmstic_file_info"
     assert by_name["Davis Vision"].benefit_lines == ("vision",)
     for alias in (
         "Davis Vision by MetLife",
@@ -2955,7 +2963,6 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Ameritas Dental",
         "Sun Life Dental",
         "LIBERTY Dental Plan",
-        "United Concordia Dental",
         "TruAssure Dental",
         "The Standard Dental",
         "Renaissance Dental",
@@ -3027,8 +3034,15 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Liberty Dental" in by_name["LIBERTY Dental Plan"].aliases
     assert by_name["United Concordia Dental"].entity_type == "dental"
     assert by_name["United Concordia Dental"].benefit_lines == ("dental",)
+    assert by_name["United Concordia Dental"].source_tier == "mrf_importable"
+    assert (
+        by_name["United Concordia Dental"].index_url
+        == "https://bcbsla.sapphiremrfhub.com/"
+    )
+    assert by_name["United Concordia Dental"].hosting_platform == "sapphire"
     assert "United Concordia" in by_name["United Concordia Dental"].aliases
     assert "United Concorida" in by_name["United Concordia Dental"].aliases
+    assert "United Concordia Companies" in by_name["United Concordia Dental"].aliases
     assert by_name["Unum Dental / Starmount Life"].entity_type == "dental"
     assert by_name["Unum Dental / Starmount Life"].benefit_lines == ("dental",)
     for review_only_name in (
@@ -3168,14 +3182,17 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Shield of Arizona, Inc." in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of IL" in by_name["BCBS Illinois"].aliases
     assert "ILLINOIS BLUE CROSS" in by_name["BCBS Illinois"].aliases
-    assert by_name["BCBS Illinois"].benefit_lines == ("medical", "dental", "vision")
+    assert by_name["BCBS Illinois"].benefit_lines == ("medical", "vision")
+    assert by_name["BCBS Montana"].benefit_lines == ("medical",)
+    assert by_name["BCBS New Mexico"].benefit_lines == ("medical", "vision")
     assert "Blue Cross and Blue Shield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Minnesota" in by_name["BCBS Minnesota"].aliases
     assert "BlueCross BlueShield of Oklahoma" in by_name["BCBS Oklahoma"].aliases
+    assert by_name["BCBS Oklahoma"].benefit_lines == ("medical", "vision")
     assert "BlueCross BlueShield of Nebraska" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Shield of NE" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
-    assert by_name["BCBS Texas"].benefit_lines == ("medical", "dental", "vision")
+    assert by_name["BCBS Texas"].benefit_lines == ("medical", "vision")
     assert by_name["BCBS Tennessee"].benefit_lines == ("medical", "dental")
     assert by_name["BCBS Tennessee ASO"].benefit_lines == ("medical", "dental")
     assert "BCBS Tennessee" in by_name["BCBS Tennessee ASO"].aliases
@@ -3586,9 +3603,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "VSP Vision" in matching_importable_names("Ameritas Vision with VSP")
     assert "VSP Vision" in matching_importable_names("Delta Vision with VSP")
     assert "Davis Vision" in matching_names("Highmark Davis Vision")
-    assert "Davis Vision" not in matching_importable_names("Highmark Davis Vision")
+    assert "Davis Vision" in matching_importable_names("Highmark Davis Vision")
     assert "Davis Vision" in matching_names("MetLife Vision with Davis Vision")
-    assert "Davis Vision" not in matching_importable_names(
+    assert "Davis Vision" in matching_importable_names(
         "MetLife Vision with Davis Vision"
     )
     assert "Superior Vision" in matching_names("MetLife Superior Vision")
@@ -10290,6 +10307,10 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
     <p>TALON search: www.mymedicalshopper.com/mrf-search/varipro.</p>
     <p>TALON employer: www.mymedicalshopper.com/mrf/example-varipro-77100.</p>
     <p>ASR groups: www.asrhealthbenefits.com/MRF.</p>
+    <p>PayerCompass: example.mrf.payercompass.com.</p>
+    <p>Cigna compliance: www.cigna.com/legal/compliance/machine-readable-files.</p>
+    <p>CMSTIC search: www.ibx.com/cmstic/?brand=qcc.</p>
+    <p>WebTPA API: price-transparency.webtpa.com.</p>
     <a href="https://example.com/not-mrf">Ignore</a>
     <a href="https://github.com/CMSgov/price-transparency-guide">CMS docs</a>
     """
@@ -10303,11 +10324,15 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
         "https://bcbsil.com/asomrf?EIN=300088171",
         "https://alliedbenefit.sapphiremrfhub.com/",
         "https://mrf.healthcarebluebook.com/Lucent",
+        "https://example.mrf.payercompass.com/",
+        "https://www.cigna.com/legal/compliance/machine-readable-files",
+        "https://www.ibx.com/cmstic/?brand=qcc",
         "https://health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE_I&brandCode=EXAMPLE/machine-readable-transparency-in-coverage",
         "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/EXAMPLE_I/EXAMPLE/latest_metadata.json",
         "https://www.mymedicalshopper.com/mrf-search/varipro",
         "https://www.mymedicalshopper.com/mrf/example-varipro-77100",
         "https://www.asrhealthbenefits.com/MRF",
+        "https://price-transparency.webtpa.com/",
     ]
 
 
