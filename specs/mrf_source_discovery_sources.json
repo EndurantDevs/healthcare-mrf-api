@@ -107,6 +107,14 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "wordpress_elfinder_mrf_links": {
+      "type": "wordpress_elfinder_mrf_links",
+      "max_bytes": 5242880,
+      "ajax_max_bytes": 5242880,
+      "max_file_managers": 10,
+      "max_directories": 100,
+      "max_targets": 1000
+    },
     "insightba_html_mrf_links": {
       "type": "html_mrf_links",
       "max_bytes": 5242880,

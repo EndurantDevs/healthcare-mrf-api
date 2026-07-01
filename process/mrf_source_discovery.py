@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 import datetime as dt
 import gzip
@@ -1218,7 +1219,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if host in {"www.ebam.com", "ebam.com"} and "machine-readable-files" in path:
-        return "html_mrf_links"
+        return "wordpress_elfinder_mrf_links"
     if (
         host in {"www.motivhealth.com", "motivhealth.com"}
         and "machinereadablefiles" in path
@@ -2101,6 +2102,50 @@ async def _fetch_json(
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
     return data
+
+
+async def _post_form_json_value(
+    url: str,
+    data: dict[str, Any],
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> Any:
+    await _assert_fetch_url_allowed(url)
+    if session is None:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
+        connector = _tcp_connector(limit=0)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _post_form_json_value(
+                url, data, max_bytes=max_bytes, session=owned_session
+            )
+    chunks: list[bytes] = []
+    total = 0
+    async with session.post(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        allow_redirects=True,
+        **_request_ssl_kwargs(url),
+    ) as resp:
+        await _assert_fetch_url_allowed(str(resp.url))
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+            chunks.append(chunk)
+        text = _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8")
+    return _loads_mrf_json_value(text)
 
 
 async def _fetch_json_value(
@@ -5986,6 +6031,289 @@ async def _resolve_html_mrf_links(
     if not targets:
         raise ValueError(f"no direct HTML MRF links found for {url}")
     return targets
+
+
+def _wordpress_elfinder_js_string(value: str | None) -> str:
+    text = html.unescape(str(value or "")).strip()
+    return text.replace("\\/", "/").replace("\\u0026", "&")
+
+
+def _wordpress_elfinder_configs_from_html(
+    html_text: str, *, base_url: str
+) -> list[dict[str, str]]:
+    text = html.unescape(str(html_text or ""))
+    configs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    data_key_pattern = re.compile(
+        r"['\"]?data_key['\"]?\s*:\s*(?P<quote>['\"])(?P<value>[^'\"]+)(?P=quote)",
+        flags=re.I,
+    )
+    url_pattern = re.compile(
+        r"['\"]?url['\"]?\s*:\s*(?P<quote>['\"])(?P<value>.*?)(?P=quote)",
+        flags=re.I | re.S,
+    )
+    nonce_pattern = re.compile(
+        r"['\"]?_wpnonce['\"]?\s*:\s*(?P<quote>['\"])(?P<value>[^'\"]+)(?P=quote)",
+        flags=re.I,
+    )
+    file_manager_pattern = re.compile(r"wp_file_manager_front([A-Za-z0-9_-]+)")
+    for data_match in data_key_pattern.finditer(text):
+        prefix = text[max(0, data_match.start() - 3000) : data_match.start()]
+        suffix = text[data_match.start() : min(len(text), data_match.end() + 1000)]
+        url_matches = list(url_pattern.finditer(prefix))
+        nonce_matches = list(nonce_pattern.finditer(prefix + suffix))
+        if not url_matches or not nonce_matches:
+            continue
+        service_url = urljoin(
+            base_url, _wordpress_elfinder_js_string(url_matches[-1].group("value"))
+        )
+        data_key = _wordpress_elfinder_js_string(data_match.group("value"))
+        nonce = _wordpress_elfinder_js_string(nonce_matches[-1].group("value"))
+        if not service_url or not data_key or not nonce:
+            continue
+        key = (service_url, data_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        file_manager_matches = list(file_manager_pattern.finditer(prefix))
+        config = {
+            "url": service_url,
+            "data_key": data_key,
+            "nonce": nonce,
+        }
+        if file_manager_matches:
+            config["file_manager_id"] = file_manager_matches[-1].group(1)
+        configs.append(config)
+    return configs
+
+
+def _wordpress_elfinder_hash_path(hash_value: str | None) -> str | None:
+    value = str(hash_value or "").strip()
+    if "_" not in value:
+        return None
+    encoded = value.split("_", 1)[1]
+    if not encoded:
+        return None
+    encoded += "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(encoded.encode("ascii"))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return decoded.decode("utf-8", errors="replace")
+
+
+def _wordpress_elfinder_root_url(payload: dict[str, Any]) -> str | None:
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    options = cwd.get("options") if isinstance(cwd, dict) else None
+    root_url = options.get("url") if isinstance(options, dict) else None
+    return _clean_text(root_url) or None
+
+
+def _wordpress_elfinder_file_url(
+    root_url: str | None, file_item: dict[str, Any]
+) -> str | None:
+    direct_url = _clean_text(file_item.get("url"))
+    if direct_url and urlsplit(direct_url).scheme in {"http", "https"}:
+        return direct_url
+    if not root_url:
+        return None
+    path = _wordpress_elfinder_hash_path(str(file_item.get("hash") or ""))
+    if not path or path == "/":
+        return None
+    return urljoin(root_url.rstrip("/") + "/", quote(path.lstrip("/"), safe="/._-~"))
+
+
+def _wordpress_elfinder_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        return []
+    return [item for item in files if isinstance(item, dict)]
+
+
+def _wordpress_elfinder_directory_hashes(payload: dict[str, Any]) -> list[str]:
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for item in _wordpress_elfinder_files(payload):
+        if str(item.get("mime") or "").lower() != "directory":
+            continue
+        directory_hash = str(item.get("hash") or "").strip()
+        if not directory_hash or not item.get("phash") or directory_hash in seen:
+            continue
+        seen.add(directory_hash)
+        hashes.append(directory_hash)
+    return hashes
+
+
+def _wordpress_elfinder_targets_from_payload(
+    source: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    root_url: str | None,
+    resolved_from_url: str,
+    resolver_type: str,
+    file_manager_id: str | None,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    for item in _wordpress_elfinder_files(payload):
+        if str(item.get("mime") or "").lower() == "directory":
+            continue
+        file_name = _clean_text(item.get("name")) or "MRF file"
+        file_url = _wordpress_elfinder_file_url(root_url, item)
+        if not file_url:
+            continue
+        file_type = _mrf_body_file_type_from_text(file_url, file_name)
+        if not file_type:
+            continue
+        file_path = _wordpress_elfinder_hash_path(str(item.get("hash") or ""))
+        metadata = {
+            "resolver": resolver_type,
+            "target_kind": "file_reference",
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "wordpress_elfinder_hash": item.get("hash"),
+            "wordpress_elfinder_path": file_path,
+            "wordpress_elfinder_mime": item.get("mime"),
+            "wordpress_elfinder_size": item.get("size"),
+            "wordpress_elfinder_file_manager_id": file_manager_id,
+        }
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=file_url,
+                label=file_name,
+                resolved_from_url=resolved_from_url,
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [])
+                },
+            )
+        )
+    return targets
+
+
+def _wordpress_elfinder_target_sort_key(target: CrawlTarget) -> tuple[int, int, str]:
+    file_type_rank = {
+        "in-network": 0,
+        "table-of-contents": 1,
+        "allowed-amounts": 2,
+    }.get(str((target.metadata or {}).get("target_file_type") or ""), 9)
+    text = f"{target.label or ''} {target.url or ''}"
+    date_match = re.search(r"(20\d{2})[-_](\d{2})[-_](\d{2})", text)
+    date_rank = (
+        -int("".join(date_match.groups())) if date_match is not None else 0
+    )
+    return (file_type_rank, date_rank, str(target.label or target.url or ""))
+
+
+async def _resolve_wordpress_elfinder_mrf_links(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "wordpress_elfinder_mrf_links")
+    timeout = getattr(session, "timeout", None) or aiohttp.ClientTimeout(
+        total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+    )
+    headers = {
+        "User-Agent": BROWSER_FALLBACK_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+        connector=_tcp_connector(limit=0),
+        trust_env=False,
+    ) as browser_session:
+        html_text = await _fetch_text(
+            url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=browser_session,
+        )
+        configs = _wordpress_elfinder_configs_from_html(html_text, base_url=url)
+        max_file_managers = _as_int(resolver.get("max_file_managers")) or len(configs)
+        ajax_max_bytes = int(
+            resolver.get("ajax_max_bytes")
+            or resolver.get("directory_max_bytes")
+            or resolver.get("max_bytes")
+            or 5 * 1024 * 1024
+        )
+        max_directories = _as_int(resolver.get("max_directories")) or 100
+        max_targets = _as_int(resolver.get("max_targets"))
+        targets: list[CrawlTarget] = []
+        opened_directories = 0
+        last_error: Exception | None = None
+        for config in configs[:max_file_managers]:
+            try:
+                root_payload = await _post_form_json_value(
+                    config["url"],
+                    {
+                        "_wpnonce": config["nonce"],
+                        "data_key": config["data_key"],
+                        "cmd": "open",
+                        "init": "1",
+                        "tree": "1",
+                    },
+                    max_bytes=ajax_max_bytes,
+                    session=browser_session,
+                )
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                last_error = exc
+                continue
+            if not isinstance(root_payload, dict):
+                continue
+            root_url = _wordpress_elfinder_root_url(root_payload)
+            targets.extend(
+                _wordpress_elfinder_targets_from_payload(
+                    source,
+                    root_payload,
+                    root_url=root_url,
+                    resolved_from_url=config["url"],
+                    resolver_type=resolver_type,
+                    file_manager_id=config.get("file_manager_id"),
+                )
+            )
+            for directory_hash in _wordpress_elfinder_directory_hashes(root_payload):
+                if opened_directories >= max_directories:
+                    break
+                opened_directories += 1
+                try:
+                    directory_payload = await _post_form_json_value(
+                        config["url"],
+                        {
+                            "_wpnonce": config["nonce"],
+                            "data_key": config["data_key"],
+                            "cmd": "open",
+                            "target": directory_hash,
+                        },
+                        max_bytes=ajax_max_bytes,
+                        session=browser_session,
+                    )
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    last_error = exc
+                    continue
+                if not isinstance(directory_payload, dict):
+                    continue
+                targets.extend(
+                    _wordpress_elfinder_targets_from_payload(
+                        source,
+                        directory_payload,
+                        root_url=root_url,
+                        resolved_from_url=config["url"],
+                        resolver_type=resolver_type,
+                        file_manager_id=config.get("file_manager_id"),
+                    )
+                )
+        targets = _dedupe_crawl_targets_by_url(targets)
+        targets = _filter_crawl_targets_by_resolver_patterns(targets, resolver)
+        targets = sorted(targets, key=_wordpress_elfinder_target_sort_key)
+        if max_targets and max_targets > 0:
+            targets = targets[:max_targets]
+        if not targets:
+            detail = f": {last_error}" if last_error else ""
+            raise ValueError(f"no WordPress elFinder MRF links found for {url}{detail}")
+        return targets
 
 
 def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, str]]:
@@ -11317,6 +11645,10 @@ async def _crawl_targets_for_source(
         return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
     if resolver_type == "midlandschoice_mrf":
         return await _resolve_midlandschoice_mrf(source, url, resolver, session)
+    if resolver_type == "wordpress_elfinder_mrf_links":
+        return await _resolve_wordpress_elfinder_mrf_links(
+            source, url, resolver, session
+        )
     if resolver_type == "html_mrf_links":
         return await _resolve_html_mrf_links(source, url, resolver, session)
     if resolver_type == "socrata_data_json_mrf_catalog":
@@ -11509,6 +11841,10 @@ async def _crawl_targets_for_source(
         )
     if resolver_type == "html_delegated_mrf_links":
         return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
+    if resolver_type == "wordpress_elfinder_mrf_links":
+        return await _resolve_wordpress_elfinder_mrf_links(
+            source, url, resolver, session
+        )
     if resolver_type == "html_mrf_links":
         return await _resolve_html_mrf_links(source, url, resolver, session)
     if resolver_type == "socrata_data_json_mrf_catalog":

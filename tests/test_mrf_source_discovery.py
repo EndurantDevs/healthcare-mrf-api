@@ -64,6 +64,16 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
     assert (
+        config["platform_resolvers"]["wordpress_elfinder_mrf_links"]["type"]
+        == "wordpress_elfinder_mrf_links"
+    )
+    assert (
+        config["platform_resolvers"]["wordpress_elfinder_mrf_links"][
+            "max_directories"
+        ]
+        == 100
+    )
+    assert (
         config["platform_resolvers"]["avmed_html_mrf_links"]["type"]
         == "html_mrf_links"
     )
@@ -480,7 +490,7 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         discovery.classify_hosting_platform(
             "https://www.ebam.com/machine-readable-files/"
         )
-        == "html_mrf_links"
+        == "wordpress_elfinder_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -870,6 +880,151 @@ def test_midlandschoice_resolver_preserves_network_labels():
     assert resolved[0].metadata["plan_info"][0]["plan_id"] == "A1"
     assert resolved[0].metadata["plan_info"][0]["plan_id_type"] == "network_code"
     assert resolved[0].metadata["plan_info"][0]["plan_name"] == "Network Alpha"
+
+
+def test_wordpress_elfinder_config_parser_extracts_ajax_metadata():
+    html = """
+    <div id="wp_file_manager_front123"></div>
+    <script>
+      jQuery("#wp_file_manager_front123").elfinder({
+        url: "https:\\/\\/example.test\\/wp-admin\\/admin-ajax.php?action=mk_file_folder_manager_shortcode",
+        customData: {
+          _wpnonce: "nonce-123",
+          data_key: "key-123",
+        }
+      });
+    </script>
+    """
+
+    configs = discovery._wordpress_elfinder_configs_from_html(
+        html, base_url="https://example.test/machine-readable-files/"
+    )
+
+    assert configs == [
+        {
+            "url": "https://example.test/wp-admin/admin-ajax.php?action=mk_file_folder_manager_shortcode",
+            "data_key": "key-123",
+            "nonce": "nonce-123",
+            "file_manager_id": "123",
+        }
+    ]
+
+
+def test_wordpress_elfinder_hash_path_decodes_file_path():
+    assert (
+        discovery._wordpress_elfinder_hash_path(
+            "l1_Y2xpZW50X2EvMjAyNi0wNy0wMV9leGFtcGxlX2FsbG93ZWQtYW1vdW50cy5jc3Y"
+        )
+        == "client_a/2026-07-01_example_allowed-amounts.csv"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
+    source = {
+        "source_id": "source_example_elfinder",
+        "display_name": "Example elFinder",
+        "hosting_platform": "wordpress_elfinder_mrf_links",
+    }
+    html = """
+    <div id="wp_file_manager_front123"></div>
+    <script>
+      jQuery("#wp_file_manager_front123").elfinder({
+        url: "https://example.test/wp-admin/admin-ajax.php?action=mk_file_folder_manager_shortcode",
+        customData: {
+          _wpnonce: "nonce-123",
+          data_key: "key-123",
+        }
+      });
+    </script>
+    """
+    directory_hash = "l1_Y2xpZW50X2E"
+    file_hash = (
+        "l1_Y2xpZW50X2EvMjAyNi0wNy0wMV9leGFtcGxlX2FsbG93ZWQtYW1vdW50cy5jc3Y"
+    )
+    calls = []
+
+    async def fake_fetch_text(url, *, max_bytes, session):
+        assert url == "https://example.test/machine-readable-files/"
+        assert max_bytes == 1024
+        assert session.headers["User-Agent"].startswith("Mozilla/5.0")
+        return html
+
+    async def fake_post_form_json_value(url, data, *, max_bytes, session):
+        calls.append(dict(data))
+        assert (
+            url
+            == "https://example.test/wp-admin/admin-ajax.php?action=mk_file_folder_manager_shortcode"
+        )
+        assert max_bytes == 2048
+        assert session.headers["User-Agent"].startswith("Mozilla/5.0")
+        assert data["_wpnonce"] == "nonce-123"
+        assert data["data_key"] == "key-123"
+        if data.get("init") == "1":
+            return {
+                "cwd": {
+                    "options": {
+                        "url": "https://files.example.test/root/",
+                    }
+                },
+                "files": [
+                    {
+                        "mime": "directory",
+                        "hash": "l1_Lw",
+                        "name": "root",
+                        "phash": "",
+                    },
+                    {
+                        "mime": "directory",
+                        "hash": directory_hash,
+                        "name": "client_a",
+                        "phash": "l1_Lw",
+                    },
+                ],
+            }
+        assert data["target"] == directory_hash
+        return {
+            "files": [
+                {
+                    "mime": "text/csv",
+                    "size": "526",
+                    "hash": file_hash,
+                    "name": "2026-07-01_example_allowed-amounts.csv",
+                    "phash": directory_hash,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery, "_post_form_json_value", fake_post_form_json_value
+    )
+
+    targets = await discovery._resolve_wordpress_elfinder_mrf_links(
+        source,
+        "https://example.test/machine-readable-files/",
+        {
+            "type": "wordpress_elfinder_mrf_links",
+            "max_bytes": 1024,
+            "ajax_max_bytes": 2048,
+            "max_targets": 5,
+        },
+        session=object(),
+    )
+
+    assert [call["cmd"] for call in calls] == ["open", "open"]
+    assert targets[0].url == (
+        "https://files.example.test/root/client_a/"
+        "2026-07-01_example_allowed-amounts.csv"
+    )
+    assert targets[0].label == "2026-07-01_example_allowed-amounts.csv"
+    assert targets[0].metadata["resolver"] == "wordpress_elfinder_mrf_links"
+    assert targets[0].metadata["target_kind"] == "file_reference"
+    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert targets[0].metadata["wordpress_elfinder_path"] == (
+        "client_a/2026-07-01_example_allowed-amounts.csv"
+    )
+    assert targets[0].metadata["wordpress_elfinder_file_manager_id"] == "123"
 
 
 def test_discovery_tls_override_is_host_scoped(monkeypatch):
@@ -2324,7 +2479,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
-    assert by_name["EBAM"].hosting_platform == "html_mrf_links"
+    assert by_name["EBAM"].hosting_platform == "wordpress_elfinder_mrf_links"
     assert by_name["Univera Healthcare"].hosting_platform == "healthsparq"
     assert by_name["EBPA"].hosting_platform == "html_mrf_links"
     assert (
