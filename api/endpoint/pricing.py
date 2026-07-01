@@ -4579,7 +4579,9 @@ async def group_plan_providers(request):
     npis = [int(row.npi) for row in rows if row.npi is not None]
 
     total_distinct = None
-    if (request.args.get("count") or "").strip().lower() in ("1", "true", "yes"):
+    count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
+    skip_exact_count = bool(location_filter_active and using_unified_addresses)
+    if count_requested and not skip_exact_count:
         total_distinct = int((await session.execute(
             text(
                 f"""
@@ -4722,6 +4724,8 @@ async def group_plan_providers(request):
                 "npi" if location_filter_active else None
             ),
             "address_types": list(address_types) if location_filter_active and not include_mail_addresses else None,
+            "count_requested": count_requested,
+            "count_exact": count_requested and not skip_exact_count,
         },
         "providers": {
             "count": len(items),

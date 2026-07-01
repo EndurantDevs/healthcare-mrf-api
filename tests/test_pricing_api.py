@@ -292,6 +292,8 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         "include_mail_addresses": False,
         "address_source": "npi",
         "address_types": ["primary", "secondary"],
+        "count_requested": True,
+        "count_exact": True,
     }
     assert payload["providers"]["total_distinct"] == 1
     assert payload["providers"]["items"][0]["address"] == {
@@ -367,6 +369,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
             "classification": "Family Medicine",
             "city": "Chicago",
             "state": "IL",
+            "count": "true",
             "enrich": "0",
             "limit": "10",
         },
@@ -377,6 +380,9 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
 
     assert payload["location_filter"]["address_source"] == "unified"
     assert payload["location_filter"]["address_types"] == ["practice", "site", "primary", "secondary"]
+    assert payload["location_filter"]["count_requested"] is True
+    assert payload["location_filter"]["count_exact"] is False
+    assert payload["providers"]["total_distinct"] is None
     assert payload["providers"]["items"][0]["address"] == {
         "type": "practice",
         "first_line": "2335 S MICHIGAN AVE",
@@ -391,6 +397,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     }
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     address_sql = str(request.ctx.sa_session.executions[1][0][0])
+    assert len(request.ctx.sa_session.executions) == 2
     assert "mrf.entity_address_unified addr" in provider_sql
     assert "addr.type IN ('practice', 'site', 'primary', 'secondary')" in provider_sql
     assert "UPPER(COALESCE(addr.state_code, addr.state_name, '')) = :location_state" in provider_sql
