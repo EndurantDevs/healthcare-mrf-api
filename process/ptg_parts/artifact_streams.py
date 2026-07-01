@@ -30,6 +30,42 @@ from process.ptg_parts.config import (
 from process.ptg_parts.domain import PTG2LogicalArtifact
 
 
+class _Utf8BomSkippingStream:
+    def __init__(self, fp):
+        self._fp = fp
+        self._prefix = b""
+        self._checked = False
+
+    def _ensure_checked(self) -> None:
+        if self._checked:
+            return
+        head = self._fp.read(3)
+        if head != b"\xef\xbb\xbf":
+            self._prefix = head
+        self._checked = True
+
+    def read(self, size: int = -1) -> bytes:
+        self._ensure_checked()
+        if size is None or size < 0:
+            data = self._prefix + self._fp.read()
+            self._prefix = b""
+            return data
+        if size == 0:
+            return b""
+        if len(self._prefix) >= size:
+            data = self._prefix[:size]
+            self._prefix = self._prefix[size:]
+            return data
+        prefix = self._prefix
+        self._prefix = b""
+        return prefix + self._fp.read(size - len(prefix))
+
+
+@contextmanager
+def _without_utf8_bom(fp):
+    yield _Utf8BomSkippingStream(fp)
+
+
 def _stream_copy_with_hash(src, dst, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
     digest = hashlib.sha256()
     total = 0
@@ -107,17 +143,20 @@ def open_json_artifact_stream(path: str | Path):
             gzip_cls = igzip.IGzipFile if igzip is not None and _env_bool(PTG2_ISAL_GZIP_ENV, False) else gzip.GzipFile
             with gzip_cls(fileobj=raw_fp, mode="rb") as gzip_fp:
                 with io.BufferedReader(gzip_fp, buffer_size=_stream_buffer_bytes()) as buffered_fp:
-                    yield buffered_fp
+                    with _without_utf8_bom(buffered_fp) as json_fp:
+                        yield json_fp
         return
     if zipfile.is_zipfile(path_obj):
         member_name = _first_zip_member(path_obj)
         if not member_name:
             raise RuntimeError(f"No file members found in zip artifact {path_obj}")
         with _open_zip_member_stream(path_obj, member_name) as fp:
-            yield fp
+            with _without_utf8_bom(fp) as json_fp:
+                yield json_fp
         return
     with open(path_obj, "rb") as fp:
-        yield fp
+        with _without_utf8_bom(fp) as json_fp:
+            yield json_fp
 
 
 def _compression_for_path(raw_path: str | Path) -> tuple[str | None, str | None]:

@@ -2720,6 +2720,24 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
         assert fp.read() == expected
 
 
+def test_ptg2_metadata_extraction_accepts_utf8_bom(tmp_path):
+    raw_path = tmp_path / "rates.json"
+    raw_path.write_bytes(
+        b'\xef\xbb\xbf{"reporting_entity_name":"Third Party Administrator",'
+        b'"reporting_entity_type":"third-party administrator",'
+        b'"last_updated_on":"2026-06-01",'
+        b'"version":"1.0",'
+        b'"in_network":[]}'
+    )
+
+    meta = asyncio.run(process_ptg._extract_metadata_fields(str(raw_path)))
+
+    assert meta["reporting_entity_name"] == "Third Party Administrator"
+    assert meta["reporting_entity_type"] == "third-party administrator"
+    assert meta["last_updated_on"] == "2026-06-01"
+    assert meta["version"] == "1.0"
+
+
 def test_ptg2_stream_logical_artifact_falls_back_to_unzip(tmp_path, monkeypatch):
     raw_path = tmp_path / "rates.zip"
     expected = b'{"in_network":[]}'
