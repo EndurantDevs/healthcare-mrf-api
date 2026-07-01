@@ -102,6 +102,7 @@ from process.ptg_parts.config import (
     PTG2_KEEP_PARTIAL_ENV, PTG2_KEEP_PRICE_SET_STAGE_ENV,
     PTG2_KEEP_SERVING_RATE_STAGE_ENV, PTG2_MANIFEST_PRECOPY_MERGE_ENV,
     PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
+    PTG2_MANIFEST_SIDECARS_ENABLED_ENV,
     PTG2_PRICE_BATCH_ROWS_ENV,
     PTG2_PROGRESS_INTERVAL_SECONDS_ENV, PTG2_PROVIDER_BUCKET_COUNT_ENV,
     PTG2_PROVIDER_CACHE_BACKEND_ENV, PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
@@ -734,16 +735,32 @@ async def _parse_in_network_file_serving_only(
     )
     manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
-    provider_npi_sidecar_enabled = _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
+    manifest_sidecars_enabled = _env_bool(PTG2_MANIFEST_SIDECARS_ENABLED_ENV, True)
+    provider_npi_sidecar_enabled = (
+        manifest_sidecars_enabled
+        and _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
+    )
     manifest_sidecar_paths = {
-        "provider_forward": manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
-        "provider_inverted": manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_forward": (
+            manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc"
+            if manifest_sidecars_enabled
+            else None
+        ),
+        "provider_inverted": (
+            manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc"
+            if manifest_sidecars_enabled
+            else None
+        ),
         "provider_npi": (
             manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc"
             if provider_npi_sidecar_enabled
             else None
         ),
-        "price_forward": manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc",
+        "price_forward": (
+            manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc"
+            if manifest_sidecars_enabled
+            else None
+        ),
     }
 
     def emit_copy_status(status: str, *, kind: str, copy_file: Path, rows: int, target_table: str | None, started_at: float | None = None) -> None:

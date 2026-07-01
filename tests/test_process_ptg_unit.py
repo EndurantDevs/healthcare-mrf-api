@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import datetime
 import gzip
 import importlib
 import io
@@ -4364,6 +4365,58 @@ def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
     assert captured_env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2sc")
 
 
+async def test_ptg2_manifest_sidecars_can_be_disabled(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_push(_objects, *_args, **_kwargs):
+        return None
+
+    async def fake_iter(*_args, **kwargs):
+        captured.update(kwargs)
+        yield "scanner_config", {}
+        yield "manifest_serving_copy_file", {
+            "path": str(tmp_path / "serving.copy"),
+            "row_count": 1,
+        }
+
+    (tmp_path / "serving.copy").write_text("row\n")
+    monkeypatch.setenv(process_ptg.PTG2_MANIFEST_SIDECARS_ENABLED_ENV, "false")
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", fake_iter)
+    monkeypatch.setattr(process_ptg, "_derive_plan_fields", lambda *_args, **_kwargs: {"plan_id": "plan"})
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_plan_rows",
+        lambda *_args, **_kwargs: ({"plan_id": "plan"}, [], {"plan_month_id": "month"}),
+    )
+    monkeypatch.setattr(
+        process_ptg,
+        "_ptg2_source_trace_rows",
+        lambda *_args, **_kwargs: ({}, {"source_trace_set_hash": "trace"}),
+    )
+
+    summary = await process_ptg._parse_in_network_file_serving_only(
+        str(tmp_path / "rates.json"),
+        1,
+        {},
+        [],
+        None,
+        False,
+        object,
+        "https://example.test/rates.json",
+        None,
+        "snapshot",
+        datetime.date(2026, 6, 1),
+        ptg2_manifest_stage_table="stage",
+    )
+
+    assert summary["serving_rates"] == 1
+    assert captured["manifest_provider_forward_sidecar_path"] is None
+    assert captured["manifest_provider_inverted_sidecar_path"] is None
+    assert captured["manifest_provider_npi_sidecar_path"] is None
+    assert captured["manifest_price_forward_sidecar_path"] is None
+
+
 def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     provider_forward = tmp_path / "provider_forward.ptg2sc"
     provider_forward.write_bytes(b"PTG2MNDS" + b"\0" * 32)
@@ -5333,12 +5386,19 @@ def test_scanner_allows_sigterm_after_dedupe():
     assert ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         -15,
         ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+        saw_stdout_terminal_summary=True,
+    )
+    assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
+        -15,
+        ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
     )
     assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         -15,
         ["PTG2_SCANNER_PROGRESS\tpercent=99.66"],
+        saw_stdout_terminal_summary=True,
     )
     assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         1,
         ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+        saw_stdout_terminal_summary=True,
     )

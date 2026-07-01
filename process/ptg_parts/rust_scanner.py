@@ -424,6 +424,7 @@ def _iter_compact_serving_records_rust(
         )
         stderr_thread.start()
     terminated_by_consumer = False
+    saw_stdout_terminal_summary = False
     try:
         while True:
             header = process.stdout.readline()
@@ -440,7 +441,10 @@ def _iter_compact_serving_records_rust(
             trailer = process.stdout.read(1)
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
-            yield name_bytes.decode("utf-8"), _json_loads(payload)
+            record_kind = name_bytes.decode("utf-8")
+            if record_kind in {"dedupe_summary", "scanner_summary"}:
+                saw_stdout_terminal_summary = True
+            yield record_kind, _json_loads(payload)
     finally:
         if process.poll() is None:
             terminated_by_consumer = True
@@ -452,7 +456,15 @@ def _iter_compact_serving_records_rust(
         return_code = process.wait()
         if stderr_thread is not None:
             stderr_thread.join(timeout=2)
-        if return_code != 0 and not terminated_by_consumer and not _is_scanner_sigterm_after_dedupe(return_code, stderr_tail):
+        if (
+            return_code != 0
+            and not terminated_by_consumer
+            and not _is_scanner_sigterm_after_dedupe(
+                return_code,
+                stderr_tail,
+                saw_stdout_terminal_summary=saw_stdout_terminal_summary,
+            )
+        ):
             raise RuntimeError(_scanner_error_message("PTG2 Rust compact scanner", return_code, stderr_tail))
 
 
@@ -566,5 +578,14 @@ def _scanner_return_code_label(return_code: int) -> str:
     return f"signal {signal_number} ({signal_name})"
 
 
-def _is_scanner_sigterm_after_dedupe(return_code: int, stderr_tail: list[str]) -> bool:
-    return return_code == -15 and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
+def _is_scanner_sigterm_after_dedupe(
+    return_code: int,
+    stderr_tail: list[str],
+    *,
+    saw_stdout_terminal_summary: bool = False,
+) -> bool:
+    return (
+        return_code == -15
+        and saw_stdout_terminal_summary
+        and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
+    )
