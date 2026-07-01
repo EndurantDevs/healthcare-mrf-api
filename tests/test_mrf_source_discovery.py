@@ -3857,6 +3857,34 @@ def test_crawl_target_context_metadata_carries_benefit_lines_from_source():
     assert "benefit_line" not in context
 
 
+def test_plan_rows_from_target_metadata_keep_target_context():
+    """Plan metadata keeps context needed by downstream discovery search."""
+    target = discovery.CrawlTarget(
+        source={"source_id": "source_1", "display_name": "Example TPA"},
+        url="https://example.test/mrf/index.json?groupNumber=1208",
+        label="Example group 1208",
+        metadata={
+            "company_name": "Example Forge LLC",
+            "employer_name": "Example Forge LLC",
+            "evidence_url": "https://example.test/asr-1208",
+            "plan_info": [
+                {"plan_id": "1208", "plan_market_type": "group", "plan_name": "Plan"}
+            ],
+            "plan_name": "Example Forge ASR Plan",
+            "resolver": "example_resolver",
+        },
+    )
+
+    [row] = discovery._plan_rows_from_target_metadata(target)
+
+    metadata = row["metadata_json"]
+    assert metadata["group_number"] == "1208"
+    assert metadata["company_name"] == "Example Forge LLC"
+    assert metadata["employer_name"] == "Example Forge LLC"
+    assert metadata["plan_name"] == "Example Forge ASR Plan"
+    assert metadata["evidence_url"] == "https://example.test/asr-1208"
+
+
 def test_filter_crawl_targets_by_resolver_patterns_keeps_configured_urls_only():
     targets = [
         discovery.CrawlTarget(
@@ -5639,22 +5667,6 @@ def test_asr_health_benefits_seed_metadata_becomes_target_context(
     assert (
         row["metadata_json"]["target_label"]
         == "ASR Health Benefits group 1208 - Example Forge LLC"
-    )
-    target.metadata["plan_info"] = [
-        {
-            "plan_id": "1208",
-            "plan_market_type": "group",
-            "plan_name": "Example Forge ASR Plan",
-        }
-    ]
-    [plan_row] = discovery._plan_rows_from_target_metadata(target)
-    assert plan_row["metadata_json"]["group_number"] == "1208"
-    assert plan_row["metadata_json"]["company_name"] == "Example Forge LLC"
-    assert plan_row["metadata_json"]["employer_name"] == "Example Forge LLC"
-    assert plan_row["metadata_json"]["plan_name"] == "Example Forge ASR Plan"
-    assert (
-        plan_row["metadata_json"]["evidence_url"]
-        == "https://example.test/asr-1208"
     )
 
 
