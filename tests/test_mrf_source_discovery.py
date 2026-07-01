@@ -584,6 +584,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://d3oz7y1cwsecds.cloudfront.net/member-prod/bcbsal"
+        )
+        == "direct_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/"
         )
         == "hmsa_monthly_toc"
@@ -640,6 +646,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform("https://www.bcbst.com/tcr")
+        == "json_mrf_directory_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://cdn.example.test/tcr/aso_directory.json"
+        )
         == "json_mrf_directory_links"
     )
     assert (
@@ -1526,6 +1538,63 @@ def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text
         ["Unrelated PackagingHSA Aetna Choice POS II"],
         "Example Packaging Inc",
     )
+
+
+@pytest.mark.asyncio
+async def test_healthcarebluebook_limits_nested_crawl(
+    monkeypatch,
+):
+    source_mapping = {
+        "source_id": "source_example_hbb",
+        "display_name": "Example HBB",
+        "hosting_platform": "healthcarebluebook_mrf",
+    }
+    listing_html = """
+    <div class="grid-item">
+      <a href="https://health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE&brandCode=ALICSI/machine-readable-transparency-in-coverage">
+        Example Nested Aetna
+      </a>
+    </div>
+    <div class="grid-item">In-Network</div>
+    """
+    observed_target_limits = []
+
+    async def fake_fetch_text(*_args, **_kwargs):
+        return listing_html
+
+    async def fake_crawl_targets_for_source(
+        nested_source, link_url, _session, *, target_limit=None
+    ):
+        observed_target_limits.append(target_limit)
+        return [
+            discovery.CrawlTarget(
+                source=nested_source,
+                url=f"{link_url}/one.json",
+                label="one",
+                metadata={"resolver": "nested"},
+            ),
+            discovery.CrawlTarget(
+                source=nested_source,
+                url=f"{link_url}/two.json",
+                label="two",
+                metadata={"resolver": "nested"},
+            ),
+        ]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
+    )
+
+    resolved_targets = await discovery._resolve_healthcarebluebook_mrf(
+        source_mapping,
+        "https://mrf.healthcarebluebook.com/Example",
+        {"type": "healthcarebluebook_mrf", "max_targets": 1},
+        session=object(),
+    )
+
+    assert observed_target_limits == [1]
+    assert [resolved_target.label for resolved_target in resolved_targets] == ["one"]
 
 
 @pytest.mark.asyncio
@@ -2662,6 +2731,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "CarePlus" in by_name["Contra Costa Health Plan"].aliases
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert "BlueCross BlueShield of South Carolina" in aliases_by_name["BCBS South Carolina"]
+    assert by_name["BCBS Alabama"].hosting_platform == "direct_toc"
     assert "BlueCross BlueShield of Alabama" in by_name["BCBS Alabama"].aliases
     assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
     assert "Blue Cross and Blue Shield of Wyoming" in by_name["BCBS Wyoming"].aliases
@@ -2702,6 +2772,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
     assert by_name["BCBS Texas"].benefit_lines == ("medical", "dental", "vision")
     assert by_name["BCBS Tennessee"].benefit_lines == ("medical", "dental")
+    assert by_name["BCBS Tennessee ASO"].benefit_lines == ("medical", "dental")
+    assert "BCBS Tennessee" in by_name["BCBS Tennessee ASO"].aliases
     assert "Premera Blue Cross WA AK" in by_name["Premera Blue Cross"].aliases
     assert (
         "BLUE CROSS WA/AK PREMERA BLUE CROSS"

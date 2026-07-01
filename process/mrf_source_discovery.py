@@ -1492,6 +1492,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "healthsparq"
     if "sapphiremrfhub.com" in host:
         return "sapphire"
+    if path.endswith("_directory.json") and any(
+        token in path for token in ("mrf", "tcr", "toc", "aso")
+    ):
+        return "json_mrf_directory_links"
     if (
         "health1.aetna.com" in host
         or "health1.firsthealth.com" in host
@@ -1502,6 +1506,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "highmark_hmhs"
     if "asomrf" in raw:
         return "bcbs_asomrf"
+    if _looks_direct_toc_url(raw):
+        return "direct_toc"
     if "changehealthcare.com" in host:
         return "change_healthcare"
     if "amazonaws.com" in host or ".s3." in host:
@@ -8681,8 +8687,14 @@ async def _resolve_healthcarebluebook_mrf(
             continue
         nested_source = {**source, "hosting_platform": nested_platform}
         try:
+            nested_target_limit = (
+                max_targets - len(targets_by_url) if max_targets else None
+            )
             nested_targets = await _crawl_targets_for_source(
-                nested_source, link_url, session
+                nested_source,
+                link_url,
+                session,
+                target_limit=nested_target_limit,
             )
         except Exception:  # pylint: disable=broad-exception-caught
             nested_targets = []
