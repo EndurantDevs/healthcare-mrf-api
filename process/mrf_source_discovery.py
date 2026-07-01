@@ -1161,6 +1161,21 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "html_mrf_links"
     if host == "caa.imagine360.com" and path.endswith("/index.html"):
         return "html_mrf_links"
+    if (
+        host in {"www.ccok.com", "ccok.com"}
+        and "/price-transparency/machine-readable" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.uofmhealthplan.org", "uofmhealthplan.org"}
+        and "price-transparency-and-interoperability" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host == "services.phpni.com"
+        and path.startswith("/machine-readable-files/files/")
+    ):
+        return "html_mrf_links"
     if host == "portal.90degreebenefits.com" and path.startswith(
         "/memberportal/machinereadablefiles"
     ):

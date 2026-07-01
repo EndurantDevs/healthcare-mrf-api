@@ -283,8 +283,8 @@ Last one-time research refresh: 2026-06-05.
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
 | OSF HealthCare | provider_sponsored | https://www.osfhealthcare.org/patients-visitors/billing-insurance/price-transparency | public transparency URL |
 | Paramount Health Care | provider_sponsored | https://paramount.healthsparq.com/healthsparq/public/#/one/insurerCode=PARAMOUNT_I&brandCode=PARAMOUNT/machine-readable-transparency-in-coverage | official Paramount Legal page links this HealthSparq machine-readable source; aliases: Paramount |
-| Physicians Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | curated source row |
-| Physicians Health Plan of N. Indiana | provider_sponsored | - | needs official source URL |
+| Physicians Health Plan | provider_sponsored | https://www.uofmhealthplan.org/members/price-transparency-and-interoperability | public U-M Health Plan price-transparency page exposes current Physicians Health Plan table-of-contents links; aliases: U-M Health Plan, UM Health Plan, University of Michigan Health Plan, Physicians Health Plan of Michigan |
+| Physicians Health Plan of N. Indiana | provider_sponsored | https://services.phpni.com/machine-readable-files/files/phpni/phpni | public PHPNI machine-readable-files service linked from the PHPNI MRF page; aliases: PHPNI, PHP Northern Indiana, Physicians Health Plan Northern Indiana |
 | Presbyterian Health Plan | provider_sponsored | https://www.phs.org/tools-resources/member/Pages/applicable-rates.aspx | curated source row |
 | Prevea360 | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
 | Priority Health | provider_sponsored | https://www.priorityhealth.com/landing/transparency | curated source row; aliases: Priority Health of Michigan |
@@ -332,7 +332,7 @@ Last one-time research refresh: 2026-06-05.
 | Community Care Plan | regional | - | needs official source URL |
 | Community Health Choice | regional | https://www.communityhealthchoice.org/health-insurance-marketplace/transparency-in-pricing/ | observed unsupported |
 | Community Health Options | regional | https://www.healthoptions.org/policies-notices | observed current direct MRF file links; aliases: Maine Community Health Options |
-| CommunityCare of OK | regional | https://www.ccok.com/transparency-coverage-information | curated source row |
+| CommunityCare of OK | regional | https://www.ccok.com/Price-Transparency/Machine-Readable/ | public CommunityCare price-transparency machine-readable-files page with in-network and allowed-amount links; aliases: Community Care of Oklahoma, CommunityCare Oklahoma, CCOK |
 | ConnectiCare | regional | https://transparency.connecticare.com/ | observed stale |
 | ConnectiCare | regional | https://www.connecticare.com/about-us/transparency-coverage-compliance | curated source row |
 | Contra Costa Health Plan | regional | https://www.cchealth.org/health-insurance/my-contra-costa-health-plan/transparency-in-coverage | public transparency page backed by hostedjson Azure listing; aliases: Contra Costa, Contra Costa Health Plan CarePlus, Care Plus, CarePlus |

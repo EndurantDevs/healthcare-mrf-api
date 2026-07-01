@@ -11987,6 +11987,9 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
 | Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
 | Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | public direct TOC; aliases: Froedtert Health Plan, Froedtert ThedaCare |
 | Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | observed stale; represented by Network Health direct table of contents |
+| CommunityCare of OK | regional | https://www.ccok.com/Price-Transparency/Machine-Readable/ | public MRF links; aliases: Community Care of Oklahoma, CCOK |
+| Physicians Health Plan | provider_sponsored | https://www.uofmhealthplan.org/members/price-transparency-and-interoperability | public MRF links; aliases: U-M Health Plan, University of Michigan Health Plan |
+| Physicians Health Plan of N. Indiana | provider_sponsored | https://services.phpni.com/machine-readable-files/files/phpni/phpni | public MRF links; aliases: PHPNI, PHP Northern Indiana |
 | Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
 | McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public HTML MRF files |
 | AmeriHealth Caritas Next | regional | https://www.amerihealthcaritasnext.com/json | public HTML MRF files |
@@ -11999,6 +12002,15 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
     assert by_name["Network Health"].hosting_platform == "direct_toc"
     assert "Froedtert Health Plan" in by_name["Network Health"].aliases
     assert by_name["Froedtert Health Plan"].status == "stale"
+    assert by_name["CommunityCare of OK"].hosting_platform == "html_mrf_links"
+    assert "Community Care of Oklahoma" in by_name["CommunityCare of OK"].aliases
+    assert by_name["Physicians Health Plan"].hosting_platform == "html_mrf_links"
+    assert "U-M Health Plan" in by_name["Physicians Health Plan"].aliases
+    assert (
+        by_name["Physicians Health Plan of N. Indiana"].hosting_platform
+        == "html_mrf_links"
+    )
+    assert "PHPNI" in by_name["Physicians Health Plan of N. Indiana"].aliases
     assert by_name["Dean Health Plan"].hosting_platform == "healthsparq"
     assert by_name["McLaren Health Plan"].hosting_platform == "html_mrf_links"
     assert by_name["AmeriHealth Caritas Next"].hosting_platform == "html_mrf_links"
