@@ -2605,6 +2605,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Principal Financial Group" in ancillary_by_name["Principal Vision"].aliases
     assert "Ameritas Dental" in ancillary_by_name["Ameritas Dental"].aliases
     assert "Fusion Vision" in ancillary_by_name["Ameritas Vision"].aliases
+    assert "reliancematrix" in ancillary_by_name["Reliance Matrix Dental and Vision"].aliases
     assert "SunLife Dental" in ancillary_by_name["Sun Life Dental"].aliases
     assert "Sunlife Financial" in ancillary_by_name["Sun Life Vision"].aliases
     assert "Standard Dental" in ancillary_by_name["The Standard Dental"].aliases
