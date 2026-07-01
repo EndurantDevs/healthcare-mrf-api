@@ -49,6 +49,12 @@ class FakeResult:
     def fetchall(self):
         return self._rows
 
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
     def __iter__(self):
         return iter(self._rows)
 
@@ -228,6 +234,87 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     params = request.ctx.sa_session.executions[0][0][1]
     assert "nucc_taxonomy" not in sql
     assert params["group_provider_specialty_taxonomy_code_0"] == "207R00000X"
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_applies_location_filter_and_returns_addresses(monkeypatch):
+    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+        return "ptg2:test"
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_id_for_plan",
+        fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    request = make_request(
+        [
+            FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
+            FakeResult(scalar=1),
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1073913877,
+                        "type": "primary",
+                        "first_line": "1400 W GREENLEAF AVE STE 101",
+                        "second_line": None,
+                        "city_name": "CHICAGO",
+                        "state_name": "IL",
+                        "postal_code": "606262805",
+                        "phone_number": "3125550100",
+                    }
+                ]
+            ),
+        ],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "city": "Chicago",
+            "state": "IL",
+            "zip5": "60626",
+            "count": "true",
+            "enrich": "0",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    payload = json.loads(response.body)
+
+    assert payload["location_filter"] == {
+        "requested": True,
+        "city": "chicago",
+        "state": "IL",
+        "zip5": "60626",
+        "include_mail_addresses": False,
+        "address_types": ["primary", "secondary"],
+    }
+    assert payload["providers"]["total_distinct"] == 1
+    assert payload["providers"]["items"][0]["address"] == {
+        "type": "primary",
+        "first_line": "1400 W GREENLEAF AVE STE 101",
+        "second_line": None,
+        "city": "CHICAGO",
+        "state": "IL",
+        "postal_code": "606262805",
+        "zip5": "60626",
+        "phone_number": "3125550100",
+    }
+    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
+    count_sql = str(request.ctx.sa_session.executions[1][0][0])
+    address_sql = str(request.ctx.sa_session.executions[2][0][0])
+    params = request.ctx.sa_session.executions[0][0][1]
+    assert "mrf.npi_address addr" in provider_sql
+    assert "addr.type IN ('primary', 'secondary')" in provider_sql
+    assert "LEFT(COALESCE(addr.postal_code, ''), 5) = :location_zip5" in provider_sql
+    assert "mrf.npi_address addr" in count_sql
+    assert "type IN ('primary', 'secondary')" in address_sql
+    assert params["location_city"] == "chicago"
+    assert params["location_state"] == "IL"
+    assert params["location_zip5"] == "60626"
 
 
 @pytest.mark.asyncio
@@ -1781,11 +1868,23 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_rejects_taxonomy_scoped_group_plan_office_visit(monkeypatch):
-    async def fail_search(*_args, **_kwargs):
-        raise AssertionError("office-visit provider-directory request should fail before PTG search")
+async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_office_visit(monkeypatch):
+    seen_args = {}
 
-    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fail_search)
+    async def fake_search(_session, args, pagination):
+        seen_args.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [],
         args={
@@ -1800,8 +1899,12 @@ async def test_list_providers_by_procedure_rejects_taxonomy_scoped_group_plan_of
         },
     )
 
-    with pytest.raises(pricing_module.InvalidUsage, match="provider-directory request"):
-        await list_providers_by_procedure(request)
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["query"]["source"] == "ptg2"
+    assert seen_args["classification"] == "Family Medicine"
+    assert seen_args["include_providers"] == "true"
 
 
 @pytest.mark.asyncio

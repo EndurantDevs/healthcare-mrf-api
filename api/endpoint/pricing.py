@@ -868,10 +868,13 @@ def _reject_broad_group_plan_provider_expansion(
         return
     if _parse_int(npi, "npi", minimum=1) is not None:
         return
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
+        return
     raise InvalidUsage(
         "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
-        "use /api/v1/pricing/group-plan-providers with specialty/classification filters, then verify location with "
-        "/npi/all or getNpiNear. Add npi for one-provider office-visit pricing."
+        "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
+        "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
     )
 
 
@@ -4394,6 +4397,14 @@ async def group_plan_providers(request):
     except (TypeError, ValueError):
         cursor_npi = 0
     enrich = (request.args.get("enrich") or "").strip().lower() in ("1", "true", "yes")
+    city = (request.args.get("city") or "").strip().lower()
+    state = (request.args.get("state") or "").strip().upper()
+    zip5 = _normalize_zip5(request.args.get("zip5"))
+    include_mail_addresses = _parse_bool(
+        request.args.get("include_mail_addresses"),
+        "include_mail_addresses",
+        default=False,
+    )
     specialty_filter = resolve_provider_specialty_filter(request.args)
 
     snapshot_id = await current_source_snapshot_id_for_plan(
@@ -4442,6 +4453,28 @@ async def group_plan_providers(request):
         specialty_filter,
     ) if specialty_filter.active else ""
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
+    location_clauses: list[str] = ["addr.npi = gm.npi"]
+    if not include_mail_addresses:
+        location_clauses.append("addr.type IN ('primary', 'secondary')")
+    if city:
+        params["location_city"] = city
+        location_clauses.append("LOWER(COALESCE(addr.city_name, '')) = :location_city")
+    if state:
+        params["location_state"] = state
+        location_clauses.append("UPPER(COALESCE(addr.state_name, '')) = :location_state")
+    if zip5:
+        params["location_zip5"] = zip5
+        location_clauses.append("LEFT(COALESCE(addr.postal_code, ''), 5) = :location_zip5")
+    location_filter_active = bool(city or state or zip5)
+    location_predicate = ""
+    if location_filter_active:
+        location_where = "\n                      AND ".join(location_clauses)
+        location_predicate = f"""EXISTS (
+                    SELECT 1
+                      FROM mrf.npi_address addr
+                     WHERE {location_where}
+                )"""
+    location_where = f"\n               AND {location_predicate}" if location_predicate else ""
 
     rows = (await session.execute(
         text(
@@ -4449,7 +4482,7 @@ async def group_plan_providers(request):
             SELECT DISTINCT gm.npi
               FROM {group_member_table} gm
              WHERE gm.npi BETWEEN :npi_min AND :npi_max
-               AND gm.npi > :cursor_npi{taxonomy_where}
+               AND gm.npi > :cursor_npi{taxonomy_where}{location_where}
              ORDER BY gm.npi
              LIMIT :limit
             """
@@ -4465,13 +4498,62 @@ async def group_plan_providers(request):
                 f"""
                 SELECT COUNT(DISTINCT gm.npi)
                   FROM {group_member_table} gm
-                 WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}
+                 WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{location_where}
                 """
             ),
             params,
         )).scalar() or 0)
 
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
+    addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
+    if location_filter_active and npis:
+        address_params: dict[str, Any] = {"npis": npis}
+        address_clauses = ["npi = ANY(:npis)"]
+        if not include_mail_addresses:
+            address_clauses.append("type IN ('primary', 'secondary')")
+        if city:
+            address_params["location_city"] = city
+            address_clauses.append("LOWER(COALESCE(city_name, '')) = :location_city")
+        if state:
+            address_params["location_state"] = state
+            address_clauses.append("UPPER(COALESCE(state_name, '')) = :location_state")
+        if zip5:
+            address_params["location_zip5"] = zip5
+            address_clauses.append("LEFT(COALESCE(postal_code, ''), 5) = :location_zip5")
+        address_where = "\n                   AND ".join(address_clauses)
+        address_rows = (await session.execute(
+            text(
+                f"""
+                SELECT npi,
+                       type,
+                       first_line,
+                       second_line,
+                       city_name,
+                       state_name,
+                       postal_code,
+                       phone_number
+                  FROM mrf.npi_address
+                 WHERE {address_where}
+                 ORDER BY npi,
+                          CASE type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END,
+                          postal_code,
+                          first_line
+                """
+            ),
+            address_params,
+        )).mappings().all()
+        for row in address_rows:
+            address = {
+                "type": row.get("type"),
+                "first_line": row.get("first_line"),
+                "second_line": row.get("second_line"),
+                "city": row.get("city_name"),
+                "state": row.get("state_name"),
+                "postal_code": row.get("postal_code"),
+                "zip5": str(row.get("postal_code") or "")[:5] or None,
+                "phone_number": row.get("phone_number"),
+            }
+            addresses_by_npi.setdefault(int(row["npi"]), []).append(address)
     if enrich and npis:
         enrich_rows = (await session.execute(
             select(
@@ -4492,6 +4574,11 @@ async def group_plan_providers(request):
             item["name"] = person or (r.provider_organization_name or None)
             item["credential"] = r.provider_credential_text
             item["entity_type_code"] = r.entity_type_code
+    for item in items:
+        item_addresses = addresses_by_npi.get(item["npi"])
+        if item_addresses:
+            item["addresses"] = item_addresses
+            item["address"] = item_addresses[0]
 
     next_cursor = str(npis[-1]) if len(npis) == limit else None
     return response.json({
@@ -4501,6 +4588,14 @@ async def group_plan_providers(request):
         "snapshot_id": snapshot_id,
         "resolved": True,
         "taxonomy_filter": specialty_filter.response_payload(),
+        "location_filter": {
+            "requested": location_filter_active,
+            "city": city or None,
+            "state": state or None,
+            "zip5": zip5 or None,
+            "include_mail_addresses": include_mail_addresses,
+            "address_types": ["primary", "secondary"] if location_filter_active and not include_mail_addresses else None,
+        },
         "providers": {
             "count": len(items),
             "total_distinct": total_distinct,
