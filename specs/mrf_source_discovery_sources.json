@@ -408,6 +408,15 @@
         "-01_Blue-Cross-and-Blue-Shield-of-Massachusetts-Inc_index.json"
       ]
     },
+    "bcbsmn_monthly_toc": {
+      "type": "monthly_toc_templates",
+      "base_url": "https://mktg.bluecrossmn.com/mrf/",
+      "file_templates": [
+        "{year}/{month_start}_Blue_Cross_and_Blue_Shield_of_Minnesota_index.json"
+      ],
+      "month_offsets": [0, -1],
+      "toc_max_bytes": 52428800
+    },
     "upmc_monthly_toc": {
       "type": "monthly_toc_templates",
       "base_url": "https://content.upmchp.com/publicweb/table-of-contents/",

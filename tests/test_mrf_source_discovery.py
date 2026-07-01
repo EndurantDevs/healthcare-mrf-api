@@ -188,6 +188,10 @@ def test_source_urls_are_loaded_from_registry_file():
         == "bcbsma_monthly_tocs"
     )
     assert (
+        config["platform_resolvers"]["bcbsmn_monthly_toc"]["type"]
+        == "monthly_toc_templates"
+    )
+    assert (
         config["platform_resolvers"]["uha_monthly_toc"]["type"]
         == "monthly_toc_templates"
     )
@@ -619,6 +623,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/"
         )
         == "hmsa_monthly_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.bluecrossmn.com/transparency-coverage-machine-readable-files"
+        )
+        == "bcbsmn_monthly_toc"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -11055,6 +11065,33 @@ def test_monthly_toc_templates_generate_current_and_previous_month_targets():
     ]
     assert targets[0].metadata["target_max_bytes"] == 123456
     assert targets[0].metadata["month_start"] == "2026-06-01"
+
+
+def test_bcbsmn_monthly_toc_template_generates_public_index_targets():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Blue Plan",
+    }
+    resolver = discovery._source_config()["platform_resolvers"][
+        "bcbsmn_monthly_toc"
+    ]
+
+    targets = discovery._monthly_toc_targets(
+        source,
+        "https://www.bluecrossmn.com/transparency-coverage-machine-readable-files",
+        resolver,
+        now=discovery.dt.datetime(2026, 7, 1, 12, 0, 0),
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mktg.bluecrossmn.com/mrf/2026/"
+        "2026-07-01_Blue_Cross_and_Blue_Shield_of_Minnesota_index.json",
+        "https://mktg.bluecrossmn.com/mrf/2026/"
+        "2026-06-01_Blue_Cross_and_Blue_Shield_of_Minnesota_index.json",
+    ]
+    assert targets[0].metadata["resolver"] == "monthly_toc_templates"
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
 
 
 def test_sutter_monthly_toc_template_generates_sitecore_index_target():

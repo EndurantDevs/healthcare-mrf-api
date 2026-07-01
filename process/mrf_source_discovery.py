@@ -1531,6 +1531,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "bcbswy_hmhs_monthly_toc"
     if (
+        host in {"www.bluecrossmn.com", "bluecrossmn.com"}
+        and "transparency-coverage-machine-readable-files" in path
+    ):
+        return "bcbsmn_monthly_toc"
+    if (
         host in {"www.upmchealthplan.com", "upmchealthplan.com"}
         and "transparency-in-coverage/mrf" in path
     ):
