@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from scripts.research.ptg_client_carrier_coverage_audit import (
     audit_carrier_rows,
+    has_catalog_source_candidate,
     is_placeholder_carrier,
     split_carrier_cell,
 )
@@ -102,6 +103,18 @@ def test_audit_carrier_rows_respects_candidate_benefit_lines():
     assert by_line["dental"].catalog_mentions == 0
     assert by_line["vision"].importable_mentions == 1
     assert unmatched["dental"] == [("Shared Carrier", 1)]
+
+
+def test_catalog_source_filter_excludes_master_list_placeholders():
+    assert has_catalog_source_candidate(
+        SimpleNamespace(index_url="https://example.test/index.json")
+    )
+    assert has_catalog_source_candidate(
+        SimpleNamespace(human_url="https://example.test/mrf")
+    )
+    assert not has_catalog_source_candidate(
+        SimpleNamespace(index_url=None, human_url=None)
+    )
 
 
 def test_audit_carrier_rows_uses_confirmed_ancillary_blue_benefit_lines():

@@ -122,6 +122,14 @@ def candidate_supports_benefit_line(candidate: Any, line: str) -> bool:
     return False
 
 
+def has_catalog_source_candidate(candidate: Any) -> bool:
+    """Return whether a candidate can appear as a source in the admin catalog."""
+    return bool(
+        getattr(candidate, "index_url", None)
+        or getattr(candidate, "human_url", None)
+    )
+
+
 def _iter_carrier_mentions(
     client_rows: Iterable[Mapping[str, str]], column: str
 ) -> Iterable[tuple[str, str, bool]]:
@@ -259,12 +267,17 @@ async def load_discovery_candidates(
     limit: int,
 ) -> tuple[list[Any], list[Any]]:
     candidates = await discovery._load_candidates(provider, test_mode=True, limit=limit)
-    importable = [
+    catalog_candidates = [
         candidate
         for candidate in candidates
+        if has_catalog_source_candidate(candidate)
+    ]
+    importable = [
+        candidate
+        for candidate in catalog_candidates
         if discovery._candidate_is_importable_source(candidate)
     ]
-    return list(candidates), importable
+    return catalog_candidates, importable
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
