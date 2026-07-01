@@ -282,7 +282,7 @@ Last one-time research refresh: 2026-06-05.
 | Ohio Health Choice | provider_sponsored | - | needs official source URL |
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
 | OSF HealthCare | provider_sponsored | https://www.osfhealthcare.org/patients-visitors/billing-insurance/price-transparency | public transparency URL |
-| Paramount Health Care | provider_sponsored | https://www.paramounthealthcare.com/transparency-in-coverage/ | curated source row |
+| Paramount Health Care | provider_sponsored | https://paramount.healthsparq.com/healthsparq/public/#/one/insurerCode=PARAMOUNT_I&brandCode=PARAMOUNT/machine-readable-transparency-in-coverage | official Paramount Legal page links this HealthSparq machine-readable source; aliases: Paramount |
 | Physicians Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | curated source row |
 | Physicians Health Plan of N. Indiana | provider_sponsored | - | needs official source URL |
 | Presbyterian Health Plan | provider_sponsored | https://www.phs.org/tools-resources/member/Pages/applicable-rates.aspx | curated source row |

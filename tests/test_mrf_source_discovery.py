@@ -2424,6 +2424,12 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
         and not discovery._candidate_is_importable_source(candidate)
         for candidate in molina
     )
+    assert by_name["Paramount Health Care"][0].index_url == (
+        "https://paramount.healthsparq.com/healthsparq/public/#/one/"
+        "insurerCode=PARAMOUNT_I&brandCode=PARAMOUNT/"
+        "machine-readable-transparency-in-coverage"
+    )
+    assert by_name["Paramount Health Care"][0].hosting_platform == "healthsparq"
 
 
 @pytest.mark.asyncio
