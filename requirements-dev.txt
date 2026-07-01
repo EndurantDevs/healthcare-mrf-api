@@ -1,10 +1,10 @@
 -r requirements.txt
-coverage>=7.14.1
+coverage>=7.14.3
 iniconfig>=2.3.0
-maturin>=1.14,<2
+maturin>=1.14.1,<2
 pluggy>=1.6.0
 pygments>=2.20.0
-pytest>=9.1.0,<10
+pytest>=9.1.1,<10
 pytest-asyncio>=1.4.0
 pytest-cov
 pytest-mock
