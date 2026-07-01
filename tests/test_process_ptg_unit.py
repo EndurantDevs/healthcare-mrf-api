@@ -5176,3 +5176,18 @@ def test_scanner_error_labels_sigterm():
 
     assert "signal 15 (SIGTERM)" in message
     assert "PTG2_DEDUPE_SUMMARY" in message
+
+
+def test_scanner_allows_sigterm_after_dedupe():
+    assert ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
+        -15,
+        ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+    )
+    assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
+        -15,
+        ["PTG2_SCANNER_PROGRESS\tpercent=99.66"],
+    )
+    assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
+        1,
+        ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+    )

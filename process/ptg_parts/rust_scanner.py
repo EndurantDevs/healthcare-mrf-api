@@ -452,7 +452,7 @@ def _iter_compact_serving_records_rust(
         return_code = process.wait()
         if stderr_thread is not None:
             stderr_thread.join(timeout=2)
-        if return_code != 0 and not terminated_by_consumer:
+        if return_code != 0 and not terminated_by_consumer and not _is_scanner_sigterm_after_dedupe(return_code, stderr_tail):
             raise RuntimeError(_scanner_error_message("PTG2 Rust compact scanner", return_code, stderr_tail))
 
 
@@ -564,3 +564,7 @@ def _scanner_return_code_label(return_code: int) -> str:
     except ValueError:
         return f"signal {signal_number}"
     return f"signal {signal_number} ({signal_name})"
+
+
+def _is_scanner_sigterm_after_dedupe(return_code: int, stderr_tail: list[str]) -> bool:
+    return return_code == -15 and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
