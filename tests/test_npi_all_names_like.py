@@ -994,3 +994,35 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
         }
     ]
     assert "source_record_ids" not in provider_match
+
+
+def test_overlay_row_merges_by_key():
+    address_key = "350a43ae-8b2b-0145-9d07-8a44ad743dcc"
+    merged_addresses = npi_module._dedupe_addresses_by_key(
+        [
+            {
+                "type": "practice",
+                "address_key": address_key,
+                "first_line": "510 E 8TH ST",
+                "address_sources": ["mrf"],
+                "source_count": 1,
+            },
+            {
+                "type": "practice",
+                "address_key": address_key,
+                "first_line": "510 E 8TH ST",
+                "address_sources": ["provider_directory_fhir"],
+                "source_record_ids": [
+                    "provider_directory_fhir:organization_address:pdfhir_source:org-1:1"
+                ],
+                "source_count": 1,
+            },
+        ]
+    )
+
+    assert merged_addresses[1:] == []
+    assert merged_addresses[0]["address_sources"] == ["mrf", "provider_directory_fhir"]
+    assert merged_addresses[0]["source_record_ids"] == [
+        "provider_directory_fhir:organization_address:pdfhir_source:org-1:1"
+    ]
+    assert merged_addresses[0]["multi_source_confirmed"]

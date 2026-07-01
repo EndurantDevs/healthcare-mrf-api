@@ -2948,6 +2948,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
         "publish_provider_directory_location_archive",
         AsyncMock(return_value={"inserted": 4, "provenance_updates": 1}),
     )
+    monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", AsyncMock(return_value={}))
     monkeypatch.setattr(
         importer,
         "publish_provider_directory_address_corroboration_if_available",
@@ -2965,7 +2966,6 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
             "publish_corroboration": True,
         },
     )
-
     assert metrics["resource_rows"] == {"Location": 2}
     assert metrics["sources_import_attempted"] == 1
     assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
@@ -4449,6 +4449,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         "publish_provider_directory_location_archive",
         AsyncMock(return_value={"inserted": 4, "provenance_updates": 1}),
     )
+    monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", AsyncMock(return_value={}))
     monkeypatch.setattr(
         importer,
         "publish_provider_directory_address_corroboration_if_available",
@@ -4484,7 +4485,6 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         seen_table=None,
     )
     importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
-
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):
     result = harness._run_fixture_case()
@@ -4669,8 +4669,10 @@ async def test_artifact_publish_source_scope(monkeypatch):
     )
     key_publish = AsyncMock(return_value=3)
     archive_publish = AsyncMock(return_value={"inserted": 4, "provenance_updates": 5})
+    overlay_publish = AsyncMock(return_value={"published": True, "rows": 6})
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", key_publish)
     monkeypatch.setattr(importer, "publish_provider_directory_location_archive", archive_publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", overlay_publish)
 
     metrics = await importer._publish_provider_directory_artifacts(
         run_id="run_1",
@@ -4681,6 +4683,7 @@ async def test_artifact_publish_source_scope(monkeypatch):
 
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"]["inserted"] == 4
+    assert metrics["address_overlay"] == {"published": True, "rows": 6}
     key_publish.assert_awaited_once_with(
         run_id="run_1",
         source_ids=["source_a", "source_b"],
@@ -4691,3 +4694,23 @@ async def test_artifact_publish_source_scope(monkeypatch):
         source_ids=["source_a", "source_b"],
         seen_table=None,
     )
+    overlay_publish.assert_awaited_once_with(
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+    )
+
+
+def test_address_overlay_sql_scope():
+    sql = importer.provider_directory_address_overlay_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+
+    assert 'INSERT INTO "mrf"."provider_directory_address_overlay_stage_test"' in sql
+    assert "provider_directory_organization" in sql
+    assert "provider_directory_fhir:organization_address:" in sql
+    assert "organization.last_seen_run_id = CAST(:run_id AS varchar)" in sql
+    assert "organization.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+    assert "addr_key_v1" in sql

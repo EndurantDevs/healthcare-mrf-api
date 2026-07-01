@@ -4859,6 +4859,7 @@ async def get_npi(request, npi):
     address_total = data.pop("address_total", None)
 
     addresses = data.get("address_list") or []
+    addresses.extend(await _fetch_provider_directory_address_overlay(npi, session=request_session))
     if not include_extra_info:
         addresses = [address for address in addresses if _is_public_street_level_address(address)]
     addresses = _dedupe_addresses_by_key(addresses)
@@ -4970,7 +4971,6 @@ async def get_npi(request, npi):
     ):
         _npi_detail_response_cache_set(cache_key, response_body)
     return response.raw(response_body, content_type="application/json")
-
 
 async def _build_npi_details(
     npi: int,
@@ -5146,3 +5146,55 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
         payload.pop("npi", None)
         rows.append(payload)
     return rows
+
+
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
+
+
+async def _fetch_provider_directory_address_overlay(
+    npi: int,
+    *,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
+        return []
+    overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    overlay_query = text(
+        f"""
+        SELECT
+            npi,
+            'practice'::varchar AS type,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            state_code,
+            postal_code,
+            country_code,
+            telephone_number,
+            fax_number,
+            phone_number,
+            fax_number_digits,
+            address_key,
+            address_precision,
+            ARRAY['provider_directory_fhir']::varchar[] AS address_sources,
+            ARRAY_AGG(source_record_id ORDER BY source_record_id)::varchar[] AS source_record_ids,
+            COUNT(DISTINCT source_id)::integer AS source_count,
+            COUNT(DISTINCT source_id)::integer AS independent_source_count,
+            (COUNT(DISTINCT source_id) > 1)::boolean AS multi_source_confirmed,
+            MAX(source_updated_at) AS updated_at
+          FROM {overlay_table_sql}
+         WHERE npi = :npi
+      GROUP BY
+            npi, first_line, second_line, city_name, state_name, state_code,
+            postal_code, country_code, telephone_number, fax_number, phone_number,
+            fax_number_digits, address_key, address_precision
+      ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key;
+        """
+    )
+    overlay_result = await _execute_stmt(overlay_query, session=session, params={"npi": int(npi)})
+    overlay_addresses: list[dict[str, Any]] = []
+    for overlay_row in overlay_result.all():
+        overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
+        overlay_addresses.append(dict(overlay_mapping))
+    return overlay_addresses

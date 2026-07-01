@@ -3052,6 +3052,7 @@ async def _publish_provider_directory_artifacts(
     metrics["location_archive"] = await publish_provider_directory_location_archive(
         run_id=run_id, source_ids=source_ids, seen_table=seen_table,
     )
+    metrics["address_overlay"] = await publish_provider_directory_address_overlay(run_id=run_id, source_ids=source_ids)
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
@@ -4598,7 +4599,6 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
             best_payload = payload
     assert best_probe is not None
     return best_probe, best_payload
-
 
 
 
@@ -7131,3 +7131,516 @@ def _clean_source_id_list(raw_source_ids: Any) -> list[str]:
         seen_source_ids.add(source_id_text)
         cleaned_source_ids.append(source_id_text)
     return cleaned_source_ids
+
+
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX = "provider_directory_address_overlay_stage"
+
+
+def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
+    raw_identifier = run_id if run_id else f"{os.getpid()}_{time.time_ns()}"
+    digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_{digest}"
+
+
+def _coerce_rowcount(value: Any) -> int:
+    if value is None:
+        return 0
+    text_value = str(value)
+    matches = re.findall(r"(\d+)", text_value)
+    return int(matches[-1]) if matches else 0
+
+
+def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
+    return (
+        "source_record_id",
+        "source_id",
+        "last_seen_run_id",
+        "resource_type",
+        "resource_id",
+        "npi",
+        "address_key",
+        "first_line",
+        "second_line",
+        "city_name",
+        "state_name",
+        "state_code",
+        "postal_code",
+        "country_code",
+        "telephone_number",
+        "fax_number",
+        "phone_number",
+        "fax_number_digits",
+        "address_precision",
+        "source_updated_at",
+        "published_at",
+    )
+
+
+def provider_directory_address_overlay_table_sql(db_schema: str | None = None, table_name: str | None = None) -> str:
+    """Create the compact Provider Directory address overlay relation."""
+    schema = db_schema if db_schema is not None else _schema()
+    table_ref = _qt(schema, table_name or PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table_ref} (
+        source_record_id varchar PRIMARY KEY,
+        source_id varchar(64) NOT NULL,
+        last_seen_run_id varchar(64),
+        resource_type varchar(64) NOT NULL,
+        resource_id varchar(256) NOT NULL,
+        npi bigint NOT NULL,
+        address_key uuid NOT NULL,
+        first_line varchar,
+        second_line varchar,
+        city_name varchar,
+        state_name varchar,
+        state_code varchar(2),
+        postal_code varchar,
+        country_code varchar,
+        telephone_number varchar,
+        fax_number varchar,
+        phone_number varchar(15),
+        fax_number_digits varchar(15),
+        address_precision varchar(32) NOT NULL DEFAULT 'street',
+        source_updated_at timestamp,
+        published_at timestamp NOT NULL DEFAULT now()
+    );
+    """
+
+
+async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
+    await db.status(provider_directory_address_overlay_table_sql(schema))
+    await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+
+
+async def _create_provider_directory_address_overlay_indexes(schema: str, table_name: str) -> None:
+    table_ref = _qt(schema, table_name)
+    statements = (
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(f'{table_name}_source_record_idx')} ON {table_ref} (source_record_id);",
+        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_npi_idx')} ON {table_ref} (npi);",
+        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_address_key_idx')} ON {table_ref} (address_key);",
+        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_source_idx')} ON {table_ref} (source_id);",
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_phone_idx')}
+            ON {table_ref} (phone_number, npi)
+         WHERE phone_number IS NOT NULL AND phone_number <> '';
+        """,
+    )
+    for statement in statements:
+        await db.status(statement)
+
+
+async def _address_overlay_scope_sources(
+    schema: str,
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    cleaned = _clean_source_id_list(source_ids)
+    if cleaned or not run_id:
+        return cleaned
+    rows = await db.all(
+        f"""
+        SELECT DISTINCT source_id
+          FROM (
+                SELECT source_id FROM {_qt(schema, "provider_directory_organization")} WHERE last_seen_run_id = :run_id
+                UNION
+                SELECT source_id FROM {_qt(schema, "provider_directory_practitioner_role")} WHERE last_seen_run_id = :run_id
+                UNION
+                SELECT source_id FROM {_qt(schema, "provider_directory_organization_affiliation")} WHERE last_seen_run_id = :run_id
+          ) AS scoped
+         WHERE source_id IS NOT NULL
+         ORDER BY source_id;
+        """,
+        run_id=run_id,
+    )
+    return _clean_source_id_list([row[0] for row in rows])
+
+
+def _provider_directory_overlay_scope_filter(
+    alias: str,
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> str:
+    clauses: list[str] = []
+    if run_id:
+        clauses.append(f"{alias}.last_seen_run_id = CAST(:run_id AS varchar)")
+    if source_ids:
+        clauses.append(f"{alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    return "".join(f"\n                   AND {clause}" for clause in clauses)
+
+
+ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
+    INSERT INTO {stage_ref} ({columns})
+    WITH organization_address_rows AS (
+        SELECT
+            ('provider_directory_fhir:organization_address:' || organization.source_id || ':' ||
+                organization.resource_id || ':' || addr.ordinal::varchar)::varchar AS source_record_id,
+            organization.source_id::varchar AS source_id,
+            organization.last_seen_run_id::varchar AS last_seen_run_id,
+            'Organization'::varchar AS resource_type,
+            organization.resource_id::varchar AS resource_id,
+            organization.npi::bigint AS npi,
+            {qschema}.addr_key_v1(
+                NULLIF(TRIM(addr.value->'line'->>0), ''),
+                NULLIF(TRIM(addr.value->'line'->>1), ''),
+                NULLIF(TRIM(addr.value->>'city'), ''),
+                NULLIF(TRIM(addr.value->>'state'), ''),
+                NULLIF(TRIM(addr.value->>'postalCode'), ''),
+                COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')
+            ) AS address_key,
+            NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
+            NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
+            NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
+            NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
+            {qschema}.addr_state_code_v1(NULLIF(TRIM(addr.value->>'state'), ''))::varchar AS state_code,
+            NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+            COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')::varchar AS country_code,
+            org_phone.telephone_number::varchar AS telephone_number,
+            org_fax.fax_number::varchar AS fax_number,
+            NULL::varchar AS phone_number,
+            NULL::varchar AS fax_number_digits,
+            'street'::varchar AS address_precision,
+            organization.updated_at AS source_updated_at,
+            now() AS published_at
+          FROM {organization_table} AS organization
+          JOIN LATERAL jsonb_array_elements(
+                COALESCE(organization.address_json::jsonb, '[]'::jsonb)
+          ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS telephone_number
+                FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'phone'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS org_phone ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS fax_number
+                FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'fax'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS org_fax ON TRUE
+         WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+           AND organization.active IS DISTINCT FROM false
+           AND NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
+           AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
+           AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+           {org_scope}
+    ), practitioner_location_rows AS (
+        SELECT
+            ('provider_directory_fhir:practitioner_role:' || role.source_id || ':' ||
+                role.resource_id || ':' || loc.resource_id)::varchar AS source_record_id,
+            role.source_id::varchar AS source_id,
+            role.last_seen_run_id::varchar AS last_seen_run_id,
+            'PractitionerRole'::varchar AS resource_type,
+            role.resource_id::varchar AS resource_id,
+            practitioner.npi::bigint AS npi,
+            CASE
+                WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
+                ELSE {qschema}.addr_key_v1(
+                    loc.first_line,
+                    loc.second_line,
+                    loc.city_name,
+                    COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
+                    loc.postal_code,
+                    COALESCE(NULLIF(loc.country_code, ''), 'US')
+                )
+            END AS address_key,
+            loc.first_line::varchar AS first_line,
+            loc.second_line::varchar AS second_line,
+            loc.city_name::varchar AS city_name,
+            COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
+            loc.state_code::varchar AS state_code,
+            loc.postal_code::varchar AS postal_code,
+            COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+            loc.telephone_number::varchar AS telephone_number,
+            loc.fax_number::varchar AS fax_number,
+            loc.phone_number::varchar AS phone_number,
+            loc.fax_number_digits::varchar AS fax_number_digits,
+            'street'::varchar AS address_precision,
+            GREATEST(
+                COALESCE(role.updated_at, TIMESTAMP 'epoch'),
+                COALESCE(practitioner.updated_at, TIMESTAMP 'epoch'),
+                COALESCE(loc.updated_at, TIMESTAMP 'epoch')
+            ) AS source_updated_at,
+            now() AS published_at
+          FROM {practitioner_role_table} AS role
+          JOIN {practitioner_table} AS practitioner
+            ON practitioner.source_id = role.source_id
+           AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
+          JOIN LATERAL jsonb_array_elements_text(COALESCE(role.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
+            ON TRUE
+          JOIN {location_table} AS loc
+            ON loc.source_id = role.source_id
+           AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+         WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+           AND practitioner.active IS DISTINCT FROM false
+           AND role.active IS DISTINCT FROM false
+           AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+           AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
+           AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
+           AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
+           {role_scope}
+    ), affiliation_location_rows AS (
+        SELECT
+            ('provider_directory_fhir:organization_affiliation:' || affiliation.source_id || ':' ||
+                affiliation.resource_id || ':' || loc.resource_id)::varchar AS source_record_id,
+            affiliation.source_id::varchar AS source_id,
+            affiliation.last_seen_run_id::varchar AS last_seen_run_id,
+            'OrganizationAffiliation'::varchar AS resource_type,
+            affiliation.resource_id::varchar AS resource_id,
+            organization.npi::bigint AS npi,
+            CASE
+                WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
+                ELSE {qschema}.addr_key_v1(
+                    loc.first_line,
+                    loc.second_line,
+                    loc.city_name,
+                    COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
+                    loc.postal_code,
+                    COALESCE(NULLIF(loc.country_code, ''), 'US')
+                )
+            END AS address_key,
+            loc.first_line::varchar AS first_line,
+            loc.second_line::varchar AS second_line,
+            loc.city_name::varchar AS city_name,
+            COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
+            loc.state_code::varchar AS state_code,
+            loc.postal_code::varchar AS postal_code,
+            COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+            loc.telephone_number::varchar AS telephone_number,
+            loc.fax_number::varchar AS fax_number,
+            loc.phone_number::varchar AS phone_number,
+            loc.fax_number_digits::varchar AS fax_number_digits,
+            'street'::varchar AS address_precision,
+            GREATEST(
+                COALESCE(affiliation.updated_at, TIMESTAMP 'epoch'),
+                COALESCE(organization.updated_at, TIMESTAMP 'epoch'),
+                COALESCE(loc.updated_at, TIMESTAMP 'epoch')
+            ) AS source_updated_at,
+            now() AS published_at
+          FROM {affiliation_table} AS affiliation
+          JOIN LATERAL (
+              SELECT DISTINCT normalized_ref AS resource_id
+                FROM (
+                    VALUES
+                        (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                        (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                ) AS refs(normalized_ref)
+               WHERE normalized_ref IS NOT NULL
+          ) AS organization_ref ON TRUE
+          JOIN {organization_table} AS organization
+            ON organization.source_id = affiliation.source_id
+           AND organization.resource_id = organization_ref.resource_id
+          JOIN LATERAL jsonb_array_elements_text(COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
+            ON TRUE
+          JOIN {location_table} AS loc
+            ON loc.source_id = affiliation.source_id
+           AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+         WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+           AND organization.active IS DISTINCT FROM false
+           AND affiliation.active IS DISTINCT FROM false
+           AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+           AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
+           AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
+           AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
+           {affiliation_scope}
+    )
+    SELECT DISTINCT ON (source_record_id)
+        source_record_id,
+        source_id,
+        last_seen_run_id,
+        resource_type,
+        resource_id,
+        npi,
+        address_key,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        state_code,
+        postal_code,
+        country_code,
+        telephone_number,
+        fax_number,
+        phone_number,
+        fax_number_digits,
+        address_precision,
+        source_updated_at,
+        published_at
+      FROM (
+            SELECT * FROM organization_address_rows
+            UNION ALL
+            SELECT * FROM practitioner_location_rows
+            UNION ALL
+            SELECT * FROM affiliation_location_rows
+      ) AS overlay_rows
+     WHERE address_key IS NOT NULL
+     ORDER BY source_record_id, source_updated_at DESC NULLS LAST;
+    """
+
+
+def provider_directory_address_overlay_insert_sql(
+    db_schema: str | None = None,
+    stage_table: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Build the scoped insert for the compact Provider Directory address overlay."""
+    schema = db_schema if db_schema is not None else _schema()
+    stage_ref = _qt(schema, stage_table or _address_overlay_stage_table_name(run_id))
+    return ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE.format(
+        stage_ref=stage_ref,
+        columns=", ".join(_provider_directory_address_overlay_columns()),
+        qschema=_q(schema),
+        uuid_re=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        org_scope=_provider_directory_overlay_scope_filter("organization", run_id=run_id, source_ids=source_ids),
+        role_scope=_provider_directory_overlay_scope_filter("role", run_id=run_id, source_ids=source_ids),
+        affiliation_scope=_provider_directory_overlay_scope_filter(
+            "affiliation",
+            run_id=run_id,
+            source_ids=source_ids,
+        ),
+        organization_table=_qt(schema, "provider_directory_organization"),
+        practitioner_table=_qt(schema, "provider_directory_practitioner"),
+        location_table=_qt(schema, "provider_directory_location"),
+        practitioner_role_table=_qt(schema, "provider_directory_practitioner_role"),
+        affiliation_table=_qt(schema, "provider_directory_organization_affiliation"),
+    )
+
+
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES = (
+    "provider_directory_organization",
+    "provider_directory_practitioner",
+    "provider_directory_location",
+    "provider_directory_practitioner_role",
+    "provider_directory_organization_affiliation",
+)
+
+
+async def _address_overlay_missing_requirement(schema: str) -> str | None:
+    if not await _address_canon_functions_available(schema):
+        return "canonical_functions_unavailable"
+    for table_name in PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES:
+        if not await _table_exists(schema, table_name):
+            return f"{table_name}_unavailable"
+    return None
+
+
+async def _copy_existing_address_overlay(
+    stage_ref: str,
+    target_ref: str,
+    columns: str,
+    source_ids: list[str],
+) -> int:
+    if not source_ids:
+        return 0
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            INSERT INTO {stage_ref} ({columns})
+            SELECT {columns}
+              FROM {target_ref}
+             WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])));
+            """,
+            source_ids=source_ids,
+        )
+    )
+
+
+async def _swap_address_overlay_stage(schema: str, stage_ref: str, target_ref: str) -> None:
+    old_table = f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE}_old"
+    async with db.transaction():
+        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
+        await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_table)};")
+        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)};")
+    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
+    await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+
+
+async def _populate_address_overlay_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    run_id: str | None,
+    source_ids: list[str],
+    query_param_dict: dict[str, Any],
+) -> dict[str, int]:
+    target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    columns = ", ".join(_provider_directory_address_overlay_columns())
+    copied_existing = await _copy_existing_address_overlay(stage_ref, target_ref, columns, source_ids)
+    inserted = _coerce_rowcount(
+        await db.status(
+            provider_directory_address_overlay_insert_sql(
+                schema,
+                stage_table,
+                run_id=run_id,
+                source_ids=source_ids,
+            ),
+            **query_param_dict,
+        )
+    )
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+    await db.status(f"ANALYZE {stage_ref};")
+    return {
+        "copied_existing": copied_existing,
+        "inserted": inserted,
+        "stage_rows": stage_rows,
+    }
+
+
+async def publish_provider_directory_address_overlay(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Publish Provider Directory address evidence without rebuilding unified addresses."""
+    schema = db_schema if db_schema is not None else _schema()
+    missing_reason = await _address_overlay_missing_requirement(schema)
+    if missing_reason:
+        return {"skipped": True, "reason": missing_reason}
+    await _ensure_provider_directory_address_overlay_table(schema)
+    effective_source_ids = await _address_overlay_scope_sources(
+        schema,
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    stage_table = _address_overlay_stage_table_name(run_id)
+    stage_ref = _qt(schema, stage_table)
+    target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    query_param_dict: dict[str, Any] = {}
+    if run_id is not None:
+        query_param_dict["run_id"] = run_id
+    if effective_source_ids:
+        query_param_dict["source_ids"] = effective_source_ids
+
+    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    try:
+        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
+        stage_metric_dict = await _populate_address_overlay_stage(
+            schema,
+            stage_table,
+            stage_ref,
+            run_id,
+            effective_source_ids,
+            query_param_dict,
+        )
+        await _swap_address_overlay_stage(schema, stage_ref, target_ref)
+        return {
+            "published": True,
+            "rows": stage_metric_dict["stage_rows"],
+            "inserted": stage_metric_dict["inserted"],
+            "copied_existing": stage_metric_dict["copied_existing"],
+            "source_ids": effective_source_ids,
+            "relation": target_ref,
+        }
+    except Exception:
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        except Exception:  # pragma: no cover - cleanup best effort
+            LOGGER.warning("Failed to clean Provider Directory address overlay stage %s", stage_ref, exc_info=True)
+        raise
