@@ -79,7 +79,7 @@ def make_request(results, args=None):
     )
 
 
-async def fake_current_source_snapshot_ids_for_plan(_session, _plan_fields):
+async def fake_plan_snapshot_pairs(_session, _plan_fields):
     return [("ptg_test", "ptg2:test")]
 
 
@@ -145,7 +145,7 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_ids_for_plan",
-        fake_current_source_snapshot_ids_for_plan,
+        fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -186,7 +186,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_ids_for_plan",
-        fake_current_source_snapshot_ids_for_plan,
+        fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -231,7 +231,7 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_ids_for_plan",
-        fake_current_source_snapshot_ids_for_plan,
+        fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -273,7 +273,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_ids_for_plan",
-        fake_current_source_snapshot_ids_for_plan,
+        fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
@@ -367,7 +367,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_ids_for_plan",
-        fake_current_source_snapshot_ids_for_plan,
+        fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     monkeypatch.setattr(

@@ -22,6 +22,7 @@ def _normalize_zip5(value: Any) -> str | None:
 
 
 def ein_plan_id_variants(value: Any) -> list[str]:
+    """Return raw, digit-only, and hyphenated EIN plan-id lookup variants."""
     raw = str(value or "").strip()
     if not raw:
         return []

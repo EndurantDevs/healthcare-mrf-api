@@ -4448,6 +4448,27 @@ async def _current_source_snapshot_pairs_for_plan(session, plan_fields: dict[str
     return [(source_key, str(snapshot_id))]
 
 
+def _annotate_ptg2_query_payload(
+    ptg2_payload: object,
+    *,
+    plan_id_type: str,
+    year: int | None,
+    has_plan_scope: bool,
+) -> None:
+    if not isinstance(ptg2_payload, dict):
+        return
+    query_payload = ptg2_payload.setdefault("query", {})
+    if not isinstance(query_payload, dict):
+        return
+    if plan_id_type:
+        query_payload.setdefault("plan_id_type", plan_id_type)
+    if year is None or not has_plan_scope:
+        return
+    ignored_params = query_payload.setdefault("ignored_params", [])
+    if isinstance(ignored_params, list) and "year" not in ignored_params:
+        ignored_params.append("year")
+
+
 @blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
 async def group_plan_providers(request):
     """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
@@ -5477,15 +5498,12 @@ async def list_provider_procedures(request, npi: str):
                     "query": query_payload,
                 }
             )
-        if isinstance(ptg2_payload, dict):
-            query_payload = ptg2_payload.setdefault("query", {})
-            if isinstance(query_payload, dict):
-                if plan_id_type:
-                    query_payload.setdefault("plan_id_type", plan_id_type)
-                if year is not None and (plan_id or plan_external_id or snapshot_id):
-                    ignored = query_payload.setdefault("ignored_params", [])
-                    if isinstance(ignored, list) and "year" not in ignored:
-                        ignored.append("year")
+        _annotate_ptg2_query_payload(
+            ptg2_payload,
+            plan_id_type=plan_id_type,
+            year=year,
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+        )
         return response.json(ptg2_payload)
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
@@ -7585,15 +7603,12 @@ async def list_providers_by_procedure(request):
                     "query": query_payload,
                 }
             )
-        if isinstance(ptg2_payload, dict):
-            query_payload = ptg2_payload.setdefault("query", {})
-            if isinstance(query_payload, dict):
-                if plan_id_type:
-                    query_payload.setdefault("plan_id_type", plan_id_type)
-                if year is not None and (plan_id or plan_external_id or snapshot_id):
-                    ignored = query_payload.setdefault("ignored_params", [])
-                    if isinstance(ignored, list) and "year" not in ignored:
-                        ignored.append("year")
+        _annotate_ptg2_query_payload(
+            ptg2_payload,
+            plan_id_type=plan_id_type,
+            year=year,
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+        )
         return response.json(ptg2_payload)
     if order_by == "cost_index":
         if not code:
