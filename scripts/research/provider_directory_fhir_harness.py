@@ -201,7 +201,8 @@ CREATE FUNCTION {schema}.addr_key_v1(a text, b text, c text, d text, e text, f t
 $$;
 CREATE TABLE {schema}.geo_zip_lookup (
     zip_code text PRIMARY KEY,
-    state text
+    state text,
+    city text
 );
 CREATE TABLE {schema}.provider_directory_location (
     source_id varchar NOT NULL,
@@ -342,9 +343,6 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         "main.py",
         "start",
         "provider-directory-fhir",
-        "--test",
-        "--seed-db-path",
-        args.seed_db_path,
         "--limit",
         str(args.limit),
         "--timeout",
@@ -352,6 +350,12 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         "--concurrency",
         str(args.concurrency),
     ]
+    if args.cli_test_mode:
+        command.append("--test")
+    if args.seed_db_path:
+        command.extend(["--seed-db-path", args.seed_db_path])
+    elif args.seed_db_url:
+        command.extend(["--seed-db-url", args.seed_db_url])
     if args.retest_results_path:
         command.extend(["--retest-results-path", args.retest_results_path])
     if args.retest_results_url:
@@ -360,6 +364,12 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         command.extend(["--credential-config-file", args.credential_config_file])
     if args.source_query:
         command.extend(["--source-query", args.source_query])
+    if args.refresh_preset:
+        command.extend(["--refresh-preset", args.refresh_preset])
+    if args.include_supplemental_catalogs is True:
+        command.append("--include-supplemental-catalogs")
+    elif args.include_supplemental_catalogs is False:
+        command.append("--no-include-supplemental-catalogs")
     if args.import_resources:
         command.append("--import-resources")
         if args.full_refresh:
@@ -437,6 +447,10 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             "timeout": args.timeout,
         },
     }
+    if args.refresh_preset:
+        payload["params"]["refresh_preset"] = args.refresh_preset
+    if args.include_supplemental_catalogs is not None:
+        payload["params"]["include_supplemental_catalogs"] = args.include_supplemental_catalogs
     if args.stale_cleanup is not None:
         payload["params"]["stale_cleanup"] = args.stale_cleanup
     if args.publish_artifacts is not None:
@@ -492,6 +506,156 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         return CaseResult(case_id=case_id, kind="control", status="failed", elapsed_seconds=time.monotonic() - started, error=str(exc))
 
 
+def _coverage_audit_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    source_summary = report.get("source_summary") if isinstance(report, dict) else {}
+    resource_summary = report.get("resource_summary") if isinstance(report, dict) else {}
+    serving_readiness = report.get("serving_readiness") if isinstance(report, dict) else {}
+    readiness_checks = [
+        check
+        for check in (serving_readiness or {}).get("checks") or []
+        if isinstance(check, dict)
+    ]
+    required_check_names = [
+        str(check.get("name") or "")
+        for check in readiness_checks
+        if check.get("required") is True and check.get("name")
+    ]
+    failed_required_check_names = [
+        str(check.get("name") or "")
+        for check in readiness_checks
+        if check.get("required") is True and check.get("status") != "pass" and check.get("name")
+    ]
+    phone_readiness_metrics = next(
+        (
+            check.get("metrics") or {}
+            for check in readiness_checks
+            if check.get("name") == "searchable_phone_overlay"
+        ),
+        {},
+    )
+    resource_row_count_by_table = {
+        table_name: int((table_summary or {}).get("row_count") or 0)
+        for table_name, table_summary in sorted((resource_summary or {}).items())
+        if isinstance(table_summary, dict)
+    }
+    return {
+        "source_count": int((source_summary or {}).get("source_count") or 0),
+        "live_valid_count": int((source_summary or {}).get("live_valid_count") or 0),
+        "live_auth_required_count": int((source_summary or {}).get("live_auth_required_count") or 0),
+        "never_probed_count": int((source_summary or {}).get("never_probed_count") or 0),
+        "resource_rows": resource_row_count_by_table,
+        "serving_readiness_status": (serving_readiness or {}).get("status"),
+        "serving_required_fail_count": int((serving_readiness or {}).get("required_fail_count") or 0),
+        "serving_required_checks": required_check_names,
+        "serving_failed_required_checks": failed_required_check_names,
+        "serving_phone_rows": int(phone_readiness_metrics.get("provider_directory_phone_rows") or 0),
+        "serving_phone_pct": phone_readiness_metrics.get("provider_directory_phone_pct"),
+    }
+
+
+def _effective_db_value(args: argparse.Namespace, attribute_name: str, env_name: str) -> Any:
+    env_map = getattr(args, "env", {}) or {}
+    if env_name in env_map:
+        return env_map[env_name]
+    return getattr(args, attribute_name)
+
+
+def _effective_db_schema(args: argparse.Namespace) -> str:
+    return str(_effective_db_value(args, "db_schema", "HLTHPRT_DB_SCHEMA"))
+
+
+def _coverage_audit_command(args: argparse.Namespace) -> list[str]:
+    """Build the coverage audit subprocess command."""
+    python = args.python or sys.executable
+    audit_command_parts = [
+        python,
+        "scripts/research/provider_directory_coverage_audit.py",
+        "--host",
+        str(_effective_db_value(args, "db_host", "HLTHPRT_DB_HOST")),
+        "--port",
+        str(_effective_db_value(args, "db_port", "HLTHPRT_DB_PORT")),
+        "--database",
+        str(_effective_db_value(args, "db_database", "HLTHPRT_DB_DATABASE")),
+        "--user",
+        str(_effective_db_value(args, "db_user", "HLTHPRT_DB_USER")),
+        "--password",
+        str(_effective_db_value(args, "db_password", "HLTHPRT_DB_PASSWORD")),
+        "--schema",
+        _effective_db_schema(args),
+        "--format",
+        "json",
+    ]
+    if args.coverage_audit_pod_safe:
+        audit_command_parts.append("--pod-safe")
+    if args.coverage_audit_fast_serving_readiness:
+        audit_command_parts.append("--fast-serving-readiness")
+    if args.coverage_audit_require_serving_ready:
+        audit_command_parts.append("--require-serving-ready")
+    if args.retest_results_path:
+        audit_command_parts.extend(["--retest-results-path", args.retest_results_path])
+    if args.coverage_audit_statement_timeout_ms:
+        audit_command_parts.extend(["--statement-timeout-ms", str(args.coverage_audit_statement_timeout_ms)])
+    return audit_command_parts
+
+
+def _parse_coverage_audit_output(output: str, returncode: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return compact audit metrics plus the decoded audit report."""
+    audit_metrics_map: dict[str, Any] = {"returncode": returncode}
+    try:
+        audit_report_map = json.loads(output)
+    except json.JSONDecodeError:
+        return audit_metrics_map, {}
+    if isinstance(audit_report_map, dict):
+        audit_metrics_map.update(_coverage_audit_metrics(audit_report_map))
+        return audit_metrics_map, audit_report_map
+    return audit_metrics_map, {}
+
+
+def _run_coverage_audit_case(args: argparse.Namespace) -> CaseResult:
+    """Run the pod-safe coverage audit as a harness report case."""
+    started = time.monotonic()
+    audit_command_parts = _coverage_audit_command(args)
+    try:
+        proc = subprocess.run(
+            audit_command_parts,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=args.coverage_audit_timeout,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        audit_metrics_map, audit_report_map = _parse_coverage_audit_output(proc.stdout, proc.returncode)
+        if proc.returncode == 0 and audit_report_map:
+            return CaseResult(
+                case_id="coverage-audit",
+                kind="audit",
+                status="succeeded",
+                elapsed_seconds=elapsed,
+                command=audit_command_parts,
+                metrics=audit_metrics_map,
+            )
+        return CaseResult(
+            case_id="coverage-audit",
+            kind="audit",
+            status="failed",
+            elapsed_seconds=elapsed,
+            command=audit_command_parts,
+            metrics=audit_metrics_map,
+            error=proc.stdout[-4000:],
+        )
+    except Exception as exc:
+        return CaseResult(
+            case_id="coverage-audit",
+            kind="audit",
+            status="failed",
+            elapsed_seconds=time.monotonic() - started,
+            command=audit_command_parts,
+            error=str(exc),
+        )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Provider Directory FHIR Harness Report",
@@ -502,12 +666,35 @@ def render_markdown(report: dict[str, Any]) -> str:
         "| Case | Kind | Status | Elapsed | Key metrics |",
         "| --- | --- | --- | ---: | --- |",
     ]
-    for result in report["results"]:
-        metrics = result.get("metrics") or {}
-        key_metrics = ", ".join(f"{key}={value}" for key, value in metrics.items() if key != "response")[:200]
+    for case_result in report["results"]:
+        metrics = case_result.get("metrics") or {}
+        key_metrics = ", ".join(
+            f"{metric_name}={metric_value}"
+            for metric_name, metric_value in metrics.items()
+            if metric_name != "response"
+        )[:200]
         lines.append(
-            f"| {result['case_id']} | {result['kind']} | {result['status']} | {result['elapsed_seconds']} | {key_metrics} |"
+            f"| {case_result['case_id']} | {case_result['kind']} | {case_result['status']} | {case_result['elapsed_seconds']} | {key_metrics} |"
         )
+    audit_results = [
+        case_result
+        for case_result in report["results"]
+        if case_result.get("case_id") == "coverage-audit" and isinstance(case_result.get("metrics"), dict)
+    ]
+    if audit_results:
+        lines.extend(["", "## Coverage Audit Readiness", ""])
+        for audit_result in audit_results:
+            metrics = audit_result.get("metrics") or {}
+            failed_checks = metrics.get("serving_failed_required_checks") or []
+            failed_text = ", ".join(f"`{check_name}`" for check_name in failed_checks) or "`none`"
+            lines.extend(
+                [
+                    f"- status: `{metrics.get('serving_readiness_status')}`",
+                    f"- required failures: `{metrics.get('serving_required_fail_count')}`",
+                    f"- failed required checks: {failed_text}",
+                    f"- phone rows: `{metrics.get('serving_phone_rows')}` ({metrics.get('serving_phone_pct')}%)",
+                ]
+            )
     lines.extend(["", "## Raw Results", "", "```json", json.dumps(report["results"], indent=2, sort_keys=True), "```", ""])
     return "\n".join(lines)
 
@@ -523,10 +710,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.sql_typing:
         results.append(_run_sql_typing_case(args))
     if args.local_cli:
-        if not args.seed_db_path:
-            results.append(CaseResult("local-cli", "cli", "skipped", 0, error="--seed-db-path is required for --local-cli"))
-        else:
-            results.append(_run_cli_case("local-cli", args))
+        results.append(_run_cli_case("local-cli", args))
+    if getattr(args, "coverage_audit", False):
+        results.append(_run_coverage_audit_case(args))
     if args.control_url:
         results.append(_run_control_case("control-api", args))
     serialized = [result.to_json() for result in results]
@@ -546,27 +732,53 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Provider Directory FHIR self-harness cases.")
+def _add_harness_case_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", help="Report output directory. Defaults to reports/provider-directory-fhir/run-<timestamp>.")
     parser.add_argument("--python", help="Python executable for local CLI case. Defaults to current interpreter.")
     parser.add_argument("--sql-typing", action="store_true", help="Run disposable DB-backed SQL typing checks through SQLAlchemy asyncpg.")
     parser.add_argument("--sql-schema", default=os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SQL_HARNESS_SCHEMA") or _sql_typing_schema())
     parser.add_argument("--keep-sql-schema", action="store_true", help="Keep the disposable SQL typing schema after the run.")
+    parser.add_argument("--local-cli", action="store_true", help="Run the local DB-backed CLI importer case.")
+    parser.add_argument("--control-url", help="Control API base URL, for example https://app-dev.healthporta.com/control/v1.")
+    parser.add_argument("--control-token", help="Control API bearer token. Defaults to HLTHPRT_CONTROL_API_TOKEN.")
+    parser.add_argument("--coverage-audit", action="store_true", help="Run a pod-safe Provider Directory coverage audit against the selected DB.")
+    parser.add_argument("--coverage-audit-timeout", type=int, default=300, help="Coverage audit subprocess timeout in seconds.")
+    parser.add_argument("--coverage-audit-statement-timeout-ms", type=int, default=0, help="Optional PostgreSQL statement_timeout for coverage audit queries.")
+    parser.add_argument("--coverage-audit-full", dest="coverage_audit_pod_safe", action="store_false", help="Run the full coverage audit instead of pod-safe source/resource checks.")
+    parser.add_argument("--coverage-audit-require-serving-ready", action="store_true", help="Fail the harness audit case unless serving_readiness is ready.")
+    parser.add_argument("--coverage-audit-fast-serving-readiness", action="store_true", help="Use bounded serving-readiness existence probes in full audit mode.")
+    parser.set_defaults(coverage_audit_pod_safe=True)
+    cli_test_group = parser.add_mutually_exclusive_group()
+    cli_test_group.add_argument("--cli-test-mode", dest="cli_test_mode", action="store_true", help="Pass --test to local CLI imports for bounded smoke defaults.")
+    cli_test_group.add_argument("--no-cli-test-mode", dest="cli_test_mode", action="store_false", help="Run the local CLI without --test, useful for scheduled monthly command-shape checks.")
+    parser.set_defaults(cli_test_mode=True)
+
+
+def _add_database_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
     parser.add_argument("--db-port", type=int, default=_env_int("HLTHPRT_DB_PORT", 5440))
     parser.add_argument("--db-database", default=os.getenv("HLTHPRT_DB_DATABASE") or "healthporta_test")
     parser.add_argument("--db-user", default=os.getenv("HLTHPRT_DB_USER") or os.getenv("USER") or "nick")
     parser.add_argument("--db-password", default=os.getenv("HLTHPRT_DB_PASSWORD") or "")
-    parser.add_argument("--local-cli", action="store_true", help="Run the local DB-backed CLI importer case.")
-    parser.add_argument("--control-url", help="Control API base URL, for example https://app-dev.healthporta.com/control/v1.")
-    parser.add_argument("--control-token", help="Control API bearer token. Defaults to HLTHPRT_CONTROL_API_TOKEN.")
+    parser.add_argument("--db-schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+
+
+def _add_source_catalog_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed-db-path", help="SQLite seed database path for local CLI runs.")
+    parser.add_argument("--seed-db-url", help="SQLite seed database URL for local CLI runs. Omit path and URL to use the importer default.")
     parser.add_argument("--retest-results-path", help="Optional provider-directory-db retest_results.json path for local/control runs.")
     parser.add_argument("--retest-results-url", help="Optional provider-directory-db retest_results.json URL for local/control runs.")
     parser.add_argument("--credential-config-file", help="Optional Provider Directory credentials JSON file for local CLI runs.")
     parser.add_argument("--limit", type=int, default=10, help="Source limit for bounded runs.")
     parser.add_argument("--source-query", help="Optional source org/plan filter.")
+    parser.add_argument("--refresh-preset", choices=("monthly-full",), help="Named importer defaults, matching scheduled Provider Directory runs.")
+    supplemental_group = parser.add_mutually_exclusive_group()
+    supplemental_group.add_argument("--include-supplemental-catalogs", dest="include_supplemental_catalogs", action="store_true", help="Include payer-specific supplemental Provider Directory catalog pages.")
+    supplemental_group.add_argument("--no-include-supplemental-catalogs", dest="include_supplemental_catalogs", action="store_false", help="Skip payer-specific supplemental Provider Directory catalog pages.")
+    parser.set_defaults(include_supplemental_catalogs=None)
+
+
+def _add_import_behavior_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed-only", action="store_true", help="Local CLI: only load source rows.")
     parser.add_argument("--no-probe", action="store_true", help="Local CLI: skip metadata probing.")
     parser.add_argument("--import-resources", action="store_true", help="Local CLI: fetch FHIR resources.")
@@ -592,6 +804,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=15, help="Per-request timeout.")
     parser.add_argument("--command-timeout", type=int, default=900, help="Local CLI command timeout.")
     parser.add_argument("--env", action="append", default=[], help="Environment override KEY=VALUE for local CLI; repeatable.")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Provider Directory FHIR self-harness cases.")
+    _add_harness_case_args(parser)
+    _add_database_args(parser)
+    _add_source_catalog_args(parser)
+    _add_import_behavior_args(parser)
     args = parser.parse_args(argv)
     env: dict[str, str] = {}
     for item in args.env:

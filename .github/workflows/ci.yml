@@ -45,6 +45,8 @@ jobs:
           python -m pip install -r requirements-dev.txt
       - name: Compile service modules
         run: python -m compileall api process db scripts main.py
+      - name: Provider Directory runtime contract
+        run: python scripts/smoke/provider_directory_runtime_contract.py
       - name: Readability budget
         run: python scripts/readability_budget.py
       - name: Guard request-time external calls

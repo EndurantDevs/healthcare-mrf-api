@@ -388,7 +388,7 @@ class ProviderDirectorySource(Base, JSONOutputMixin):
     data_quality_flag = Column(String(64))
     data_quality_sample_npi = Column(String(32))
     data_quality_practitioner_count = Column(String(64))
-    data_quality_checked = Column(String(64))
+    data_quality_checked = Column(TEXT)
     is_medicare_advantage = Column(Boolean)
     is_medicaid_mco = Column(Boolean)
     is_chip = Column(Boolean)

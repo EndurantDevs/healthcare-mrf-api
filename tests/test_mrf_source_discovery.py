@@ -2605,11 +2605,13 @@ async def test_master_list_keeps_high_value_public_aliases():
         "master-list", test_mode=True, limit=2000
     )
     by_name = {candidate.payer_name: candidate for candidate in candidates}
-    [active_humana] = [
+    active_humana_candidates = [
         candidate
         for candidate in candidates
         if candidate.payer_name == "Humana" and candidate.status == "active"
     ]
+    assert len(active_humana_candidates) == 1
+    active_humana = active_humana_candidates[0]
     assert active_humana.source_tier == "coverage_evidence"
     assert active_humana.benefit_lines == ("medical", "dental", "vision")
     assert not discovery._candidate_is_importable_source(active_humana)
@@ -8515,12 +8517,7 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     ]
 
 
-@pytest.mark.asyncio
-async def test_push_import_control_catalog_snapshots_importable_sources_only(
-    monkeypatch,
-):
-    calls = []
-
+def _catalog_snapshot_fake_session(captured_calls):
     class FakeResponse:
         def __init__(self, payload, status=200):
             self.payload = payload
@@ -8549,7 +8546,7 @@ async def test_push_import_control_catalog_snapshots_importable_sources_only(
             return False
 
         def post(self, url, json):
-            calls.append({"url": url, "json": json})
+            captured_calls.append({"url": url, "json": json})
             if url.endswith("/v1/catalog/sources"):
                 return FakeResponse({"source_id": f"ic_{json['source_key']}"})
             if url.endswith("/v1/ptg/discover/ingest-preview"):
@@ -8559,7 +8556,7 @@ async def test_push_import_control_catalog_snapshots_importable_sources_only(
             return FakeResponse({}, status=404)
 
         def get(self, url):
-            calls.append({"url": url, "json": None})
+            captured_calls.append({"url": url, "json": None})
             if "/v1/catalog/sources/ic_" in url:
                 return FakeResponse(
                     {
@@ -8569,8 +8566,41 @@ async def test_push_import_control_catalog_snapshots_importable_sources_only(
                 )
             return FakeResponse({}, status=404)
 
-    async def fake_snapshot(source_ids):
-        assert source_ids == ["source_importable"]
+    return FakeSession
+
+
+def _catalog_snapshot_source_rows():
+    return [
+        {
+            "source_id": "source_importable",
+            "index_url": "https://example.com/index.json",
+            "display_name": "Example Importable",
+            "source_key": "example-importable",
+            "seed_provider": "master-list",
+            "access_model": "free",
+            "source_type": "toc_json",
+            "metadata_json": {"source_tier": "mrf_importable"},
+        },
+        {
+            "source_id": "source_evidence",
+            "index_url": "https://example.com/benefits",
+            "display_name": "Example Evidence",
+            "source_key": "example-evidence",
+            "seed_provider": "master-list",
+            "access_model": "free",
+            "source_type": "coverage_evidence",
+            "metadata_json": {"source_tier": "coverage_evidence"},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_skips_snapshots_for_coverage_evidence_sources():
+    """Only importable sources trigger preview snapshots."""
+    captured_calls = []
+
+    async def fake_snapshot_items(catalog_source_ids):
+        assert catalog_source_ids == ["source_importable"]
         return {
             "source_importable": [
                 {
@@ -8582,47 +8612,26 @@ async def test_push_import_control_catalog_snapshots_importable_sources_only(
             ]
         }
 
-    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
-    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
-    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
-    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
-
-    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
-        [
-            {
-                "source_id": "source_importable",
-                "index_url": "https://example.com/index.json",
-                "display_name": "Example Importable",
-                "source_key": "example-importable",
-                "seed_provider": "master-list",
-                "access_model": "free",
-                "source_type": "toc_json",
-                "metadata_json": {"source_tier": "mrf_importable"},
-            },
-            {
-                "source_id": "source_evidence",
-                "index_url": "https://example.com/benefits",
-                "display_name": "Example Evidence",
-                "source_key": "example-evidence",
-                "seed_provider": "master-list",
-                "access_model": "free",
-                "source_type": "coverage_evidence",
-                "metadata_json": {"source_tier": "coverage_evidence"},
-            },
-        ]
-    )
+    with pytest.MonkeyPatch.context() as patch_context:
+        patch_context.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+        patch_context.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+        patch_context.setattr(discovery, "_import_control_snapshot_items", fake_snapshot_items)
+        patch_context.setattr(discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(captured_calls))
+        sources_synced, plans_synced, sync_errors = await discovery._push_import_control_catalog(
+            _catalog_snapshot_source_rows()
+        )
 
     source_payloads = [
         call["json"]
-        for call in calls
+        for call in captured_calls
         if call["url"].endswith("/v1/catalog/sources")
         and call["json"].get("visibility") == "public"
     ]
 
     assert sources_synced == 2
     assert plans_synced == 1
-    assert errors == []
-    assert {payload["source_key"] for payload in source_payloads} == {
+    assert sync_errors == []
+    assert {source_payload["source_key"] for source_payload in source_payloads} == {
         "example-importable",
         "example-evidence",
     }

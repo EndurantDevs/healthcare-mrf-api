@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import csv
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
@@ -19,7 +21,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -70,8 +74,12 @@ DEFAULT_RESOURCES = (
     "OrganizationAffiliation",
     "Endpoint",
 )
+_PUBLISH_SCOPE_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
     resource_type.lower() for resource_type in DEFAULT_RESOURCES
+)
+FHIR_RESOURCE_TEMPLATE_PATH_SEGMENTS = frozenset(
+    ("{resource}", "%7bresource%7d", "[parameters]", "%5bparameters%5d")
 )
 FHIR_BASE_TRAILING_PATH_SEGMENTS = frozenset({"provider-directory", "providerdirectory"})
 LINKED_RESOURCE_TYPES = frozenset(
@@ -122,6 +130,8 @@ RESOURCE_ENDPOINT_FIELDS = {
     "Endpoint": "endpoint_endpoint",
 }
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "provider_directory_address_corroboration"
+PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE = "provider_directory_network_catalog"
+PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX = "provider_directory_network_catalog_stage"
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
 PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
@@ -131,6 +141,13 @@ PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
     "pd_price_addr_corrob_plan_pair_idx",
     "pd_price_addr_corrob_pd_source_idx",
     "pd_price_addr_corrob_network_names_gin",
+)
+PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
+    "source_network_idx",
+    "source_idx",
+    "network_key_idx",
+    "issuer_network_key_idx",
+    "name_idx",
 )
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
@@ -239,6 +256,19 @@ DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
 PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
+PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL = "monthly-full"
+PROVIDER_DIRECTORY_REFRESH_PRESETS = (PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL,)
+PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS: dict[str, Any] = {
+    "import_resources": True,
+    "full_refresh": True,
+    "stale_cleanup": True,
+    "publish_artifacts": True,
+    "publish_corroboration": True,
+    "open_only": False,
+    "include_auth_required": True,
+    "bulk_export": True,
+    "include_supplemental_catalogs": True,
+}
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -246,6 +276,17 @@ FHIR_ONBOARDING_GATEWAY_HOSTS = {
     "partners.centene.com",
 }
 CMS_NON_PUBLIC_PROVIDER_DIRECTORY_RE = re.compile(r"\bpublic\s*=\s*no\b", re.IGNORECASE)
+CMS_SMA_ENDPOINT_DIRECTORY_URL = (
+    "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv"
+)
+CMS_SMA_ENDPOINT_DIRECTORY_URL_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CMS_SMA_ENDPOINT_DIRECTORY_URL"
+CMS_SMA_ENDPOINT_DIRECTORY_SOURCE = "cms-sma-endpoint-directory"
+CMS_SMA_CATALOG_VALIDATION_STATUS = "catalog_public"
+CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS = "catalog_in_development"
+CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES = {"active", "in development"}
+PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS = "catalog_blocked"
+PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE = "provider-directory-blocker-registry"
+URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
 ALOHR_GRAPHQL_URL = "https://api.esante.us/graphql"
@@ -293,13 +334,57 @@ AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirecto
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CENTENE_PARTNER_PORTAL_APIS_URL = "https://partners.centene.com/apis"
 CENTENE_PROVIDER_DIRECTORY_BASE = "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory"
+CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE = "https://iopc-provider.api.centene.com/iopc/provider/ca"
+CENTENE_STALE_GENERIC_BASE = "https://fhir.centene.com/provider-directory"
 CENTENE_PROVIDER_DIRECTORY_DOC_URL = (
     "https://external-api.my.centene.com/partner-portal/files?"
     "url=OASFiles/docs/FHIR-ProviderDirectory-GettingStartedV7-PP-2026-06-25_20:40:13.md"
 )
+AMERIHEALTH_CARITAS_DOC_URL = "https://developer.amerihealthcaritas.com/dvp/v1/apidocumentation"
+AMERIHEALTH_CARITAS_DOC_URL_ENV = "HLTHPRT_PROVIDER_DIRECTORY_AMERIHEALTH_CARITAS_CATALOG_URL"
+AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX = "https://api-ext.amerihealthcaritas.com"
+AMERIHEALTH_CARITAS_STALE_GENERIC_BASE = "https://fhir.amerihealthcaritas.com/provider-directory"
+CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL = (
+    "https://www.cchealth.org/health-insurance/about-cchp-managed-care/apis-for-developers"
+)
+CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CONTRA_COSTA_CATALOG_URL"
+CONTRA_COSTA_PROVIDER_DIRECTORY_BASE = "https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod"
+CONTRA_COSTA_PROVIDER_DIRECTORY_METADATA_URL = f"{CONTRA_COSTA_PROVIDER_DIRECTORY_BASE}/metadata"
+HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE = "https://providerfhirapi.healthpartnersplans.com"
+HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_METADATA_URL = f"{HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE}/metadata"
+HAP_PROVIDER_DIRECTORY_DOC_URL = "https://api.hap.org/providerdirectoryapi"
+HAP_PROVIDER_DIRECTORY_BASE = "https://provider-directory-r4.api.hap.org"
+HAP_PROVIDER_DIRECTORY_METADATA_URL = f"{HAP_PROVIDER_DIRECTORY_BASE}/metadata"
+CHORUS_PROVIDER_DIRECTORY_DOC_URL = "https://appconnect.chorushealthplans.org/developers/providerapi"
+FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL = "https://devportal.firstmedicalpr.com/ApiLibrary"
+AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS = {
+    "amerihealth caritas dc": "5400",
+    "amerihealth caritas district of columbia": "5400",
+    "amerihealth caritas de": "7100",
+    "amerihealth caritas delaware": "7100",
+    "amerihealth caritas la": "2100",
+    "amerihealth caritas louisiana": "2100",
+    "amerihealth caritas nc": "1200",
+    "amerihealth caritas north carolina": "1200",
+    "amerihealth caritas nh": "0900",
+    "amerihealth caritas new hampshire": "0900",
+    "amerihealth caritas oh": "7700",
+    "amerihealth caritas ohio": "7700",
+    "amerihealth caritas pa": "0500",
+    "amerihealth caritas pennsylvania": "0500",
+}
 UHC_INTEROPERABILITY_APIS_URL = "https://www.uhc.com/legal/interoperability-apis"
 UHC_PROVIDER_DIRECTORY_BASE = "https://flex.optum.com/fhirpublic/R4"
 UHC_PROVIDER_DIRECTORY_METADATA_URL = f"{UHC_PROVIDER_DIRECTORY_BASE}/metadata"
+HUMANA_PROVIDER_DIRECTORY_BASE = "https://fhir.humana.com/api"
+HUMANA_PROVIDER_DIRECTORY_METADATA_URL = f"{HUMANA_PROVIDER_DIRECTORY_BASE}/metadata"
+MOLINA_DEVELOPER_PORTAL_URL = "https://developer.interop.molinahealthcare.com"
+MOLINA_PROVIDER_DIRECTORY_BASE = "https://api.interop.molinahealthcare.com/providerdirectory"
+MOLINA_PROVIDER_DIRECTORY_METADATA_URL = f"{MOLINA_PROVIDER_DIRECTORY_BASE}/metadata"
+TMHP_PROVIDER_DIRECTORY_BASE = "https://cmsinterop.tmhp.com/tmhp/fhir/pd/R4"
+TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata"
+NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
+NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL = f"{NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/metadata"
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
@@ -312,6 +397,8 @@ SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
     "Organization": "organization",
     "Location": "location",
 }
+PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
+PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 
 
 @dataclass(frozen=True)
@@ -346,6 +433,18 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+POSTGRES_IDENTIFIER_MAX_LENGTH = 63
+
+
+def _bounded_identifier(name: str) -> str:
+    """Return a deterministic PostgreSQL-safe identifier no longer than 63 bytes."""
+    if len(name) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(digest) - 1)
+    return f"{name[:trim_to]}_{digest}"
+
+
 def _sql_string_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -355,6 +454,19 @@ def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_exp
     return (
         f"({ref_expr} IN ({resource_id_expr}, '{resource_type_literal}/' || {resource_id_expr}) "
         f"OR {ref_expr} LIKE '%/{resource_type_literal}/' || {resource_id_expr})"
+    )
+
+
+def _sql_reference_resource_id(ref_expr: str, resource_type: str) -> str:
+    resource_type_literal = str(resource_type).replace("'", "''")
+    return (
+        "NULLIF(BTRIM(CASE "
+        f"WHEN {ref_expr} LIKE '%/{resource_type_literal}/%' "
+        f"THEN regexp_replace({ref_expr}, '^.*/{resource_type_literal}/', '') "
+        f"WHEN {ref_expr} LIKE '{resource_type_literal}/%' "
+        f"THEN regexp_replace({ref_expr}, '^{resource_type_literal}/', '') "
+        f"ELSE {ref_expr} "
+        "END), '')"
     )
 
 
@@ -485,7 +597,11 @@ def _resource_or_metadata_parent_base(api_base: str | None) -> str | None:
         return None
     segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
     last_segment = segments[-1].lower() if segments else ""
-    if last_segment == "metadata" or last_segment in FHIR_RESOURCE_PATH_SEGMENTS:
+    if (
+        last_segment == "metadata"
+        or last_segment in FHIR_RESOURCE_PATH_SEGMENTS
+        or last_segment in FHIR_RESOURCE_TEMPLATE_PATH_SEGMENTS
+    ):
         return _parent_base_url(canonical)
     return None
 
@@ -511,7 +627,11 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
         if last_segment == "metadata":
             _append_unique(candidates, _parent_base_url(api_base))
             return
-        if last_segment in FHIR_RESOURCE_PATH_SEGMENTS or last_segment in FHIR_BASE_TRAILING_PATH_SEGMENTS:
+        if (
+            last_segment in FHIR_RESOURCE_PATH_SEGMENTS
+            or last_segment in FHIR_RESOURCE_TEMPLATE_PATH_SEGMENTS
+            or last_segment in FHIR_BASE_TRAILING_PATH_SEGMENTS
+        ):
             _append_unique(candidates, _parent_base_url(api_base))
 
     add(source.get("api_base"))
@@ -533,6 +653,21 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
 def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
     urls: list[tuple[str, str]] = []
     seen: set[str] = set()
+    metadata = _source_metadata(source)
+    for explicit_url in (
+        metadata.get("provider_directory_confirmed_metadata_url"),
+        metadata.get("metadata_url"),
+    ):
+        metadata_url = _clean_text(explicit_url)
+        if not metadata_url or metadata_url in seen:
+            continue
+        metadata_base = _provider_directory_base_from_metadata_url(metadata_url)
+        api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+        candidate_base = _canonical_base(metadata_base or api_base)
+        if not candidate_base:
+            continue
+        urls.append((candidate_base, metadata_url))
+        seen.add(metadata_url)
     for api_base in _candidate_base_urls(source):
         for url in (f"{api_base}/metadata?_format=json", f"{api_base}/metadata"):
             if url in seen:
@@ -706,7 +841,7 @@ def _load_credentials_config() -> dict[str, Any]:
             if isinstance(payload, dict):
                 config.update(payload)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
+            payload = None
     raw = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
     if raw:
         try:
@@ -714,7 +849,7 @@ def _load_credentials_config() -> dict[str, Any]:
             if isinstance(payload, dict):
                 config.update(payload)
         except json.JSONDecodeError:
-            pass
+            payload = None
     return config
 
 
@@ -1053,23 +1188,48 @@ def _stable_source_id(row: dict[str, Any]) -> str:
     return f"pdfhir_{digest}"
 
 
+def _source_override_endpoint_fields(api_base: str) -> dict[str, str]:
+    return {
+        endpoint_field: f"{api_base.rstrip('/')}/{resource_type}"
+        for resource_type, endpoint_field in RESOURCE_ENDPOINT_FIELDS.items()
+    }
+
+
+def _payer_alias_key(value: Any) -> str:
+    text = (_clean_text(value) or "").lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
 def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
+    parsed_api_base = urllib.parse.urlsplit(api_base or "")
+    api_host = parsed_api_base.netloc.lower()
+    api_path = parsed_api_base.path.lower()
     portal_url = (_clean_text(row.get("portal_url")) or "").lower()
     source_url = (_clean_text(row.get("source_url")) or "").lower()
     should_override = (
         api_base == "https://fhir-ehr.cerner.com/r4/aetna"
         or api_base == AETNA_PROVIDER_DIRECTORY_BASE
+        or (
+            api_host == "vteapif1.aetna.com"
+            and "/fhirdirectory/" in api_path
+            and "/patientaccess" in api_path
+        )
         or "developerportal.aetna.com" in portal_url
         or "developerportal.aetna.com" in source_url
     )
     if not should_override:
         return None
+    auth_type = _clean_text(row.get("auth_type"))
+    if (auth_type or "").strip().lower() in {"", "n/a", "na", "none", "open", "public"}:
+        auth_type = "OAuth2/SMART"
     return {
         "api_base": AETNA_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": AETNA_PROVIDER_DIRECTORY_BASE,
         "requires_registration": True,
-        "auth_type": _clean_text(row.get("auth_type")) or "OAuth2/SMART",
+        "auth_type": auth_type,
+        "last_validated_status": "auth_required",
+        "endpoints": _source_override_endpoint_fields(AETNA_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "aetna_apif1_providerdirectory",
             "provider_directory_override_reason": (
@@ -1102,6 +1262,7 @@ def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
         "canonical_api_base": ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
         "requires_registration": True,
         "auth_type": "OAuth2/SMART",
+        "endpoints": _source_override_endpoint_fields(ALOHR_FHIR_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "alohr_healthshare_providerdirectory",
             "provider_directory_override_reason": (
@@ -1142,6 +1303,7 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
         "canonical_api_base": CIGNA_PROVIDER_DIRECTORY_BASE,
         "requires_registration": False,
         "auth_type": "none",
+        "endpoints": _source_override_endpoint_fields(CIGNA_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "cigna_public_providerdirectory",
             "provider_directory_override_reason": (
@@ -1160,9 +1322,10 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
     source_url = (_clean_text(row.get("source_url")) or "").lower()
     source_detail = (_clean_text(row.get("source_detail")) or "").lower()
     should_override = (
-        api_base in {CENTENE_PARTNER_PORTAL_APIS_URL, CENTENE_PROVIDER_DIRECTORY_BASE}
+        api_base in {CENTENE_PARTNER_PORTAL_APIS_URL, CENTENE_PROVIDER_DIRECTORY_BASE, CENTENE_STALE_GENERIC_BASE}
         or "partners.centene.com/apis" in portal_url
         or "partners.centene.com/apis" in source_url
+        or urllib.parse.urlsplit(api_base or "").netloc.lower() == "fhir.centene.com"
         or "partner portal" in source_detail and "centene" in source_detail
     )
     if not should_override:
@@ -1172,6 +1335,7 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
         "canonical_api_base": CENTENE_PROVIDER_DIRECTORY_BASE,
         "requires_registration": False,
         "auth_type": "none",
+        "endpoints": _source_override_endpoint_fields(CENTENE_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "centene_iopc_pd_providerdirectory",
             "provider_directory_override_reason": (
@@ -1182,6 +1346,119 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
             "provider_directory_confirmed_base": CENTENE_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": CENTENE_PARTNER_PORTAL_APIS_URL,
             "provider_directory_confirmed_doc_url": CENTENE_PROVIDER_DIRECTORY_DOC_URL,
+            "provider_directory_replaces_stale_generic_api_bases": [CENTENE_STALE_GENERIC_BASE],
+            "provider_directory_special_case_california_base": CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE,
+            "provider_directory_resource_probe_caveat": (
+                "Official Centene documentation publishes this Provider Directory base, but live "
+                "metadata/resource probes can return CloudFront HTTP 403 from non-allowlisted networks; "
+                "normal probe validation still gates resource import."
+            ),
+        },
+    }
+
+
+def _amerihealth_caritas_plan_code(row: dict[str, Any]) -> str | None:
+    plan_name_key = _payer_alias_key(row.get("plan_name"))
+    if plan_name_key in AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS:
+        return AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS[plan_name_key]
+    org_name_key = _payer_alias_key(row.get("org_name"))
+    if org_name_key in AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS:
+        return AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS[org_name_key]
+    return None
+
+
+def _amerihealth_caritas_provider_directory_base(plan_code: str) -> str:
+    return f"{AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX}/{plan_code}/provider-api"
+
+
+def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    org_name = (_clean_text(row.get("org_name")) or "").lower()
+    plan_code = _amerihealth_caritas_plan_code(row)
+    parsed_api_base = urllib.parse.urlsplit(api_base or "")
+    api_host = parsed_api_base.netloc.lower()
+    api_path = parsed_api_base.path.lower()
+    if api_host == "api-ext.amerihealthcaritas.com" and "/provider-api" in api_path:
+        return None
+    should_override = (
+        plan_code
+        and (
+            "amerihealth caritas" in org_name
+            or api_host in {"apps.availity.com", "fhir.amerihealthcaritas.com"}
+            or "amerihealthcaritas.com" in portal_url
+            or "amerihealthcaritas.com" in source_url
+        )
+    )
+    if not should_override:
+        return None
+    provider_base = _amerihealth_caritas_provider_directory_base(plan_code)
+    return {
+        "api_base": provider_base,
+        "canonical_api_base": provider_base,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(provider_base),
+        "metadata": {
+            "provider_directory_override": "amerihealth_caritas_api_ext_provider_api",
+            "provider_directory_override_reason": (
+                "AmeriHealth Caritas publishes plan-specific public Provider Directory FHIR bases "
+                "at api-ext.amerihealthcaritas.com; seed rows can point at stale Availity or "
+                "fhir.amerihealthcaritas.com paths."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": provider_base,
+            "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
+            "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
+            "provider_directory_plan_code": plan_code,
+        },
+    }
+
+
+def _molina_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    org_name = (_clean_text(row.get("org_name")) or "").lower()
+    parsed_api_base = urllib.parse.urlsplit(api_base or "")
+    api_host = parsed_api_base.netloc.lower()
+    api_path = parsed_api_base.path.lower()
+    should_override = (
+        api_base in {MOLINA_DEVELOPER_PORTAL_URL, MOLINA_PROVIDER_DIRECTORY_BASE}
+        or (
+            api_host == "fhir.molinahealthcare.com"
+            and api_path.rstrip("/") == "/provider-directory"
+        )
+        or "developer.interop.molinahealthcare.com" in portal_url
+        or "developer.interop.molinahealthcare.com" in source_url
+        or ("molina" in org_name and api_base == MOLINA_DEVELOPER_PORTAL_URL)
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": MOLINA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": MOLINA_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(MOLINA_PROVIDER_DIRECTORY_BASE),
+        "metadata": {
+            "provider_directory_override": "molina_interop_providerdirectory",
+            "provider_directory_override_reason": (
+                "Molina's developer portal documents a public Provider Directory API, while the "
+                "working FHIR metadata base is api.interop.molinahealthcare.com/providerdirectory; "
+                "seed and retest rows can point at the portal or stale fhir.molinahealthcare.com host."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": MOLINA_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_catalog_url": MOLINA_DEVELOPER_PORTAL_URL,
+            "provider_directory_confirmed_metadata_url": MOLINA_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_resource_probe_caveat": (
+                "Metadata is open, but broad resource searches returned HTTP 500 from the live API "
+                "during discovery; resource import diagnostics remain authoritative."
+            ),
         },
     }
 
@@ -1191,12 +1468,19 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
     portal_url = (_clean_text(row.get("portal_url")) or "").lower()
     source_url = (_clean_text(row.get("source_url")) or "").lower()
     org_name = (_clean_text(row.get("org_name")) or "").lower()
+    parsed_api_base = urllib.parse.urlsplit(api_base or "")
+    api_host = parsed_api_base.netloc.lower()
+    api_path = parsed_api_base.path.lower()
     should_override = (
         api_base in {
             UHC_INTEROPERABILITY_APIS_URL,
             f"{UHC_INTEROPERABILITY_APIS_URL}/patient-access-api",
             UHC_PROVIDER_DIRECTORY_BASE,
         }
+        or (
+            api_host == "fhir.uhc.com"
+            and api_path.rstrip("/") == "/v1/provider-directory"
+        )
         or "uhc.com/legal/interoperability-apis" in portal_url
         or "uhc.com/legal/interoperability-apis" in source_url
         or ("unitedhealthcare" in org_name and "uhc.com/legal/interoperability-apis" in (api_base or ""))
@@ -1208,6 +1492,8 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
         "canonical_api_base": UHC_PROVIDER_DIRECTORY_BASE,
         "requires_registration": False,
         "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(UHC_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "uhc_flex_optum_fhirpublic_r4",
             "provider_directory_override_reason": (
@@ -1218,6 +1504,123 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
             "provider_directory_confirmed_base": UHC_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": UHC_INTEROPERABILITY_APIS_URL,
             "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
+        },
+    }
+
+
+def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    if api_base == TMHP_PROVIDER_DIRECTORY_BASE:
+        return {
+            "api_base": TMHP_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": TMHP_PROVIDER_DIRECTORY_BASE,
+            "requires_registration": False,
+            "auth_type": "none",
+            "endpoints": _source_override_endpoint_fields(TMHP_PROVIDER_DIRECTORY_BASE),
+            "metadata": {
+                "provider_directory_override": "tmhp_public_providerdirectory",
+                "provider_directory_override_reason": (
+                    "Texas TMHP publishes public Provider Directory FHIR metadata and resource bundles; "
+                    "seed rows can retain stale OAuth/SMART labels."
+                ),
+                "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+                "provider_directory_confirmed_base": TMHP_PROVIDER_DIRECTORY_BASE,
+                "provider_directory_confirmed_metadata_url": TMHP_PROVIDER_DIRECTORY_METADATA_URL,
+            },
+        }
+    if api_base == NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE:
+        return {
+            "api_base": NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+            "requires_registration": False,
+            "auth_type": "none",
+            "endpoints": _source_override_endpoint_fields(NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE),
+            "metadata": {
+                "provider_directory_override": "nebraska_dhhs_public_providerdirectory",
+                "provider_directory_override_reason": (
+                    "Nebraska DHHS publishes public Provider Directory FHIR metadata and resource bundles; "
+                    "seed rows can retain stale OAuth/SMART labels."
+                ),
+                "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+                "provider_directory_confirmed_base": NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+                "provider_directory_confirmed_metadata_url": NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL,
+            },
+        }
+    return None
+
+
+def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    org_key = _payer_alias_key(row.get("org_name"))
+    parsed_api_base = urllib.parse.urlsplit(api_base or "")
+    api_host = parsed_api_base.netloc.lower()
+    api_path = parsed_api_base.path.lower()
+    should_override = (
+        api_base in {HAP_PROVIDER_DIRECTORY_DOC_URL, HAP_PROVIDER_DIRECTORY_BASE}
+        or (
+            api_host == "api.hap.org"
+            and api_path.rstrip("/") in {"/providerdirectoryapi", "/fhir/provider-directory"}
+        )
+        or "api.hap.org/providerdirectoryapi" in portal_url
+        or "api.hap.org/providerdirectoryapi" in source_url
+        or org_key in {"hap", "health alliance plan"}
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": HAP_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": HAP_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(HAP_PROVIDER_DIRECTORY_BASE),
+        "metadata": {
+            "provider_directory_override": "hap_provider_directory_r4",
+            "provider_directory_override_reason": (
+                "HAP's developer portal publishes a public no-auth Provider Directory production "
+                "base at provider-directory-r4.api.hap.org; seed rows can point at the docs page, "
+                "a stale api.hap.org/fhir/provider-directory path, or contain only the HAP payer name."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": HAP_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_catalog_url": HAP_PROVIDER_DIRECTORY_DOC_URL,
+            "provider_directory_confirmed_metadata_url": HAP_PROVIDER_DIRECTORY_METADATA_URL,
+        },
+    }
+
+
+def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    source_detail = (_clean_text(row.get("source_detail")) or "").lower()
+    should_override = (
+        api_base == HUMANA_PROVIDER_DIRECTORY_BASE
+        or bool(api_base and api_base.startswith(f"{HUMANA_PROVIDER_DIRECTORY_BASE}/"))
+        or "fhir.humana.com/api" in portal_url
+        or "fhir.humana.com/api" in source_url
+        or ("humana" in source_detail and "fhir.humana.com" in source_detail)
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": HUMANA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": HUMANA_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(HUMANA_PROVIDER_DIRECTORY_BASE),
+        "metadata": {
+            "provider_directory_override": "humana_public_fhir_api",
+            "provider_directory_override_reason": (
+                "Humana publishes public R4 Provider Directory metadata and resource search "
+                "collections at fhir.humana.com/api; seed rows can retain stale OAuth labels."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": HUMANA_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_metadata_url": HUMANA_PROVIDER_DIRECTORY_METADATA_URL,
         },
     }
 
@@ -1241,6 +1644,7 @@ def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | N
         "requires_registration": False,
         "auth_type": "none",
         "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(SCAN_PROVIDER_DIRECTORY_BASE),
         "metadata": {
             "provider_directory_override": "scan_providerdirectory_intersystems",
             "provider_directory_override_reason": (
@@ -1263,18 +1667,34 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         "external_seed_id": _clean_text(row.get("id")),
         "note": _clean_text(row.get("note")),
     }
+    seed_metadata = _json_object(row.get("metadata_json"))
+    if seed_metadata:
+        metadata.update(seed_metadata)
+        metadata["external_seed_id"] = _clean_text(row.get("id"))
+        metadata["note"] = _clean_text(row.get("note"))
+    if _clean_text(row.get("source")) == "amerihealth-caritas-developer-portal":
+        metadata["provider_directory_replaces_stale_generic_api_bases"] = [
+            AMERIHEALTH_CARITAS_STALE_GENERIC_BASE
+        ]
+        metadata["provider_directory_confirmed_catalog_url"] = AMERIHEALTH_CARITAS_DOC_URL
     override = (
         _aetna_provider_directory_override(row)
         or _alohr_provider_directory_override(row)
         or _cigna_provider_directory_override(row)
         or _centene_provider_directory_override(row)
+        or _amerihealth_caritas_provider_directory_override(row)
+        or _molina_provider_directory_override(row)
         or _uhc_provider_directory_override(row)
+        or _state_public_provider_directory_override(row)
+        or _hap_provider_directory_override(row)
+        or _humana_provider_directory_override(row)
         or _scan_provider_directory_override(row)
     )
     if override:
         api_base = override["api_base"]
         canonical_api_base = override["canonical_api_base"]
         metadata = {**metadata, **override["metadata"]}
+    endpoint_overrides = override.get("endpoints", {}) if override else {}
     parent_api_base = _resource_or_metadata_parent_base(api_base)
     if parent_api_base and _canonical_base(parent_api_base) != canonical_api_base:
         metadata.setdefault("provider_directory_previous_api_base", api_base)
@@ -1296,24 +1716,63 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         "portal_url": _clean_text(row.get("portal_url")),
         "api_base": api_base,
         "canonical_api_base": canonical_api_base,
-        "endpoint_insurance_plan": _clean_text(row.get("endpoint_insurance_plan")),
-        "endpoint_practitioner": _clean_text(row.get("endpoint_practitioner")),
-        "endpoint_practitioner_role": _clean_text(row.get("endpoint_practitioner_role")),
-        "endpoint_organization": _clean_text(row.get("endpoint_organization")),
-        "endpoint_organization_affiliation": _clean_text(row.get("endpoint_organization_affiliation")),
-        "endpoint_location": _clean_text(row.get("endpoint_location")),
-        "endpoint_healthcare_service": _clean_text(row.get("endpoint_healthcare_service")),
-        "endpoint_network": _clean_text(row.get("endpoint_network")),
-        "endpoint_endpoint": _clean_text(row.get("endpoint_endpoint")),
+        "endpoint_insurance_plan": _clean_text(
+            endpoint_overrides.get("endpoint_insurance_plan")
+            if "endpoint_insurance_plan" in endpoint_overrides
+            else row.get("endpoint_insurance_plan")
+        ),
+        "endpoint_practitioner": _clean_text(
+            endpoint_overrides.get("endpoint_practitioner")
+            if "endpoint_practitioner" in endpoint_overrides
+            else row.get("endpoint_practitioner")
+        ),
+        "endpoint_practitioner_role": _clean_text(
+            endpoint_overrides.get("endpoint_practitioner_role")
+            if "endpoint_practitioner_role" in endpoint_overrides
+            else row.get("endpoint_practitioner_role")
+        ),
+        "endpoint_organization": _clean_text(
+            endpoint_overrides.get("endpoint_organization")
+            if "endpoint_organization" in endpoint_overrides
+            else row.get("endpoint_organization")
+        ),
+        "endpoint_organization_affiliation": _clean_text(
+            endpoint_overrides.get("endpoint_organization_affiliation")
+            if "endpoint_organization_affiliation" in endpoint_overrides
+            else row.get("endpoint_organization_affiliation")
+        ),
+        "endpoint_location": _clean_text(
+            endpoint_overrides.get("endpoint_location")
+            if "endpoint_location" in endpoint_overrides
+            else row.get("endpoint_location")
+        ),
+        "endpoint_healthcare_service": _clean_text(
+            endpoint_overrides.get("endpoint_healthcare_service")
+            if "endpoint_healthcare_service" in endpoint_overrides
+            else row.get("endpoint_healthcare_service")
+        ),
+        "endpoint_network": _clean_text(
+            endpoint_overrides.get("endpoint_network")
+            if "endpoint_network" in endpoint_overrides
+            else row.get("endpoint_network")
+        ),
+        "endpoint_endpoint": _clean_text(
+            endpoint_overrides.get("endpoint_endpoint")
+            if "endpoint_endpoint" in endpoint_overrides
+            else row.get("endpoint_endpoint")
+        ),
         "requires_registration": (
-            bool(_bool_from_seed(row.get("requires_registration")))
-            or bool(override.get("requires_registration") if override else False)
+            bool(override["requires_registration"])
+            if override and "requires_registration" in override
+            else bool(_bool_from_seed(row.get("requires_registration")))
         ),
         "requires_api_key": bool(_bool_from_seed(row.get("requires_api_key"))),
         "auth_type": override.get("auth_type") if override else _clean_text(row.get("auth_type")),
         "last_validated": _clean_text(row.get("last_validated")),
         "last_validated_status": (
-            override.get("last_validated_status") if override else _clean_text(row.get("last_validated_status"))
+            _clean_text(override.get("last_validated_status"))
+            if override and "last_validated_status" in override
+            else _clean_text(row.get("last_validated_status"))
         ),
         "fhir_version": _clean_text(row.get("fhir_version")),
         "compliance_flag": _clean_text(row.get("compliance_flag")),
@@ -2076,7 +2535,6 @@ def provider_directory_address_corroboration_sql(
     practitioner_ref_match = _sql_ref_matches_resource("role.practitioner_ref", "Practitioner", "practitioner.resource_id")
     role_location_ref_match = _sql_ref_matches_resource("role.location_ref", "Location", "loc.resource_id")
     role_plan_ref_match = _sql_ref_matches_resource("plan_ref.value", "InsurancePlan", "insurance_plan.resource_id")
-    role_network_ref_match = _sql_ref_matches_resource("network_ref.value", "Organization", "network_org.resource_id")
     affiliation_org_ref_match = _sql_ref_matches_resource(
         "affiliation.organization_ref", "Organization", "organization.resource_id"
     )
@@ -2087,20 +2545,7 @@ def provider_directory_address_corroboration_sql(
     affiliation_plan_ref_match = _sql_ref_matches_resource(
         "plan_ref.value", "InsurancePlan", "insurance_plan.resource_id"
     )
-    affiliation_network_ref_match = _sql_ref_matches_resource(
-        "network_ref.value", "Organization", "network_org.resource_id"
-    )
-    network_name_key_expr = (
-        "NULLIF(regexp_replace(lower(COALESCE(network_org.name, '')), '[^a-z0-9]+', '', 'g'), '')"
-    )
-    network_issuer_key_expr = (
-        "NULLIF(regexp_replace(lower(COALESCE(NULLIF(network_src.org_name, ''), "
-        "network_src.plan_name, '')), '[^a-z0-9]+', '', 'g'), '')"
-    )
-    network_issuer_network_key_expr = (
-        f"CASE WHEN {network_issuer_key_expr} IS NOT NULL AND {network_name_key_expr} IS NOT NULL "
-        f"THEN {network_issuer_key_expr} || ':' || {network_name_key_expr} ELSE NULL END"
-    )
+    network_ref_resource_id_expr = _sql_reference_resource_id("network_ref.value", "Organization")
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
     WITH address_candidates AS (
@@ -2254,34 +2699,33 @@ def provider_directory_address_corroboration_sql(
             SELECT
                 bool_or(network_ref.value IS NOT NULL) AS provider_directory_network_context_present,
                 COALESCE(
-                    array_agg(DISTINCT network_org.name)
-                        FILTER (WHERE NULLIF(BTRIM(network_org.name), '') IS NOT NULL),
+                    array_agg(DISTINCT network_catalog.provider_directory_network_name)
+                        FILTER (WHERE NULLIF(BTRIM(network_catalog.provider_directory_network_name), '') IS NOT NULL),
                     ARRAY[]::varchar[]
                 ) AS provider_directory_network_names,
                 COALESCE(
                     jsonb_agg(
                         DISTINCT jsonb_build_object(
                             'ref', network_ref.value,
-                            'resource_id', network_org.resource_id,
-                            'name', network_org.name,
-                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb),
-                            'provider_directory_network_key', {network_name_key_expr},
+                            'resource_id', network_catalog.network_resource_id,
+                            'name', network_catalog.provider_directory_network_name,
+                            'aliases', COALESCE(network_catalog.aliases::jsonb, '[]'::jsonb),
+                            'provider_directory_network_key', network_catalog.provider_directory_network_key,
                             'provider_directory_source', 'provider_directory_fhir',
                             'provider_directory_source_id', role.source_id,
-                            'provider_directory_org_name', network_src.org_name,
-                            'provider_directory_plan_name', network_src.plan_name,
-                            'provider_directory_issuer_key', {network_issuer_key_expr},
-                            'provider_directory_issuer_network_match_key', {network_issuer_network_key_expr}
+                            'provider_directory_org_name', network_catalog.source_org_name,
+                            'provider_directory_plan_name', network_catalog.source_plan_name,
+                            'provider_directory_issuer_key', network_catalog.provider_directory_issuer_key,
+                            'provider_directory_issuer_network_match_key',
+                                network_catalog.provider_directory_issuer_network_match_key
                         )
-                    ) FILTER (WHERE network_org.resource_id IS NOT NULL),
+                    ) FILTER (WHERE network_catalog.network_resource_id IS NOT NULL),
                     '[]'::jsonb
                 ) AS provider_directory_network_matches
               FROM network_ref_values network_ref
-              LEFT JOIN {_qt(schema, "provider_directory_source")} network_src
-                ON network_src.source_id = role.source_id
-              LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
-                ON network_org.source_id = role.source_id
-               AND {role_network_ref_match}
+              LEFT JOIN {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)} network_catalog
+                ON network_catalog.source_id = role.source_id
+               AND network_catalog.network_resource_id = {network_ref_resource_id_expr}
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = role.source_id
@@ -2412,36 +2856,35 @@ def provider_directory_address_corroboration_sql(
             SELECT
                 bool_or(network_ref.value IS NOT NULL) AS provider_directory_network_context_present,
                 COALESCE(
-                    array_agg(DISTINCT network_org.name)
-                        FILTER (WHERE NULLIF(BTRIM(network_org.name), '') IS NOT NULL),
+                    array_agg(DISTINCT network_catalog.provider_directory_network_name)
+                        FILTER (WHERE NULLIF(BTRIM(network_catalog.provider_directory_network_name), '') IS NOT NULL),
                     ARRAY[]::varchar[]
                 ) AS provider_directory_network_names,
                 COALESCE(
                     jsonb_agg(
                         DISTINCT jsonb_build_object(
                             'ref', network_ref.value,
-                            'resource_id', network_org.resource_id,
-                            'name', network_org.name,
-                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb),
-                            'provider_directory_network_key', {network_name_key_expr},
+                            'resource_id', network_catalog.network_resource_id,
+                            'name', network_catalog.provider_directory_network_name,
+                            'aliases', COALESCE(network_catalog.aliases::jsonb, '[]'::jsonb),
+                            'provider_directory_network_key', network_catalog.provider_directory_network_key,
                             'provider_directory_source', 'provider_directory_fhir',
                             'provider_directory_source_id', affiliation.source_id,
-                            'provider_directory_org_name', network_src.org_name,
-                            'provider_directory_plan_name', network_src.plan_name,
-                            'provider_directory_issuer_key', {network_issuer_key_expr},
-                            'provider_directory_issuer_network_match_key', {network_issuer_network_key_expr}
+                            'provider_directory_org_name', network_catalog.source_org_name,
+                            'provider_directory_plan_name', network_catalog.source_plan_name,
+                            'provider_directory_issuer_key', network_catalog.provider_directory_issuer_key,
+                            'provider_directory_issuer_network_match_key',
+                                network_catalog.provider_directory_issuer_network_match_key
                         )
-                    ) FILTER (WHERE network_org.resource_id IS NOT NULL),
+                    ) FILTER (WHERE network_catalog.network_resource_id IS NOT NULL),
                     '[]'::jsonb
                 ) AS provider_directory_network_matches
               FROM jsonb_array_elements_text(
                   COALESCE(affiliation.network_refs, '[]'::jsonb)
               ) AS network_ref(value)
-              LEFT JOIN {_qt(schema, "provider_directory_source")} network_src
-                ON network_src.source_id = affiliation.source_id
-              LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
-                ON network_org.source_id = affiliation.source_id
-               AND {affiliation_network_ref_match}
+              LEFT JOIN {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)} network_catalog
+                ON network_catalog.source_id = affiliation.source_id
+               AND network_catalog.network_resource_id = {network_ref_resource_id_expr}
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = affiliation.source_id
@@ -2578,30 +3021,31 @@ async def _create_provider_directory_address_corroboration_indexes(
     table_name: str = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> None:
     table_ref = _qt(schema, table_name)
+    index_name = partial(_address_corroboration_index_name, table_name)
     statements = (
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_lookup_idx"))}
             ON {table_ref} (npi, address_key);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_active_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_active_lookup_idx"))}
             ON {table_ref} (npi, address_key, provider_directory_observed_at DESC NULLS LAST)
             WHERE provider_directory_active_match IS TRUE;
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_source_snapshot_idx")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_source_snapshot_idx"))}
             ON {table_ref} (source_key, snapshot_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_plan_pair_idx")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_plan_pair_idx"))}
             ON {table_ref} (snapshot_id, plan_id, ptg_plan_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_pd_source_idx")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_pd_source_idx"))}
             ON {table_ref} (provider_directory_source_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_network_names_gin")}
+        CREATE INDEX IF NOT EXISTS {_q(index_name("pd_price_addr_corrob_network_names_gin"))}
             ON {table_ref} USING gin (provider_directory_network_names);
         """,
     )
@@ -2609,23 +3053,92 @@ async def _create_provider_directory_address_corroboration_indexes(
         await db.status(statement)
 
 
+def _address_corroboration_index_name(table_name: str, target_index_name: str) -> str:
+    if table_name == PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW:
+        return target_index_name
+    return _bounded_identifier(f"{table_name}_{target_index_name}")
+
+
+async def _rename_address_corroboration_stage_indexes(schema: str, stage_table: str) -> None:
+    for target_index_name in PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES:
+        stage_index_name = _address_corroboration_index_name(stage_table, target_index_name)
+        if stage_index_name == target_index_name:
+            continue
+        await db.status(
+            f"ALTER INDEX IF EXISTS {_qt(schema, stage_index_name)} RENAME TO {_q(target_index_name)};"
+        )
+
+
+async def _swap_address_corroboration_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    target_relation: str,
+) -> None:
+    target_ref = _qt(schema, target_relation)
+    old_relation = f"{target_relation}_old"
+    old_ref = _qt(schema, old_relation)
+    async with db.transaction():
+        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
+        await db.status(
+            f"""
+            DO $$
+            DECLARE relkind_value "char";
+            BEGIN
+                SELECT cls.relkind
+                  INTO relkind_value
+                  FROM pg_class cls
+                  JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+                 WHERE ns.nspname = {_sql_string_literal(schema)}
+                   AND cls.relname = {_sql_string_literal(target_relation)};
+
+                IF relkind_value = 'v' THEN
+                    EXECUTE 'DROP VIEW {target_ref}';
+                ELSIF relkind_value = 'm' THEN
+                    EXECUTE 'DROP MATERIALIZED VIEW {target_ref}';
+                ELSIF relkind_value IN ('r', 'p') THEN
+                    EXECUTE 'ALTER TABLE {target_ref} RENAME TO {_q(old_relation)}';
+                END IF;
+            END $$;
+            """
+        )
+        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(target_relation)};")
+    await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
+    await _rename_address_corroboration_stage_indexes(schema, stage_table)
+    await _create_provider_directory_address_corroboration_indexes(schema, target_relation)
+    await db.status(f"DROP TABLE IF EXISTS {old_ref};")
+
+
 async def publish_provider_directory_address_corroboration_table(
     db_schema: str | None = None,
+    *,
+    refresh_network_catalog: bool = True,
 ) -> dict[str, Any]:
     schema = db_schema or _schema()
     relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
     stage_table = _stage_table_name()
     stage_ref = _qt(schema, stage_table)
+    network_catalog_metrics = (
+        await publish_provider_directory_network_catalog(schema)
+        if refresh_network_catalog
+        else await _ensure_provider_directory_network_catalog_populated(schema)
+    )
     select_sql = provider_directory_address_corroboration_select_sql(schema)
     try:
         await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
         row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, relation))
-        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(relation)};")
-        await _create_provider_directory_address_corroboration_indexes(schema, relation)
+        await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
+        await db.status(f"ANALYZE {stage_ref};")
+        await _swap_address_corroboration_stage(schema, stage_table, stage_ref, relation)
         await db.status(f"ANALYZE {_qt(schema, relation)};")
-        return {"published": True, "relation": _qt(schema, relation), "rows": row_count, "storage": "table"}
+        return {
+            "published": True,
+            "relation": _qt(schema, relation),
+            "rows": row_count,
+            "storage": "table",
+            "network_catalog": network_catalog_metrics,
+        }
     except Exception:
         try:
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
@@ -2660,6 +3173,7 @@ def provider_directory_location_address_key_sql(
         f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
     )
     zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_city_select = "geo.city::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_state_join = (
         f"""
           LEFT JOIN {_qt(schema, "geo_zip_lookup")} AS geo
@@ -2671,6 +3185,7 @@ def provider_directory_location_address_key_sql(
     needs_work_clauses = [
         f"{source_alias}.address_key IS NULL",
         f"{source_alias}.zip5 IS NULL",
+        f"{source_alias}.city_name IS NULL",
         f"{source_alias}.state_code IS NULL",
         f"{source_alias}.city_norm IS NULL",
         f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
@@ -2724,7 +3239,13 @@ def provider_directory_location_address_key_sql(
                     THEN {zip_state_select}
                 ELSE NULL::varchar
             END AS zip_restored_state,
-            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(normalized.city_name::varchar, '')), '') IS NULL
+                    THEN {zip_city_select}
+                ELSE NULL::varchar
+            END AS zip_restored_city,
+            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state,
+            COALESCE(NULLIF(BTRIM(normalized.city_name::varchar), ''), {zip_city_select}) AS resolved_city
           FROM normalized
           {zip_state_join}
     ),
@@ -2735,14 +3256,20 @@ def provider_directory_location_address_key_sql(
             {qschema}.addr_key_v1(
                 first_line,
                 second_line,
-                city_name,
+                resolved_city,
                 resolved_state,
                 postal_code,
                 COALESCE(NULLIF(normalized_country, ''), 'US')
             ) AS computed_address_key,
             source_zip5 AS computed_zip5,
             {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
-            {qschema}.addr_city_norm_v1(city_name)::varchar AS computed_city_norm,
+            {qschema}.addr_city_norm_v1(resolved_city)::varchar AS computed_city_norm,
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(city_name::varchar, '')), '') IS NULL
+                 AND zip_restored_city IS NOT NULL
+                    THEN zip_restored_city::varchar
+                ELSE NULL::varchar
+            END AS restored_city_name,
             CASE
                 WHEN raw_state ~ '^[0-9]{{1,2}}$'
                     THEN {qschema}.addr_state_code_v1(resolved_state)::varchar
@@ -2757,6 +3284,7 @@ def provider_directory_location_address_key_sql(
     UPDATE {location_ref} AS loc
        SET address_key = keyed.computed_address_key::text,
            zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
+           city_name = COALESCE(keyed.restored_city_name, loc.city_name),
            state_name = COALESCE(keyed.restored_state_name, loc.state_name),
            state_code = COALESCE(keyed.computed_state_code, loc.state_code),
            city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
@@ -2769,6 +3297,7 @@ def provider_directory_location_address_key_sql(
        AND (
             loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
          OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
+         OR loc.city_name IS DISTINCT FROM COALESCE(keyed.restored_city_name, loc.city_name)
          OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
          OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
          OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
@@ -2799,6 +3328,7 @@ def provider_directory_location_address_key_batch_sql(
         f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
     )
     zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_city_select = "geo.city::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_state_join = (
         f"""
           LEFT JOIN {_qt(schema, "geo_zip_lookup")} AS geo
@@ -2810,6 +3340,7 @@ def provider_directory_location_address_key_batch_sql(
     needs_work_clauses = [
         f"{source_alias}.address_key IS NULL",
         f"{source_alias}.zip5 IS NULL",
+        f"{source_alias}.city_name IS NULL",
         f"{source_alias}.state_code IS NULL",
         f"{source_alias}.city_norm IS NULL",
         f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
@@ -2873,7 +3404,13 @@ def provider_directory_location_address_key_batch_sql(
                     THEN {zip_state_select}
                 ELSE NULL::varchar
             END AS zip_restored_state,
-            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(normalized.city_name::varchar, '')), '') IS NULL
+                    THEN {zip_city_select}
+                ELSE NULL::varchar
+            END AS zip_restored_city,
+            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state,
+            COALESCE(NULLIF(BTRIM(normalized.city_name::varchar), ''), {zip_city_select}) AS resolved_city
           FROM normalized
           {zip_state_join}
     ),
@@ -2884,14 +3421,20 @@ def provider_directory_location_address_key_batch_sql(
             {qschema}.addr_key_v1(
                 first_line,
                 second_line,
-                city_name,
+                resolved_city,
                 resolved_state,
                 postal_code,
                 COALESCE(NULLIF(normalized_country, ''), 'US')
             ) AS computed_address_key,
             source_zip5 AS computed_zip5,
             {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
-            {qschema}.addr_city_norm_v1(city_name)::varchar AS computed_city_norm,
+            {qschema}.addr_city_norm_v1(resolved_city)::varchar AS computed_city_norm,
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(city_name::varchar, '')), '') IS NULL
+                 AND zip_restored_city IS NOT NULL
+                    THEN zip_restored_city::varchar
+                ELSE NULL::varchar
+            END AS restored_city_name,
             CASE
                 WHEN raw_state ~ '^[0-9]{{1,2}}$'
                     THEN {qschema}.addr_state_code_v1(resolved_state)::varchar
@@ -2907,6 +3450,7 @@ def provider_directory_location_address_key_batch_sql(
         UPDATE {location_ref} AS loc
            SET address_key = keyed.computed_address_key::text,
                zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
+               city_name = COALESCE(keyed.restored_city_name, loc.city_name),
                state_name = COALESCE(keyed.restored_state_name, loc.state_name),
                state_code = COALESCE(keyed.computed_state_code, loc.state_code),
                city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
@@ -2919,6 +3463,7 @@ def provider_directory_location_address_key_batch_sql(
            AND (
                 loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
              OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
+             OR loc.city_name IS DISTINCT FROM COALESCE(keyed.restored_city_name, loc.city_name)
              OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
              OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
              OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
@@ -3010,14 +3555,19 @@ async def _publish_provider_directory_artifacts(
     run_id: str | None,
     metrics: dict[str, Any],
     seen_table: str | None = None,
-    address_key_run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
+    address_key_run_id: str | None = None,
+    publish_scope_run_id: str | None | object = _PUBLISH_SCOPE_UNSET,
+    source_ids: list[str] | tuple[str, ...] | None = None,
     publish_corroboration: bool = False,
 ) -> dict[str, Any]:
+    effective_publish_scope_run_id = (
+        run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
+    )
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=0,
-        total=4,
+        total=5,
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
@@ -3026,7 +3576,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=1,
-        total=4,
+        total=5,
         message=(
             "backfilled Provider Directory location contacts; "
             f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
@@ -3042,7 +3592,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=2,
-        total=4,
+        total=5,
         message=(
             "stamped Provider Directory location address keys; "
             f"rows={metrics['location_address_keys_stamped']}"
@@ -3050,14 +3600,16 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     metrics["location_archive"] = await publish_provider_directory_location_archive(
-        run_id=run_id, source_ids=source_ids, seen_table=seen_table,
+        run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
     )
-    metrics["address_overlay"] = await publish_provider_directory_address_overlay(run_id=run_id, source_ids=source_ids)
+    metrics["address_overlay"] = await publish_provider_directory_address_overlay(
+        run_id=effective_publish_scope_run_id, source_ids=source_ids
+    )
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=3,
-        total=4,
+        total=5,
         message=(
             "published Provider Directory locations to address archive; "
             f"inserted={metrics['location_archive'].get('inserted', 0)} "
@@ -3065,10 +3617,27 @@ async def _publish_provider_directory_artifacts(
         ),
         metrics=metrics,
     )
+    metrics["network_catalog"] = await publish_provider_directory_network_catalog(
+        run_id=effective_publish_scope_run_id,
+        source_ids=source_ids,
+    )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=4,
+        total=5,
+        message=(
+            "published Provider Directory network catalog; "
+            f"rows={metrics['network_catalog'].get('rows', 0)}"
+        ),
+        metrics=metrics,
+    )
     metrics["publish_corroboration"] = publish_corroboration
     if publish_corroboration:
         metrics["ptg_corroboration_view_published"] = (
-            await publish_provider_directory_address_corroboration_if_available()
+            await publish_provider_directory_address_corroboration_if_available(
+                refresh_network_catalog=False,
+            )
         )
         message = "published Provider Directory PTG corroboration artifacts"
     else:
@@ -3080,8 +3649,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=4,
-        total=4,
+        done=5,
+        total=5,
         message=message,
         metrics=metrics,
     )
@@ -3104,12 +3673,14 @@ def provider_directory_location_archive_stage_sql(
     stage = stage_table or _provider_directory_location_archive_stage_table_name()
     stage_ref = _qt(schema, stage)
     location_ref = _qt(schema, "provider_directory_location")
+    organization_ref = _qt(schema, "provider_directory_organization")
     uuid_re = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-    scope_clauses: list[str] = []
+    location_scope_clauses: list[str] = []
+    organization_scope_clauses: list[str] = []
     if seen_table:
         seen_ref = _qt(schema, seen_table)
         seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
-        scope_clauses.append(
+        location_scope_clauses.append(
             f"""EXISTS (
                 SELECT 1
                   FROM {seen_ref} AS seen
@@ -3119,10 +3690,24 @@ def provider_directory_location_archive_stage_sql(
                    AND seen.resource_id = loc.resource_id
             )"""
         )
+        organization_scope_clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Organization'
+                   {seen_run_filter}
+                   AND seen.source_id = organization.source_id
+                   AND seen.resource_id = organization.resource_id
+            )"""
+        )
     elif run_id is not None:
-        scope_clauses.append("loc.last_seen_run_id = CAST(:run_id AS varchar)")
-    if source_ids: scope_clauses.append("loc.source_id = ANY(CAST(:source_ids AS varchar[]))")
-    scope_sql = "".join(f"\n           AND {clause}" for clause in scope_clauses)
+        location_scope_clauses.append("loc.last_seen_run_id = CAST(:run_id AS varchar)")
+        organization_scope_clauses.append("organization.last_seen_run_id = CAST(:run_id AS varchar)")
+    if source_ids:
+        location_scope_clauses.append("loc.source_id = ANY(CAST(:source_ids AS varchar[]))")
+        organization_scope_clauses.append("organization.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    location_scope_sql = "".join(f"\n           AND {clause}" for clause in location_scope_clauses)
+    organization_scope_sql = "".join(f"\n           AND {clause}" for clause in organization_scope_clauses)
     return f"""
     CREATE UNLOGGED TABLE {stage_ref} AS
     WITH eligible AS (
@@ -3154,7 +3739,49 @@ def provider_directory_location_archive_stage_sql(
                 ),
                 'US'
            ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
-           {scope_sql}
+           {location_scope_sql}
+        UNION ALL
+        SELECT
+            {_q(schema)}.addr_key_v1(
+                NULLIF(BTRIM(addr.value->'line'->>0), ''),
+                NULLIF(BTRIM(addr.value->'line'->>1), ''),
+                NULLIF(BTRIM(addr.value->>'city'), ''),
+                NULLIF(BTRIM(addr.value->>'state'), ''),
+                NULLIF(BTRIM(addr.value->>'postalCode'), ''),
+                COALESCE(NULLIF(BTRIM(addr.value->>'country'), ''), 'US')
+            ) AS address_key,
+            NULLIF(BTRIM(addr.value->'line'->>0), '')::text AS first_line,
+            NULLIF(BTRIM(addr.value->'line'->>1), '')::text AS second_line,
+            NULLIF(BTRIM(addr.value->>'city'), '')::text AS city_name,
+            NULLIF(BTRIM(addr.value->>'state'), '')::text AS state_name,
+            NULLIF(BTRIM(addr.value->>'postalCode'), '')::text AS postal_code,
+            COALESCE(NULLIF(BTRIM(addr.value->>'country'), ''), 'US')::text AS country_code,
+            organization.updated_at,
+            organization.source_id,
+            organization.resource_id
+          FROM {organization_ref} AS organization
+          JOIN LATERAL jsonb_array_elements(
+                COALESCE(organization.address_json::jsonb, '[]'::jsonb)
+          ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
+         WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+           AND organization.active IS DISTINCT FROM false
+           AND NULLIF(BTRIM(addr.value->'line'->>0), '') IS NOT NULL
+           AND NULLIF(BTRIM(addr.value->>'postalCode'), '') IS NOT NULL
+           AND (
+                NULLIF(BTRIM(addr.value->'line'->>0), '') IS NOT NULL
+             OR NULLIF(BTRIM(addr.value->>'city'), '') IS NOT NULL
+           )
+           AND NULLIF(BTRIM(addr.value->>'state'), '') IS NOT NULL
+           AND UPPER(NULLIF(BTRIM(addr.value->>'state'), ''))
+                NOT IN ('UN', 'XX', 'ZZ', 'NULL', 'N/A')
+           AND COALESCE(
+                NULLIF(
+                    UPPER(regexp_replace(COALESCE(NULLIF(addr.value->>'country', ''), 'US'), '[^A-Z0-9]', '', 'g')),
+                    ''
+                ),
+                'US'
+           ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
+           {organization_scope_sql}
     )
     SELECT DISTINCT ON (address_key)
         address_key,
@@ -3165,6 +3792,7 @@ def provider_directory_location_archive_stage_sql(
         postal_code,
         country_code
       FROM eligible
+     WHERE address_key IS NOT NULL
      ORDER BY
         address_key,
         first_line IS NULL,
@@ -3223,13 +3851,528 @@ async def publish_provider_directory_location_archive(
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
 
 
+def _network_catalog_stage_table_name(run_id: str | None = None) -> str:
+    raw_identifier = run_id if run_id else f"{os.getpid()}_{time.time_ns()}"
+    digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX}_{digest}"
+
+
+def _provider_directory_network_catalog_columns() -> tuple[str, ...]:
+    return (
+        "source_id",
+        "network_resource_id",
+        "provider_directory_network_name",
+        "provider_directory_network_key",
+        "provider_directory_issuer_key",
+        "provider_directory_issuer_network_match_key",
+        "aliases",
+        "refs",
+        "source_resource_counts",
+        "insurance_plan_ref_count",
+        "practitioner_role_ref_count",
+        "organization_affiliation_ref_count",
+        "distinct_ref_count",
+        "source_org_name",
+        "source_plan_name",
+        "canonical_api_base",
+        "observed_at",
+        "published_at",
+    )
+
+
+def provider_directory_network_catalog_table_sql(
+    db_schema: str | None = None,
+    table_name: str | None = None,
+) -> str:
+    """Create the compact Provider Directory network catalog relation."""
+    schema = db_schema if db_schema is not None else _schema()
+    table_ref = _qt(schema, table_name or PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table_ref} (
+        source_id varchar(64) NOT NULL,
+        network_resource_id varchar(256) NOT NULL,
+        provider_directory_network_name varchar(512) NOT NULL,
+        provider_directory_network_key varchar NOT NULL,
+        provider_directory_issuer_key varchar,
+        provider_directory_issuer_network_match_key varchar,
+        aliases jsonb NOT NULL DEFAULT '[]'::jsonb,
+        refs jsonb NOT NULL DEFAULT '[]'::jsonb,
+        source_resource_counts jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+        insurance_plan_ref_count bigint NOT NULL DEFAULT 0,
+        practitioner_role_ref_count bigint NOT NULL DEFAULT 0,
+        organization_affiliation_ref_count bigint NOT NULL DEFAULT 0,
+        distinct_ref_count bigint NOT NULL DEFAULT 0,
+        source_org_name varchar(256),
+        source_plan_name varchar(512),
+        canonical_api_base text,
+        observed_at timestamp,
+        published_at timestamp NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, network_resource_id)
+    );
+    """
+
+
+async def _ensure_provider_directory_network_catalog_table(schema: str) -> None:
+    await db.status(provider_directory_network_catalog_table_sql(schema))
+    await _create_provider_directory_network_catalog_indexes(
+        schema,
+        PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+    )
+
+
+async def _provider_directory_network_catalog_has_rows(schema: str) -> bool:
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)}
+                 LIMIT 1
+            );
+            """
+        )
+    )
+
+
+async def _ensure_provider_directory_network_catalog_populated(schema: str) -> dict[str, Any]:
+    await _ensure_provider_directory_network_catalog_table(schema)
+    missing_reason = await _network_catalog_missing_requirement(schema)
+    relation = _qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+    if missing_reason:
+        return {
+            "skipped": True,
+            "reason": missing_reason,
+            "relation": relation,
+        }
+    if await _provider_directory_network_catalog_has_rows(schema):
+        return {
+            "published": False,
+            "reason": "already_populated",
+            "relation": relation,
+        }
+    return await publish_provider_directory_network_catalog(schema)
+
+
+def _network_catalog_index_name(table_name: str, suffix: str) -> str:
+    return _bounded_identifier(f"{table_name}_{suffix}")
+
+
+async def _create_provider_directory_network_catalog_indexes(schema: str, table_name: str) -> None:
+    table_ref = _qt(schema, table_name)
+    statements = (
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {_q(_network_catalog_index_name(table_name, "source_network_idx"))}
+            ON {table_ref} (source_id, network_resource_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(_network_catalog_index_name(table_name, "source_idx"))}
+            ON {table_ref} (source_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(_network_catalog_index_name(table_name, "network_key_idx"))}
+            ON {table_ref} (provider_directory_network_key);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(_network_catalog_index_name(table_name, "issuer_network_key_idx"))}
+            ON {table_ref} (provider_directory_issuer_network_match_key)
+         WHERE provider_directory_issuer_network_match_key IS NOT NULL;
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(_network_catalog_index_name(table_name, "name_idx"))}
+            ON {table_ref} (provider_directory_network_name);
+        """,
+    )
+    for statement in statements:
+        await db.status(statement)
+
+
+async def _rename_network_catalog_stage_indexes(schema: str, stage_table: str) -> None:
+    for suffix in PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES:
+        stage_index_name = _network_catalog_index_name(stage_table, suffix)
+        target_index_name = _network_catalog_index_name(PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE, suffix)
+        if stage_index_name == target_index_name:
+            continue
+        await db.status(
+            f"ALTER INDEX IF EXISTS {_qt(schema, stage_index_name)} RENAME TO {_q(target_index_name)};"
+        )
+
+
+PROVIDER_DIRECTORY_NETWORK_CATALOG_REQUIRED_TABLES = (
+    "provider_directory_source",
+    "provider_directory_insurance_plan",
+    "provider_directory_practitioner_role",
+    "provider_directory_organization_affiliation",
+    "provider_directory_organization",
+)
+
+
+async def _network_catalog_missing_requirement(schema: str) -> str | None:
+    for table_name in PROVIDER_DIRECTORY_NETWORK_CATALOG_REQUIRED_TABLES:
+        if not await _table_exists(schema, table_name):
+            return f"{table_name}_unavailable"
+    return None
+
+
+async def _network_catalog_scope_sources(
+    schema: str,
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    cleaned = _clean_source_id_list(source_ids)
+    if cleaned or not run_id:
+        return cleaned
+    rows = await db.all(
+        f"""
+        SELECT DISTINCT source_id
+          FROM (
+                SELECT source_id
+                  FROM {_qt(schema, "provider_directory_insurance_plan")}
+                 WHERE last_seen_run_id = :run_id
+                   AND jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0
+                UNION
+                SELECT source_id
+                  FROM {_qt(schema, "provider_directory_practitioner_role")}
+                 WHERE last_seen_run_id = :run_id
+                   AND jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0
+                UNION
+                SELECT source_id
+                  FROM {_qt(schema, "provider_directory_organization_affiliation")}
+                 WHERE last_seen_run_id = :run_id
+                   AND jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0
+          ) AS scoped
+         WHERE source_id IS NOT NULL
+         ORDER BY source_id;
+        """,
+        run_id=run_id,
+    )
+    return _clean_source_id_list([row[0] for row in rows])
+
+
+def _provider_directory_network_catalog_scope_filter(
+    alias: str,
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> str:
+    clauses: list[str] = []
+    if run_id:
+        clauses.append(f"{alias}.last_seen_run_id = CAST(:run_id AS varchar)")
+    if source_ids:
+        clauses.append(f"{alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    return "".join(f"\n             AND {clause}" for clause in clauses)
+
+
+def provider_directory_network_catalog_insert_sql(
+    db_schema: str | None = None,
+    stage_table: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Build the scoped insert for resolved Provider Directory network Organizations."""
+    schema = db_schema if db_schema is not None else _schema()
+    stage_ref = _qt(schema, stage_table or _network_catalog_stage_table_name(run_id))
+    ref_resource_id_expr = _sql_reference_resource_id("refs_raw.network_ref", "Organization")
+    insurance_plan_scope = _provider_directory_network_catalog_scope_filter(
+        "insurance_plan",
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    practitioner_role_scope = _provider_directory_network_catalog_scope_filter(
+        "role",
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    affiliation_scope = _provider_directory_network_catalog_scope_filter(
+        "affiliation",
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    return f"""
+    INSERT INTO {stage_ref} ({", ".join(_provider_directory_network_catalog_columns())})
+    WITH refs_raw AS MATERIALIZED (
+        SELECT
+            insurance_plan.source_id::varchar AS source_id,
+            'InsurancePlan'::varchar AS source_resource_type,
+            insurance_plan.resource_id::varchar AS source_resource_id,
+            network_ref.value::varchar AS network_ref,
+            insurance_plan.last_seen_run_id::varchar AS last_seen_run_id,
+            insurance_plan.observed_at AS source_observed_at,
+            insurance_plan.updated_at AS source_updated_at
+          FROM {_qt(schema, "provider_directory_insurance_plan")} AS insurance_plan
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+                COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
+         ) AS network_ref(value)
+         WHERE NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
+           {insurance_plan_scope}
+        UNION ALL
+        SELECT
+            role.source_id::varchar AS source_id,
+            'PractitionerRole'::varchar AS source_resource_type,
+            role.resource_id::varchar AS source_resource_id,
+            network_ref.value::varchar AS network_ref,
+            role.last_seen_run_id::varchar AS last_seen_run_id,
+            role.observed_at AS source_observed_at,
+            role.updated_at AS source_updated_at
+          FROM {_qt(schema, "provider_directory_practitioner_role")} AS role
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+                COALESCE(role.network_refs::jsonb, '[]'::jsonb)
+         ) AS network_ref(value)
+         WHERE role.active IS DISTINCT FROM false
+           AND NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
+           {practitioner_role_scope}
+        UNION ALL
+        SELECT
+            affiliation.source_id::varchar AS source_id,
+            'OrganizationAffiliation'::varchar AS source_resource_type,
+            affiliation.resource_id::varchar AS source_resource_id,
+            network_ref.value::varchar AS network_ref,
+            affiliation.last_seen_run_id::varchar AS last_seen_run_id,
+            affiliation.observed_at AS source_observed_at,
+            affiliation.updated_at AS source_updated_at
+          FROM {_qt(schema, "provider_directory_organization_affiliation")} AS affiliation
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
+         ) AS network_ref(value)
+         WHERE affiliation.active IS DISTINCT FROM false
+           AND NULLIF(BTRIM(network_ref.value), '') IS NOT NULL
+           {affiliation_scope}
+    ), refs AS MATERIALIZED (
+        SELECT
+            refs_raw.source_id,
+            refs_raw.source_resource_type,
+            refs_raw.source_resource_id,
+            refs_raw.network_ref,
+            {ref_resource_id_expr}::varchar AS network_resource_id,
+            refs_raw.last_seen_run_id,
+            refs_raw.source_observed_at,
+            refs_raw.source_updated_at
+          FROM refs_raw
+         WHERE NULLIF(BTRIM(refs_raw.network_ref), '') IS NOT NULL
+    ), joined AS MATERIALIZED (
+        SELECT
+            refs.source_id,
+            refs.source_resource_type,
+            refs.source_resource_id,
+            refs.network_ref,
+            refs.network_resource_id,
+            refs.last_seen_run_id,
+            refs.source_observed_at,
+            refs.source_updated_at,
+            NULLIF(BTRIM(network_org.name), '')::varchar AS provider_directory_network_name,
+            COALESCE(network_org.aliases::jsonb, '[]'::jsonb) AS aliases,
+            NULLIF(regexp_replace(lower(COALESCE(network_org.name, '')), '[^a-z0-9]+', '', 'g'), '')
+                AS provider_directory_network_key,
+            NULLIF(regexp_replace(lower(COALESCE(NULLIF(src.org_name, ''), src.plan_name, '')), '[^a-z0-9]+', '', 'g'), '')
+                AS provider_directory_issuer_key,
+            src.org_name::varchar AS source_org_name,
+            src.plan_name::varchar AS source_plan_name,
+            src.canonical_api_base::text AS canonical_api_base,
+            GREATEST(
+                COALESCE(refs.source_observed_at, TIMESTAMP 'epoch'),
+                COALESCE(refs.source_updated_at, TIMESTAMP 'epoch'),
+                COALESCE(network_org.observed_at, TIMESTAMP 'epoch'),
+                COALESCE(network_org.updated_at, TIMESTAMP 'epoch'),
+                COALESCE(src.updated_at, TIMESTAMP 'epoch')
+            ) AS observed_at
+          FROM refs
+          JOIN {_qt(schema, "provider_directory_organization")} AS network_org
+            ON network_org.source_id = refs.source_id
+           AND network_org.resource_id = refs.network_resource_id
+          JOIN {_qt(schema, "provider_directory_source")} AS src
+            ON src.source_id = refs.source_id
+         WHERE refs.network_resource_id IS NOT NULL
+           AND network_org.active IS DISTINCT FROM false
+           AND NULLIF(BTRIM(network_org.name), '') IS NOT NULL
+    ), keyed AS MATERIALIZED (
+        SELECT
+            joined.*,
+            CASE
+                WHEN joined.provider_directory_issuer_key IS NOT NULL
+                 AND joined.provider_directory_network_key IS NOT NULL
+                    THEN joined.provider_directory_issuer_key || ':' || joined.provider_directory_network_key
+                ELSE NULL
+            END::varchar AS provider_directory_issuer_network_match_key
+          FROM joined
+         WHERE joined.provider_directory_network_key IS NOT NULL
+    )
+    SELECT
+        keyed.source_id,
+        keyed.network_resource_id,
+        keyed.provider_directory_network_name,
+        keyed.provider_directory_network_key,
+        keyed.provider_directory_issuer_key,
+        keyed.provider_directory_issuer_network_match_key,
+        keyed.aliases,
+        COALESCE(
+            jsonb_agg(
+                DISTINCT jsonb_build_object(
+                    'resource_type', keyed.source_resource_type,
+                    'resource_id', keyed.source_resource_id,
+                    'ref', keyed.network_ref,
+                    'last_seen_run_id', keyed.last_seen_run_id
+                )
+            ),
+            '[]'::jsonb
+        ) AS refs,
+        jsonb_build_object(
+            'InsurancePlan', COUNT(DISTINCT keyed.source_resource_id)
+                FILTER (WHERE keyed.source_resource_type = 'InsurancePlan'),
+            'PractitionerRole', COUNT(DISTINCT keyed.source_resource_id)
+                FILTER (WHERE keyed.source_resource_type = 'PractitionerRole'),
+            'OrganizationAffiliation', COUNT(DISTINCT keyed.source_resource_id)
+                FILTER (WHERE keyed.source_resource_type = 'OrganizationAffiliation')
+        ) AS source_resource_counts,
+        (COUNT(DISTINCT keyed.source_resource_id)
+            FILTER (WHERE keyed.source_resource_type = 'InsurancePlan'))::bigint
+            AS insurance_plan_ref_count,
+        (COUNT(DISTINCT keyed.source_resource_id)
+            FILTER (WHERE keyed.source_resource_type = 'PractitionerRole'))::bigint
+            AS practitioner_role_ref_count,
+        (COUNT(DISTINCT keyed.source_resource_id)
+            FILTER (WHERE keyed.source_resource_type = 'OrganizationAffiliation'))::bigint
+            AS organization_affiliation_ref_count,
+        COUNT(DISTINCT keyed.source_resource_type || ':' || keyed.source_resource_id || ':' || keyed.network_ref)::bigint
+            AS distinct_ref_count,
+        keyed.source_org_name,
+        keyed.source_plan_name,
+        keyed.canonical_api_base,
+        MAX(keyed.observed_at) AS observed_at,
+        now() AS published_at
+      FROM keyed
+  GROUP BY
+        keyed.source_id,
+        keyed.network_resource_id,
+        keyed.provider_directory_network_name,
+        keyed.provider_directory_network_key,
+        keyed.provider_directory_issuer_key,
+        keyed.provider_directory_issuer_network_match_key,
+        keyed.aliases,
+        keyed.source_org_name,
+        keyed.source_plan_name,
+        keyed.canonical_api_base;
+    """
+
+
+async def _copy_existing_network_catalog(
+    stage_ref: str,
+    target_ref: str,
+    columns: str,
+    source_ids: list[str],
+) -> int:
+    if not source_ids:
+        return 0
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            INSERT INTO {stage_ref} ({columns})
+            SELECT {columns}
+              FROM {target_ref}
+             WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])));
+            """,
+            source_ids=source_ids,
+        )
+    )
+
+
+async def _swap_network_catalog_stage(schema: str, stage_table: str, stage_ref: str, target_ref: str) -> None:
+    old_table = f"{PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE}_old"
+    async with db.transaction():
+        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
+        await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_table)};")
+        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)};")
+    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
+    await _rename_network_catalog_stage_indexes(schema, stage_table)
+    await _create_provider_directory_network_catalog_indexes(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+
+
+async def publish_provider_directory_network_catalog(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Publish resolved Provider Directory networks without locking source tables."""
+    schema = db_schema if db_schema is not None else _schema()
+    missing_reason = await _network_catalog_missing_requirement(schema)
+    if missing_reason:
+        return {"skipped": True, "reason": missing_reason}
+    await _ensure_provider_directory_network_catalog_table(schema)
+    effective_source_ids = await _network_catalog_scope_sources(
+        schema,
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    target_ref = _qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+    if run_id is not None and not effective_source_ids:
+        return {
+            "skipped": True,
+            "reason": "no_scoped_sources",
+            "source_ids": [],
+            "relation": target_ref,
+        }
+    stage_table = _network_catalog_stage_table_name(run_id)
+    stage_ref = _qt(schema, stage_table)
+    columns = ", ".join(_provider_directory_network_catalog_columns())
+    query_param_dict: dict[str, Any] = {}
+    if run_id is not None:
+        query_param_dict["run_id"] = run_id
+    if effective_source_ids:
+        query_param_dict["source_ids"] = effective_source_ids
+
+    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    try:
+        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
+        copied_existing = await _copy_existing_network_catalog(
+            stage_ref,
+            target_ref,
+            columns,
+            effective_source_ids,
+        )
+        inserted = _coerce_rowcount(
+            await db.status(
+                provider_directory_network_catalog_insert_sql(
+                    schema,
+                    stage_table,
+                    run_id=run_id,
+                    source_ids=effective_source_ids,
+                ),
+                **query_param_dict,
+            )
+        )
+        stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+        await _create_provider_directory_network_catalog_indexes(schema, stage_table)
+        await db.status(f"ANALYZE {stage_ref};")
+        await _swap_network_catalog_stage(schema, stage_table, stage_ref, target_ref)
+        return {
+            "published": True,
+            "rows": stage_rows,
+            "inserted": inserted,
+            "copied_existing": copied_existing,
+            "source_ids": effective_source_ids,
+            "relation": target_ref,
+        }
+    except Exception:
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        except Exception:  # pragma: no cover - cleanup best effort
+            LOGGER.warning("Failed to clean Provider Directory network catalog stage %s", stage_ref, exc_info=True)
+        raise
+
+
 async def publish_provider_directory_address_corroboration_if_available(
     db_schema: str | None = None,
+    *,
+    refresh_network_catalog: bool = True,
 ) -> bool:
     schema = db_schema or _schema()
     if not await _table_exists(schema, "entity_address_unified"):
         return False
-    await publish_provider_directory_address_corroboration_table(schema)
+    await publish_provider_directory_address_corroboration_table(
+        schema,
+        refresh_network_catalog=refresh_network_catalog,
+    )
     return True
 
 
@@ -4238,6 +5381,707 @@ def _seed_row_matches_query(row: dict[str, Any], source_query: str | None) -> bo
     )
 
 
+def _seed_row_has_importable_provider_directory_override(row: dict[str, Any]) -> bool:
+    source_row = _source_row_from_seed(row)
+    metadata = source_row.get("metadata_json") or {}
+    if not metadata.get("provider_directory_override"):
+        return False
+    validation = (_clean_text(source_row.get("last_validated_status")) or "").lower()
+    return validation in {"", "valid", "auth_required"}
+
+
+def _seed_row_has_recoverable_provider_directory_base(row: dict[str, Any]) -> bool:
+    if _seed_row_has_importable_provider_directory_override(row):
+        return True
+    source_row = _source_row_from_seed(row)
+    metadata = source_row.get("metadata_json") or {}
+    return metadata.get("provider_directory_base_normalization") == "resource_or_metadata_parent_base"
+
+
+class _AmeriHealthCaritasCatalogParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_cell = False
+        self._cell_text: list[str] = []
+        self._row: list[str] = []
+        self._row_links: list[str] = []
+        self.rows: list[tuple[list[str], list[str]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell_text = []
+        if tag == "a" and self._in_cell:
+            href = dict(attrs).get("href")
+            if href:
+                self._row_links.append(href)
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._cell_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._in_cell:
+            self._row.append(" ".join(" ".join(self._cell_text).split()))
+            self._cell_text = []
+            self._in_cell = False
+        if tag == "tr" and self._row:
+            self.rows.append((self._row, self._row_links))
+            self._row = []
+            self._row_links = []
+
+
+class _HtmlLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._href: str | None = None
+        self._text: list[str] = []
+        self.links: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a" or self._href is not None:
+            return
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        self._href = href
+        self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._href is None:
+            return
+        self.links.append((" ".join(" ".join(self._text).split()), self._href))
+        self._href = None
+        self._text = []
+
+
+def _provider_api_base_from_url(url: str | None) -> str | None:
+    text = _clean_text(url)
+    if not text or "/provider-api" not in text:
+        return None
+    prefix = text.split("/provider-api", 1)[0]
+    return _canonical_base(f"{prefix}/provider-api")
+
+
+def _provider_directory_base_from_metadata_url(url: str | None) -> str | None:
+    text = _clean_text(url)
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/")
+    if not path.lower().endswith("/metadata"):
+        return None
+    base_path = path[: -len("/metadata")].rstrip("/")
+    if not base_path:
+        return None
+    return _canonical_base(urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, base_path, "", "")))
+
+
+def _extract_urls_from_text(value: str | None) -> list[str]:
+    text = (_clean_text(value) or "").replace("\xa0", " ")
+    urls: list[str] = []
+    for match in URL_IN_TEXT_RE.finditer(text):
+        url = match.group(0).strip().rstrip(".,;")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _resource_type_from_provider_directory_url(url: str | None) -> str | None:
+    canonical = _canonical_base(url)
+    if not canonical:
+        return None
+    parsed = urllib.parse.urlsplit(canonical)
+    segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    if not segments:
+        return None
+    resource_type_by_key = {resource_type.lower(): resource_type for resource_type in DEFAULT_RESOURCES}
+    return resource_type_by_key.get(segments[-1].lower())
+
+
+def _provider_directory_base_from_catalog_url(url: str | None) -> str | None:
+    canonical = _canonical_base(url)
+    if not canonical:
+        return None
+    return _resource_or_metadata_parent_base(canonical) or canonical
+
+
+def _base_path(value: str | None) -> str:
+    parsed = urllib.parse.urlsplit(value or "")
+    return parsed.path.rstrip("/").lower()
+
+
+def _cms_sma_bases_are_related(left: str | None, right: str | None) -> bool:
+    left_base = _canonical_base(left)
+    right_base = _canonical_base(right)
+    if not left_base or not right_base:
+        return False
+    left_parts = urllib.parse.urlsplit(left_base)
+    right_parts = urllib.parse.urlsplit(right_base)
+    if left_parts.netloc.lower() != right_parts.netloc.lower():
+        return False
+    left_path = _base_path(left_base)
+    right_path = _base_path(right_base)
+    return (
+        left_path == right_path
+        or not left_path
+        or not right_path
+        or left_path.startswith(f"{right_path}/")
+        or right_path.startswith(f"{left_path}/")
+    )
+
+
+def _cms_sma_selected_api_base(production_base: str, capability_bases: list[str]) -> str:
+    for capability_base in capability_bases:
+        if _cms_sma_bases_are_related(production_base, capability_base):
+            return capability_base
+    return production_base
+
+
+def _cms_sma_header_key(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (_clean_text(value) or "").lower()).strip()
+
+
+def _cms_sma_column_index(
+    headers: list[str],
+    keys: set[str],
+    *,
+    start: int = 0,
+) -> int | None:
+    for index, value in enumerate(headers[start:], start=start):
+        if _cms_sma_header_key(value) in keys:
+            return index
+    return None
+
+
+def _cms_sma_cell(row: list[str], index: int | None) -> str | None:
+    if index is None or index >= len(row):
+        return None
+    return _clean_text(row[index])
+
+
+def _cms_sma_endpoint_directory_seed_rows_from_csv(
+    csv_text: str,
+    *,
+    source_query: str | None = None,
+    source_url: str = CMS_SMA_ENDPOINT_DIRECTORY_URL,
+) -> list[dict[str, Any]]:
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    if len(rows) < 2:
+        return []
+    section_headers = rows[0]
+    field_headers = rows[1]
+    provider_start = next(
+        (
+            index
+            for index, value in enumerate(section_headers)
+            if _cms_sma_header_key(value) == "provider directory endpoint information"
+        ),
+        0,
+    )
+    state_col = _cms_sma_column_index(field_headers, {"state"})
+    source_date_col = _cms_sma_column_index(field_headers, {"information as of date date completing the survey"})
+    prod_col = _cms_sma_column_index(field_headers, {"provider directory production base url"}, start=provider_start)
+    status_col = _cms_sma_column_index(field_headers, {"status drop down list"}, start=provider_start)
+    cap_col = _cms_sma_column_index(field_headers, {"fhir capability statement link"}, start=provider_start)
+    public_col = _cms_sma_column_index(field_headers, {"is the api public y n drop down list"}, start=provider_start)
+    refresh_col = _cms_sma_column_index(
+        field_headers,
+        {"data refresh frequency e g real time hourly daily weekly monthly"},
+        start=provider_start,
+    )
+    version_col = _cms_sma_column_index(field_headers, {"fhir version drop down list"}, start=provider_start)
+    if state_col is None or prod_col is None or status_col is None or public_col is None:
+        return []
+
+    seed_rows: list[dict[str, Any]] = []
+    for row in rows[2:]:
+        state = _cms_sma_cell(row, state_col)
+        if not state:
+            continue
+        status = _cms_sma_cell(row, status_col)
+        public_value = _cms_sma_cell(row, public_col)
+        status_key = (status or "").strip().lower()
+        if status_key not in CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES:
+            continue
+        if not (public_value or "").strip().lower().startswith("y"):
+            continue
+        validation_status = (
+            CMS_SMA_CATALOG_VALIDATION_STATUS
+            if status_key == "active"
+            else CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS
+        )
+
+        production_urls = _extract_urls_from_text(_cms_sma_cell(row, prod_col))
+        capability_urls = _extract_urls_from_text(_cms_sma_cell(row, cap_col))
+        capability_bases: list[str] = []
+        capability_url_by_base: dict[str, str] = {}
+        for capability_url in capability_urls:
+            capability_base = _provider_directory_base_from_metadata_url(capability_url)
+            if not capability_base:
+                continue
+            _append_unique(capability_bases, capability_base)
+            capability_url_by_base.setdefault(capability_base, capability_url)
+
+        groups: dict[str, dict[str, Any]] = {}
+
+        def group_for(api_base: str) -> dict[str, Any]:
+            group = groups.setdefault(
+                api_base,
+                {
+                    "api_base": api_base,
+                    "endpoints": {},
+                    "equivalent_api_bases": [],
+                    "metadata_url": None,
+                },
+            )
+            for capability_base, capability_url in capability_url_by_base.items():
+                if _cms_sma_bases_are_related(api_base, capability_base):
+                    group["metadata_url"] = group["metadata_url"] or capability_url
+                    _append_unique(group["equivalent_api_bases"], capability_base)
+            return group
+
+        for production_url in production_urls:
+            production_base = _provider_directory_base_from_catalog_url(production_url)
+            if not production_base:
+                continue
+            api_base = _cms_sma_selected_api_base(production_base, capability_bases)
+            group = group_for(api_base)
+            _append_unique(group["equivalent_api_bases"], production_base)
+            _append_unique(group["equivalent_api_bases"], production_url)
+            resource_type = _resource_type_from_provider_directory_url(production_url)
+            endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type or "")
+            if endpoint_field and endpoint_field not in group["endpoints"]:
+                group["endpoints"][endpoint_field] = production_url
+
+        if not groups:
+            for capability_base in capability_bases:
+                group = group_for(capability_base)
+                group["metadata_url"] = group["metadata_url"] or capability_url_by_base.get(capability_base)
+
+        source_date = _cms_sma_cell(row, source_date_col)
+        refresh = _cms_sma_cell(row, refresh_col)
+        fhir_version = _cms_sma_cell(row, version_col)
+        state_key = re.sub(r"[^a-z0-9]+", "-", state.lower()).strip("-")
+        for group in groups.values():
+            api_base = group["api_base"]
+            digest = hashlib.sha1(f"{state}|{api_base}".encode("utf-8")).hexdigest()[:8]
+            metadata = {
+                "provider_directory_source_catalog": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+                "provider_directory_confirmed_catalog_url": source_url,
+                "provider_directory_catalog_status": status,
+                "provider_directory_catalog_public": public_value,
+                "provider_directory_equivalent_api_bases": group["equivalent_api_bases"],
+            }
+            if group["metadata_url"]:
+                metadata["provider_directory_confirmed_metadata_url"] = group["metadata_url"]
+            seed_row = {
+                "id": f"cms-sma-{state_key}-{digest}",
+                "org_name": f"State of {state}",
+                "plan_name": f"{state} Medicaid Provider Directory",
+                "api_base": api_base,
+                "auth_type": "none",
+                "last_validated_status": validation_status,
+                "requires_registration": False,
+                "fhir_version": fhir_version,
+                "source": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+                "source_detail": f"CMS SMA Endpoint Directory public Provider Directory row state={state}",
+                "source_url": source_url,
+                "source_date": source_date,
+                "note": (
+                    "Catalog-discovered public Provider Directory endpoint from the CMS State Medicaid "
+                    "Agency Endpoint Directory; live probe validation controls resource import."
+                ),
+                "metadata_json": metadata,
+                **group["endpoints"],
+            }
+            if refresh:
+                seed_row["data_quality_checked"] = refresh
+            if _seed_row_matches_query(seed_row, source_query):
+                seed_rows.append(seed_row)
+    return seed_rows
+
+
+def _external_splash_target_url(href: str | None, *, source_url: str) -> str | None:
+    text = _clean_text(href)
+    if not text:
+        return None
+    absolute = urllib.parse.urljoin(source_url, text)
+    parsed = urllib.parse.urlsplit(absolute)
+    params = urllib.parse.parse_qs(parsed.query)
+    for key in ("splash", "url"):
+        values = params.get(key)
+        if values:
+            return values[0]
+    return absolute
+
+
+def _amerihealth_caritas_seed_rows_from_catalog_html(
+    html_text: str,
+    *,
+    source_query: str | None = None,
+    source_url: str = AMERIHEALTH_CARITAS_DOC_URL,
+    source_date: str | None = None,
+) -> list[dict[str, Any]]:
+    parser = _AmeriHealthCaritasCatalogParser()
+    parser.feed(html_text)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for cells, links in parser.rows:
+        if len(cells) < 2 or cells[0].strip().lower() == "planid":
+            continue
+        plan_code = _clean_text(cells[0])
+        plan_name = _clean_text(cells[1])
+        provider_base = next(
+            (
+                base
+                for href in links
+                if (base := _provider_api_base_from_url(href))
+            ),
+            None,
+        )
+        if not plan_code or not plan_name or not provider_base:
+            continue
+        key = (plan_code.lower(), _payer_alias_key(plan_name), provider_base)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = {
+            "id": f"amerihealth-caritas-{plan_code.lower()}-{hashlib.sha1(plan_name.encode('utf-8')).hexdigest()[:8]}",
+            "org_name": "AmeriHealth Caritas",
+            "plan_name": plan_name,
+            "api_base": provider_base,
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "requires_registration": False,
+            "source": "amerihealth-caritas-developer-portal",
+            "source_detail": f"official AmeriHealth Caritas Provider Directory API plan_code={plan_code}",
+            "source_url": source_url,
+            "source_date": source_date,
+            "note": "Supplemental Provider Directory source from AmeriHealth Caritas developer portal.",
+        }
+        if _seed_row_matches_query(row, source_query):
+            rows.append(row)
+    return rows
+
+
+def _read_text_from_path_or_url(path: str | None, url: str, *, timeout: int) -> tuple[str, str]:
+    clean_path = _clean_text(path)
+    if clean_path:
+        return Path(clean_path).read_text(encoding="utf-8"), clean_path
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace"), url
+
+
+def _seed_rows_from_amerihealth_caritas_catalog(
+    *,
+    source_query: str | None = None,
+    timeout: int = 30,
+    catalog_path: str | None = None,
+    catalog_url: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = (
+        _clean_text(catalog_url)
+        or _clean_text(os.getenv(AMERIHEALTH_CARITAS_DOC_URL_ENV))
+        or AMERIHEALTH_CARITAS_DOC_URL
+    )
+    text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
+    rows = _amerihealth_caritas_seed_rows_from_catalog_html(
+        text,
+        source_query=source_query,
+        source_url=source,
+    )
+    return rows, {"source": source, "rows": len(rows)}
+
+
+def _contra_costa_seed_row(
+    provider_base: str,
+    *,
+    source_url: str,
+    source_date: str | None = None,
+    note_suffix: str | None = None,
+) -> dict[str, Any]:
+    note = "Supplemental Provider Directory source from Contra Costa Health APIs for Developers page."
+    if note_suffix:
+        note = f"{note} {note_suffix}"
+    return {
+        "id": f"contra-costa-health-plan-{hashlib.sha1(provider_base.encode('utf-8')).hexdigest()[:8]}",
+        "org_name": "Contra Costa Health Plan",
+        "plan_name": "Contra Costa Health Plan Provider Directory",
+        "api_base": provider_base,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "requires_registration": False,
+        "is_medicaid_mco": True,
+        "source": "contra-costa-health-developer-page",
+        "source_detail": "official Contra Costa Health Provider Directory API base URL",
+        "source_url": source_url,
+        "source_date": source_date,
+        "note": note,
+    }
+
+
+def _contra_costa_seed_rows_from_developer_html(
+    html_text: str,
+    *,
+    source_query: str | None = None,
+    source_url: str = CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL,
+    source_date: str | None = None,
+) -> list[dict[str, Any]]:
+    parser = _HtmlLinkParser()
+    parser.feed(html_text)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for label, href in parser.links:
+        label_key = re.sub(r"[^a-z0-9]+", "", (_clean_text(label) or "").lower())
+        if "providerdirectoryapibaseurl" not in label_key:
+            continue
+        target_url = _external_splash_target_url(href, source_url=source_url)
+        provider_base = _provider_directory_base_from_metadata_url(target_url)
+        if not provider_base or provider_base in seen:
+            continue
+        seen.add(provider_base)
+        row = _contra_costa_seed_row(provider_base, source_url=source_url, source_date=source_date)
+        if _seed_row_matches_query(row, source_query):
+            rows.append(row)
+    return rows
+
+
+def _contra_costa_fallback_seed_rows(
+    *,
+    source_query: str | None = None,
+    source_url: str = CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL,
+) -> list[dict[str, Any]]:
+    row = _contra_costa_seed_row(
+        CONTRA_COSTA_PROVIDER_DIRECTORY_BASE,
+        source_url=source_url,
+        note_suffix=(
+            "The official page can block automated fetches, so the importer retains the "
+            "confirmed public metadata base as a fallback."
+        ),
+    )
+    return [row] if _seed_row_matches_query(row, source_query) else []
+
+
+def _seed_rows_from_contra_costa_catalog(
+    *,
+    source_query: str | None = None,
+    timeout: int = 30,
+    catalog_path: str | None = None,
+    catalog_url: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = (
+        _clean_text(catalog_url)
+        or _clean_text(os.getenv(CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL_ENV))
+        or CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL
+    )
+    try:
+        text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
+    except Exception as exc:
+        rows = _contra_costa_fallback_seed_rows(source_query=source_query, source_url=url)
+        return rows, {
+            "source": url,
+            "rows": len(rows),
+            "fallback": True,
+            "error": _short_error(exc),
+        }
+    rows = _contra_costa_seed_rows_from_developer_html(
+        text,
+        source_query=source_query,
+        source_url=source,
+    )
+    if rows:
+        return rows, {"source": source, "rows": len(rows)}
+    rows = _contra_costa_fallback_seed_rows(source_query=source_query, source_url=source)
+    return rows, {"source": source, "rows": len(rows), "fallback": True}
+
+
+def _seed_rows_from_cms_sma_endpoint_directory(
+    *,
+    source_query: str | None = None,
+    timeout: int = 30,
+    catalog_path: str | None = None,
+    catalog_url: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = (
+        _clean_text(catalog_url)
+        or _clean_text(os.getenv(CMS_SMA_ENDPOINT_DIRECTORY_URL_ENV))
+        or CMS_SMA_ENDPOINT_DIRECTORY_URL
+    )
+    text, source = _read_text_from_path_or_url(catalog_path, url, timeout=timeout)
+    rows = _cms_sma_endpoint_directory_seed_rows_from_csv(
+        text,
+        source_query=source_query,
+        source_url=source,
+    )
+    return rows, {"source": source, "rows": len(rows)}
+
+
+def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
+    blocker_rows = [
+        {
+            "id": "provider-directory-blocked-chorus-community-health-plans",
+            "org_name": "Chorus Community Health Plans (fka Children's Community Health Plan)",
+            "plan_name": "Medicaid MCO",
+            "api_base": None,
+            "auth_type": "none",
+            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
+            "requires_registration": False,
+            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+            "source_detail": "blocked Provider Directory endpoint discovery",
+            "source_url": CHORUS_PROVIDER_DIRECTORY_DOC_URL,
+            "note": (
+                "Official Chorus developer page exposes Provider Directory documentation through a "
+                "JavaScript app, but no importable public FHIR base has been confirmed."
+            ),
+            "metadata_json": {
+                "provider_directory_blocked": True,
+                "provider_directory_blocked_reason": "official portal present but no importable public FHIR base confirmed",
+                "provider_directory_confirmed_catalog_url": CHORUS_PROVIDER_DIRECTORY_DOC_URL,
+            },
+        },
+        {
+            "id": "provider-directory-blocked-first-medical-pr",
+            "org_name": "First Medical Health Plan, Inc.",
+            "plan_name": "Medicaid MCO",
+            "api_base": None,
+            "auth_type": "user token",
+            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
+            "requires_registration": True,
+            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+            "source_detail": "blocked Provider Directory endpoint discovery",
+            "source_url": FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL,
+            "note": (
+                "Official First Medical developer portal lists Practitioner and Location APIs under "
+                "a user-token security model; no open importable Provider Directory FHIR base has "
+                "been confirmed."
+            ),
+            "metadata_json": {
+                "provider_directory_blocked": True,
+                "provider_directory_blocked_reason": "official portal requires user token and no open public FHIR base is confirmed",
+                "provider_directory_confirmed_catalog_url": FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL,
+            },
+        },
+        {
+            "id": "provider-directory-blocked-territory-of-puerto-rico",
+            "org_name": "Territory of Puerto Rico",
+            "plan_name": "Medicaid FFS",
+            "api_base": None,
+            "auth_type": "none",
+            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
+            "requires_registration": False,
+            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+            "source_detail": "CMS SMA Endpoint Directory Provider Directory status not yet started",
+            "source_url": CMS_SMA_ENDPOINT_DIRECTORY_URL,
+            "note": (
+                "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as "
+                "not yet started/TBD, so no importable public FHIR base is currently known."
+            ),
+            "metadata_json": {
+                "provider_directory_blocked": True,
+                "provider_directory_blocked_reason": "CMS SMA Endpoint Directory lists Provider Directory as not yet started/TBD",
+                "provider_directory_confirmed_catalog_url": CMS_SMA_ENDPOINT_DIRECTORY_URL,
+            },
+        },
+    ]
+    return [row for row in blocker_rows if _seed_row_matches_query(row, source_query)]
+
+
+def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
+    row = {
+        "id": "health-partners-plans-provider-directory",
+        "org_name": "Health Partners Plans",
+        "plan_name": "Health Partners Plans Provider Directory",
+        "api_base": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "requires_registration": False,
+        "source": "health-partners-plans-fhir-root",
+        "source_detail": "official Health Partners Plans public Provider Directory FHIR server",
+        "source_url": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
+        "note": "Supplemental Provider Directory source from the Health Partners Plans public FHIR server.",
+    }
+    return [row] if _seed_row_matches_query(row, source_query) else []
+
+
+def _seed_rows_from_supplemental_catalogs(
+    *,
+    source_query: str | None = None,
+    timeout: int = 30,
+    amerihealth_caritas_catalog_path: str | None = None,
+    amerihealth_caritas_catalog_url: str | None = None,
+    contra_costa_catalog_path: str | None = None,
+    contra_costa_catalog_url: str | None = None,
+    cms_sma_endpoint_directory_path: str | None = None,
+    cms_sma_endpoint_directory_url: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {"catalogs": {}}
+    try:
+        catalog_rows, catalog_metrics = _seed_rows_from_amerihealth_caritas_catalog(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=amerihealth_caritas_catalog_path,
+            catalog_url=amerihealth_caritas_catalog_url,
+        )
+        rows.extend(catalog_rows)
+        metrics["catalogs"]["amerihealth_caritas"] = catalog_metrics
+    except Exception as exc:
+        metrics["catalogs"]["amerihealth_caritas"] = {
+            "rows": 0,
+            "error": _short_error(exc),
+        }
+    try:
+        catalog_rows, catalog_metrics = _seed_rows_from_contra_costa_catalog(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=contra_costa_catalog_path,
+            catalog_url=contra_costa_catalog_url,
+        )
+        rows.extend(catalog_rows)
+        metrics["catalogs"]["contra_costa"] = catalog_metrics
+    except Exception as exc:
+        metrics["catalogs"]["contra_costa"] = {
+            "rows": 0,
+            "error": _short_error(exc),
+        }
+    try:
+        catalog_rows, catalog_metrics = _seed_rows_from_cms_sma_endpoint_directory(
+            source_query=source_query,
+            timeout=timeout,
+            catalog_path=cms_sma_endpoint_directory_path,
+            catalog_url=cms_sma_endpoint_directory_url,
+        )
+        rows.extend(catalog_rows)
+        metrics["catalogs"]["cms_sma_endpoint_directory"] = catalog_metrics
+    except Exception as exc:
+        metrics["catalogs"]["cms_sma_endpoint_directory"] = {
+            "rows": 0,
+            "error": _short_error(exc),
+        }
+    catalog_rows = _health_partners_plans_seed_rows(source_query=source_query)
+    rows.extend(catalog_rows)
+    metrics["catalogs"]["health_partners_plans"] = {
+        "source": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
+        "rows": len(catalog_rows),
+    }
+    catalog_rows = _provider_directory_blocker_seed_rows(source_query=source_query)
+    rows.extend(catalog_rows)
+    metrics["catalogs"]["provider_directory_blockers"] = {
+        "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+        "rows": len(catalog_rows),
+    }
+    metrics["rows"] = len(rows)
+    return rows, metrics
+
+
 def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -4247,12 +6091,11 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
     if not isinstance(results, list):
         raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
     seed_rows: list[dict[str, Any]] = []
+    allowed_classifications = {"valid", "valid_non_fhir", "auth_required"}
     for index, item in enumerate(results):
         if not isinstance(item, dict):
             continue
         classification = (_clean_text(item.get("classification")) or "").lower()
-        if classification not in {"valid", "valid_non_fhir", "auth_required"}:
-            continue
         api_base = _clean_text(item.get("api_base"))
         org_name = _clean_text(item.get("org_name"))
         if not api_base or not org_name:
@@ -4279,9 +6122,44 @@ def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = Non
             "source_url": _clean_text(item.get("url")),
             "source_date": _clean_text(payload.get("tested_at")) if isinstance(payload, dict) else None,
         }
+        if classification not in allowed_classifications and not _seed_row_has_recoverable_provider_directory_base(row):
+            continue
         if _seed_row_matches_query(row, source_query):
             seed_rows.append(row)
     return seed_rows
+
+
+def _append_unique_metadata_value(metadata: dict[str, Any], key: str, value: str | None) -> None:
+    clean_value = _clean_text(value)
+    if not clean_value:
+        return
+    values = metadata.get(key)
+    if not isinstance(values, list):
+        values = []
+    if clean_value not in values:
+        values.append(clean_value)
+    metadata[key] = values
+
+
+def _merge_skipped_source_row_metadata(target: dict[str, Any], skipped: dict[str, Any]) -> None:
+    target_metadata = target.setdefault("metadata_json", {})
+    if not isinstance(target_metadata, dict):
+        target_metadata = {}
+        target["metadata_json"] = target_metadata
+    skipped_metadata = skipped.get("metadata_json") if isinstance(skipped.get("metadata_json"), dict) else {}
+    target_base = _canonical_base(target.get("canonical_api_base") or target.get("api_base"))
+    for raw_base in (
+        skipped.get("api_base"),
+        skipped.get("canonical_api_base"),
+        skipped_metadata.get("provider_directory_previous_api_base"),
+        skipped_metadata.get("provider_directory_confirmed_base"),
+    ):
+        base = _canonical_base(raw_base)
+        if base and base != target_base:
+            _append_unique_metadata_value(target_metadata, "provider_directory_equivalent_api_bases", base)
+    skipped_override = _clean_text(skipped_metadata.get("provider_directory_override"))
+    if skipped_override:
+        _append_unique_metadata_value(target_metadata, "provider_directory_merged_overrides", skipped_override)
 
 
 def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4289,6 +6167,9 @@ def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any
     seen_source_ids: set[str] = set()
     seen_source_keys: set[tuple[str, str, str]] = set()
     seen_org_base_keys: set[tuple[str, str]] = set()
+    rows_by_source_id: dict[str, dict[str, Any]] = {}
+    rows_by_source_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    rows_by_org_base_key: dict[tuple[str, str], dict[str, Any]] = {}
     for row in source_rows:
         source_id = _clean_text(row.get("source_id"))
         org_name_key = (_clean_text(row.get("org_name")) or "").lower()
@@ -4298,15 +6179,22 @@ def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any
         org_base_key = (org_name_key, api_base_key)
         is_retest = row.get("seed_source") == "provider-directory-db-retest"
         if source_id and source_id in seen_source_ids:
+            _merge_skipped_source_row_metadata(rows_by_source_id[source_id], row)
             continue
         if is_retest and (source_key in seen_source_keys or org_base_key in seen_org_base_keys):
+            retained = rows_by_source_key.get(source_key) or rows_by_org_base_key.get(org_base_key)
+            if retained is not None:
+                _merge_skipped_source_row_metadata(retained, row)
             continue
         if source_id:
             seen_source_ids.add(source_id)
+            rows_by_source_id[source_id] = row
         if is_retest:
             seen_source_keys.add(source_key)
+            rows_by_source_key[source_key] = row
         if org_name_key and api_base_key:
             seen_org_base_keys.add(org_base_key)
+            rows_by_org_base_key[org_base_key] = row
         deduped.append(row)
     return deduped
 
@@ -4609,7 +6497,7 @@ def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) 
         try:
             return max(1, int(env_value))
         except ValueError:
-            pass
+            return max(timeout + 1, (timeout * candidate_count) + 2)
     return max(timeout + 1, (timeout * candidate_count) + 2)
 
 
@@ -4631,8 +6519,7 @@ async def _probe_sources(
     capability_rows: list[dict[str, Any]] = []
     source_updates: list[dict[str, Any]] = []
     valid_source_ids: set[str] = set()
-    valid = 0
-    probed = 0
+    probe_counts_by_name = {"valid": 0, "probed": 0}
     total_sources = len(sources)
     report_every = max(1, total_sources // 20)
     flush_every = _probe_flush_every()
@@ -4647,21 +6534,19 @@ async def _probe_sources(
     )
 
     async def _flush_probe_rows(*, force: bool = False) -> None:
-        nonlocal capability_rows, source_updates
         async with flush_lock:
             if not force and len(source_updates) < flush_every:
                 return
-            rows_to_flush = capability_rows
-            updates_to_flush = source_updates
-            capability_rows = []
-            source_updates = []
-        if rows_to_flush:
-            await _upsert_rows(ProviderDirectoryCapability, rows_to_flush)
-        if updates_to_flush:
-            await _upsert_rows(ProviderDirectorySource, updates_to_flush)
+            capability_flush_rows = list(capability_rows)
+            source_update_rows = list(source_updates)
+            capability_rows.clear()
+            source_updates.clear()
+        if capability_flush_rows:
+            await _upsert_rows(ProviderDirectoryCapability, capability_flush_rows)
+        if source_update_rows:
+            await _upsert_rows(ProviderDirectorySource, source_update_rows)
 
     async def _run_probe(source: dict[str, Any]) -> None:
-        nonlocal probed, valid
         async with semaphore:
             started = time.monotonic()
             hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
@@ -4720,7 +6605,7 @@ async def _probe_sources(
                 capability_rows.append(parse_capability(source, payload, probe))
                 update["fhir_version"] = _clean_text(payload.get("fhirVersion")) or update.get("fhir_version")
                 if probe["status"] == "valid":
-                    valid += 1
+                    probe_counts_by_name["valid"] += 1
                     valid_source_ids.add(source["source_id"])
             else:
                 capability_rows.append(
@@ -4738,20 +6623,20 @@ async def _probe_sources(
                     }
                 )
             source_updates.append(update)
-            probed += 1
+            probe_counts_by_name["probed"] += 1
             await _flush_probe_rows()
-            if probed == total_sources or probed % report_every == 0:
+            if probe_counts_by_name["probed"] == total_sources or probe_counts_by_name["probed"] % report_every == 0:
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory probing sources",
-                    done=probed,
+                    done=probe_counts_by_name["probed"],
                     total=total_sources,
-                    message=f"probed {probed}/{total_sources} source(s); valid={valid}",
+                    message=f"probed {probe_counts_by_name['probed']}/{total_sources} source(s); valid={probe_counts_by_name['valid']}",
                 )
 
     await asyncio.gather(*[_run_probe(source) for source in sources])
     await _flush_probe_rows(force=True)
-    return len(sources), valid, valid_source_ids
+    return len(sources), probe_counts_by_name["valid"], valid_source_ids
 
 
 def _bundle_entries(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -4950,18 +6835,16 @@ async def _stream_bulk_export_output_rows(
     fetch_url = _url_with_query_params(url, options["query_params"])
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
-    rows_fetched = 0
-    rows_written = 0
-    row_limit_reached = False
+    stream_counts_by_name = {"rows_fetched": 0, "rows_written": 0}
+    row_limit_by_name = {"reached": False}
 
     async def flush_pending_rows() -> None:
-        nonlocal rows_written, pending_rows
         if row_batch_handler and pending_rows:
-            rows_written += await row_batch_handler(model, pending_rows)
-            pending_rows = []
+            pending_rows_list = list(pending_rows)
+            pending_rows.clear()
+            stream_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
 
     def handle_line(raw_line: bytes) -> str | None:
-        nonlocal rows_fetched, row_limit_reached
         line = raw_line.strip()
         if not line:
             return None
@@ -4983,13 +6866,13 @@ async def _stream_bulk_export_output_rows(
         parsed_model, row = parsed
         if parsed_model is not model:
             return None
-        rows_fetched += 1
+        stream_counts_by_name["rows_fetched"] += 1
         if retain_rows:
             rows.append(row)
         if row_batch_handler:
             pending_rows.append(row)
-        if not _limit_allows_more(rows_fetched, per_resource_limit):
-            row_limit_reached = True
+        if not _limit_allows_more(stream_counts_by_name["rows_fetched"], per_resource_limit):
+            row_limit_by_name["reached"] = True
         return None
 
     try:
@@ -5001,7 +6884,7 @@ async def _stream_bulk_export_output_rows(
             ssl=_ssl_context(),
         ) as response:
             if response.status != 200:
-                return rows, rows_fetched, rows_written, row_limit_reached, f"bulk_export_output_http_{response.status}"
+                return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, f"bulk_export_output_http_{response.status}")
             buffer = b""
             async for chunk in response.content.iter_chunked(READ_CHUNK_BYTES):
                 buffer += chunk
@@ -5009,20 +6892,35 @@ async def _stream_bulk_export_output_rows(
                     line, buffer = buffer.split(b"\n", 1)
                     error = handle_line(line)
                     if error:
-                        return rows, rows_fetched, rows_written, row_limit_reached, error
+                        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, error)
                     if row_batch_handler and len(pending_rows) >= max(1, row_batch_size):
                         await flush_pending_rows()
-                    if row_limit_reached:
+                    if row_limit_by_name["reached"]:
                         await flush_pending_rows()
-                        return rows, rows_fetched, rows_written, True, None
+                        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, None)
             if buffer.strip():
                 error = handle_line(buffer)
                 if error:
-                    return rows, rows_fetched, rows_written, row_limit_reached, error
+                    return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, error)
             await flush_pending_rows()
-            return rows, rows_fetched, rows_written, row_limit_reached, None
+            return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, None)
     except Exception as exc:
-        return rows, rows_fetched, rows_written, row_limit_reached, f"{type(exc).__name__}: {exc}"
+        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, f"{type(exc).__name__}: {exc}")
+
+
+def _bulk_stream_result(
+    rows: list[dict[str, Any]],
+    stream_counts_by_name: dict[str, int],
+    row_limit_by_name: dict[str, bool],
+    error: str | None,
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    return (
+        rows,
+        stream_counts_by_name["rows_fetched"],
+        stream_counts_by_name["rows_written"],
+        row_limit_by_name["reached"],
+        error,
+    )
 
 
 async def _fetch_bulk_export_resource_rows(
@@ -5211,7 +7109,7 @@ async def _fetch_resource_rows(
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     rows_fetched = 0
-    rows_written = 0
+    fetch_counts_by_name = {"rows_written": 0}
     pages = 0
     seen_urls: set[str] = set()
     row_limit_reached = False
@@ -5224,11 +7122,11 @@ async def _fetch_resource_rows(
     partition_error_count = 0
 
     async def flush_pending_rows() -> None:
-        nonlocal rows_written, pending_rows
         if not row_batch_handler or not pending_rows:
             return
-        rows_written += await row_batch_handler(model, pending_rows)
-        pending_rows = []
+        pending_rows_list = list(pending_rows)
+        pending_rows.clear()
+        fetch_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
 
     for start_url in start_urls:
         url = start_url
@@ -5311,7 +7209,7 @@ async def _fetch_resource_rows(
         model=model,
         rows=rows,
         rows_fetched=rows_fetched,
-        rows_written=rows_written,
+        rows_written=fetch_counts_by_name["rows_written"],
         pages_fetched=pages,
         complete=complete,
         row_limit_reached=row_limit_reached,
@@ -5646,16 +7544,15 @@ async def _import_linked_resource_rows(
     edge_source_ids = source_ids or [source["source_id"]]
     canonical_api_base = source.get("canonical_api_base") or source.get("api_base")
     by_model: dict[type, list[dict[str, Any]]] = {}
-    pending_row_count = 0
+    linked_counts_by_name = {"pending_rows": 0}
     flush_threshold = max(int(flush_rows or _linked_resource_flush_rows()), 1)
 
     async def flush_pending_rows() -> None:
-        nonlocal pending_row_count
         if not by_model:
             return
         pending = by_model.copy()
         by_model.clear()
-        pending_row_count = 0
+        linked_counts_by_name["pending_rows"] = 0
         for model, rows in pending.items():
             if not rows:
                 continue
@@ -5694,9 +7591,9 @@ async def _import_linked_resource_rows(
                 continue
             fetched_resource_type, model, row = result
             by_model.setdefault(model, []).append(row)
-            pending_row_count += 1
+            linked_counts_by_name["pending_rows"] += 1
             existing.add((fetched_resource_type, row.get("resource_id")))
-            if pending_row_count >= flush_threshold:
+            if linked_counts_by_name["pending_rows"] >= flush_threshold:
                 await flush_pending_rows()
     finally:
         for task in tasks:
@@ -5990,6 +7887,25 @@ def _publish_corroboration_enabled(value: Any) -> bool:
         value,
         _bool_or_default(os.getenv(PUBLISH_CORROBORATION_ENV), False),
     )
+
+
+def _apply_provider_directory_refresh_preset(task: dict[str, Any]) -> dict[str, Any]:
+    preset = _clean_text(task.get("refresh_preset") or task.get("preset"))
+    if not preset:
+        return task
+    normalized_preset = preset.strip().lower().replace("_", "-")
+    if normalized_preset not in PROVIDER_DIRECTORY_REFRESH_PRESETS:
+        raise ValueError(
+            "Unsupported Provider Directory refresh_preset "
+            f"{preset!r}; expected one of {', '.join(PROVIDER_DIRECTORY_REFRESH_PRESETS)}"
+        )
+    defaults = PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS
+    normalized_task = dict(task)
+    normalized_task["refresh_preset"] = normalized_preset
+    for key, value in defaults.items():
+        if normalized_task.get(key) in (None, ""):
+            normalized_task[key] = value
+    return normalized_task
 
 
 def _int_or_default(value: Any, default: int) -> int:
@@ -6321,7 +8237,7 @@ async def _import_resources(
     progress_lock = asyncio.Lock()
     active_partial_counts: dict[int, dict[str, int]] = {}
     active_group_details: dict[int, dict[str, Any]] = {}
-    next_partial_progress_at = 0.0
+    progress_timer_by_name = {"next_partial_progress_at": 0.0}
 
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
         for key, value in source_counts.items():
@@ -6362,16 +8278,15 @@ async def _import_resources(
         )
 
     async def report_progress(force: bool = False) -> None:
-        nonlocal next_partial_progress_at
         if not progress_callback:
             return
         snapshot: dict[str, int] | None = None
         details: dict[str, Any] | None = None
         async with progress_lock:
             now = time.monotonic()
-            if force or now >= next_partial_progress_at:
+            if force or now >= progress_timer_by_name["next_partial_progress_at"]:
                 if not force:
-                    next_partial_progress_at = now + 15.0
+                    progress_timer_by_name["next_partial_progress_at"] = now + 15.0
                 snapshot = progress_counts_snapshot()
                 details = {"active_source_groups": active_group_snapshot()}
         if snapshot is not None:
@@ -6432,7 +8347,38 @@ async def _import_resources(
         source_stale_counts: dict[str, int] = {}
         source_stale_ready_source_ids: dict[str, list[str]] = {}
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+        deferred_zero_role_cleanup: ResourceFetchResult | None = None
         scan_role_reverse_lookup_planned = _scan_practitioner_role_reverse_lookup_planned(source, resources)
+
+        async def mark_resource_stale_cleanup_ready(resource_type: str, result: ResourceFetchResult) -> None:
+            if not stale_cleanup or not result.complete:
+                return
+            if seen_stage_table:
+                source_stale_ready_source_ids[resource_type] = list(source_ids)
+                return
+            for source_id in source_ids:
+                stale_deleted = await _delete_stale_resource_rows(
+                    result.model,
+                    source_id,
+                    run_id,
+                    use_seen_table=True,
+                )
+                if stale_deleted:
+                    source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
+
+        def should_retry_zero_practitioner_role(result: ResourceFetchResult | None) -> bool:
+            return (
+                result is not None
+                and not scan_role_reverse_lookup_planned
+                and bool(_resource_start_url(source, "PractitionerRole", page_count=page_count))
+                and result.complete
+                and not result.error
+                and not result.bounded
+                and result.rows_fetched == 0
+                and result.rows_written == 0
+                and source_counts.get("Practitioner", 0) > 0
+                and source_counts.get("Location", 0) > 0
+            )
         if _alohr_source_uses_graphql_connector(source):
             async with progress_lock:
                 active_group_details[group_key]["current_resource"] = "ALOHR GraphQL"
@@ -6518,19 +8464,105 @@ async def _import_resources(
                 result,
                 rows_written_per_source=written_total // max(1, len(source_ids)),
             )
-            if stale_cleanup and result.complete:
-                if seen_stage_table:
-                    source_stale_ready_source_ids[resource_type] = list(source_ids)
-                else:
-                    for source_id in source_ids:
-                        stale_deleted = await _delete_stale_resource_rows(
-                            result.model,
-                            source_id,
-                            run_id,
-                            use_seen_table=True,
-                        )
-                        if stale_deleted:
-                            source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
+            if (
+                resource_type == "PractitionerRole"
+                and result.complete
+                and not result.error
+                and not result.bounded
+                and result.rows_fetched == 0
+                and written_total == 0
+            ):
+                deferred_zero_role_cleanup = result
+            else:
+                await mark_resource_stale_cleanup_ready(resource_type, result)
+        if should_retry_zero_practitioner_role(deferred_zero_role_cleanup):
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = "PractitionerRole retry"
+                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
+
+            use_streaming = stream_batch_size > 0
+
+            async def retry_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                written = await _upsert_resource_rows(
+                    model,
+                    _copy_rows_for_source_ids(rows, source_ids),
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                    source_ids=source_ids,
+                )
+                await maybe_report_partial_progress(group_key, "PractitionerRole", written)
+                return written
+
+            retry_result = await _fetch_resource_rows(
+                source,
+                "PractitionerRole",
+                per_resource_limit=per_resource_limit,
+                page_limit=page_limit,
+                page_count=page_count,
+                timeout=timeout,
+                run_id=run_id,
+                row_batch_handler=retry_row_batch_handler if use_streaming else None,
+                row_batch_size=stream_batch_size,
+                retain_rows=linked_resource_limit > 0 or not use_streaming,
+                cancel_ctx=cancel_ctx,
+                cancel_task=cancel_task,
+                bulk_export=False,
+            )
+            if retry_result is None:
+                retry_result = replace(
+                    deferred_zero_role_cleanup,
+                    complete=False,
+                    error=PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR,
+                    fetch_mode=f"{deferred_zero_role_cleanup.fetch_mode}_retry",
+                )
+                retry_written_total = 0
+            else:
+                retry_result = replace(retry_result, fetch_mode=f"{retry_result.fetch_mode}_retry")
+                for _source_id in source_ids:
+                    _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", retry_result)
+                if retry_result.rows or "PractitionerRole" not in rows_by_resource:
+                    rows_by_resource["PractitionerRole"] = retry_result.rows
+                retry_written_total = (
+                    retry_result.rows_written
+                    if use_streaming
+                    else await _upsert_resource_rows(
+                        retry_result.model,
+                        _copy_rows_for_source_ids(retry_result.rows, source_ids),
+                        run_id=run_id,
+                        track_seen=stale_cleanup,
+                        seen_table=seen_stage_table,
+                        canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                        source_ids=source_ids,
+                    )
+                )
+                source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + retry_written_total
+                if (
+                    retry_result.complete
+                    and not retry_result.error
+                    and not retry_result.bounded
+                    and retry_result.rows_fetched == 0
+                    and retry_written_total == 0
+                ):
+                    retry_result = replace(
+                        retry_result,
+                        complete=False,
+                        error=PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR,
+                    )
+            retry_diagnostic = _resource_fetch_diagnostic(
+                retry_result,
+                rows_written_per_source=retry_written_total // max(1, len(source_ids)),
+            )
+            retry_diagnostic["retry_of_zero_rows"] = True
+            retry_diagnostic["retry_reason"] = PRACTITIONER_ROLE_ZERO_RETRY_REASON
+            source_resource_diagnostics["PractitionerRole"] = retry_diagnostic
+            if retry_result.error != PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR:
+                await mark_resource_stale_cleanup_ready("PractitionerRole", retry_result)
+        elif deferred_zero_role_cleanup is not None:
+            await mark_resource_stale_cleanup_ready("PractitionerRole", deferred_zero_role_cleanup)
         if (
             "PractitionerRole" in resources
             and _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
@@ -6567,21 +8599,7 @@ async def _import_resources(
                 result,
                 rows_written_per_source=written_total // max(1, len(source_ids)),
             )
-            if stale_cleanup and result.complete:
-                if seen_stage_table:
-                    source_stale_ready_source_ids["PractitionerRole"] = list(source_ids)
-                else:
-                    for source_id in source_ids:
-                        stale_deleted = await _delete_stale_resource_rows(
-                            result.model,
-                            source_id,
-                            run_id,
-                            use_seen_table=True,
-                        )
-                        if stale_deleted:
-                            source_stale_counts["PractitionerRole"] = (
-                                source_stale_counts.get("PractitionerRole", 0) + stale_deleted
-                            )
+            await mark_resource_stale_cleanup_ready("PractitionerRole", result)
         if linked_resource_limit > 0 and rows_by_resource:
             async with progress_lock:
                 active_group_details[group_key]["current_resource"] = "Linked resources"
@@ -6700,7 +8718,7 @@ async def _import_resources(
 
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
-    task = task or {}
+    task = _apply_provider_directory_refresh_preset(task or {})
     await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
     test_mode = bool(task.get("test") or task.get("test_mode") or ctx["context"].get("test_mode"))
@@ -6729,6 +8747,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     publish_corroboration = _publish_corroboration_enabled(task.get("publish_corroboration"))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
+    include_supplemental_catalogs = _bool_or_default(task.get("include_supplemental_catalogs"), False)
     credential_config_file = _clean_text(task.get("credential_config_file"))
     _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(credential_config_file)
     full_refresh = bool(task.get("full_refresh", False))
@@ -6788,7 +8807,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         metrics = await _publish_provider_directory_artifacts(
             run_id=run_id,
             metrics=metrics,
-            address_key_run_id=run_id,
+            address_key_run_id=None,
+            publish_scope_run_id=None,
             source_ids=requested_source_ids,
             publish_corroboration=publish_corroboration,
         )
@@ -6802,6 +8822,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     tmpdir = None
     retest_tmpdir = None
     supplemental_retest_seed_rows: list[dict[str, Any]] = []
+    supplemental_catalog_seed_rows: list[dict[str, Any]] = []
+    supplemental_catalog_metrics: dict[str, Any] = {
+        "enabled": include_supplemental_catalogs,
+        "rows": 0,
+        "catalogs": {},
+    }
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory resolving source catalog",
@@ -6838,6 +8864,19 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     if retest_path is not None:
         supplemental_retest_seed_rows = _seed_rows_from_retest_results(retest_path, source_query=source_query)
         seed_rows.extend(supplemental_retest_seed_rows)
+    if include_supplemental_catalogs:
+        supplemental_catalog_seed_rows, supplemental_catalog_metrics = _seed_rows_from_supplemental_catalogs(
+            source_query=source_query,
+            timeout=timeout,
+            amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
+            amerihealth_caritas_catalog_url=_clean_text(task.get("amerihealth_caritas_catalog_url")),
+            contra_costa_catalog_path=_clean_text(task.get("contra_costa_catalog_path")),
+            contra_costa_catalog_url=_clean_text(task.get("contra_costa_catalog_url")),
+            cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
+            cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
+        )
+        supplemental_catalog_metrics["enabled"] = True
+        seed_rows.extend(supplemental_catalog_seed_rows)
 
     try:
         source_rows = _dedupe_source_rows([_source_row_from_seed(row) for row in seed_rows])
@@ -6859,6 +8898,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "sources_seeded": len(source_rows),
             "source_ids": requested_source_ids,
             "supplemental_retest_sources_considered": len(supplemental_retest_seed_rows),
+            "supplemental_catalog_sources_considered": len(supplemental_catalog_seed_rows),
+            "supplemental_catalogs": supplemental_catalog_metrics,
             "stale_source_rows_deleted": stale_source_rows_deleted,
             "sources_probed": 0,
             "valid_capability_sources": 0,
@@ -6990,6 +9031,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     metrics=metrics,
                     seen_table=seen_stage_table_for_publish,
                     address_key_run_id=run_id,
+                    publish_scope_run_id=run_id,
                     source_ids=artifact_source_ids,
                     publish_corroboration=publish_corroboration,
                 )
@@ -7046,6 +9088,10 @@ async def main(
     source_ids: list[str] | tuple[str, ...] | str | None = None,
     limit: int | None = None,
     source_query: str | None = None,
+    refresh_preset: str | None = None,
+    include_supplemental_catalogs: bool | None = None,
+    cms_sma_endpoint_directory_path: str | None = None,
+    cms_sma_endpoint_directory_url: str | None = None,
     seed_only: bool = False,
     probe: bool = True,
     import_resources: bool = False,
@@ -7083,6 +9129,10 @@ async def main(
         "source_ids": source_ids,
         "limit": limit,
         "source_query": source_query,
+        "refresh_preset": refresh_preset,
+        "include_supplemental_catalogs": include_supplemental_catalogs,
+        "cms_sma_endpoint_directory_path": cms_sma_endpoint_directory_path,
+        "cms_sma_endpoint_directory_url": cms_sma_endpoint_directory_url,
         "seed_only": seed_only,
         "probe": probe,
         "import_resources": import_resources,
@@ -7135,6 +9185,13 @@ def _clean_source_id_list(raw_source_ids: Any) -> list[str]:
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX = "provider_directory_address_overlay_stage"
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
+    "source_record_idx",
+    "npi_idx",
+    "address_key_idx",
+    "source_idx",
+    "phone_idx",
+)
 
 
 def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
@@ -7213,21 +9270,39 @@ async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 
+def _address_overlay_index_name(table_name: str, suffix: str) -> str:
+    return _bounded_identifier(f"{table_name}_{suffix}")
+
+
 async def _create_provider_directory_address_overlay_indexes(schema: str, table_name: str) -> None:
     table_ref = _qt(schema, table_name)
     statements = (
-        f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(f'{table_name}_source_record_idx')} ON {table_ref} (source_record_id);",
-        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_npi_idx')} ON {table_ref} (npi);",
-        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_address_key_idx')} ON {table_ref} (address_key);",
-        f"CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_source_idx')} ON {table_ref} (source_id);",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_record_idx'))} "
+        f"ON {table_ref} (source_record_id);",
+        f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
+        f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'address_key_idx'))} "
+        f"ON {table_ref} (address_key);",
+        f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_idx'))} "
+        f"ON {table_ref} (source_id);",
         f"""
-        CREATE INDEX IF NOT EXISTS {_q(f'{table_name}_phone_idx')}
+        CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'phone_idx'))}
             ON {table_ref} (phone_number, npi)
          WHERE phone_number IS NOT NULL AND phone_number <> '';
         """,
     )
     for statement in statements:
         await db.status(statement)
+
+
+async def _rename_address_overlay_stage_indexes(schema: str, stage_table: str) -> None:
+    for suffix in PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES:
+        stage_index_name = _address_overlay_index_name(stage_table, suffix)
+        target_index_name = _address_overlay_index_name(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, suffix)
+        if stage_index_name == target_index_name:
+            continue
+        await db.status(
+            f"ALTER INDEX IF EXISTS {_qt(schema, stage_index_name)} RENAME TO {_q(target_index_name)};"
+        )
 
 
 async def _address_overlay_scope_sources(
@@ -7512,6 +9587,304 @@ def provider_directory_address_overlay_insert_sql(
     )
 
 
+ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES = {
+    "organization_address": "organization",
+    "practitioner_role": "role",
+    "organization_affiliation": "affiliation",
+}
+
+
+ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
+    "organization_address": """
+        INSERT INTO {stage_ref} ({columns})
+        WITH organization_rows AS MATERIALIZED (
+            SELECT
+                organization.source_id::varchar AS source_id,
+                organization.last_seen_run_id::varchar AS last_seen_run_id,
+                organization.resource_id::varchar AS resource_id,
+                organization.npi::bigint AS npi,
+                organization.address_json::jsonb AS address_json,
+                organization.updated_at AS updated_at,
+                (
+                    SELECT telecom.value->>'value'
+                      FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                     WHERE telecom.value->>'system' = 'phone'
+                       AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                     LIMIT 1
+                )::varchar AS telephone_number,
+                (
+                    SELECT telecom.value->>'value'
+                      FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                     WHERE telecom.value->>'system' = 'fax'
+                       AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                     LIMIT 1
+                )::varchar AS fax_number
+              FROM {organization_table} AS organization
+             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+               AND organization.active IS DISTINCT FROM false
+               {component_scope}
+        ), raw_org_addresses AS MATERIALIZED (
+            SELECT
+                ('provider_directory_fhir:organization_address:' || organization_rows.source_id || ':' ||
+                    organization_rows.resource_id || ':' || addr.ordinal::varchar)::varchar AS source_record_id,
+                organization_rows.source_id,
+                organization_rows.last_seen_run_id,
+                'Organization'::varchar AS resource_type,
+                organization_rows.resource_id,
+                organization_rows.npi,
+                jsonb_build_array(
+                    NULLIF(TRIM(addr.value->'line'->>0), ''),
+                    NULLIF(TRIM(addr.value->'line'->>1), ''),
+                    NULLIF(TRIM(addr.value->>'city'), ''),
+                    NULLIF(TRIM(addr.value->>'state'), ''),
+                    NULLIF(TRIM(addr.value->>'postalCode'), ''),
+                    COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')
+                )::text::varchar AS address_lookup_key,
+                NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
+                NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
+                NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
+                NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
+                NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+                COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')::varchar AS country_code,
+                organization_rows.telephone_number,
+                organization_rows.fax_number,
+                organization_rows.updated_at AS source_updated_at
+              FROM organization_rows
+              JOIN LATERAL jsonb_array_elements(
+                    COALESCE(organization_rows.address_json, '[]'::jsonb)
+              ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
+             WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
+               AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
+               AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+        ), org_address_keys AS MATERIALIZED (
+            SELECT
+                key_parts.address_lookup_key,
+                key_parts.first_line,
+                key_parts.second_line,
+                key_parts.city_name,
+                key_parts.state_name,
+                key_parts.postal_code,
+                key_parts.country_code,
+                {qschema}.addr_key_v1(
+                    key_parts.first_line,
+                    key_parts.second_line,
+                    key_parts.city_name,
+                    key_parts.state_name,
+                    key_parts.postal_code,
+                    key_parts.country_code
+                ) AS address_key,
+                {qschema}.addr_state_code_v1(key_parts.state_name)::varchar AS state_code
+              FROM (
+                    SELECT DISTINCT
+                        address_lookup_key,
+                        first_line,
+                        second_line,
+                        city_name,
+                        state_name,
+                        postal_code,
+                        country_code
+                      FROM raw_org_addresses
+              ) AS key_parts
+        )
+        SELECT
+            raw.source_record_id,
+            raw.source_id,
+            raw.last_seen_run_id,
+            raw.resource_type,
+            raw.resource_id,
+            raw.npi,
+            keys.address_key,
+            raw.first_line,
+            raw.second_line,
+            raw.city_name,
+            raw.state_name,
+            keys.state_code,
+            raw.postal_code,
+            raw.country_code,
+            raw.telephone_number,
+            raw.fax_number,
+            NULL::varchar AS phone_number,
+            NULL::varchar AS fax_number_digits,
+            'street'::varchar AS address_precision,
+            raw.source_updated_at,
+            now() AS published_at
+          FROM raw_org_addresses AS raw
+          JOIN org_address_keys AS keys
+            ON keys.address_lookup_key = raw.address_lookup_key
+         WHERE keys.address_key IS NOT NULL;
+    """,
+    "practitioner_role": """
+        INSERT INTO {stage_ref} ({columns})
+        SELECT {columns}
+          FROM (
+            SELECT
+                ('provider_directory_fhir:practitioner_role:' || role.source_id || ':' ||
+                    role.resource_id || ':' || loc.resource_id)::varchar AS source_record_id,
+                role.source_id::varchar AS source_id,
+                role.last_seen_run_id::varchar AS last_seen_run_id,
+                'PractitionerRole'::varchar AS resource_type,
+                role.resource_id::varchar AS resource_id,
+                practitioner.npi::bigint AS npi,
+                CASE
+                    WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
+                    ELSE {qschema}.addr_key_v1(
+                        loc.first_line,
+                        loc.second_line,
+                        loc.city_name,
+                        COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
+                        loc.postal_code,
+                        COALESCE(NULLIF(loc.country_code, ''), 'US')
+                    )
+                END AS address_key,
+                loc.first_line::varchar AS first_line,
+                loc.second_line::varchar AS second_line,
+                loc.city_name::varchar AS city_name,
+                COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
+                loc.state_code::varchar AS state_code,
+                loc.postal_code::varchar AS postal_code,
+                COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+                loc.telephone_number::varchar AS telephone_number,
+                loc.fax_number::varchar AS fax_number,
+                loc.phone_number::varchar AS phone_number,
+                loc.fax_number_digits::varchar AS fax_number_digits,
+                'street'::varchar AS address_precision,
+                GREATEST(
+                    COALESCE(role.updated_at, TIMESTAMP 'epoch'),
+                    COALESCE(practitioner.updated_at, TIMESTAMP 'epoch'),
+                    COALESCE(loc.updated_at, TIMESTAMP 'epoch')
+                ) AS source_updated_at,
+                now() AS published_at
+              FROM {practitioner_role_table} AS role
+              JOIN {practitioner_table} AS practitioner
+                ON practitioner.source_id = role.source_id
+               AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
+              JOIN LATERAL jsonb_array_elements_text(COALESCE(role.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
+                ON TRUE
+              JOIN {location_table} AS loc
+                ON loc.source_id = role.source_id
+               AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+               AND practitioner.active IS DISTINCT FROM false
+               AND role.active IS DISTINCT FROM false
+               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+               AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
+               AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
+               AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
+               {component_scope}
+          ) AS overlay_rows
+         WHERE address_key IS NOT NULL;
+    """,
+    "organization_affiliation": """
+        INSERT INTO {stage_ref} ({columns})
+        SELECT {columns}
+          FROM (
+            SELECT
+                ('provider_directory_fhir:organization_affiliation:' || affiliation.source_id || ':' ||
+                    affiliation.resource_id || ':' || loc.resource_id)::varchar AS source_record_id,
+                affiliation.source_id::varchar AS source_id,
+                affiliation.last_seen_run_id::varchar AS last_seen_run_id,
+                'OrganizationAffiliation'::varchar AS resource_type,
+                affiliation.resource_id::varchar AS resource_id,
+                organization.npi::bigint AS npi,
+                CASE
+                    WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
+                    ELSE {qschema}.addr_key_v1(
+                        loc.first_line,
+                        loc.second_line,
+                        loc.city_name,
+                        COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
+                        loc.postal_code,
+                        COALESCE(NULLIF(loc.country_code, ''), 'US')
+                    )
+                END AS address_key,
+                loc.first_line::varchar AS first_line,
+                loc.second_line::varchar AS second_line,
+                loc.city_name::varchar AS city_name,
+                COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
+                loc.state_code::varchar AS state_code,
+                loc.postal_code::varchar AS postal_code,
+                COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+                loc.telephone_number::varchar AS telephone_number,
+                loc.fax_number::varchar AS fax_number,
+                loc.phone_number::varchar AS phone_number,
+                loc.fax_number_digits::varchar AS fax_number_digits,
+                'street'::varchar AS address_precision,
+                GREATEST(
+                    COALESCE(affiliation.updated_at, TIMESTAMP 'epoch'),
+                    COALESCE(organization.updated_at, TIMESTAMP 'epoch'),
+                    COALESCE(loc.updated_at, TIMESTAMP 'epoch')
+                ) AS source_updated_at,
+                now() AS published_at
+              FROM {affiliation_table} AS affiliation
+              JOIN LATERAL (
+                  SELECT DISTINCT normalized_ref AS resource_id
+                    FROM (
+                        VALUES
+                            (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                            (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                    ) AS refs(normalized_ref)
+                   WHERE normalized_ref IS NOT NULL
+              ) AS organization_ref ON TRUE
+              JOIN {organization_table} AS organization
+                ON organization.source_id = affiliation.source_id
+               AND organization.resource_id = organization_ref.resource_id
+              JOIN LATERAL jsonb_array_elements_text(COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
+                ON TRUE
+              JOIN {location_table} AS loc
+                ON loc.source_id = affiliation.source_id
+               AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+               AND organization.active IS DISTINCT FROM false
+               AND affiliation.active IS DISTINCT FROM false
+               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+               AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
+               AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
+               AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
+               {component_scope}
+          ) AS overlay_rows
+         WHERE address_key IS NOT NULL;
+    """,
+}
+
+
+def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: str | None) -> dict[str, str]:
+    """Return shared SQL template parameters for Provider Directory overlay inserts."""
+    return {
+        "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
+        "columns": ", ".join(_provider_directory_address_overlay_columns()),
+        "qschema": _q(schema),
+        "uuid_re": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "organization_table": _qt(schema, "provider_directory_organization"),
+        "practitioner_table": _qt(schema, "provider_directory_practitioner"),
+        "location_table": _qt(schema, "provider_directory_location"),
+        "practitioner_role_table": _qt(schema, "provider_directory_practitioner_role"),
+        "affiliation_table": _qt(schema, "provider_directory_organization_affiliation"),
+    }
+
+
+def _address_overlay_component_insert_sql(
+    db_schema: str | None = None,
+    stage_table: str | None = None,
+    *,
+    component: str,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Build one bounded insert for a Provider Directory overlay component."""
+    template = ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES.get(component)
+    scope_type = ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES.get(component)
+    if template is None or scope_type is None:
+        raise ValueError(f"unknown Provider Directory address overlay component: {component}")
+    schema = db_schema if db_schema is not None else _schema()
+    context = _address_overlay_sql_context(schema, stage_table, run_id)
+    context["component_scope"] = _provider_directory_overlay_scope_filter(
+        scope_type,
+        run_id=run_id,
+        source_ids=source_ids,
+    )
+    return template.format(**context)
+
+
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES = (
     "provider_directory_organization",
     "provider_directory_practitioner",
@@ -7551,13 +9924,14 @@ async def _copy_existing_address_overlay(
     )
 
 
-async def _swap_address_overlay_stage(schema: str, stage_ref: str, target_ref: str) -> None:
+async def _swap_address_overlay_stage(schema: str, stage_table: str, stage_ref: str, target_ref: str) -> None:
     old_table = f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE}_old"
     async with db.transaction():
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
         await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_table)};")
         await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)};")
     await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
+    await _rename_address_overlay_stage_indexes(schema, stage_table)
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 
@@ -7572,22 +9946,28 @@ async def _populate_address_overlay_stage(
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     columns = ", ".join(_provider_directory_address_overlay_columns())
     copied_existing = await _copy_existing_address_overlay(stage_ref, target_ref, columns, source_ids)
-    inserted = _coerce_rowcount(
-        await db.status(
-            provider_directory_address_overlay_insert_sql(
-                schema,
-                stage_table,
-                run_id=run_id,
-                source_ids=source_ids,
-            ),
-            **query_param_dict,
+    inserted_by_component: dict[str, int] = {}
+    for component in ("organization_address", "practitioner_role", "organization_affiliation"):
+        inserted_by_component[component] = _coerce_rowcount(
+            await db.status(
+                _address_overlay_component_insert_sql(
+                    schema,
+                    stage_table,
+                    component=component,
+                    run_id=run_id,
+                    source_ids=source_ids,
+                ),
+                **query_param_dict,
+            )
         )
-    )
+    inserted = sum(inserted_by_component.values())
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+    await _create_provider_directory_address_overlay_indexes(schema, stage_table)
     await db.status(f"ANALYZE {stage_ref};")
     return {
         "copied_existing": copied_existing,
         "inserted": inserted,
+        "inserted_by_component": inserted_by_component,
         "stage_rows": stage_rows,
     }
 
@@ -7609,6 +9989,13 @@ async def publish_provider_directory_address_overlay(
         run_id=run_id,
         source_ids=source_ids,
     )
+    if run_id is not None and not effective_source_ids:
+        return {
+            "skipped": True,
+            "reason": "no_scoped_sources",
+            "source_ids": [],
+            "relation": _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE),
+        }
     stage_table = _address_overlay_stage_table_name(run_id)
     stage_ref = _qt(schema, stage_table)
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
@@ -7629,11 +10016,12 @@ async def publish_provider_directory_address_overlay(
             effective_source_ids,
             query_param_dict,
         )
-        await _swap_address_overlay_stage(schema, stage_ref, target_ref)
+        await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref)
         return {
             "published": True,
             "rows": stage_metric_dict["stage_rows"],
             "inserted": stage_metric_dict["inserted"],
+            "inserted_by_component": stage_metric_dict["inserted_by_component"],
             "copied_existing": stage_metric_dict["copied_existing"],
             "source_ids": effective_source_ids,
             "relation": target_ref,

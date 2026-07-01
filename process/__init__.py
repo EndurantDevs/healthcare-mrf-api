@@ -80,6 +80,7 @@ from process.provider_enrichment import (main as initiate_provider_enrichment,
 from process.provider_directory_fhir import (
     main as initiate_provider_directory_fhir,
     process_data as process_provider_directory_fhir_data,
+    PROVIDER_DIRECTORY_REFRESH_PRESETS,
     shutdown as provider_directory_fhir_shutdown,
     startup as provider_directory_fhir_startup,
 )
@@ -1143,9 +1144,24 @@ def provider_enrichment(test: bool):
 )
 @click.option("--limit", type=int, help="Maximum seed sources to process.")
 @click.option("--source-query", help="Case-insensitive org/plan substring filter for the seed database.")
+@click.option(
+    "--refresh-preset",
+    type=click.Choice(PROVIDER_DIRECTORY_REFRESH_PRESETS, case_sensitive=False),
+    help="Named Provider Directory refresh defaults, e.g. monthly-full for scheduled full resource imports.",
+)
+@click.option(
+    "--include-supplemental-catalogs/--no-include-supplemental-catalogs",
+    default=None,
+    help="Include payer-specific supplemental Provider Directory catalog pages. Defaults on for monthly-full.",
+)
 @click.option("--seed-only", is_flag=True, help="Load source rows without probing endpoints.")
 @click.option("--no-probe", is_flag=True, help="Skip CapabilityStatement probes.")
-@click.option("--import-resources", is_flag=True, help="Fetch resources from importable FHIR endpoints.")
+@click.option(
+    "--import-resources",
+    is_flag=True,
+    default=None,
+    help="Fetch resources from importable FHIR endpoints.",
+)
 @click.option(
     "--canonical-backfill-only",
     is_flag=True,
@@ -1171,8 +1187,7 @@ def provider_enrichment(test: bool):
 )
 @click.option(
     "--full-refresh/--sample-refresh",
-    default=False,
-    show_default=True,
+    default=None,
     help="Default to unbounded resource/page scanning for full Provider Directory refreshes.",
 )
 @click.option(
@@ -1224,6 +1239,8 @@ def provider_directory_fhir(
     source_id: tuple[str, ...],
     limit: int | None,
     source_query: str | None,
+    refresh_preset: str | None,
+    include_supplemental_catalogs: bool | None,
     seed_only: bool,
     no_probe: bool,
     import_resources: bool,
@@ -1260,6 +1277,8 @@ def provider_directory_fhir(
             source_ids=list(source_id),
             limit=limit,
             source_query=source_query,
+            refresh_preset=refresh_preset,
+            include_supplemental_catalogs=include_supplemental_catalogs,
             seed_only=seed_only,
             probe=not no_probe,
             import_resources=import_resources,
@@ -1368,13 +1387,13 @@ def pharmacy_economics(test: bool):
     show_default=True,
     help=(
         "full rebuilds all address-bearing sources; "
-        "provider-directory-partial patches Provider Directory serving rows."
+        "provider-directory-partial rebuilds changed Provider Directory serving rows via replacement-table publish."
     ),
 )
 @click.option(
     "--serving-only-refresh/--full-refresh-support",
     default=None,
-    help="For full refreshes, publish only the denormalized serving table and leave support tables unchanged.",
+    help="Publish only the denormalized serving table and leave support tables unchanged.",
 )
 @click.option("--provider-directory-run-id", help="Provider Directory FHIR run id to scope provider-directory-partial.")
 @click.option(
@@ -1385,7 +1404,7 @@ def pharmacy_economics(test: bool):
 @click.option(
     "--provider-directory-partial-scope",
     type=click.Choice(["latest-run", "all"], case_sensitive=False),
-    help="Default provider-directory-partial scope; latest-run avoids unscoped full-source patches.",
+    help="Default provider-directory-partial scope; latest-run avoids unscoped full-source refreshes.",
 )
 @click.option(
     "--provider-directory-source-batch-size",

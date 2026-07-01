@@ -1820,14 +1820,14 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
         parent_group = _infer_parent_group(current_section, payer_name)
         for url in urls:
             target_payer_query = _master_list_target_payer_query(notes_text)
-            raw_payload = {
+            raw_payload_map = {
                 "section": current_section,
                 "raw_payer_name": raw_payer_name,
                 "url_cell": url_cell,
                 "notes": notes_text,
             }
             if target_payer_query:
-                raw_payload["target_payer_query"] = target_payer_query
+                raw_payload_map["target_payer_query"] = target_payer_query
             candidates.append(
                 SourceCandidate(
                     payer_name=payer_name,
@@ -1859,7 +1859,7 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
                     confidence=85 if url else 45,
                     license_status="curated_public_research",
                     review_status="pending",
-                    raw_payload=raw_payload,
+                    raw_payload=raw_payload_map,
                 )
             )
     return _dedupe_candidates(candidates)
@@ -14077,9 +14077,9 @@ async def _push_import_control_catalog(
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
         return (0, 0, [])
-    eligible_groups: dict[str, list[dict[str, Any]]] = {}
+    eligible_groups_map: dict[str, list[dict[str, Any]]] = {}
     for row in eligible:
-        eligible_groups.setdefault(_import_control_source_identity_key(row), []).append(row)
+        eligible_groups_map.setdefault(_import_control_source_identity_key(row), []).append(row)
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     headers = {
@@ -14093,7 +14093,7 @@ async def _push_import_control_catalog(
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
-        for group_rows in eligible_groups.values():
+        for group_rows in eligible_groups_map.values():
             snapshot_source_ids = [
                 str(row.get("source_id") or "")
                 for row in group_rows

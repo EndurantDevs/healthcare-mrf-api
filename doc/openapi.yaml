@@ -2532,6 +2532,7 @@ paths:
           in: query
           schema:
             type: boolean
+            default: false
           description: Include mailing addresses when applying location filters.
       responses:
         '200':

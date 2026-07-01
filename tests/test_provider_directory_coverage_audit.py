@@ -22,6 +22,18 @@ def test_provider_directory_coverage_audit_parse_args_accepts_skip_ptg():
     assert args.skip_ptg is True
 
 
+def test_provider_directory_coverage_audit_parse_args_accepts_require_serving_ready():
+    args = audit.parse_args(["--require-serving-ready"])
+
+    assert args.require_serving_ready is True
+
+
+def test_provider_directory_coverage_audit_parse_args_accepts_fast_serving_readiness():
+    args = audit.parse_args(["--fast-serving-readiness"])
+
+    assert args.fast_serving_readiness is True
+
+
 def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flags():
     args = audit.parse_args(
         [
@@ -51,6 +63,12 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
     assert args.skip_ptg_network_overlap is True
     assert args.force_ptg_live_view_scans is True
     assert args.statement_timeout_ms == 5000
+
+
+def test_provider_directory_coverage_audit_pod_safe_sets_fast_serving_readiness():
+    args = audit.parse_args(["--pod-safe"])
+
+    assert args.fast_serving_readiness is True
 
 
 def test_provider_directory_coverage_audit_pod_safe_sets_expensive_skip_flags():
@@ -283,6 +301,152 @@ def test_provider_directory_coverage_audit_retest_coverage_counts_current_redire
             "api_base": "https://public-directory.example/providers",
             "status_code": 200,
             "payer_id": 999,
+        }
+    ]
+
+
+def test_provider_directory_coverage_audit_retest_coverage_groups_unchecked_backlog():
+    coverage = audit._source_catalog_retest_coverage(
+        {
+            "results": [
+                {
+                    "classification": "unreachable",
+                    "org_name": "Molina Healthcare",
+                    "api_base": "https://fhir.molinahealthcare.com/provider-directory/",
+                },
+                {
+                    "classification": "unreachable",
+                    "org_name": "Centene",
+                    "api_base": "https://fhir.centene.com/provider-directory/",
+                },
+                {
+                    "classification": "unreachable",
+                    "org_name": "WellCare",
+                    "api_base": "https://fhir.centene.com/provider-directory/",
+                },
+                {
+                    "classification": "no_api",
+                    "org_name": "Health Partners Plans",
+                    "api_base": None,
+                },
+                {
+                    "classification": "no_api",
+                    "org_name": "Still Missing Payer",
+                    "api_base": None,
+                },
+                {
+                    "classification": "no_api",
+                    "org_name": "First Medical Health Plan, Inc.",
+                    "api_base": None,
+                },
+                {
+                    "classification": "not_found",
+                    "org_name": "AmeriHealth Caritas",
+                    "api_base": "https://fhir.amerihealthcaritas.com/provider-directory/",
+                    "status_code": 404,
+                },
+                {
+                    "classification": "unreachable",
+                    "org_name": "State of Alaska",
+                    "api_base": "https://api.alaskafhir.com/r4/public/Practitioner",
+                },
+                {
+                    "classification": "timeout",
+                    "org_name": "Blue Cross and Blue Shield of Illinois",
+                    "api_base": "https://api.bcbsil.com/fhir/provider-directory/",
+                },
+            ],
+        },
+        [
+            {
+                "source_id": "pdfhir_molina",
+                "org_name": "Molina Healthcare",
+                "api_base": "https://api.interop.molinahealthcare.com/providerdirectory",
+                "canonical_api_base": "https://api.interop.molinahealthcare.com/providerdirectory",
+                "metadata_json": {
+                    "provider_directory_confirmed_base": "https://api.interop.molinahealthcare.com/providerdirectory",
+                    "provider_directory_equivalent_api_bases": [
+                        "https://fhir.molinahealthcare.com/provider-directory"
+                    ],
+                },
+            },
+            {
+                "source_id": "pdfhir_health_partners_plans",
+                "org_name": "Health Partners Plans",
+                "api_base": "https://providerfhirapi.healthpartnersplans.com",
+                "canonical_api_base": "https://providerfhirapi.healthpartnersplans.com",
+                "metadata_json": {},
+            },
+            {
+                "source_id": "pdfhir_amerihealth_caritas_pa",
+                "org_name": "AmeriHealth Caritas",
+                "api_base": "https://api-ext.amerihealthcaritas.com/0500/provider-api",
+                "canonical_api_base": "https://api-ext.amerihealthcaritas.com/0500/provider-api",
+                "metadata_json": {
+                    "provider_directory_replaces_stale_generic_api_bases": [
+                        "https://fhir.amerihealthcaritas.com/provider-directory"
+                    ]
+                },
+            },
+            {
+                "source_id": "pdfhir_centene",
+                "org_name": "Centene Corporation",
+                "api_base": "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory",
+                "canonical_api_base": "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory",
+                "metadata_json": {
+                    "provider_directory_replaces_stale_generic_api_bases": [
+                        "https://fhir.centene.com/provider-directory"
+                    ]
+                },
+            },
+            {
+                "source_id": "pdfhir_cms_sma_alaska",
+                "org_name": "State of Alaska",
+                "api_base": "https://api.alaskafhir.com/r4",
+                "canonical_api_base": "https://api.alaskafhir.com/r4",
+                "metadata_json": {
+                    "provider_directory_equivalent_api_bases": [
+                        "https://api.alaskafhir.com/r4/public/Practitioner"
+                    ]
+                },
+            },
+            {
+                "source_id": "pdfhir_bcbsil",
+                "org_name": "Blue Cross and Blue Shield of Illinois",
+                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/bcbsil/r4",
+                "canonical_api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/bcbsil/r4",
+                "last_validated_status": "valid",
+                "metadata_json": {},
+            },
+            {
+                "source_id": "pdfhir_first_medical_blocked",
+                "org_name": "First Medical Health Plan, Inc.",
+                "api_base": None,
+                "canonical_api_base": None,
+                "last_validated_status": "catalog_blocked",
+                "metadata_json": {"provider_directory_blocked": True},
+            },
+        ],
+        sample_limit=3,
+    )
+
+    assert coverage["unchecked_classification_counts"] == {
+        "no_api": 3,
+        "not_found": 1,
+        "timeout": 1,
+        "unreachable": 4,
+    }
+    assert coverage["unchecked_result_count"] == 9
+    assert coverage["recovered_unchecked_result_count"] == 8
+    assert coverage["uncovered_unchecked_result_count"] == 1
+    assert coverage["uncovered_unchecked_clusters"] == [
+        {
+            "source_host": "(missing host)",
+            "classification": "no_api",
+            "result_count": 1,
+            "sample_payers": ["Still Missing Payer"],
+            "sample_api_bases": [],
+            "sample_status_codes": [],
         }
     ]
 
@@ -1112,6 +1276,330 @@ def test_provider_directory_coverage_audit_ref_match_accepts_absolute_url_suffix
     assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
 
 
+def test_provider_directory_coverage_audit_reference_id_expr_accepts_absolute_url_suffixes():
+    sql = audit._sql_fhir_reference_resource_id("refs.ref", "Organization")
+
+    assert "regexp_replace(refs.ref, '^.*/Organization/', '')" in sql
+    assert "regexp_replace(refs.ref, '^Organization/', '')" in sql
+    assert "ELSE refs.ref" in sql
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_unified_summary_fast_probe(monkeypatch):
+    async def relation_exists(_conn, _schema, table):
+        return table == "entity_address_unified"
+
+    class FakeConn:
+        def __init__(self):
+            self.fetchrow_sql = ""
+
+        async def fetchrow(self, sql, *_args):
+            self.fetchrow_sql = sql
+            return {
+                "has_provider_directory_rows": True,
+                "has_provider_directory_keyed_rows": True,
+                "has_provider_directory_phone_rows": False,
+                "has_provider_directory_null_key_rows": True,
+                "has_provider_directory_source_record_id_rows": True,
+                "has_provider_directory_country_001_rows": False,
+                "has_provider_directory_country_us_rows": True,
+            }
+
+    conn = FakeConn()
+    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+
+    summary = await audit._unified_summary(conn, "mrf", fast_probe=True)
+
+    assert summary["available"] is True
+    assert summary["summary_source"] == "entity_address_unified_fast_probe"
+    assert summary["fast_probe"] is True
+    assert summary["counts_are_lower_bounds"] is True
+    assert summary["provider_directory_rows"] == 1
+    assert summary["provider_directory_keyed_rows"] == 1
+    assert summary["provider_directory_source_record_id_rows"] == 1
+    assert summary["provider_directory_source_record_id_pct"] == 100.0
+    assert "EXISTS (" in conn.fetchrow_sql
+    assert "LIMIT 1" in conn.fetchrow_sql
+    assert "count(*)" not in conn.fetchrow_sql.lower()
+
+
+def _serving_ready_report() -> dict:
+    return {
+        "source_summary": {
+            "available": True,
+            "source_count": 10,
+            "live_valid_count": 7,
+            "live_auth_required_count": 1,
+        },
+        "source_resource_coverage_summary": {
+            "available": True,
+            "source_count": 10,
+            "sources_with_resource_rows": 7,
+            "resource_source_pct": 70.0,
+        },
+        "unified_summary": {
+            "available": True,
+            "summary_source": "provider_directory_address_overlay",
+            "provider_directory_rows": 100,
+            "provider_directory_keyed_rows": 100,
+            "provider_directory_keyed_pct": 100.0,
+            "provider_directory_phone_rows": 80,
+            "provider_directory_phone_pct": 80.0,
+            "provider_directory_source_record_id_rows": 100,
+            "provider_directory_source_record_id_pct": 100.0,
+        },
+        "plan_network_context_summary": {
+            "available": True,
+            "network_ref_rows": 20,
+            "resolved_network_names": 5,
+        },
+        "network_catalog_summary": {
+            "available": True,
+            "network_catalog_rows": 5,
+            "rows_with_issuer_network_match_key": 5,
+        },
+        "ptg_summary": {
+            "ptg_unified_address": {
+                "available": True,
+                "ptg_unified_address_rows": 40,
+            },
+            "ptg_corroboration": {
+                "available": True,
+                "relation_kind": "table",
+                "corroboration_rows": 12,
+                "active_match_rows": 8,
+            },
+            "ptg_network_name_overlap": {
+                "available": True,
+                "provider_directory_plan_network_names": 3,
+                "matched_plan_network_names": 2,
+                "matched_plan_pairs": 1,
+            },
+        },
+    }
+
+
+def test_provider_directory_coverage_audit_serving_readiness_ready():
+    """Ready means imported FHIR data is searchable by address and phone."""
+    summary = audit._serving_readiness_summary(_serving_ready_report())
+
+    assert summary["status"] == "ready"
+    assert summary["required_fail_count"] == 0
+    assert [check["status"] for check in summary["checks"]] == ["pass"] * 8
+
+
+def test_provider_directory_coverage_audit_serving_readiness_flags_required_gaps():
+    summary = audit._serving_readiness_summary(
+        {
+            "source_summary": {"available": True, "source_count": 2},
+            "source_resource_coverage_summary": {
+                "available": True,
+                "source_count": 2,
+                "sources_with_resource_rows": 0,
+            },
+            "unified_summary": {
+                "available": True,
+                "provider_directory_rows": 10,
+                "provider_directory_keyed_rows": 10,
+                "provider_directory_phone_rows": 0,
+                "provider_directory_source_record_id_rows": 2,
+            },
+            "plan_network_context_summary": {
+                "available": True,
+                "network_ref_rows": 4,
+                "resolved_network_names": 2,
+            },
+            "network_catalog_summary": {
+                "available": False,
+            },
+            "ptg_summary": {
+                "ptg_unified_address": {
+                    "available": True,
+                    "ptg_unified_address_rows": 6,
+                },
+                "ptg_corroboration": {
+                    "available": False,
+                    "relation_kind": "view",
+                },
+                "ptg_network_name_overlap": {
+                    "available": True,
+                    "provider_directory_plan_network_names": 2,
+                    "matched_plan_network_names": 0,
+                },
+            },
+        }
+    )
+
+    failed = {check["name"] for check in summary["checks"] if check["status"] == "fail"}
+
+    assert summary["status"] == "not_ready"
+    assert summary["required_fail_count"] == 6
+    assert failed == {
+        "resource_rows_imported",
+        "searchable_phone_overlay",
+        "source_detail_attribution",
+        "network_catalog_published",
+        "ptg_corroboration_table",
+        "ptg_network_name_overlap",
+    }
+
+
+def test_provider_directory_coverage_audit_serving_readiness_respects_pod_safe_skips():
+    summary = audit._serving_readiness_summary(
+        {
+            "source_summary": {
+                "available": True,
+                "source_count": 2,
+                "live_valid_count": 1,
+            },
+            "source_resource_coverage_summary": {
+                "available": True,
+                "source_count": 2,
+                "sources_with_resource_rows": 1,
+            },
+            "unified_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-unified",
+            },
+            "plan_network_context_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-network-resolution",
+            },
+            "network_catalog_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-network-resolution",
+            },
+            "ptg_summary": audit._skipped_ptg_summary(),
+        }
+    )
+
+    checks = {check["name"]: check for check in summary["checks"]}
+
+    assert summary["status"] == "ready"
+    assert summary["required_fail_count"] == 0
+    assert checks["searchable_address_overlay"]["status"] == "skip"
+    assert checks["searchable_phone_overlay"]["status"] == "skip"
+    assert checks["source_detail_attribution"]["status"] == "skip"
+    assert checks["searchable_address_overlay"]["required"] is False
+    assert checks["searchable_phone_overlay"]["required"] is False
+
+
+def test_provider_directory_coverage_audit_gap_wording_for_fast_probe_lower_bounds():
+    gaps = audit._derive_gaps(
+        {
+            "source_summary": {"available": False},
+            "capability_status_counts": [],
+            "unified_summary": {
+                "available": True,
+                "counts_are_lower_bounds": True,
+                "provider_directory_rows": 1,
+                "provider_directory_keyed_rows": 1,
+                "provider_directory_null_key_rows": 1,
+                "provider_directory_source_record_id_rows": 1,
+                "provider_directory_country_001_rows": 1,
+            },
+            "source_resource_coverage_summary": {"available": False},
+        }
+    )
+
+    assert "At least one Provider Directory unified-address row still lacks address_key." in gaps
+    assert "At least one Provider Directory unified-address row still exposes country_code `001`." in gaps
+    assert all(not gap.startswith("1 Provider Directory unified-address") for gap in gaps)
+
+
+def test_provider_directory_coverage_audit_markdown_renders_serving_readiness():
+    report = {
+        "generated_at": "2026-07-01T12:00:00Z",
+        "schema": "mrf",
+        "source_summary": {
+            "available": True,
+            "source_count": 1,
+            "live_valid_count": 1,
+            "live_valid_pct": 100.0,
+            "live_auth_required_count": 0,
+            "auth_required_pct": 0.0,
+            "live_timeout_count": 0,
+            "timeout_pct": 0.0,
+            "live_credential_or_gateway_non_fhir_count": 0,
+            "live_valid_non_fhir_count": 0,
+            "api_base_count": 1,
+            "api_base_pct": 100.0,
+        },
+        "serving_readiness": {
+            "status": "not_ready",
+            "required_pass_count": 1,
+            "required_fail_count": 2,
+            "checks": [
+                {
+                    "name": "source_catalog_seeded",
+                    "status": "pass",
+                    "required": True,
+                    "metrics": {"source_count": 1},
+                },
+                {
+                    "name": "resource_rows_imported",
+                    "status": "fail",
+                    "required": True,
+                    "reason": "no Provider Directory source has imported FHIR resource rows",
+                    "metrics": {"sources_with_resource_rows": 0},
+                },
+                {
+                    "name": "searchable_phone_overlay",
+                    "status": "fail",
+                    "required": True,
+                    "reason": "no Provider Directory phone rows are available for provider phone search",
+                    "metrics": {"provider_directory_phone_rows": 0},
+                },
+            ],
+        },
+    }
+
+    markdown = audit.render_markdown(report)
+
+    assert "- serving readiness: `not_ready` (`1`/`3` required checks passing)" in markdown
+    assert "## Serving Readiness Gate" in markdown
+    assert "`resource_rows_imported`" in markdown
+    assert "no Provider Directory source has imported FHIR resource rows" in markdown
+    assert "`searchable_phone_overlay`" in markdown
+    assert "no Provider Directory phone rows are available for provider phone search" in markdown
+    assert '"provider_directory_phone_rows": 0' in markdown
+
+
+def test_provider_directory_coverage_audit_serving_readiness_exit_code():
+    ready_report = {"serving_readiness": {"status": "ready", "required_fail_count": 0}}
+    not_ready_report = {"serving_readiness": {"status": "not_ready", "required_fail_count": 2}}
+
+    assert audit._serving_readiness_exit_code(ready_report, require_serving_ready=True) == 0
+    assert audit._serving_readiness_exit_code(not_ready_report, require_serving_ready=True) == 1
+    assert audit._serving_readiness_exit_code(not_ready_report, require_serving_ready=False) == 0
+
+
+def test_provider_directory_coverage_audit_main_can_gate_serving_readiness(monkeypatch, capsys):
+    async def fake_build_report(_args):
+        return {
+            "generated_at": "2026-07-01T12:00:00Z",
+            "schema": "mrf",
+            "serving_readiness": {
+                "status": "not_ready",
+                "required_pass_count": 1,
+                "required_fail_count": 2,
+                "checks": [],
+            },
+        }
+
+    monkeypatch.setattr(audit, "build_report", fake_build_report)
+
+    exit_code = audit.main(["--require-serving-ready"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert '"status": "not_ready"' in captured.out
+    assert "Provider Directory serving readiness gate failed" in captured.err
+
+
 def test_provider_directory_coverage_audit_plan_network_context_sql_uses_ref_bearing_resources():
     sql = audit._plan_network_context_cte_sql("mrf")
 
@@ -1120,8 +1608,114 @@ def test_provider_directory_coverage_audit_plan_network_context_sql_uses_ref_bea
     assert '"mrf"."provider_directory_organization_affiliation"' in sql
     assert '"mrf"."provider_directory_organization"' in sql
     assert "jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb))" in sql
-    assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
+    assert "ref_resource_id" in sql
+    assert "org.resource_id = distinct_refs.ref_resource_id" in sql
     assert "sample_resolved_network_names" in sql
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_network_catalog_summary(monkeypatch):
+    async def relation_exists(_conn, _schema, table):
+        return table == "provider_directory_network_catalog"
+
+    class FakeConn:
+        def __init__(self):
+            self.fetchrow_sql = ""
+            self.fetch_sql = ""
+
+        async def fetchrow(self, sql, *_args):
+            self.fetchrow_sql = sql
+            return {
+                "network_catalog_rows": 10,
+                "network_catalog_source_count": 3,
+                "distinct_network_keys": 9,
+                "rows_with_issuer_network_match_key": 8,
+                "insurance_plan_ref_count": 4,
+                "practitioner_role_ref_count": 5,
+                "organization_affiliation_ref_count": 6,
+                "distinct_ref_count": 15,
+                "latest_published_at": None,
+            }
+
+        async def fetch(self, sql, *_args):
+            self.fetch_sql = sql
+            return [
+                {
+                    "source_id": "source_a",
+                    "source_org_name": "Issuer A",
+                    "source_plan_name": "Plan A",
+                    "canonical_api_base": "https://issuer.example/fhir",
+                    "network_count": 2,
+                    "distinct_ref_count": 7,
+                    "insurance_plan_ref_count": 3,
+                    "practitioner_role_ref_count": 2,
+                    "organization_affiliation_ref_count": 2,
+                    "sample_network_names": ["Choice Network", "PPO"],
+                }
+            ]
+
+    conn = FakeConn()
+    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+
+    summary = await audit._network_catalog_summary(conn, "mrf", sample_limit=5)
+
+    assert summary["available"] is True
+    assert summary["network_catalog_rows"] == 10
+    assert summary["issuer_network_match_key_pct"] == 80.0
+    assert summary["samples"][0]["sample_network_names"] == ["Choice Network", "PPO"]
+    assert '"mrf"."provider_directory_network_catalog"' in conn.fetchrow_sql
+    assert "provider_directory_issuer_network_match_key" in conn.fetchrow_sql
+    assert "sample_network_names" in conn.fetch_sql
+
+
+def test_provider_directory_coverage_audit_gaps_when_network_catalog_not_published():
+    report = {
+        "plan_network_context_summary": {
+            "available": True,
+            "sources_with_resolved_network_names": 3,
+            "resolved_network_names": 10,
+        },
+        "network_catalog_summary": {"available": False},
+        "ptg_summary": {
+            "ptg_corroboration": {"available": True, "corroboration_rows": 10},
+        },
+    }
+
+    assert audit._derive_gaps(report) == [
+        "Provider Directory has resolved network names, but `provider_directory_network_catalog` is not published."
+    ]
+
+
+def test_provider_directory_coverage_audit_markdown_includes_network_catalog():
+    markdown = audit.render_markdown(
+        {
+            "generated_at": "2026-07-01T00:00:00Z",
+            "schema": "mrf",
+            "network_catalog_summary": {
+                "available": True,
+                "network_catalog_rows": 10,
+                "network_catalog_source_count": 3,
+                "rows_with_issuer_network_match_key": 8,
+                "issuer_network_match_key_pct": 80.0,
+                "samples": [
+                    {
+                        "source_id": "source_a",
+                        "source_org_name": "Issuer A",
+                        "network_count": 2,
+                        "distinct_ref_count": 7,
+                        "insurance_plan_ref_count": 3,
+                        "practitioner_role_ref_count": 2,
+                        "organization_affiliation_ref_count": 2,
+                        "sample_network_names": ["Choice Network", "PPO"],
+                    }
+                ],
+            },
+        }
+    )
+
+    assert "- network catalog: `10` network(s) across `3` source(s); issuer/network match keys `8` (80.0%)" in markdown
+    assert "## Provider Directory Network Catalog" in markdown
+    assert "| Issuer A | 2 | 7 | 3 | 2 | 2 | Choice Network, PPO |" in markdown
 
 
 def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_rows():
@@ -1150,6 +1744,43 @@ def test_provider_directory_coverage_audit_gaps_when_requested_plan_lacks_corrob
     assert audit._derive_gaps(report) == [
         "Requested PTG plan `codex_plan_a` has no Provider Directory address corroboration rows."
     ]
+
+
+def test_provider_directory_coverage_audit_gaps_when_network_context_lacks_corroboration_publish():
+    report = {
+        "plan_network_context_summary": {
+            "available": True,
+            "sources_with_resolved_network_names": 29,
+            "resolved_network_names": 570,
+        },
+        "ptg_summary": {
+            "ptg_corroboration": {"available": False},
+        },
+    }
+
+    assert audit._derive_gaps(report) == [
+        "Provider Directory has resolved network names from 29 source(s), "
+        "but `provider_directory_address_corroboration` is not published for PTG network matching."
+    ]
+
+
+def test_provider_directory_coverage_audit_suppresses_network_corroboration_gap_when_ptg_skipped():
+    report = {
+        "plan_network_context_summary": {
+            "available": True,
+            "sources_with_resolved_network_names": 29,
+            "resolved_network_names": 570,
+        },
+        "ptg_summary": {
+            "ptg_corroboration": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-ptg-corroboration",
+            },
+        },
+    }
+
+    assert audit._derive_gaps(report) == []
 
 
 def test_provider_directory_coverage_audit_gaps_for_missing_unified_source_ids_and_numeric_country():
@@ -1716,7 +2347,9 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
                 "phone_unified_rows": 8,
             }
 
-        async def fetch(self, _sql, _limit):
+        async def fetch(self, _sql, *_args):
+            if "resource_diagnostics" in _sql:
+                return []
             self.fetch_calls += 1
             if self.fetch_calls == 1:
                 return [
@@ -1798,6 +2431,87 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
     assert (
         summary["organization_address_without_unified_samples"][0]["source_id"]
         == "pdfhir_org_no_projection"
+    )
+
+
+@pytest.mark.asyncio
+async def test_practitioner_role_reimport_gap_summary_flags_missing_roles(monkeypatch):
+    async def relation_exists(_conn, _schema, table):
+        return table in {
+            "provider_directory_source",
+            "provider_directory_practitioner",
+            "provider_directory_location",
+            "provider_directory_practitioner_role",
+            "provider_directory_address_overlay",
+        }
+
+    class FakeConn:
+        def __init__(self):
+            self.fetchrow_sql = None
+            self.fetch_sql = None
+
+        async def fetchrow(self, sql):
+            self.fetchrow_sql = sql
+            return {
+                "source_count": 3,
+                "sources_with_practitioner_role_endpoint": 2,
+                "practitioner_role_reimport_gap_source_count": 1,
+                "practitioner_role_without_location_ref_source_count": 0,
+                "practitioner_role_projection_gap_source_count": 0,
+            }
+
+        async def fetch(self, sql, *_args):
+            self.fetch_sql = sql
+            return [
+                {
+                    "source_id": "pdfhir_michigan",
+                    "org_name": "Michigan",
+                    "plan_name": "Medicaid",
+                    "canonical_api_base": "https://api.interopstation.com/mdhhs/fhir",
+                    "endpoint_practitioner_role": "https://api.interopstation.com/mdhhs/fhir/PractitionerRole",
+                    "last_probe_status": "valid",
+                    "auth_type": "open",
+                    "practitioner_rows": 15800,
+                    "valid_npi_practitioner_rows": 15800,
+                    "location_rows": 9035,
+                    "street_zip_location_rows": 2000,
+                    "practitioner_role_rows": 0,
+                    "practitioner_role_location_ref_rows": 0,
+                    "overlay_rows": 0,
+                }
+            ]
+
+    conn = FakeConn()
+    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
+
+    summary = await audit._practitioner_role_reimport_gap_summary(conn, "mrf", sample_limit=5)
+
+    assert summary["available"] is True
+    assert summary["sources_with_practitioner_role_endpoint"] == 2
+    assert summary["practitioner_role_reimport_gap_source_count"] == 1
+    assert summary["samples"][0]["source_id"] == "pdfhir_michigan"
+    assert "provider_directory_address_overlay" in conn.fetchrow_sql
+    assert "valid_npi_practitioner_rows > 0" in conn.fetch_sql
+    assert "practitioner_role_rows = 0" in conn.fetch_sql
+
+
+def test_provider_directory_coverage_audit_gap_includes_practitioner_role_reimport_gap():
+    report = {
+        "source_summary": {"available": True, "source_count": 1, "auth_required_sources": 0},
+        "capability_status_counts": {},
+        "unified_summary": {"available": False},
+        "source_resource_coverage_summary": {"available": False},
+        "practitioner_role_reimport_gap_summary": {
+            "available": True,
+            "practitioner_role_reimport_gap_source_count": 2,
+        },
+    }
+
+    gaps = audit._derive_gaps(report)
+
+    assert (
+        "2 Provider Directory source(s) expose PractitionerRole endpoints and have practitioners/locations, but no imported PractitionerRole rows."
+        in gaps
     )
 
 

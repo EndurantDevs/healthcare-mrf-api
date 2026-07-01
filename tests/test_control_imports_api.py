@@ -61,6 +61,14 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "credential_config_file" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    provider_directory_refresh_preset = next(
+        param
+        for param in items["provider-directory-fhir"]["params_schema"]
+        if param["name"] == "refresh_preset"
+    )
+    assert provider_directory_refresh_preset["type"] == "choice"
+    assert "monthly-full" in provider_directory_refresh_preset["choices"]
+    assert any(param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
@@ -132,9 +140,20 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
         for param in items["entity-address-unified"]["params_schema"]
     )
     assert any(
+        param["name"] == "serving_only_refresh" and param["type"] == "boolean"
+        for param in items["entity-address-unified"]["params_schema"]
+    )
+    assert any(
         param["name"] == "refresh_mode" and param["type"] == "choice"
         for param in items["entity-address-unified"]["params_schema"]
     )
+    entity_provider_directory_scope = next(
+        param
+        for param in items["entity-address-unified"]["params_schema"]
+        if param["name"] == "provider_directory_partial_scope"
+    )
+    assert entity_provider_directory_scope["type"] == "choice"
+    assert entity_provider_directory_scope["choices"] == ["latest-run", "all"]
     assert any(
         param["name"] == "provider_directory_source_batch_size" and param["type"] == "integer"
         for param in items["entity-address-unified"]["params_schema"]
@@ -146,6 +165,20 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert "provider-directory-partial" in entity_refresh_mode["choices"]
     assert "ptg-partial" not in entity_refresh_mode["choices"]
     assert not any(param["name"] == "ptg_source_key" for param in items["entity-address-unified"]["params_schema"])
+
+
+def test_provider_directory_runtime_contract_preflight_passes():
+    from scripts.smoke import provider_directory_runtime_contract
+
+    report = provider_directory_runtime_contract.build_report()
+
+    assert report["ok"] is True, report
+    assert report["checks"]["provider_directory_cli"]["ok"] is True
+    assert report["checks"]["coverage_audit_cli"]["ok"] is True
+    assert report["checks"]["provider_directory_harness_cli"]["ok"] is True
+    assert report["checks"]["importer_schema"]["ok"] is True
+    assert report["checks"]["monthly_preset"]["ok"] is True
+    assert report["checks"]["serving_readiness_contract"]["ok"] is True
 
 
 def test_control_wrapped_publish_importers_request_shutdown():
