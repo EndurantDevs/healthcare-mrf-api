@@ -2338,6 +2338,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         )
     benefit_lines_by_ancillary_name = {
         "Apta Health Coverage": ("medical",),
+        "Allegiance Ancillary Claims Coverage": ("dental", "vision"),
         "Auxiant Ancillary Benefits": ("dental", "vision"),
         "ASR Health Benefits Dental and Vision Coverage": ("dental", "vision"),
         "BCBS Alabama Dental Coverage": ("dental",),
@@ -2353,9 +2354,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Beam Benefits Ancillary Coverage": ("dental", "vision"),
         "BEST Life Dental and Vision Coverage": ("dental", "vision"),
         "CBA Blue Dental Coverage": ("dental",),
+        "CarePlus Dental Plans Coverage": ("dental",),
         "ClaimChoice Administrators Coverage": ("medical",),
         "Consociate Health Ancillary Benefits": ("dental", "vision"),
         "Direct Dental Coverage": ("dental",),
+        "Diversified Group Ancillary Coverage": ("dental", "vision"),
         "Dominion National Dental": ("dental",),
         "Dominion National Vision": ("vision",),
         "EBPA Medical and Dental Coverage": ("dental",),
@@ -2572,9 +2575,18 @@ async def test_master_list_keeps_high_value_public_aliases():
         in ancillary_by_name["BCBS Tennessee Dental and Vision Coverage"].aliases
     )
     assert "Apta Health" in ancillary_by_name["Apta Health Coverage"].aliases
+    assert (
+        "Allegiance Benefit Plan Management Inc"
+        in ancillary_by_name["Allegiance Ancillary Claims Coverage"].aliases
+    )
     assert "Claim Choice" in ancillary_by_name["ClaimChoice Administrators Coverage"].aliases
+    assert "Care Plus" in ancillary_by_name["CarePlus Dental Plans Coverage"].aliases
     assert "Dental Blue Network" in ancillary_by_name["CBA Blue Dental Coverage"].aliases
     assert "Direct Dental Administrators" in ancillary_by_name["Direct Dental Coverage"].aliases
+    assert (
+        "Diversified Group Brokerage"
+        in ancillary_by_name["Diversified Group Ancillary Coverage"].aliases
+    )
     assert "VSP Choice" in ancillary_by_name["EMI Health Vision Coverage"].aliases
     assert (
         "HealthPartners Dental"
