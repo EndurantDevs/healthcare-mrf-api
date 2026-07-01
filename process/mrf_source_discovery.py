@@ -4498,10 +4498,13 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
         "client_id",
         "client_name",
         "company_name",
+        "evidence_url",
         "employer_id",
         "employer_name",
         "employer_slug",
         "entity_slug",
+        "plan_sponsor_name",
+        "sponsor_name",
         "tpa_slug",
         "tpa_name",
         "ein",
@@ -8573,6 +8576,7 @@ def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
 def _plan_rows_from_target_metadata(target: CrawlTarget) -> list[dict[str, Any]]:
     source = target.source
     metadata = dict(target.metadata or {})
+    context_metadata = _crawl_target_context_metadata(target)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     now = _utc_now()
     for plan in _metadata_plan_info(metadata):
@@ -8611,6 +8615,7 @@ def _plan_rows_from_target_metadata(target: CrawlTarget) -> list[dict[str, Any]]
                 "resolver": metadata.get("resolver"),
                 "target_url": target.url,
                 "resolved_from_url": target.resolved_from_url,
+                **context_metadata,
             },
             "first_seen_at": now,
             "last_seen_at": now,
@@ -11164,6 +11169,8 @@ async def _resolve_providence_mrf_api(
 
 
 def _looks_direct_toc_url(url: str | None) -> bool:
+    if _looks_non_tic_mrf_reference(url):
+        return False
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower()

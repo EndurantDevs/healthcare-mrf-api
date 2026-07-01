@@ -5640,6 +5640,22 @@ def test_asr_health_benefits_seed_metadata_becomes_target_context(
         row["metadata_json"]["target_label"]
         == "ASR Health Benefits group 1208 - Example Forge LLC"
     )
+    target.metadata["plan_info"] = [
+        {
+            "plan_id": "1208",
+            "plan_market_type": "group",
+            "plan_name": "Example Forge ASR Plan",
+        }
+    ]
+    [plan_row] = discovery._plan_rows_from_target_metadata(target)
+    assert plan_row["metadata_json"]["group_number"] == "1208"
+    assert plan_row["metadata_json"]["company_name"] == "Example Forge LLC"
+    assert plan_row["metadata_json"]["employer_name"] == "Example Forge LLC"
+    assert plan_row["metadata_json"]["plan_name"] == "Example Forge ASR Plan"
+    assert (
+        plan_row["metadata_json"]["evidence_url"]
+        == "https://example.test/asr-1208"
+    )
 
 
 def test_asr_health_benefits_private_seed_context_overlay(tmp_path, monkeypatch):
@@ -10656,6 +10672,27 @@ def test_direct_toc_url_accepts_no_extension_mrf_index():
     )
     assert discovery._looks_direct_toc_url(
         "https://mrf.secure.bcbsks.com/api/filedownloadhttptrigger?name=table-of-contents&ext=json"
+    )
+
+
+def test_direct_toc_url_rejects_provider_directory_indexes():
+    assert (
+        discovery._looks_direct_toc_url(
+            "https://example.test/acadirectory/97176/97176Index.json"
+        )
+        is False
+    )
+    assert (
+        discovery._looks_direct_toc_url(
+            "https://example.test/provider-directory/index.json"
+        )
+        is False
+    )
+    assert (
+        discovery._looks_direct_toc_url(
+            "https://example.test/cms-data-index/index.json"
+        )
+        is False
     )
 
 
