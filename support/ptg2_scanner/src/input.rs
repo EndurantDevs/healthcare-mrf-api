@@ -36,6 +36,7 @@ struct LossyUtf8Reader<R: Read> {
     output: Vec<u8>,
     output_pos: usize,
     eof: bool,
+    checked_bom: bool,
 }
 
 impl<R: Read> LossyUtf8Reader<R> {
@@ -46,6 +47,23 @@ impl<R: Read> LossyUtf8Reader<R> {
             output: Vec::new(),
             output_pos: 0,
             eof: false,
+            checked_bom: false,
+        }
+    }
+
+    fn strip_initial_bom(&mut self, bytes: Vec<u8>, eof: bool) -> Option<Vec<u8>> {
+        if self.checked_bom {
+            return Some(bytes);
+        }
+        if bytes.len() < 3 && !eof {
+            self.pending = bytes;
+            return None;
+        }
+        self.checked_bom = true;
+        if bytes.starts_with(b"\xEF\xBB\xBF") {
+            Some(bytes[3..].to_vec())
+        } else {
+            Some(bytes)
         }
     }
 
@@ -101,7 +119,9 @@ impl<R: Read> LossyUtf8Reader<R> {
                 self.eof = true;
                 if !self.pending.is_empty() {
                     let pending = std::mem::take(&mut self.pending);
-                    self.append_valid_utf8_lossy(&pending, true);
+                    if let Some(bytes) = self.strip_initial_bom(pending, true) {
+                        self.append_valid_utf8_lossy(&bytes, true);
+                    }
                 }
                 break;
             }
@@ -113,7 +133,9 @@ impl<R: Read> LossyUtf8Reader<R> {
                 bytes.extend_from_slice(&raw[..read]);
                 bytes
             };
-            self.append_valid_utf8_lossy(&bytes, false);
+            if let Some(bytes) = self.strip_initial_bom(bytes, false) {
+                self.append_valid_utf8_lossy(&bytes, false);
+            }
         }
         Ok(!self.output.is_empty())
     }
@@ -234,6 +256,20 @@ mod tests {
         let mut text = String::new();
         reader.read_to_string(&mut text).expect("read json file");
         assert_eq!(text, "{\"name\":\"A\u{FFFD}B\"}");
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn open_json_reader_strips_utf8_bom() {
+        let path = temp_path("bom.json");
+        std::fs::write(&path, b"\xEF\xBB\xBF{\"ok\":true}").expect("write bom test file");
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader =
+            open_json_reader(&path, Arc::clone(&bytes_read)).expect("open json reader");
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read json file");
+        assert_eq!(text, "{\"ok\":true}");
         assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
         std::fs::remove_file(path).ok();
     }
