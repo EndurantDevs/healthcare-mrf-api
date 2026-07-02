@@ -442,6 +442,11 @@ async def _index_provider_group_locations(
     location_indexes = [
         ("group_zip_idx", "(provider_group_global_id_128, zip5, npi)"),
         ("zip_group_idx", "(zip5, provider_group_global_id_128, npi)"),
+        (
+            "zip_type_cover_idx",
+            "(zip5, address_type, provider_group_global_id_128, npi, address_checksum) "
+            "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL",
+        ),
         ("state_city_group_idx", "(state_name, city_name, provider_group_global_id_128, npi)"),
         ("state_city_npi_group_idx", "(state_name, city_name, npi, provider_group_global_id_128)"),
         ("group_state_city_npi_addr_idx", "(provider_group_global_id_128, state_name, city_name, npi, address_checksum)"),

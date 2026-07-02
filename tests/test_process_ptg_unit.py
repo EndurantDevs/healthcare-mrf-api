@@ -673,6 +673,27 @@ def test_rust_publish_skips_optional_provider_geo_index_when_postgis_is_missing(
     assert any("geo_gist_idx" in statement for statement in status_calls)
 
 
+def test_manifest_provider_group_location_indexes_include_zip_covering_index(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+
+    asyncio.run(
+        ptg_manifest_publish._index_provider_group_locations(
+            schema_name="mrf",
+            provider_group_location_table="ptg2_provider_group_location_snap",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert "zip_type_cover_idx" in joined
+    assert "(zip5, address_type, provider_group_global_id_128, npi, address_checksum)" in joined
+    assert "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL" in joined
+
+
 def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
     async def fake_all(statement, **_params):
         if "FROM pg_class" in statement:
