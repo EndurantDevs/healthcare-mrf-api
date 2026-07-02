@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 
 import aiohttp
 from sqlalchemy import case, func, or_
@@ -828,8 +828,7 @@ def _scan_practitioner_role_reverse_lookup_planned(source: dict[str, Any], resou
 
 def _scan_practitioner_role_seed_rows(
     rows_by_resource: dict[str, list[dict[str, Any]]]
-) -> list[tuple[str, str, str]]:
-    seeds: list[tuple[str, str, str]] = []
+) -> Iterator[tuple[str, str, str]]:
     seen: set[tuple[str, str]] = set()
     for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
         search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
@@ -841,8 +840,7 @@ def _scan_practitioner_role_seed_rows(
             if key in seen:
                 continue
             seen.add(key)
-            seeds.append((search_param, resource_type, resource_id))
-    return seeds
+            yield (search_param, resource_type, resource_id)
 
 
 def _scan_practitioner_role_reverse_lookup_url(
@@ -7280,25 +7278,9 @@ async def _fetch_scan_practitioner_role_rows(
     options: ScanPractitionerRoleFetchOptions,
 ) -> ResourceFetchResult:
     model = ProviderDirectoryPractitionerRole
-    seeds = _scan_practitioner_role_seed_rows(rows_by_resource)
-    if not seeds:
-        return ResourceFetchResult(
-            model=model,
-            rows=[],
-            rows_fetched=0,
-            rows_written=0,
-            pages_fetched=0,
-            complete=False,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
-            error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
-            fetch_mode="source_specific_deferred",
-        )
-
     rows: list[dict[str, Any]] = []
-    seen_role_ids: set[str] = set()
+    seen_role_ids: set[str] | None = set() if options.retain_rows else None
+    seed_count = 0
     rows_fetched = 0
     pages = 0
     row_limit_reached = False
@@ -7321,7 +7303,8 @@ async def _fetch_scan_practitioner_role_rows(
     )
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
 
-    for search_param, seed_resource_type, seed_resource_id in seeds:
+    for search_param, seed_resource_type, seed_resource_id in _scan_practitioner_role_seed_rows(rows_by_resource):
+        seed_count += 1
         if options.cancel_ctx is not None:
             await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
         if not _limit_allows_more(rows_fetched, options.per_resource_limit):
@@ -7381,9 +7364,12 @@ async def _fetch_scan_practitioner_role_rows(
                 if parsed_model is not model:
                     continue
                 role_id = _clean_text(row.get("resource_id"))
-                if not role_id or role_id in seen_role_ids:
+                if not role_id:
                     continue
-                seen_role_ids.add(role_id)
+                if seen_role_ids is not None:
+                    if role_id in seen_role_ids:
+                        continue
+                    seen_role_ids.add(role_id)
                 if options.retain_rows:
                     rows.append(row)
                 await stream_buffer.add(row)
@@ -7403,6 +7389,21 @@ async def _fetch_scan_practitioner_role_rows(
             break
 
     await stream_buffer.flush()
+    if seed_count == 0:
+        return ResourceFetchResult(
+            model=model,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
+            fetch_mode="source_specific_deferred",
+        )
     complete = (
         not error_message
         and not row_limit_reached
