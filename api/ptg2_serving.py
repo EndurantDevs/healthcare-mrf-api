@@ -2436,6 +2436,39 @@ async def _ptg2_manifest_location_provider_matches(
         )
         member_filters.append(_ptg2_individual_npi_exists_sql("pgm_scope.npi"))
 
+    member_scope_join = ""
+    member_scope_cte = ""
+    component_table = _safe_table_name(serving_tables.provider_set_component_table)
+    serving_table = _safe_table_name(serving_tables.serving_table)
+    requested_plan_id = str(plan_id or args.get("plan_id") or args.get("plan_external_id") or "").strip()
+    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_code = (
+        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
+        if requested_system
+        else str(args.get("code") or args.get("reported_code") or "").strip()
+    )
+    if component_table and serving_table and requested_plan_id and requested_code:
+        params["location_plan_id"] = requested_plan_id
+        params["location_reported_code"] = requested_code
+        rate_scope_filters = [
+            "rate_scope.plan_id = :location_plan_id",
+            "rate_scope.reported_code = :location_reported_code",
+        ]
+        if requested_system:
+            params["location_reported_code_system"] = requested_system
+            rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
+        member_scope_cte = f"""
+            rate_provider_groups AS MATERIALIZED (
+                SELECT DISTINCT psc.provider_group_global_id_128
+                FROM {serving_table} rate_scope
+                JOIN {component_table} psc
+                  ON psc.provider_set_global_id_128 = rate_scope.provider_set_global_id_128
+                WHERE {" AND ".join(rate_scope_filters)}
+            ),"""
+        member_scope_join = """
+                JOIN rate_provider_groups rpg
+                  ON rpg.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
+
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
     has_npi_data = await _serving_table_available(session, npi_data_table)
@@ -2523,9 +2556,12 @@ async def _ptg2_manifest_location_provider_matches(
         result = await session.execute(
             text(
                 f"""
-            WITH scoped_member_npis AS MATERIALIZED (
+            WITH
+            {member_scope_cte}
+            scoped_member_npis AS MATERIALIZED (
                 SELECT DISTINCT pgm_scope.npi
                 FROM {provider_group_member_table} pgm_scope
+                {member_scope_join}
                 WHERE {" AND ".join(member_filters)}
             ),
             raw_location_npis AS (

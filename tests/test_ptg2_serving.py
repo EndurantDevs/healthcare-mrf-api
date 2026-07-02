@@ -2282,6 +2282,7 @@ async def test_manifest_location_provider_matches_uses_component_table_without_s
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
         provider_group_member_table="mrf.ptg2_provider_group_member_snap",
         provider_set_component_table="mrf.ptg2_provider_set_component_snap",
         id_storage="uuid",
@@ -2297,10 +2298,30 @@ async def test_manifest_location_provider_matches_uses_component_table_without_s
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "lat": "34.14024131",
+            "long": "-118.255125",
+            "radius_miles": "10",
+            "limit": "5",
+        },
         candidate_limit=5,
+        plan_id="010854205",
     )
 
+    location_sql = str(session.calls[2][0][0])
+    location_params = session.calls[2][0][1]
+    assert "rate_provider_groups AS MATERIALIZED" in location_sql
+    assert "FROM mrf.ptg2_serving_manifest_snap rate_scope" in location_sql
+    assert "JOIN mrf.ptg2_provider_set_component_snap psc" in location_sql
+    assert "rate_scope.plan_id = :location_plan_id" in location_sql
+    assert "rate_scope.reported_code = :location_reported_code" in location_sql
+    assert "JOIN rate_provider_groups rpg" in location_sql
+    assert location_params["location_plan_id"] == "010854205"
+    assert location_params["location_reported_code"] == "90837"
+    assert location_params["location_reported_code_system"] == "CPT"
     component_sql = str(session.calls[-1][0][0])
     component_params = session.calls[-1][0][1]
     assert "FROM mrf.ptg2_provider_set_component_snap" in component_sql
