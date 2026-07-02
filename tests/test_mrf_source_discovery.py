@@ -8787,11 +8787,12 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_push_import_control_catalog_batches_snapshot_lookup_for_metadata_only(
+async def test_push_import_control_catalog_promotes_metadata_only_staged_sources(
     monkeypatch,
 ):
-    """Metadata-only rows share one snapshot lookup and skip source-state fetches."""
-    calls = []
+    """Metadata-only rows share one snapshot lookup and become searchable."""
+    http_calls = []
+    progress_events = []
     snapshot_calls = []
 
     async def fake_snapshot(source_ids):
@@ -8802,44 +8803,91 @@ async def test_push_import_control_catalog_batches_snapshot_lookup_for_metadata_
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
     monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
     monkeypatch.setattr(
-        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(calls)
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
+    )
+    monkeypatch.setattr(
+        discovery,
+        "enqueue_live_progress",
+        lambda **payload: progress_events.append(payload),
     )
 
     sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
-        [
-            {
-                "source_id": "source_one",
-                "index_url": "https://one.example.test/index.json",
-                "display_name": "Example One",
-                "source_key": "example-one",
-                "access_model": "free",
-                "source_type": "toc_json",
-                "status": "active",
-                "metadata_json": {"source_tier": "mrf_importable"},
-            },
-            {
-                "source_id": "source_two",
-                "index_url": "https://two.example.test/index.json",
-                "display_name": "Example Two",
-                "source_key": "example-two",
-                "access_model": "free",
-                "source_type": "toc_json",
-                "status": "active",
-                "metadata_json": {"source_tier": "mrf_importable"},
-            },
-        ]
+        _metadata_only_catalog_source_rows(),
+        progress_run_id="run_catalog",
     )
+
+    source_payloads = [
+        call["json"]
+        for call in http_calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ]
 
     assert sources_synced == 2
     assert plans_synced == 0
     assert errors == []
     assert snapshot_calls == [("source_one", "source_two")]
-    assert [
-        call["url"].rsplit("/", 1)[-1]
-        for call in calls
-        if call["url"].endswith("/v1/catalog/sources")
-    ] == ["sources", "sources"]
-    assert not [call for call in calls if "/v1/catalog/sources/ic_" in call["url"]]
+    _assert_metadata_only_sources_promoted(source_payloads)
+    assert not [
+        call
+        for call in http_calls
+        if call["url"].endswith("/v1/ptg/discover/ingest-preview")
+    ]
+    _assert_catalog_progress_events(progress_events)
+
+
+def _assert_metadata_only_sources_promoted(source_payloads):
+    assert len(source_payloads) == 4
+    assert [payload["visibility"] for payload in source_payloads] == [
+        "internal",
+        "public",
+        "internal",
+        "public",
+    ]
+    assert [payload["status"] for payload in source_payloads] == [
+        "needs_review",
+        "active",
+        "needs_review",
+        "active",
+    ]
+    assert [payload["preserve_operator_state"] for payload in source_payloads] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
+def _assert_catalog_progress_events(progress_events):
+    assert [(event["done"], event["total"]) for event in progress_events] == [
+        (1, 2),
+        (2, 2),
+    ]
+    assert {event["run_id"] for event in progress_events} == {"run_catalog"}
+
+
+def _metadata_only_catalog_source_rows():
+    return [
+        {
+            "source_id": "source_one",
+            "index_url": "https://one.example.test/index.json",
+            "display_name": "Example One",
+            "source_key": "example-one",
+            "access_model": "free",
+            "source_type": "toc_json",
+            "status": "active",
+            "metadata_json": {"source_tier": "mrf_importable"},
+        },
+        {
+            "source_id": "source_two",
+            "index_url": "https://two.example.test/index.json",
+            "display_name": "Example Two",
+            "source_key": "example-two",
+            "access_model": "free",
+            "source_type": "toc_json",
+            "status": "active",
+            "metadata_json": {"source_tier": "mrf_importable"},
+        },
+    ]
 
 
 def _catalog_snapshot_fake_session(captured_calls):

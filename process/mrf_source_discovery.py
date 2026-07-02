@@ -14121,7 +14121,10 @@ async def _mark_import_control_seed_promoted(
 
 
 async def _push_import_control_catalog(
-    source_rows: list[dict[str, Any]], *, limit: int | None = None
+    source_rows: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    progress_run_id: str | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """Promote eligible discovered sources into import-control and push their discovered
     plans (built from the stored MRF file snapshot). Returns
@@ -14184,6 +14187,30 @@ async def _push_import_control_catalog(
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
+        progress_total = sum(
+            len(
+                _dedupe_import_control_source_rows(
+                    group_rows, snapshots_by_source_id
+                )
+            )
+            for group_rows in eligible_rows_by_identity.values()
+        )
+        progress_done = 0
+
+        def emit_catalog_sync_progress(message: str) -> None:
+            """Publish one import-control catalog sync progress event for this run."""
+            if progress_run_id:
+                enqueue_live_progress(
+                    run_id=progress_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="syncing import-control catalog",
+                    unit="sources",
+                    done=progress_done,
+                    total=progress_total,
+                    message=message,
+                )
+
         for group_rows in eligible_rows_by_identity.values():
             rows_to_sync = _dedupe_import_control_source_rows(
                 group_rows, snapshots_by_source_id
@@ -14205,14 +14232,12 @@ async def _push_import_control_catalog(
                         status=_IMPORT_CONTROL_STAGED_STATUS,
                     )
                     if not ic_source_id:
+                        progress_done += 1
+                        emit_catalog_sync_progress(
+                            f"catalog source {progress_done}/{progress_total} skipped"
+                        )
                         continue
                     source_status_lower = source_status.lower()
-                    if not items and source_status_lower == "active" and not evidence_only:
-                        # Existing public sources still need metadata-only refreshes
-                        # (aliases, benefit lines, source tier). New staged rows remain
-                        # internal/needs_review until a later crawl proves plan files.
-                        sources_synced += 1
-                        continue
                     stored = await _fetch_import_control_source(session, base, ic_source_id)
                     # Flip staged rows public after ingest. Also let an active registry row with
                     # crawled files clear a stale state left by an older duplicate URL row.
@@ -14222,6 +14247,26 @@ async def _push_import_control_catalog(
                         and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                     )
                     stored_status = str((stored or {}).get("status") or "").lower()
+                    if not items and source_status_lower == "active" and not evidence_only:
+                        # Existing public sources still need metadata-only refreshes
+                        # (aliases, benefit lines, source tier). Newly staged metadata-only
+                        # sources should become searchable even when the source snapshot has
+                        # not produced preview items yet.
+                        if staged:
+                            await _promote_import_control_source(
+                                session,
+                                base,
+                                row,
+                                visibility="public",
+                                status=source_status,
+                                preserve_operator_state=False,
+                            )
+                        sources_synced += 1
+                        progress_done += 1
+                        emit_catalog_sync_progress(
+                            f"synced catalog source {progress_done}/{progress_total}"
+                        )
+                        continue
                     source_plans = 0
                     if items and not evidence_only:
                         for batch in _chunked(_split_preview_items(items), 100):
@@ -14250,6 +14295,10 @@ async def _push_import_control_catalog(
                         )
                     sources_synced += 1
                     plans_synced += source_plans
+                    progress_done += 1
+                    emit_catalog_sync_progress(
+                        f"synced catalog source {progress_done}/{progress_total}"
+                    )
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     errors.append(
                         {
@@ -14257,6 +14306,10 @@ async def _push_import_control_catalog(
                             "import_control_source_id": ic_source_id,
                             "message": str(exc),
                         }
+                    )
+                    progress_done += 1
+                    emit_catalog_sync_progress(
+                        f"catalog source {progress_done}/{progress_total} failed"
                     )
                     continue
     if errors and not sources_synced:
@@ -14661,7 +14714,11 @@ async def main(
                         message=f"syncing catalog plans for {len(source_rows)} source rows",
                     )
                 sources_synced, plans_synced, catalog_errors = (
-                    await _push_import_control_catalog(source_rows, limit=bounded_limit)
+                    await _push_import_control_catalog(
+                        source_rows,
+                        limit=bounded_limit,
+                        progress_run_id=control_run_id,
+                    )
                 )
                 result.import_control_sources_synced = sources_synced
                 result.import_control_plans_synced = plans_synced
