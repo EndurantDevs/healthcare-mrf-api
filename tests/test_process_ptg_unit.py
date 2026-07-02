@@ -4728,6 +4728,7 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
                 "010854205",
                 "",
                 process_ptg.normalize_import_month("2026-04"),
+                "example_dental",
             ),
             "plan_id": "010854205",
             "plan_market_type": "",

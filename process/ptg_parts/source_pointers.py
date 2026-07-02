@@ -14,15 +14,25 @@ from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident, _table_exists
 
 
-def _ptg2_plan_source_key(plan_id: str, plan_market_type: str | None, import_month: datetime.date) -> str:
-    return semantic_hash(
-        {
-            "plan_id": plan_id,
-            "plan_market_type": plan_market_type or "",
-            "import_month": import_month.isoformat(),
-        },
-        domain="ptg2_current_plan_source",
-    )[:32]
+def _ptg2_plan_source_key(
+    plan_id: str,
+    plan_market_type: str | None,
+    import_month: datetime.date,
+    source_key: str = "",
+) -> str:
+    # source_key MUST be part of the pointer key: a plan served by multiple
+    # network sources (e.g. a medical network plus a pharmacy carve-out) needs
+    # one current-pointer row per source. Without it, whichever source
+    # publishes last overwrites the others' rows via ON CONFLICT, and
+    # current_source_snapshot_ids_for_plan only ever sees one network.
+    payload = {
+        "plan_id": plan_id,
+        "plan_market_type": plan_market_type or "",
+        "import_month": import_month.isoformat(),
+    }
+    if source_key:
+        payload["source_key"] = source_key
+    return semantic_hash(payload, domain="ptg2_current_plan_source")[:32]
 
 
 async def _current_source_snapshot_id(source_key: str) -> str | None:
@@ -89,7 +99,9 @@ async def _source_plan_rows(
         plan_market_type = str(data.get("plan_market_type") or "").strip().lower()
         result.append(
             {
-                "plan_source_key": _ptg2_plan_source_key(plan_id, plan_market_type, import_month),
+                "plan_source_key": _ptg2_plan_source_key(
+                    plan_id, plan_market_type, import_month, source_key
+                ),
                 "plan_id": plan_id,
                 "plan_market_type": plan_market_type,
                 "import_month": import_month,
