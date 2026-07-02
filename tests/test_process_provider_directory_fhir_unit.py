@@ -2910,11 +2910,14 @@ def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_
     assert "AND overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')" in sql
     assert "split_part(overlay.source_record_id, ':', 5)" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
+    assert "practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')" in sql
     assert "practitioner.npi = e.npi" in sql
     assert 'LEFT JOIN "mrf"."provider_directory_location" loc' in sql
     assert "loc.resource_id = e.location_resource_id" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
+    assert "JOIN LATERAL (\n              SELECT DISTINCT normalized_ref AS resource_id" in sql
+    assert "organization.resource_id = organization_ref.resource_id" in sql
     assert "organization_address_matches AS" not in sql
     assert "'organization_address'::varchar AS provider_directory_match_type" not in sql
     assert 'LEFT JOIN "mrf"."provider_directory_network_catalog" network_catalog' in sql

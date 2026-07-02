@@ -2695,14 +2695,7 @@ def provider_directory_address_corroboration_sql(
 
     schema = db_schema or _schema()
     view_ref = _qt(schema, view_name)
-    practitioner_ref_match = _sql_ref_matches_resource("role.practitioner_ref", "Practitioner", "practitioner.resource_id")
     role_plan_ref_match = _sql_ref_matches_resource("plan_ref.value", "InsurancePlan", "insurance_plan.resource_id")
-    affiliation_org_ref_match = _sql_ref_matches_resource(
-        "affiliation.organization_ref", "Organization", "organization.resource_id"
-    )
-    affiliation_participating_org_ref_match = _sql_ref_matches_resource(
-        "affiliation.participating_organization_ref", "Organization", "organization.resource_id"
-    )
     network_ref_resource_id_expr = _sql_reference_resource_id("network_ref.value", "Organization")
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
@@ -2789,8 +2782,8 @@ def provider_directory_address_corroboration_sql(
            AND role.resource_id = e.resource_id
           JOIN {_qt(schema, "provider_directory_practitioner")} practitioner
             ON practitioner.source_id = role.source_id
+           AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
            AND practitioner.npi = e.npi
-           AND {practitioner_ref_match}
           LEFT JOIN {_qt(schema, "provider_directory_location")} loc
             ON loc.source_id = e.source_id
            AND loc.resource_id = e.location_resource_id
@@ -2921,13 +2914,19 @@ def provider_directory_address_corroboration_sql(
             ON e.resource_type = 'OrganizationAffiliation'
            AND affiliation.source_id = e.source_id
            AND affiliation.resource_id = e.resource_id
+          JOIN LATERAL (
+              SELECT DISTINCT normalized_ref AS resource_id
+                FROM (
+                    VALUES
+                        (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                        (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                ) AS refs(normalized_ref)
+               WHERE normalized_ref IS NOT NULL
+          ) AS organization_ref ON TRUE
           JOIN {_qt(schema, "provider_directory_organization")} organization
             ON organization.source_id = affiliation.source_id
+           AND organization.resource_id = organization_ref.resource_id
            AND organization.npi = e.npi
-           AND (
-                {affiliation_org_ref_match}
-             OR {affiliation_participating_org_ref_match}
-           )
           LEFT JOIN {_qt(schema, "provider_directory_location")} loc
             ON loc.source_id = e.source_id
            AND loc.resource_id = e.location_resource_id
