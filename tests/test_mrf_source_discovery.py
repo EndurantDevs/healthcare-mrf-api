@@ -8869,6 +8869,63 @@ async def test_push_import_control_catalog_ingests_existing_public_snapshot_item
     ]
 
 
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_loads_snapshots_per_source_identity(
+    monkeypatch,
+):
+    calls = []
+    snapshot_calls = []
+
+    async def fake_snapshot(source_ids):
+        snapshot_calls.append(tuple(source_ids))
+        return {
+            source_id: [
+                {
+                    "canonical_url": f"https://example.com/{source_id}/rates.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Carrier",
+                    "plan_info": [
+                        {"plan_id": source_id, "plan_market_type": "group"}
+                    ],
+                }
+            ]
+            for source_id in source_ids
+        }
+
+    source_records = [
+        {
+            **_existing_public_catalog_source_row(),
+            "source_id": "source_first",
+            "index_url": "https://example.com/first/index.json",
+            "source_key": "example-first",
+        },
+        {
+            **_existing_public_catalog_source_row(),
+            "source_id": "source_second",
+            "index_url": "https://example.com/second/index.json",
+            "source_key": "example-second",
+        },
+    ]
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_existing_public_snapshot_fake_session(calls),
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        source_records
+    )
+
+    assert sources_synced == 2
+    assert plans_synced == 2
+    assert errors == []
+    assert snapshot_calls == [("source_first",), ("source_second",)]
+
+
 def _existing_public_catalog_source_row():
     return {
         "source_id": "source_existing",
@@ -9255,7 +9312,7 @@ def _replacement_catalog_source_row():
 async def test_push_import_control_catalog_promotes_metadata_only_staged_sources(
     monkeypatch,
 ):
-    """Metadata-only rows share one snapshot lookup and become searchable."""
+    """Metadata-only rows load snapshots per source identity and become searchable."""
     http_calls = []
     progress_events = []
     snapshot_calls = []
@@ -9290,7 +9347,7 @@ async def test_push_import_control_catalog_promotes_metadata_only_staged_sources
     assert sources_synced == 2
     assert plans_synced == 0
     assert errors == []
-    assert snapshot_calls == [("source_one", "source_two")]
+    assert snapshot_calls == [("source_one",), ("source_two",)]
     _assert_metadata_only_sources_promoted(source_payloads)
     assert not [
         call
@@ -9739,7 +9796,7 @@ async def test_push_import_control_catalog_keeps_failed_source_internal_and_repo
             return FakeResponse({}, status=404)
 
     async def fake_snapshot(source_ids_arg):
-        assert source_ids_arg == ["source_ok", "source_fail"]
+        assert source_ids_arg in (["source_ok"], ["source_fail"])
         item = {
             "canonical_url": "https://example.com/rates.json.gz",
             "domain": "in_network",

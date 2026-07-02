@@ -14302,27 +14302,13 @@ async def _push_import_control_catalog(
     sources_synced = 0
     plans_synced = 0
     errors: list[dict[str, Any]] = []
-    snapshot_source_ids = [
-        str(row.get("source_id") or "")
-        for row in eligible
-        if _source_row_is_importable(row) and str(row.get("source_id") or "")
-    ]
-    snapshots_by_source_id = (
-        await _import_control_snapshot_items(snapshot_source_ids)
-        if snapshot_source_ids
-        else {}
-    )
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
-        progress_total = sum(
-            len(
-                _dedupe_import_control_source_rows(
-                    group_rows, snapshots_by_source_id
-                )
-            )
-            for group_rows in eligible_rows_by_identity.values()
-        )
+        # Snapshot rows can be very large for broad public carriers. Load only the
+        # current source identity group so private-context catalog syncs do not
+        # materialize every source file preview in one process.
+        progress_total = len(eligible)
         progress_done = 0
 
         def emit_catalog_sync_progress(message: str) -> None:
@@ -14340,6 +14326,16 @@ async def _push_import_control_catalog(
                 )
 
         for group_rows in eligible_rows_by_identity.values():
+            group_snapshot_source_ids = [
+                str(row.get("source_id") or "")
+                for row in group_rows
+                if _source_row_is_importable(row) and str(row.get("source_id") or "")
+            ]
+            snapshots_by_source_id = (
+                await _import_control_snapshot_items(group_snapshot_source_ids)
+                if group_snapshot_source_ids
+                else {}
+            )
             rows_to_sync = _dedupe_import_control_source_rows(
                 group_rows, snapshots_by_source_id
             )
