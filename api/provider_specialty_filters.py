@@ -374,6 +374,61 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
     )
 
 
+def provider_specialty_taxonomy_semijoin_sql(
+    params: dict[str, Any],
+    param_prefix: str,
+    specialty_filter: ProviderSpecialtyFilter,
+    *,
+    schema: str = PTG2_SCHEMA,
+    nt_alias: str | None = None,
+    nucc_alias: str | None = None,
+) -> str:
+    """Uncorrelated ``SELECT npi FROM npi_taxonomy`` subquery for ``<npi> IN (...)``.
+
+    Same row-level semantics as provider_specialty_taxonomy_exists_sql, but shaped
+    so Postgres resolves the matching-NPI set ONCE (driving the
+    (healthcare_provider_taxonomy_code, npi) index) and semi-joins it, instead of
+    re-probing npi_taxonomy per outer row. Use this when the outer row source is
+    unbounded — e.g. a whole group-plan network member table, where the correlated
+    EXISTS form degraded to one index probe per member row.
+    """
+    if not specialty_filter.active:
+        return ""
+
+    nt = nt_alias or f"{param_prefix}_nt"
+    nucc = nucc_alias or f"{param_prefix}_nucc"
+    clauses: list[str] = []
+    joins = ""
+
+    if specialty_filter.primary_only:
+        clauses.append(f"UPPER(COALESCE({nt}.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'")
+
+    if specialty_filter.taxonomy_codes:
+        code_placeholders: list[str] = []
+        for idx, code in enumerate(specialty_filter.taxonomy_codes):
+            key = f"{param_prefix}_taxonomy_code_{idx}"
+            # Same sargability contract as the EXISTS builder: uppercase the
+            # parameter, never wrap the indexed column.
+            params[key] = str(code or "").upper()
+            code_placeholders.append(f":{key}")
+        clauses.append(
+            f"{nt}.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})"
+        )
+
+    if specialty_filter.classification and specialty_filter.use_classification_predicate:
+        classification_key = f"{param_prefix}_classification"
+        params[classification_key] = specialty_filter.classification
+        joins = f"\n                    JOIN {schema}.nucc_taxonomy {nucc} ON {nucc}.code = {nt}.healthcare_provider_taxonomy_code"
+        clauses.append(f"LOWER(COALESCE({nucc}.classification, '')) = LOWER(:{classification_key})")
+        if not specialty_filter.include_subspecialties:
+            clauses.append(f"NULLIF(BTRIM(COALESCE({nucc}.specialization, '')), '') IS NULL")
+
+    where = "\n                      AND ".join(clauses)
+    return f"""SELECT {nt}.npi
+                    FROM {schema}.npi_taxonomy {nt}{joins}
+                    WHERE {where}"""
+
+
 def provider_specialty_taxonomy_exists_sql(
     npi_sql: str,
     params: dict[str, Any],

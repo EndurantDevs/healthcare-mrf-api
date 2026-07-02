@@ -116,6 +116,7 @@ from api.ptg2_serving_utils import (
 )
 from api.provider_specialty_filters import (
     provider_specialty_taxonomy_exists_sql,
+    provider_specialty_taxonomy_semijoin_sql,
     resolve_provider_specialty_filter,
 )
 
@@ -912,6 +913,19 @@ def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
     return (
         f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi n_entity "
         f"WHERE n_entity.npi = {npi_sql} AND COALESCE(n_entity.entity_type_code, 0) = 1)"
+    )
+
+
+def _ptg2_individual_npi_scalar_filter_sql(npi_sql: str) -> str:
+    # Scalar-subquery form of _ptg2_individual_npi_exists_sql. The EXISTS form
+    # gets pulled up into a semi-join, and against an unbounded outer (a whole
+    # network member table) the planner then seq-scans + hashes all ~7M npi
+    # rows. A scalar subquery is never pulled up, so it stays one PK probe per
+    # already-filtered candidate row. npi.npi is the primary key, so the
+    # subquery is guaranteed scalar.
+    return (
+        f"COALESCE((SELECT COALESCE(n_entity.entity_type_code, 0) = 1 "
+        f"FROM {PTG2_SCHEMA}.npi n_entity WHERE n_entity.npi = {npi_sql}), false)"
     )
 
 
@@ -2483,17 +2497,25 @@ async def _ptg2_manifest_location_provider_matches(
     member_filters = ["pgm_scope.npi IS NOT NULL"]
     # Also apply clinical specialty/taxonomy at the member scope, mirroring the
     # non-location taxonomy filter (_ptg2_manifest_filter_npis_by_provider_taxonomy)
-    # and the compact provider filter.
+    # and the compact provider filter. Taxonomy predicates are uncorrelated
+    # `npi IN (SELECT ...)` semi-joins rather than correlated EXISTS: a
+    # whole-network member table puts millions of rows in scope, and a
+    # correlated probe runs once per row (measured ~32M page reads / 24-45s
+    # cold -> upstream 502 on sparse behavioral codes), while the semi-join
+    # resolves the taxonomy NPI set once off the
+    # (healthcare_provider_taxonomy_code, npi) index (~0.8M page reads / 0.5s
+    # on the same snapshot).
     location_specialty_filter = resolve_provider_specialty_filter(args)
     if location_specialty_filter.active:
         member_filters.append(
-            provider_specialty_taxonomy_exists_sql(
-                "pgm_scope.npi",
+            "pgm_scope.npi IN ("
+            + provider_specialty_taxonomy_semijoin_sql(
                 params,
                 "manifest_location_specialty",
                 location_specialty_filter,
                 schema=PTG2_SCHEMA,
             )
+            + ")"
         )
     location_inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
         args,
@@ -2502,12 +2524,18 @@ async def _ptg2_manifest_location_provider_matches(
         params=params,
         param_prefix="manifest_location_inferred_taxonomy",
     )
+    member_entity_filter_sql = ""
     if location_inferred_taxonomy_sql:
         member_filters.append(
-            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-            f"WHERE nt.npi = pgm_scope.npi AND {location_inferred_taxonomy_sql})"
+            f"pgm_scope.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
+            f"WHERE {location_inferred_taxonomy_sql})"
         )
-        member_filters.append(_ptg2_individual_npi_exists_sql("pgm_scope.npi"))
+        # The individual-NPI check has no selective index to drive, so it runs
+        # as a scalar probe per candidate AFTER the member x taxonomy
+        # intersection (tens of thousands of rows) instead of inside it
+        # (millions).
+        member_entity_filter_sql = _ptg2_individual_npi_scalar_filter_sql("scope_filter.npi")
+    member_taxonomy_scoped = location_specialty_filter.active or bool(location_inferred_taxonomy_sql)
 
     member_scope_join = ""
     final_member_scope_join = ""
@@ -2569,6 +2597,53 @@ async def _ptg2_manifest_location_provider_matches(
             )
             member_filters.append(f"pgm_scope.{rate_group_filter}")
             final_member_filters.append(f"pgm.{rate_group_filter}")
+
+    # With a taxonomy filter, resolve the member x taxonomy intersection ONCE in
+    # a MATERIALIZED CTE (small for sparse codes) and drive the address lookup
+    # from it: LATERAL + OFFSET 0 pins one (npi) index probe per scoped NPI. The
+    # zip filter compares an expression over postal_code, so any address-driven
+    # plan degrades to a full bitmap scan of the address table (~3M pages) --
+    # the planner picked exactly that for both the EXISTS and plain-JOIN forms.
+    # Without a taxonomy filter, membership stays a per-address-row EXISTS:
+    # materializing a whole unfiltered network (1M+ NPIs) costs more than it
+    # saves.
+    member_prefilter_cte = ""
+    if member_taxonomy_scoped:
+        scoped_member_cte_name = "scoped_taxonomy_member_npis" if member_entity_filter_sql else "scoped_member_npis"
+        member_entity_cte = (
+            f""",
+            scoped_member_npis AS MATERIALIZED (
+                SELECT scope_filter.npi
+                FROM scoped_taxonomy_member_npis scope_filter
+                WHERE {member_entity_filter_sql}
+            )"""
+            if member_entity_filter_sql
+            else ""
+        )
+        member_prefilter_cte = f"""
+            {scoped_member_cte_name} AS MATERIALIZED (
+                SELECT DISTINCT pgm_scope.npi
+                FROM {provider_group_member_table} pgm_scope
+                {member_scope_join}
+                WHERE {" AND ".join(member_filters)}
+            ){member_entity_cte},"""
+        location_address_from_sql = f"""FROM scoped_member_npis scope_npis
+                JOIN LATERAL (
+                    SELECT addr_probe.*
+                    FROM {npi_address_table} addr_probe
+                    WHERE addr_probe.npi = scope_npis.npi
+                    OFFSET 0
+                ) addr ON TRUE"""
+        member_match_predicate = "TRUE"
+    else:
+        location_address_from_sql = f"FROM {npi_address_table} addr"
+        member_match_predicate = f"""EXISTS (
+                      SELECT 1
+                      FROM {provider_group_member_table} pgm_scope
+                      {member_scope_join}
+                      WHERE pgm_scope.npi = addr.npi
+                        AND {" AND ".join(member_filters)}
+                  )"""
 
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
@@ -2660,6 +2735,7 @@ async def _ptg2_manifest_location_provider_matches(
                 f"""
             WITH
             {member_scope_cte}
+            {member_prefilter_cte}
             raw_location_npis AS (
                 SELECT DISTINCT ON (addr.npi)
                     addr.npi,
@@ -2683,16 +2759,10 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.fax_number_digits,
                     addr.fax_extension,
                     {location_select_sql}
-                FROM {npi_address_table} addr
+                {location_address_from_sql}
                 WHERE {" AND ".join(address_filters)}
                   AND addr.type = ANY(CAST(:address_types AS varchar[]))
-                  AND EXISTS (
-                      SELECT 1
-                      FROM {provider_group_member_table} pgm_scope
-                      {member_scope_join}
-                      WHERE pgm_scope.npi = addr.npi
-                        AND {" AND ".join(member_filters)}
-                  )
+                  AND {member_match_predicate}
                 ORDER BY {location_order_sql},
                     CASE addr.type
                         WHEN 'practice' THEN 0

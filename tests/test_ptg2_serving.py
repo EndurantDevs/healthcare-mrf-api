@@ -3620,12 +3620,21 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    # The location query scopes provider-group members before address radius
-    # ordering, with taxonomy predicates applied to member NPIs.
+    # With a taxonomy filter, the member x taxonomy intersection is resolved
+    # once in a MATERIALIZED CTE (uncorrelated semi-join, sargable code
+    # predicate) and probed per address row. Correlated per-member probes must
+    # not reappear: on whole-network member tables they run once per row and
+    # time the request out.
+    assert "scoped_member_npis AS MATERIALIZED" in sql
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
-    assert "pgm_scope.npi = addr.npi" in sql
-    assert "mrf.npi_taxonomy" in sql
-    assert "nt.npi = pgm_scope.npi" in sql
+    assert "pgm_scope.npi IN (SELECT manifest_location_specialty_nt.npi" in sql
+    assert "FROM scoped_member_npis scope_npis" in sql
+    assert "WHERE addr_probe.npi = scope_npis.npi" in sql
+    # OFFSET 0 pins the per-NPI index probe; without it the planner flattens
+    # the LATERAL and bitmap-scans the whole address table.
+    assert "OFFSET 0" in sql
+    assert "manifest_location_specialty_nt.npi = pgm_scope.npi" not in sql
+    assert "UPPER(COALESCE(manifest_location_specialty_nt.healthcare_provider_taxonomy_code" not in sql
     assert "207X00000X" in str(params)
 
 
@@ -3666,10 +3675,140 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = pgm_scope.npi" in sql
-    assert "pgm_scope.npi = addr.npi" in sql
-    assert "n_entity.entity_type_code" in sql
+    # Inferred-taxonomy scoping is an uncorrelated semi-join in the member CTE...
+    assert "scoped_taxonomy_member_npis AS MATERIALIZED" in sql
+    assert "pgm_scope.npi IN (SELECT nt.npi FROM mrf.npi_taxonomy nt" in sql
+    assert "nt.npi = pgm_scope.npi" not in sql
+    # ...and the individual-NPI check runs as a scalar probe per candidate in a
+    # second CTE stage after the intersection (an EXISTS gets pulled up into a
+    # hash of the whole npi table).
+    assert "scoped_member_npis AS MATERIALIZED" in sql
+    assert "FROM scoped_taxonomy_member_npis scope_filter" in sql
+    assert "COALESCE((SELECT COALESCE(n_entity.entity_type_code, 0) = 1" in sql
+    assert "n_entity.npi = scope_filter.npi" in sql
+    assert "FROM scoped_member_npis scope_npis" in sql
+    assert "WHERE addr_probe.npi = scope_npis.npi" in sql
+    # OFFSET 0 pins the per-NPI index probe; without it the planner flattens
+    # the LATERAL and bitmap-scans the whole address table.
+    assert "OFFSET 0" in sql
     assert "207X00000X" in str(params)
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exists(monkeypatch):
+    # Without a taxonomy filter the member check must stay a per-address-row
+    # EXISTS: materializing a whole unfiltered network (1M+ NPIs) would cost
+    # more than it saves.
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            False,
+            FakeResult(rows=[]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_a, **_k: {group_id: (provider_set_id,)},
+    )
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+    )
+
+    sql = str(session.calls[2][0][0])
+    assert "pgm_scope.npi = addr.npi" in sql
+    assert "scoped_member_npis" not in sql
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_plan_scoped_taxonomy_semijoin_shape(monkeypatch):
+    # Regression for plan-scoped provider-pricing expansion 502s (group plan
+    # 010854205, CPT 90837, behavioral taxonomy_codes, primary_only=false): on
+    # snapshots whose member table covers the whole network, correlated
+    # taxonomy probes ran once per row (~32M page reads, 24-45s cold, and the
+    # empty-first-pass secondary-address fallback doubled it -> upstream 502).
+    # The member CTE must scope by uncorrelated semi-joins, keep the
+    # taxonomy-code predicate sargable, and stage the individual-NPI check
+    # after the intersection.
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_a, **_k: {group_id: (provider_set_id,)},
+    )
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "zip5": "27616",
+            "limit": "5",
+            "code": "90837",
+            "code_system": "CPT",
+            "taxonomy_codes": "101YM0800X,101YP2500X,103T00000X,103TC0700X,1041C0700X,106H00000X,2084P0800X,363LP0808X,364SP0808X",
+            "primary_only": "false",
+        },
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    sql = str(session.calls[-1][0][0])
+    params = session.calls[-1][0][1]
+    # Rate scoping still narrows members to provider groups serving this
+    # plan+code when the snapshot has a populated component table.
+    assert "rate_provider_groups AS MATERIALIZED" in sql
+    assert "rate_scope.plan_id = :location_plan_id" in sql
+    assert params["location_plan_id"] == "010854205"
+    assert params["location_reported_code"] == "90837"
+    # Specialty and inferred taxonomy scope via uncorrelated semi-joins; no
+    # correlated per-member probes may reappear in the member CTE.
+    assert "pgm_scope.npi IN (SELECT manifest_location_specialty_nt.npi" in sql
+    assert "pgm_scope.npi IN (SELECT nt.npi FROM mrf.npi_taxonomy nt" in sql
+    assert "= pgm_scope.npi" not in sql
+    # Sargable code predicate (bare column, uppercased parameters).
+    assert "UPPER(COALESCE(manifest_location_specialty_nt.healthcare_provider_taxonomy_code" not in sql
+    # primary_only=false must not add the primary-switch clause to the semi-join.
+    assert "manifest_location_specialty_nt.healthcare_provider_primary_taxonomy_switch" not in sql
+    # Individual-NPI check runs as a scalar probe in a second CTE stage over
+    # the member x taxonomy intersection, and the address scan probes the
+    # final CTE.
+    assert "scoped_taxonomy_member_npis AS MATERIALIZED" in sql
+    assert "FROM scoped_taxonomy_member_npis scope_filter" in sql
+    assert "COALESCE((SELECT COALESCE(n_entity.entity_type_code, 0) = 1" in sql
+    assert "FROM scoped_member_npis scope_npis" in sql
+    assert "WHERE addr_probe.npi = scope_npis.npi" in sql
+    # OFFSET 0 pins the per-NPI index probe; without it the planner flattens
+    # the LATERAL and bitmap-scans the whole address table.
+    assert "OFFSET 0" in sql
+    assert params["manifest_location_specialty_taxonomy_code_0"] == "101YM0800X"
+    assert params["manifest_location_specialty_taxonomy_code_8"] == "364SP0808X"
 
 
 @pytest.mark.asyncio
