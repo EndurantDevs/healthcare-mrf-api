@@ -37,6 +37,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         serving_index.get("provider_entry_component_table"),
         serving_index.get("provider_group_member_table"),
         serving_index.get("provider_group_location_table"),
+        serving_index.get("provider_group_rate_scope_table"),
     ]
     allowed_prefixes = (
         "ptg2_serving_rate_compact_",
@@ -49,6 +50,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         "ptg2_provider_entry_component_",
         "ptg2_provider_group_member_",
         "ptg2_provider_group_location_",
+        "ptg2_provider_group_rate_scope_",
     )
     result: list[str] = []
     for value in table_values:

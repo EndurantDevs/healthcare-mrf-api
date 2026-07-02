@@ -46,6 +46,7 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
                     "procedure_table": "mrf.ptg2_procedure_token",
                     "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
                     "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+                    "provider_group_rate_scope_table": "mrf.ptg2_provider_group_rate_scope_token",
                 }
             }
         ]
@@ -60,6 +61,7 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
     assert tables.serving_table == "mrf.ptg2_serving_rate_compact_token"
     assert tables.price_atom_table == "mrf.ptg2_price_atom_token"
     assert tables.provider_group_member_table == "mrf.ptg2_provider_group_member_token"
+    assert tables.provider_group_rate_scope_table == "mrf.ptg2_provider_group_rate_scope_token"
     assert tables.is_manifest_backed_snapshot is False
 
 

@@ -133,12 +133,14 @@ ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
+_PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR = "_ptg2_manifest_location_jit_disabled"
 
 
 @dataclass(frozen=True)
 class _ManifestProviderLocationQuery:
     serving_tables: PTG2ServingTables
     provider_group_location_table: str
+    provider_group_rate_scope_table: str
     npi_data_table: str
     has_npi_data: bool
     provider_name_sql: str
@@ -167,6 +169,13 @@ class _ManifestProviderLocationScope:
     join_sql: str
     group_filter_sql: str | None
     is_empty: bool = False
+
+
+async def _set_local_jit_off_for_manifest_location(session) -> None:
+    if getattr(session, _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR, False):
+        return
+    await session.execute(text("SET LOCAL jit = off"))
+    setattr(session, _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR, True)
 
 
 _PROVIDER_GROUP_LOCATION_SQL = """
@@ -292,6 +301,18 @@ def _ptg2_manifest_provider_location_scope(
         )
         return _ManifestProviderLocationScope("", "", group_filter_sql)
     if query_context.has_component_rate_scope:
+        if query_context.provider_group_rate_scope_table:
+            route_filters = [
+                "rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128",
+                "rpg_location.plan_id = :location_plan_id",
+                "rpg_location.reported_code = :location_reported_code",
+            ]
+            if "location_reported_code_system" in query_context.params:
+                route_filters.append("rpg_location.reported_code_system = :location_reported_code_system")
+            join_sql = f"""
+                JOIN {query_context.provider_group_rate_scope_table} rpg_location
+                  ON {" AND ".join(route_filters)}"""
+            return _ManifestProviderLocationScope("", join_sql, "TRUE")
         join_sql = """
                 JOIN rate_provider_groups rpg_location
                   ON rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128"""
@@ -299,6 +320,43 @@ def _ptg2_manifest_provider_location_scope(
     if query_context.is_provider_group_location_scope_empty:
         return _ManifestProviderLocationScope("", "", None, is_empty=True)
     return _ManifestProviderLocationScope("", "", None)
+
+
+async def _manifest_provider_group_rate_scope_available(
+    session,
+    provider_group_rate_scope_table: str,
+    *,
+    plan_id: str,
+    reported_code: str,
+    code_system: str | None,
+) -> bool:
+    if not provider_group_rate_scope_table or not plan_id or not reported_code:
+        return False
+    filters = [
+        "plan_id = :plan_id",
+        "reported_code = :reported_code",
+    ]
+    params: dict[str, Any] = {
+        "plan_id": plan_id,
+        "reported_code": reported_code,
+    }
+    if code_system:
+        filters.append("reported_code_system = :reported_code_system")
+        params["reported_code_system"] = code_system
+    result = await session.execute(
+        text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {provider_group_rate_scope_table}
+                WHERE {" AND ".join(filters)}
+                LIMIT 1
+            )
+            """
+        ),
+        params,
+    )
+    return bool(result.scalar())
 
 
 def _manifest_location_geo_filters(query_context: _ManifestProviderLocationQuery) -> list[str]:
@@ -354,11 +412,14 @@ def _ptg2_manifest_provider_location_filters(
     )
     if array_taxonomy_filter:
         location_filter_clauses.append(array_taxonomy_filter)
-    if query_context.location_inferred_taxonomy_sql:
+    if query_context.location_inferred_taxonomy_sql and not (
+        array_taxonomy_filter and not query_context.location_specialty_filter.active
+    ):
         location_filter_clauses.append(
             f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
             f"WHERE nt.npi = loc.npi AND {query_context.location_inferred_taxonomy_sql})"
         )
+    if query_context.location_inferred_taxonomy_sql:
         location_filter_clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
     return location_filter_clauses
 
@@ -2829,6 +2890,8 @@ async def _ptg2_manifest_location_provider_matches(
     component_table = _safe_table_name(serving_tables.provider_set_component_table)
     serving_table = _safe_table_name(serving_tables.serving_table)
     provider_group_location_table = _safe_table_name(serving_tables.provider_group_location_table)
+    provider_group_rate_scope_table = _safe_table_name(serving_tables.provider_group_rate_scope_table)
+    active_provider_group_rate_scope_table = ""
     rate_provider_group_ids: tuple[str, ...] = ()
     has_component_rate_scope = False
     has_checked_rate_provider_group_sidecar = False
@@ -2857,6 +2920,16 @@ async def _ptg2_manifest_location_provider_matches(
         if requested_system:
             rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
             params["location_reported_code_system"] = requested_system
+        if provider_group_rate_scope_table:
+            has_route_scope = await _manifest_provider_group_rate_scope_available(
+                session,
+                provider_group_rate_scope_table,
+                plan_id=requested_plan_id,
+                reported_code=requested_code,
+                code_system=requested_system,
+            )
+            if has_route_scope:
+                active_provider_group_rate_scope_table = provider_group_rate_scope_table
         member_scope_cte = f"""
             rate_provider_groups AS MATERIALIZED (
                 SELECT DISTINCT psc.provider_group_global_id_128
@@ -3051,6 +3124,7 @@ async def _ptg2_manifest_location_provider_matches(
         query_context = _ManifestProviderLocationQuery(
             serving_tables=serving_tables,
             provider_group_location_table=provider_group_location_table,
+            provider_group_rate_scope_table=active_provider_group_rate_scope_table,
             npi_data_table=npi_data_table,
             has_npi_data=has_npi_data,
             provider_name_sql=provider_name_sql,
@@ -3081,6 +3155,7 @@ async def _ptg2_manifest_location_provider_matches(
             query_context,
             rate_scope.group_filter_sql,
         )
+        await _set_local_jit_off_for_manifest_location(session)
         query_result = await session.execute(
             text(
                 _manifest_group_location_sql(
@@ -3275,6 +3350,16 @@ async def _ptg2_manifest_location_provider_matches(
         if not candidates:
             return rows
 
+        candidates_by_address_key: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        candidates_by_premise_key: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for idx, candidate in enumerate(candidates):
+            candidate_address_key = str(candidate.get("address_key") or "")
+            candidate_premise_key = str(candidate.get("premise_key") or "")
+            if candidate_address_key:
+                candidates_by_address_key.setdefault(candidate_address_key, []).append((idx, candidate))
+            if candidate_premise_key:
+                candidates_by_premise_key.setdefault(candidate_premise_key, []).append((idx, candidate))
+
         def _fallback_rank(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int, int, int, str]:
             type_rank = {"primary": 0, "practice": 1, "secondary": 2}.get(str(candidate.get("type") or ""), 3)
             return (
@@ -3291,18 +3376,18 @@ async def _ptg2_manifest_location_provider_matches(
                 continue
             row_address_key = str(row.get("address_key") or "")
             row_premise_key = str(row.get("premise_key") or "")
-            matches = [
-                candidate
-                for candidate in candidates
-                if (row_address_key and str(candidate.get("address_key") or "") == row_address_key)
-                or (row_premise_key and str(candidate.get("premise_key") or "") == row_premise_key)
-            ]
+            matches_by_idx: dict[int, dict[str, Any]] = {}
+            if row_address_key:
+                matches_by_idx.update(candidates_by_address_key.get(row_address_key, ()))
+            if row_premise_key:
+                matches_by_idx.update(candidates_by_premise_key.get(row_premise_key, ()))
+            matches = list(matches_by_idx.values())
             if not matches:
                 filled_rows.append(row)
                 continue
             same_npi_matches = [candidate for candidate in matches if candidate.get("npi") == row.get("npi")]
             if same_npi_matches:
-                best = sorted(same_npi_matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
+                best = min(same_npi_matches, key=lambda candidate: _fallback_rank(candidate, row))
             else:
                 distinct_phones = {
                     str(candidate.get("phone_number") or "").strip()
@@ -3312,7 +3397,7 @@ async def _ptg2_manifest_location_provider_matches(
                 if len(distinct_phones) != 1:
                     filled_rows.append(row)
                     continue
-                best = sorted(matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
+                best = min(matches, key=lambda candidate: _fallback_rank(candidate, row))
             row = dict(row)
             row["telephone_number"] = best.get("telephone_number") or best.get("phone_number")
             row["phone_number"] = row.get("phone_number") or best.get("phone_number")

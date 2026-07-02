@@ -44,6 +44,7 @@ class PTG2ServingTables:
     provider_entry_component_table: str | None = None
     provider_group_member_table: str | None = None
     provider_group_location_table: str | None = None
+    provider_group_rate_scope_table: str | None = None
     storage: str | None = None
     type: str | None = None
     snapshot_scoped: bool = False

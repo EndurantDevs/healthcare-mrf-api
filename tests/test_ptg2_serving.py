@@ -38,6 +38,8 @@ class FakeSession:
         self.rollback_count = 0
 
     async def execute(self, *_args, **_kwargs):
+        if _args and str(_args[0]).strip().lower() == "set local jit = off":
+            return FakeResult()
         self.calls.append((_args, _kwargs))
         value = self._results.pop(0) if self._results else None
         if isinstance(value, Exception):
@@ -2353,8 +2355,111 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
     assert "FROM mrf.ptg2_provider_group_location_snap loc" in location_sql
     assert "JOIN rate_provider_groups rpg_location" in location_sql
     assert "loc.taxonomy_array && (" in location_sql
+    assert "nt.healthcare_provider_taxonomy_code IN" not in location_sql
+    assert "FROM mrf.npi n_entity" in location_sql
     assert "FROM mrf.entity_address_unified addr" not in location_sql
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" not in location_sql
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_uses_provider_group_rate_scope_table_when_declared(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        provider_group_rate_scope_table="mrf.ptg2_provider_group_rate_scope_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(side_effect=AssertionError("component-backed lookup should not use sidecar rate scope")),
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    route_scope_sql = str(session.calls[2][0][0])
+    route_scope_params = session.calls[2][0][1]
+    assert "SELECT EXISTS" in route_scope_sql
+    assert "FROM mrf.ptg2_provider_group_rate_scope_snap" in route_scope_sql
+    assert route_scope_params["plan_id"] == "010854205"
+    assert route_scope_params["reported_code"] == "90837"
+    assert route_scope_params["reported_code_system"] == "CPT"
+    location_sql = str(session.calls[4][0][0])
+    assert "rate_provider_groups AS MATERIALIZED" not in location_sql
+    assert "JOIN mrf.ptg2_provider_group_rate_scope_snap rpg_location" in location_sql
+    assert "rpg_location.plan_id = :location_plan_id" in location_sql
+    assert "rpg_location.reported_code = :location_reported_code" in location_sql
+    assert "rpg_location.reported_code_system = :location_reported_code_system" in location_sql
+    assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" not in location_sql
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_rate_scope_table_falls_back_when_pair_uncovered(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            FakeResult(scalar=False),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        provider_group_rate_scope_table="mrf.ptg2_provider_group_rate_scope_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    location_sql = str(session.calls[4][0][0])
+    assert "rate_provider_groups AS MATERIALIZED" in location_sql
+    assert "JOIN mrf.ptg2_provider_group_rate_scope_snap rpg_location" not in location_sql
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
 

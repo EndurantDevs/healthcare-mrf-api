@@ -24,7 +24,8 @@ PTG2_LEGACY_SNAPSHOT_TABLE_RE = re.compile(
     r"serving_rate(?:_compact)?|"
     r"procedure|price_code_set|price_atom|price_set|price_set_entry|"
     r"provider_set|provider_set_component|provider_set_entry|"
-    r"provider_entry_component|provider_group_member|provider_group_location"
+    r"provider_entry_component|provider_group_member|provider_group_location|"
+    r"provider_group_rate_scope"
     r")_[0-9a-f]{12,16}(?:_p[0-9]{2})?$"
 )
 
@@ -82,6 +83,7 @@ def _manifest_referenced_tables(manifest: Any) -> set[str]:
         _table_name(payload.get("table")),
         _table_name(payload.get("price_atom_table")),
         _table_name(payload.get("provider_group_member_table")),
+        _table_name(payload.get("provider_group_rate_scope_table")),
         _table_name(payload.get("code_count_table")),
     }
     return {table_name for table_name in table_names if table_name}

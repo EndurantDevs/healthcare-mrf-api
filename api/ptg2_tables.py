@@ -210,4 +210,5 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
         provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
+        provider_group_rate_scope_table=_safe_table_name(serving_index.get("provider_group_rate_scope_table")),
     ))
