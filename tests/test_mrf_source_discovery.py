@@ -1571,6 +1571,8 @@ def test_query_expansion_sources_have_query_specific_source_identity():
     assert second_row is not None
     assert first_row["source_id"] != second_row["source_id"]
     assert first_row["source_key"] != second_row["source_key"]
+    assert first_row["metadata_json"]["target_payer_query"] == "Example Packaging"
+    assert second_row["metadata_json"]["target_payer_query"] == "Example Forge"
 
 
 def test_sapphire_query_slug_variants_probe_common_legal_suffixes():

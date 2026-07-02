@@ -1928,6 +1928,10 @@ def _candidate_target_payer_query(candidate: SourceCandidate) -> str | None:
     return query.lower() if query else None
 
 
+def _candidate_target_payer_query_display(candidate: SourceCandidate) -> str | None:
+    return _clean_text((candidate.raw_payload or {}).get("target_payer_query")) or None
+
+
 def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidate]:
     by_key: dict[tuple[str, str | None, str | None], SourceCandidate] = {}
 
@@ -2569,12 +2573,15 @@ def _candidate_to_rows(
 def _candidate_metadata(
     candidate: SourceCandidate, aliases: list[str] | tuple[str, ...]
 ) -> dict[str, Any]:
+    target_payer_query = _candidate_target_payer_query_display(candidate)
     metadata: dict[str, Any] = {
         "aliases": list(aliases),
         "benefit_lines": list(candidate.benefit_lines),
         "source_tier": _normalize_source_tier(candidate.source_tier),
         "raw": candidate.raw_payload,
     }
+    if target_payer_query:
+        metadata["target_payer_query"] = target_payer_query
     optional_lists = {
         "source_coverage": candidate.source_coverage,
         "vendor_names": candidate.vendor_names,
