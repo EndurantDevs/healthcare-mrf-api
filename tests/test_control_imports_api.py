@@ -114,6 +114,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "sync_import_control_catalog" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "probe_files" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])

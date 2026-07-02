@@ -1565,6 +1565,7 @@ def address_archive_v2_migrate(
 @click.option("--file-probe-entity-types", help="Comma-separated payer entity types to probe, for example tpa or network/tpa.")
 @click.option("--file-probe-payer-query", help="Case-insensitive payer-name substring for file probes.")
 @click.option("--sync-import-control", is_flag=True, help="Push discovered source seeds to the configured import-control service.")
+@click.option("--sync-import-control-catalog", is_flag=True, help="Also publish discovered sources into the import-control searchable catalog.")
 @click.option("--max-toc-bytes", type=int, help="Maximum TOC/index response bytes to fetch during discovery.")
 @click.option("--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10.")
 @click.option("--crawl-target-limit", type=int, help="Maximum resolved TOC targets to crawl after platform expansion.")
@@ -1583,6 +1584,7 @@ def mrf_source_discovery_command(
     file_probe_entity_types: str | None,
     file_probe_payer_query: str | None,
     sync_import_control: bool,
+    sync_import_control_catalog: bool,
     max_toc_bytes: int | None,
     concurrency: int | None,
     crawl_target_limit: int | None,
@@ -1604,6 +1606,7 @@ def mrf_source_discovery_command(
             file_probe_entity_types=file_probe_entity_types,
             file_probe_payer_query=file_probe_payer_query,
             sync_import_control=sync_import_control,
+            sync_import_control_catalog=sync_import_control_catalog,
             max_toc_bytes=max_toc_bytes or None,
             concurrency=concurrency or None,
             crawl_target_limit=crawl_target_limit or None,
