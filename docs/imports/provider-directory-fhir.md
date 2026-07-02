@@ -53,7 +53,8 @@ when `provider-directory-db` has no concrete FHIR base. Currently this includes
 AmeriHealth Caritas plan-specific `provider-api` rows from its developer portal,
 Contra Costa Health Plan's public Provider Directory API base from its APIs
 for Developers page, Health Partners Plans' public Provider Directory FHIR
-server, and the CMS State Medicaid Agency Endpoint Directory CSV. CMS SMA rows
+server, Aetna's credentialed Commercial/Medicare Provider Directory data base,
+and the CMS State Medicaid Agency Endpoint Directory CSV. CMS SMA rows
 are limited to public rows with a tracked Provider Directory status. Active
 rows start with `last_validated_status='catalog_public'`; public rows marked
 in development start with `last_validated_status='catalog_in_development'`.
@@ -77,6 +78,21 @@ can return CloudFront HTTP 403. The official Centene documentation also names
 `https://iopc-provider.api.centene.com/iopc/provider/ca/` for California
 provider details; it is retained as metadata for follow-up parsing rather than
 used as the primary normalized base.
+Aetna catalog rows from older public snapshots can point at stale portal or
+patient-access bases. The importer normalizes those Medicaid Provider Directory
+rows to `https://apif1.aetna.com/fhir/v1/providerdirectory`, then adds a
+separate supplemental source for Commercial/Medicare data at
+`https://apif1.aetna.com/fhir/v1/providerdirectorydata`. Both bases share the
+same secret-backed Aetna OAuth2 credential rule. The Commercial/Medicare base
+supports Bulk Data `$export`; Aetna's API gateway accepts the export request
+when `_outputFormat` is omitted, so the importer suppresses the generic
+`_outputFormat=application/fhir+ndjson` parameter for that base. If bulk export
+is disabled or unsupported during a bounded smoke run, the importer uses
+Aetna-specific state partitions for `Practitioner`, `Organization`, `Location`,
+and `InsurancePlan` search. `PractitionerRole`,
+`OrganizationAffiliation`, and `HealthcareService` remain bulk-first because
+their broad search contracts require specialty/location or referenced-resource
+lookups and are not safely enumerable through a generic unfiltered search.
 Some retest rows have no concrete API base and no currently confirmed open FHIR
 endpoint. Supplemental catalog discovery adds explicit `catalog_blocked` rows
 for those cases when there is primary evidence that the endpoint is not
@@ -260,6 +276,11 @@ normal resource pages. If the payer returns a normal unsupported status such as
 importer falls back to the existing paginated FHIR search. Export attempts that
 are accepted but later fail are recorded in the per-source resource diagnostics
 as `fetch_mode=bulk_export` errors.
+The Aetna Commercial/Medicare base is a known variant of this path: its
+`$export` operation is accepted with `_type=...` and `Prefer: respond-async`,
+but rejects the optional `_outputFormat` query parameter. That exception is
+handled by source metadata so normal Bulk Data servers keep the standards-shaped
+request while Aetna gets the gateway-compatible request.
 
 Full-refresh stale cleanup also uses an append-only unlogged seen stage by
 default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids

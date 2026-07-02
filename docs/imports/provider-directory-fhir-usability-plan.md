@@ -41,16 +41,31 @@ normal `provider-directory-credentials` secret. Aetna's production Provider
 Directory token endpoint accepts OAuth2 client credentials with scope
 `Public NonPII`.
 
-The Aetna API is not currently crawlable through the generic unfiltered FHIR
-search strategy:
+Aetna exposes two production Provider Directory bases:
+
+- `/fhir/v1/providerdirectory` for Medicaid Provider Directory resources.
+- `/fhir/v1/providerdirectorydata` for Commercial and Medicare Provider
+  Directory resources.
+
+The Commercial/Medicare base supports Bulk Data `$export` with
+`Prefer: respond-async`, but the Aetna gateway rejects the optional
+`_outputFormat=application/fhir+ndjson` parameter. The importer therefore omits
+`_outputFormat` for that source while preserving the generic Bulk Data request
+shape for other payers. This is the full-refresh path for Aetna
+Commercial/Medicare data.
+
+Aetna is still not crawlable through a generic unfiltered FHIR search strategy:
 
 - `Practitioner` requires NPI or name plus location.
 - `PractitionerRole` and `OrganizationAffiliation` require specialty.
 - `Location` and `InsurancePlan` can be queried by location/state.
-- The observed CapabilityStatement does not advertise a root `$export`
-  operation, and the generic `[base]/$export?_type=...` path returned 404 from
-  dev.
+- The Medicaid base is constrained to specific search criteria and does not
+  expose the Commercial/Medicare bulk route.
 
-Therefore Aetna credentials can reduce the credential backlog immediately, but
-full Aetna row coverage needs a dedicated Aetna partitioning strategy or the
-exact API-gateway bulk export route from Aetna's product swagger.
+For bounded non-bulk validation, the importer uses Aetna-specific state
+partitions for Commercial/Medicare `Practitioner`, `Organization`, `Location`,
+and `InsurancePlan` search. Enumerating all two-letter name combinations or all
+NPIs is not a full import strategy; NPI search is only useful when we already
+have known NPIs. ZIP search can support targeted checks, but a full ZIP crawl is
+less efficient than Aetna's bulk route and still does not solve every role or
+affiliation expansion cleanly.

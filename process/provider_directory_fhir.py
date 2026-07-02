@@ -280,6 +280,7 @@ US_STATE_FIPS_TO_ABBR = {
     "72": "PR",
     "78": "VI",
 }
+US_STATE_ABBRS = tuple(US_STATE_FIPS_TO_ABBR[fips] for fips in sorted(US_STATE_FIPS_TO_ABBR))
 PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON"
 PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
 _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -368,6 +369,8 @@ query ALOHR_ORG_FIND($criteria: ProviderOrgSearchCriteria, $nextToken: String) {
 }
 """
 AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectory"
+AETNA_PROVIDER_DIRECTORY_DATA_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectorydata"
+AETNA_PROVIDER_DIRECTORY_TOKEN_URL = "https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token"
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CENTENE_PARTNER_PORTAL_APIS_URL = "https://partners.centene.com/apis"
 CENTENE_PROVIDER_DIRECTORY_BASE = "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory"
@@ -883,6 +886,19 @@ def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
     return ()
 
 
+def _aetna_provider_directory_data_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
+    state_param_by_resource = {
+        "Practitioner": "address-state:exact",
+        "Organization": "address-state",
+        "Location": "address-state:exact",
+        "InsurancePlan": "address-state",
+    }
+    state_param = state_param_by_resource.get(resource_type)
+    if not state_param:
+        return ()
+    return tuple((state_param, state) for state in US_STATE_ABBRS)
+
+
 def _url_with_query_item(url: str, key: str, value: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -897,6 +913,11 @@ def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_cou
     if not start_url:
         return []
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        partitions = _aetna_provider_directory_data_partition_values(resource_type)
+        if not partitions:
+            return [start_url]
+        return [_url_with_query_item(start_url, key, value) for key, value in partitions]
     if api_base != SCAN_PROVIDER_DIRECTORY_BASE:
         return [start_url]
     partitions = _scan_partition_values(resource_type)
@@ -1140,6 +1161,7 @@ def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
     canonical_api_base = _canonical_base(source.get("api_base") or source.get("canonical_api_base"))
     host = urllib.parse.urlsplit(canonical_api_base or "").netloc.lower()
     org_name = _normalize_credential_key(source.get("org_name"))
+    metadata = _source_metadata(source)
 
     hosts = _mapping(config.get("hosts"))
     if host and host in {str(key).lower(): key for key in hosts}:
@@ -1151,9 +1173,22 @@ def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
         _canonical_base(str(key)) or str(key).rstrip("/"): key
         for key in api_bases
     }
-    if canonical_api_base and canonical_api_base in normalized_api_bases:
-        key = normalized_api_bases[canonical_api_base]
-        spec = _merge_credential_spec(spec, _mapping(api_bases.get(key)), matched_by=f"api_bases:{canonical_api_base}")
+    candidate_api_bases: list[str] = []
+    _append_unique(candidate_api_bases, canonical_api_base)
+    for equivalent_base in metadata.get("provider_directory_equivalent_api_bases") or []:
+        _append_unique(candidate_api_bases, _canonical_base(equivalent_base))
+    if canonical_api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_BASE)
+    elif canonical_api_base == AETNA_PROVIDER_DIRECTORY_BASE:
+        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_DATA_BASE)
+    for candidate_api_base in candidate_api_bases:
+        if candidate_api_base and candidate_api_base in normalized_api_bases:
+            key = normalized_api_bases[candidate_api_base]
+            spec = _merge_credential_spec(
+                spec,
+                _mapping(api_bases.get(key)),
+                matched_by=f"api_bases:{candidate_api_base}",
+            )
 
     org_names = _mapping(config.get("org_names") or config.get("orgNames"))
     normalized_orgs = {_normalize_credential_key(key): key for key in org_names}
@@ -1412,6 +1447,8 @@ def _payer_alias_key(value: Any) -> str:
 
 def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
+    if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        return None
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
     api_path = parsed_api_base.path.lower()
@@ -1447,11 +1484,43 @@ def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
             ),
             "provider_directory_confirmed_base": AETNA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_token_url": (
-                "https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token"
+                AETNA_PROVIDER_DIRECTORY_TOKEN_URL
             ),
+            "provider_directory_equivalent_api_bases": [
+                AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            ],
             "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
         },
     }
+
+
+def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
+    row = {
+        "id": "aetna-provider-directory-commercial-medicare-bulk",
+        "org_name": "Aetna",
+        "plan_name": "Aetna Commercial and Medicare Provider Directory",
+        "api_base": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        "auth_type": "OAuth2/SMART",
+        "last_validated_status": "auth_required",
+        "requires_registration": True,
+        "source": "aetna-developer-portal",
+        "source_detail": "official Aetna Commercial and Medicare Provider Directory FHIR server",
+        "source_url": "https://developerportal.aetna.com/apis",
+        "note": (
+            "Supplemental Aetna source for Commercial and Medicare Provider Directory data. "
+            "This base supports Bulk Data $export with OAuth2 client credentials."
+        ),
+        "metadata_json": {
+            "provider_directory_override": "aetna_apif1_providerdirectorydata",
+            "provider_directory_confirmed_base": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            "provider_directory_confirmed_token_url": AETNA_PROVIDER_DIRECTORY_TOKEN_URL,
+            "provider_directory_equivalent_api_bases": [
+                AETNA_PROVIDER_DIRECTORY_BASE,
+            ],
+            "provider_directory_bulk_export_omit_output_format": True,
+        },
+    }
+    return [row] if _seed_row_matches_query(row, source_query) else []
 
 
 def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -6246,6 +6315,12 @@ def _seed_rows_from_supplemental_catalogs(
         "source": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
         "rows": len(catalog_rows),
     }
+    catalog_rows = _aetna_provider_directory_data_seed_rows(source_query=source_query)
+    rows.extend(catalog_rows)
+    metrics["catalogs"]["aetna_provider_directorydata"] = {
+        "source": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        "rows": len(catalog_rows),
+    }
     catalog_rows = _provider_directory_blocker_seed_rows(source_query=source_query)
     rows.extend(catalog_rows)
     metrics["catalogs"]["provider_directory_blockers"] = {
@@ -6813,8 +6888,18 @@ async def _probe_sources(
     return len(sources), probe_counts_by_name["valid"], valid_source_ids
 
 
+def _is_bundle_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("resourceType") == "Bundle":
+        return True
+    # Aetna's /providerdirectorydata search responses are Bundle-shaped but can
+    # omit the top-level resourceType while still including entry/link/type.
+    return isinstance(payload.get("entry"), list) and isinstance(payload.get("link"), list)
+
+
 def _bundle_entries(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not payload or payload.get("resourceType") != "Bundle":
+    if not _is_bundle_payload(payload):
         return []
     entries = []
     for entry in payload.get("entry") or []:
@@ -6836,12 +6921,15 @@ def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | 
     api_base = _canonical_base(source.get("api_base"))
     if not api_base:
         return None
-    query = urllib.parse.urlencode(
-        {
-            "_type": resource_type,
-            "_outputFormat": "application/fhir+ndjson",
-        }
+    query_params = {"_type": resource_type}
+    metadata = _source_metadata(source)
+    omit_output_format = (
+        api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE
+        or metadata.get("provider_directory_bulk_export_omit_output_format") is True
     )
+    if not omit_output_format:
+        query_params["_outputFormat"] = "application/fhir+ndjson"
+    query = urllib.parse.urlencode(query_params)
     return f"{api_base}/$export?{query}"
 
 
@@ -7337,7 +7425,7 @@ async def _fetch_resource_rows(
                     break
                 error_message = current_error
                 break
-            if not payload or payload.get("resourceType") != "Bundle":
+            if not _is_bundle_payload(payload):
                 if partitioned_fetch:
                     partition_error_count += 1
                     error_message = f"partition_errors_{partition_error_count}_last_non_bundle_payload"

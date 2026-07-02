@@ -81,7 +81,59 @@ def test_source_row_from_seed_overrides_aetna_developer_portal_base():
     assert row["auth_type"] == "OAuth2/SMART"
     assert row["last_validated_status"] == "auth_required"
     assert row["metadata_json"]["provider_directory_override"] == "aetna_apif1_providerdirectory"
+    assert importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE in row["metadata_json"]["provider_directory_equivalent_api_bases"]
     assert row["metadata_json"]["provider_directory_previous_api_base"] == "https://fhir-ehr.cerner.com/r4/aetna"
+
+
+def test_aetna_provider_directorydata_supplemental_source_is_not_rewritten_to_medicaid_base():
+    rows = importer._aetna_provider_directory_data_seed_rows(source_query="Aetna")
+    assert len(rows) == 1
+
+    row = importer._source_row_from_seed(rows[0])
+
+    assert row["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
+    assert row["canonical_api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
+    assert row["requires_registration"] is True
+    assert row["last_validated_status"] == "auth_required"
+    assert row["metadata_json"]["provider_directory_override"] == "aetna_apif1_providerdirectorydata"
+    assert row["metadata_json"]["provider_directory_bulk_export_omit_output_format"] is True
+
+
+def test_aetna_provider_directorydata_uses_providerdirectory_credentials(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON",
+        json.dumps(
+            {
+                "api_bases": {
+                    importer.AETNA_PROVIDER_DIRECTORY_BASE: {
+                        "oauth2": {
+                            "token_url": importer.AETNA_PROVIDER_DIRECTORY_TOKEN_URL,
+                            "client_id": "client",
+                            "client_secret": "secret",
+                            "scope": "Public NonPII",
+                        }
+                    }
+                }
+            }
+        ),
+    )
+
+    spec = importer._credential_spec_for_source(
+        {
+            "source_id": "aetna-data",
+            "org_name": "Aetna",
+            "api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            "canonical_api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            "metadata_json": {
+                "provider_directory_equivalent_api_bases": [
+                    importer.AETNA_PROVIDER_DIRECTORY_BASE,
+                ],
+            },
+        }
+    )
+
+    assert spec["oauth2"]["scope"] == "Public NonPII"
+    assert f"api_bases:{importer.AETNA_PROVIDER_DIRECTORY_BASE}" in spec["_matched_by"]
 
 
 def test_source_row_from_seed_overrides_aetna_stale_public_auth_label():
@@ -3904,12 +3956,13 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
         },
     )
 
-    assert metrics["sources_seeded"] == 7
-    assert metrics["supplemental_catalog_sources_considered"] == 6
+    assert metrics["sources_seeded"] == 8
+    assert metrics["supplemental_catalog_sources_considered"] == 7
     assert metrics["supplemental_catalogs"]["catalogs"]["amerihealth_caritas"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["contra_costa"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["cms_sma_endpoint_directory"]["rows"] == 0
     assert metrics["supplemental_catalogs"]["catalogs"]["health_partners_plans"]["rows"] == 1
+    assert metrics["supplemental_catalogs"]["catalogs"]["aetna_provider_directorydata"]["rows"] == 1
     assert metrics["supplemental_catalogs"]["catalogs"]["provider_directory_blockers"]["rows"] == 3
     amerihealth = next(
         row for row in upserted if row["seed_source"] == "amerihealth-caritas-developer-portal"
@@ -3927,6 +3980,11 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     )
     assert health_partners_plans["org_name"] == "Health Partners Plans"
     assert health_partners_plans["api_base"] == importer.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE
+    aetna = next(
+        row for row in upserted if row["seed_source"] == "aetna-developer-portal"
+    )
+    assert aetna["org_name"] == "Aetna"
+    assert aetna["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
     blockers = [
         row for row in upserted if row["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
     ]
@@ -4749,6 +4807,54 @@ def test_resource_start_urls_partitions_scan_too_costly_resources():
     assert plan_urls == ["https://providerdirectory.scanhealthplan.com/InsurancePlan?_count=25"]
 
 
+def test_resource_start_urls_partitions_aetna_providerdirectorydata_state_searches():
+    practitioner_urls = importer._resource_start_urls(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "Practitioner",
+        page_count=10,
+    )
+    organization_urls = importer._resource_start_urls(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "Organization",
+        page_count=10,
+    )
+    location_urls = importer._resource_start_urls(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "Location",
+        page_count=10,
+    )
+    plan_urls = importer._resource_start_urls(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "InsurancePlan",
+        page_count=10,
+    )
+    role_urls = importer._resource_start_urls(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "PractitionerRole",
+        page_count=10,
+    )
+
+    assert practitioner_urls[0] == (
+        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/Practitioner?"
+        "_count=10&address-state%3Aexact=AL"
+    )
+    assert practitioner_urls[-1].endswith("_count=10&address-state%3Aexact=VI")
+    assert len(practitioner_urls) == len(importer.US_STATE_ABBRS)
+    assert organization_urls[0] == (
+        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/Organization?_count=10&address-state=AL"
+    )
+    assert len(organization_urls) == len(importer.US_STATE_ABBRS)
+    assert location_urls[0].endswith("_count=10&address-state%3Aexact=AL")
+    assert len(location_urls) == len(importer.US_STATE_ABBRS)
+    assert plan_urls[0] == (
+        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/InsurancePlan?_count=10&address-state=AL"
+    )
+    assert len(plan_urls) == len(importer.US_STATE_ABBRS)
+    assert role_urls == [
+        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/PractitionerRole?_count=10"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
     calls: list[str] = []
@@ -5382,6 +5488,15 @@ def test_bulk_export_start_url_uses_base_export_operation():
     )
 
 
+def test_bulk_export_start_url_omits_output_format_for_aetna_providerdirectorydata():
+    url = importer._bulk_export_start_url(
+        {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE},
+        "Practitioner",
+    )
+
+    assert url == f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/$export?_type=Practitioner"
+
+
 def test_bulk_export_pre_stream_failures_fall_back_to_paged_reads():
     assert importer._bulk_export_pre_stream_should_fallback(500, None) is True
     assert importer._bulk_export_pre_stream_should_fallback(401, None) is True
@@ -5546,6 +5661,48 @@ async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(mon
     importer._record_resource_fetch_stats(stats, "Practitioner", result)
     assert stats["Practitioner"]["bulk_export_sources"] == 1
     assert stats["Practitioner"]["sources_failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_accepts_bundle_shaped_payload_without_resource_type(monkeypatch):
+    async def fake_fetch_json(url, *, timeout):
+        assert url == "https://example.test/fhir/Practitioner?_count=25"
+        return (
+            200,
+            {
+                "type": "searchset",
+                "total": 1,
+                "link": [{"relation": "self", "url": url}],
+                "entry": [
+                    {
+                        "fullUrl": "https://example.test/fhir/Practitioner/prac-1",
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "prac-1",
+                            "name": [{"family": "Aetna"}],
+                        },
+                    }
+                ],
+            },
+            None,
+            10,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert result is not None
+    assert result.rows_fetched == 1
+    assert result.rows[0]["resource_id"] == "prac-1"
 
 
 @pytest.mark.asyncio
