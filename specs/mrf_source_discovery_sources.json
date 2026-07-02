@@ -4,11 +4,16 @@
   "source_query_expansion_platforms": [
     "sapphire",
     "aetna_health1",
+    "anthem_s3_mrf",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
     "healthcarebluebook_mrf",
     "html_mrf_with_healthcarebluebook",
+    "hcsc_asomrf_landing",
+    "html_mrf_links",
+    "bcbsal_html_mrf_links",
+    "blueadvantage_html_mrf_links",
     "auxiant_wordpress",
     "payercompass_mrf"
   ],

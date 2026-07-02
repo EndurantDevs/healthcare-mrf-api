@@ -1313,6 +1313,36 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
         index_url="https://example.test/transparency-in-coverage",
         hosting_platform="html_mrf_with_healthcarebluebook",
     )
+    hcsc = discovery.SourceCandidate(
+        payer_name="Example Blue",
+        provider="master-list",
+        index_url="https://example.test/asomrf",
+        hosting_platform="hcsc_asomrf_landing",
+    )
+    html_mrf = discovery.SourceCandidate(
+        payer_name="Example Regional",
+        provider="master-list",
+        index_url="https://example.test/mrf",
+        hosting_platform="html_mrf_links",
+    )
+    bcbsal = discovery.SourceCandidate(
+        payer_name="Example Alabama Blue",
+        provider="master-list",
+        index_url="https://example.test/web/tcr",
+        hosting_platform="bcbsal_html_mrf_links",
+    )
+    blueadvantage = discovery.SourceCandidate(
+        payer_name="Example Blue Advantage",
+        provider="master-list",
+        index_url="https://example.test/machine-readable-files",
+        hosting_platform="blueadvantage_html_mrf_links",
+    )
+    anthem = discovery.SourceCandidate(
+        payer_name="Example Anthem",
+        provider="master-list",
+        index_url="https://example.test/machine-readable-file/search/",
+        hosting_platform="anthem_s3_mrf",
+    )
     auxiant_directory = discovery.SourceCandidate(
         payer_name="Example Auxiant",
         provider="master-list",
@@ -1337,6 +1367,11 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert discovery._candidate_supports_source_query_expansion(
         delegated_healthcarebluebook
     )
+    assert discovery._candidate_supports_source_query_expansion(hcsc)
+    assert discovery._candidate_supports_source_query_expansion(html_mrf)
+    assert discovery._candidate_supports_source_query_expansion(bcbsal)
+    assert discovery._candidate_supports_source_query_expansion(blueadvantage)
+    assert discovery._candidate_supports_source_query_expansion(anthem)
     assert discovery._candidate_supports_source_query_expansion(auxiant_directory)
     assert not discovery._candidate_supports_source_query_expansion(direct_group)
     expanded = discovery._candidate_with_target_payer_query(
