@@ -4818,6 +4818,84 @@ async def test_scan_practitioner_role_reverse_lookup_writes_row_batches(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_scan_practitioner_role_reverse_lookup_pages_seed_rows_from_stage(monkeypatch):
+    seed_queries: list[dict[str, Any]] = []
+
+    async def fake_db_all(_statement, **params):
+        seed_queries.append(params)
+        if params["resource_type"] == "Practitioner" and params["last_resource_id"] == "":
+            return [("prac-1",)]
+        return []
+
+    fetch_calls: list[str] = []
+
+    async def fake_fetch_json(_source, url, *, timeout):
+        fetch_calls.append(url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "fullUrl": "https://providerdirectory.scanhealthplan.com/PractitionerRole/role-1",
+                        "resource": {
+                            "resourceType": "PractitionerRole",
+                            "id": "role-1",
+                            "practitioner": {"reference": "Practitioner/prac-1"},
+                        },
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    streamed_row_batches: list[list[dict[str, object]]] = []
+
+    async def row_batch_handler(_model, row_batch):
+        streamed_row_batches.append(row_batch)
+        return len(row_batch)
+
+    monkeypatch.setattr(importer.db, "all", fake_db_all)
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    result = await importer._fetch_scan_practitioner_role_rows(
+        {
+            "source_id": "scan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        },
+        {},
+        importer.ScanPractitionerRoleFetchOptions(
+            per_resource_limit=5,
+            page_limit=0,
+            page_count=25,
+            timeout=3,
+            run_id="run_1",
+            row_batch_handler=row_batch_handler,
+            row_batch_size=1,
+            retain_rows=False,
+            seed_stage_table="provider_directory_import_seen_stage_test",
+            seed_source_ids=("scan",),
+        ),
+    )
+
+    assert result.rows == []
+    assert result.rows_fetched == 1
+    assert result.rows_written == 1
+    assert streamed_row_batches[0][0]["resource_id"] == "role-1"
+    assert fetch_calls == [
+        "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
+    ]
+    assert seed_queries[0]["source_ids"] == ["scan"]
+    assert [query["resource_type"] for query in seed_queries] == [
+        "Practitioner",
+        "Organization",
+        "Location",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 

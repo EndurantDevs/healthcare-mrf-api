@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import aiohttp
 from sqlalchemy import case, func, or_
@@ -436,6 +436,9 @@ class ScanPractitionerRoleFetchOptions:
     cancel_ctx: dict[str, Any] | None = None
     cancel_task: dict[str, Any] | None = None
     deadline_seconds: int = 0
+    seed_stage_table: str | None = None
+    seed_source_ids: tuple[str, ...] = ()
+    seed_page_size: int = 5000
 
 
 @dataclass
@@ -841,6 +844,48 @@ def _scan_practitioner_role_seed_rows(
                 continue
             seen.add(key)
             yield (search_param, resource_type, resource_id)
+
+
+async def _iter_scan_practitioner_role_seed_rows(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+    options: ScanPractitionerRoleFetchOptions,
+) -> AsyncIterator[tuple[str, str, str]]:
+    if options.seed_stage_table and options.seed_source_ids:
+        stage_ref = _qt(_schema(), options.seed_stage_table)
+        source_ids = list(options.seed_source_ids)
+        page_size = max(1, options.seed_page_size)
+        for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+            search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
+            last_resource_id = ""
+            while True:
+                rows = await db.all(
+                    f"""
+                    SELECT DISTINCT resource_id
+                      FROM {stage_ref}
+                     WHERE resource_type = :resource_type
+                       AND source_id = ANY(CAST(:source_ids AS varchar[]))
+                       AND resource_id > :last_resource_id
+                     ORDER BY resource_id
+                     LIMIT :limit;
+                    """,
+                    resource_type=resource_type,
+                    source_ids=source_ids,
+                    last_resource_id=last_resource_id,
+                    limit=page_size,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    resource_id = _clean_text(row[0])
+                    if not resource_id:
+                        continue
+                    last_resource_id = resource_id
+                    yield (search_param, resource_type, resource_id)
+                if len(rows) < page_size:
+                    break
+        return
+    for seed in _scan_practitioner_role_seed_rows(rows_by_resource):
+        yield seed
 
 
 def _scan_practitioner_role_reverse_lookup_url(
@@ -7303,7 +7348,10 @@ async def _fetch_scan_practitioner_role_rows(
     )
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
 
-    for search_param, seed_resource_type, seed_resource_id in _scan_practitioner_role_seed_rows(rows_by_resource):
+    async for search_param, seed_resource_type, seed_resource_id in _iter_scan_practitioner_role_seed_rows(
+        rows_by_resource,
+        options,
+    ):
         seed_count += 1
         if options.cancel_ctx is not None:
             await raise_if_cancelled(options.cancel_ctx, options.cancel_task)
@@ -8658,6 +8706,11 @@ async def _import_resources(
                 active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             use_streaming = stream_batch_size > 0
+            scan_seed_stage_table = seen_stage_table if use_streaming and seen_stage_table else None
+            if scan_seed_stage_table:
+                await _prepare_provider_directory_import_seen_stage_lookup(scan_seed_stage_table)
+                for seed_resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+                    rows_by_resource.pop(seed_resource_type, None)
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
                 """Write streamed SCAN PractitionerRole rows for each mirrored source."""
@@ -8688,6 +8741,8 @@ async def _import_resources(
                     cancel_ctx=cancel_ctx,
                     cancel_task=cancel_task,
                     deadline_seconds=linked_resource_deadline_seconds,
+                    seed_stage_table=scan_seed_stage_table,
+                    seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
                 ),
             )
             for _source_id in source_ids:
