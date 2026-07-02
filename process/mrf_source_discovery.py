@@ -14385,15 +14385,7 @@ async def _push_import_control_catalog(
                             or stored_status != source_status_lower
                         )
                     )
-                    should_ingest_preview = bool(
-                        items
-                        and not evidence_only
-                        and (
-                            staged
-                            or stored_status == "stale"
-                            or needs_public_state_refresh
-                        )
-                    )
+                    should_ingest_preview = bool(items and not evidence_only)
                     if not items and source_status_lower == "active" and not evidence_only:
                         # Existing public sources still need metadata-only refreshes
                         # (aliases, benefit lines, source tier). Newly staged metadata-only

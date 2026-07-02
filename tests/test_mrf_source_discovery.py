@@ -8768,7 +8768,7 @@ async def test_push_import_control_catalog_refreshes_existing_public_source_meta
 
 
 @pytest.mark.asyncio
-async def test_push_import_control_catalog_skips_existing_public_preview_reingest(
+async def test_push_import_control_catalog_ingests_existing_public_snapshot_items(
     monkeypatch,
 ):
     calls = []
@@ -8792,7 +8792,7 @@ async def test_push_import_control_catalog_skips_existing_public_preview_reinges
     monkeypatch.setattr(
         discovery.aiohttp,
         "ClientSession",
-        _catalog_public_metadata_only_fake_session(calls),
+        _catalog_existing_public_snapshot_fake_session(calls),
     )
 
     sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
@@ -8800,14 +8800,14 @@ async def test_push_import_control_catalog_skips_existing_public_preview_reinges
     )
 
     assert sources_synced == 1
-    assert plans_synced == 0
+    assert plans_synced == 1
     assert errors == []
-    assert not [
+    assert [
         call
         for call in calls
         if call["url"].endswith("/v1/ptg/discover/ingest-preview")
     ]
-    assert not [
+    assert [
         call for call in calls if call["url"].endswith("/v1/catalog/seeds/import")
     ]
 
@@ -8829,6 +8829,59 @@ def _existing_public_catalog_source_row():
             "benefit_lines": ["medical", "dental"],
         },
     }
+
+
+def _catalog_existing_public_snapshot_fake_session(captured_calls):
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            captured_calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                return FakeResponse({"source_id": "ic_source_1"})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                return FakeResponse({"counts": {"plans": 1}})
+            if url.endswith("/v1/catalog/seeds/import"):
+                return FakeResponse({"count": 1, "items": json.get("items") or []})
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            captured_calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_1"):
+                return FakeResponse(
+                    {
+                        "source_id": "ic_source_1",
+                        "visibility": "public",
+                        "status": "active",
+                    }
+                )
+            return FakeResponse({}, status=404)
+
+    return FakeSession
 
 
 @pytest.mark.asyncio
