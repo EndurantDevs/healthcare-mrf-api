@@ -422,6 +422,7 @@ TMHP_PROVIDER_DIRECTORY_BASE = "https://cmsinterop.tmhp.com/tmhp/fhir/pd/R4"
 TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL = f"{NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/metadata"
+INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
@@ -433,6 +434,11 @@ SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
     "Practitioner": "practitioner",
     "Organization": "organization",
     "Location": "location",
+}
+PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
+    # This HAPI proxy returns an empty PractitionerRole Bundle for _count >= 50,
+    # even though _count=25 returns rows and a next link.
+    (INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
 }
 PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
@@ -795,6 +801,43 @@ def _bounded_page_count(page_count: int) -> int:
     return max(1, min(int(page_count or 1), _max_page_count()))
 
 
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _metadata_resource_page_count_cap(source: dict[str, Any], resource_type: str) -> int | None:
+    metadata = _source_metadata(source)
+    raw_caps = (
+        metadata.get("provider_directory_resource_page_count_caps")
+        or metadata.get("provider_directory_page_count_caps")
+    )
+    if isinstance(raw_caps, dict):
+        for key in (resource_type, resource_type.lower()):
+            if key in raw_caps and (cap := _positive_int(raw_caps.get(key))):
+                return cap
+    raw_resource = metadata.get("provider_directory_resource_page_count_cap")
+    if isinstance(raw_resource, dict):
+        for key in (resource_type, resource_type.lower()):
+            if key in raw_resource and (cap := _positive_int(raw_resource.get(key))):
+                return cap
+    return None
+
+
+def _source_resource_page_count(source: dict[str, Any], resource_type: str, page_count: int) -> int:
+    bounded_count = _bounded_page_count(page_count)
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    hard_cap = PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS.get((api_base or "", resource_type))
+    metadata_cap = _metadata_resource_page_count_cap(source, resource_type)
+    caps = [cap for cap in (hard_cap, metadata_cap) if cap]
+    if not caps:
+        return bounded_count
+    return max(1, min(bounded_count, min(caps)))
+
+
 def _url_with_count(url: str, page_count: int) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -806,20 +849,21 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    resource_page_count = _source_resource_page_count(source, resource_type, page_count)
     endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
     endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
     if endpoint and not _is_placeholder_url(endpoint):
         parsed = urllib.parse.urlsplit(endpoint)
         if parsed.scheme and parsed.netloc:
-            return _url_with_count(endpoint, page_count)
+            return _url_with_count(endpoint, resource_page_count)
         if api_base:
             return _url_with_count(
                 urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint),
-                page_count,
+                resource_page_count,
             )
     if not api_base:
         return None
-    return _url_with_count(f"{api_base}/{resource_type}", page_count)
+    return _url_with_count(f"{api_base}/{resource_type}", resource_page_count)
 
 
 SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -955,7 +999,7 @@ def _scan_practitioner_role_reverse_lookup_url(
         f"{api_base}/PractitionerRole",
         {
             search_param: reference,
-            "_count": str(_bounded_page_count(page_count)),
+            "_count": str(_source_resource_page_count(source, "PractitionerRole", page_count)),
         },
     )
 

@@ -836,6 +836,13 @@ configured, run a full resource refresh (`resource_limit=0`,
 `bulk_export=true`, `source_concurrency=1`,
 `publish_artifacts=true`, `publish_corroboration=false`), and delete stale rows
 only for completed source/resource scans.
+The importer may cap `_count` below the schedule-level `page_count` for a
+specific payer/resource when the live FHIR server is known to misbehave at
+larger page sizes. The confirmed case is Michigan InteropStation
+`PractitionerRole`, where `_count>=50` returns an empty Bundle while `_count=25`
+returns rows and a next link. Future source-specific caps can also be carried
+in source `metadata_json.provider_directory_resource_page_count_caps` without
+changing the monthly schedule.
 `import-control` also schedules a follow-up artifact-only Provider Directory
 run after the monthly `entity-address-unified` Provider Directory partial
 projection. That run uses `publish_artifacts_only=true` and

@@ -4644,6 +4644,50 @@ def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
     assert url == "https://example.test/fhir/HealthcareService?_count=500"
 
 
+def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_count():
+    url = importer._resource_start_url(
+        {
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+            "endpoint_practitioner_role": (
+                f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole"
+            ),
+        },
+        "PractitionerRole",
+        page_count=100,
+    )
+
+    assert url == (
+        "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?_count=25"
+    )
+
+
+def test_resource_start_url_does_not_cap_other_michigan_interopstation_resources():
+    url = importer._resource_start_url(
+        {"api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE},
+        "Practitioner",
+        page_count=100,
+    )
+
+    assert url == "https://api.interopstation.com/mdhhs/fhir/Practitioner?_count=100"
+
+
+def test_resource_start_url_uses_metadata_resource_page_count_cap():
+    url = importer._resource_start_url(
+        {
+            "api_base": "https://payer.example/fhir",
+            "metadata_json": {
+                "provider_directory_resource_page_count_caps": {
+                    "PractitionerRole": 10,
+                }
+            },
+        },
+        "PractitionerRole",
+        page_count=100,
+    )
+
+    assert url == "https://payer.example/fhir/PractitionerRole?_count=10"
+
+
 def test_resource_start_url_ignores_catalog_annotation_endpoint():
     url = importer._resource_start_url(
         {
