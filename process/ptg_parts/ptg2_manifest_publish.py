@@ -305,12 +305,11 @@ async def _materialize_manifest_components(
     if not sidecar_path.exists() or sidecar_path.stat().st_size <= 0:
         return None
 
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)} CASCADE;")
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(table_name)} (
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(table_name)} (
             provider_set_global_id_128 {id_type} NOT NULL,
             provider_group_global_id_128 {id_type} NOT NULL
         );

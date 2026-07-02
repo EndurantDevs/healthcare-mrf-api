@@ -2244,6 +2244,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     session = FakeSession(
         [
             FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
             False,
             FakeResult(rows=[location_by_field]),
             FakeResult(rows=[component_by_field]),
@@ -2270,8 +2271,10 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         plan_id="010854205",
     )
 
-    location_sql = str(session.calls[2][0][0])
-    location_params = session.calls[2][0][1]
+    populated_sql = str(session.calls[1][0][0])
+    location_sql = str(session.calls[3][0][0])
+    location_params = session.calls[3][0][1]
+    assert "SELECT EXISTS" in populated_sql
     for expected_sql in (
         "rate_provider_groups AS MATERIALIZED",
         "FROM mrf.ptg2_serving_manifest_snap rate_scope",
@@ -2291,6 +2294,27 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     assert component_params["group_ids"] == [group_id]
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monkeypatch):
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession([FakeResult(rows=[])])
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_args, **_kwargs: {group_id: (provider_set_id,)},
+    )
+
+    sets_by_group = await ptg2_serving._manifest_sets_by_group(session, tables, (group_id,))
+
+    assert sets_by_group == {group_id: (provider_set_id,)}
 
 
 @pytest.mark.asyncio

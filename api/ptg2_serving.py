@@ -1534,6 +1534,7 @@ async def _manifest_sets_by_group(
     if not normalized_group_ids:
         return {}
 
+    sidecar_available = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"))
     component_table = _safe_table_name(serving_tables.provider_set_component_table)
     if component_table:
         sets_by_group: dict[str, set[str]] = {group_id: set() for group_id in normalized_group_ids}
@@ -1560,11 +1561,34 @@ async def _manifest_sets_by_group(
                 provider_set_id = _ptg2_manifest_id(component_mapping.get("provider_set_global_id_128"))
                 if group_id and provider_set_id:
                     sets_by_group.setdefault(group_id, set()).add(provider_set_id)
+            missing_group_ids = tuple(
+                group_id for group_id, provider_set_ids in sets_by_group.items() if not provider_set_ids
+            )
+            if missing_group_ids and sidecar_available:
+                fallback_sets = _ptg2_manifest_sidecar_members_many(
+                    serving_tables,
+                    "provider_inverted",
+                    missing_group_ids,
+                )
+                for group_id, provider_set_ids in fallback_sets.items():
+                    sets_by_group.setdefault(group_id, set()).update(provider_set_ids)
             return {group_id: tuple(sorted(provider_set_ids)) for group_id, provider_set_ids in sets_by_group.items()}
 
-    if not _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"):
+    if not sidecar_available:
         return None
     return _ptg2_manifest_sidecar_members_many(serving_tables, "provider_inverted", normalized_group_ids)
+
+
+async def _is_manifest_component_table_populated(session, table_name: str | None) -> bool:
+    component_table = _safe_table_name(table_name)
+    if not component_table:
+        return False
+    try:
+        result = await session.execute(text(f"SELECT EXISTS (SELECT 1 FROM {component_table} LIMIT 1)"))
+        return bool(result.scalar())
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return False
 
 
 def _ptg2_manifest_provider_npis_for_provider_set(
@@ -2447,16 +2471,22 @@ async def _ptg2_manifest_location_provider_matches(
         if requested_system
         else str(args.get("code") or args.get("reported_code") or "").strip()
     )
-    if component_table and serving_table and requested_plan_id and requested_code:
+    if (
+        component_table
+        and serving_table
+        and requested_plan_id
+        and requested_code
+        and requested_system
+        and await _is_manifest_component_table_populated(session, component_table)
+    ):
         params["location_plan_id"] = requested_plan_id
         params["location_reported_code"] = requested_code
         rate_scope_filters = [
             "rate_scope.plan_id = :location_plan_id",
             "rate_scope.reported_code = :location_reported_code",
+            "rate_scope.reported_code_system = :location_reported_code_system",
         ]
-        if requested_system:
-            params["location_reported_code_system"] = requested_system
-            rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
+        params["location_reported_code_system"] = requested_system
         member_scope_cte = f"""
             rate_provider_groups AS MATERIALIZED (
                 SELECT DISTINCT psc.provider_group_global_id_128
