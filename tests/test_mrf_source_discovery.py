@@ -8840,13 +8840,102 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     assert sources_synced in {1}
     assert plans_synced in {1}
     assert errors == []
-    assert len(source_payloads) == 2
-    assert all(payload["display_name"] == "Example Active Benefits" for payload in source_payloads)
+    assert len(source_payloads) == 3
+    assert all(
+        payload["display_name"] == "Example Active Benefits"
+        for payload in final_public_sources
+    )
     assert len(final_public_sources) in {1}
     assert final_public_sources[0]["status"] == "active"
     assert final_public_sources[0]["metadata"]["aliases"] == [
         "Example Active Benefits",
         "Example Active Administrators",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_supersedes_unselected_duplicates(
+    monkeypatch,
+):
+    """Duplicate private-context rows are hidden after the selected row syncs."""
+    http_calls = []
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_current"]
+        return {
+            "source_current": [
+                {
+                    "canonical_url": "https://example.com/rates.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Current Benefits",
+                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
+    )
+
+    (
+        sources_synced,
+        plans_synced,
+        sync_errors,
+    ) = await discovery._push_import_control_catalog(_duplicate_private_catalog_source_rows())
+
+    source_request_bodies = [
+        call["json"]
+        for call in http_calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ]
+    superseded_request_bodies = [
+        request_body
+        for request_body in source_request_bodies
+        if request_body["status"] == "superseded"
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 1
+    assert sync_errors == []
+    assert len(superseded_request_bodies) == 1
+    assert superseded_request_bodies[0]["source_key"] == "example-duplicate"
+    assert superseded_request_bodies[0]["visibility"] == "internal"
+    assert superseded_request_bodies[0]["preserve_operator_state"] is False
+
+
+def _duplicate_private_catalog_source_rows():
+    private_metadata_dict = {
+        "target_payer_query": "Example Employer",
+        "private_query_context": True,
+        "private_context_benefit_line": "medical",
+        "private_context_carrier_query": "Example Carrier",
+    }
+    return [
+        {
+            "source_id": "source_current",
+            "index_url": "https://example.com/shared-index.json",
+            "display_name": "Example Current Benefits",
+            "source_key": "example-current",
+            "seed_provider": "master-list",
+            "access_model": "free",
+            "source_type": "toc_json",
+            "status": "active",
+            "metadata_json": dict(private_metadata_dict),
+        },
+        {
+            "source_id": "source_duplicate",
+            "index_url": "https://example.com/shared-index.json",
+            "display_name": "Example Duplicate Benefits",
+            "source_key": "example-duplicate",
+            "seed_provider": "master-list",
+            "access_model": "free",
+            "source_type": "toc_json",
+            "status": "needs_review",
+            "metadata_json": dict(private_metadata_dict),
+        },
     ]
 
 

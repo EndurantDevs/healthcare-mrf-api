@@ -13984,6 +13984,14 @@ def _dedupe_import_control_source_rows(
     return list(by_key.values())
 
 
+def _duplicate_import_control_source_rows(
+    group_rows: list[dict[str, Any]], selected_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return same-identity rows not selected for catalog publication."""
+    selected_object_ids = {id(row) for row in selected_rows}
+    return [row for row in group_rows if id(row) not in selected_object_ids]
+
+
 async def _promote_import_control_source(
     session: aiohttp.ClientSession,
     base: str,
@@ -14215,11 +14223,13 @@ async def _push_import_control_catalog(
             rows_to_sync = _dedupe_import_control_source_rows(
                 group_rows, snapshots_by_source_id
             )
+            synced_identity_keys: set[str] = set()
             for row in rows_to_sync:
                 source_id = str(row.get("source_id") or "")
                 items = snapshots_by_source_id.get(source_id) or []
                 source_status = str(row.get("status") or "active").strip() or "active"
                 evidence_only = not _source_row_is_importable(row)
+                identity_key = _import_control_source_identity_key(row)
                 ic_source_id: str | None = None
                 try:
                     # Stage the source non-public first so a mid-sync failure never leaves a
@@ -14265,8 +14275,9 @@ async def _push_import_control_catalog(
                                 visibility="public",
                                 status=source_status,
                                 preserve_operator_state=False,
-                            )
+                        )
                         sources_synced += 1
+                        synced_identity_keys.add(identity_key)
                         progress_done += 1
                         emit_catalog_sync_progress(
                             f"synced catalog source {progress_done}/{progress_total}"
@@ -14300,6 +14311,7 @@ async def _push_import_control_catalog(
                         )
                     sources_synced += 1
                     plans_synced += source_plans
+                    synced_identity_keys.add(identity_key)
                     progress_done += 1
                     emit_catalog_sync_progress(
                         f"synced catalog source {progress_done}/{progress_total}"
@@ -14317,6 +14329,30 @@ async def _push_import_control_catalog(
                         f"catalog source {progress_done}/{progress_total} failed"
                     )
                     continue
+            for duplicate_row in _duplicate_import_control_source_rows(
+                group_rows, rows_to_sync
+            ):
+                duplicate_identity_key = _import_control_source_identity_key(duplicate_row)
+                if duplicate_identity_key not in synced_identity_keys:
+                    continue
+                try:
+                    await _promote_import_control_source(
+                        session,
+                        base,
+                        duplicate_row,
+                        visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
+                        status="superseded",
+                        preserve_operator_state=False,
+                    )
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    errors.append(
+                        {
+                            "source_id": str(duplicate_row.get("source_id") or "")
+                            or None,
+                            "import_control_source_id": None,
+                            "message": f"duplicate cleanup failed: {exc}",
+                        }
+                    )
     if errors and not sources_synced:
         raise RuntimeError(
             f"import-control catalog sync failed for all {len(errors)} source(s): "
