@@ -12546,7 +12546,12 @@ def _candidate_matches_text_filters(
             return False
     if payer_query:
         query = _clean_text(payer_query).lower()
-        searchable_names = (candidate.payer_name, *candidate.aliases)
+        target_payer_query = _candidate_target_payer_query(candidate)
+        searchable_names = (
+            candidate.payer_name,
+            *candidate.aliases,
+            target_payer_query or "",
+        )
         if not any(
             _candidate_search_name_matches_query(name, query)
             for name in searchable_names

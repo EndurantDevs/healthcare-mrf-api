@@ -1383,6 +1383,11 @@ async def test_private_query_context_expands_supported_public_sources(
         candidate.raw_payload["private_query_context"] for candidate in expanded
     )
     assert not any(candidate.payer_name == "Example Direct" for candidate in expanded)
+    assert discovery._candidate_matches_text_filters(
+        expanded[0],
+        entity_types=(),
+        payer_query="Example Packaging",
+    )
 
 
 def _write_private_context_config(
