@@ -116,6 +116,7 @@ from api.ptg2_serving_utils import (
     _uuid_to_hex,
 )
 from api.provider_specialty_filters import (
+    ProviderSpecialtyFilter,
     provider_specialty_taxonomy_exists_sql,
     provider_specialty_taxonomy_semijoin_sql,
     resolve_provider_specialty_filter,
@@ -394,15 +395,21 @@ def _ptg2_manifest_provider_location_filters(
         location_filter_clauses.append("LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5")
     elif geo_filter_clauses:
         location_filter_clauses.extend(geo_filter_clauses)
+    # Precise taxonomy predicates are uncorrelated `npi IN (SELECT ...)`
+    # semi-joins, not correlated EXISTS: the location scan covers a dense-metro
+    # zip radius of the (17M-row scale) group-location table, and a per-row
+    # probe (worse for classification filters, which join nucc per row) is what
+    # 502'd plan-scoped classification searches.
     if query_context.location_specialty_filter.active:
         location_filter_clauses.append(
-            provider_specialty_taxonomy_exists_sql(
-                "loc.npi",
+            "loc.npi IN ("
+            + provider_specialty_taxonomy_semijoin_sql(
                 query_context.params,
                 "manifest_location_table_specialty",
                 query_context.location_specialty_filter,
                 schema=PTG2_SCHEMA,
             )
+            + ")"
         )
     array_taxonomy_filter = _taxonomy_array_overlap_sql(
         "loc",
@@ -410,14 +417,25 @@ def _ptg2_manifest_provider_location_filters(
         "manifest_location_table",
         query_context.location_array_taxonomy_codes,
     )
+    if not array_taxonomy_filter:
+        # Classification-only filters resolve no taxonomy codes, so the
+        # code-driven overlap above is empty; derive the in-index prefilter
+        # from nucc classification instead. The precise semi-join above still
+        # decides membership (primary_only etc.).
+        array_taxonomy_filter = _classification_taxonomy_array_overlap_sql(
+            "loc",
+            query_context.params,
+            "manifest_location_table",
+            query_context.location_specialty_filter,
+        )
     if array_taxonomy_filter:
         location_filter_clauses.append(array_taxonomy_filter)
     if query_context.location_inferred_taxonomy_sql and not (
         array_taxonomy_filter and not query_context.location_specialty_filter.active
     ):
         location_filter_clauses.append(
-            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-            f"WHERE nt.npi = loc.npi AND {query_context.location_inferred_taxonomy_sql})"
+            f"loc.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
+            f"WHERE {query_context.location_inferred_taxonomy_sql})"
         )
     if query_context.location_inferred_taxonomy_sql:
         location_filter_clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
@@ -1559,6 +1577,38 @@ def _taxonomy_array_overlap_sql(
         f"{alias}.taxonomy_array && ("
         f"SELECT ARRAY_AGG(int_code) FROM {PTG2_SCHEMA}.nucc_taxonomy "
         f"WHERE code IN ({', '.join(code_placeholders)}))"
+    )
+
+
+def _classification_taxonomy_array_overlap_sql(
+    alias: str,
+    params: dict[str, Any],
+    param_prefix: str,
+    specialty_filter: ProviderSpecialtyFilter,
+) -> str:
+    # Classification-driven variant of _taxonomy_array_overlap_sql for filters
+    # that resolve no explicit taxonomy codes. Overlap against every nucc code
+    # in the classification family is a superset of the precise predicate
+    # (primary_only, per-row specialization) — callers must still apply that.
+    if not (
+        specialty_filter.active
+        and specialty_filter.classification
+        and specialty_filter.use_classification_predicate
+        and not specialty_filter.taxonomy_codes
+    ):
+        return ""
+    classification_key = f"{param_prefix}_array_classification"
+    params[classification_key] = specialty_filter.classification
+    specialization_clause = (
+        " AND NULLIF(BTRIM(COALESCE(specialization, '')), '') IS NULL"
+        if not specialty_filter.include_subspecialties
+        else ""
+    )
+    return (
+        f"{alias}.taxonomy_array && ("
+        f"SELECT ARRAY_AGG(int_code) FROM {PTG2_SCHEMA}.nucc_taxonomy "
+        f"WHERE LOWER(COALESCE(classification, '')) = LOWER(:{classification_key})"
+        f"{specialization_clause})"
     )
 
 

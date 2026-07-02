@@ -2364,6 +2364,73 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
 
 
 @pytest.mark.asyncio
+async def test_manifest_location_classification_filter_scopes_via_semijoin_and_array(monkeypatch):
+    """Classification filters must prefilter in-index and semi-join, not probe per row.
+
+    Regression for plan-scoped 502s with plan_id + zip5 + classification
+    (e.g. 'Orthopaedic Surgery', CPT 99204 - no inference rule): the
+    classification resolves no taxonomy codes, so the code-driven
+    taxonomy_array overlap was empty and the correlated EXISTS (with a nucc
+    join) ran once per location row of a dense-metro zip radius.
+    """
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "plan_id": "010854205",
+            "code": "99204",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "classification": "Orthopaedic Surgery",
+            "limit": "20",
+        },
+        candidate_limit=20,
+        plan_id="010854205",
+    )
+
+    location_sql = str(session.calls[3][0][0])
+    location_params = session.calls[3][0][1]
+    assert "FROM mrf.ptg2_provider_group_location_snap loc" in location_sql
+    # Precise classification check is an uncorrelated semi-join...
+    assert "loc.npi IN (SELECT manifest_location_table_specialty_nt.npi" in location_sql
+    assert "manifest_location_table_specialty_nt.npi = loc.npi" not in location_sql
+    assert (
+        "UPPER(COALESCE(manifest_location_table_specialty_nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+        in location_sql
+    )
+    # ...and the classification also derives an in-index taxonomy_array
+    # prefilter so the zip/GIN indexes narrow rows before any precise check.
+    assert "loc.taxonomy_array && (" in location_sql
+    assert "LOWER(COALESCE(classification, '')) = LOWER(:manifest_location_table_array_classification)" in location_sql
+    assert location_params["manifest_location_table_array_classification"] == "Orthopaedic Surgery"
+    assert location_params["manifest_location_table_specialty_classification"] == "Orthopaedic Surgery"
+
+
+@pytest.mark.asyncio
 async def test_manifest_location_uses_provider_group_rate_scope_table_when_declared(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
