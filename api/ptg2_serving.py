@@ -2354,17 +2354,20 @@ async def _ptg2_manifest_location_provider_matches(
     if len(filters) == 1:
         return None
 
-    # Scope location matches to the requested clinical specialty/taxonomy, mirroring
-    # the non-location taxonomy filter (_ptg2_manifest_filter_npis_by_provider_taxonomy)
-    # and the compact provider filter. Without this, a procedure+ZIP search returns
-    # every NPI that merely carries a negotiated rate at that address (e.g. an
-    # optometry practice or a hospital for an arthroscopic ACL repair) instead of the
-    # clinically appropriate specialists (orthopedic surgeons).
+    # Scope location matches to providers that actually appear in this PTG snapshot
+    # before applying address/radius ordering. Limiting nearest NPIs globally first
+    # is both slow in dense metros and incorrect: the nearest global providers may
+    # not participate in the priced source, causing relevant in-network providers to
+    # be dropped before the provider_group_member join.
+    member_filters = ["pgm_scope.npi IS NOT NULL"]
+    # Also apply clinical specialty/taxonomy at the member scope, mirroring the
+    # non-location taxonomy filter (_ptg2_manifest_filter_npis_by_provider_taxonomy)
+    # and the compact provider filter.
     location_specialty_filter = resolve_provider_specialty_filter(args)
     if location_specialty_filter.active:
-        filters.append(
+        member_filters.append(
             provider_specialty_taxonomy_exists_sql(
-                "addr.npi",
+                "pgm_scope.npi",
                 params,
                 "manifest_location_specialty",
                 location_specialty_filter,
@@ -2379,11 +2382,11 @@ async def _ptg2_manifest_location_provider_matches(
         param_prefix="manifest_location_inferred_taxonomy",
     )
     if location_inferred_taxonomy_sql:
-        filters.append(
+        member_filters.append(
             f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
-            f"WHERE nt.npi = addr.npi AND {location_inferred_taxonomy_sql})"
+            f"WHERE nt.npi = pgm_scope.npi AND {location_inferred_taxonomy_sql})"
         )
-        filters.append(_ptg2_individual_npi_exists_sql("addr.npi"))
+        member_filters.append(_ptg2_individual_npi_exists_sql("pgm_scope.npi"))
 
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
@@ -2472,7 +2475,12 @@ async def _ptg2_manifest_location_provider_matches(
         result = await session.execute(
             text(
                 f"""
-            WITH raw_location_npis AS (
+            WITH scoped_member_npis AS MATERIALIZED (
+                SELECT DISTINCT pgm_scope.npi
+                FROM {provider_group_member_table} pgm_scope
+                WHERE {" AND ".join(member_filters)}
+            ),
+            raw_location_npis AS (
                 SELECT DISTINCT ON (addr.npi)
                     addr.npi,
                     addr.type,
@@ -2495,7 +2503,9 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.fax_number_digits,
                     addr.fax_extension,
                     {location_select_sql}
-                FROM {npi_address_table} addr
+                FROM scoped_member_npis scope_npis
+                JOIN {npi_address_table} addr
+                  ON addr.npi = scope_npis.npi
                 WHERE {" AND ".join(address_filters)}
                   AND addr.type = ANY(CAST(:address_types AS varchar[]))
                 ORDER BY {location_order_sql},

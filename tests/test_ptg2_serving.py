@@ -2195,7 +2195,10 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert address["fax_number"] == "8185551213"
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    assert "FROM mrf.entity_address_unified addr" in sql
+    assert "scoped_member_npis AS MATERIALIZED" in sql
+    assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
+    assert "JOIN mrf.entity_address_unified addr" in sql
+    assert "ON addr.npi = scope_npis.npi" in sql
     assert "raw_location_npis AS" in sql
     assert "location_npis AS MATERIALIZED" in sql
     assert "ORDER BY zip_rank, distance_miles ASC NULLS LAST, npi" in sql
@@ -3430,9 +3433,12 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    # The location query is now scoped by an npi_taxonomy EXISTS predicate on addr.npi.
+    # The location query is scoped by a provider snapshot member CTE before address
+    # radius ordering, with taxonomy predicates applied to member NPIs.
+    assert "scoped_member_npis AS MATERIALIZED" in sql
+    assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
     assert "mrf.npi_taxonomy" in sql
-    assert "addr.npi" in sql
+    assert "nt.npi = pgm_scope.npi" in sql
     assert "207X00000X" in str(params)
 
 
@@ -3473,7 +3479,8 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = addr.npi" in sql
+    assert "scoped_member_npis AS MATERIALIZED" in sql
+    assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = pgm_scope.npi" in sql
     assert "n_entity.entity_type_code" in sql
     assert "207X00000X" in str(params)
 
