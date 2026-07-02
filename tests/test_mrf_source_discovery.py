@@ -8317,6 +8317,34 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
     assert item["reviewed_at"]
 
 
+def test_import_control_source_identity_key_keeps_context_scoped_generic_urls():
+    shared_url = "https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I"
+    first_key = discovery._import_control_source_identity_key(
+        {
+            "source_id": "source_one",
+            "index_url": shared_url,
+            "metadata_json": {
+                "target_payer_query": "Example Manufacturing",
+                "private_context_benefit_line": "medical",
+                "private_context_carrier_query": "Example Carrier",
+            },
+        }
+    )
+    second_key = discovery._import_control_source_identity_key(
+        {
+            "source_id": "source_two",
+            "index_url": shared_url,
+            "metadata_json": {
+                "target_payer_query": "Example Foundry",
+                "private_context_benefit_line": "medical",
+                "private_context_carrier_query": "Example Carrier",
+            },
+        }
+    )
+
+    assert first_key != second_key
+
+
 @pytest.mark.asyncio
 async def test_push_import_control_catalog_marks_successful_seed_promoted(monkeypatch):
     calls = []

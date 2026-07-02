@@ -13919,9 +13919,29 @@ _IMPORT_CONTROL_STAGED_STATUS = "needs_review"
 
 def _import_control_source_identity_key(row: dict[str, Any]) -> str:
     index_url, official_url = _import_control_source_urls(row)
-    return (
-        _canonical_or_none(index_url or official_url)
-        or str(row.get("source_id") or row.get("source_key") or "")
+    base_key = _canonical_or_none(index_url or official_url)
+    if not base_key:
+        return str(row.get("source_id") or row.get("source_key") or "")
+    context_metadata = _import_control_source_context_metadata(row)
+    if not context_metadata:
+        return base_key
+    context_parts = [
+        str(context_metadata[key]).strip()
+        for key in (
+            "target_payer_query",
+            "private_context_benefit_line",
+            "private_context_carrier_query",
+        )
+        if str(context_metadata.get(key) or "").strip()
+    ]
+    if not context_parts:
+        return base_key
+    return _id(
+        "import-control-source-identity",
+        {
+            "source_url": base_key,
+            "context": context_parts,
+        },
     )
 
 
