@@ -12947,6 +12947,12 @@ async def _crawl_toc_metadata(
     )
     connector = _tcp_connector(limit=worker_count * 2)
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
+    try:
+        target_crawl_timeout = float(
+            os.getenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "180")
+        )
+    except ValueError:
+        target_crawl_timeout = 180.0
 
     async def crawl_one(
         target: CrawlTarget, session: aiohttp.ClientSession
@@ -13104,14 +13110,40 @@ async def _crawl_toc_metadata(
         for _ in range(min(worker_count, max(total, 1))):
             target_queue.put_nowait(None)
 
-        async def worker() -> None:
+        async def target_crawl_worker() -> None:
+            """Crawl queued TOC targets and convert stuck targets to failures."""
             while True:
-                target = await target_queue.get()
+                crawl_target = await target_queue.get()
                 try:
-                    if target is None:
+                    if crawl_target is None:
                         await result_queue.put(None)
                         return
-                    await result_queue.put(await crawl_one(target, session))
+                    if target_crawl_timeout > 0:
+                        crawl_result = await asyncio.wait_for(
+                            crawl_one(crawl_target, session),
+                            timeout=target_crawl_timeout,
+                        )
+                    else:
+                        crawl_result = await crawl_one(crawl_target, session)
+                    await result_queue.put(crawl_result)
+                except TimeoutError:
+                    await result_queue.put(
+                        (
+                            [],
+                            [],
+                            [
+                                _crawl_failed_observation(
+                                    crawl_target.source,
+                                    crawl_target.url,
+                                    TimeoutError(
+                                        f"TOC target crawl timed out after {target_crawl_timeout:g}s"
+                                    ),
+                                    run_id,
+                                )
+                            ],
+                            crawl_target.url,
+                        )
+                    )
                 finally:
                     target_queue.task_done()
 
@@ -13175,7 +13207,9 @@ async def _crawl_toc_metadata(
             )
 
         active_workers = min(worker_count, max(total, 1))
-        workers = [asyncio.create_task(worker()) for _ in range(active_workers)]
+        workers = [
+            asyncio.create_task(target_crawl_worker()) for _ in range(active_workers)
+        ]
         writer_task = asyncio.create_task(writer(active_workers))
         worker_group = asyncio.gather(*workers)
         try:

@@ -12860,6 +12860,65 @@ async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crawl_table_of_contents_metadata_times_out_slow_target(monkeypatch):
+    pushed_batches = []
+    source_rows = [
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "index_url": "https://example.com/source",
+        }
+    ]
+    slow_crawl_target = discovery.CrawlTarget(
+        source=source_rows[0],
+        url="https://example.com/slow-index.json",
+    )
+
+    async def fake_resolve_crawl_targets(*_args, **_kwargs):
+        return [slow_crawl_target], []
+
+    async def slow_fetch_json(*_args, **_kwargs):
+        await asyncio.sleep(0.05)
+        return {}
+
+    async def fake_push_crawl_row_batches(plan_rows, file_rows, observation_rows, **_kwargs):
+        pushed_batches.append(
+            {
+                "plan_rows": list(plan_rows),
+                "file_rows": list(file_rows),
+                "observation_rows": list(observation_rows),
+            }
+        )
+
+    monkeypatch.setenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "0.001")
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(discovery, "_fetch_json", slow_fetch_json)
+    monkeypatch.setattr(
+        discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches
+    )
+
+    plan_count, file_count, crawl_observations = await discovery._crawl_toc_metadata(
+        source_rows,
+        test_mode=False,
+        run_id="run_1",
+        max_toc_bytes=1024,
+        concurrency=1,
+    )
+
+    failed_observations = [
+        observation_row
+        for pushed_batch in pushed_batches
+        for observation_row in pushed_batch["observation_rows"]
+        if observation_row.get("status") == "crawl_failed"
+    ]
+    assert plan_count == 0
+    assert file_count == 1
+    assert len(crawl_observations) in {1}
+    assert len(failed_observations) == 1
+    assert "timed out" in failed_observations[0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch):
     pushed_batches = []
     source_rows = [
