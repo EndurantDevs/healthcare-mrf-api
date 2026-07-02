@@ -2297,6 +2297,49 @@ async def test_manifest_location_uses_component_table(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_manifest_location_rate_prefilter_allows_missing_code_system(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        id_storage="uuid",
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    location_sql = str(session.calls[3][0][0])
+    location_params = session.calls[3][0][1]
+    assert "rate_provider_groups AS MATERIALIZED" in location_sql
+    assert "rate_scope.reported_code = :location_reported_code" in location_sql
+    assert "rate_scope.reported_code_system = :location_reported_code_system" not in location_sql
+    assert location_params["location_plan_id"] == "010854205"
+    assert location_params["location_reported_code"] == "90837"
+    assert "location_reported_code_system" not in location_params
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
 async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monkeypatch):
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"

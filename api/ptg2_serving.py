@@ -2476,7 +2476,6 @@ async def _ptg2_manifest_location_provider_matches(
         and serving_table
         and requested_plan_id
         and requested_code
-        and requested_system
         and await _is_manifest_component_table_populated(session, component_table)
     ):
         params["location_plan_id"] = requested_plan_id
@@ -2484,9 +2483,10 @@ async def _ptg2_manifest_location_provider_matches(
         rate_scope_filters = [
             "rate_scope.plan_id = :location_plan_id",
             "rate_scope.reported_code = :location_reported_code",
-            "rate_scope.reported_code_system = :location_reported_code_system",
         ]
-        params["location_reported_code_system"] = requested_system
+        if requested_system:
+            rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
+            params["location_reported_code_system"] = requested_system
         member_scope_cte = f"""
             rate_provider_groups AS MATERIALIZED (
                 SELECT DISTINCT psc.provider_group_global_id_128
