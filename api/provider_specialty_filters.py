@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import difflib
+import json
+import logging
 import os
-from dataclasses import dataclass
+import re
+import time
+from dataclasses import dataclass, field
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -140,24 +148,200 @@ _CLASSIFICATION_BASE_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _normalize_specialty_key(value: str) -> str:
-    # "Obstetrics & Gynecology", "obstetrics/gynecology", and "ob-gyn" should hit
-    # the same alias row as their canonical spellings.
-    key = value.lower()
-    for sep in ("&", "+"):
-        key = key.replace(sep, " and ")
-    for sep in ("/", "-", "_", ",", "."):
-        key = key.replace(sep, " ")
-    return " ".join(key.split())
+    # Same normalization as the terminology_synonym term_key column, so alias
+    # lookups here and DB rows seeded by process.terminology_synonyms agree.
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", value.lower())).strip()
 
 
-_NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
-    _normalize_specialty_key(alias): codes
-    for alias, codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items()
-}
+def _specialty_key_variants(value: str) -> tuple[str, ...]:
+    # NUCC spells families with "&" (normalizes to a dropped token) while
+    # callers often write "and"; probe both shapes so "obstetrics & gynecology"
+    # and "obstetrics and gynecology" resolve identically.
+    key = _normalize_specialty_key(value)
+    if not key:
+        return ()
+    without_and = " ".join(token for token in key.split() if token != "and")
+    if without_and and without_and != key:
+        return (key, without_and)
+    return (key,)
+
+
+class SpecialtyResolutionCache:
+    """Term -> taxonomy-code-set index shared by all specialty-filter surfaces.
+
+    Precedence (later overwrites earlier): NUCC-derived names (classification
+    families, specializations, display names) < terminology_synonym rows
+    (domain=provider_type) < the curated static dict above. The static tier is
+    always present, so cold starts and DB-less tests behave like today.
+    """
+
+    # Cache entry: (all_codes, base_codes). base_codes backs
+    # include_subspecialties=false — for NUCC classification families it holds
+    # the specialization-empty rows, falling back to all_codes for families
+    # with no base row (e.g. Radiology) so the flag never empties a result.
+    _RETRY_AFTER_FAILURE_SECONDS = 120.0
+
+    def __init__(self, ttl_seconds: float = 900.0) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._alias_codes: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        self._loaded_at: float | None = None
+        self._lock = asyncio.Lock()
+        self._rebuild_from_static()
+
+    def _rebuild_from_static(
+        self,
+        dynamic_entries: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    ) -> None:
+        merged: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = dict(dynamic_entries or {})
+        for alias, codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items():
+            for variant in _specialty_key_variants(alias):
+                merged[variant] = (codes, codes)
+        self._alias_codes = merged
+
+    def lookup(self, term: str, include_subspecialties: bool = True) -> tuple[str, ...]:
+        for variant in _specialty_key_variants(term):
+            entry = self._alias_codes.get(variant)
+            if entry:
+                all_codes, base_codes = entry
+                return all_codes if include_subspecialties else base_codes
+        return ()
+
+    def suggestions(self, term: str, count: int = 3) -> tuple[str, ...]:
+        key = _normalize_specialty_key(term)
+        if not key:
+            return ()
+        return tuple(difflib.get_close_matches(key, self._alias_codes.keys(), n=count, cutoff=0.75))
+
+    @property
+    def stale(self) -> bool:
+        return self._loaded_at is None or (time.monotonic() - self._loaded_at) >= self._ttl_seconds
+
+    async def ensure(self, session) -> None:
+        if not self.stale:
+            return
+        async with self._lock:
+            if not self.stale:
+                return
+            try:
+                dynamic_entries = await self._load_dynamic_entries(session)
+            except Exception:
+                logger.warning("specialty resolution cache refresh failed; keeping current tier", exc_info=True)
+                # Retry well before the full TTL so one transient DB error does
+                # not pin static-only resolution for 15 minutes.
+                self._loaded_at = time.monotonic() - self._ttl_seconds + self._RETRY_AFTER_FAILURE_SECONDS
+                return
+            self._rebuild_from_static(dynamic_entries)
+            self._loaded_at = time.monotonic()
+
+    async def _load_dynamic_entries(self, session) -> dict[str, tuple[str, ...]]:
+        from sqlalchemy import select
+
+        from db.models import NUCCTaxonomy, TerminologySynonym
+
+        nucc_table = NUCCTaxonomy.__table__
+        nucc_result = await session.execute(
+            select(
+                nucc_table.c.code,
+                nucc_table.c.classification,
+                nucc_table.c.specialization,
+                nucc_table.c.display_name,
+            )
+        )
+        classification_codes: dict[str, list[str]] = {}
+        classification_base_codes: dict[str, list[str]] = {}
+        specialization_codes: dict[str, list[str]] = {}
+        display_codes: dict[str, list[str]] = {}
+        for row in nucc_result.mappings():
+            code = str(row.get("code") or "").strip().upper()
+            if not code:
+                continue
+            classification = str(row.get("classification") or "").strip()
+            specialization = str(row.get("specialization") or "").strip()
+            display_name = str(row.get("display_name") or "").strip()
+            if classification:
+                classification_codes.setdefault(classification, []).append(code)
+                if not specialization:
+                    classification_base_codes.setdefault(classification, []).append(code)
+            if specialization:
+                specialization_codes.setdefault(specialization, []).append(code)
+            if display_name:
+                display_codes.setdefault(display_name, []).append(code)
+
+        entries: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+        def _index(name: str, codes: list[str], base_codes: list[str] | None = None) -> None:
+            deduped = tuple(dict.fromkeys(codes))
+            if not deduped:
+                return
+            base = tuple(dict.fromkeys(base_codes)) if base_codes else deduped
+            for variant in _specialty_key_variants(name):
+                entries[variant] = (deduped, base)
+
+        # Order matters: display names are the most specific, then
+        # specializations; classification families win same-key collisions so a
+        # family term always means the whole family. A directly-named
+        # specialization or display name IS the request, so its base equals all.
+        for name, codes in display_codes.items():
+            _index(name, codes)
+        for name, codes in specialization_codes.items():
+            _index(name, codes)
+        for name, codes in classification_codes.items():
+            _index(name, codes, base_codes=classification_base_codes.get(name))
+
+        synonym_table = TerminologySynonym.__table__
+        synonym_result = await session.execute(
+            select(
+                synonym_table.c.synonym,
+                synonym_table.c.target_system,
+                synonym_table.c.target_code,
+                synonym_table.c.metadata_json,
+            ).where(synonym_table.c.domain == "provider_type")
+        )
+        # Synonym rows sharing one normalized key (e.g. curated 'radiology' ->
+        # 2085R0202X plus importer 'Radiology' -> one row per family code) are
+        # UNIONED per key, sorted for determinism: the un-ORDERed SELECT must
+        # not decide the winner across workers or TTL refreshes.
+        synonym_variant_codes: dict[str, list[str]] = {}
+        for row in synonym_result.mappings():
+            synonym = str(row.get("synonym") or "").strip()
+            if not synonym:
+                continue
+            target_system = str(row.get("target_system") or "").strip().upper()
+            code = ""
+            if target_system == "NUCC":
+                code = str(row.get("target_code") or "").strip().upper()
+            else:
+                metadata_raw = row.get("metadata_json")
+                if metadata_raw:
+                    try:
+                        code = str((json.loads(metadata_raw) or {}).get("nucc_code") or "").strip().upper()
+                    except (TypeError, ValueError):
+                        code = ""
+            if code:
+                for variant in _specialty_key_variants(synonym):
+                    synonym_variant_codes.setdefault(variant, []).append(code)
+        for variant, codes in synonym_variant_codes.items():
+            unioned = tuple(sorted(dict.fromkeys(codes)))
+            entries[variant] = (unioned, unioned)
+        return entries
+
+
+_SPECIALTY_RESOLUTION_CACHE = SpecialtyResolutionCache()
+
+
+async def ensure_specialty_resolution_cache(session) -> None:
+    """Refresh the shared specialty cache from the DB when stale (lazy, TTL)."""
+    await _SPECIALTY_RESOLUTION_CACHE.ensure(session)
+
+
+def specialty_resolution_cache() -> SpecialtyResolutionCache:
+    return _SPECIALTY_RESOLUTION_CACHE
+
 
 _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES: dict[str, str] = {
-    _normalize_specialty_key(alias): classification
+    variant: classification
     for alias, classification in _SPECIALTY_CLASSIFICATION_ALIASES.items()
+    for variant in _specialty_key_variants(alias)
 }
 
 
@@ -195,6 +379,8 @@ class ProviderSpecialtyFilter:
     include_subspecialties: bool = False
     primary_only: bool = True
     use_classification_predicate: bool = True
+    unresolved_specialty: str | None = None
+    suggested_specialties: tuple[str, ...] = field(default=())
 
     @property
     def active(self) -> bool:
@@ -226,16 +412,22 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
         primary_only = _normalize_bool(args.get("primary_only"))
 
     key = _normalize_specialty_key(specialty)
-    if not taxonomy_codes and key in _NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES:
-        taxonomy_codes = _NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES[key]
+    if not taxonomy_codes and specialty:
+        taxonomy_codes = _SPECIALTY_RESOLUTION_CACHE.lookup(
+            specialty, include_subspecialties=include_subspecialties
+        )
     if not classification and key in _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES:
         classification = _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES[key]
+    unresolved_specialty: str | None = None
+    suggested_specialties: tuple[str, ...] = ()
     if specialty and not taxonomy_codes and not classification:
-        # Unknown alias: fall back to matching the raw string against the NUCC
-        # classification column so canonical names ("Obstetrics & Gynecology",
-        # "Urology", ...) filter instead of leaving the specialty unresolved,
-        # which upstream guards treat as "no specialty supplied" and reject.
-        classification = specialty
+        # No alias, terminology, or NUCC-name match. Deliberately do NOT guess a
+        # classification predicate here: an arbitrary string as classification
+        # silently returns empty provider lists on every surface. Callers see
+        # unresolved_specialty and decide (guard: informative 400; list
+        # endpoints: warn and skip the filter).
+        unresolved_specialty = specialty
+        suggested_specialties = _SPECIALTY_RESOLUTION_CACHE.suggestions(specialty)
     use_classification_predicate = True
     classification_key = classification.lower()
     if (
@@ -254,6 +446,8 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
         include_subspecialties=include_subspecialties,
         primary_only=primary_only,
         use_classification_predicate=use_classification_predicate,
+        unresolved_specialty=unresolved_specialty,
+        suggested_specialties=suggested_specialties,
     )
 
 

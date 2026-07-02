@@ -216,8 +216,37 @@ def _procedure_rows() -> list[dict[str, Any]]:
     return rows
 
 
+def _specialty_alias_rows() -> list[dict[str, Any]]:
+    """Mirror the API's curated specialty alias dict into the synonym table.
+
+    The dict in api.provider_specialty_filters is the bootstrap tier of the
+    shared specialty resolution cache; seeding the same aliases here keeps the
+    DB tier (and every terminology consumer) in lockstep with it. Multi-code
+    bundles become one row per NUCC code — the (domain, term_key,
+    target_system, target_code) primary key makes that natural.
+    """
+    from api.provider_specialty_filters import _SPECIALTY_TAXONOMY_CODE_ALIASES
+
+    rows: list[dict[str, Any]] = []
+    for alias, taxonomy_codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items():
+        for taxonomy_code in taxonomy_codes:
+            row = _record(
+                domain="provider_type",
+                synonym=alias,
+                term_type="curated_specialty_alias",
+                target_system="NUCC",
+                target_code=taxonomy_code,
+                canonical_term=alias,
+                confidence=0.95,
+                metadata={"nucc_code": taxonomy_code, "alias_bundle": alias},
+            )
+            if row:
+                rows.append(row)
+    return rows
+
+
 def _curated_rows() -> list[dict[str, Any]]:
-    return _provider_rows() + _procedure_rows()
+    return _provider_rows() + _specialty_alias_rows() + _procedure_rows()
 
 
 def _norm_sql(expr: str) -> str:

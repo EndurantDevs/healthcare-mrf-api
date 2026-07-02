@@ -29,3 +29,21 @@ def clear_npi_detail_response_cache():
     npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
     yield
     npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def freeze_specialty_resolution_cache():
+    # Endpoint handlers lazily refresh the shared specialty cache from the DB;
+    # unit tests stub sessions with queued results, so a refresh would consume
+    # from the queue and shift every subsequent stubbed query. Mark the cache
+    # fresh so only tests that target it (via their own instances or an
+    # explicit monkeypatch) exercise the DB tier.
+    import time
+
+    from api import provider_specialty_filters as psf_module
+
+    cache = psf_module._SPECIALTY_RESOLUTION_CACHE
+    previous_loaded_at = cache._loaded_at
+    cache._loaded_at = time.monotonic()
+    yield
+    cache._loaded_at = previous_loaded_at

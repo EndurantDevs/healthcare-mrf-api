@@ -26,6 +26,7 @@ from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_specialty_filters import (
     ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
     PRIMARY_CARE_TAXONOMY_CODES,
+    ensure_specialty_resolution_cache,
     provider_specialty_taxonomy_exists_sql,
     resolve_provider_specialty_filter,
 )
@@ -885,10 +886,23 @@ def _reject_broad_group_plan_provider_expansion(
     specialty_filter = resolve_provider_specialty_filter(args)
     if specialty_filter.active or args.get("taxonomy_code") or args.get("taxonomy_classification"):
         return
+    if specialty_filter.unresolved_specialty:
+        _raise_unresolved_specialty(specialty_filter)
     raise InvalidUsage(
         "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
         "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
         "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
+    )
+
+
+def _raise_unresolved_specialty(specialty_filter) -> None:
+    suggestion_note = ""
+    if specialty_filter.suggested_specialties:
+        suggestion_note = f"; nearest known specialties: {', '.join(specialty_filter.suggested_specialties)}"
+    raise InvalidUsage(
+        f"Specialty '{specialty_filter.unresolved_specialty}' does not match any known specialty, "
+        f"NUCC classification/specialization, or curated alias{suggestion_note}. "
+        "Pass a recognized specialty, a classification, or explicit taxonomy_codes."
     )
 
 
@@ -4484,6 +4498,7 @@ async def group_plan_providers(request):
     plan_id = (request.args.get("plan_id") or "").strip()
     if not plan_id:
         raise InvalidUsage("plan_id (EIN) is required")
+    await ensure_specialty_resolution_cache(session)
     market_type = (request.args.get("market_type") or "group").strip().lower()
     try:
         limit = int(request.args.get("limit") or 200)
@@ -4505,6 +4520,15 @@ async def group_plan_providers(request):
         default=False,
     )
     specialty_filter = resolve_provider_specialty_filter(request.args)
+    specialty_warning = None
+    if specialty_filter.unresolved_specialty:
+        nearest_note = ""
+        if specialty_filter.suggested_specialties:
+            nearest_note = f"; nearest known: {', '.join(specialty_filter.suggested_specialties)}"
+        specialty_warning = (
+            f"specialty '{specialty_filter.unresolved_specialty}' did not resolve to a taxonomy filter; "
+            f"results are NOT specialty-filtered{nearest_note}"
+        )
 
     requested_source_key = (request.args.get("source_key") or "").strip().lower()
     snapshot_pairs = await _current_source_snapshot_pairs_for_plan(
@@ -4517,6 +4541,7 @@ async def group_plan_providers(request):
             "reason": "no published serving snapshot for this plan_id + market_type",
             "providers": {"count": 0, "items": [], "next_cursor": None},
             "taxonomy_filter": specialty_filter.response_payload(),
+            "specialty_warning": specialty_warning,
             "exhausted": True,
         })
     selected_source_key, snapshot_id = snapshot_pairs[0]
@@ -4756,6 +4781,7 @@ async def group_plan_providers(request):
         "snapshots": snapshots,
         "resolved": True,
         "taxonomy_filter": specialty_filter.response_payload(),
+        "specialty_warning": specialty_warning,
         "location_filter": {
             "requested": has_location_filter,
             "city": city or None,
@@ -7472,6 +7498,16 @@ async def list_providers_by_procedure(request):
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
+    await ensure_specialty_resolution_cache(session)
+    if plan_id or plan_external_id or snapshot_id:
+        # Plan-scoped searches filter via taxonomy codes; an unresolvable
+        # specialty would otherwise silently return every specialty as if
+        # filtered. Claims mode keeps its own LIKE/terminology fallback.
+        specialty_probe = resolve_provider_specialty_filter(args)
+        if specialty_probe.unresolved_specialty and not (
+            args.get("taxonomy_code") or args.get("taxonomy_classification")
+        ):
+            _raise_unresolved_specialty(specialty_probe)
     _reject_broad_group_plan_provider_expansion(
         args,
         {
