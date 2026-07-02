@@ -6,6 +6,7 @@ from scripts.research.ptg_client_carrier_coverage_audit import (
     _add_optional_report_sections,
     audit_carrier_rows,
     audit_non_importable_carrier_rows,
+    audit_non_importable_reason_summary,
     has_catalog_source_candidate,
     is_placeholder_carrier,
     split_carrier_cell,
@@ -222,6 +223,73 @@ def test_audit_non_importable_carrier_rows_reports_evidence_only_matches():
     assert non_importable["vision"] == []
 
 
+def _reason_summary_candidates():
+    return [
+        SimpleNamespace(
+            name="Evidence Medical",
+            source_tier="coverage_evidence",
+            status="active",
+            index_url="https://example.test/evidence",
+            benefit_lines=("medical",),
+        ),
+        SimpleNamespace(
+            name="Archived Medical",
+            source_tier="mrf_importable",
+            status="archived",
+            index_url="https://example.test/archived",
+            benefit_lines=("medical",),
+        ),
+        SimpleNamespace(
+            name="Directory Dental",
+            source_tier="directory_evidence",
+            status="active",
+            human_url="https://example.test/directory",
+            benefit_lines=("dental",),
+        ),
+        SimpleNamespace(
+            name="Policy Vision",
+            source_tier="mrf_importable",
+            status="active",
+            human_url="https://example.test/policy",
+            benefit_lines=("vision",),
+        ),
+    ]
+
+
+def test_audit_non_importable_reason_summary_uses_aggregate_buckets():
+    """Non-importable detail can be explained without exposing carrier labels."""
+    client_rows = [
+        {
+            "MEDICAL_CARRIERS": "Evidence Medical\nArchived Medical",
+            "DENTAL_CARRIERS": "Directory Dental",
+            "VISION_CARRIERS": "Policy Vision",
+        },
+        {
+            "MEDICAL_CARRIERS": "Evidence Medical",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        },
+    ]
+
+    summary = audit_non_importable_reason_summary(
+        client_rows,
+        all_candidates=_reason_summary_candidates(),
+        importable_candidates=[],
+        matcher=lambda candidate, carrier: candidate.name.lower() == carrier.lower(),
+    )
+
+    assert summary["medical"] == {
+        "archived_source": {"distinct": 1, "mentions": 1},
+        "coverage_evidence_only": {"distinct": 1, "mentions": 2},
+    }
+    assert summary["dental"] == {
+        "directory_evidence_only": {"distinct": 1, "mentions": 1}
+    }
+    assert summary["vision"] == {
+        "not_importable_by_policy": {"distinct": 1, "mentions": 1}
+    }
+
+
 def test_optional_sections_redact_private_carrier_labels():
     report_by_section = {}
     client_rows = [
@@ -251,3 +319,46 @@ def test_optional_sections_redact_private_carrier_labels():
     unmatched_carrier = report_by_section["top_unmatched"]["medical"][0]["carrier"]
     assert unmatched_carrier.startswith("carrier:")
     assert "Private" not in unmatched_carrier
+
+
+def test_optional_non_importable_summary_is_private_safe_with_redacted_labels():
+    report_by_section = {}
+    client_rows = [
+        {
+            "MEDICAL_CARRIERS": "Synthetic Evidence",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        }
+    ]
+    parsed_args = SimpleNamespace(
+        show_unmatched=False,
+        show_non_importable=True,
+        top_unmatched=5,
+        top_non_importable=5,
+        redact_labels=True,
+    )
+
+    _add_optional_report_sections(
+        report_by_section,
+        parsed_args=parsed_args,
+        client_rows=client_rows,
+        all_candidates=[
+            SimpleNamespace(
+                name="Synthetic Evidence",
+                source_tier="coverage_evidence",
+                status="active",
+                index_url="https://example.test/evidence",
+                benefit_lines=("medical",),
+            )
+        ],
+        importable_candidates=[],
+        unmatched={},
+        matcher=lambda candidate, carrier: candidate.name.lower() == carrier.lower(),
+    )
+
+    assert report_by_section["non_importable_reason_summary"]["medical"] == {
+        "coverage_evidence_only": {"distinct": 1, "mentions": 1}
+    }
+    carrier = report_by_section["top_non_importable"]["medical"][0]["carrier"]
+    assert carrier.startswith("carrier:")
+    assert "Synthetic" not in carrier

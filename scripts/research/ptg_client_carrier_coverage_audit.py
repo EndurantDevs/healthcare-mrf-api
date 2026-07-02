@@ -73,6 +73,32 @@ class CarrierCoverageStats:
 Matcher = Callable[[Any, str], bool]
 
 
+def _source_tier(candidate: Any) -> str:
+    return str(getattr(candidate, "source_tier", "") or "").strip().lower()
+
+
+def _source_status(candidate: Any) -> str:
+    return str(getattr(candidate, "status", "") or "").strip().lower()
+
+
+def non_importable_reason_for_matches(matches: Sequence[Any]) -> str:
+    """Classify why catalog evidence for a carrier is not importable."""
+    if not matches:
+        return "unmatched"
+    if any(_source_status(candidate) == "archived" for candidate in matches):
+        return "archived_source"
+    if any(_source_tier(candidate) == "coverage_evidence" for candidate in matches):
+        return "coverage_evidence_only"
+    if any(_source_tier(candidate) == "directory_evidence" for candidate in matches):
+        return "directory_evidence_only"
+    if any(
+        getattr(candidate, "index_url", None) or getattr(candidate, "human_url", None)
+        for candidate in matches
+    ):
+        return "not_importable_by_policy"
+    return "no_public_source_url"
+
+
 def split_carrier_cell(value: str | None) -> list[str]:
     """Split one carrier cell without treating commas inside names as separators."""
     text = str(value or "").strip()
@@ -334,6 +360,47 @@ def audit_non_importable_carrier_rows(
     return non_importable_by_line
 
 
+def audit_non_importable_reason_summary(
+    client_rows: Iterable[Mapping[str, str]],
+    *,
+    all_candidates: Sequence[Any],
+    importable_candidates: Sequence[Any],
+    line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
+    matcher: Matcher = discovery_candidate_matches,
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Return aggregate-only reasons for catalog matches lacking importable sources."""
+    csv_rows = list(client_rows)
+    summary_by_line: dict[str, dict[str, dict[str, int]]] = {}
+
+    for line, column in line_columns:
+        line_all_candidates = _filter_candidates_by_line(all_candidates, line)
+        line_importable_candidates = _filter_candidates_by_line(importable_candidates, line)
+        distinct = _collect_distinct_carrier_matches(
+            csv_rows,
+            column=column,
+            line_all_candidates=line_all_candidates,
+            line_importable_candidates=line_importable_candidates,
+            matcher=matcher,
+        )
+        reason_summary: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"distinct": 0, "mentions": 0}
+        )
+        for entry in distinct.values():
+            if not entry["catalog"] or entry["importable"]:
+                continue
+            matches = [
+                candidate
+                for candidate in line_all_candidates
+                if matcher(candidate, str(entry["label"]))
+            ]
+            reason = non_importable_reason_for_matches(matches)
+            reason_summary[reason]["distinct"] += 1
+            reason_summary[reason]["mentions"] += int(entry["count"])
+        summary_by_line[line] = dict(sorted(reason_summary.items()))
+
+    return summary_by_line
+
+
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
@@ -389,6 +456,7 @@ def _add_optional_report_sections(
     all_candidates: Sequence[Any],
     importable_candidates: Sequence[Any],
     unmatched: Mapping[str, Sequence[tuple[str, int]]],
+    matcher: Matcher = discovery_candidate_matches,
 ) -> None:
     display_carrier = lambda label: (
         f"carrier:{hashlib.sha256(normalize_carrier(label).encode('utf-8')).hexdigest()[:12]}"
@@ -411,6 +479,15 @@ def _add_optional_report_sections(
             client_rows,
             all_candidates=all_candidates,
             importable_candidates=importable_candidates,
+            matcher=matcher,
+        )
+        report_payload["non_importable_reason_summary"] = (
+            audit_non_importable_reason_summary(
+                client_rows,
+                all_candidates=all_candidates,
+                importable_candidates=importable_candidates,
+                matcher=matcher,
+            )
         )
         report_payload["top_non_importable"] = {
             benefit_line: [
@@ -424,33 +501,51 @@ def _add_optional_report_sections(
 
 
 def _print_human_report(
-    payload: Mapping[str, Any],
+    report_payload: Mapping[str, Any],
     *,
     show_unmatched: bool,
     show_non_importable: bool,
 ) -> None:
     print(
-        f"rows={payload['rows']} candidates={payload['candidates']} "
-        f"importable_candidates={payload['importable_candidates']}"
+        f"rows={report_payload['rows']} candidates={report_payload['candidates']} "
+        f"importable_candidates={report_payload['importable_candidates']}"
     )
-    for item in payload["coverage"]:
+    for coverage_row in report_payload["coverage"]:
         print(
-            f"{item['line']}: importable {item['importable_mentions']}/{item['mentions_total']} mentions, "
-            f"{item['distinct_importable']}/{item['distinct_total']} distinct; "
-            f"catalog/evidence {item['catalog_mentions']}/{item['mentions_total']} mentions, "
-            f"{item['distinct_catalog']}/{item['distinct_total']} distinct; "
-            f"unmatched {item['unmatched_mentions']} mentions, {item['distinct_unmatched']} distinct"
+            f"{coverage_row['line']}: importable "
+            f"{coverage_row['importable_mentions']}/{coverage_row['mentions_total']} mentions, "
+            f"{coverage_row['distinct_importable']}/{coverage_row['distinct_total']} distinct; "
+            f"catalog/evidence {coverage_row['catalog_mentions']}/"
+            f"{coverage_row['mentions_total']} mentions, "
+            f"{coverage_row['distinct_catalog']}/{coverage_row['distinct_total']} distinct; "
+            f"unmatched {coverage_row['unmatched_mentions']} mentions, "
+            f"{coverage_row['distinct_unmatched']} distinct"
         )
     if show_unmatched:
-        for line, items in payload["top_unmatched"].items():
-            print(f"{line} top unmatched:")
-            for item in items:
-                print(f"  {item['mentions']:>4}  {item['carrier']}")
+        for benefit_line, unmatched_rows in report_payload["top_unmatched"].items():
+            print(f"{benefit_line} top unmatched:")
+            for unmatched_row in unmatched_rows:
+                print(f"  {unmatched_row['mentions']:>4}  {unmatched_row['carrier']}")
     if show_non_importable:
-        for line, items in payload["top_non_importable"].items():
-            print(f"{line} top non-importable:")
-            for item in items:
-                print(f"  {item['mentions']:>4}  {item['carrier']}")
+        print("non-importable reason summary:")
+        for benefit_line, reason_counts_by_name in report_payload[
+            "non_importable_reason_summary"
+        ].items():
+            reason_parts = [
+                f"{reason}={reason_counts['mentions']} mentions/"
+                f"{reason_counts['distinct']} distinct"
+                for reason, reason_counts in reason_counts_by_name.items()
+            ]
+            print(f"  {benefit_line}: {', '.join(reason_parts) or 'none'}")
+        for benefit_line, non_importable_rows in report_payload[
+            "top_non_importable"
+        ].items():
+            print(f"{benefit_line} top non-importable:")
+            for non_importable_row in non_importable_rows:
+                print(
+                    f"  {non_importable_row['mentions']:>4}  "
+                    f"{non_importable_row['carrier']}"
+                )
 
 
 async def async_main(argv: Sequence[str] | None = None) -> int:
@@ -466,7 +561,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         importable_candidates=importable_candidates,
     )
     payload = {
-        "csv_path": str(args.csv_path),
+        "csv_path": "<redacted>" if args.redact_labels else str(args.csv_path),
         "rows": len(rows),
         "provider": args.provider,
         "candidates": len(all_candidates),
