@@ -925,6 +925,30 @@ def _minimal_resource_id_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     ]
 
 
+def _compact_linked_reference_rows(resource_type: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reference_fields = tuple(
+        field
+        for fields_by_target in LINKED_REFERENCE_FIELDS.get(resource_type, {}).values()
+        for field in fields_by_target
+    )
+    compact_rows: list[dict[str, Any]] = []
+    for row in rows:
+        resource_id = _clean_text(row.get("resource_id"))
+        if not resource_id:
+            continue
+        compact_row: dict[str, Any] = {"resource_id": resource_id}
+        for field in reference_fields:
+            value = row.get(field)
+            if isinstance(value, list):
+                compact_values = [_clean_text(item) for item in value if _clean_text(item)]
+                if compact_values:
+                    compact_row[field] = compact_values
+            elif (cleaned := _clean_text(value)):
+                compact_row[field] = cleaned
+        compact_rows.append(compact_row)
+    return compact_rows
+
+
 def _load_credentials_config() -> dict[str, Any]:
     config: dict[str, Any] = {}
     path = _clean_text(_PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.get()) or _clean_text(
@@ -8551,8 +8575,13 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
-                if scan_role_reverse_lookup_planned and resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
-                    rows_by_resource.setdefault(resource_type, []).extend(_minimal_resource_id_rows(rows))
+                if linked_resource_limit > 0 or (
+                    scan_role_reverse_lookup_planned
+                    and resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES
+                ):
+                    rows_by_resource.setdefault(resource_type, []).extend(
+                        _compact_linked_reference_rows(resource_type, rows)
+                    )
                 written = await _upsert_resource_rows(
                     model,
                     _copy_rows_for_source_ids(rows, source_ids),
@@ -8575,7 +8604,7 @@ async def _import_resources(
                 run_id=run_id,
                 row_batch_handler=row_batch_handler if use_streaming else None,
                 row_batch_size=stream_batch_size,
-                retain_rows=linked_resource_limit > 0 or not use_streaming,
+                retain_rows=not use_streaming,
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
                 bulk_export=bulk_export,

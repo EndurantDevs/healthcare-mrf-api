@@ -5083,6 +5083,79 @@ async def test_import_resources_does_not_retain_streamed_scan_roles_for_linked_f
     assert captured_scan_options[0].retain_rows is False
 
 
+@pytest.mark.asyncio
+async def test_import_resources_keeps_compact_streamed_rows_for_linked_fallback(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    fetch_kwargs: dict[str, Any] = {}
+
+    async def fake_fetch_resource_rows(source, resource_type, **kwargs):
+        fetch_kwargs.update(kwargs)
+        assert resource_type == "PractitionerRole"
+        row_batch_handler = kwargs["row_batch_handler"]
+        rows = [
+            {
+                "source_id": source["source_id"],
+                "resource_id": "role-1",
+                "practitioner_ref": "Practitioner/prac-1",
+                "location_refs": ["Location/loc-1"],
+                "network_refs": ["Organization/network-1"],
+                "specialty_codes": [{"code": "207Q00000X"}],
+                "telecom": [{"system": "phone", "value": "3125550100"}],
+            }
+        ]
+        rows_written = await row_batch_handler(ProviderDirectoryPractitionerRole, rows)
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitionerRole,
+            rows=[],
+            rows_fetched=1,
+            rows_written=rows_written,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+    async def fake_upsert_resource_rows(_model, rows, **_kwargs):
+        return len(rows)
+
+    linked_rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+
+    async def fake_import_linked_resource_rows(_source, rows_by_resource, **_kwargs):
+        linked_rows_by_resource.update({key: list(value) for key, value in rows_by_resource.items()})
+        return {}
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
+    monkeypatch.setattr(importer, "_import_linked_resource_rows", fake_import_linked_resource_rows)
+
+    counts = await importer._import_resources(
+        [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
+        resources=["PractitionerRole"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        linked_resource_limit=50000,
+        stream_batch_size=1,
+    )
+
+    assert counts == {"PractitionerRole": 1}
+    assert fetch_kwargs["retain_rows"] is False
+    assert linked_rows_by_resource == {
+        "PractitionerRole": [
+            {
+                "resource_id": "role-1",
+                "practitioner_ref": "Practitioner/prac-1",
+                "location_refs": ["Location/loc-1"],
+                "network_refs": ["Organization/network-1"],
+            }
+        ]
+    }
+
+
 def test_bulk_export_start_url_uses_base_export_operation():
     url = importer._bulk_export_start_url(
         {"api_base": "https://example.test/fhir/"},
