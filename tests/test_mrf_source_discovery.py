@@ -8587,6 +8587,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("HLTHPRT_MRF_PRIVATE_CONTEXT_SNAPSHOT_SYNC", "true")
     monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
     monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
 
@@ -8632,6 +8633,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
     assert calls[-1]["json"]["status"] == "active"
     assert calls[-1]["json"]["preserve_operator_state"] is False
     assert calls[-1]["json"]["metadata"]["target_payer_query"] == "Example Employer"
+
 
 
 @pytest.mark.asyncio
@@ -8782,24 +8784,7 @@ async def test_push_import_control_catalog_refreshes_existing_public_source_meta
     )
 
     sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
-        [
-            {
-                "source_id": "source_existing",
-                "index_url": "https://example.com/index.json",
-                "human_url": "https://example.com/transparency",
-                "display_name": "Example Carrier",
-                "source_key": "example-carrier",
-                "seed_provider": "master-list",
-                "access_model": "free",
-                "source_type": "toc_json",
-                "status": "active",
-                "metadata_json": {
-                    "source_tier": "mrf_importable",
-                    "aliases": ["Example Specialty Plan"],
-                    "benefit_lines": ["medical", "dental"],
-                },
-            }
-        ]
+        [_existing_public_catalog_source_row()]
     )
 
     source_payloads = [
@@ -9154,6 +9139,7 @@ async def test_push_import_control_catalog_supersedes_unselected_duplicates(
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("HLTHPRT_MRF_PRIVATE_CONTEXT_SNAPSHOT_SYNC", "true")
     monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
     monkeypatch.setattr(
         discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
@@ -14463,3 +14449,53 @@ async def test_direct_discovery_run_emits_import_control_visible_state(monkeypat
         control_run_id,
     ]
     assert flushed == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_skips_private_context_snapshot_by_default(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_snapshot(_source_ids):
+        raise AssertionError("private query wrappers should not load snapshots")
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.delenv("HLTHPRT_MRF_PRIVATE_CONTEXT_SNAPSHOT_SYNC", raising=False)
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_public_metadata_only_fake_session(calls),
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_private",
+                "index_url": "https://example.com/index.json",
+                "human_url": "https://example.com/transparency",
+                "display_name": "Example Payer",
+                "source_key": "example-private",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "metadata_json": {
+                    "source_tier": "mrf_importable",
+                    "target_payer_query": "Example Employer",
+                    "private_query_context": True,
+                    "private_context_benefit_line": "medical",
+                    "private_context_carrier_query": "Example Carrier",
+                },
+            }
+        ]
+    )
+
+    assert sources_synced == 1
+    assert plans_synced == 0
+    assert errors == []
+    assert [call["url"] for call in calls] == [
+        "http://import-control.test/v1/catalog/sources",
+        "http://import-control.test/v1/catalog/sources/ic_source_1",
+    ]

@@ -13334,6 +13334,16 @@ def _import_control_source_context_metadata(row: dict[str, Any]) -> dict[str, An
     return context_metadata_by_key
 
 
+def _has_private_query_context_source_row(row: dict[str, Any]) -> bool:
+    return bool(_import_control_source_context_metadata(row).get("private_query_context"))
+
+
+def _should_sync_private_context_snapshots() -> bool:
+    return str(
+        os.getenv("HLTHPRT_MRF_PRIVATE_CONTEXT_SNAPSHOT_SYNC") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def _sync_import_control_seeds(
     source_rows: list[dict[str, Any]], *, limit: int | None = None
 ) -> int:
@@ -14330,6 +14340,10 @@ async def _push_import_control_catalog(
                 str(row.get("source_id") or "")
                 for row in group_rows
                 if _source_row_is_importable(row) and str(row.get("source_id") or "")
+                and (
+                    not _has_private_query_context_source_row(row)
+                    or _should_sync_private_context_snapshots()
+                )
             ]
             snapshots_by_source_id = (
                 await _import_control_snapshot_items(group_snapshot_source_ids)
