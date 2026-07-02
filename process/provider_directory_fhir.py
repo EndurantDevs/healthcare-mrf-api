@@ -7366,9 +7366,9 @@ async def _fetch_scan_practitioner_role_rows(
                 role_id = _clean_text(row.get("resource_id"))
                 if not role_id:
                     continue
+                if seen_role_ids is not None and role_id in seen_role_ids:
+                    continue
                 if seen_role_ids is not None:
-                    if role_id in seen_role_ids:
-                        continue
                     seen_role_ids.add(role_id)
                 if options.retain_rows:
                     rows.append(row)
