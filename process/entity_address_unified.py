@@ -111,6 +111,10 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "service_phone_digits_npi",
     "service_phone_number_npi",
     "service_address_key_npi",
+    # The API phone-fallback lookup filters "address_key = ANY(..) OR
+    # premise_key = ANY(..)"; without a premise_key index the OR forces a full
+    # seq scan of the serving table (~3M pages, ~5.7s per location search).
+    "premise_key",
     "taxonomy_plans_network",
     "procedures_array",
     "medications_array",
