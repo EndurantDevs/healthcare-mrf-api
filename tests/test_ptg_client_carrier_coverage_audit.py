@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from scripts.research.ptg_client_carrier_coverage_audit import (
     audit_carrier_rows,
+    audit_non_importable_carrier_rows,
     has_catalog_source_candidate,
     is_placeholder_carrier,
     split_carrier_cell,
@@ -184,3 +185,37 @@ def test_audit_cache_reuses_carrier_match():
     assert by_line["medical"].distinct_importable == expected_distinct_importable
     assert unmatched["medical"] == []
     assert matcher_calls == [("Repeated Carrier", "Repeated Carrier")]
+
+
+def test_audit_non_importable_carrier_rows_reports_evidence_only_matches():
+    client_rows = [
+        {
+            "MEDICAL_CARRIERS": "Importable Medical\nEvidence Medical",
+            "DENTAL_CARRIERS": "Evidence Dental\nMissing Dental",
+            "VISION_CARRIERS": "Importable Vision",
+        },
+        {
+            "MEDICAL_CARRIERS": "Evidence Medical",
+            "DENTAL_CARRIERS": "Evidence Dental",
+            "VISION_CARRIERS": "",
+        },
+    ]
+
+    non_importable = audit_non_importable_carrier_rows(
+        client_rows,
+        all_candidates=[
+            SimpleNamespace(name="Importable Medical"),
+            SimpleNamespace(name="Evidence Medical"),
+            SimpleNamespace(name="Evidence Dental"),
+            SimpleNamespace(name="Importable Vision"),
+        ],
+        importable_candidates=[
+            SimpleNamespace(name="Importable Medical"),
+            SimpleNamespace(name="Importable Vision"),
+        ],
+        matcher=lambda candidate, carrier: candidate.name.lower() == carrier.lower(),
+    )
+
+    assert non_importable["medical"] == [("Evidence Medical", 2)]
+    assert non_importable["dental"] == [("Evidence Dental", 2)]
+    assert non_importable["vision"] == []

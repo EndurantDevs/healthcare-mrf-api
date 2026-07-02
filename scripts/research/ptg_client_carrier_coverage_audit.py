@@ -155,6 +155,56 @@ def _has_cached_carrier_match(
     return cache_by_carrier[carrier_key]
 
 
+def _filter_candidates_by_line(
+    source_candidates: Sequence[Any],
+    line: str,
+) -> list[Any]:
+    return [
+        candidate
+        for candidate in source_candidates
+        if candidate_supports_benefit_line(candidate, line)
+    ]
+
+
+def _collect_distinct_carrier_matches(
+    csv_rows: Sequence[Mapping[str, str]],
+    *,
+    column: str,
+    line_all_candidates: Sequence[Any],
+    line_importable_candidates: Sequence[Any],
+    matcher: Matcher,
+) -> dict[str, dict[str, Any]]:
+    distinct: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"label": "", "count": 0, "importable": False, "catalog": False}
+    )
+    importable_match_cache_by_carrier: dict[str, bool] = {}
+    catalog_match_cache_by_carrier: dict[str, bool] = {}
+
+    for carrier_label, carrier_key, is_placeholder in _iter_carrier_mentions(
+        csv_rows, column
+    ):
+        if is_placeholder:
+            continue
+        entry = distinct[carrier_key]
+        entry["label"] = entry["label"] or carrier_label
+        entry["count"] += 1
+        entry["importable"] = _has_cached_carrier_match(
+            importable_match_cache_by_carrier,
+            carrier_key,
+            carrier_label,
+            line_importable_candidates,
+            matcher,
+        )
+        entry["catalog"] = _has_cached_carrier_match(
+            catalog_match_cache_by_carrier,
+            carrier_key,
+            carrier_label,
+            line_all_candidates,
+            matcher,
+        )
+    return distinct
+
+
 def audit_carrier_rows(
     client_rows: Iterable[Mapping[str, str]],
     *,
@@ -168,16 +218,8 @@ def audit_carrier_rows(
     csv_rows = list(client_rows)
 
     for line, column in line_columns:
-        line_all_candidates = [
-            candidate
-            for candidate in all_candidates
-            if candidate_supports_benefit_line(candidate, line)
-        ]
-        line_importable_candidates = [
-            candidate
-            for candidate in importable_candidates
-            if candidate_supports_benefit_line(candidate, line)
-        ]
+        line_all_candidates = _filter_candidates_by_line(all_candidates, line)
+        line_importable_candidates = _filter_candidates_by_line(importable_candidates, line)
         mentions_total = 0
         placeholders = 0
         importable_mentions = 0
@@ -256,6 +298,41 @@ def audit_carrier_rows(
     return stats_by_line, unmatched_by_line
 
 
+def audit_non_importable_carrier_rows(
+    client_rows: Iterable[Mapping[str, str]],
+    *,
+    all_candidates: Sequence[Any],
+    importable_candidates: Sequence[Any],
+    line_columns: Sequence[tuple[str, str]] = DEFAULT_LINE_COLUMNS,
+    matcher: Matcher = discovery_candidate_matches,
+) -> dict[str, list[tuple[str, int]]]:
+    """Return carrier labels that have catalog evidence but no importable source."""
+    csv_rows = list(client_rows)
+    non_importable_by_line: dict[str, list[tuple[str, int]]] = {}
+
+    for line, column in line_columns:
+        distinct = _collect_distinct_carrier_matches(
+            csv_rows,
+            column=column,
+            line_all_candidates=_filter_candidates_by_line(all_candidates, line),
+            line_importable_candidates=_filter_candidates_by_line(
+                importable_candidates, line
+            ),
+            matcher=matcher,
+        )
+
+        non_importable_by_line[line] = sorted(
+            (
+                (str(entry["label"]), int(entry["count"]))
+                for entry in distinct.values()
+                if entry["catalog"] and not entry["importable"]
+            ),
+            key=lambda item: (-item[1], item[0].lower()),
+        )
+
+    return non_importable_by_line
+
+
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
@@ -293,8 +370,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Print unmatched carrier labels. Keep output local because labels come from the private CSV.",
     )
     parser.add_argument("--top-unmatched", type=int, default=20)
+    parser.add_argument(
+        "--show-non-importable",
+        action="store_true",
+        help=(
+            "Print catalog/evidence carrier labels that still lack an importable source. "
+            "Keep output local because labels come from the private CSV."
+        ),
+    )
+    parser.add_argument("--top-non-importable", type=int, default=50)
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     return parser
+
+
+def _add_optional_report_sections(
+    report_payload: dict[str, Any],
+    *,
+    parsed_args: argparse.Namespace,
+    client_rows: Sequence[Mapping[str, str]],
+    all_candidates: Sequence[Any],
+    importable_candidates: Sequence[Any],
+    unmatched: Mapping[str, Sequence[tuple[str, int]]],
+) -> None:
+    if parsed_args.show_unmatched:
+        report_payload["top_unmatched"] = {
+            benefit_line: [
+                {"carrier": carrier_label, "mentions": mention_count}
+                for carrier_label, mention_count in carrier_counts[
+                    : parsed_args.top_unmatched
+                ]
+            ]
+            for benefit_line, carrier_counts in unmatched.items()
+        }
+    if parsed_args.show_non_importable:
+        non_importable = audit_non_importable_carrier_rows(
+            client_rows,
+            all_candidates=all_candidates,
+            importable_candidates=importable_candidates,
+        )
+        report_payload["top_non_importable"] = {
+            benefit_line: [
+                {"carrier": carrier_label, "mentions": mention_count}
+                for carrier_label, mention_count in carrier_counts[
+                    : parsed_args.top_non_importable
+                ]
+            ]
+            for benefit_line, carrier_counts in non_importable.items()
+        }
+
+
+def _print_human_report(
+    payload: Mapping[str, Any],
+    *,
+    show_unmatched: bool,
+    show_non_importable: bool,
+) -> None:
+    print(
+        f"rows={payload['rows']} candidates={payload['candidates']} "
+        f"importable_candidates={payload['importable_candidates']}"
+    )
+    for item in payload["coverage"]:
+        print(
+            f"{item['line']}: importable {item['importable_mentions']}/{item['mentions_total']} mentions, "
+            f"{item['distinct_importable']}/{item['distinct_total']} distinct; "
+            f"catalog/evidence {item['catalog_mentions']}/{item['mentions_total']} mentions, "
+            f"{item['distinct_catalog']}/{item['distinct_total']} distinct; "
+            f"unmatched {item['unmatched_mentions']} mentions, {item['distinct_unmatched']} distinct"
+        )
+    if show_unmatched:
+        for line, items in payload["top_unmatched"].items():
+            print(f"{line} top unmatched:")
+            for item in items:
+                print(f"  {item['mentions']:>4}  {item['carrier']}")
+    if show_non_importable:
+        for line, items in payload["top_non_importable"].items():
+            print(f"{line} top non-importable:")
+            for item in items:
+                print(f"  {item['mentions']:>4}  {item['carrier']}")
 
 
 async def async_main(argv: Sequence[str] | None = None) -> int:
@@ -317,31 +469,22 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         "importable_candidates": len(importable_candidates),
         "coverage": [item.to_dict() for item in stats],
     }
-    if args.show_unmatched:
-        payload["top_unmatched"] = {
-            line: [{"carrier": label, "mentions": count} for label, count in items[: args.top_unmatched]]
-            for line, items in unmatched.items()
-        }
+    _add_optional_report_sections(
+        payload,
+        parsed_args=args,
+        client_rows=rows,
+        all_candidates=all_candidates,
+        importable_candidates=importable_candidates,
+        unmatched=unmatched,
+    )
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print(
-            f"rows={payload['rows']} candidates={payload['candidates']} "
-            f"importable_candidates={payload['importable_candidates']}"
+        _print_human_report(
+            payload,
+            show_unmatched=args.show_unmatched,
+            show_non_importable=args.show_non_importable,
         )
-        for item in stats:
-            print(
-                f"{item.line}: importable {item.importable_mentions}/{item.mentions_total} mentions, "
-                f"{item.distinct_importable}/{item.distinct_total} distinct; "
-                f"catalog/evidence {item.catalog_mentions}/{item.mentions_total} mentions, "
-                f"{item.distinct_catalog}/{item.distinct_total} distinct; "
-                f"unmatched {item.unmatched_mentions} mentions, {item.distinct_unmatched} distinct"
-            )
-        if args.show_unmatched:
-            for line, items in unmatched.items():
-                print(f"{line} top unmatched:")
-                for label, count in items[: args.top_unmatched]:
-                    print(f"  {count:>4}  {label}")
     return 0
 
 
