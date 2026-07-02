@@ -4483,11 +4483,14 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert result["rate_count"] == 321
     assert result["serving_rates"] == 321
     assert result["table"].startswith("mrf.ptg2_serving_")
+    assert result["provider_group_location_table"].startswith("mrf.ptg2_provider_group_location_")
     assert result["artifacts"]["manifest_uri"] == "file:///tmp/snapshot.manifest.json"
     assert result["artifacts"]["sidecars"][0]["name"] == "provider_set_members"
     assert "RENAME TO" in joined
     assert "snapshot_id" not in joined
     assert "plan_id, reported_code_system, reported_code" in joined
+    assert "CREATE UNLOGGED TABLE" in joined
+    assert "provider_group_global_id_128 uuid NOT NULL" in joined
     assert "SELECT DISTINCT ON (serving_content_hash_128)" not in joined
     assert "SELECT DISTINCT ON (price_atom_global_id_128)" not in joined
     assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" not in joined

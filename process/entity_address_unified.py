@@ -107,7 +107,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "primary_state_city_npi",
     "primary_zip5_npi",
     "serving_zip5_npi",
-    "serving_taxonomy",
+    "serving_zip5_taxonomy",
     "primary_phone_npi",
     "service_phone_digits_npi",
     "service_phone_number_npi",
@@ -1458,15 +1458,14 @@ async def _create_support_stage_indexes(
     )
     phase_context["support_stage_index_concurrency"] = index_concurrency
     progress_lock = asyncio.Lock()
-    completed = 0
+    completed_counts = [0]
     total = len(stage_tables)
 
     async def _index_stage_table(index: int, stage_cls) -> None:
-        nonlocal completed
         table_name = stage_cls.__tablename__
         if run_id:
             async with progress_lock:
-                current_done = completed
+                current_done = completed_counts[0]
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="entity-address-unified",
@@ -1485,14 +1484,14 @@ async def _create_support_stage_indexes(
         await _create_stage_indexes(stage_cls, db_schema, context=phase_context)
         if run_id:
             async with progress_lock:
-                completed += 1
+                completed_counts[0] += 1
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="entity-address-unified",
                     status="running",
                     phase="entity-address-unified indexing support tables",
                     unit="tables",
-                    done=completed,
+                    done=completed_counts[0],
                     total=total,
                     pct=99,
                     message=f"indexed support table {index}/{total}: {table_name}",

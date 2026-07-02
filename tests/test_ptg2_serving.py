@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -2235,8 +2236,22 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert params["address_types"] == ["practice", "primary"]
 
 
+def _expect_member_first_manifest_sql(location_sql: str) -> None:
+    """Assert plan/code-constrained manifest location lookup starts from rated member NPIs."""
+    assert "scoped_member_npis AS MATERIALIZED" in location_sql
+    assert "FROM scoped_member_npis scope_npis" in location_sql
+    assert "WHERE addr_probe.npi = scope_npis.npi" in location_sql
+    assert "WHERE pgm_scope.npi = addr.npi" not in location_sql
+
+
+def _fail_manifest_sidecar_usage(*_args, **_kwargs) -> None:
+    """Raise when a component-table manifest test unexpectedly touches sidecars."""
+    raise AssertionError("sidecar should not be used")
+
+
 @pytest.mark.asyncio
 async def test_manifest_location_uses_component_table(monkeypatch):
+    """Component-backed manifest location lookup should prefilter by rated provider members."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
@@ -2258,11 +2273,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         id_storage="uuid",
     )
 
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sidecar should not be used")),
-    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -2285,6 +2296,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         "JOIN rate_provider_groups rpg",
     ):
         assert expected_sql in location_sql
+    _expect_member_first_manifest_sql(location_sql)
     assert location_params["location_plan_id"] == "010854205"
     assert location_params["location_reported_code"] == "90837"
     assert location_params["location_reported_code_system"] == "CPT"
@@ -2293,6 +2305,49 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     assert "FROM mrf.ptg2_provider_set_component_snap" in component_sql
     assert "CAST(:group_ids AS uuid[])" in component_sql
     assert component_params["group_ids"] == [group_id]
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_uses_component_table_with_provider_group_locations(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    location_sql = str(session.calls[3][0][0])
+    assert "rate_provider_groups AS MATERIALIZED" in location_sql
+    assert "FROM mrf.ptg2_provider_group_location_snap loc" in location_sql
+    assert "JOIN rate_provider_groups rpg_location" in location_sql
+    assert "FROM mrf.entity_address_unified addr" not in location_sql
+    assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" not in location_sql
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
 
@@ -2393,6 +2448,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     assert rate_set_params["reported_code"] == "90837"
     assert rate_set_params["reported_code_system"] == "CPT"
     assert "rate_provider_groups AS MATERIALIZED" not in location_sql
+    _expect_member_first_manifest_sql(location_sql)
     assert "pgm_scope.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
     assert "pgm.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
     assert location_params["location_rate_provider_group_ids"] == [group_id]
@@ -4239,16 +4295,146 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
     assert "JOIN filtered_locations loc" in sql
     assert "loc.npi" in sql
+    assert "loc.long::float8" not in sql
+    assert "loc.long" in sql
+    assert "loc.city_name" in sql
+    assert "loc.state_name" in sql
     assert "AND EXISTS (" in sql
     assert "OFFSET 0" in sql
     assert "COALESCE(tax.specializations, loc.specializations" not in sql
     assert "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations" in sql
     assert "array_remove(array_agg(NULLIF(nucc.specialization, '')" in sql
+    assert "'entity_address_unified'::varchar AS location_source" in sql
+    assert "'address_key', loc.address_key::text" in sql
     assert "FROM mrf.npi_address addr" not in sql
     assert "JOIN mrf.npi_address addr_filter" not in sql
     assert params["city_exact"] == "HOUSTON"
     assert params["provider_match_limit"] >= 64
     assert params["location_rate_candidate_limit"] >= 4096
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_legacy_scan(monkeypatch):
+    sidecar_probe = AsyncMock(return_value=())
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg2_serving, "_manifest_rate_provider_groups_from_sidecar", sidecar_probe)
+
+    session = FakeSession([])
+    result = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        ptg2_types.PTG2ServingTables(
+            serving_table="mrf.ptg2_serving_token",
+            provider_group_member_table="mrf.ptg2_provider_group_member_token",
+            provider_group_location_table="mrf.ptg2_provider_group_location_token",
+            artifacts={
+                "provider_forward": {"path": "provider-forward.bin"},
+                "provider_inverted": {"path": "provider-inverted.bin"},
+            },
+            id_storage="uuid",
+        ),
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75,
+        },
+        plan_id="010854205",
+    )
+
+    assert result == (set(), {})
+    sidecar_probe.assert_awaited_once()
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_prefers_provider_group_location_table(monkeypatch):
+    group_id = "00000000-0000-0000-0000-000000000001"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "provider_group_global_id_128": group_id,
+                        "npi": 1234567890,
+                        "address_key": None,
+                        "premise_key": None,
+                        "location_hash": "npi_address:1234567890:primary:addr-1",
+                        "state": "IL",
+                        "city": "CHICAGO",
+                        "zip5": "60601",
+                        "distance_miles": 0.0,
+                        "zip_match_type": "same_zip",
+                        "anchor_zip5": "60601",
+                        "zip_radius_miles": 75.0,
+                        "location_source": "npi_address",
+                        "location_confidence_code": "npi_address",
+                        "address_payload": {"first_line": "100 Main", "city": "CHICAGO"},
+                        "telephone_number": "312-555-0100",
+                        "fax_number": None,
+                        "phone_number": "3125550100",
+                        "phone_extension": None,
+                        "fax_number_digits": None,
+                        "fax_extension": None,
+                        "taxonomy_codes": ["103T00000X"],
+                        "specialties": ["Psychologist"],
+                        "classifications": ["Psychologist"],
+                        "specializations": [],
+                        "primary_specialty": "Psychologist",
+                        "primary_specialization": None,
+                        "provider_name": "Example Provider",
+                    }
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(return_value=(group_id,)),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_sets_by_group",
+        AsyncMock(return_value={group_id.replace("-", ""): ("provider-set-1",)}),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_overlay_provider_directory_corroboration",
+        AsyncMock(side_effect=lambda _session, rows, **_kwargs: rows),
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        ptg2_types.PTG2ServingTables(
+            serving_table="mrf.ptg2_serving_token",
+            provider_group_member_table="mrf.ptg2_provider_group_member_token",
+            provider_group_location_table="mrf.ptg2_provider_group_location_token",
+            artifacts={"provider_inverted": {"path": "provider-inverted.bin"}},
+            id_storage="uuid",
+        ),
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75,
+        },
+        plan_id="010854205",
+    )
+
+    assert provider_set_ids == {"provider-set-1"}
+    assert providers_by_set["provider-set-1"][0]["npi"] == 1234567890
+    sql = str(session.calls[0][0][0])
+    assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
+    assert "FROM mrf.ptg2_provider_group_member_token pgm_scope" not in sql
 
 
 @pytest.mark.asyncio
@@ -4322,6 +4508,8 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
     assert "LIMIT :rate_candidate_limit" in sql
+    assert "loc.long::float8" in sql
+    assert "loc.lon::float8" not in sql
     assert "LIMIT :rate_candidate_limit OFFSET" not in sql
     assert "provider_filtered_rates AS MATERIALIZED" in sql
     assert not sql.rstrip().endswith("LIMIT :limit OFFSET :offset")

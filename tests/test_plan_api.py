@@ -210,10 +210,11 @@ async def test_plan_find_plan_bad_year():
         await find_a_plan(request)
 
 
-def test_plan_get_price_plan_bad_age():
+@pytest.mark.asyncio
+async def test_plan_get_price_plan_bad_age():
     request = make_request([], args={"age": "bad"})
     with pytest.raises(sanic.exceptions.BadRequest):
-        asyncio.get_event_loop().run_until_complete(get_price_plan(request, "123"))
+        await get_price_plan(request, "123")
 
 
 @pytest.mark.asyncio

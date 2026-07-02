@@ -2685,17 +2685,17 @@ def provider_directory_address_corroboration_sql(
     *,
     view_name: str = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> str:
-    """Build a view that corroborates unified addresses with payer FHIR data.
+    """Build a view that corroborates role-bound Provider Directory addresses.
 
-    The relation name is kept for serving compatibility, but this no longer
-    reads PTG/TiC-derived address rows. PTG files prove a provider has a rate;
-    address proof comes from entity_address_unified and the payer directory.
+    The compact address overlay is the driving relation, scoped to role and
+    affiliation rows that can carry network context. Direct Organization
+    address evidence stays in provider_directory_address_overlay for provider
+    APIs, but is intentionally excluded from this PTG corroboration artifact.
     """
 
     schema = db_schema or _schema()
     view_ref = _qt(schema, view_name)
     practitioner_ref_match = _sql_ref_matches_resource("role.practitioner_ref", "Practitioner", "practitioner.resource_id")
-    role_location_ref_match = _sql_ref_matches_resource("role.location_ref", "Location", "loc.resource_id")
     role_plan_ref_match = _sql_ref_matches_resource("plan_ref.value", "InsurancePlan", "insurance_plan.resource_id")
     affiliation_org_ref_match = _sql_ref_matches_resource(
         "affiliation.organization_ref", "Organization", "organization.resource_id"
@@ -2703,58 +2703,35 @@ def provider_directory_address_corroboration_sql(
     affiliation_participating_org_ref_match = _sql_ref_matches_resource(
         "affiliation.participating_organization_ref", "Organization", "organization.resource_id"
     )
-    affiliation_location_ref_match = _sql_ref_matches_resource("affiliation.location_ref", "Location", "loc.resource_id")
-    affiliation_plan_ref_match = _sql_ref_matches_resource(
-        "plan_ref.value", "InsurancePlan", "insurance_plan.resource_id"
-    )
     network_ref_resource_id_expr = _sql_reference_resource_id("network_ref.value", "Organization")
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
     WITH address_candidates AS (
         SELECT
-            COALESCE(e.npi, e.inferred_npi)::bigint AS npi,
-            e.location_key::varchar AS location_key,
-            e.address_key::uuid AS address_key,
-            e.zip5::varchar AS zip5,
-            e.state_code::varchar AS state_code,
-            e.city_norm::varchar AS city_norm
-          FROM {_qt(schema, "entity_address_unified")} e
-         WHERE COALESCE(e.npi, e.inferred_npi) IS NOT NULL
-           AND e.address_key IS NOT NULL
-           AND e.type IN ('practice', 'primary', 'secondary', 'site')
-    ),
-    practitioner_role_locations AS (
-        SELECT
-            role.source_id,
-            role.resource_id AS role_resource_id,
-            role.practitioner_ref,
-            role.organization_ref,
-            location_ref.value AS location_ref,
-            COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS network_refs,
-            COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb) AS insurance_plan_refs,
-            COALESCE(role.specialty_codes::jsonb, '[]'::jsonb) AS specialty_codes,
-            COALESCE(role.code_codes::jsonb, '[]'::jsonb) AS code_codes,
-            role.active AS role_active,
-            role.observed_at AS role_observed_at
-          FROM {_qt(schema, "provider_directory_practitioner_role")} role
-          JOIN LATERAL (
-              SELECT direct_location_ref.value
-                FROM jsonb_array_elements_text(
-                    COALESCE(role.location_refs::jsonb, '[]'::jsonb)
-                ) AS direct_location_ref(value)
-              UNION
-              SELECT service_location_ref.value
-                FROM jsonb_array_elements_text(
-                    COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
-                ) AS service_ref(value)
-                JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
-                  ON healthcare_service.source_id = role.source_id
-                 AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
-               CROSS JOIN LATERAL jsonb_array_elements_text(
-                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-               ) AS service_location_ref(value)
-               WHERE healthcare_service.active IS DISTINCT FROM false
-          ) AS location_ref(value) ON TRUE
+            overlay.source_record_id::varchar AS source_record_id,
+            overlay.source_id::varchar AS source_id,
+            overlay.resource_type::varchar AS resource_type,
+            overlay.resource_id::varchar AS resource_id,
+            CASE
+                WHEN overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')
+                    THEN NULLIF(split_part(overlay.source_record_id, ':', 5), '')
+                ELSE NULL::varchar
+            END AS location_resource_id,
+            overlay.npi::bigint AS npi,
+            NULL::varchar AS location_key,
+            overlay.address_key::uuid AS address_key,
+            NULLIF(LEFT(regexp_replace(COALESCE(overlay.postal_code, ''), '\\D', '', 'g'), 5), '')::varchar AS zip5,
+            overlay.state_code::varchar AS state_code,
+            NULLIF(regexp_replace(upper(BTRIM(COALESCE(overlay.city_name, ''))), '[^A-Z0-9]+', '', 'g'), '')::varchar AS city_norm,
+            overlay.telephone_number::varchar AS telephone_number,
+            overlay.phone_number::varchar AS phone_number,
+            overlay.fax_number::varchar AS fax_number,
+            overlay.fax_number_digits::varchar AS fax_number_digits,
+            overlay.source_updated_at AS source_updated_at
+          FROM {_qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)} overlay
+         WHERE overlay.npi IS NOT NULL
+           AND overlay.address_key IS NOT NULL
+           AND overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')
     ),
     practitioner_matches AS (
         SELECT
@@ -2773,17 +2750,17 @@ def provider_directory_address_corroboration_sql(
             src.plan_name AS provider_directory_plan_name,
             practitioner.resource_id AS provider_directory_provider_resource_id,
             practitioner.full_name AS provider_directory_provider_name,
-            role.role_resource_id AS provider_directory_role_resource_id,
-            loc.resource_id AS provider_directory_location_resource_id,
+            role.resource_id AS provider_directory_role_resource_id,
+            COALESCE(loc.resource_id, e.location_resource_id) AS provider_directory_location_resource_id,
             loc.name AS provider_directory_location_name,
-            loc.telephone_number AS provider_directory_telephone_number,
-            loc.phone_number AS provider_directory_phone_number,
+            COALESCE(loc.telephone_number, e.telephone_number) AS provider_directory_telephone_number,
+            COALESCE(loc.phone_number, e.phone_number) AS provider_directory_phone_number,
             loc.phone_extension AS provider_directory_phone_extension,
-            loc.fax_number AS provider_directory_fax_number,
-            loc.fax_number_digits AS provider_directory_fax_number_digits,
+            COALESCE(loc.fax_number, e.fax_number) AS provider_directory_fax_number,
+            COALESCE(loc.fax_number_digits, e.fax_number_digits) AS provider_directory_fax_number_digits,
             loc.fax_extension AS provider_directory_fax_extension,
-            role.network_refs AS provider_directory_network_refs,
-            role.insurance_plan_refs AS provider_directory_insurance_plan_refs,
+            COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs,
+            COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb) AS provider_directory_insurance_plan_refs,
             COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
                 AS provider_directory_network_names,
             COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
@@ -2793,33 +2770,30 @@ def provider_directory_address_corroboration_sql(
                 AS provider_directory_network_context_present,
             COALESCE(plan_context.provider_directory_insurance_plan_matches, '[]'::jsonb)
                 AS provider_directory_insurance_plan_matches,
-            role.specialty_codes AS provider_directory_specialty_codes,
-            role.code_codes AS provider_directory_role_codes,
+            COALESCE(role.specialty_codes::jsonb, '[]'::jsonb) AS provider_directory_specialty_codes,
+            COALESCE(role.code_codes::jsonb, '[]'::jsonb) AS provider_directory_role_codes,
             'practitioner_role'::varchar AS provider_directory_match_type,
-            (role.role_active IS DISTINCT FROM false) AS provider_directory_active_role,
+            (role.active IS DISTINCT FROM false) AS provider_directory_active_role,
             (practitioner.active IS DISTINCT FROM false) AS provider_directory_active_provider,
-            (loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
+            (loc.resource_id IS NULL OR loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
             GREATEST(
-                COALESCE(role.role_observed_at, TIMESTAMP 'epoch'),
+                COALESCE(e.source_updated_at, TIMESTAMP 'epoch'),
+                COALESCE(role.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(practitioner.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(loc.observed_at, TIMESTAMP 'epoch')
             ) AS provider_directory_observed_at
           FROM address_candidates e
+          JOIN {_qt(schema, "provider_directory_practitioner_role")} role
+            ON e.resource_type = 'PractitionerRole'
+           AND role.source_id = e.source_id
+           AND role.resource_id = e.resource_id
           JOIN {_qt(schema, "provider_directory_practitioner")} practitioner
-            ON practitioner.npi = e.npi
-          JOIN practitioner_role_locations role
-            ON role.source_id = practitioner.source_id
+            ON practitioner.source_id = role.source_id
+           AND practitioner.npi = e.npi
            AND {practitioner_ref_match}
-          JOIN {_qt(schema, "provider_directory_location")} loc
-            ON loc.source_id = role.source_id
-           AND {role_location_ref_match}
-           AND (
-                CASE
-                    WHEN loc.address_key ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
-                        THEN loc.address_key::uuid
-                    ELSE NULL::uuid
-                END
-           ) = e.address_key
+          LEFT JOIN {_qt(schema, "provider_directory_location")} loc
+            ON loc.source_id = e.source_id
+           AND loc.resource_id = e.location_resource_id
           LEFT JOIN LATERAL (
             SELECT
                 COALESCE(
@@ -2834,7 +2808,7 @@ def provider_directory_address_corroboration_sql(
                     '[]'::jsonb
                 ) AS provider_directory_insurance_plan_matches
               FROM jsonb_array_elements_text(
-                  COALESCE(role.insurance_plan_refs, '[]'::jsonb)
+                  COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)
               ) AS plan_ref(value)
               LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                 ON insurance_plan.source_id = role.source_id
@@ -2844,12 +2818,12 @@ def provider_directory_address_corroboration_sql(
             WITH network_ref_values AS (
                 SELECT network_ref.value
                   FROM jsonb_array_elements_text(
-                      COALESCE(role.network_refs, '[]'::jsonb)
+                      COALESCE(role.network_refs::jsonb, '[]'::jsonb)
                   ) AS network_ref(value)
                 UNION
                 SELECT plan_network_ref.value
                   FROM jsonb_array_elements_text(
-                      COALESCE(role.insurance_plan_refs, '[]'::jsonb)
+                      COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)
                   ) AS plan_ref(value)
                   JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                     ON insurance_plan.source_id = role.source_id
@@ -2894,40 +2868,7 @@ def provider_directory_address_corroboration_sql(
          WHERE e.npi IS NOT NULL
            AND e.address_key IS NOT NULL
     ),
-    organization_affiliation_locations AS (
-        SELECT
-            affiliation.source_id,
-            affiliation.resource_id AS role_resource_id,
-            affiliation.organization_ref,
-            affiliation.participating_organization_ref,
-            location_ref.value AS location_ref,
-            COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS network_refs,
-            '[]'::jsonb AS insurance_plan_refs,
-            COALESCE(affiliation.specialty_codes::jsonb, '[]'::jsonb) AS specialty_codes,
-            COALESCE(affiliation.code_codes::jsonb, '[]'::jsonb) AS code_codes,
-            affiliation.active AS role_active,
-            affiliation.observed_at AS role_observed_at
-          FROM {_qt(schema, "provider_directory_organization_affiliation")} affiliation
-          JOIN LATERAL (
-              SELECT direct_location_ref.value
-                FROM jsonb_array_elements_text(
-                    COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-                ) AS direct_location_ref(value)
-              UNION
-              SELECT service_location_ref.value
-                FROM jsonb_array_elements_text(
-                    COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
-                ) AS service_ref(value)
-                JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
-                  ON healthcare_service.source_id = affiliation.source_id
-                 AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
-               CROSS JOIN LATERAL jsonb_array_elements_text(
-                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-               ) AS service_location_ref(value)
-               WHERE healthcare_service.active IS DISTINCT FROM false
-          ) AS location_ref(value) ON TRUE
-    ),
-    organization_matches AS (
+    organization_affiliation_matches AS (
         SELECT
             NULL::varchar AS source_key,
             NULL::varchar AS snapshot_id,
@@ -2944,17 +2885,17 @@ def provider_directory_address_corroboration_sql(
             src.plan_name AS provider_directory_plan_name,
             organization.resource_id AS provider_directory_provider_resource_id,
             organization.name AS provider_directory_provider_name,
-            affiliation.role_resource_id AS provider_directory_role_resource_id,
-            loc.resource_id AS provider_directory_location_resource_id,
+            affiliation.resource_id AS provider_directory_role_resource_id,
+            COALESCE(loc.resource_id, e.location_resource_id) AS provider_directory_location_resource_id,
             loc.name AS provider_directory_location_name,
-            loc.telephone_number AS provider_directory_telephone_number,
-            loc.phone_number AS provider_directory_phone_number,
+            COALESCE(loc.telephone_number, e.telephone_number) AS provider_directory_telephone_number,
+            COALESCE(loc.phone_number, e.phone_number) AS provider_directory_phone_number,
             loc.phone_extension AS provider_directory_phone_extension,
-            loc.fax_number AS provider_directory_fax_number,
-            loc.fax_number_digits AS provider_directory_fax_number_digits,
+            COALESCE(loc.fax_number, e.fax_number) AS provider_directory_fax_number,
+            COALESCE(loc.fax_number_digits, e.fax_number_digits) AS provider_directory_fax_number_digits,
             loc.fax_extension AS provider_directory_fax_extension,
-            affiliation.network_refs AS provider_directory_network_refs,
-            affiliation.insurance_plan_refs AS provider_directory_insurance_plan_refs,
+            COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs,
+            '[]'::jsonb AS provider_directory_insurance_plan_refs,
             COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
                 AS provider_directory_network_names,
             COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
@@ -2962,58 +2903,34 @@ def provider_directory_address_corroboration_sql(
             false AS provider_directory_plan_context_matched,
             COALESCE(network_context.provider_directory_network_context_present, false)
                 AS provider_directory_network_context_present,
-            COALESCE(plan_context.provider_directory_insurance_plan_matches, '[]'::jsonb)
-                AS provider_directory_insurance_plan_matches,
-            affiliation.specialty_codes AS provider_directory_specialty_codes,
-            affiliation.code_codes AS provider_directory_role_codes,
+            '[]'::jsonb AS provider_directory_insurance_plan_matches,
+            COALESCE(affiliation.specialty_codes::jsonb, '[]'::jsonb) AS provider_directory_specialty_codes,
+            COALESCE(affiliation.code_codes::jsonb, '[]'::jsonb) AS provider_directory_role_codes,
             'organization_affiliation'::varchar AS provider_directory_match_type,
-            (affiliation.role_active IS DISTINCT FROM false) AS provider_directory_active_role,
+            (affiliation.active IS DISTINCT FROM false) AS provider_directory_active_role,
             (organization.active IS DISTINCT FROM false) AS provider_directory_active_provider,
-            (loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
+            (loc.resource_id IS NULL OR loc.status IS NULL OR lower(loc.status) <> 'inactive') AS provider_directory_active_location,
             GREATEST(
-                COALESCE(affiliation.role_observed_at, TIMESTAMP 'epoch'),
+                COALESCE(e.source_updated_at, TIMESTAMP 'epoch'),
+                COALESCE(affiliation.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(organization.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(loc.observed_at, TIMESTAMP 'epoch')
             ) AS provider_directory_observed_at
           FROM address_candidates e
+          JOIN {_qt(schema, "provider_directory_organization_affiliation")} affiliation
+            ON e.resource_type = 'OrganizationAffiliation'
+           AND affiliation.source_id = e.source_id
+           AND affiliation.resource_id = e.resource_id
           JOIN {_qt(schema, "provider_directory_organization")} organization
-            ON organization.npi = e.npi
-          JOIN organization_affiliation_locations affiliation
-            ON affiliation.source_id = organization.source_id
+            ON organization.source_id = affiliation.source_id
+           AND organization.npi = e.npi
            AND (
                 {affiliation_org_ref_match}
              OR {affiliation_participating_org_ref_match}
            )
-          JOIN {_qt(schema, "provider_directory_location")} loc
-            ON loc.source_id = affiliation.source_id
-           AND {affiliation_location_ref_match}
-           AND (
-                CASE
-                    WHEN loc.address_key ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
-                        THEN loc.address_key::uuid
-                    ELSE NULL::uuid
-                END
-           ) = e.address_key
-          LEFT JOIN LATERAL (
-            SELECT
-                COALESCE(
-                    jsonb_agg(
-                        DISTINCT jsonb_build_object(
-                            'ref', plan_ref.value,
-                            'resource_id', insurance_plan.resource_id,
-                            'plan_identifier', insurance_plan.plan_identifier,
-                            'name', insurance_plan.name
-                        )
-                    ) FILTER (WHERE plan_ref.value IS NOT NULL),
-                    '[]'::jsonb
-                ) AS provider_directory_insurance_plan_matches
-              FROM jsonb_array_elements_text(
-                  COALESCE(affiliation.insurance_plan_refs, '[]'::jsonb)
-              ) AS plan_ref(value)
-              LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
-                ON insurance_plan.source_id = affiliation.source_id
-               AND {affiliation_plan_ref_match}
-          ) plan_context ON TRUE
+          LEFT JOIN {_qt(schema, "provider_directory_location")} loc
+            ON loc.source_id = e.source_id
+           AND loc.resource_id = e.location_resource_id
           LEFT JOIN LATERAL (
             SELECT
                 bool_or(network_ref.value IS NOT NULL) AS provider_directory_network_context_present,
@@ -3042,7 +2959,7 @@ def provider_directory_address_corroboration_sql(
                     '[]'::jsonb
                 ) AS provider_directory_network_matches
               FROM jsonb_array_elements_text(
-                  COALESCE(affiliation.network_refs, '[]'::jsonb)
+                  COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
               ) AS network_ref(value)
               LEFT JOIN {_qt(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)} network_catalog
                 ON network_catalog.source_id = affiliation.source_id
@@ -3056,9 +2973,9 @@ def provider_directory_address_corroboration_sql(
     matches AS (
         SELECT * FROM practitioner_matches
         UNION ALL
-        SELECT * FROM organization_matches
+        SELECT * FROM organization_affiliation_matches
     )
-    SELECT DISTINCT
+    SELECT
         source_key,
         snapshot_id,
         plan_id,
@@ -3737,7 +3654,7 @@ async def _publish_provider_directory_artifacts(
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
         metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
         location_contacts_message = (
             "backfilled Provider Directory location contacts; "
@@ -3756,7 +3673,7 @@ async def _publish_provider_directory_artifacts(
     )
     if seen_table:
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
         metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
             run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
         )
@@ -3775,13 +3692,13 @@ async def _publish_provider_directory_artifacts(
         message=location_address_keys_message,
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
         metrics["location_archive"] = await publish_provider_directory_location_archive(
             run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
         )
     else:
         metrics["location_archive"] = _provider_directory_publish_target_skipped()
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
         metrics["address_overlay"] = await publish_provider_directory_address_overlay(
             run_id=effective_publish_scope_run_id, source_ids=source_ids
         )
@@ -3793,8 +3710,8 @@ async def _publish_provider_directory_artifacts(
         f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
     )
     if (
-        not _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
-        and not _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
+        not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
+        and not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
     ):
         address_artifact_message = "skipped Provider Directory location archive and address overlay publish"
     await _mark_provider_directory_progress(
@@ -3805,7 +3722,7 @@ async def _publish_provider_directory_artifacts(
         message=address_artifact_message,
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
         metrics["network_catalog"] = await publish_provider_directory_network_catalog(
             run_id=effective_publish_scope_run_id,
             source_ids=source_ids,
@@ -3826,7 +3743,7 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     metrics["publish_corroboration"] = publish_corroboration
-    if publish_corroboration and _provider_directory_publish_target_enabled(
+    if publish_corroboration and is_provider_directory_publish_target_enabled(
         publish_artifacts_targets,
         "corroboration",
     ):
@@ -8165,7 +8082,7 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
     else:
         target_values = raw_targets
 
-    selected: set[str] = set()
+    selected_targets: set[str] = set()
     for target_candidate in target_values:
         target_text = _clean_text(target_candidate)
         if not target_text:
@@ -8178,7 +8095,7 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
         )
         expanded = PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES.get(normalized)
         if expanded is not None:
-            selected.update(expanded)
+            selected_targets.update(expanded)
             continue
         if normalized not in PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS:
             raise ValueError(
@@ -8186,11 +8103,12 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
                 f"{target_text!r}; expected one of "
                 f"{', '.join(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS)}"
             )
-        selected.add(normalized)
-    return selected or None
+        selected_targets.add(normalized)
+    return selected_targets or None
 
 
-def _provider_directory_publish_target_enabled(targets: set[str] | None, target: str) -> bool:
+def is_provider_directory_publish_target_enabled(targets: set[str] | None, target: str) -> bool:
+    """Return whether a publish artifact target should be emitted for this task."""
     return targets is None or target in targets
 
 

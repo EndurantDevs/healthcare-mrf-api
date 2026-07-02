@@ -287,6 +287,165 @@ async def _index_manifest_components(schema_name: str, table_name: str) -> None:
     )
 
 
+async def _create_optional_manifest_provider_geo_index(
+    *,
+    schema_name: str,
+    provider_group_location_table: str,
+) -> None:
+    try:
+        await db.status(
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, 'geo_gist_idx'))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} "
+            "USING gist (geography(st_makepoint(long::float8, lat::float8))) "
+            "WHERE lat IS NOT NULL AND long IS NOT NULL;"
+        )
+    except Exception as exc:  # pragma: no cover - exact driver exception varies by environment.
+        logger.warning(
+            "Skipping optional PTG2 manifest provider geo GiST index for %s.%s: %s",
+            schema_name,
+            provider_group_location_table,
+            exc,
+        )
+
+
+async def _build_manifest_provider_group_location_table(
+    *,
+    schema_name: str,
+    provider_group_member_table: str,
+    provider_group_location_table: str,
+) -> str | None:
+    if not await _table_exists(schema_name, provider_group_member_table):
+        return None
+    id_type = _ptg2_id_sql_type()
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} CASCADE;"
+    )
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} (
+            provider_group_global_id_128 {id_type} NOT NULL,
+            npi bigint NOT NULL,
+            address_key uuid,
+            premise_key uuid,
+            zip5 varchar(5),
+            state_name varchar,
+            city_name varchar,
+            lat numeric,
+            long numeric,
+            address_precision varchar,
+            taxonomy_array int[] NOT NULL DEFAULT '{{0}}',
+            address_type varchar,
+            address_checksum varchar,
+            first_line varchar,
+            second_line varchar,
+            postal_code varchar,
+            country_code varchar,
+            formatted_address varchar,
+            telephone_number varchar,
+            fax_number varchar,
+            phone_number varchar,
+            phone_extension varchar,
+            fax_number_digits varchar,
+            fax_extension varchar
+        );
+        """
+    )
+    await db.status(
+        f"""
+        INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} (
+            provider_group_global_id_128,
+            npi,
+            address_key,
+            premise_key,
+            zip5,
+            state_name,
+            city_name,
+            lat,
+            long,
+            address_precision,
+            taxonomy_array,
+            address_type,
+            address_checksum,
+            first_line,
+            second_line,
+            postal_code,
+            country_code,
+            formatted_address,
+            telephone_number,
+            fax_number,
+            phone_number,
+            phone_extension,
+            fax_number_digits,
+            fax_extension
+        )
+        SELECT DISTINCT
+            pgm.provider_group_global_id_128,
+            pgm.npi,
+            addr.address_key,
+            addr.premise_key,
+            COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)::varchar)::varchar(5) AS zip5,
+            addr.state_name::varchar,
+            addr.city_name::varchar,
+            addr.lat,
+            addr.long,
+            addr.address_precision::varchar,
+            COALESCE(addr.taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array,
+            addr.type::varchar AS address_type,
+            addr.checksum::varchar AS address_checksum,
+            addr.first_line::varchar,
+            addr.second_line::varchar,
+            addr.postal_code::varchar,
+            addr.country_code::varchar,
+            addr.formatted_address::varchar,
+            addr.telephone_number::varchar,
+            addr.fax_number::varchar,
+            addr.phone_number::varchar,
+            addr.phone_extension::varchar,
+            addr.fax_number_digits::varchar,
+            addr.fax_extension::varchar
+          FROM {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} pgm
+          JOIN {_quote_ident(schema_name)}.entity_address_unified addr
+            ON addr.npi = pgm.npi
+         WHERE addr.type IN ('primary', 'secondary', 'practice', 'site')
+           AND (
+                NULLIF(COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)::varchar), '') IS NOT NULL
+             OR NULLIF(addr.state_name, '') IS NOT NULL
+             OR NULLIF(addr.city_name, '') IS NOT NULL
+             OR (addr.lat IS NOT NULL AND addr.long IS NOT NULL)
+           );
+        """
+    )
+    location_indexes = [
+        ("group_zip_idx", "(provider_group_global_id_128, zip5, npi)"),
+        ("zip_group_idx", "(zip5, provider_group_global_id_128, npi)"),
+        ("state_city_group_idx", "(state_name, city_name, provider_group_global_id_128, npi)"),
+        ("state_city_npi_group_idx", "(state_name, city_name, npi, provider_group_global_id_128)"),
+        (
+            "group_state_city_npi_addr_idx",
+            "(provider_group_global_id_128, state_name, city_name, npi, address_checksum)",
+        ),
+        ("npi_group_idx", "(npi, provider_group_global_id_128)"),
+        ("group_npi_idx", "(provider_group_global_id_128, npi)"),
+        (
+            "lat_long_group_idx",
+            "(lat, long, provider_group_global_id_128, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
+        ),
+        ("address_key_idx", "(address_key, provider_group_global_id_128, npi) WHERE address_key IS NOT NULL"),
+        ("taxonomy_array_gin_idx", "USING gin (taxonomy_array gin__int_ops)"),
+    ]
+    for role, columns_sql in location_indexes:
+        await db.status(
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, role))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} {columns_sql};"
+        )
+    await _create_optional_manifest_provider_geo_index(
+        schema_name=schema_name,
+        provider_group_location_table=provider_group_location_table,
+    )
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)};")
+    return provider_group_location_table
+
+
 async def _materialize_manifest_components(
     *,
     schema_name: str,
@@ -464,6 +623,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     provider_group_member_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_group_member")
     price_atom_table = _ptg2_snapshot_table_name("price_atom", source_key, snapshot_id)
     provider_group_member_table = _ptg2_snapshot_table_name("provider_group_member", source_key, snapshot_id)
+    provider_group_location_table = _ptg2_snapshot_table_name("provider_group_location", source_key, snapshot_id)
     provider_set_component_table = _ptg2_snapshot_table_name("provider_set_component", source_key, snapshot_id)
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     started_at = time.monotonic()
@@ -471,6 +631,9 @@ async def _publish_ptg2_manifest_serving_snapshot(
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} CASCADE;"
+    )
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} CASCADE;"
     )
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_component_table)} CASCADE;"
@@ -607,6 +770,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
             (npi, provider_group_global_id_128);
             """
         )
+    materialized_provider_group_location_table = await _build_manifest_provider_group_location_table(
+        schema_name=schema_name,
+        provider_group_member_table=provider_group_member_table,
+        provider_group_location_table=provider_group_location_table,
+    )
     materialized_provider_set_component_table = await _materialize_manifest_components(
         schema_name=schema_name,
         table_name=provider_set_component_table,
@@ -643,6 +811,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(
             f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_set_component_table)};"
         )
+    if materialized_provider_group_location_table:
+        await db.status(
+            f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_group_location_table)};"
+        )
     row_count = await _exact_table_rows(schema_name, final_table)
     elapsed_seconds = time.monotonic() - started_at
     artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
@@ -655,6 +827,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "table": f"{schema_name}.{final_table}",
         "price_atom_table": f"{schema_name}.{price_atom_table}",
         "provider_group_member_table": f"{schema_name}.{provider_group_member_table}",
+        "provider_group_location_table": (
+            f"{schema_name}.{materialized_provider_group_location_table}"
+            if materialized_provider_group_location_table
+            else None
+        ),
         "provider_set_component_table": (
             f"{schema_name}.{materialized_provider_set_component_table}"
             if materialized_provider_set_component_table
