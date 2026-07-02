@@ -8903,6 +8903,7 @@ async def test_push_import_control_catalog_supersedes_unselected_duplicates(
         call["json"]
         for call in http_calls
         if call["url"].endswith("/v1/catalog/sources")
+        and call["method"] == "POST"
     ]
     superseded_request_bodies = [
         request_body
@@ -8987,20 +8988,30 @@ async def test_push_import_control_catalog_supersedes_replaced_urls(
         call["json"]
         for call in http_calls
         if call["url"].endswith("/v1/catalog/sources")
+        and call["method"] == "POST"
     ]
-    superseded_request_bodies = [
-        request_body
-        for request_body in source_request_bodies
-        if request_body["status"] == "superseded"
+    superseded_patch_bodies = [
+        call["json"]
+        for call in http_calls
+        if call["url"].endswith("/v1/catalog/sources/ic_legacy_old_source")
+        and call["method"] == "PATCH"
     ]
 
     assert sources_synced == 1
     assert plans_synced == 1
     assert sync_errors == []
-    assert len(superseded_request_bodies) == 1
-    assert superseded_request_bodies[0]["index_url"] == "https://example.com/old-transparency"
-    assert superseded_request_bodies[0]["visibility"] == "internal"
-    assert superseded_request_bodies[0]["preserve_operator_state"] is False
+    assert not [
+        request_body
+        for request_body in source_request_bodies
+        if request_body["index_url"] == "https://example.com/old-transparency"
+    ]
+    assert superseded_patch_bodies == [
+        {
+            "visibility": "internal",
+            "status": "superseded",
+            "preserve_operator_state": False,
+        }
+    ]
 
 
 def _replacement_catalog_source_row():
@@ -9124,56 +9135,94 @@ def _metadata_only_catalog_source_rows():
     ]
 
 
+class _CatalogSnapshotFakeResponse:
+    def __init__(self, response_payload, status=200):
+        self.response_payload = response_payload
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def json(self):
+        return self.response_payload
+
+    async def text(self):
+        return "error"
+
+
+class _CatalogSnapshotFakeSession:
+    def __init__(self, captured_calls):
+        self.captured_calls = captured_calls
+        self.get = self.fetch_source
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def post(self, request_url, json):
+        self.captured_calls.append(
+            {"method": "POST", "url": request_url, "json": json}
+        )
+        if request_url.endswith("/v1/catalog/sources"):
+            return _CatalogSnapshotFakeResponse({"source_id": f"ic_{json['source_key']}"})
+        if request_url.endswith("/v1/ptg/discover/ingest-preview"):
+            return _CatalogSnapshotFakeResponse({"counts": {"plans": 1}})
+        if request_url.endswith("/v1/catalog/seeds/import"):
+            return _CatalogSnapshotFakeResponse(
+                {"count": 1, "items": json.get("items") or []}
+            )
+        return _CatalogSnapshotFakeResponse({}, status=404)
+
+    def fetch_source(self, request_url, params=None):
+        self.captured_calls.append(
+            {"method": "GET", "url": request_url, "params": params, "json": None}
+        )
+        if "/v1/catalog/sources/ic_" in request_url:
+            return _CatalogSnapshotFakeResponse(
+                {
+                    "source_id": request_url.rsplit("/", 1)[-1],
+                    "visibility": "internal",
+                    "status": "needs_review",
+                }
+            )
+        if (
+            request_url.endswith("/v1/catalog/sources")
+            and (params or {}).get("q") == "https://example.com/old-transparency"
+        ):
+            return _CatalogSnapshotFakeResponse(
+                {
+                    "items": [
+                        {
+                            "source_id": "ic_legacy_old_source",
+                            "source_key": "legacy-old-source",
+                            "canonical_index_url": (
+                                "https://example.com/old-transparency"
+                            ),
+                        }
+                    ]
+                }
+            )
+        return _CatalogSnapshotFakeResponse({}, status=404)
+
+    def patch(self, request_url, json):
+        self.captured_calls.append(
+            {"method": "PATCH", "url": request_url, "json": json}
+        )
+        return _CatalogSnapshotFakeResponse(
+            {"source_id": request_url.rsplit("/", 1)[-1], **json}
+        )
+
+
 def _catalog_snapshot_fake_session(captured_calls):
-    class FakeResponse:
-        def __init__(self, payload, status=200):
-            self.payload = payload
-            self.status = status
+    def fake_session_factory(*_args, **_kwargs):
+        return _CatalogSnapshotFakeSession(captured_calls)
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        async def json(self):
-            return self.payload
-
-        async def text(self):
-            return "error"
-
-    class FakeSession:
-        def __init__(self, *_args, **_kwargs):
-            return None
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        def post(self, url, json):
-            captured_calls.append({"url": url, "json": json})
-            if url.endswith("/v1/catalog/sources"):
-                return FakeResponse({"source_id": f"ic_{json['source_key']}"})
-            if url.endswith("/v1/ptg/discover/ingest-preview"):
-                return FakeResponse({"counts": {"plans": 1}})
-            if url.endswith("/v1/catalog/seeds/import"):
-                return FakeResponse({"count": 1, "items": json.get("items") or []})
-            return FakeResponse({}, status=404)
-
-        def get(self, url):
-            captured_calls.append({"url": url, "json": None})
-            if "/v1/catalog/sources/ic_" in url:
-                return FakeResponse(
-                    {
-                        "visibility": "internal",
-                        "status": "needs_review",
-                    }
-                )
-            return FakeResponse({}, status=404)
-
-    return FakeSession
+    return fake_session_factory
 
 
 def _catalog_snapshot_source_rows():

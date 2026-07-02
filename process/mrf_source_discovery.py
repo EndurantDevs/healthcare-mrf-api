@@ -14091,6 +14091,69 @@ async def _fetch_import_control_source(
     return data if isinstance(data, dict) else None
 
 
+async def _find_import_control_sources_by_url(
+    session: aiohttp.ClientSession,
+    import_control_base_url: str,
+    source_index_url: str,
+) -> list[dict[str, Any]]:
+    """Return catalog sources whose stored canonical URL matches source_index_url."""
+    canonical_source_url = _canonical_or_none(source_index_url) or source_index_url
+    async with session.get(
+        f"{import_control_base_url}/v1/catalog/sources",
+        params={"q": source_index_url, "limit": "100"},
+    ) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise RuntimeError(
+                f"import-control source search failed: {resp.status} {text[:200]}"
+            )
+        response_payload = await resp.json()
+    response_items = (
+        response_payload.get("items") if isinstance(response_payload, dict) else None
+    )
+    if not isinstance(response_items, list):
+        return []
+    matching_sources: list[dict[str, Any]] = []
+    for source_record in response_items:
+        if not isinstance(source_record, dict):
+            continue
+        catalog_source_urls = {
+            str(source_record.get("canonical_index_url") or "").strip(),
+            str(source_record.get("index_url") or "").strip(),
+            str(source_record.get("official_url") or "").strip(),
+        }
+        if (
+            canonical_source_url in catalog_source_urls
+            or source_index_url in catalog_source_urls
+        ):
+            matching_sources.append(source_record)
+    return matching_sources
+
+
+async def _patch_import_control_source_state(
+    session: aiohttp.ClientSession,
+    base: str,
+    source_id: str,
+    *,
+    visibility: str,
+    status: str,
+) -> None:
+    payload = {
+        "visibility": visibility,
+        "status": status,
+        "preserve_operator_state": False,
+    }
+    async with session.patch(
+        f"{base}/v1/catalog/sources/{source_id}", json=payload
+    ) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise RuntimeError(
+                f"import-control source patch failed: {resp.status} {text[:200]}"
+            )
+        await resp.json()
+
+
 async def _ingest_import_control_preview(
     session: aiohttp.ClientSession,
     base: str,
@@ -14140,16 +14203,32 @@ async def _mark_import_control_seed_promoted(
 async def _supersede_import_control_replaced_urls(
     session: aiohttp.ClientSession,
     base: str,
-    row: dict[str, Any],
+    source_row: dict[str, Any],
 ) -> None:
     """Hide catalog rows for explicitly replaced source URLs."""
-    metadata = row.get("metadata_json") or {}
+    metadata = source_row.get("metadata_json") or {}
     for old_url in metadata.get("supersedes_urls") or []:
         old_url_text = str(old_url or "").strip()
         if not old_url_text:
             continue
+        replaced_sources = await _find_import_control_sources_by_url(
+            session, base, old_url_text
+        )
+        for replaced_source in replaced_sources:
+            replaced_source_id = str(replaced_source.get("source_id") or "").strip()
+            if not replaced_source_id:
+                continue
+            await _patch_import_control_source_state(
+                session,
+                base,
+                replaced_source_id,
+                visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
+                status="superseded",
+            )
+        if replaced_sources:
+            continue
         replacement_source_map = {
-            **row,
+            **source_row,
             "index_url": old_url_text,
             "human_url": old_url_text,
             "canonical_url": _canonical_or_none(old_url_text),
