@@ -8786,6 +8786,62 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     ]
 
 
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_batches_snapshot_lookup_for_metadata_only(
+    monkeypatch,
+):
+    """Metadata-only rows share one snapshot lookup and skip source-state fetches."""
+    calls = []
+    snapshot_calls = []
+
+    async def fake_snapshot(source_ids):
+        snapshot_calls.append(tuple(source_ids))
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(calls)
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_one",
+                "index_url": "https://one.example.test/index.json",
+                "display_name": "Example One",
+                "source_key": "example-one",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+            {
+                "source_id": "source_two",
+                "index_url": "https://two.example.test/index.json",
+                "display_name": "Example Two",
+                "source_key": "example-two",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+        ]
+    )
+
+    assert sources_synced == 2
+    assert plans_synced == 0
+    assert errors == []
+    assert snapshot_calls == [("source_one", "source_two")]
+    assert [
+        call["url"].rsplit("/", 1)[-1]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ] == ["sources", "sources"]
+    assert not [call for call in calls if "/v1/catalog/sources/ic_" in call["url"]]
+
+
 def _catalog_snapshot_fake_session(captured_calls):
     class FakeResponse:
         def __init__(self, payload, status=200):

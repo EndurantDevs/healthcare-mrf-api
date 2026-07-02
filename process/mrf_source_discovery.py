@@ -14171,24 +14171,26 @@ async def _push_import_control_catalog(
     sources_synced = 0
     plans_synced = 0
     errors: list[dict[str, Any]] = []
+    snapshot_source_ids = [
+        str(row.get("source_id") or "")
+        for row in eligible
+        if _source_row_is_importable(row) and str(row.get("source_id") or "")
+    ]
+    snapshots_by_source_id = (
+        await _import_control_snapshot_items(snapshot_source_ids)
+        if snapshot_source_ids
+        else {}
+    )
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
         for group_rows in eligible_rows_by_identity.values():
-            snapshot_source_ids = [
-                str(row.get("source_id") or "")
-                for row in group_rows
-                if _source_row_is_importable(row)
-            ]
-            snapshot = (
-                await _import_control_snapshot_items(snapshot_source_ids)
-                if snapshot_source_ids
-                else {}
+            rows_to_sync = _dedupe_import_control_source_rows(
+                group_rows, snapshots_by_source_id
             )
-            rows_to_sync = _dedupe_import_control_source_rows(group_rows, snapshot)
             for row in rows_to_sync:
                 source_id = str(row.get("source_id") or "")
-                items = snapshot.get(source_id) or []
+                items = snapshots_by_source_id.get(source_id) or []
                 source_status = str(row.get("status") or "active").strip() or "active"
                 evidence_only = not _source_row_is_importable(row)
                 ic_source_id: str | None = None
@@ -14204,6 +14206,13 @@ async def _push_import_control_catalog(
                     )
                     if not ic_source_id:
                         continue
+                    source_status_lower = source_status.lower()
+                    if not items and source_status_lower == "active" and not evidence_only:
+                        # Existing public sources still need metadata-only refreshes
+                        # (aliases, benefit lines, source tier). New staged rows remain
+                        # internal/needs_review until a later crawl proves plan files.
+                        sources_synced += 1
+                        continue
                     stored = await _fetch_import_control_source(session, base, ic_source_id)
                     # Flip staged rows public after ingest. Also let an active registry row with
                     # crawled files clear a stale state left by an older duplicate URL row.
@@ -14213,14 +14222,6 @@ async def _push_import_control_catalog(
                         and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                     )
                     stored_status = str((stored or {}).get("status") or "").lower()
-                    source_status_lower = source_status.lower()
-                    if not items and source_status_lower == "active" and not evidence_only:
-                        # Existing public sources still need metadata-only refreshes
-                        # (aliases, benefit lines, source tier). New staged rows remain
-                        # internal/needs_review until a later crawl proves plan files.
-                        if not staged:
-                            sources_synced += 1
-                        continue
                     source_plans = 0
                     if items and not evidence_only:
                         for batch in _chunked(_split_preview_items(items), 100):
