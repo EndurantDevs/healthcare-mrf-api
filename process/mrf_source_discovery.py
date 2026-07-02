@@ -13274,47 +13274,31 @@ def _import_control_seed_item(
         "license_status": row.get("license_status"),
         "confidence": row.get("confidence"),
         "review_status": review_status or row.get("review_status") or "pending",
-        "metadata": {
-            "hosting_platform": row.get("hosting_platform"),
-            "source_type": row.get("source_type"),
-            "source_tier": _source_row_source_tier(row),
-            "domain": row.get("domain"),
-            "healthcare_source_id": row.get("source_id"),
-            "benefit_lines": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("benefit_lines") or []
-                )
-            ),
-            "aliases": list(
-                dict.fromkeys((row.get("metadata_json") or {}).get("aliases") or [])
-            ),
-            "source_coverage": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("source_coverage") or []
-                )
-            ),
-            "vendor_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("vendor_names") or []
-                )
-            ),
-            "network_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("network_names") or []
-                )
-            ),
-            "plan_names": list(
-                dict.fromkeys(
-                    (row.get("metadata_json") or {}).get("plan_names") or []
-                )
-            ),
-        },
+        "metadata": _import_control_seed_metadata(row),
     }
     if promoted_source_id:
         item["promoted_source_id"] = promoted_source_id
     if item["review_status"] == "promoted":
         item["reviewed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     return item
+
+
+def _import_control_seed_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = row.get("metadata_json") or {}
+    return {
+        "hosting_platform": row.get("hosting_platform"),
+        "source_type": row.get("source_type"),
+        "source_tier": _source_row_source_tier(row),
+        "domain": row.get("domain"),
+        "healthcare_source_id": row.get("source_id"),
+        "target_payer_query": metadata.get("target_payer_query"),
+        "benefit_lines": list(dict.fromkeys(metadata.get("benefit_lines") or [])),
+        "aliases": list(dict.fromkeys(metadata.get("aliases") or [])),
+        "source_coverage": list(dict.fromkeys(metadata.get("source_coverage") or [])),
+        "vendor_names": list(dict.fromkeys(metadata.get("vendor_names") or [])),
+        "network_names": list(dict.fromkeys(metadata.get("network_names") or [])),
+        "plan_names": list(dict.fromkeys(metadata.get("plan_names") or [])),
+    }
 
 
 async def _sync_import_control_seeds(

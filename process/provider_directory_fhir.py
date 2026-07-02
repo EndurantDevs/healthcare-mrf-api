@@ -936,16 +936,16 @@ def _compact_linked_reference_rows(resource_type: str, rows: list[dict[str, Any]
         resource_id = _clean_text(row.get("resource_id"))
         if not resource_id:
             continue
-        compact_row: dict[str, Any] = {"resource_id": resource_id}
+        compact_row_dict: dict[str, Any] = {"resource_id": resource_id}
         for field in reference_fields:
             value = row.get(field)
             if isinstance(value, list):
                 compact_values = [_clean_text(item) for item in value if _clean_text(item)]
                 if compact_values:
-                    compact_row[field] = compact_values
+                    compact_row_dict[field] = compact_values
             elif (cleaned := _clean_text(value)):
-                compact_row[field] = cleaned
-        compact_rows.append(compact_row)
+                compact_row_dict[field] = cleaned
+        compact_rows.append(compact_row_dict)
     return compact_rows
 
 

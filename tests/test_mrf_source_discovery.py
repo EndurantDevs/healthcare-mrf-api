@@ -8300,6 +8300,7 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
             "hosting_platform": "sapphire",
             "source_type": "toc_json",
             "domain": "medical",
+            "metadata_json": {"target_payer_query": "Example Employer"},
         },
         review_status="promoted",
         promoted_source_id="ic_source_1",
@@ -8310,6 +8311,7 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
     assert item["review_status"] == "promoted"
     assert item["promoted_source_id"] == "ic_source_1"
     assert item["metadata"]["healthcare_source_id"] == "source_local"
+    assert item["metadata"]["target_payer_query"] == "Example Employer"
     assert item["reviewed_at"]
 
 

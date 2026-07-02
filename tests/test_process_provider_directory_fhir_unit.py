@@ -5086,24 +5086,55 @@ async def test_import_resources_does_not_retain_streamed_scan_roles_for_linked_f
 @pytest.mark.asyncio
 async def test_import_resources_keeps_compact_streamed_rows_for_linked_fallback(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
-    fetch_kwargs: dict[str, Any] = {}
+    fetch_kwargs_dict: dict[str, Any] = {}
+    linked_rows_by_resource: dict[str, list[dict[str, Any]]] = {}
 
-    async def fake_fetch_resource_rows(source, resource_type, **kwargs):
-        fetch_kwargs.update(kwargs)
-        assert resource_type == "PractitionerRole"
-        row_batch_handler = kwargs["row_batch_handler"]
-        rows = [
+    _patch_compact_streamed_row_fallback(
+        monkeypatch,
+        fetch_kwargs_dict=fetch_kwargs_dict,
+        linked_rows_by_resource=linked_rows_by_resource,
+    )
+
+    counts = await importer._import_resources(
+        [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
+        resources=["PractitionerRole"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        linked_resource_limit=50000,
+        stream_batch_size=1,
+    )
+
+    assert counts == {"PractitionerRole": 1}
+    assert fetch_kwargs_dict["retain_rows"] is False
+    assert linked_rows_by_resource == {
+        "PractitionerRole": [
             {
-                "source_id": source["source_id"],
                 "resource_id": "role-1",
                 "practitioner_ref": "Practitioner/prac-1",
                 "location_refs": ["Location/loc-1"],
                 "network_refs": ["Organization/network-1"],
-                "specialty_codes": [{"code": "207Q00000X"}],
-                "telecom": [{"system": "phone", "value": "3125550100"}],
             }
         ]
-        rows_written = await row_batch_handler(ProviderDirectoryPractitionerRole, rows)
+    }
+
+
+def _patch_compact_streamed_row_fallback(
+    monkeypatch,
+    *,
+    fetch_kwargs_dict: dict[str, Any],
+    linked_rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> None:
+    async def fake_fetch_resource_rows(source, resource_type, **kwargs):
+        fetch_kwargs_dict.update(kwargs)
+        assert resource_type == "PractitionerRole"
+        row_batch_handler = kwargs["row_batch_handler"]
+        rows_written = await row_batch_handler(
+            ProviderDirectoryPractitionerRole,
+            [_practitioner_role_stream_row(source["source_id"])],
+        )
         return importer.ResourceFetchResult(
             model=ProviderDirectoryPractitionerRole,
             rows=[],
@@ -5120,8 +5151,6 @@ async def test_import_resources_keeps_compact_streamed_rows_for_linked_fallback(
     async def fake_upsert_resource_rows(_model, rows, **_kwargs):
         return len(rows)
 
-    linked_rows_by_resource: dict[str, list[dict[str, Any]]] = {}
-
     async def fake_import_linked_resource_rows(_source, rows_by_resource, **_kwargs):
         linked_rows_by_resource.update({key: list(value) for key, value in rows_by_resource.items()})
         return {}
@@ -5130,29 +5159,16 @@ async def test_import_resources_keeps_compact_streamed_rows_for_linked_fallback(
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
     monkeypatch.setattr(importer, "_import_linked_resource_rows", fake_import_linked_resource_rows)
 
-    counts = await importer._import_resources(
-        [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
-        resources=["PractitionerRole"],
-        per_resource_limit=0,
-        page_limit=0,
-        page_count=25,
-        timeout=3,
-        run_id="run_1",
-        linked_resource_limit=50000,
-        stream_batch_size=1,
-    )
 
-    assert counts == {"PractitionerRole": 1}
-    assert fetch_kwargs["retain_rows"] is False
-    assert linked_rows_by_resource == {
-        "PractitionerRole": [
-            {
-                "resource_id": "role-1",
-                "practitioner_ref": "Practitioner/prac-1",
-                "location_refs": ["Location/loc-1"],
-                "network_refs": ["Organization/network-1"],
-            }
-        ]
+def _practitioner_role_stream_row(source_id: str) -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "resource_id": "role-1",
+        "practitioner_ref": "Practitioner/prac-1",
+        "location_refs": ["Location/loc-1"],
+        "network_refs": ["Organization/network-1"],
+        "specialty_codes": [{"code": "207Q00000X"}],
+        "telecom": [{"system": "phone", "value": "3125550100"}],
     }
 
 
