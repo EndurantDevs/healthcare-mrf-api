@@ -3620,10 +3620,10 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    # The location query is scoped by a provider snapshot member CTE before address
-    # radius ordering, with taxonomy predicates applied to member NPIs.
-    assert "scoped_member_npis AS MATERIALIZED" in sql
+    # The location query scopes provider-group members before address radius
+    # ordering, with taxonomy predicates applied to member NPIs.
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
+    assert "pgm_scope.npi = addr.npi" in sql
     assert "mrf.npi_taxonomy" in sql
     assert "nt.npi = pgm_scope.npi" in sql
     assert "207X00000X" in str(params)
@@ -3666,8 +3666,8 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
 
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    assert "scoped_member_npis AS MATERIALIZED" in sql
     assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = pgm_scope.npi" in sql
+    assert "pgm_scope.npi = addr.npi" in sql
     assert "n_entity.entity_type_code" in sql
     assert "207X00000X" in str(params)
 
