@@ -2897,7 +2897,8 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_provider_directory_address_corroboration_sql_links_unified_npi_address_to_fhir_roles():
+def test_provider_directory_address_corroboration_sql_links_unified_npi_address_roles():
+    """Validate the corroboration view joins unified NPI addresses to FHIR roles."""
     sql = importer.provider_directory_address_corroboration_sql("mrf")
 
     assert 'CREATE OR REPLACE VIEW "mrf"."provider_directory_address_corroboration" AS' in sql
@@ -2927,6 +2928,12 @@ def test_provider_directory_address_corroboration_sql_links_unified_npi_address_
     assert "'matched_on'," in sql
     assert "'npi_address_key_role_location'" in sql
     assert "'npi_address_key_role_location_plan'" in sql
+
+
+def test_provider_directory_address_corroboration_sql_projects_network_plan_evidence():
+    """Validate provider-directory evidence fields survive the corroboration view."""
+    sql = importer.provider_directory_address_corroboration_sql("mrf")
+
     assert "provider_directory_plan_context_matched" in sql
     assert "provider_directory_network_context_present" in sql
     assert "provider_directory_network_names" in sql

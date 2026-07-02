@@ -3736,9 +3736,9 @@ def _compact_provider_filter_sql(
         geo_clauses: list[str] = []
         if params.get("geo_lat") is not None:
             geo_clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            geo_clauses.append("loc.lon::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            geo_clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
             geo_clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.lon::float8')} <= CAST(:geo_radius_miles AS double precision)"
+                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
             )
         if params.get("zip5") and geo_clauses:
             clauses.append(f"(LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
@@ -3747,9 +3747,9 @@ def _compact_provider_filter_sql(
         elif geo_clauses:
             clauses.extend(geo_clauses)
         if params.get("city_exact"):
-            clauses.append("UPPER(COALESCE(loc.city, '')) = :city_exact")
+            clauses.append("UPPER(COALESCE(loc.city_name, '')) = :city_exact")
         if params.get("state_exact"):
-            clauses.append("UPPER(COALESCE(loc.state, '')) = :state_exact")
+            clauses.append("UPPER(COALESCE(loc.state_name, '')) = :state_exact")
         if inferred_sql:
             clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
             clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
@@ -3940,14 +3940,44 @@ def _compact_provider_expansion_sql(
                 zip_rank_sql = "CASE WHEN LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 THEN 0 ELSE 1 END"
             location_order_sql = f"""
             ORDER BY {zip_rank_sql},
-                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.lon::float8')} ASC NULLS LAST,
-                     loc.location_hash
+                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} ASC NULLS LAST,
+                     loc.npi,
+                     loc.address_checksum
             """
         return f"""
         {component_join}
         {member_join}
         JOIN LATERAL (
-            SELECT loc.*
+            SELECT
+                loc.npi,
+                ('npi_address:' || loc.npi::varchar || ':' || COALESCE(loc.address_type, '') || ':' || COALESCE(loc.address_checksum, ''))::varchar AS location_hash,
+                loc.state_name AS state,
+                loc.city_name AS city,
+                loc.zip5,
+                'npi_address'::varchar AS location_source,
+                'npi_address'::varchar AS location_confidence_code,
+                jsonb_build_object(
+                    'first_line', loc.first_line,
+                    'second_line', loc.second_line,
+                    'city', loc.city_name,
+                    'state', loc.state_name,
+                    'postal_code', loc.postal_code,
+                    'country_code', loc.country_code,
+                    'zip5', loc.zip5,
+                    'address_key', loc.address_checksum,
+                    'address_checksum', loc.address_checksum,
+                    'lat', loc.lat,
+                    'long', loc.long
+                ) AS address_payload,
+                ARRAY[]::varchar[] AS taxonomy_codes,
+                ARRAY[]::varchar[] AS specialties,
+                ARRAY[]::varchar[] AS classifications,
+                ARRAY[]::varchar[] AS specializations,
+                NULL::varchar AS primary_specialty,
+                NULL::varchar AS primary_specialization,
+                'TiC provider'::varchar AS provider_name,
+                loc.lat,
+                loc.long
             FROM {serving_tables.provider_group_location_table} loc
             WHERE loc.npi = pgm.npi
               AND EXISTS (
@@ -4156,7 +4186,7 @@ async def _search_compact_serving_table(
     if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
         provider_distance_select_sql = ""
         if params.get("geo_lat") is not None:
-            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.lon::float8")
+            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.long::float8")
             if params.get("zip5"):
                 same_zip_sql = "LEFT(COALESCE(loc.zip5, ''), 5) = :zip5"
                 provider_distance_select_sql = (

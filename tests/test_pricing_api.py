@@ -383,10 +383,10 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["location_filter"]["zip_radius_miles"] == 10.0
-    assert payload["location_filter"]["zips_considered"] == 3
+    assert response_payload["location_filter"]["zip_radius_miles"] == 10.0
+    assert response_payload["location_filter"]["zips_considered"] == 3
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
     assert "= ANY(:location_zips)" in provider_sql
@@ -423,9 +423,9 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["ok"] is True
+    assert response_payload["ok"] is True
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
     assert "WITH local_specialty_npis AS MATERIALIZED" in provider_sql
@@ -444,13 +444,13 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     async def fake_pairs(_session, _plan_fields):
         return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
 
-    member_tables = {
+    member_table_by_snapshot = {
         "ptg2:test:ndc": "mrf.ptg2_provider_group_member_ndc",
         "ptg2:test:c2": "mrf.ptg2_provider_group_member_c2",
     }
 
     async def fake_snapshot_serving_tables(_session, snapshot_id):
-        return types.SimpleNamespace(provider_group_member_table=member_tables[snapshot_id])
+        return types.SimpleNamespace(provider_group_member_table=member_table_by_snapshot[snapshot_id])
 
     monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
@@ -465,10 +465,10 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    response_payload = json.loads(response.body)
 
-    assert payload["snapshot_id"] == "ptg2:test:ndc"
-    assert payload["snapshots"] == [
+    assert response_payload["snapshot_id"] == "ptg2:test:ndc"
+    assert response_payload["snapshots"] == [
         {"source_key": "ptg_ndc", "snapshot_id": "ptg2:test:ndc", "enumerated": True},
         {"source_key": "ptg_c2", "snapshot_id": "ptg2:test:c2", "enumerated": True},
     ]

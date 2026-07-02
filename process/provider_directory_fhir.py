@@ -3738,7 +3738,7 @@ async def _publish_provider_directory_artifacts(
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
         metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
         location_contacts_message = (
             "backfilled Provider Directory location contacts; "
@@ -3757,7 +3757,7 @@ async def _publish_provider_directory_artifacts(
     )
     if seen_table:
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
         metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
             run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
         )
@@ -3776,13 +3776,13 @@ async def _publish_provider_directory_artifacts(
         message=location_address_keys_message,
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
         metrics["location_archive"] = await publish_provider_directory_location_archive(
             run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
         )
     else:
         metrics["location_archive"] = _provider_directory_publish_target_skipped()
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
         metrics["address_overlay"] = await publish_provider_directory_address_overlay(
             run_id=effective_publish_scope_run_id, source_ids=source_ids
         )
@@ -3794,8 +3794,8 @@ async def _publish_provider_directory_artifacts(
         f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
     )
     if (
-        not _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
-        and not _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
+        not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
+        and not is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
     ):
         address_artifact_message = "skipped Provider Directory location archive and address overlay publish"
     await _mark_provider_directory_progress(
@@ -3806,7 +3806,7 @@ async def _publish_provider_directory_artifacts(
         message=address_artifact_message,
         metrics=metrics,
     )
-    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
         metrics["network_catalog"] = await publish_provider_directory_network_catalog(
             run_id=effective_publish_scope_run_id,
             source_ids=source_ids,
@@ -3827,7 +3827,7 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     metrics["publish_corroboration"] = publish_corroboration
-    if publish_corroboration and _provider_directory_publish_target_enabled(
+    if publish_corroboration and is_provider_directory_publish_target_enabled(
         publish_artifacts_targets,
         "corroboration",
     ):
@@ -8166,7 +8166,7 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
     else:
         target_values = raw_targets
 
-    selected: set[str] = set()
+    selected_targets: set[str] = set()
     for target_candidate in target_values:
         target_text = _clean_text(target_candidate)
         if not target_text:
@@ -8179,7 +8179,7 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
         )
         expanded = PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES.get(normalized)
         if expanded is not None:
-            selected.update(expanded)
+            selected_targets.update(expanded)
             continue
         if normalized not in PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS:
             raise ValueError(
@@ -8187,11 +8187,12 @@ def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] |
                 f"{target_text!r}; expected one of "
                 f"{', '.join(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS)}"
             )
-        selected.add(normalized)
-    return selected or None
+        selected_targets.add(normalized)
+    return selected_targets or None
 
 
-def _provider_directory_publish_target_enabled(targets: set[str] | None, target: str) -> bool:
+def is_provider_directory_publish_target_enabled(targets: set[str] | None, target: str) -> bool:
+    """Return whether a publish artifact target should be emitted for this task."""
     return targets is None or target in targets
 
 

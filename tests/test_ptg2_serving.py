@@ -2235,8 +2235,22 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert params["address_types"] == ["practice", "primary"]
 
 
+def _expect_member_first_manifest_sql(location_sql: str) -> None:
+    """Assert plan/code-constrained manifest location lookup starts from rated member NPIs."""
+    assert "scoped_member_npis AS MATERIALIZED" in location_sql
+    assert "FROM scoped_member_npis scope_npis" in location_sql
+    assert "WHERE addr_probe.npi = scope_npis.npi" in location_sql
+    assert "WHERE pgm_scope.npi = addr.npi" not in location_sql
+
+
+def _fail_manifest_sidecar_usage(*_args, **_kwargs) -> None:
+    """Raise when a component-table manifest test unexpectedly touches sidecars."""
+    raise AssertionError("sidecar should not be used")
+
+
 @pytest.mark.asyncio
 async def test_manifest_location_uses_component_table(monkeypatch):
+    """Component-backed manifest location lookup should prefilter by rated provider members."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
@@ -2258,11 +2272,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         id_storage="uuid",
     )
 
-    monkeypatch.setattr(
-        ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sidecar should not be used")),
-    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -2285,6 +2295,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         "JOIN rate_provider_groups rpg",
     ):
         assert expected_sql in location_sql
+    _expect_member_first_manifest_sql(location_sql)
     assert location_params["location_plan_id"] == "010854205"
     assert location_params["location_reported_code"] == "90837"
     assert location_params["location_reported_code_system"] == "CPT"
@@ -2393,6 +2404,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     assert rate_set_params["reported_code"] == "90837"
     assert rate_set_params["reported_code_system"] == "CPT"
     assert "rate_provider_groups AS MATERIALIZED" not in location_sql
+    _expect_member_first_manifest_sql(location_sql)
     assert "pgm_scope.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
     assert "pgm.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
     assert location_params["location_rate_provider_group_ids"] == [group_id]
@@ -4239,6 +4251,10 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
     assert "JOIN filtered_locations loc" in sql
     assert "loc.npi" in sql
+    assert "loc.long::float8" not in sql
+    assert "loc.long" in sql
+    assert "loc.city_name" in sql
+    assert "loc.state_name" in sql
     assert "AND EXISTS (" in sql
     assert "OFFSET 0" in sql
     assert "COALESCE(tax.specializations, loc.specializations" not in sql
@@ -4322,6 +4338,8 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
     assert "LIMIT :rate_candidate_limit" in sql
+    assert "loc.long::float8" in sql
+    assert "loc.lon::float8" not in sql
     assert "LIMIT :rate_candidate_limit OFFSET" not in sql
     assert "provider_filtered_rates AS MATERIALIZED" in sql
     assert not sql.rstrip().endswith("LIMIT :limit OFFSET :offset")

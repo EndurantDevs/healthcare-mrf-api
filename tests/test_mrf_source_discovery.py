@@ -7,6 +7,7 @@ import io
 import json
 import types
 import zipfile
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
