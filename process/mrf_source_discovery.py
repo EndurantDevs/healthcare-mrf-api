@@ -14244,6 +14244,7 @@ def _discovery_run_params(
     file_probe_entity_types: tuple[str, ...],
     file_probe_payer_query: str | None,
     sync_import_control: bool,
+    sync_import_control_catalog: bool,
     max_toc_bytes: int,
     concurrency: int,
     crawl_target_limit: int | None,
@@ -14262,6 +14263,7 @@ def _discovery_run_params(
         "file_probe_entity_types": list(file_probe_entity_types),
         "file_probe_payer_query": file_probe_payer_query,
         "sync_import_control": sync_import_control,
+        "sync_import_control_catalog": sync_import_control_catalog,
         "max_toc_bytes": max_toc_bytes,
         "concurrency": concurrency,
         "crawl_target_limit": crawl_target_limit,
@@ -14361,6 +14363,7 @@ async def main(
     file_probe_entity_types: Any = None,
     file_probe_payer_query: str | None = None,
     sync_import_control: bool = False,
+    sync_import_control_catalog: bool = True,
     max_toc_bytes: int = MAX_TOC_BYTES_DEFAULT,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
@@ -14406,6 +14409,7 @@ async def main(
         file_probe_entity_types=parsed_file_probe_entity_types,
         file_probe_payer_query=parsed_file_probe_payer_query,
         sync_import_control=sync_import_control,
+        sync_import_control_catalog=sync_import_control_catalog,
         max_toc_bytes=max_toc_bytes,
         concurrency=concurrency,
         crawl_target_limit=crawl_target_limit,
@@ -14605,29 +14609,42 @@ async def main(
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control", "message": str(exc)})
-        try:
+        if sync_import_control_catalog:
+            try:
+                if control_run_id:
+                    enqueue_live_progress(
+                        run_id=control_run_id,
+                        importer="mrf-source-discovery",
+                        status="running",
+                        phase="syncing import-control catalog",
+                        unit="sources",
+                        done=0,
+                        total=len(source_rows),
+                        message=f"syncing catalog plans for {len(source_rows)} source rows",
+                    )
+                sources_synced, plans_synced, catalog_errors = (
+                    await _push_import_control_catalog(source_rows, limit=bounded_limit)
+                )
+                result.import_control_sources_synced = sources_synced
+                result.import_control_plans_synced = plans_synced
+                for item in catalog_errors:
+                    result.errors.append({"provider": "import-control-catalog", **item})
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                result.errors.append(
+                    {"provider": "import-control-catalog", "message": str(exc)}
+                )
+        else:
             if control_run_id:
                 enqueue_live_progress(
                     run_id=control_run_id,
                     importer="mrf-source-discovery",
                     status="running",
-                    phase="syncing import-control catalog",
+                    phase="skipping import-control catalog sync",
                     unit="sources",
-                    done=0,
+                    done=len(source_rows),
                     total=len(source_rows),
-                    message=f"syncing catalog plans for {len(source_rows)} source rows",
+                    message="skipped catalog plan sync",
                 )
-            sources_synced, plans_synced, catalog_errors = (
-                await _push_import_control_catalog(source_rows, limit=bounded_limit)
-            )
-            result.import_control_sources_synced = sources_synced
-            result.import_control_plans_synced = plans_synced
-            for item in catalog_errors:
-                result.errors.append({"provider": "import-control-catalog", **item})
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            result.errors.append(
-                {"provider": "import-control-catalog", "message": str(exc)}
-            )
 
     crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
     finished_at = _utc_now()
@@ -14729,6 +14746,9 @@ async def process_data(
                 "sync_import_control",
                 _env_flag("HLTHPRT_MRF_DISCOVERY_SYNC_IMPORT_CONTROL_DEFAULT"),
             )
+        ),
+        sync_import_control_catalog=bool(
+            task.get("sync_import_control_catalog", True)
         ),
         max_toc_bytes=int(task.get("max_toc_bytes") or MAX_TOC_BYTES_DEFAULT),
         concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),

@@ -13602,6 +13602,55 @@ async def test_source_payer_query_filters_before_candidate_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sync_import_control_can_skip_catalog_push(monkeypatch):
+    """Source-only import-control sync must not push plan catalog rows."""
+    candidate = discovery.SourceCandidate(
+        payer_name="Example Payer",
+        provider="master-list",
+        index_url="https://example.com/index.json",
+        status="active",
+    )
+    source_record_by_field = {"source_id": "source_1", "index_url": candidate.index_url}
+    load_candidates_mock = AsyncMock(return_value=[candidate])
+    store_candidates_mock = AsyncMock(
+        return_value=([{"payer_name": "Example Payer"}], [source_record_by_field])
+    )
+    seed_sync_mock = AsyncMock(return_value=1)
+    catalog_sync_mock = AsyncMock(
+        side_effect=AssertionError("catalog sync should be skipped")
+    )
+    async_noop_mock = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(discovery, "_load_candidates", load_candidates_mock)
+    monkeypatch.setattr(discovery, "_store_candidates", store_candidates_mock)
+    monkeypatch.setattr(discovery, "_sync_import_control_seeds", seed_sync_mock)
+    monkeypatch.setattr(discovery, "_push_import_control_catalog", catalog_sync_mock)
+    monkeypatch.setattr(discovery, "init_db", async_noop_mock)
+    monkeypatch.setattr(discovery, "ensure_database", async_noop_mock)
+    monkeypatch.setattr(discovery, "_ensure_catalog_tables", async_noop_mock)
+    monkeypatch.setattr(discovery, "push_objects", async_noop_mock)
+    monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(discovery, "_emit_discovery_control_event", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        discovery, "_flush_discovery_control_events", async_noop_mock
+    )
+
+    discovery_summary = await discovery.main(
+        provider="master-list",
+        sync_import_control=True,
+        sync_import_control_catalog=False,
+    )
+
+    assert discovery_summary["candidates"] == 1
+    assert discovery_summary["import_control_synced"] == 1
+    assert discovery_summary["import_control_sources_synced"] == 0
+    assert discovery_summary["import_control_plans_synced"] == 0
+    assert discovery_summary["errors"] == []
+    seed_sync_mock.assert_awaited_once_with([source_record_by_field], limit=None)
+    catalog_sync_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_direct_discovery_run_emits_import_control_visible_state(monkeypatch):
     pushed = []
     events = []
