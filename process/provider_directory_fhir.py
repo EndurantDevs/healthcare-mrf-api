@@ -10241,6 +10241,44 @@ async def _dedupe_address_overlay_stage(stage_ref: str) -> int:
     )
 
 
+def _no_scoped_address_overlay_sources_result(schema: str) -> dict[str, Any]:
+    return {
+        "skipped": True,
+        "reason": "no_scoped_sources",
+        "source_ids": [],
+        "relation": _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE),
+    }
+
+
+def _address_overlay_publish_result(
+    stage_metric_dict: dict[str, int],
+    *,
+    source_ids: list[str],
+    target_ref: str,
+) -> dict[str, Any]:
+    return {
+        "published": True,
+        "rows": stage_metric_dict["stage_rows"],
+        "inserted": stage_metric_dict["inserted"],
+        "inserted_by_component": stage_metric_dict["inserted_by_component"],
+        "duplicates_removed": stage_metric_dict["duplicates_removed"],
+        "copied_existing": stage_metric_dict["copied_existing"],
+        "source_ids": source_ids,
+        "relation": target_ref,
+    }
+
+
+async def _drop_address_overlay_stage_best_effort(stage_ref: str) -> None:
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    except Exception:  # pragma: no cover - cleanup best effort
+        LOGGER.warning(
+            "Failed to clean Provider Directory address overlay stage %s",
+            stage_ref,
+            exc_info=True,
+        )
+
+
 async def publish_provider_directory_address_overlay(
     db_schema: str | None = None,
     *,
@@ -10259,12 +10297,7 @@ async def publish_provider_directory_address_overlay(
         source_ids=source_ids,
     )
     if run_id is not None and not effective_source_ids:
-        return {
-            "skipped": True,
-            "reason": "no_scoped_sources",
-            "source_ids": [],
-            "relation": _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE),
-        }
+        return _no_scoped_address_overlay_sources_result(schema)
     stage_table = _address_overlay_stage_table_name(run_id)
     stage_ref = _qt(schema, stage_table)
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
@@ -10286,19 +10319,11 @@ async def publish_provider_directory_address_overlay(
             query_param_dict,
         )
         await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref)
-        return {
-            "published": True,
-            "rows": stage_metric_dict["stage_rows"],
-            "inserted": stage_metric_dict["inserted"],
-            "inserted_by_component": stage_metric_dict["inserted_by_component"],
-            "duplicates_removed": stage_metric_dict["duplicates_removed"],
-            "copied_existing": stage_metric_dict["copied_existing"],
-            "source_ids": effective_source_ids,
-            "relation": target_ref,
-        }
+        return _address_overlay_publish_result(
+            stage_metric_dict,
+            source_ids=effective_source_ids,
+            target_ref=target_ref,
+        )
     except Exception:
-        try:
-            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        except Exception:  # pragma: no cover - cleanup best effort
-            LOGGER.warning("Failed to clean Provider Directory address overlay stage %s", stage_ref, exc_info=True)
+        await _drop_address_overlay_stage_best_effort(stage_ref)
         raise
