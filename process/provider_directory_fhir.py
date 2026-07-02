@@ -10203,6 +10203,7 @@ async def _populate_address_overlay_stage(
             )
         )
     inserted = sum(inserted_by_component.values())
+    duplicates_removed = await _dedupe_address_overlay_stage(stage_ref)
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
     await _create_provider_directory_address_overlay_indexes(schema, stage_table)
     await db.status(f"ANALYZE {stage_ref};")
@@ -10210,8 +10211,34 @@ async def _populate_address_overlay_stage(
         "copied_existing": copied_existing,
         "inserted": inserted,
         "inserted_by_component": inserted_by_component,
+        "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
+
+
+async def _dedupe_address_overlay_stage(stage_ref: str) -> int:
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            DELETE FROM {stage_ref} AS stage_row
+             USING (
+                    SELECT
+                        ctid,
+                        row_number() OVER (
+                            PARTITION BY source_record_id
+                            ORDER BY
+                                source_updated_at DESC NULLS LAST,
+                                published_at DESC,
+                                npi,
+                                address_key
+                        ) AS duplicate_rank
+                      FROM {stage_ref}
+                  ) AS ranked
+             WHERE stage_row.ctid = ranked.ctid
+               AND ranked.duplicate_rank > 1;
+            """
+        )
+    )
 
 
 async def publish_provider_directory_address_overlay(
@@ -10264,6 +10291,7 @@ async def publish_provider_directory_address_overlay(
             "rows": stage_metric_dict["stage_rows"],
             "inserted": stage_metric_dict["inserted"],
             "inserted_by_component": stage_metric_dict["inserted_by_component"],
+            "duplicates_removed": stage_metric_dict["duplicates_removed"],
             "copied_existing": stage_metric_dict["copied_existing"],
             "source_ids": effective_source_ids,
             "relation": target_ref,

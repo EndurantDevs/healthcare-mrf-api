@@ -6760,6 +6760,8 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
             return "INSERT 0 7"
         if "provider_directory_fhir:organization_affiliation:" in sql_text:
             return "INSERT 0 8"
+        if "duplicate_rank > 1" in sql_text:
+            return "DELETE 2"
         return "OK"
 
     class FakeTransaction:
@@ -6791,6 +6793,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
         "practitioner_role": 7,
         "organization_affiliation": 8,
     }
+    assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
     assert metrics["source_ids"] == ["source_a"]
     assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
@@ -6800,6 +6803,8 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_idx}"' in joined_sql
     assert 'FROM "mrf"."provider_directory_address_overlay"' in joined_sql
     assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
+    assert "PARTITION BY source_record_id" in joined_sql
+    assert "duplicate_rank > 1" in joined_sql
     assert f'ALTER TABLE "mrf"."{stage_table}" RENAME TO "provider_directory_address_overlay"' in joined_sql
     assert 'ALTER TABLE "mrf"."provider_directory_address_overlay" RENAME TO "provider_directory_address_overlay_old"' in joined_sql
     assert (
