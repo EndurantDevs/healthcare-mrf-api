@@ -1385,6 +1385,81 @@ async def test_private_query_context_expands_supported_public_sources(
     assert not any(candidate.payer_name == "Example Direct" for candidate in expanded)
 
 
+def _write_private_context_config(
+    tmp_path,
+    *,
+    master_text: str,
+    private_context_text: str,
+) -> tuple[Path, Path]:
+    master_list_path = tmp_path / "master.md"
+    master_list_path.write_text(master_text, encoding="utf-8")
+    private_path = tmp_path / "private-context.csv"
+    private_path.write_text(private_context_text, encoding="utf-8")
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "master-list": {
+                        "parser": "master-list",
+                        "path": str(master_list_path),
+                    }
+                },
+                "platform_resolvers": {
+                    "aetna_health1": {"type": "healthsparq_public_mrf"},
+                },
+                "source_query_expansion_platforms": ["aetna_health1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path, private_path
+
+
+@pytest.mark.asyncio
+async def test_private_query_context_survives_public_candidate_limit(
+    tmp_path, monkeypatch
+):
+    """Private company rows are controlled by their own limit, not source limit."""
+    config_path, private_path = _write_private_context_config(
+        tmp_path,
+        master_text="\n".join(
+            [
+                "## National carriers",
+                "| Payer | Type | URL | Notes |",
+                "| --- | --- | --- | --- |",
+                (
+                    "| Example Public Filler | national | https://filler.example.test/index.json | "
+                    "aliases: Filler Carrier; benefit_lines: medical |"
+                ),
+                (
+                    "| Example Aetna | national | "
+                    "https://health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE&brandCode=ALICSI/"
+                    "machine-readable-transparency-in-coverage | aliases: Aetna; benefit_lines: medical |"
+                ),
+            ]
+        ),
+        private_context_text=(
+            "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
+            "Example Packaging,Aetna,,\n"
+        ),
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setenv(discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=1
+    )
+
+    assert [candidate.payer_name for candidate in candidates] == [
+        "Example Public Filler",
+        "Example Aetna",
+    ]
+    assert candidates[1].raw_payload["target_payer_query"] == "Example Packaging"
+    assert candidates[1].raw_payload["private_query_context"] is True
+
+
 def _example_query_source_candidate(
     payer_name: str, insurer_code: str
 ) -> discovery.SourceCandidate:

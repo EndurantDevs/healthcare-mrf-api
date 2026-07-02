@@ -2375,10 +2375,9 @@ async def _load_candidates(
     if parser == "master-list":
         path = _resolve_config_path(str(config.get("path") or ""))
         candidates = parse_master_list(path.read_text(encoding="utf-8"))
-        candidates = _dedupe_candidates(
-            candidates + _private_query_expanded_candidates(candidates)
-        )
-        return candidates[:limit] if limit else candidates
+        private_expanded = _private_query_expanded_candidates(candidates)
+        public_candidates = candidates[:limit] if limit else candidates
+        return _dedupe_candidates(public_candidates + private_expanded)
     if test_mode:
         return []
     raise ValueError(f"unsupported provider: {provider}")
