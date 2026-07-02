@@ -18,6 +18,33 @@ MODULE_SPEC.loader.exec_module(pricing_module)
 resolve_procedure_taxonomy = pricing_module.resolve_procedure_taxonomy
 
 
+async def fake_resolve_psychotherapy_internal_codes(
+    _session,
+    _requested_code,
+    _request_args,
+    default_system=None,
+):
+    return [190837], {
+        "input_code": {"code_system": default_system, "code": "90837"},
+        "resolved_codes": [
+            {
+                "code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "code": "190837",
+            }
+        ],
+        "internal_codes": [190837],
+        "matched_via": [],
+        "expanded": False,
+    }
+
+
+async def fake_empty_taxonomy_evidence(_session, *, year, internal_codes, limit):
+    assert year == 2023
+    assert internal_codes == [190837]
+    assert limit == 10
+    return []
+
+
 def make_request(args=None):
     return types.SimpleNamespace(
         args=args or {},
@@ -29,40 +56,17 @@ def make_request(args=None):
 async def test_resolve_procedure_taxonomy_psychotherapy_prefers_behavioral_health(
     monkeypatch,
 ):
-    async def fake_resolve_internal_codes(
-        _session,
-        _requested_code,
-        _request_args,
-        default_system=None,
-    ):
-        return [190837], {
-            "input_code": {"code_system": default_system, "code": "90837"},
-            "resolved_codes": [
-                {
-                    "code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM,
-                    "code": "190837",
-                }
-            ],
-            "internal_codes": [190837],
-            "matched_via": [],
-            "expanded": False,
-        }
-
-    async def fake_load_evidence(_session, *, year, internal_codes, limit):
-        assert year == 2023
-        assert internal_codes == [190837]
-        assert limit == 10
-        return []
+    """Psychotherapy CPT requests infer behavioral-health taxonomy scope."""
 
     monkeypatch.setattr(
         pricing_module,
         "_resolve_internal_codes_for_request",
-        fake_resolve_internal_codes,
+        fake_resolve_psychotherapy_internal_codes,
     )
     monkeypatch.setattr(
         pricing_module,
         "_load_procedure_taxonomy_evidence",
-        fake_load_evidence,
+        fake_empty_taxonomy_evidence,
     )
     pricing_request = make_request(
         args={"code": "90837", "code_system": "CPT", "year": "2023"}
