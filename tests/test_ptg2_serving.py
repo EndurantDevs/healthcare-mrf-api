@@ -2195,10 +2195,11 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert address["fax_number"] == "8185551213"
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
-    assert "scoped_member_npis AS MATERIALIZED" in sql
+    assert "scoped_member_npis AS MATERIALIZED" not in sql
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
-    assert "JOIN mrf.entity_address_unified addr" in sql
-    assert "ON addr.npi = scope_npis.npi" in sql
+    assert "FROM mrf.entity_address_unified addr" in sql
+    assert "WHERE pgm_scope.npi = addr.npi" in sql
+    assert "AND EXISTS (" in sql
     assert "raw_location_npis AS" in sql
     assert "location_npis AS MATERIALIZED" in sql
     assert "ORDER BY zip_rank, distance_miles ASC NULLS LAST, npi" in sql
@@ -2335,6 +2336,66 @@ async def test_manifest_location_rate_prefilter_allows_missing_code_system(monke
     assert location_params["location_plan_id"] == "010854205"
     assert location_params["location_reported_code"] == "90837"
     assert "location_reported_code_system" not in location_params
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_uses_sidecar_rate_groups_without_component_table(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(rows=[{"provider_set_global_id_128": provider_set_id}]),
+            False,
+            FakeResult(rows=[location_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={
+            "provider_forward": {"name": "provider_forward", "path": "/tmp/provider_forward.ptg2sc"},
+            "provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"},
+        },
+        id_storage="uuid",
+    )
+
+    def fake_members_many(_serving_tables, name, owner_ids, **_kwargs):
+        if name == "provider_forward":
+            assert owner_ids == (provider_set_id,)
+            return {provider_set_id: (group_id,)}
+        if name == "provider_inverted":
+            assert owner_ids == (group_id,)
+            return {group_id: (provider_set_id,)}
+        raise AssertionError(name)
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_members_many)
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    rate_set_sql = str(session.calls[1][0][0])
+    rate_set_params = session.calls[1][0][1]
+    location_sql = str(session.calls[3][0][0])
+    location_params = session.calls[3][0][1]
+    assert "SELECT DISTINCT provider_set_global_id_128" in rate_set_sql
+    assert "FROM mrf.ptg2_serving_manifest_snap" in rate_set_sql
+    assert rate_set_params["plan_id"] == "010854205"
+    assert rate_set_params["reported_code"] == "90837"
+    assert rate_set_params["reported_code_system"] == "CPT"
+    assert "rate_provider_groups AS MATERIALIZED" not in location_sql
+    assert "pgm_scope.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
+    assert "pgm.provider_group_global_id_128 = ANY(CAST(:location_rate_provider_group_ids AS uuid[]))" in location_sql
+    assert location_params["location_rate_provider_group_ids"] == [group_id]
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
 

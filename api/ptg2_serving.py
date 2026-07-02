@@ -1591,6 +1591,55 @@ async def _is_manifest_component_table_populated(session, table_name: str | None
         return False
 
 
+async def _manifest_rate_provider_groups_from_sidecar(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    serving_table: str | None,
+    plan_id: str,
+    reported_code: str,
+    code_system: str,
+) -> tuple[str, ...]:
+    table_name = _safe_table_name(serving_table)
+    if (
+        not table_name
+        or not plan_id
+        or not reported_code
+        or not _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
+    ):
+        return ()
+    rate_scope_filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
+    query_params_by_name: dict[str, Any] = {"plan_id": plan_id, "reported_code": reported_code}
+    if code_system:
+        rate_scope_filters.append("reported_code_system = :reported_code_system")
+        query_params_by_name["reported_code_system"] = code_system
+    try:
+        provider_set_result = await session.execute(
+            text(
+                f"""
+                SELECT DISTINCT provider_set_global_id_128
+                FROM {table_name}
+                WHERE {" AND ".join(rate_scope_filters)}
+                ORDER BY provider_set_global_id_128
+                """
+            ),
+            query_params_by_name,
+        )
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return ()
+    provider_set_ids_list: list[str] = []
+    for provider_set_row in provider_set_result:
+        provider_set_id = _ptg2_manifest_id(_row_mapping(provider_set_row).get("provider_set_global_id_128"))
+        if provider_set_id:
+            provider_set_ids_list.append(provider_set_id)
+    provider_set_ids = tuple(provider_set_ids_list)
+    if not provider_set_ids:
+        return ()
+    groups_by_set = _ptg2_manifest_sidecar_members_many(serving_tables, "provider_forward", provider_set_ids)
+    return tuple(sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids}))
+
+
 def _ptg2_manifest_provider_npis_for_provider_set(
     serving_tables: PTG2ServingTables,
     provider_set_global_id: str,
@@ -2461,6 +2510,8 @@ async def _ptg2_manifest_location_provider_matches(
         member_filters.append(_ptg2_individual_npi_exists_sql("pgm_scope.npi"))
 
     member_scope_join = ""
+    final_member_scope_join = ""
+    final_member_filters: list[str] = []
     member_scope_cte = ""
     component_table = _safe_table_name(serving_tables.provider_set_component_table)
     serving_table = _safe_table_name(serving_tables.serving_table)
@@ -2496,8 +2547,28 @@ async def _ptg2_manifest_location_provider_matches(
                 WHERE {" AND ".join(rate_scope_filters)}
             ),"""
         member_scope_join = """
-                JOIN rate_provider_groups rpg
-                  ON rpg.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
+                JOIN rate_provider_groups rpg_scope
+                  ON rpg_scope.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
+        final_member_scope_join = """
+            JOIN rate_provider_groups rpg
+              ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
+    elif serving_table and requested_plan_id and requested_code:
+        rate_provider_group_ids = await _manifest_rate_provider_groups_from_sidecar(
+            session,
+            serving_tables,
+            serving_table=serving_table,
+            plan_id=requested_plan_id,
+            reported_code=requested_code,
+            code_system=requested_system,
+        )
+        if rate_provider_group_ids:
+            params["location_rate_provider_group_ids"] = list(rate_provider_group_ids)
+            rate_group_filter = (
+                "provider_group_global_id_128 = ANY("
+                f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
+            )
+            member_filters.append(f"pgm_scope.{rate_group_filter}")
+            final_member_filters.append(f"pgm.{rate_group_filter}")
 
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
@@ -2583,17 +2654,12 @@ async def _ptg2_manifest_location_provider_matches(
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
         address_filters = [*filters]
         address_params = {**params, "address_types": list(address_types)}
+        final_member_where_sql = f"WHERE {' AND '.join(final_member_filters)}" if final_member_filters else ""
         result = await session.execute(
             text(
                 f"""
             WITH
             {member_scope_cte}
-            scoped_member_npis AS MATERIALIZED (
-                SELECT DISTINCT pgm_scope.npi
-                FROM {provider_group_member_table} pgm_scope
-                {member_scope_join}
-                WHERE {" AND ".join(member_filters)}
-            ),
             raw_location_npis AS (
                 SELECT DISTINCT ON (addr.npi)
                     addr.npi,
@@ -2617,11 +2683,16 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.fax_number_digits,
                     addr.fax_extension,
                     {location_select_sql}
-                FROM scoped_member_npis scope_npis
-                JOIN {npi_address_table} addr
-                  ON addr.npi = scope_npis.npi
+                FROM {npi_address_table} addr
                 WHERE {" AND ".join(address_filters)}
                   AND addr.type = ANY(CAST(:address_types AS varchar[]))
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {provider_group_member_table} pgm_scope
+                      {member_scope_join}
+                      WHERE pgm_scope.npi = addr.npi
+                        AND {" AND ".join(member_filters)}
+                  )
                 ORDER BY {location_order_sql},
                     CASE addr.type
                         WHEN 'practice' THEN 0
@@ -2709,8 +2780,10 @@ async def _ptg2_manifest_location_provider_matches(
                 {provider_name_sql} AS provider_name
             FROM located_with_tax addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
+            {final_member_scope_join}
             {provider_join}
             {address_fallback_join}
+            {final_member_where_sql}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
                 CASE addr.type
