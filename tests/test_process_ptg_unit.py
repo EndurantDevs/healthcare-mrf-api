@@ -679,7 +679,12 @@ def test_manifest_provider_group_location_indexes_include_zip_covering_index(mon
     async def fake_status(statement, **_params):
         status_calls.append(statement)
 
+    async def fake_all(statement, **_params):
+        assert "nucc_taxonomy" in statement
+        return [{"int_code": 101}, {"int_code": 202}]
+
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
 
     asyncio.run(
         ptg_manifest_publish._index_provider_group_locations(
@@ -692,6 +697,8 @@ def test_manifest_provider_group_location_indexes_include_zip_covering_index(mon
     assert "zip_type_cover_idx" in joined
     assert "(zip5, address_type, provider_group_global_id_128, npi, address_checksum)" in joined
     assert "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL" in joined
+    assert "zip_taxonomy_rule_" in joined
+    assert "WHERE npi IS NOT NULL AND taxonomy_array && ARRAY[101,202]::integer[]" in joined
 
 
 def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):

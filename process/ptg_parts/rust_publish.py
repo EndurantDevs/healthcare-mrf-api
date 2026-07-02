@@ -9,6 +9,7 @@ import os
 import time
 from typing import Any
 
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import db
 from process.ptg_parts.compact_indexes import (
     _index_snapshot_compact_table_entries,
@@ -30,6 +31,19 @@ from process.ptg_parts.snapshot_tables import (
 )
 
 logger = logging.getLogger(__name__)
+_MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
+
+
+def _row_value(row: Any, key: str, position: int = 0) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    value = getattr(row, key, None)
+    if value is not None:
+        return value
+    try:
+        return row[position]
+    except Exception:
+        return None
 
 
 def _ptg2_publish_timestamp() -> str:
@@ -55,6 +69,51 @@ async def _create_optional_provider_geo_index(
             provider_group_location_table,
             exc,
         )
+
+
+async def _create_inferred_taxonomy_zip_indexes(
+    *,
+    schema_name: str,
+    provider_group_location_table: str,
+) -> None:
+    for idx, rule in enumerate(INFERRED_PROVIDER_TAXONOMY_RULES):
+        if not rule.taxonomy_codes or len(rule.taxonomy_codes) > _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES:
+            continue
+        try:
+            rows = await db.all(
+                f"""
+                SELECT int_code
+                  FROM {_quote_ident(schema_name)}.nucc_taxonomy
+                 WHERE code = ANY(:taxonomy_codes)
+                   AND int_code IS NOT NULL
+                 ORDER BY int_code
+                """,
+                taxonomy_codes=list(rule.taxonomy_codes),
+            )
+            int_codes = sorted(
+                {
+                    int(value)
+                    for row in rows
+                    if (value := _row_value(row, "int_code")) is not None
+                }
+            )
+            if not int_codes:
+                continue
+            taxonomy_sql = "ARRAY[" + ",".join(str(code) for code in int_codes) + "]::integer[]"
+            await db.status(
+                f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, f'zip_taxonomy_rule_{idx}_idx'))} "
+                f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} "
+                f"(zip5, address_type, provider_group_hash, npi, address_checksum) "
+                f"WHERE npi IS NOT NULL AND taxonomy_array && {taxonomy_sql};"
+            )
+        except Exception as exc:  # pragma: no cover - exact driver exception varies by environment.
+            logger.warning(
+                "Skipping optional PTG2 inferred-taxonomy zip index for %s.%s rule=%s: %s",
+                schema_name,
+                provider_group_location_table,
+                idx,
+                exc,
+            )
 
 
 async def _publish_renamed_rust_dictionary_table(
@@ -318,6 +377,10 @@ async def _publish_rust_compact_snapshot_tables(
                 f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} {columns_sql};"
             )
         await _create_optional_provider_geo_index(
+            schema_name=schema_name,
+            provider_group_location_table=provider_group_location_table,
+        )
+        await _create_inferred_taxonomy_zip_indexes(
             schema_name=schema_name,
             provider_group_location_table=provider_group_location_table,
         )

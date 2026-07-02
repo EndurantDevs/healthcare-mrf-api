@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import db
 from process.ptg_parts.config import (
     PTG2_BINARY_IDS_ENV, PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV,
@@ -23,6 +24,19 @@ from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
 
 PTG2_MANIFEST_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"
 logger = logging.getLogger(__name__)
+_MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
+
+
+def _row_value(row: Any, key: str, position: int = 0) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    value = getattr(row, key, None)
+    if value is not None:
+        return value
+    try:
+        return row[position]
+    except Exception:
+        return None
 PTG2_MANIFEST_SERVING_COLUMNS = [
     "serving_content_hash_128",
     "plan_id",
@@ -399,6 +413,52 @@ async def _create_optional_manifest_provider_geo_index(
         )
 
 
+async def _create_inferred_taxonomy_zip_indexes(
+    *,
+    schema_name: str,
+    provider_group_location_table: str,
+    group_column: str,
+) -> None:
+    for idx, rule in enumerate(INFERRED_PROVIDER_TAXONOMY_RULES):
+        if not rule.taxonomy_codes or len(rule.taxonomy_codes) > _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES:
+            continue
+        try:
+            rows = await db.all(
+                f"""
+                SELECT int_code
+                  FROM {_quote_ident(schema_name)}.nucc_taxonomy
+                 WHERE code = ANY(:taxonomy_codes)
+                   AND int_code IS NOT NULL
+                 ORDER BY int_code
+                """,
+                taxonomy_codes=list(rule.taxonomy_codes),
+            )
+            int_codes = sorted(
+                {
+                    int(value)
+                    for row in rows
+                    if (value := _row_value(row, "int_code")) is not None
+                }
+            )
+            if not int_codes:
+                continue
+            taxonomy_sql = "ARRAY[" + ",".join(str(code) for code in int_codes) + "]::integer[]"
+            await db.status(
+                f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, f'zip_taxonomy_rule_{idx}_idx'))} "
+                f"ON {_qualified_table(schema_name, provider_group_location_table)} "
+                f"(zip5, address_type, {group_column}, npi, address_checksum) "
+                f"WHERE npi IS NOT NULL AND taxonomy_array && {taxonomy_sql};"
+            )
+        except Exception as exc:  # pragma: no cover - exact driver exception varies by environment.
+            logger.warning(
+                "Skipping optional PTG2 inferred-taxonomy zip index for %s.%s rule=%s: %s",
+                schema_name,
+                provider_group_location_table,
+                idx,
+                exc,
+            )
+
+
 def _qualified_table(schema_name: str, table_name: str) -> str:
     return f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
 
@@ -464,6 +524,11 @@ async def _index_provider_group_locations(
     await _create_optional_manifest_provider_geo_index(
         schema_name=schema_name,
         provider_group_location_table=provider_group_location_table,
+    )
+    await _create_inferred_taxonomy_zip_indexes(
+        schema_name=schema_name,
+        provider_group_location_table=provider_group_location_table,
+        group_column="provider_group_global_id_128",
     )
     await db.status(f"ANALYZE {_qualified_table(schema_name, provider_group_location_table)};")
 

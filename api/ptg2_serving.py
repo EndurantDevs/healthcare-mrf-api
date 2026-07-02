@@ -135,6 +135,7 @@ ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR = "_ptg2_manifest_location_jit_disabled"
+_PTG2_TAXONOMY_INT_CODE_CACHE: dict[tuple[str, ...], tuple[int, ...]] = {}
 
 
 @dataclass(frozen=True)
@@ -157,7 +158,8 @@ class _ManifestProviderLocationQuery:
     geo_radius_miles: float | None
     location_specialty_filter: Any
     location_inferred_taxonomy_sql: str
-    location_array_taxonomy_codes: tuple[int, ...]
+    location_array_taxonomy_codes: tuple[Any, ...]
+    location_array_taxonomy_int_codes: tuple[int, ...]
     rate_provider_group_ids: tuple[str, ...]
     has_component_rate_scope: bool
     member_scope_cte: str
@@ -182,6 +184,7 @@ async def _set_local_jit_off_for_manifest_location(session) -> None:
 _PROVIDER_GROUP_LOCATION_SQL = """
             WITH
             {location_rate_scope_cte}
+            {location_zip_scope_cte}
             raw_location_rows AS (
                 SELECT DISTINCT ON (loc.provider_group_global_id_128, loc.npi)
                     loc.provider_group_global_id_128,
@@ -225,7 +228,7 @@ _PROVIDER_GROUP_LOCATION_SQL = """
                     loc.address_type,
                     loc.address_checksum,
                     {provider_name_sql} AS provider_name
-                FROM {provider_group_location_table} loc
+                {provider_group_location_from_sql}
                 {provider_location_join}
                 {location_rate_scope_join}
                 WHERE {location_where_sql}
@@ -360,21 +363,149 @@ async def _manifest_provider_group_rate_scope_available(
     return bool(result.scalar())
 
 
-def _manifest_location_geo_filters(query_context: _ManifestProviderLocationQuery) -> list[str]:
+async def _taxonomy_int_codes_for_codes(
+    session,
+    taxonomy_codes: Iterable[Any],
+) -> tuple[int, ...]:
+    normalized_codes = tuple(
+        dict.fromkeys(
+            str(code or "").strip().upper()
+            for code in taxonomy_codes
+            if str(code or "").strip()
+        )
+    )
+    if not normalized_codes:
+        return ()
+    cached = _PTG2_TAXONOMY_INT_CODE_CACHE.get(normalized_codes)
+    if cached is not None:
+        return cached
+    try:
+        result = await session.execute(
+            text(
+                f"""
+                SELECT int_code
+                  FROM {PTG2_SCHEMA}.nucc_taxonomy
+                 WHERE code = ANY(CAST(:taxonomy_codes AS varchar[]))
+                   AND int_code IS NOT NULL
+                 ORDER BY int_code
+                """
+            ),
+            {"taxonomy_codes": list(normalized_codes)},
+        )
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return ()
+    int_codes = tuple(
+        sorted(
+            {
+                int(value)
+                for row in result
+                if (value := _row_mapping(row).get("int_code")) is not None
+            }
+        )
+    )
+    if int_codes:
+        _PTG2_TAXONOMY_INT_CODE_CACHE[normalized_codes] = int_codes
+    return int_codes
+
+
+def _literal_int_array_sql(values: Iterable[Any]) -> str:
+    int_values = sorted({int(value) for value in values})
+    if not int_values:
+        return "ARRAY[]::integer[]"
+    return "ARRAY[" + ",".join(str(value) for value in int_values) + "]::integer[]"
+
+
+def _manifest_location_geo_filters_for_alias(
+    query_context: _ManifestProviderLocationQuery,
+    alias: str,
+) -> list[str]:
     geo_filter_clauses: list[str] = []
     if (
         query_context.geo_lat is not None
         and query_context.geo_long is not None
         and query_context.geo_radius_miles is not None
     ):
-        geo_filter_clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-        geo_filter_clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+        geo_filter_clauses.append(f"{alias}.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+        geo_filter_clauses.append(f"{alias}.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
         geo_filter_clauses.append(
-            f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} "
+            f"{_ptg2_geo_distance_miles_sql(f'{alias}.lat::float8', f'{alias}.long::float8')} "
             "<= CAST(:geo_radius_miles AS double precision)"
         )
-        geo_filter_clauses.append("COALESCE(loc.address_precision, '') <> 'city_zip'")
+        geo_filter_clauses.append(f"COALESCE({alias}.address_precision, '') <> 'city_zip'")
     return geo_filter_clauses
+
+
+def _manifest_location_geo_filters(query_context: _ManifestProviderLocationQuery) -> list[str]:
+    return _manifest_location_geo_filters_for_alias(query_context, "loc")
+
+
+def _manifest_location_zip_or_geo_sql(
+    query_context: _ManifestProviderLocationQuery,
+    *,
+    alias: str = "loc",
+) -> str | None:
+    geo_filter_clauses = _manifest_location_geo_filters_for_alias(query_context, alias)
+    zip_expr = f"LEFT(COALESCE({alias}.zip5, {alias}.postal_code, ''), 5) = :zip5"
+    if query_context.zip_value and geo_filter_clauses:
+        return f"({zip_expr} OR ({' AND '.join(geo_filter_clauses)}))"
+    if query_context.zip_value:
+        return zip_expr
+    if geo_filter_clauses:
+        return " AND ".join(geo_filter_clauses)
+    return None
+
+
+def _manifest_location_zip_radius_fast_path_enabled(query_context: _ManifestProviderLocationQuery) -> bool:
+    return bool(
+        query_context.zip_value
+        and query_context.geo_lat is not None
+        and query_context.geo_long is not None
+        and query_context.geo_radius_miles is not None
+        and query_context.location_array_taxonomy_int_codes
+        and not query_context.location_specialty_filter.active
+    )
+
+
+def _manifest_location_zip_scope_sql(query_context: _ManifestProviderLocationQuery) -> str:
+    if not _manifest_location_zip_radius_fast_path_enabled(query_context):
+        return ""
+    return f"""
+            location_zip_scope AS MATERIALIZED (
+                SELECT g.zip_code::text AS zip5
+                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
+                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
+                    ON g.latitude IS NOT NULL
+                   AND g.longitude IS NOT NULL
+                 WHERE anchor.zip_code = :zip5
+                   AND 69.0 * sqrt(
+                        power(g.latitude - anchor.latitude, 2)
+                        + power(
+                            (g.longitude - anchor.longitude)
+                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
+                            2
+                        )
+                   ) <= CAST(:geo_radius_miles AS double precision)
+            ),"""
+
+
+def _manifest_location_from_sql(query_context: _ManifestProviderLocationQuery) -> str:
+    if not _manifest_location_zip_radius_fast_path_enabled(query_context):
+        return f"FROM {query_context.provider_group_location_table} loc"
+    taxonomy_filter_sql = _literal_int_array_sql(query_context.location_array_taxonomy_int_codes)
+    zip_or_geo_sql = _manifest_location_zip_or_geo_sql(query_context, alias="loc") or "TRUE"
+    return f"""
+                FROM location_zip_scope zip_scope
+                JOIN LATERAL (
+                    SELECT loc.*
+                      FROM {query_context.provider_group_location_table} loc
+                     WHERE loc.zip5 = zip_scope.zip5
+                       AND loc.npi IS NOT NULL
+                       AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
+                       AND loc.taxonomy_array && {taxonomy_filter_sql}
+                       AND {zip_or_geo_sql}
+                     OFFSET 0
+                ) loc ON TRUE"""
 
 
 def _ptg2_manifest_provider_location_filters(
@@ -454,9 +585,10 @@ def _manifest_group_location_sql(
     )
     return _PROVIDER_GROUP_LOCATION_SQL.format(
         location_rate_scope_cte=rate_scope.cte_sql,
+        location_zip_scope_cte=_manifest_location_zip_scope_sql(query_context),
         group_location_select_sql=query_context.location_select_sql.replace("addr.", "loc."),
         provider_name_sql=query_context.provider_name_sql,
-        provider_group_location_table=query_context.provider_group_location_table,
+        provider_group_location_from_sql=_manifest_location_from_sql(query_context),
         provider_location_join=provider_location_join,
         location_rate_scope_join=rate_scope.join_sql,
         location_where_sql=" AND ".join(location_filter_clauses),
@@ -2920,6 +3052,19 @@ async def _ptg2_manifest_location_provider_matches(
     inferred_taxonomy_rule = _inferred_provider_taxonomy_rule(args)
     if inferred_taxonomy_rule is not None:
         location_array_taxonomy_codes.extend(inferred_taxonomy_rule.taxonomy_codes)
+    location_array_taxonomy_int_codes: tuple[int, ...] = ()
+    if (
+        zip_value
+        and geo_lat is not None
+        and geo_long is not None
+        and geo_radius_miles is not None
+        and inferred_taxonomy_rule is not None
+        and not location_specialty_filter.active
+    ):
+        location_array_taxonomy_int_codes = await _taxonomy_int_codes_for_codes(
+            session,
+            inferred_taxonomy_rule.taxonomy_codes,
+        )
     member_entity_filter_sql = ""
     if location_inferred_taxonomy_sql:
         member_filters.append(
@@ -3191,6 +3336,7 @@ async def _ptg2_manifest_location_provider_matches(
             location_specialty_filter=location_specialty_filter,
             location_inferred_taxonomy_sql=location_inferred_taxonomy_sql,
             location_array_taxonomy_codes=tuple(location_array_taxonomy_codes),
+            location_array_taxonomy_int_codes=location_array_taxonomy_int_codes,
             rate_provider_group_ids=rate_provider_group_ids,
             has_component_rate_scope=has_component_rate_scope,
             member_scope_cte=member_scope_cte,
