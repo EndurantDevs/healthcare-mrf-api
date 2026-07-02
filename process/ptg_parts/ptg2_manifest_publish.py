@@ -325,11 +325,14 @@ async def _build_manifest_provider_group_location_table(
         CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} (
             provider_group_global_id_128 {id_type} NOT NULL,
             npi bigint NOT NULL,
+            address_key uuid,
+            premise_key uuid,
             zip5 varchar(5),
             state_name varchar,
             city_name varchar,
             lat numeric,
             long numeric,
+            address_precision varchar,
             taxonomy_array int[] NOT NULL DEFAULT '{{0}}',
             address_type varchar,
             address_checksum varchar,
@@ -337,6 +340,7 @@ async def _build_manifest_provider_group_location_table(
             second_line varchar,
             postal_code varchar,
             country_code varchar,
+            formatted_address varchar,
             telephone_number varchar,
             fax_number varchar,
             phone_number varchar,
@@ -351,11 +355,14 @@ async def _build_manifest_provider_group_location_table(
         INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} (
             provider_group_global_id_128,
             npi,
+            address_key,
+            premise_key,
             zip5,
             state_name,
             city_name,
             lat,
             long,
+            address_precision,
             taxonomy_array,
             address_type,
             address_checksum,
@@ -363,6 +370,7 @@ async def _build_manifest_provider_group_location_table(
             second_line,
             postal_code,
             country_code,
+            formatted_address,
             telephone_number,
             fax_number,
             phone_number,
@@ -373,11 +381,14 @@ async def _build_manifest_provider_group_location_table(
         SELECT DISTINCT
             pgm.provider_group_global_id_128,
             pgm.npi,
-            LEFT(COALESCE(addr.postal_code, ''), 5)::varchar(5) AS zip5,
+            addr.address_key,
+            addr.premise_key,
+            COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)::varchar)::varchar(5) AS zip5,
             addr.state_name::varchar,
             addr.city_name::varchar,
             addr.lat,
             addr.long,
+            addr.address_precision::varchar,
             COALESCE(addr.taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array,
             addr.type::varchar AS address_type,
             addr.checksum::varchar AS address_checksum,
@@ -385,6 +396,7 @@ async def _build_manifest_provider_group_location_table(
             addr.second_line::varchar,
             addr.postal_code::varchar,
             addr.country_code::varchar,
+            addr.formatted_address::varchar,
             addr.telephone_number::varchar,
             addr.fax_number::varchar,
             addr.phone_number::varchar,
@@ -392,11 +404,11 @@ async def _build_manifest_provider_group_location_table(
             addr.fax_number_digits::varchar,
             addr.fax_extension::varchar
           FROM {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} pgm
-          JOIN {_quote_ident(schema_name)}.npi_address addr
+          JOIN {_quote_ident(schema_name)}.entity_address_unified addr
             ON addr.npi = pgm.npi
-         WHERE addr.type IN ('primary', 'secondary', 'practice')
+         WHERE addr.type IN ('primary', 'secondary', 'practice', 'site')
            AND (
-                NULLIF(LEFT(COALESCE(addr.postal_code, ''), 5), '') IS NOT NULL
+                NULLIF(COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)::varchar), '') IS NOT NULL
              OR NULLIF(addr.state_name, '') IS NOT NULL
              OR NULLIF(addr.city_name, '') IS NOT NULL
              OR (addr.lat IS NOT NULL AND addr.long IS NOT NULL)
@@ -418,6 +430,7 @@ async def _build_manifest_provider_group_location_table(
             "lat_long_group_idx",
             "(lat, long, provider_group_global_id_128, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
         ),
+        ("address_key_idx", "(address_key, provider_group_global_id_128, npi) WHERE address_key IS NOT NULL"),
         ("taxonomy_array_gin_idx", "USING gin (taxonomy_array gin__int_ops)"),
     ]
     for role, columns_sql in location_indexes:

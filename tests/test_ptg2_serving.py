@@ -4261,11 +4261,50 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert "COALESCE(tax.specializations, loc.specializations" not in sql
     assert "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations" in sql
     assert "array_remove(array_agg(NULLIF(nucc.specialization, '')" in sql
+    assert "'entity_address_unified'::varchar AS location_source" in sql
+    assert "'address_key', loc.address_key::text" in sql
     assert "FROM mrf.npi_address addr" not in sql
     assert "JOIN mrf.npi_address addr_filter" not in sql
     assert params["city_exact"] == "HOUSTON"
     assert params["provider_match_limit"] >= 64
     assert params["location_rate_candidate_limit"] >= 4096
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_legacy_scan(monkeypatch):
+    sidecar_probe = AsyncMock(return_value=())
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg2_serving, "_manifest_rate_provider_groups_from_sidecar", sidecar_probe)
+
+    session = FakeSession([])
+    result = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        ptg2_types.PTG2ServingTables(
+            serving_table="mrf.ptg2_serving_token",
+            provider_group_member_table="mrf.ptg2_provider_group_member_token",
+            provider_group_location_table="mrf.ptg2_provider_group_location_token",
+            artifacts={
+                "provider_forward": {"path": "provider-forward.bin"},
+                "provider_inverted": {"path": "provider-inverted.bin"},
+            },
+            id_storage="uuid",
+        ),
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75,
+        },
+        plan_id="010854205",
+    )
+
+    assert result == (set(), {})
+    sidecar_probe.assert_awaited_once()
+    assert session.calls == []
 
 
 @pytest.mark.asyncio
