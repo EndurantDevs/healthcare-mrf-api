@@ -13100,131 +13100,94 @@ async def _crawl_toc_metadata(
                 total=expanded_target_count,
                 message=message,
             )
-        target_queue: asyncio.Queue[CrawlTarget | None] = asyncio.Queue()
-        result_queue: asyncio.Queue[
-            tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]
-            | None
-        ] = asyncio.Queue(maxsize=max(worker_count * 4, 1))
-        for target in targets:
-            target_queue.put_nowait(target)
-        for _ in range(min(worker_count, max(total, 1))):
-            target_queue.put_nowait(None)
+        crawl_semaphore = asyncio.Semaphore(worker_count)
 
-        async def target_crawl_worker() -> None:
-            """Crawl queued TOC targets and convert stuck targets to failures."""
-            while True:
-                crawl_target = await target_queue.get()
+        async def crawl_bounded(
+            crawl_target: CrawlTarget,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+            """Crawl one target under the shared concurrency and timeout limits."""
+            async with crawl_semaphore:
                 try:
-                    if crawl_target is None:
-                        await result_queue.put(None)
-                        return
                     if target_crawl_timeout > 0:
-                        crawl_result = await asyncio.wait_for(
+                        return await asyncio.wait_for(
                             crawl_one(crawl_target, session),
                             timeout=target_crawl_timeout,
                         )
-                    else:
-                        crawl_result = await crawl_one(crawl_target, session)
-                    await result_queue.put(crawl_result)
+                    return await crawl_one(crawl_target, session)
                 except TimeoutError:
-                    await result_queue.put(
-                        (
-                            [],
-                            [],
-                            [
-                                _crawl_failed_observation(
-                                    crawl_target.source,
-                                    crawl_target.url,
-                                    TimeoutError(
-                                        f"TOC target crawl timed out after {target_crawl_timeout:g}s"
-                                    ),
-                                    run_id,
-                                )
-                            ],
-                            crawl_target.url,
-                        )
+                    return (
+                        [],
+                        [],
+                        [
+                            _crawl_failed_observation(
+                                crawl_target.source,
+                                crawl_target.url,
+                                TimeoutError(
+                                    f"TOC target crawl timed out after {target_crawl_timeout:g}s"
+                                ),
+                                run_id,
+                            )
+                        ],
+                        crawl_target.url,
                     )
-                finally:
-                    target_queue.task_done()
 
-        async def writer(active_workers: int) -> None:
-            done = 0
-            finished_workers = 0
-            plan_batch: list[dict[str, Any]] = []
-            file_batch: list[dict[str, Any]] = []
-            observation_batch: list[dict[str, Any]] = []
-            while finished_workers < active_workers:
-                item = await result_queue.get()
-                if item is None:
-                    finished_workers += 1
-                    continue
-                plan_rows, file_rows, crawl_observations, url = item
-                done += 1
-                discovery_count_map["plans"] += len(plan_rows)
-                discovery_count_map["files"] += len(file_rows)
-                for row in crawl_observations:
-                    observation_ids.add(row["observation_id"])
-                plan_batch.extend(plan_rows)
-                file_batch.extend(file_rows)
-                observation_batch.extend(crawl_observations)
-                if (
-                    len(plan_batch) >= write_batch_size
-                    or len(file_batch) >= write_batch_size
-                    or len(observation_batch) >= write_batch_size
-                ):
-                    if progress_run_id:
-                        enqueue_live_progress(
-                            run_id=progress_run_id,
-                            importer="mrf-source-discovery",
-                            status="running",
-                            phase="writing TOC metadata rows",
-                            unit="targets",
-                            done=done,
-                            total=total,
-                            message=f"writing rows for TOC target {done}/{total}",
-                            label=str(url),
-                        )
-                    await _push_crawl_row_batches(
-                        plan_batch,
-                        file_batch,
-                        observation_batch,
-                        batch_size=write_batch_size,
-                    )
+        completed_target_count = 0
+        pending_plan_rows: list[dict[str, Any]] = []
+        pending_file_rows: list[dict[str, Any]] = []
+        pending_observation_rows: list[dict[str, Any]] = []
+        crawl_tasks = [asyncio.create_task(crawl_bounded(target)) for target in targets]
+        for task in asyncio.as_completed(crawl_tasks):
+            target_result = await task
+            plan_rows, file_rows, crawl_observations, result_url = target_result
+            completed_target_count += 1
+            discovery_count_map["plans"] += len(plan_rows)
+            discovery_count_map["files"] += len(file_rows)
+            for row in crawl_observations:
+                observation_ids.add(row["observation_id"])
+            pending_plan_rows.extend(plan_rows)
+            pending_file_rows.extend(file_rows)
+            pending_observation_rows.extend(crawl_observations)
+            if (
+                len(pending_plan_rows) >= write_batch_size
+                or len(pending_file_rows) >= write_batch_size
+                or len(pending_observation_rows) >= write_batch_size
+            ):
                 if progress_run_id:
                     enqueue_live_progress(
                         run_id=progress_run_id,
                         importer="mrf-source-discovery",
                         status="running",
-                        phase="crawling TOC metadata",
+                        phase="writing TOC metadata rows",
                         unit="targets",
-                        done=done,
+                        done=completed_target_count,
                         total=total,
-                        message=f"crawled {done}/{total} TOC targets",
-                        label=str(url),
+                        message=f"writing rows for TOC target {completed_target_count}/{total}",
+                        label=str(result_url),
                     )
-            await _push_crawl_row_batches(
-                plan_batch, file_batch, observation_batch, batch_size=write_batch_size
-            )
-
-        active_workers = min(worker_count, max(total, 1))
-        workers = [
-            asyncio.create_task(target_crawl_worker()) for _ in range(active_workers)
-        ]
-        writer_task = asyncio.create_task(writer(active_workers))
-        worker_group = asyncio.gather(*workers)
-        try:
-            done, _ = await asyncio.wait(
-                {worker_group, writer_task}, return_when=asyncio.FIRST_EXCEPTION
-            )
-            for task in done:
-                task.result()
-            await worker_group
-            await writer_task
-        except Exception:
-            worker_group.cancel()
-            writer_task.cancel()
-            await asyncio.gather(worker_group, writer_task, return_exceptions=True)
-            raise
+                await _push_crawl_row_batches(
+                    pending_plan_rows,
+                    pending_file_rows,
+                    pending_observation_rows,
+                    batch_size=write_batch_size,
+                )
+            if progress_run_id:
+                enqueue_live_progress(
+                    run_id=progress_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="crawling TOC metadata",
+                    unit="targets",
+                    done=completed_target_count,
+                    total=total,
+                    message=f"crawled {completed_target_count}/{total} TOC targets",
+                    label=str(result_url),
+                )
+        await _push_crawl_row_batches(
+            pending_plan_rows,
+            pending_file_rows,
+            pending_observation_rows,
+            batch_size=write_batch_size,
+        )
     return (
         discovery_count_map["plans"],
         discovery_count_map["files"],
