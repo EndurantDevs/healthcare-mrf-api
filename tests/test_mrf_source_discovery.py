@@ -12745,6 +12745,36 @@ async def test_resolve_crawl_targets_progress_reports_source_pages(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_crawl_targets_uses_bounded_default_timeout(monkeypatch):
+    observed_timeouts = []
+
+    async def fake_crawl_targets_for_source(source, url, session, **_kwargs):
+        return [discovery.CrawlTarget(source=source, url=f"{url}/index.json")]
+
+    async def recording_wait_for(awaitable, *, timeout):
+        observed_timeouts.append(timeout)
+        return await awaitable
+
+    monkeypatch.delenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
+    )
+    monkeypatch.setattr(discovery.asyncio, "wait_for", recording_wait_for)
+
+    targets, observations = await discovery._resolve_crawl_targets(
+        [{"source_id": "source_1", "index_url": "https://example.com/source-1"}],
+        session=object(),
+        run_id="run_1",
+        progress_run_id=None,
+        concurrency=1,
+    )
+
+    assert len(targets) == 1
+    assert observations == []
+    assert observed_timeouts == [60.0]
+
+
+@pytest.mark.asyncio
 async def test_resolve_crawl_targets_times_out_slow_source(monkeypatch):
     async def slow_crawl_targets_for_source(*_args, **_kwargs):
         await asyncio.sleep(0.05)

@@ -12134,10 +12134,10 @@ async def _resolve_crawl_targets(
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
     try:
         source_resolve_timeout = float(
-            os.getenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", "180")
+            os.getenv("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", "60")
         )
     except ValueError:
-        source_resolve_timeout = 180.0
+        source_resolve_timeout = 60.0
     pending_labels = {
         idx: _source_progress_label(source, url)
         for idx, source, url in items
