@@ -1099,6 +1099,11 @@ def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_h
     assert oneup["regulated_market_source_count"] == 50
     assert oneup["api_base_group_count"] == 50
     assert oneup["sample_api_base_count"] == 1
+    assert oneup["cumulative_credential_config_missing_source_count"] == 50
+    assert oneup["cumulative_credential_rule_candidate_source_count"] == 50
+    assert oneup["cumulative_regulated_market_source_count"] == 50
+    assert oneup["cumulative_missing_source_pct"] == 54.95
+    assert oneup["cumulative_candidate_source_pct"] == 54.35
     assert availity["priority_rank"] == 2
     assert availity["source_count"] == 42
     assert availity["credential_config_missing_source_count"] == 41
@@ -1111,6 +1116,11 @@ def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_h
     assert availity["market_flag_source_mentions"] == 44
     assert availity["api_base_group_count"] == 42
     assert availity["sample_api_base_count"] == 2
+    assert availity["cumulative_credential_config_missing_source_count"] == 91
+    assert availity["cumulative_credential_rule_candidate_source_count"] == 92
+    assert availity["cumulative_regulated_market_source_count"] == 87
+    assert availity["cumulative_missing_source_pct"] == 100.0
+    assert availity["cumulative_candidate_source_pct"] == 100.0
     assert availity["auth_types"] == ["API Key", "OAuth2 Client Credentials"]
     assert availity["sample_missing_secret_env_vars"] == ["AVAILITY_API_KEY"]
     assert "oauth2" in availity["credential_rule_template"]
@@ -1137,6 +1147,32 @@ def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_h
     ]
     assert availity["groups"][0]["sample_sources"][0]["source_id"] == "pdfhir_oauth"
     assert availity["sample_missing_secret_sources"][0]["source_id"] == "pdfhir_api_key"
+    assert priority["top_host_coverage"] == [
+        {
+            "top_n": 1,
+            "host_count": 1,
+            "credential_config_missing_source_count": 50,
+            "credential_rule_candidate_source_count": 50,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 50,
+            "missing_source_pct": 54.95,
+            "candidate_source_pct": 54.35,
+            "endpoint_discovery_source_pct": 0.0,
+            "hosts": ["api.1up.health"],
+        },
+        {
+            "top_n": 2,
+            "host_count": 2,
+            "credential_config_missing_source_count": 91,
+            "credential_rule_candidate_source_count": 92,
+            "endpoint_discovery_needed_source_count": 0,
+            "regulated_market_source_count": 87,
+            "missing_source_pct": 100.0,
+            "candidate_source_pct": 100.0,
+            "endpoint_discovery_source_pct": 0.0,
+            "hosts": ["api.1up.health", "apps.availity.com"],
+        },
+    ]
     assert "secret-value" not in str(priority)
 
 

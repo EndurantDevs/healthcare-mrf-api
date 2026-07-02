@@ -1768,8 +1768,67 @@ def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
             str(item.get("source_host")),
         )
     )
+    total_missing_sources = _int(backlog.get("credential_config_missing_source_count"))
+    total_candidate_sources = _int(backlog.get("credential_rule_candidate_source_count"))
+    total_endpoint_discovery_sources = _int(backlog.get("endpoint_discovery_needed_source_count"))
+    cumulative_missing_sources = 0
+    cumulative_candidate_sources = 0
+    cumulative_endpoint_discovery_sources = 0
+    cumulative_regulated_market_sources = 0
     for index, host in enumerate(hosts, start=1):
         host["priority_rank"] = index
+        cumulative_missing_sources += _int(host.get("credential_config_missing_source_count"))
+        cumulative_candidate_sources += _int(host.get("credential_rule_candidate_source_count"))
+        cumulative_endpoint_discovery_sources += _int(host.get("endpoint_discovery_needed_source_count"))
+        cumulative_regulated_market_sources += _int(host.get("regulated_market_source_count"))
+        host["cumulative_credential_config_missing_source_count"] = cumulative_missing_sources
+        host["cumulative_credential_rule_candidate_source_count"] = cumulative_candidate_sources
+        host["cumulative_endpoint_discovery_needed_source_count"] = cumulative_endpoint_discovery_sources
+        host["cumulative_regulated_market_source_count"] = cumulative_regulated_market_sources
+        host["cumulative_missing_source_pct"] = _pct(cumulative_missing_sources, total_missing_sources)
+        host["cumulative_candidate_source_pct"] = _pct(cumulative_candidate_sources, total_candidate_sources)
+        host["cumulative_endpoint_discovery_source_pct"] = _pct(
+            cumulative_endpoint_discovery_sources,
+            total_endpoint_discovery_sources,
+        )
+
+    top_host_coverage = []
+    top_n_values = sorted({value for value in (1, 3, 5, 10, 25, len(hosts)) if 0 < value <= len(hosts)})
+    for top_n in top_n_values:
+        if not hosts:
+            break
+        selected = hosts[:top_n]
+        top_host_coverage.append(
+            {
+                "top_n": top_n,
+                "host_count": len(selected),
+                "credential_config_missing_source_count": sum(
+                    _int(host.get("credential_config_missing_source_count")) for host in selected
+                ),
+                "credential_rule_candidate_source_count": sum(
+                    _int(host.get("credential_rule_candidate_source_count")) for host in selected
+                ),
+                "endpoint_discovery_needed_source_count": sum(
+                    _int(host.get("endpoint_discovery_needed_source_count")) for host in selected
+                ),
+                "regulated_market_source_count": sum(
+                    _int(host.get("regulated_market_source_count")) for host in selected
+                ),
+                "missing_source_pct": _pct(
+                    sum(_int(host.get("credential_config_missing_source_count")) for host in selected),
+                    total_missing_sources,
+                ),
+                "candidate_source_pct": _pct(
+                    sum(_int(host.get("credential_rule_candidate_source_count")) for host in selected),
+                    total_candidate_sources,
+                ),
+                "endpoint_discovery_source_pct": _pct(
+                    sum(_int(host.get("endpoint_discovery_needed_source_count")) for host in selected),
+                    total_endpoint_discovery_sources,
+                ),
+                "hosts": [host.get("source_host") for host in selected],
+            }
+        )
 
     return {
         "generated_at": backlog.get("generated_at"),
@@ -1785,6 +1844,7 @@ def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
         "endpoint_discovery_needed_source_count": backlog.get("endpoint_discovery_needed_source_count"),
         "credential_missing_secret_env_vars": _list(backlog.get("credential_missing_secret_env_vars")),
         "host_count": len(hosts),
+        "top_host_coverage": top_host_coverage,
         "hosts": hosts,
     }
 
