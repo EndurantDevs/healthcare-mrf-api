@@ -415,10 +415,16 @@ class ResourceFetchResult:
     next_url_remaining: bool
     error: str | None = None
     fetch_mode: str = "paged"
+    deadline_reached: bool = False
 
     @property
     def bounded(self) -> bool:
-        return self.row_limit_reached or self.page_limit_reached or self.hard_page_limit_reached
+        return (
+            self.row_limit_reached
+            or self.page_limit_reached
+            or self.hard_page_limit_reached
+            or self.deadline_reached
+        )
 
 
 @dataclass(frozen=True)
@@ -7200,6 +7206,7 @@ async def _fetch_resource_rows(
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
     bulk_export: bool = False,
+    deadline_seconds: int = 0,
 ) -> ResourceFetchResult | None:
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
@@ -7246,6 +7253,8 @@ async def _fetch_resource_rows(
     hard_page_limit_reached = False
     next_url_remaining = False
     error_message: str | None = None
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    deadline_reached = False
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     partitioned_fetch = len(start_urls) > 1
     partition_error_count = 0
@@ -7262,6 +7271,10 @@ async def _fetch_resource_rows(
         while url and _limit_allows_more(rows_fetched, per_resource_limit):
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                deadline_reached = True
+                next_url_remaining = True
+                break
             if page_limit > 0 and pages >= page_limit:
                 page_limit_reached = True
                 next_url_remaining = True
@@ -7318,6 +7331,10 @@ async def _fetch_resource_rows(
                 if not _limit_allows_more(rows_fetched, per_resource_limit):
                     row_limit_reached = entry_index < len(entries) - 1
                     break
+                if deadline_at is not None and time.monotonic() >= deadline_at:
+                    deadline_reached = True
+                    next_url_remaining = True
+                    break
             next_url = _next_link(payload)
             url = urllib.parse.urljoin(url, next_url) if next_url else None
             if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
@@ -7328,12 +7345,20 @@ async def _fetch_resource_rows(
             row_limit_reached
             or page_limit_reached
             or hard_page_limit_reached
+            or deadline_reached
             or (error_message and not partitioned_fetch)
             or not _limit_allows_more(rows_fetched, per_resource_limit)
         ):
             break
     await flush_pending_rows()
-    complete = not error_message and not row_limit_reached and not page_limit_reached and not hard_page_limit_reached and not url
+    complete = (
+        not error_message
+        and not row_limit_reached
+        and not page_limit_reached
+        and not hard_page_limit_reached
+        and not deadline_reached
+        and not url
+    )
     return ResourceFetchResult(
         model=model,
         rows=rows,
@@ -7345,7 +7370,8 @@ async def _fetch_resource_rows(
         page_limit_reached=page_limit_reached,
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining or bool(url),
-        error=error_message,
+        error=error_message or ("deadline_reached" if deadline_reached else None),
+        deadline_reached=deadline_reached,
     )
 
 
@@ -7811,6 +7837,7 @@ def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_
         "row_limit_reached": result.row_limit_reached,
         "page_limit_reached": result.page_limit_reached,
         "hard_page_limit_reached": result.hard_page_limit_reached,
+        "deadline_reached": result.deadline_reached,
         "next_url_remaining": result.next_url_remaining,
     }
 
@@ -8380,6 +8407,7 @@ async def _import_resources(
     linked_resource_limit: int = 0,
     linked_resource_concurrency: int = 5,
     linked_resource_deadline_seconds: int = 0,
+    resource_deadline_seconds: int = 0,
     linked_counts: dict[str, int] | None = None,
     resource_fetch_stats: dict[str, dict[str, Any]] | None = None,
     stale_counts: dict[str, int] | None = None,
@@ -8608,6 +8636,7 @@ async def _import_resources(
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
                 bulk_export=bulk_export,
+                deadline_seconds=resource_deadline_seconds,
             )
             if not result:
                 continue
@@ -8680,6 +8709,7 @@ async def _import_resources(
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
                 bulk_export=False,
+                deadline_seconds=resource_deadline_seconds,
             )
             if retry_result is None:
                 retry_result = replace(
@@ -8969,6 +8999,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("linked_resource_deadline_seconds"),
         _env_int("HLTHPRT_PROVIDER_DIRECTORY_LINKED_RESOURCE_DEADLINE_SECONDS", 0),
     )
+    resource_deadline_seconds = _int_or_default(
+        task.get("resource_deadline_seconds"),
+        _env_int("HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_DEADLINE_SECONDS", 0),
+    )
     stream_batch_size = _int_or_default(
         task.get("stream_batch_size"),
         0 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_STREAM_BATCH_SIZE", DEFAULT_STREAM_BATCH_SIZE),
@@ -9112,6 +9146,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "resource_limit": resource_limit,
             "linked_resource_limit": linked_resource_limit,
             "linked_resource_deadline_seconds": linked_resource_deadline_seconds,
+            "resource_deadline_seconds": resource_deadline_seconds,
             "page_limit": page_limit,
             "page_count": page_count,
             "stream_batch_size": stream_batch_size,
@@ -9209,6 +9244,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 linked_resource_limit=linked_resource_limit,
                 linked_resource_concurrency=concurrency,
                 linked_resource_deadline_seconds=linked_resource_deadline_seconds,
+                resource_deadline_seconds=resource_deadline_seconds,
                 linked_counts=metrics.setdefault("linked_resource_rows", {}),
                 resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
                 stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
@@ -9311,6 +9347,7 @@ async def main(
     credential_config_file: str | None = None,
     resources: str | None = None,
     resource_limit: int | None = None,
+    resource_deadline_seconds: int | None = None,
     linked_resource_limit: int | None = None,
     linked_resource_deadline_seconds: int | None = None,
     page_limit: int | None = None,
@@ -9352,6 +9389,7 @@ async def main(
         "credential_config_file": credential_config_file,
         "resources": resources,
         "resource_limit": resource_limit,
+        "resource_deadline_seconds": resource_deadline_seconds,
         "linked_resource_limit": linked_resource_limit,
         "linked_resource_deadline_seconds": linked_resource_deadline_seconds,
         "page_limit": page_limit,

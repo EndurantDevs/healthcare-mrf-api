@@ -45,6 +45,7 @@ REQUIRED_PROVIDER_DIRECTORY_HARNESS_OPTIONS = (
     "--credential-config-file",
     "--refresh-preset",
     "--include-supplemental-catalogs",
+    "--resource-deadline-seconds",
     "--linked-resource-deadline-seconds",
 )
 REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS = (
@@ -57,6 +58,7 @@ REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS = (
     "publish_corroboration",
     "retest_results_url",
     "resource_limit",
+    "resource_deadline_seconds",
     "linked_resource_limit",
     "linked_resource_deadline_seconds",
     "page_limit",

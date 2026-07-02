@@ -380,6 +380,8 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             command.append("--no-stale-cleanup")
         if args.resource_limit is not None:
             command.extend(["--resource-limit", str(args.resource_limit)])
+        if args.resource_deadline_seconds is not None:
+            command.extend(["--resource-deadline-seconds", str(args.resource_deadline_seconds)])
         if args.linked_resource_limit is not None:
             command.extend(["--linked-resource-limit", str(args.linked_resource_limit)])
         if args.linked_resource_deadline_seconds is not None:
@@ -457,6 +459,7 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         payload["params"]["publish_artifacts"] = args.publish_artifacts
     for key in (
         "resource_limit",
+        "resource_deadline_seconds",
         "linked_resource_limit",
         "linked_resource_deadline_seconds",
         "page_limit",
@@ -794,6 +797,7 @@ def _add_import_behavior_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-credentialed", action="store_true", help="Local CLI: include sources not marked open/none.")
     parser.add_argument("--resources", help="Comma-separated resource list for local CLI imports.")
     parser.add_argument("--resource-limit", type=int, default=None, help="Rows per source/resource; 0 means unbounded.")
+    parser.add_argument("--resource-deadline-seconds", type=int, default=None, help="Seconds to spend fetching one regular resource endpoint; 0 disables the deadline.")
     parser.add_argument("--linked-resource-limit", type=int, default=None, help="Referenced FHIR resources per source.")
     parser.add_argument("--linked-resource-deadline-seconds", type=int, default=None, help="Seconds to spend fetching linked resources per source; 0 disables the deadline.")
     parser.add_argument("--page-limit", type=int, default=None, help="FHIR pages per source/resource; 0 means unbounded.")

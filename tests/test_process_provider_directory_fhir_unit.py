@@ -4676,6 +4676,67 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(_source, url, *, timeout):
+        calls.append(url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "link": [{"relation": "next", "url": "https://example.test/fhir/Location?page=2"}],
+                "entry": [
+                    {
+                        "fullUrl": f"https://example.test/fhir/Location/location-{len(calls)}",
+                        "resource": {
+                            "resourceType": "Location",
+                            "id": f"location-{len(calls)}",
+                            "address": {
+                                "line": ["1 Main St"],
+                                "city": "Long Beach",
+                                "state": "CA",
+                                "postalCode": "90802",
+                                "country": "US",
+                            },
+                        },
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+    monotonic_values = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(importer.time, "monotonic", lambda: next(monotonic_values, 2.0))
+
+    result = await importer._fetch_resource_rows(
+        {
+            "source_id": "example",
+            "api_base": "https://example.test/fhir",
+            "canonical_api_base": "https://example.test/fhir",
+        },
+        "Location",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        deadline_seconds=1,
+    )
+
+    assert result is not None
+    assert result.rows_fetched == 1
+    assert result.complete is False
+    assert result.bounded is True
+    assert result.deadline_reached is True
+    assert result.next_url_remaining is True
+    assert result.error == "deadline_reached"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_fetch_resource_rows_defers_scan_practitioner_role_reverse_lookup(monkeypatch):
     calls: list[str] = []
 
@@ -6088,6 +6149,7 @@ def _harness_cli_args(**overrides: Any) -> argparse.Namespace:
         full_refresh=False,
         stale_cleanup=None,
         resource_limit=None,
+        resource_deadline_seconds=None,
         linked_resource_limit=None,
         linked_resource_deadline_seconds=None,
         page_limit=None,

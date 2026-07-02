@@ -1215,6 +1215,7 @@ def provider_enrichment(test: bool):
     help="Comma-separated resources to fetch. Defaults to InsurancePlan,PractitionerRole,Practitioner,Organization,Location,HealthcareService,OrganizationAffiliation.",
 )
 @click.option("--resource-limit", type=int, help="Rows per source/resource to retain.")
+@click.option("--resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching one regular resource endpoint.")
 @click.option("--linked-resource-limit", type=int, help="Referenced FHIR resources per source to fetch after paged resources.")
 @click.option("--linked-resource-deadline-seconds", type=int, help="Maximum seconds to spend fetching linked resources per source.")
 @click.option("--page-limit", type=int, help="Maximum FHIR pages per source/resource.")
@@ -1255,6 +1256,7 @@ def provider_directory_fhir(
     include_auth_required: bool,
     resources: str | None,
     resource_limit: int | None,
+    resource_deadline_seconds: int | None,
     linked_resource_limit: int | None,
     linked_resource_deadline_seconds: int | None,
     page_limit: int | None,
@@ -1293,6 +1295,7 @@ def provider_directory_fhir(
             include_auth_required=include_auth_required,
             resources=resources,
             resource_limit=resource_limit,
+            resource_deadline_seconds=resource_deadline_seconds,
             linked_resource_limit=linked_resource_limit,
             linked_resource_deadline_seconds=linked_resource_deadline_seconds,
             page_limit=page_limit,

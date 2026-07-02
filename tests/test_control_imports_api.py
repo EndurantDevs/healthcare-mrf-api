@@ -70,6 +70,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert "monthly-full" in provider_directory_refresh_preset["choices"]
     assert any(param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "resource_deadline_seconds" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
