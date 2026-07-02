@@ -887,11 +887,12 @@ def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
 
 
 def _aetna_provider_directory_data_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
+    if resource_type == "InsurancePlan":
+        return (("name", "aetna"),)
     state_param_by_resource = {
         "Practitioner": "address-state:exact",
         "Organization": "address-state",
         "Location": "address-state:exact",
-        "InsurancePlan": "address-state",
     }
     state_param = state_param_by_resource.get(resource_type)
     if not state_param:

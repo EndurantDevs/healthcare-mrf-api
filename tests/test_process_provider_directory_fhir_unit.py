@@ -4846,10 +4846,9 @@ def test_resource_start_urls_partitions_aetna_providerdirectorydata_state_search
     assert len(organization_urls) == len(importer.US_STATE_ABBRS)
     assert location_urls[0].endswith("_count=10&address-state%3Aexact=AL")
     assert len(location_urls) == len(importer.US_STATE_ABBRS)
-    assert plan_urls[0] == (
-        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/InsurancePlan?_count=10&address-state=AL"
-    )
-    assert len(plan_urls) == len(importer.US_STATE_ABBRS)
+    assert plan_urls == [
+        "https://apif1.aetna.com/fhir/v1/providerdirectorydata/InsurancePlan?_count=10&name=aetna"
+    ]
     assert role_urls == [
         "https://apif1.aetna.com/fhir/v1/providerdirectorydata/PractitionerRole?_count=10"
     ]

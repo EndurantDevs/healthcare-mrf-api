@@ -88,8 +88,8 @@ supports Bulk Data `$export`; Aetna's API gateway accepts the export request
 when `_outputFormat` is omitted, so the importer suppresses the generic
 `_outputFormat=application/fhir+ndjson` parameter for that base. If bulk export
 is disabled or unsupported during a bounded smoke run, the importer uses
-Aetna-specific state partitions for `Practitioner`, `Organization`, `Location`,
-and `InsurancePlan` search. `PractitionerRole`,
+Aetna-specific state partitions for `Practitioner`, `Organization`, and
+`Location`, plus `name=aetna` search for `InsurancePlan`. `PractitionerRole`,
 `OrganizationAffiliation`, and `HealthcareService` remain bulk-first because
 their broad search contracts require specialty/location or referenced-resource
 lookups and are not safely enumerable through a generic unfiltered search.

@@ -63,8 +63,9 @@ Aetna is still not crawlable through a generic unfiltered FHIR search strategy:
   expose the Commercial/Medicare bulk route.
 
 For bounded non-bulk validation, the importer uses Aetna-specific state
-partitions for Commercial/Medicare `Practitioner`, `Organization`, `Location`,
-and `InsurancePlan` search. Enumerating all two-letter name combinations or all
+partitions for Commercial/Medicare `Practitioner`, `Organization`, and
+`Location`, plus `name=aetna` search for `InsurancePlan`. Enumerating all
+two-letter name combinations or all
 NPIs is not a full import strategy; NPI search is only useful when we already
 have known NPIs. ZIP search can support targeted checks, but a full ZIP crawl is
 less efficient than Aetna's bulk route and still does not solve every role or
