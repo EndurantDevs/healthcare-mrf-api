@@ -2811,6 +2811,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Empire BlueCross BlueShield" in by_name["Anthem"].aliases
     assert "Empire HealthChoice HMO, Inc." in by_name["Anthem"].aliases
+    assert "Delta Dental of Kentucky" in by_name["Anthem"].aliases
+    assert "DeltaDentalKY" in by_name["Anthem"].aliases
     assert by_name["CareFirst BCBS"].benefit_lines == (
         "medical",
         "dental",
