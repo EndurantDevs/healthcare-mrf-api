@@ -12953,6 +12953,12 @@ async def _crawl_toc_metadata(
         )
     except ValueError:
         target_crawl_timeout = 180.0
+    try:
+        row_write_timeout = float(
+            os.getenv("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", "180")
+        )
+    except ValueError:
+        row_write_timeout = 180.0
 
     async def crawl_one(
         target: CrawlTarget, session: aiohttp.ClientSession
@@ -13164,12 +13170,16 @@ async def _crawl_toc_metadata(
                         message=f"writing rows for TOC target {completed_target_count}/{total}",
                         label=str(result_url),
                     )
-                await _push_crawl_row_batches(
+                write_coro = _push_crawl_row_batches(
                     pending_plan_rows,
                     pending_file_rows,
                     pending_observation_rows,
                     batch_size=write_batch_size,
                 )
+                if row_write_timeout > 0:
+                    await asyncio.wait_for(write_coro, timeout=row_write_timeout)
+                else:
+                    await write_coro
             if progress_run_id:
                 enqueue_live_progress(
                     run_id=progress_run_id,
@@ -13182,12 +13192,27 @@ async def _crawl_toc_metadata(
                     message=f"crawled {completed_target_count}/{total} TOC targets",
                     label=str(result_url),
                 )
-        await _push_crawl_row_batches(
+        if progress_run_id:
+            enqueue_live_progress(
+                run_id=progress_run_id,
+                importer="mrf-source-discovery",
+                status="running",
+                phase="writing final TOC metadata rows",
+                unit="targets",
+                done=completed_target_count,
+                total=total,
+                message=f"writing final rows for {completed_target_count}/{total} TOC targets",
+            )
+        final_write_coro = _push_crawl_row_batches(
             pending_plan_rows,
             pending_file_rows,
             pending_observation_rows,
             batch_size=write_batch_size,
         )
+        if row_write_timeout > 0:
+            await asyncio.wait_for(final_write_coro, timeout=row_write_timeout)
+        else:
+            await final_write_coro
     return (
         discovery_count_map["plans"],
         discovery_count_map["files"],
