@@ -2916,6 +2916,11 @@ def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_
     assert "loc.resource_id = e.location_resource_id" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
+    assert (
+        "insurance_plan.resource_id = NULLIF(BTRIM(CASE WHEN plan_ref.value LIKE '%/InsurancePlan/%'"
+        in sql
+    )
+    assert "|| insurance_plan.resource_id" not in sql
     assert "JOIN LATERAL (\n              SELECT DISTINCT normalized_ref AS resource_id" in sql
     assert "organization.resource_id = organization_ref.resource_id" in sql
     assert "organization_address_matches AS" not in sql

@@ -2695,7 +2695,7 @@ def provider_directory_address_corroboration_sql(
 
     schema = db_schema or _schema()
     view_ref = _qt(schema, view_name)
-    role_plan_ref_match = _sql_ref_matches_resource("plan_ref.value", "InsurancePlan", "insurance_plan.resource_id")
+    plan_ref_resource_id_expr = _sql_reference_resource_id("plan_ref.value", "InsurancePlan")
     network_ref_resource_id_expr = _sql_reference_resource_id("network_ref.value", "Organization")
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
@@ -2805,7 +2805,7 @@ def provider_directory_address_corroboration_sql(
               ) AS plan_ref(value)
               LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                 ON insurance_plan.source_id = role.source_id
-               AND {role_plan_ref_match}
+               AND insurance_plan.resource_id = {plan_ref_resource_id_expr}
           ) plan_context ON TRUE
           LEFT JOIN LATERAL (
             WITH network_ref_values AS (
@@ -2820,7 +2820,7 @@ def provider_directory_address_corroboration_sql(
                   ) AS plan_ref(value)
                   JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                     ON insurance_plan.source_id = role.source_id
-                   AND {role_plan_ref_match}
+                   AND insurance_plan.resource_id = {plan_ref_resource_id_expr}
                   CROSS JOIN LATERAL jsonb_array_elements_text(
                       COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
                   ) AS plan_network_ref(value)
