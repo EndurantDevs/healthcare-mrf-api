@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-import json
 import logging
 import os
 import re
@@ -192,13 +191,15 @@ class SpecialtyResolutionCache:
         self,
         dynamic_entries: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
     ) -> None:
-        merged: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = dict(dynamic_entries or {})
+        entries_by_variant: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = dict(dynamic_entries or {})
         for alias, codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items():
             for variant in _specialty_key_variants(alias):
-                merged[variant] = (codes, codes)
-        self._alias_codes = merged
+                entries_by_variant[variant] = (codes, codes)
+        self._alias_codes = entries_by_variant
 
     def lookup(self, term: str, include_subspecialties: bool = True) -> tuple[str, ...]:
+        """Resolve a specialty term to taxonomy codes from the shared cache."""
+
         for variant in _specialty_key_variants(term):
             entry = self._alias_codes.get(variant)
             if entry:
@@ -207,20 +208,26 @@ class SpecialtyResolutionCache:
         return ()
 
     def suggestions(self, term: str, count: int = 3) -> tuple[str, ...]:
+        """Return close normalized specialty aliases for unresolved input."""
+
         key = _normalize_specialty_key(term)
         if not key:
             return ()
         return tuple(difflib.get_close_matches(key, self._alias_codes.keys(), n=count, cutoff=0.75))
 
     @property
-    def stale(self) -> bool:
+    def is_stale(self) -> bool:
+        """Return whether the cache should be refreshed from the DB."""
+
         return self._loaded_at is None or (time.monotonic() - self._loaded_at) >= self._ttl_seconds
 
     async def ensure(self, session) -> None:
-        if not self.stale:
+        """Refresh the cache once per TTL, preserving the current tier on failures."""
+
+        if not self.is_stale:
             return
         async with self._lock:
-            if not self.stale:
+            if not self.is_stale:
                 return
             try:
                 dynamic_entries = await self._load_dynamic_entries(session)
@@ -233,98 +240,12 @@ class SpecialtyResolutionCache:
             self._rebuild_from_static(dynamic_entries)
             self._loaded_at = time.monotonic()
 
-    async def _load_dynamic_entries(self, session) -> dict[str, tuple[str, ...]]:
-        from sqlalchemy import select
+    async def _load_dynamic_entries(self, session) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        """Load DB-backed NUCC and synonym specialty aliases."""
 
-        from db.models import NUCCTaxonomy, TerminologySynonym
+        from api.provider_specialty_cache_entries import load_dynamic_specialty_entries
 
-        nucc_table = NUCCTaxonomy.__table__
-        nucc_result = await session.execute(
-            select(
-                nucc_table.c.code,
-                nucc_table.c.classification,
-                nucc_table.c.specialization,
-                nucc_table.c.display_name,
-            )
-        )
-        classification_codes: dict[str, list[str]] = {}
-        classification_base_codes: dict[str, list[str]] = {}
-        specialization_codes: dict[str, list[str]] = {}
-        display_codes: dict[str, list[str]] = {}
-        for row in nucc_result.mappings():
-            code = str(row.get("code") or "").strip().upper()
-            if not code:
-                continue
-            classification = str(row.get("classification") or "").strip()
-            specialization = str(row.get("specialization") or "").strip()
-            display_name = str(row.get("display_name") or "").strip()
-            if classification:
-                classification_codes.setdefault(classification, []).append(code)
-                if not specialization:
-                    classification_base_codes.setdefault(classification, []).append(code)
-            if specialization:
-                specialization_codes.setdefault(specialization, []).append(code)
-            if display_name:
-                display_codes.setdefault(display_name, []).append(code)
-
-        entries: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
-
-        def _index(name: str, codes: list[str], base_codes: list[str] | None = None) -> None:
-            deduped = tuple(dict.fromkeys(codes))
-            if not deduped:
-                return
-            base = tuple(dict.fromkeys(base_codes)) if base_codes else deduped
-            for variant in _specialty_key_variants(name):
-                entries[variant] = (deduped, base)
-
-        # Order matters: display names are the most specific, then
-        # specializations; classification families win same-key collisions so a
-        # family term always means the whole family. A directly-named
-        # specialization or display name IS the request, so its base equals all.
-        for name, codes in display_codes.items():
-            _index(name, codes)
-        for name, codes in specialization_codes.items():
-            _index(name, codes)
-        for name, codes in classification_codes.items():
-            _index(name, codes, base_codes=classification_base_codes.get(name))
-
-        synonym_table = TerminologySynonym.__table__
-        synonym_result = await session.execute(
-            select(
-                synonym_table.c.synonym,
-                synonym_table.c.target_system,
-                synonym_table.c.target_code,
-                synonym_table.c.metadata_json,
-            ).where(synonym_table.c.domain == "provider_type")
-        )
-        # Synonym rows sharing one normalized key (e.g. curated 'radiology' ->
-        # 2085R0202X plus importer 'Radiology' -> one row per family code) are
-        # UNIONED per key, sorted for determinism: the un-ORDERed SELECT must
-        # not decide the winner across workers or TTL refreshes.
-        synonym_variant_codes: dict[str, list[str]] = {}
-        for row in synonym_result.mappings():
-            synonym = str(row.get("synonym") or "").strip()
-            if not synonym:
-                continue
-            target_system = str(row.get("target_system") or "").strip().upper()
-            code = ""
-            if target_system == "NUCC":
-                code = str(row.get("target_code") or "").strip().upper()
-            else:
-                metadata_raw = row.get("metadata_json")
-                if metadata_raw:
-                    try:
-                        code = str((json.loads(metadata_raw) or {}).get("nucc_code") or "").strip().upper()
-                    except (TypeError, ValueError):
-                        code = ""
-            if code:
-                for variant in _specialty_key_variants(synonym):
-                    synonym_variant_codes.setdefault(variant, []).append(code)
-        for variant, codes in synonym_variant_codes.items():
-            unioned = tuple(sorted(dict.fromkeys(codes)))
-            entries[variant] = (unioned, unioned)
-        return entries
-
+        return await load_dynamic_specialty_entries(session, _specialty_key_variants)
 
 _SPECIALTY_RESOLUTION_CACHE = SpecialtyResolutionCache()
 
@@ -335,6 +256,8 @@ async def ensure_specialty_resolution_cache(session) -> None:
 
 
 def specialty_resolution_cache() -> SpecialtyResolutionCache:
+    """Return the process-wide provider specialty resolution cache."""
+
     return _SPECIALTY_RESOLUTION_CACHE
 
 

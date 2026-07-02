@@ -132,11 +132,11 @@ async def test_include_subspecialties_false_uses_family_base_codes():
 
 @pytest.mark.asyncio
 async def test_colliding_synonym_rows_union_deterministically():
-    colliding = [
+    colliding_rows = [
         {"synonym": "Radiology", "target_system": "NUCC", "target_code": "2085N0700X", "metadata_json": None},
         {"synonym": "radiology", "target_system": "PROVIDER_TYPE", "target_code": "Diagnostic Radiology", "metadata_json": '{"nucc_code": "2085R0202X"}'},
     ]
-    for ordering in (colliding, list(reversed(colliding))):
+    for ordering in (colliding_rows, list(reversed(colliding_rows))):
         cache = SpecialtyResolutionCache()
         await cache.ensure(_FakeSession(NUCC_ROWS, ordering))
         assert cache.lookup("radiology") == ("2085N0700X", "2085R0202X"), ordering
@@ -190,10 +190,10 @@ async def test_resolver_uses_loaded_shared_cache(monkeypatch):
 def test_seed_rows_mirror_static_alias_dict():
     from process.terminology_synonyms import _specialty_alias_rows
 
-    rows = _specialty_alias_rows()
-    seeded = {(row["synonym"], row["target_code"]) for row in rows}
+    specialty_rows = _specialty_alias_rows()
+    seeded_alias_pairs = {(specialty_row["synonym"], specialty_row["target_code"]) for specialty_row in specialty_rows}
     for alias, codes in psf._SPECIALTY_TAXONOMY_CODE_ALIASES.items():
         for code in codes:
-            assert (alias, code) in seeded
-    assert all(row["target_system"] == "NUCC" for row in rows)
-    assert all(row["domain"] == "provider_type" for row in rows)
+            assert (alias, code) in seeded_alias_pairs
+    assert all(specialty_row["target_system"] == "NUCC" for specialty_row in specialty_rows)
+    assert all(specialty_row["domain"] == "provider_type" for specialty_row in specialty_rows)
