@@ -14367,23 +14367,35 @@ async def _push_import_control_catalog(
                     stored = await _fetch_import_control_source(session, base, ic_source_id)
                     # Flip staged rows public after ingest. Also let an active registry row with
                     # crawled files clear a stale state left by an older duplicate URL row.
+                    stored_visibility = str((stored or {}).get("visibility") or "")
                     staged = stored is None or (
-                        str(stored.get("visibility") or "")
-                        == _IMPORT_CONTROL_STAGED_VISIBILITY
+                        stored_visibility == _IMPORT_CONTROL_STAGED_VISIBILITY
                         and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                     )
                     stored_status = str((stored or {}).get("status") or "").lower()
+                    needs_public_state_refresh = (
+                        source_status_lower == "active"
+                        and stored_status in {"stale", "superseded"}
+                        and (
+                            stored_visibility != "public"
+                            or stored_status != source_status_lower
+                        )
+                    )
                     should_ingest_preview = bool(
                         items
                         and not evidence_only
-                        and (staged or stored_status == "stale")
+                        and (
+                            staged
+                            or stored_status == "stale"
+                            or needs_public_state_refresh
+                        )
                     )
                     if not items and source_status_lower == "active" and not evidence_only:
                         # Existing public sources still need metadata-only refreshes
                         # (aliases, benefit lines, source tier). Newly staged metadata-only
                         # sources should become searchable even when the source snapshot has
                         # not produced preview items yet.
-                        if staged:
+                        if staged or needs_public_state_refresh:
                             await _promote_import_control_source(
                                 session,
                                 base,
@@ -14419,6 +14431,7 @@ async def _push_import_control_catalog(
                         staged
                         or source_status_lower != "active"
                         or (items and stored_status == "stale")
+                        or needs_public_state_refresh
                     ):
                         await _promote_import_control_source(
                             session,

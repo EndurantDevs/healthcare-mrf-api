@@ -8996,7 +8996,6 @@ async def test_push_import_control_catalog_supersedes_replaced_urls(
         if call["url"].endswith("/v1/catalog/sources/ic_legacy_old_source")
         and call["method"] == "PATCH"
     ]
-
     assert sources_synced == 1
     assert plans_synced == 1
     assert sync_errors == []
@@ -9012,6 +9011,18 @@ async def test_push_import_control_catalog_supersedes_replaced_urls(
             "preserve_operator_state": False,
         }
     ]
+    _assert_replacement_source_republished(source_request_bodies)
+
+
+def _assert_replacement_source_republished(source_request_bodies):
+    current_source_publications = [
+        request_body
+        for request_body in source_request_bodies
+        if request_body["source_key"] == "example-current"
+        and request_body["visibility"] == "public"
+        and request_body["status"] == "active"
+    ]
+    assert len(current_source_publications) == 1
 
 
 def _replacement_catalog_source_row():
@@ -9183,11 +9194,16 @@ class _CatalogSnapshotFakeSession:
             {"method": "GET", "url": request_url, "params": params, "json": None}
         )
         if "/v1/catalog/sources/ic_" in request_url:
+            status = (
+                "superseded"
+                if request_url.endswith("/v1/catalog/sources/ic_example-current")
+                else "needs_review"
+            )
             return _CatalogSnapshotFakeResponse(
                 {
                     "source_id": request_url.rsplit("/", 1)[-1],
                     "visibility": "internal",
-                    "status": "needs_review",
+                    "status": status,
                 }
             )
         if (
