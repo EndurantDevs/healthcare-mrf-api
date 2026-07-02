@@ -1200,6 +1200,28 @@ def test_parse_master_list_preserves_coverage_evidence_metadata():
     assert candidate.raw_payload["target_payer_query"] == "Example Packaging"
 
 
+def test_parse_master_list_defaults_url_less_rows_to_coverage_evidence():
+    markdown = """
+## Public ancillary placeholders
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Example Dental Placeholder | dental | - | needs official public pricing MRF TOC or landing URL; benefit lines: dental; aliases: Example Dental |
+| Example Dental Explicit | dental | - | source tier: mrf_importable; benefit lines: dental; aliases: Example Dental Explicit |
+| Example Dental Source | dental | https://example.test/toc/index.json | public pricing TOC; benefit lines: dental; aliases: Example Dental Source |
+"""
+
+    by_name = {
+        candidate.payer_name: candidate for candidate in discovery.parse_master_list(markdown)
+    }
+
+    assert by_name["Example Dental Placeholder"].index_url is None
+    assert by_name["Example Dental Placeholder"].source_tier == "coverage_evidence"
+    assert by_name["Example Dental Explicit"].index_url is None
+    assert by_name["Example Dental Explicit"].source_tier == "mrf_importable"
+    assert by_name["Example Dental Source"].index_url == "https://example.test/toc/index.json"
+    assert by_name["Example Dental Source"].source_tier == "mrf_importable"
+
+
 def test_parse_master_list_preserves_legacy_public_aliases_for_active_sources():
     markdown = """
 ## Public regional aliases
