@@ -202,11 +202,11 @@ def test_seed_rows_mirror_static_alias_dict():
 def test_taxonomy_semijoin_sql_is_sargable_and_uncorrelated():
     from api.provider_specialty_filters import provider_specialty_taxonomy_semijoin_sql
 
-    params = {}
+    params_by_name = {}
     resolved = resolve_provider_specialty_filter(
         {"taxonomy_codes": "101YM0800X,103T00000X", "primary_only": "false"}
     )
-    sql = provider_specialty_taxonomy_semijoin_sql(params, "loc_specialty", resolved, schema="mrf")
+    sql = provider_specialty_taxonomy_semijoin_sql(params_by_name, "loc_specialty", resolved, schema="mrf")
     assert sql.startswith("SELECT loc_specialty_nt.npi")
     assert "FROM mrf.npi_taxonomy loc_specialty_nt" in sql
     # Uncorrelated: no reference to any outer NPI column.
@@ -216,7 +216,7 @@ def test_taxonomy_semijoin_sql_is_sargable_and_uncorrelated():
     assert "loc_specialty_nt.healthcare_provider_taxonomy_code IN (:loc_specialty_taxonomy_code_0, :loc_specialty_taxonomy_code_1)" in sql
     assert "UPPER(COALESCE(loc_specialty_nt.healthcare_provider_taxonomy_code" not in sql
     assert "healthcare_provider_primary_taxonomy_switch" not in sql
-    assert params == {
+    assert params_by_name == {
         "loc_specialty_taxonomy_code_0": "101YM0800X",
         "loc_specialty_taxonomy_code_1": "103T00000X",
     }
@@ -225,14 +225,14 @@ def test_taxonomy_semijoin_sql_is_sargable_and_uncorrelated():
 def test_taxonomy_semijoin_sql_primary_only_and_classification_clauses():
     from api.provider_specialty_filters import provider_specialty_taxonomy_semijoin_sql
 
-    params = {}
+    params_by_name = {}
     resolved = resolve_provider_specialty_filter({"specialty": "internal medicine", "include_subspecialties": "true"})
     assert resolved.classification == "Internal Medicine"
-    sql = provider_specialty_taxonomy_semijoin_sql(params, "p", resolved, schema="mrf")
+    sql = provider_specialty_taxonomy_semijoin_sql(params_by_name, "p", resolved, schema="mrf")
     assert "UPPER(COALESCE(p_nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'" in sql
     assert "JOIN mrf.nucc_taxonomy p_nucc ON p_nucc.code = p_nt.healthcare_provider_taxonomy_code" in sql
     assert "LOWER(COALESCE(p_nucc.classification, '')) = LOWER(:p_classification)" in sql
-    assert params["p_classification"] == "Internal Medicine"
+    assert params_by_name["p_classification"] == "Internal Medicine"
     # include_subspecialties=true must not constrain specialization.
     assert "p_nucc.specialization" not in sql
 
@@ -240,6 +240,6 @@ def test_taxonomy_semijoin_sql_primary_only_and_classification_clauses():
 def test_taxonomy_semijoin_sql_inactive_filter_returns_empty():
     from api.provider_specialty_filters import provider_specialty_taxonomy_semijoin_sql
 
-    params = {}
-    assert provider_specialty_taxonomy_semijoin_sql(params, "p", resolve_provider_specialty_filter({}), schema="mrf") == ""
-    assert params == {}
+    params_by_name = {}
+    assert provider_specialty_taxonomy_semijoin_sql(params_by_name, "p", resolve_provider_specialty_filter({}), schema="mrf") == ""
+    assert params_by_name == {}

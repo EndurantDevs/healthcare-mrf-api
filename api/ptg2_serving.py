@@ -916,7 +916,7 @@ def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
     )
 
 
-def _ptg2_individual_npi_scalar_filter_sql(npi_sql: str) -> str:
+def _ptg2_individual_npi_scalar_sql(npi_sql: str) -> str:
     # Scalar-subquery form of _ptg2_individual_npi_exists_sql. The EXISTS form
     # gets pulled up into a semi-join, and against an unbounded outer (a whole
     # network member table) the planner then seq-scans + hashes all ~7M npi
@@ -2534,7 +2534,7 @@ async def _ptg2_manifest_location_provider_matches(
         # as a scalar probe per candidate AFTER the member x taxonomy
         # intersection (tens of thousands of rows) instead of inside it
         # (millions).
-        member_entity_filter_sql = _ptg2_individual_npi_scalar_filter_sql("scope_filter.npi")
+        member_entity_filter_sql = _ptg2_individual_npi_scalar_sql("scope_filter.npi")
     member_taxonomy_scoped = location_specialty_filter.active or bool(location_inferred_taxonomy_sql)
 
     member_scope_join = ""
