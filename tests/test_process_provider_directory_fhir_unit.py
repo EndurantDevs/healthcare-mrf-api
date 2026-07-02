@@ -2897,33 +2897,30 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_provider_directory_address_corroboration_sql_links_unified_npi_address_roles():
-    """Validate the corroboration view joins unified NPI addresses to FHIR roles."""
+def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_to_fhir_roles():
+    """Validate the corroboration view joins overlay NPI addresses to FHIR roles."""
     sql = importer.provider_directory_address_corroboration_sql("mrf")
 
     assert 'CREATE OR REPLACE VIEW "mrf"."provider_directory_address_corroboration" AS' in sql
-    assert 'FROM "mrf"."entity_address_unified" e' in sql
+    assert 'FROM "mrf"."provider_directory_address_overlay" overlay' in sql
+    assert 'FROM "mrf"."entity_address_unified" e' not in sql
     assert "WITH address_candidates AS" in sql
-    assert "'provider_directory_fhir' = ANY(e.address_sources)" in sql
+    assert "overlay.resource_type::varchar AS resource_type" in sql
+    assert "overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')" in sql
+    assert "split_part(overlay.source_record_id, ':', 5)" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
     assert "practitioner.npi = e.npi" in sql
-    assert 'JOIN "mrf"."provider_directory_location" loc' in sql
-    assert "COALESCE(role.location_refs::jsonb, '[]'::jsonb)" in sql
-    assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
-    assert "COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
-    assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in sql
-    assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
-    assert "COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)" in sql
-    assert "COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
-    assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
-    assert "role.location_ref IN (loc.resource_id, 'Location/' || loc.resource_id)" in sql
-    assert "role.location_ref LIKE '%/Location/' || loc.resource_id" in sql
+    assert 'LEFT JOIN "mrf"."provider_directory_location" loc' in sql
+    assert "loc.resource_id = e.location_resource_id" in sql
+    assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
+    assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
+    assert "organization_address_matches AS" in sql
+    assert "'organization_address'::varchar AS provider_directory_match_type" in sql
     assert 'LEFT JOIN "mrf"."provider_directory_network_catalog" network_catalog' in sql
     assert "network_catalog.network_resource_id = NULLIF(BTRIM(CASE" in sql
     assert "regexp_replace(network_ref.value, '^.*/Organization/', '')" in sql
     assert "regexp_replace(network_ref.value, '^Organization/', '')" in sql
-    assert "loc.address_key ~* '^[0-9a-f]{8}-" in sql
-    assert "THEN loc.address_key::uuid" in sql
+    assert "overlay.address_key::uuid AS address_key" in sql
     assert "jsonb_build_object(" in sql
     assert "'matched_on'," in sql
     assert "'npi_address_key_role_location'" in sql
@@ -2951,8 +2948,8 @@ def test_provider_directory_address_corroboration_sql_projects_network_plan_evid
     assert "'org_name', provider_directory_org_name" in sql
     assert "'plan_name', provider_directory_plan_name" in sql
     assert "provider_directory_insurance_plan_matches" in sql
-    assert "loc.phone_number AS provider_directory_phone_number" in sql
-    assert "loc.fax_number_digits AS provider_directory_fax_number_digits" in sql
+    assert "COALESCE(loc.phone_number, e.phone_number) AS provider_directory_phone_number" in sql
+    assert "COALESCE(loc.fax_number_digits, e.fax_number_digits) AS provider_directory_fax_number_digits" in sql
     assert "insurance_plan.plan_identifier" in sql
     assert "insurance_plan.network_refs::jsonb" in sql
     assert "network_org" not in sql
@@ -2962,6 +2959,7 @@ def test_provider_directory_address_corroboration_sql_projects_network_plan_evid
     assert "NULL::varchar AS ptg_plan_id" in sql
     assert "'payer_directory_corroborated_location'" in sql
     assert "'provider_directory_address'" in sql
+    assert "'npi_address_key_organization_address'" in sql
     assert "UNION ALL" in sql
     assert 'provider_directory_organization_affiliation' in sql
 
@@ -2992,7 +2990,8 @@ def test_provider_directory_address_corroboration_select_sql_returns_query_body(
 
     assert not sql.startswith("CREATE OR REPLACE VIEW")
     assert sql.startswith("WITH address_candidates AS")
-    assert 'FROM "mrf"."entity_address_unified" e' in sql
+    assert 'FROM "mrf"."provider_directory_address_overlay" overlay' in sql
+    assert 'FROM "mrf"."entity_address_unified" e' not in sql
     assert "provider_directory_network_names" in sql
 
 
@@ -3027,7 +3026,8 @@ async def test_publish_provider_directory_address_corroboration_table_swaps_inde
     publish_catalog.assert_awaited_once_with("mrf")
     assert 'DROP TABLE IF EXISTS "mrf"."pd_stage_corrob"' in joined
     assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_corrob" AS' in joined
-    assert 'FROM "mrf"."entity_address_unified" e' in joined
+    assert 'FROM "mrf"."provider_directory_address_overlay" overlay' in joined
+    assert 'FROM "mrf"."entity_address_unified" e' not in joined
     assert 'DROP VIEW "mrf"."provider_directory_address_corroboration"' in joined
     assert 'DROP TABLE "mrf"."provider_directory_address_corroboration";' not in joined
     assert (
