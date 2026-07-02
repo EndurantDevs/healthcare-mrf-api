@@ -1381,6 +1381,49 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert expanded.raw_payload["query_expansion_source"] is True
 
 
+def test_query_expansion_ranking_keeps_targeted_sources_before_generic_pages():
+    generic_sources = [
+        discovery.SourceCandidate(
+            payer_name=f"Example Regional {index}",
+            provider="master-list",
+            index_url=f"https://example{index}.test/mrf",
+            hosting_platform="html_mrf_links",
+        )
+        for index in range(30)
+    ]
+    talon = discovery.SourceCandidate(
+        payer_name="Example Talon TPA",
+        provider="master-list",
+        index_url="https://www.mymedicalshopper.com/mrf-search/example-tpa",
+        hosting_platform="mymedicalshopper_talon",
+    )
+    healthcarebluebook = discovery.SourceCandidate(
+        payer_name="Example Directory TPA",
+        provider="master-list",
+        index_url="https://mrf.healthcarebluebook.com/ExampleTPA",
+        hosting_platform="healthcarebluebook_mrf",
+    )
+    mixed = (
+        generic_sources[:10]
+        + [healthcarebluebook]
+        + generic_sources[10:20]
+        + [talon]
+        + generic_sources[20:]
+    )
+
+    ranked = discovery._rank_query_expansion_candidates(mixed)
+
+    assert [candidate.payer_name for candidate in ranked[:2]] == [
+        "Example Talon TPA",
+        "Example Directory TPA",
+    ]
+    assert [candidate.payer_name for candidate in ranked[2:5]] == [
+        "Example Regional 0",
+        "Example Regional 1",
+        "Example Regional 2",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_private_query_context_expands_supported_public_sources(
     tmp_path, monkeypatch

@@ -273,6 +273,23 @@ def _source_config() -> dict[str, Any]:
     return _SOURCE_CONFIG_CACHE
 
 
+TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
+    "mymedicalshopper_talon",
+    "mymedicalshopper_talon_bounded",
+    "healthcarebluebook_mrf",
+    "html_mrf_with_healthcarebluebook",
+    "payercompass_mrf",
+    "uhc_public_blobs",
+    "aetna_health1",
+    "sapphire",
+    "auxiant_wordpress",
+)
+SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
+    platform: rank
+    for rank, platform in enumerate(TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS)
+}
+
+
 def _provider_config(provider: str) -> dict[str, Any]:
     providers = _source_config().get("providers") or {}
     config = providers.get(provider)
@@ -12672,6 +12689,31 @@ def _candidate_supports_source_query_expansion(candidate: SourceCandidate) -> bo
     return bool(source_url)
 
 
+def _candidate_source_query_expansion_rank(candidate: SourceCandidate) -> int:
+    source_url = candidate.index_url or candidate.human_url
+    platform = candidate.hosting_platform or classify_hosting_platform(source_url)
+    return SOURCE_QUERY_EXPANSION_PLATFORM_RANK.get(
+        str(platform or ""),
+        len(SOURCE_QUERY_EXPANSION_PLATFORM_RANK),
+    )
+
+
+def _rank_query_expansion_candidates(
+    candidates: list[SourceCandidate],
+) -> list[SourceCandidate]:
+    ranked_candidates = (
+        (_candidate_source_query_expansion_rank(candidate), index, candidate)
+        for index, candidate in enumerate(candidates)
+    )
+    return [
+        candidate
+        for _, _, candidate in sorted(
+            ranked_candidates,
+            key=lambda item: (item[0], item[1]),
+        )
+    ]
+
+
 def _candidate_with_target_payer_query(
     candidate: SourceCandidate, query: str
 ) -> SourceCandidate:
@@ -14893,7 +14935,10 @@ async def main(
                         candidate, parsed_source_payer_query or ""
                     )
                 )
-        candidates = _dedupe_candidates(filtered_candidates + query_expansion_candidates)
+        candidates = _dedupe_candidates(
+            filtered_candidates
+            + _rank_query_expansion_candidates(query_expansion_candidates)
+        )
     candidates = [
         candidate
         for candidate in candidates
