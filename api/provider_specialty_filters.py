@@ -91,6 +91,13 @@ _SPECIALTY_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "rheumatologist": ("207RR0500X",),
     "ob-gyn": ("207V00000X",),
     "obgyn": ("207V00000X",),
+    "obstetrics and gynecology": ("207V00000X",),
+    "obstetrics gynecology": ("207V00000X",),
+    "obstetrics": ("207V00000X",),
+    "obstetrician": ("207V00000X",),
+    "gynecology": ("207V00000X",),
+    "gynecologist": ("207V00000X",),
+    "obstetrician gynecologist": ("207V00000X",),
     "infertility specialist": ("207VE0102X",),
     "ophthalmology": ("207W00000X",),
     "ophthalmologist": ("207W00000X",),
@@ -129,6 +136,28 @@ _CLASSIFICATION_BASE_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "dermatology": ("207N00000X",),
     "emergency medicine": ("207P00000X",),
     "dentist": ("122300000X",),
+}
+
+
+def _normalize_specialty_key(value: str) -> str:
+    # "Obstetrics & Gynecology", "obstetrics/gynecology", and "ob-gyn" should hit
+    # the same alias row as their canonical spellings.
+    key = value.lower()
+    for sep in ("&", "+"):
+        key = key.replace(sep, " and ")
+    for sep in ("/", "-", "_", ",", "."):
+        key = key.replace(sep, " ")
+    return " ".join(key.split())
+
+
+_NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
+    _normalize_specialty_key(alias): codes
+    for alias, codes in _SPECIALTY_TAXONOMY_CODE_ALIASES.items()
+}
+
+_NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES: dict[str, str] = {
+    _normalize_specialty_key(alias): classification
+    for alias, classification in _SPECIALTY_CLASSIFICATION_ALIASES.items()
 }
 
 
@@ -196,11 +225,17 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
     if args.get("primary_only") not in (None, ""):
         primary_only = _normalize_bool(args.get("primary_only"))
 
-    key = specialty.lower()
-    if not taxonomy_codes and key in _SPECIALTY_TAXONOMY_CODE_ALIASES:
-        taxonomy_codes = _SPECIALTY_TAXONOMY_CODE_ALIASES[key]
-    if not classification and key in _SPECIALTY_CLASSIFICATION_ALIASES:
-        classification = _SPECIALTY_CLASSIFICATION_ALIASES[key]
+    key = _normalize_specialty_key(specialty)
+    if not taxonomy_codes and key in _NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES:
+        taxonomy_codes = _NORMALIZED_SPECIALTY_TAXONOMY_CODE_ALIASES[key]
+    if not classification and key in _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES:
+        classification = _NORMALIZED_SPECIALTY_CLASSIFICATION_ALIASES[key]
+    if specialty and not taxonomy_codes and not classification:
+        # Unknown alias: fall back to matching the raw string against the NUCC
+        # classification column so canonical names ("Obstetrics & Gynecology",
+        # "Urology", ...) filter instead of leaving the specialty unresolved,
+        # which upstream guards treat as "no specialty supplied" and reject.
+        classification = specialty
     use_classification_predicate = True
     classification_key = classification.lower()
     if (
