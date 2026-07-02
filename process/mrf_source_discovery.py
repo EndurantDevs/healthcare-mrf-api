@@ -14574,6 +14574,122 @@ def _discovery_control_metrics(
     }
 
 
+def _discovery_crawl_run_row(
+    run_context_dict: dict[str, Any],
+    *,
+    status: str,
+    result: DiscoveryResult | None = None,
+    finished_at: dt.datetime | None = None,
+    bytes_streamed: int = 0,
+    error_dicts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the persisted crawl-run summary row for any terminal or active state."""
+    return {
+        "crawl_run_id": run_context_dict["crawl_run_id"],
+        "run_id": run_context_dict["control_run_id"],
+        "provider": ",".join(run_context_dict["providers"]),
+        "mode": run_context_dict["run_mode"],
+        "status": status,
+        "started_at": run_context_dict["started_at"],
+        "finished_at": finished_at,
+        "params": run_context_dict["run_params"],
+        "sources_discovered": result.sources if result is not None else 0,
+        "urls_checked": result.urls_checked if result is not None else 0,
+        "etag_skipped": 0,
+        "plans_discovered": result.plans if result is not None else 0,
+        "files_discovered": result.files if result is not None else 0,
+        "bytes_streamed": bytes_streamed,
+        "errors": error_dicts if error_dicts is not None else [],
+    }
+
+
+async def _persist_failed_discovery_crawl_row(
+    failure_context_dict: dict[str, Any]
+) -> None:
+    """Persist the crawl-run row for an already-announced discovery failure."""
+    discovery_result = failure_context_dict["result"]
+    error_dict = failure_context_dict["error_dict"]
+    finished_at = failure_context_dict["finished_at"]
+    run_context_dict = failure_context_dict["run_context_dict"]
+    try:
+        await push_objects(
+            [
+                _discovery_crawl_run_row(
+                    run_context_dict,
+                    status="failed",
+                    result=discovery_result,
+                    finished_at=finished_at,
+                    error_dicts=[error_dict],
+                )
+            ],
+            MRFCrawlRun,
+            rewrite=True,
+            use_copy=False,
+        )
+    except Exception:  # pragma: no cover - preserve the original failure.
+        logging.getLogger(__name__).debug(
+            "failed to persist mrf source discovery failure",
+            exc_info=True,
+        )
+
+
+async def _publish_failed_discovery_state(
+    failure_context_dict: dict[str, Any]
+) -> None:
+    """Publish terminal progress/events for an already-announced discovery failure."""
+    discovery_result = failure_context_dict["result"]
+    failure_message = failure_context_dict["message"]
+    error_dict = failure_context_dict["error_dict"]
+    finished_at = failure_context_dict["finished_at"]
+    run_context_dict = failure_context_dict["run_context_dict"]
+    control_run_id = run_context_dict["control_run_id"]
+    if not control_run_id:
+        return
+    progress_dict = {
+        "unit": "sources",
+        "done": discovery_result.sources,
+        "total": max(discovery_result.sources, 1),
+        "pct": 0,
+        "message": failure_message,
+        "phase": "mrf source discovery failed",
+    }
+    enqueue_live_progress(
+        run_id=control_run_id,
+        importer="mrf-source-discovery",
+        status="failed",
+        **progress_dict,
+    )
+    if not failure_context_dict["emit_standalone_control_events"]:
+        return
+    _emit_discovery_control_event(
+        control_run_id=control_run_id,
+        crawl_run_id=run_context_dict["crawl_run_id"],
+        status="failed",
+        phase_detail="mrf source discovery failed",
+        progress=progress_dict,
+        params=run_context_dict["run_params"],
+        metrics=_discovery_control_metrics(
+            discovery_result,
+            crawl_status="failed",
+            crawl_run_id=run_context_dict["crawl_run_id"],
+            run_mode=run_context_dict["run_mode"],
+        ),
+        error=error_dict,
+        started_at=run_context_dict["started_at"],
+        finished_at=finished_at,
+        triggered_by=failure_context_dict["triggered_by"],
+    )
+    await _flush_discovery_control_events()
+
+
+async def _record_failed_discovery_state(
+    failure_context_dict: dict[str, Any]
+) -> None:
+    """Persist and publish terminal state for an already-announced discovery failure."""
+    await _persist_failed_discovery_crawl_row(failure_context_dict)
+    await _publish_failed_discovery_state(failure_context_dict)
+
+
 def _emit_discovery_control_event(
     *,
     control_run_id: str,
@@ -14686,6 +14802,14 @@ async def main(
         concurrency=concurrency,
         crawl_target_limit=crawl_target_limit,
     )
+    run_context_dict = {
+        "crawl_run_id": crawl_run_id,
+        "control_run_id": control_run_id,
+        "providers": providers,
+        "run_mode": run_mode,
+        "started_at": started_at,
+        "run_params": run_params,
+    }
     emit_standalone_control_events = bool(not dry_run and not run_id)
     if emit_standalone_control_events:
         _emit_discovery_control_event(
@@ -14792,73 +14916,98 @@ async def main(
         )
         return result.as_dict()
 
-    await init_db(db, asyncio.get_event_loop())
-    await ensure_database(test_mode)
-    await _ensure_catalog_tables()
-    await push_objects(
-        [
-            {
-                "crawl_run_id": crawl_run_id,
-                "run_id": control_run_id,
-                "provider": ",".join(providers),
-                "mode": run_mode,
-                "status": "running",
-                "started_at": started_at,
-                "params": run_params,
-                "sources_discovered": 0,
-                "urls_checked": 0,
-                "etag_skipped": 0,
-                "plans_discovered": 0,
-                "files_discovered": 0,
-                "bytes_streamed": 0,
-                "errors": [],
-            }
-        ],
-        MRFCrawlRun,
-        rewrite=True,
-        use_copy=False,
-    )
+    recorded_failure_run_ids: set[str] = set()
 
-    payer_rows, source_rows = await _store_candidates(candidates)
+    async def record_discovery_failure(exc: BaseException) -> None:
+        """Persist and publish a terminal failure without suppressing the original exception."""
+        if control_run_id in recorded_failure_run_ids:
+            return
+        recorded_failure_run_ids.add(control_run_id)
+        finished_at = _utc_now()
+        message = str(exc).strip() or exc.__class__.__name__
+        error_dict = {"code": "source_discovery_failed", "message": message}
+        await _record_failed_discovery_state(
+            {
+                "run_context_dict": run_context_dict,
+                "result": result,
+                "message": message,
+                "error_dict": error_dict,
+                "finished_at": finished_at,
+                "emit_standalone_control_events": emit_standalone_control_events,
+                "triggered_by": "direct_cli" if not run_id else None,
+            }
+        )
+
+    try:
+        await init_db(db, asyncio.get_event_loop())
+        await ensure_database(test_mode)
+        await _ensure_catalog_tables()
+        await push_objects(
+            [_discovery_crawl_run_row(run_context_dict, status="running")],
+            MRFCrawlRun,
+            rewrite=True,
+            use_copy=False,
+        )
+    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+        await record_discovery_failure(exc)
+        raise
+
+    try:
+        payer_rows, source_rows = await _store_candidates(candidates)
+    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+        await record_discovery_failure(exc)
+        raise
     result.payers = len(payer_rows)
     result.sources = len(source_rows)
     observations: list[dict[str, Any]] = []
     observation_run_id = control_run_id
     progress_run_id = control_run_id
     if check_urls:
-        observations = await _store_observations(
-            source_rows,
-            test_mode=test_mode,
-            run_id=observation_run_id,
-            progress_run_id=progress_run_id,
-            concurrency=concurrency,
-        )
-        result.urls_checked = len(observations)
-    if crawl:
-        plans_discovered, files_discovered, crawl_observations = (
-            await _crawl_toc_metadata(
-                [row for row in source_rows if _source_row_is_importable(row)],
+        try:
+            observations = await _store_observations(
+                source_rows,
                 test_mode=test_mode,
                 run_id=observation_run_id,
                 progress_run_id=progress_run_id,
-                max_toc_bytes=max_toc_bytes,
                 concurrency=concurrency,
-                crawl_target_limit=crawl_target_limit,
             )
-        )
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
+        result.urls_checked = len(observations)
+    if crawl:
+        try:
+            plans_discovered, files_discovered, crawl_observations = (
+                await _crawl_toc_metadata(
+                    [row for row in source_rows if _source_row_is_importable(row)],
+                    test_mode=test_mode,
+                    run_id=observation_run_id,
+                    progress_run_id=progress_run_id,
+                    max_toc_bytes=max_toc_bytes,
+                    concurrency=concurrency,
+                    crawl_target_limit=crawl_target_limit,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
         observations.extend(crawl_observations)
         result.plans = plans_discovered
         result.files = files_discovered
     if probe_files:
-        probe_observations, ok_count = await _probe_mrf_file_heads(
-            file_types=parsed_file_probe_types,
-            limit=file_probe_limit,
-            entity_types=parsed_file_probe_entity_types,
-            payer_query=parsed_file_probe_payer_query,
-            run_id=observation_run_id,
-            progress_run_id=progress_run_id,
-            concurrency=concurrency,
-        )
+        try:
+            probe_observations, ok_count = await _probe_mrf_file_heads(
+                file_types=parsed_file_probe_types,
+                limit=file_probe_limit,
+                entity_types=parsed_file_probe_entity_types,
+                payer_query=parsed_file_probe_payer_query,
+                run_id=observation_run_id,
+                progress_run_id=progress_run_id,
+                concurrency=concurrency,
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+            await record_discovery_failure(exc)
+            raise
         observations.extend(probe_observations)
         result.files_probed = len(probe_observations)
         result.file_probe_ok = ok_count
@@ -14925,30 +15074,25 @@ async def main(
     crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
     finished_at = _utc_now()
     bytes_streamed = sum(int(item.get("content_length") or 0) for item in observations)
-    await push_objects(
-        [
-            {
-                "crawl_run_id": crawl_run_id,
-                "run_id": control_run_id,
-                "provider": ",".join(providers),
-                "mode": run_mode,
-                "status": crawl_status,
-                "started_at": started_at,
-                "finished_at": finished_at,
-                "params": run_params,
-                "sources_discovered": result.sources,
-                "urls_checked": result.urls_checked,
-                "etag_skipped": 0,
-                "plans_discovered": result.plans,
-                "files_discovered": result.files,
-                "bytes_streamed": bytes_streamed,
-                "errors": result.errors,
-            }
-        ],
-        MRFCrawlRun,
-        rewrite=True,
-        use_copy=False,
-    )
+    try:
+        await push_objects(
+            [
+                _discovery_crawl_run_row(
+                    run_context_dict,
+                    status=crawl_status,
+                    result=result,
+                    finished_at=finished_at,
+                    bytes_streamed=bytes_streamed,
+                    error_dicts=result.errors,
+                )
+            ],
+            MRFCrawlRun,
+            rewrite=True,
+            use_copy=False,
+        )
+    except BaseException as exc:  # pragma: no cover - re-raised after cleanup.
+        await record_discovery_failure(exc)
+        raise
     if control_run_id:
         enqueue_live_progress(
             run_id=control_run_id,

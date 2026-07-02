@@ -2483,7 +2483,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | aliases: UGS |
 | WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | aliases: WellNet Healthcare |
 | The Health Plan | regional | https://www.healthplan.org/machine_readable_files | aliases: The Health Plan of West Virginia, THP |
-| BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | aliases: Blue Cross and Blue Shield of Wyoming, BCBSWY |
+| BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | benefit lines: medical, dental, vision; aliases: Blue Cross and Blue Shield of Wyoming, Blue Cross Blue Shield Wyoming, Blue Cross Blue Shield of Wyoming, BCBSWY, BCBSWY Dental, BCBSWY Vision |
 | WPS Health | regional | https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml | aliases: Wisconsin Physicians Service, WPS |
 | SummaCare | regional | https://files.myplancentral.com/TIC/TOC/ | aliases: SummaCare MEWA, Summa Health System |
 | Health Alliance Plan | provider_sponsored | https://hap.healthsparq.com/healthsparq/public/#/one/insurerCode=HAP_I&brandCode=HAP/machine-readable-transparency-in-coverage | aliases: HAP, Alliance Health and Life Insurance Company |
@@ -2731,9 +2731,18 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "THP",
     )
     assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
+    assert by_name["BCBS Wyoming"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
     assert by_name["BCBS Wyoming"].aliases == (
         "Blue Cross and Blue Shield of Wyoming",
+        "Blue Cross Blue Shield Wyoming",
+        "Blue Cross Blue Shield of Wyoming",
         "BCBSWY",
+        "BCBSWY Dental",
+        "BCBSWY Vision",
     )
     assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
     assert by_name["WPS Health"].aliases == ("Wisconsin Physicians Service", "WPS")
@@ -3741,9 +3750,18 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "BlueCross BlueShield of South Carolina" in aliases_by_name["BCBS South Carolina"]
     assert by_name["BCBS Alabama"].hosting_platform == "direct_toc"
     assert "BlueCross BlueShield of Alabama" in by_name["BCBS Alabama"].aliases
+    assert by_name["BCBS North Dakota"].benefit_lines == ("medical", "dental")
+    assert "BCBSND Dental" in by_name["BCBS North Dakota"].aliases
     assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
+    assert by_name["BCBS Wyoming"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
     assert "Blue Cross and Blue Shield of Wyoming" in by_name["BCBS Wyoming"].aliases
     assert "BCBSWY" in by_name["BCBS Wyoming"].aliases
+    assert "BCBSWY Dental" in by_name["BCBS Wyoming"].aliases
+    assert "BCBSWY Vision" in by_name["BCBS Wyoming"].aliases
     assert "Blue Cross Blue Shield/Blue Water" in by_name["BCBS Michigan"].aliases
     assert "Blue Cross & Blue Shield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert "BlueCross BlueShield of Mississippi" in by_name["BCBS Mississippi"].aliases
@@ -3759,9 +3777,13 @@ async def test_master_list_keeps_high_value_public_aliases():
         in by_name["BCBS Massachusetts"].aliases
     )
     assert by_name["BCBS Massachusetts"].benefit_lines == ("medical", "dental")
+    assert "Blue Cross Blue Shield Arkansas" in by_name["Arkansas BCBS"].aliases
+    assert "Blue Cross Blue Shield Louisiana" in by_name["BCBS Louisiana"].aliases
     assert "MISSOURI BLUE CROSS OF KANSAS CITY" in by_name["BCBS Kansas City"].aliases
+    assert "Blue Cross Blue Shield Hawaii" in by_name["HMSA"].aliases
     assert "BlueCross BlueShield of AZ" in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of Arizona" in by_name["BCBS Arizona"].aliases
+    assert "Blue Cross Blue Shield Arizona" in by_name["BCBS Arizona"].aliases
     assert "Blue Cross Blue Shield of Arizona" in by_name["BCBS Arizona"].aliases
     assert "ARIZONA BLUE CROSS" in by_name["BCBS Arizona"].aliases
     assert (
@@ -3784,7 +3806,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BCBS Texas"].benefit_lines == ("medical", "vision")
     assert by_name["BCBS Tennessee"].benefit_lines == ("medical", "dental")
     assert by_name["BCBS Tennessee ASO"].benefit_lines == ("medical", "dental")
+    assert "Blue Cross Blue Shield Tennessee" in by_name["BCBS Tennessee"].aliases
+    assert "Blue Cross Blue Shield TN" in by_name["BCBS Tennessee"].aliases
     assert "BCBS Tennessee" in by_name["BCBS Tennessee ASO"].aliases
+    assert "Blue Cross Blue Shield Tennessee" in by_name["BCBS Tennessee ASO"].aliases
+    assert "Blue Cross Blue Shield Rhode Island" in by_name["BCBS Rhode Island"].aliases
+    assert "Blue Cross Blue Shield South Carolina" in aliases_by_name["BCBS South Carolina"]
+    assert "Blue Cross Blue Shield Vermont" in by_name["BCBS Vermont"].aliases
     assert "Premera Blue Cross WA AK" in by_name["Premera Blue Cross"].aliases
     assert (
         "BLUE CROSS WA/AK PREMERA BLUE CROSS"
@@ -4003,7 +4031,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         "Blue Cross and Blue Shield of Arizona, Inc."
     )
     assert "BCBS Arizona" in matching_names("Blue Cross Blue Shield  of Arizona")
+    assert "BCBS Arizona" in matching_importable_names("Blue Cross Blue Shield Arizona")
     assert "BCBS Arizona" in matching_names("ARIZONA BLUE CROSS")
+    assert "BCBS Tennessee" in matching_importable_names("Blue Cross Blue Shield TN")
     assert "BCBS Alabama" in matching_names("BlueCross BlueShield of Alabama")
     assert "BCBS Massachusetts" in matching_names(
         "Blue Cross and Blue Shield of Massachusetts HMO Blue, Inc."
@@ -14501,6 +14531,61 @@ async def test_direct_discovery_run_emits_import_control_visible_state(monkeypat
         control_run_id,
     ]
     assert flushed == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch):
+    """Direct CLI discovery failures must publish terminal visible state."""
+    push_calls = []
+    control_events = []
+    progress_events = []
+    flush_timeouts = []
+
+    async def fake_push_objects(row_dicts, orm_model, *, rewrite, use_copy):
+        push_calls.append((orm_model, row_dicts, rewrite, use_copy))
+
+    def fake_flush(timeout_seconds):
+        flush_timeouts.append(timeout_seconds)
+
+    def record_live_progress(**progress_payload):
+        progress_events.append(progress_payload)
+
+    source_candidate = discovery.SourceCandidate(
+        payer_name="Example Payer",
+        provider="master-list",
+        index_url="https://example.com/index.json",
+        status="active",
+    )
+    replacements = [
+        ("_load_candidates", AsyncMock(return_value=[source_candidate])),
+        ("init_db", AsyncMock()),
+        ("ensure_database", AsyncMock()),
+        ("_ensure_catalog_tables", AsyncMock()),
+        ("push_objects", fake_push_objects),
+        ("_store_candidates", AsyncMock(side_effect=RuntimeError("catalog write failed"))),
+        ("enqueue_status_event", control_events.append),
+        ("enqueue_live_progress", record_live_progress),
+        ("flush_status_events", AsyncMock(side_effect=fake_flush)),
+    ]
+    for attribute_name, replacement_value in replacements:
+        monkeypatch.setattr(discovery, attribute_name, replacement_value)
+
+    with pytest.raises(RuntimeError, match="catalog write failed"):
+        await discovery.main(test_mode=True, provider="master-list", limit=1)
+
+    crawl_rows = [
+        row_dicts[0]
+        for pushed_model, row_dicts, rewrite_flag, copy_flag in push_calls
+        if pushed_model is discovery.MRFCrawlRun
+    ]
+    assert all(rewrite_flag is True and copy_flag is False for _, _, rewrite_flag, copy_flag in push_calls)
+    assert [event["status"] for event in control_events] == ["running", "failed"]
+    assert [crawl_row["status"] for crawl_row in crawl_rows] == ["running", "failed"]
+    assert control_events[1]["phase_detail"] == "mrf source discovery failed"
+    assert control_events[1]["error"]["message"] == "catalog write failed"
+    assert progress_events[-1]["status"] == "failed"
+    assert progress_events[-1]["message"] == "catalog write failed"
+    assert flush_timeouts == [1.0]
 
 
 @pytest.mark.asyncio
