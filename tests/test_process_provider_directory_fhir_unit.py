@@ -4650,7 +4650,7 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(
+    location_fetch_result = await importer._fetch_resource_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
@@ -4668,19 +4668,19 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
         "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
         "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
     ]
-    assert result is not None
-    assert result.model is ProviderDirectoryLocation
-    assert result.rows_fetched == 1
-    assert result.rows[0]["resource_id"] == "location-1"
-    assert result.error == "partition_errors_1_last_http_413"
+    assert location_fetch_result is not None
+    assert location_fetch_result.model is ProviderDirectoryLocation
+    assert location_fetch_result.rows_fetched == 1
+    assert location_fetch_result.rows[0]["resource_id"] == "location-1"
+    assert location_fetch_result.error == "partition_errors_1_last_http_413"
 
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
-    calls: list[str] = []
+    fetched_urls: list[str] = []
 
     async def fake_fetch_json(_source, url, *, timeout):
-        calls.append(url)
+        fetched_urls.append(url)
         return (
             200,
             {
@@ -4688,10 +4688,10 @@ async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
                 "link": [{"relation": "next", "url": "https://example.test/fhir/Location?page=2"}],
                 "entry": [
                     {
-                        "fullUrl": f"https://example.test/fhir/Location/location-{len(calls)}",
+                        "fullUrl": f"https://example.test/fhir/Location/location-{len(fetched_urls)}",
                         "resource": {
                             "resourceType": "Location",
-                            "id": f"location-{len(calls)}",
+                            "id": f"location-{len(fetched_urls)}",
                             "address": {
                                 "line": ["1 Main St"],
                                 "city": "Long Beach",
@@ -4711,7 +4711,7 @@ async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
     monotonic_values = iter([0.0, 0.0, 2.0])
     monkeypatch.setattr(importer.time, "monotonic", lambda: next(monotonic_values, 2.0))
 
-    result = await importer._fetch_resource_rows(
+    location_fetch_result = await importer._fetch_resource_rows(
         {
             "source_id": "example",
             "api_base": "https://example.test/fhir",
@@ -4726,14 +4726,14 @@ async def test_fetch_resource_rows_stops_at_deadline(monkeypatch):
         deadline_seconds=1,
     )
 
-    assert result is not None
-    assert result.rows_fetched == 1
-    assert result.complete is False
-    assert result.bounded is True
-    assert result.deadline_reached is True
-    assert result.next_url_remaining is True
-    assert result.error == "deadline_reached"
-    assert len(calls) == 1
+    assert location_fetch_result is not None
+    assert location_fetch_result.rows_fetched == 1
+    assert location_fetch_result.complete is False
+    assert location_fetch_result.bounded is True
+    assert location_fetch_result.deadline_reached is True
+    assert location_fetch_result.next_url_remaining is True
+    assert location_fetch_result.error == "deadline_reached"
+    assert len(fetched_urls) == 1
 
 
 @pytest.mark.asyncio

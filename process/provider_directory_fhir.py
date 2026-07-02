@@ -7254,7 +7254,7 @@ async def _fetch_resource_rows(
     next_url_remaining = False
     error_message: str | None = None
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
-    deadline_reached = False
+    is_deadline_reached = False
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     partitioned_fetch = len(start_urls) > 1
     partition_error_count = 0
@@ -7272,7 +7272,7 @@ async def _fetch_resource_rows(
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if deadline_at is not None and time.monotonic() >= deadline_at:
-                deadline_reached = True
+                is_deadline_reached = True
                 next_url_remaining = True
                 break
             if page_limit > 0 and pages >= page_limit:
@@ -7332,7 +7332,7 @@ async def _fetch_resource_rows(
                     row_limit_reached = entry_index < len(entries) - 1
                     break
                 if deadline_at is not None and time.monotonic() >= deadline_at:
-                    deadline_reached = True
+                    is_deadline_reached = True
                     next_url_remaining = True
                     break
             next_url = _next_link(payload)
@@ -7345,7 +7345,7 @@ async def _fetch_resource_rows(
             row_limit_reached
             or page_limit_reached
             or hard_page_limit_reached
-            or deadline_reached
+            or is_deadline_reached
             or (error_message and not partitioned_fetch)
             or not _limit_allows_more(rows_fetched, per_resource_limit)
         ):
@@ -7356,7 +7356,7 @@ async def _fetch_resource_rows(
         and not row_limit_reached
         and not page_limit_reached
         and not hard_page_limit_reached
-        and not deadline_reached
+        and not is_deadline_reached
         and not url
     )
     return ResourceFetchResult(
@@ -7370,8 +7370,8 @@ async def _fetch_resource_rows(
         page_limit_reached=page_limit_reached,
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining or bool(url),
-        error=error_message or ("deadline_reached" if deadline_reached else None),
-        deadline_reached=deadline_reached,
+        error=error_message or ("deadline_reached" if is_deadline_reached else None),
+        deadline_reached=is_deadline_reached,
     )
 
 
