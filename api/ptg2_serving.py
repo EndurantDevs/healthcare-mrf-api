@@ -198,27 +198,14 @@ _PROVIDER_GROUP_LOCATION_SQL = """
                     {group_location_select_sql},
                     'entity_address_unified'::varchar AS location_source,
                     'entity_address_unified'::varchar AS location_confidence_code,
-                    jsonb_build_object(
-                        'first_line', loc.first_line,
-                        'second_line', loc.second_line,
-                        'city', loc.city_name,
-                        'state', loc.state_name,
-                        'postal_code', loc.postal_code,
-                        'country_code', loc.country_code,
-                        'zip5', LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5),
-                        'address_key', loc.address_key::text,
-                        'address_checksum', loc.address_checksum,
-                        'address_precision', loc.address_precision,
-                        'formatted_address', loc.formatted_address,
-                        'lat', loc.lat,
-                        'long', loc.long,
-                        'telephone_number', loc.telephone_number,
-                        'fax_number', loc.fax_number,
-                        'phone_number', loc.phone_number,
-                        'phone_extension', loc.phone_extension,
-                        'fax_number_digits', loc.fax_number_digits,
-                        'fax_extension', loc.fax_extension
-                    )::text AS address_payload,
+                    loc.first_line,
+                    loc.second_line,
+                    loc.postal_code,
+                    loc.country_code,
+                    loc.address_precision,
+                    loc.formatted_address,
+                    loc.lat,
+                    loc.long,
                     loc.telephone_number,
                     loc.fax_number,
                     loc.phone_number,
@@ -226,10 +213,8 @@ _PROVIDER_GROUP_LOCATION_SQL = """
                     loc.fax_number_digits,
                     loc.fax_extension,
                     loc.address_type,
-                    loc.address_checksum,
-                    {provider_name_sql} AS provider_name
+                    loc.address_checksum
                 {provider_group_location_from_sql}
-                {provider_location_join}
                 {location_rate_scope_join}
                 WHERE {location_where_sql}
                   AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
@@ -253,6 +238,28 @@ _PROVIDER_GROUP_LOCATION_SQL = """
             located_with_tax AS MATERIALIZED (
                 SELECT
                     loc.*,
+                    jsonb_build_object(
+                        'first_line', loc.first_line,
+                        'second_line', loc.second_line,
+                        'city', loc.city,
+                        'state', loc.state,
+                        'postal_code', loc.postal_code,
+                        'country_code', loc.country_code,
+                        'zip5', loc.zip5,
+                        'address_key', loc.address_key::text,
+                        'address_checksum', loc.address_checksum,
+                        'address_precision', loc.address_precision,
+                        'formatted_address', loc.formatted_address,
+                        'lat', loc.lat,
+                        'long', loc.long,
+                        'telephone_number', loc.telephone_number,
+                        'fax_number', loc.fax_number,
+                        'phone_number', loc.phone_number,
+                        'phone_extension', loc.phone_extension,
+                        'fax_number_digits', loc.fax_number_digits,
+                        'fax_extension', loc.fax_extension
+                    )::text AS address_payload,
+                    {provider_name_sql} AS provider_name,
                     tax.taxonomy_codes,
                     tax.specialties,
                     tax.classifications,
@@ -260,6 +267,7 @@ _PROVIDER_GROUP_LOCATION_SQL = """
                     tax.primary_specialty,
                     tax.primary_specialization
                 FROM location_npis loc
+                {provider_location_join}
                 {provider_taxonomy_summary_lateral_sql}
             )
             SELECT
