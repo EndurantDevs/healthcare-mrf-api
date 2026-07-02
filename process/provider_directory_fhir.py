@@ -2722,6 +2722,7 @@ def provider_directory_address_corroboration_sql(
          WHERE COALESCE(e.npi, e.inferred_npi) IS NOT NULL
            AND e.address_key IS NOT NULL
            AND e.type IN ('practice', 'primary', 'secondary', 'site')
+           AND 'provider_directory_fhir' = ANY(e.address_sources)
     ),
     practitioner_role_locations AS (
         SELECT

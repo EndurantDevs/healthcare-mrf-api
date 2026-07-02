@@ -2903,6 +2903,7 @@ def test_provider_directory_address_corroboration_sql_links_unified_npi_address_
     assert 'CREATE OR REPLACE VIEW "mrf"."provider_directory_address_corroboration" AS' in sql
     assert 'FROM "mrf"."entity_address_unified" e' in sql
     assert "WITH address_candidates AS" in sql
+    assert "'provider_directory_fhir' = ANY(e.address_sources)" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
     assert "practitioner.npi = e.npi" in sql
     assert 'JOIN "mrf"."provider_directory_location" loc' in sql
