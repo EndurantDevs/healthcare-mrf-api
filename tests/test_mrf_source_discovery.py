@@ -14,6 +14,61 @@ import pytest
 discovery = importlib.import_module("process.mrf_source_discovery")
 
 
+class _FakeChunkedContent:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    async def iter_chunked(self, _size):
+        yield self._body
+
+
+class _FakeFetchResponse:
+    def __init__(
+        self,
+        *,
+        status: int,
+        body: bytes,
+        content_type: str,
+        url: str = "https://example.test/toc.json",
+    ):
+        self.status = status
+        self.headers = {"Content-Type": content_type}
+        self.content = _FakeChunkedContent(body)
+        self.charset = "utf-8"
+        self.url = url
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def release(self):
+        return None
+
+
+class _RecordingBrowserFallbackSession:
+    observed_user_agents: list[str] = []
+    response = _FakeFetchResponse(
+        status=200,
+        body=b'{"ok": true}',
+        content_type="application/json",
+    )
+
+    def __init__(self, *, headers, **_kwargs):
+        self.observed_user_agents.append(headers["User-Agent"])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def get(self, _url, *, allow_redirects):
+        assert allow_redirects is True
+        return self.response
+
+
 def test_source_urls_are_loaded_from_registry_file():
     config = discovery._source_config()
 
@@ -4162,53 +4217,25 @@ async def test_fetch_json_retries_browser_headers_after_406(monkeypatch):
     async def allow_url(_url):
         return None
 
-    class FakeContent:
-        def __init__(self, body: bytes):
-            self._body = body
-
-        async def iter_chunked(self, _size):
-            yield self._body
-
-    class FakeResponse:
-        def __init__(self, status: int, body: bytes, content_type: str):
-            self.status = status
-            self.headers = {"Content-Type": content_type}
-            self.content = FakeContent(body)
-            self.charset = "utf-8"
-            self.url = "https://example.test/toc.json"
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        def release(self):
-            return None
-
     class InitialSession:
         def get(self, _url, *, allow_redirects):
             assert allow_redirects is True
-            return FakeResponse(406, b"<html>not acceptable</html>", "text/html")
-
-    fallback_headers = {}
-
-    class BrowserFallbackSession:
-        def __init__(self, *, headers, **_kwargs):
-            fallback_headers.update(headers)
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-        def get(self, _url, *, allow_redirects):
-            assert allow_redirects is True
-            return FakeResponse(200, b'{"ok": true}', "application/json")
+            return _FakeFetchResponse(
+                status=406,
+                body=b"<html>not acceptable</html>",
+                content_type="text/html",
+            )
 
     monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
-    monkeypatch.setattr(discovery.aiohttp, "ClientSession", BrowserFallbackSession)
+    _RecordingBrowserFallbackSession.observed_user_agents = []
+    _RecordingBrowserFallbackSession.response = _FakeFetchResponse(
+        status=200,
+        body=b'{"ok": true}',
+        content_type="application/json",
+    )
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _RecordingBrowserFallbackSession
+    )
 
     payload = await discovery._fetch_json_value(
         "https://example.test/toc.json",
@@ -4217,7 +4244,45 @@ async def test_fetch_json_retries_browser_headers_after_406(monkeypatch):
     )
 
     assert payload == {"ok": True}
-    assert fallback_headers["User-Agent"] == discovery.BROWSER_FALLBACK_USER_AGENT
+    assert _RecordingBrowserFallbackSession.observed_user_agents == [
+        discovery.BROWSER_FALLBACK_USER_AGENT
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_retries_browser_headers_after_connection_reset(monkeypatch):
+    """Connection resets from HTML directory hosts should use browser fallback."""
+
+    async def allow_url(_url):
+        return None
+
+    class InitialSession:
+        def get(self, _url, *, allow_redirects):
+            assert allow_redirects is True
+            raise discovery.aiohttp.ClientOSError(54, "connection reset by peer")
+
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
+    _RecordingBrowserFallbackSession.observed_user_agents = []
+    _RecordingBrowserFallbackSession.response = _FakeFetchResponse(
+        status=200,
+        body=b"<html>ok</html>",
+        content_type="text/html",
+        url="https://transparency.example.test/INN",
+    )
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _RecordingBrowserFallbackSession
+    )
+
+    text = await discovery._fetch_text(
+        "https://transparency.example.test/INN",
+        max_bytes=1024,
+        session=InitialSession(),
+    )
+
+    assert text == "<html>ok</html>"
+    assert _RecordingBrowserFallbackSession.observed_user_agents == [
+        discovery.BROWSER_FALLBACK_USER_AGENT
+    ]
 
 
 @pytest.mark.asyncio
@@ -4509,6 +4574,29 @@ def test_master_list_marks_replaced_viva_transparency_url_archived():
     assert candidate.status == "archived"
     assert candidate.hosting_platform == "custom"
     assert not discovery._candidate_is_importable_source(candidate)
+
+
+def test_master_list_demotes_replaced_transparency_legal_page():
+    markdown = """
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Example Regional Plan | regional | https://transparency.example.test/ | curated source row |
+| Example Regional Plan | regional | https://www.example.test/about/transparency-coverage-compliance | observed stale; replaced by dedicated price-transparency machine-readable-files host |
+"""
+
+    candidates = discovery.parse_master_list(markdown)
+
+    by_url = {candidate.index_url: candidate for candidate in candidates}
+    current = by_url["https://transparency.example.test/"]
+    replaced = by_url[
+        "https://www.example.test/about/transparency-coverage-compliance"
+    ]
+
+    assert current.status == "active"
+    assert current.hosting_platform == "custom"
+    assert discovery._candidate_is_importable_source(current)
+    assert replaced.status == "stale"
+    assert not discovery._candidate_is_importable_source(replaced)
 
 
 def test_import_control_snapshot_company_fallback_from_index_url():
@@ -10907,6 +10995,21 @@ def test_parse_html_mrf_links_accepts_query_named_download_body_files():
             ],
         },
     ]
+
+
+def test_html_mrf_directory_links_include_connecticare_style_network_folders():
+    html = """
+    <a href="github.com/CMSgov/price-transparency-guide">CMS guide</a>
+    <a href="/INN">In-Network</a>
+    <a href="/OON">Out-Of-Network</a>
+    """
+
+    urls = discovery._html_mrf_directory_urls(
+        html, base_url="https://transparency.example.test/"
+    )
+
+    assert "https://transparency.example.test/INN" in urls
+    assert "https://transparency.example.test/OON" in urls
 
 
 def test_parse_html_mrf_links_accepts_zipped_table_of_contents_files():

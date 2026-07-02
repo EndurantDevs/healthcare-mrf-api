@@ -334,8 +334,8 @@ Last one-time research refresh: 2026-06-05.
 | Community Health Choice | regional | https://www.communityhealthchoice.org/health-insurance-marketplace/transparency-in-pricing/ | observed unsupported |
 | Community Health Options | regional | https://www.healthoptions.org/policies-notices | observed current direct MRF file links; aliases: Maine Community Health Options |
 | CommunityCare of OK | regional | https://www.ccok.com/Price-Transparency/Machine-Readable/ | public CommunityCare price-transparency machine-readable-files page with in-network and allowed-amount links; aliases: Community Care of Oklahoma, CommunityCare Oklahoma, CCOK |
-| ConnectiCare | regional | https://transparency.connecticare.com/ | observed stale |
-| ConnectiCare | regional | https://www.connecticare.com/about-us/transparency-coverage-compliance | curated source row |
+| ConnectiCare | regional | https://transparency.connecticare.com/ | curated source row |
+| ConnectiCare | regional | https://www.connecticare.com/about-us/transparency-coverage-compliance | observed stale; replaced by dedicated price-transparency machine-readable-files host |
 | Contra Costa Health Plan | regional | https://www.cchealth.org/health-insurance/my-contra-costa-health-plan/transparency-in-coverage | public transparency page backed by hostedjson Azure listing; aliases: Contra Costa, Contra Costa Health Plan CarePlus, Care Plus, CarePlus |
 | Cook Children's | regional | - | needs official source URL |
 | Curative Health Plan | regional | https://curative.com/transparency-in-coverage-rates | public transparency page with current TOC link; aliases: Curative, Curative Health |

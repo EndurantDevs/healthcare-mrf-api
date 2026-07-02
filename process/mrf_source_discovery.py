@@ -2042,7 +2042,11 @@ async def _fetch_text(
             url, allow_redirects=True, **_request_ssl_kwargs(url)
         ) as resp:
             body, charset = await read_response(resp, allow_browser_fallback=True)
-    except (aiohttp.ServerDisconnectedError, BrowserFallbackRequired):
+    except (
+        aiohttp.ClientOSError,
+        aiohttp.ServerDisconnectedError,
+        BrowserFallbackRequired,
+    ):
         retry_headers = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
