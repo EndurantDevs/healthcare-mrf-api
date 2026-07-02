@@ -2330,9 +2330,15 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
         provider_group_member_table="mrf.ptg2_provider_group_member_snap",
         provider_set_component_table="mrf.ptg2_provider_set_component_snap",
         provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(side_effect=AssertionError("component-backed lookup should not use sidecar rate scope")),
+    )
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,

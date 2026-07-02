@@ -2608,6 +2608,7 @@ async def _ptg2_manifest_location_provider_matches(
         provider_group_location_table
         and not rate_provider_group_ids
         and not rate_provider_group_sidecar_checked
+        and not component_rate_scope_available
         and serving_table
         and requested_plan_id
         and requested_code
