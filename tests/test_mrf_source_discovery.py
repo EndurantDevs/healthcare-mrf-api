@@ -8404,6 +8404,12 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
                 "seed_provider": "master-list",
                 "access_model": "free",
                 "source_type": "toc_json",
+                "metadata_json": {
+                    "target_payer_query": "Example Employer",
+                    "private_query_context": True,
+                    "private_context_benefit_line": "medical",
+                    "private_context_carrier_query": "Example Carrier",
+                },
             }
         ]
     )
@@ -8421,9 +8427,14 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
     assert source_upsert_count_map["created"] == 2
     assert calls[0]["json"]["visibility"] == "internal"
     assert calls[0]["json"]["status"] == "needs_review"
+    assert calls[0]["json"]["metadata"]["target_payer_query"] == "Example Employer"
+    assert calls[0]["json"]["metadata"]["private_query_context"] is True
+    assert calls[0]["json"]["metadata"]["private_context_benefit_line"] == "medical"
+    assert calls[0]["json"]["metadata"]["private_context_carrier_query"] == "Example Carrier"
     assert calls[-1]["json"]["visibility"] == "public"
     assert calls[-1]["json"]["status"] == "active"
     assert calls[-1]["json"]["preserve_operator_state"] is False
+    assert calls[-1]["json"]["metadata"]["target_payer_query"] == "Example Employer"
 
 
 @pytest.mark.asyncio
@@ -8509,7 +8520,12 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
                     "vendor_names": ["Example Virtual Health"],
                     "network_names": ["Example National PPO"],
                     "plan_names": ["Example Guided Health Plan"],
-                    "raw": {"target_payer_query": "Example Packaging"},
+                    "raw": {
+                        "target_payer_query": "Example Packaging",
+                        "private_query_context": True,
+                        "private_context_benefit_line": "medical",
+                        "private_context_carrier_query": "Example Carrier",
+                    },
                 },
             }
         ]
@@ -8538,6 +8554,13 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
     assert source_payloads[-1]["metadata"]["plan_names"] == [
         "Example Guided Health Plan"
     ]
+    assert source_payloads[-1]["metadata"]["target_payer_query"] == "Example Packaging"
+    assert source_payloads[-1]["metadata"]["private_query_context"] is True
+    assert source_payloads[-1]["metadata"]["private_context_benefit_line"] == "medical"
+    assert (
+        source_payloads[-1]["metadata"]["private_context_carrier_query"]
+        == "Example Carrier"
+    )
     assert "raw" not in source_payloads[-1]["metadata"]
 
 

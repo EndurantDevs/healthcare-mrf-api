@@ -13302,7 +13302,28 @@ def _import_control_seed_metadata(row: dict[str, Any]) -> dict[str, Any]:
         "vendor_names": list(dict.fromkeys(metadata.get("vendor_names") or [])),
         "network_names": list(dict.fromkeys(metadata.get("network_names") or [])),
         "plan_names": list(dict.fromkeys(metadata.get("plan_names") or [])),
+        **_import_control_source_context_metadata(row),
     }
+
+
+def _import_control_source_context_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = row.get("metadata_json") or {}
+    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    context_metadata_by_key: dict[str, Any] = {}
+    for key in (
+        "target_payer_query",
+        "private_query_context",
+        "private_context_benefit_line",
+        "private_context_carrier_query",
+    ):
+        value = metadata.get(key)
+        if value is None:
+            value = raw.get(key)
+        if isinstance(value, str):
+            value = _clean_text(value)
+        if value not in (None, ""):
+            context_metadata_by_key[key] = value
+    return context_metadata_by_key
 
 
 async def _sync_import_control_seeds(
@@ -14003,6 +14024,7 @@ async def _promote_import_control_source(
                     (row.get("metadata_json") or {}).get("plan_names") or []
                 )
             ),
+            **_import_control_source_context_metadata(row),
         },
     }
     async with session.post(f"{base}/v1/catalog/sources", json=payload) as resp:
