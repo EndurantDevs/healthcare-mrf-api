@@ -8435,6 +8435,69 @@ async def test_push_import_control_catalog_syncs_coverage_evidence_without_previ
 
 
 @pytest.mark.asyncio
+async def test_push_import_control_catalog_refreshes_existing_public_source_metadata(
+    monkeypatch,
+):
+    """Existing public importable sources accept alias-only metadata refreshes."""
+    calls = []
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_existing"]
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_public_metadata_only_fake_session(calls),
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_existing",
+                "index_url": "https://example.com/index.json",
+                "human_url": "https://example.com/transparency",
+                "display_name": "Example Carrier",
+                "source_key": "example-carrier",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "status": "active",
+                "metadata_json": {
+                    "source_tier": "mrf_importable",
+                    "aliases": ["Example Specialty Plan"],
+                    "benefit_lines": ["medical", "dental"],
+                },
+            }
+        ]
+    )
+
+    source_payloads = [
+        call["json"]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 0
+    assert errors == []
+    assert len(source_payloads) == 1
+    assert source_payloads[0]["visibility"] == "internal"
+    assert source_payloads[0]["status"] == "needs_review"
+    assert source_payloads[0]["preserve_operator_state"] is True
+    assert source_payloads[0]["metadata"]["aliases"] == ["Example Specialty Plan"]
+    assert source_payloads[0]["metadata"]["benefit_lines"] == ["medical", "dental"]
+    assert not [
+        call
+        for call in calls
+        if call["url"].endswith("/v1/ptg/discover/ingest-preview")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     monkeypatch,
 ):
@@ -8640,6 +8703,59 @@ def _catalog_snapshot_source_rows():
             "metadata_json": {"source_tier": "coverage_evidence"},
         },
     ]
+
+
+def _catalog_public_metadata_only_fake_session(captured_calls):
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            captured_calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                return FakeResponse({"source_id": "ic_source_1"})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                raise AssertionError("metadata-only refresh should not ingest preview")
+            if url.endswith("/v1/catalog/seeds/import"):
+                raise AssertionError("metadata-only refresh should not promote seed")
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            captured_calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_1"):
+                return FakeResponse(
+                    {
+                        "source_id": "ic_source_1",
+                        "visibility": "public",
+                        "status": "active",
+                    }
+                )
+            return FakeResponse({}, status=404)
+
+    return FakeSession
 
 
 @pytest.mark.asyncio

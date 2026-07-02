@@ -14112,19 +14112,11 @@ async def _push_import_control_catalog(
                 else {}
             )
             rows_to_sync = _dedupe_import_control_source_rows(group_rows, snapshot)
-            if not snapshot and all(
-                str(row.get("status") or "active").strip().lower() == "active"
-                and _source_row_is_importable(row)
-                for row in rows_to_sync
-            ):
-                continue
             for row in rows_to_sync:
                 source_id = str(row.get("source_id") or "")
                 items = snapshot.get(source_id) or []
                 source_status = str(row.get("status") or "active").strip() or "active"
                 evidence_only = not _source_row_is_importable(row)
-                if not items and source_status.lower() == "active" and not evidence_only:
-                    continue
                 ic_source_id: str | None = None
                 try:
                     # Stage the source non-public first so a mid-sync failure never leaves a
@@ -14148,6 +14140,13 @@ async def _push_import_control_catalog(
                     )
                     stored_status = str((stored or {}).get("status") or "").lower()
                     source_status_lower = source_status.lower()
+                    if not items and source_status_lower == "active" and not evidence_only:
+                        # Existing public sources still need metadata-only refreshes
+                        # (aliases, benefit lines, source tier). New staged rows remain
+                        # internal/needs_review until a later crawl proves plan files.
+                        if not staged:
+                            sources_synced += 1
+                        continue
                     source_plans = 0
                     if items and not evidence_only:
                         for batch in _chunked(_split_preview_items(items), 100):
