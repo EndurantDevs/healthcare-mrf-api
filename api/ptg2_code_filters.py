@@ -86,6 +86,31 @@ INFERRED_PROVIDER_TAXONOMY_RULES = (
         display_terms=("anesthesiology", "nurse anesthetist", "anesthesiologist assistant"),
     ),
     InferredProviderTaxonomyRule(
+        # Psychiatric diagnostic/interview and psychotherapy services (90785-90899)
+        # are commonly billed by behavioral-health clinicians. Without this curated
+        # range, sparse Medicare evidence can leave the resolver in validate-only
+        # mode and callers may surface unrelated specialties from broad plan searches.
+        ranges=((90785, 90899),),
+        taxonomy_codes=(
+            "101YP2500X",  # Counselor, Mental Health
+            "103T00000X",  # Psychologist
+            "103TC0700X",  # Clinical Psychologist
+            "1041C0700X",  # Clinical Social Worker
+            "106H00000X",  # Marriage & Family Therapist
+            "2084P0800X",  # Psychiatry
+            "363LP0808X",  # Nurse Practitioner, Psych/Mental Health
+            "364SP0808X",  # Clinical Nurse Specialist, Psych/Mental Health
+        ),
+        display_terms=(
+            "psychotherapy",
+            "behavioral health",
+            "mental health",
+            "psychology",
+            "clinical social work",
+            "psychiatry",
+        ),
+    ),
+    InferredProviderTaxonomyRule(
         ranges=((80000, 87999),),
         taxonomy_codes=(
             "1223P0106X",
