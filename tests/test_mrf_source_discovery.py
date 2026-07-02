@@ -9183,14 +9183,14 @@ async def test_push_import_control_catalog_keeps_failed_source_internal_and_repo
             return FakeResponse({}, status=404)
 
     async def fake_snapshot(source_ids_arg):
-        assert source_ids_arg in (["source_ok"], ["source_fail"])
+        assert source_ids_arg == ["source_ok", "source_fail"]
         item = {
             "canonical_url": "https://example.com/rates.json.gz",
             "domain": "in_network",
             "reporting_entity_name": "Example Payer",
             "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
         }
-        return {source_ids_arg[0]: [item]}
+        return {source_id: [item] for source_id in source_ids_arg}
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
