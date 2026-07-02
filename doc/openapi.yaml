@@ -2532,7 +2532,19 @@ paths:
           schema:
             type: string
             pattern: '^[0-9]{5}$'
-          description: Filter providers to practice addresses in this ZIP code.
+          description: >-
+            Filter providers to practice addresses near this ZIP code. Widened
+            to zip_radius_miles (default 10) around the ZIP; pass
+            zip_radius_miles=0 for an exact-ZIP match.
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            default: 10
+          description: >-
+            Radius in miles around zip5 used to widen the ZIP filter.
+            Ignored when zip5 is not provided. 0 disables widening.
         - name: include_mail_addresses
           in: query
           schema:

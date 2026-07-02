@@ -399,10 +399,14 @@ def provider_specialty_taxonomy_exists_sql(
         code_placeholders: list[str] = []
         for idx, code in enumerate(specialty_filter.taxonomy_codes):
             key = f"{param_prefix}_taxonomy_code_{idx}"
-            params[key] = code
+            # Stored NUCC codes are canonically uppercase (verified: zero
+            # mixed-case rows on dev); normalize the parameter instead of
+            # wrapping the column in UPPER(), which defeats the
+            # (taxonomy_code, npi) index and forces a 12M-row scan.
+            params[key] = str(code or "").upper()
             code_placeholders.append(f":{key}")
         clauses.append(
-            f"UPPER(COALESCE({nt}.healthcare_provider_taxonomy_code, '')) IN ({', '.join(code_placeholders)})"
+            f"{nt}.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})"
         )
 
     if specialty_filter.classification and specialty_filter.use_classification_predicate:

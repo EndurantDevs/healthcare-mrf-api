@@ -4159,6 +4159,17 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
         {"index_elements": ("state_name", "city_name", "npi"), "name": "primary_state_city_npi", "where": "type='primary'"},
         {"index_elements": ("zip5", "npi"), "name": "primary_zip5_npi", "where": "type='primary'"},
+        # Serving-type ZIP lookup for group-plan provider enumeration: the
+        # expression must match the query's zip5 fallback exactly so the
+        # planner can use it, and the WHERE mirrors the serving address types.
+        {
+            "index_elements": (
+                "(COALESCE(zip5, LEFT(COALESCE(postal_code, ''), 5)))",
+                "npi",
+            ),
+            "name": "serving_zip5_npi",
+            "where": "type IN ('practice','site','primary','secondary')",
+        },
         {
             "index_elements": (
                 "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",

@@ -4488,8 +4488,9 @@ async def group_plan_providers(request):
     """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
     group plan, keyed by EIN plan_id + market_type, keyset-paginated by NPI.
 
-    Resolves the plan's published serving snapshot via ptg2_current_plan_source,
-    then expands provider_set -> provider_group -> member NPI for that plan. The
+    Resolves ALL of the plan's published serving snapshots (one per network
+    source) via ptg2_current_plan_source and unions their member tables. The
+    zip5 filter widens to zip_radius_miles (default 10) around the ZIP. The
     PTG2 serving search itself hard-requires a procedure code, so this is the only
     path that can answer "all providers for this group plan". Proxied by api-layer
     and surfaced as the api-mcp find_group_plan_providers orchestrator tool.
@@ -4514,6 +4515,15 @@ async def group_plan_providers(request):
     city = (request.args.get("city") or "").strip().lower()
     state = (request.args.get("state") or "").strip().upper()
     zip5 = _normalize_zip5(request.args.get("zip5"))
+    # zip5 means "this ZIP plus a radius" everywhere else on the pricing
+    # surface (search-by-procedure defaults to 10 miles); a strict-equality
+    # ZIP match here silently returned zero providers one block outside the
+    # requested ZIP. zip_radius_miles=0 restores exact matching.
+    zip_radius_miles = _parse_zip_radius_miles(
+        request.args.get("zip_radius_miles"),
+        param="zip_radius_miles",
+        default=10.0 if zip5 else 0.0,
+    )
     include_mail_addresses = _parse_bool(
         request.args.get("include_mail_addresses"),
         "include_mail_addresses",
@@ -4545,17 +4555,37 @@ async def group_plan_providers(request):
             "exhausted": True,
         })
     selected_source_key, snapshot_id = snapshot_pairs[0]
-    snapshots = [{"source_key": source_key, "snapshot_id": snapshot} for source_key, snapshot in snapshot_pairs]
 
-    serving_tables = await snapshot_serving_tables(session, snapshot_id)
-    group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-    if not group_member_table:
+    # A plan served by multiple networks (e.g. a medical network plus a
+    # pharmacy carve-out) has one snapshot per source. Enumerating only the
+    # first snapshot silently presented a single network as "the plan's
+    # entire directory", so union the member tables of every published
+    # snapshot instead.
+    snapshots = []
+    member_tables: list[str] = []
+    for pair_source_key, pair_snapshot_id in snapshot_pairs:
+        pair_tables = await snapshot_serving_tables(session, pair_snapshot_id)
+        pair_member_table = _safe_table_name(pair_tables.provider_group_member_table)
+        snapshots.append({
+            "source_key": pair_source_key,
+            "snapshot_id": pair_snapshot_id,
+            "enumerated": bool(pair_member_table),
+        })
+        if pair_member_table:
+            member_tables.append(pair_member_table)
+    if not member_tables:
+        serving_tables = await snapshot_serving_tables(session, snapshot_id)
         return response.json({
             "ok": False, "error_type": "unsupported_storage",
             "plan_id": plan_id, "market_type": market_type, "snapshot_id": snapshot_id,
             "reason": "serving snapshot does not expose a provider_group_member table",
             "serving_table": _safe_table_name(serving_tables.serving_table),
         }, status=501)
+    if len(member_tables) == 1:
+        group_member_table = member_tables[0]
+    else:
+        member_union = " UNION ALL ".join(f"SELECT npi FROM {table}" for table in member_tables)
+        group_member_table = f"({member_union})"
 
     # current_source_snapshot_ids_for_plan resolves the plan's per-SOURCE serving
     # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
@@ -4604,6 +4634,20 @@ async def group_plan_providers(request):
         if uses_unified_addresses
         else "LEFT(COALESCE(addr.postal_code, ''), 5)"
     )
+    location_zips: list[str] = []
+    if zip5:
+        if zip_radius_miles > 0:
+            radius_rows = await _zip_radius_rows(
+                session,
+                zip5=zip5,
+                radius_miles=zip_radius_miles,
+                state_hint=state or None,
+            )
+            location_zips = sorted(
+                {str(row.get("zip5")) for row in radius_rows if row.get("zip5")} | {zip5}
+            )
+        else:
+            location_zips = [zip5]
     location_clauses: list[str] = ["addr.npi = gm.npi"]
     if not include_mail_addresses:
         location_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
@@ -4613,9 +4657,9 @@ async def group_plan_providers(request):
     if state:
         params["location_state"] = state
         location_clauses.append(f"{state_expr} = :location_state")
-    if zip5:
-        params["location_zip5"] = zip5
-        location_clauses.append(f"{zip5_expr} = :location_zip5")
+    if location_zips:
+        params["location_zips"] = location_zips
+        location_clauses.append(f"{zip5_expr} = ANY(:location_zips)")
     location_predicate = ""
     if has_location_filter:
         location_where = "\n                      AND ".join(location_clauses)
@@ -4626,9 +4670,42 @@ async def group_plan_providers(request):
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
 
-    provider_rows = (await session.execute(
-        text(
-            f"""
+    # Sparse filters (specialty AND a ZIP set) make the member-table walk
+    # pathological: it scans millions of member NPIs probing per-row EXISTS
+    # before it collects LIMIT matches. Compute the small local-specialty
+    # candidate set first (zip-index + taxonomy-index hash join) and drive
+    # the member lookup from it instead.
+    use_local_candidates = bool(specialty_filter.active and location_zips)
+    candidate_cte = ""
+    if use_local_candidates:
+        candidate_taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
+            "addr.npi",
+            params,
+            "cand_provider_specialty",
+            specialty_filter,
+        )
+        candidate_clauses = [clause for clause in location_clauses if clause != "addr.npi = gm.npi"]
+        if candidate_taxonomy_predicate:
+            candidate_clauses.append(candidate_taxonomy_predicate)
+        candidate_where = "\n                      AND ".join(candidate_clauses)
+        candidate_cte = f"""WITH local_specialty_npis AS MATERIALIZED (
+                SELECT DISTINCT addr.npi
+                  FROM {address_table} addr
+                 WHERE {candidate_where}
+            )
+            """
+    if use_local_candidates:
+        provider_sql = f"""
+            {candidate_cte}SELECT DISTINCT gm.npi
+              FROM {group_member_table} gm
+              JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
+             WHERE gm.npi BETWEEN :npi_min AND :npi_max
+               AND gm.npi > :cursor_npi
+             ORDER BY gm.npi
+             LIMIT :limit
+            """
+    else:
+        provider_sql = f"""
             SELECT DISTINCT gm.npi
               FROM {group_member_table} gm
              WHERE gm.npi BETWEEN :npi_min AND :npi_max
@@ -4636,25 +4713,29 @@ async def group_plan_providers(request):
              ORDER BY gm.npi
              LIMIT :limit
             """
-        ),
-        params,
-    )).fetchall()
+    provider_rows = (await session.execute(text(provider_sql), params)).fetchall()
     provider_npis = [int(row.npi) for row in provider_rows if row.npi is not None]
 
     total_distinct = None
     is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
-    should_skip_exact_count = bool(has_location_filter and uses_unified_addresses)
+    should_skip_exact_count = bool(
+        has_location_filter and uses_unified_addresses and not use_local_candidates
+    )
     if is_count_requested and not should_skip_exact_count:
-        total_distinct = int((await session.execute(
-            text(
-                f"""
+        if use_local_candidates:
+            count_sql = f"""
+                {candidate_cte}SELECT COUNT(DISTINCT gm.npi)
+                  FROM {group_member_table} gm
+                  JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
+                 WHERE gm.npi BETWEEN :npi_min AND :npi_max
+                """
+        else:
+            count_sql = f"""
                 SELECT COUNT(DISTINCT gm.npi)
                   FROM {group_member_table} gm
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{location_where}
                 """
-            ),
-            params,
-        )).scalar() or 0)
+        total_distinct = int((await session.execute(text(count_sql), params)).scalar() or 0)
 
     provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
@@ -4669,9 +4750,9 @@ async def group_plan_providers(request):
         if state:
             address_params["location_state"] = state
             address_clauses.append(f"{state_expr} = :location_state")
-        if zip5:
-            address_params["location_zip5"] = zip5
-            address_clauses.append(f"{zip5_expr} = :location_zip5")
+        if location_zips:
+            address_params["location_zips"] = location_zips
+            address_clauses.append(f"{zip5_expr} = ANY(:location_zips)")
         address_where = "\n                   AND ".join(address_clauses)
         coverage_match_sql = _group_plan_provider_coverage_match_sql(
             "addr",
@@ -4787,6 +4868,8 @@ async def group_plan_providers(request):
             "city": city or None,
             "state": state or None,
             "zip5": zip5 or None,
+            "zip_radius_miles": zip_radius_miles if zip5 else None,
+            "zips_considered": len(location_zips) if location_zips else None,
             "include_mail_addresses": include_mail_addresses,
             "address_source": "unified" if has_location_filter and uses_unified_addresses else (
                 "npi" if has_location_filter else None
