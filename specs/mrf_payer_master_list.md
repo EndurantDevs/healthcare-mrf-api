@@ -313,7 +313,7 @@ Last one-time research refresh: 2026-06-05.
 | AmeriHealth | regional | https://www.amerihealth.com/developer-resources/index.html | curated source row |
 | AmeriHealth NJ Insurance Co, Inc. | regional | https://www.amerihealth.com/developer-resources/index.html | observed stale; 6 plans; 23 files |
 | AmeriHealth PA HMO, Inc. | regional | https://www.amerihealth.com/developer-resources/index.html | observed stale; 2 plans; 20 files |
-| Aspirus Health Plan | regional | https://aspirus.healthsparq.com/healthsparq/public/#/one/&insurerCode=ASPIRUS_I&brandCode=ASPIRUS/machine-readable-transparency-in-coverage | public Aspirus pricing-transparency page links this HealthSparq machine-readable files route |
+| Aspirus Health Plan | regional | https://aspirus.healthsparq.com/healthsparq/public/#/one/&insurerCode=ASPIRUS_I&brandCode=ASPIRUS/machine-readable-transparency-in-coverage | public Aspirus pricing-transparency page links this HealthSparq machine-readable files route; supersedes urls: https://aspirushealthplan.com/insurance/pricingTransparency |
 | AultCare | regional | - | needs official source URL |
 | AultCare/Aultman | regional | https://aultcare.com/price-transparency | curated source row |
 | AvMed | regional | https://www.avmed.org/en/for-developers | public AvMed developer page with TiC table-of-contents and Azure MRF directory links |

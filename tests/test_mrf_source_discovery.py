@@ -3216,6 +3216,13 @@ async def test_master_list_keeps_high_value_public_aliases():
         "&insurerCode=ASPIRUS_I&brandCode=ASPIRUS/"
         "machine-readable-transparency-in-coverage"
     )
+    assert by_name["Aspirus Health Plan"].raw_payload["notes"]
+    assert (
+        "https://aspirushealthplan.com/insurance/pricingTransparency"
+        in discovery._candidate_metadata(
+            by_name["Aspirus Health Plan"], by_name["Aspirus Health Plan"].aliases
+        )["supersedes_urls"]
+    )
     assert by_name["Moda Health"].benefit_lines == ("medical", "dental")
     assert "Delta Dental of Oregon" in by_name["Moda Health"].aliases
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
@@ -8943,6 +8950,74 @@ def _duplicate_private_catalog_source_rows():
             "metadata_json": dict(private_metadata_dict),
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_supersedes_replaced_urls(
+    monkeypatch,
+):
+    """Explicit source URL replacements hide the previous catalog row."""
+    http_calls = []
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_current"]
+        return {
+            "source_current": [
+                {
+                    "canonical_url": "https://example.com/rates.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Current Benefits",
+                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
+    )
+
+    sources_synced, plans_synced, sync_errors = await discovery._push_import_control_catalog(
+        [_replacement_catalog_source_row()]
+    )
+
+    source_request_bodies = [
+        call["json"]
+        for call in http_calls
+        if call["url"].endswith("/v1/catalog/sources")
+    ]
+    superseded_request_bodies = [
+        request_body
+        for request_body in source_request_bodies
+        if request_body["status"] == "superseded"
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 1
+    assert sync_errors == []
+    assert len(superseded_request_bodies) == 1
+    assert superseded_request_bodies[0]["index_url"] == "https://example.com/old-transparency"
+    assert superseded_request_bodies[0]["visibility"] == "internal"
+    assert superseded_request_bodies[0]["preserve_operator_state"] is False
+
+
+def _replacement_catalog_source_row():
+    return {
+        "source_id": "source_current",
+        "index_url": "https://example.com/current-index.json",
+        "display_name": "Example Current Benefits",
+        "source_key": "example-current",
+        "seed_provider": "master-list",
+        "access_model": "free",
+        "source_type": "toc_json",
+        "status": "active",
+        "metadata_json": {
+            "source_tier": "mrf_importable",
+            "supersedes_urls": ["https://example.com/old-transparency"],
+        },
+    }
 
 
 @pytest.mark.asyncio

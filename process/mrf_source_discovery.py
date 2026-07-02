@@ -2591,6 +2591,10 @@ def _candidate_metadata(
         "vendor_names": candidate.vendor_names,
         "network_names": candidate.network_names,
         "plan_names": candidate.plan_names,
+        "supersedes_urls": _master_list_note_values(
+            (candidate.raw_payload or {}).get("notes") or "",
+            r"supersedes[-_\s]*urls?",
+        ),
     }
     for key, values in optional_lists.items():
         cleaned = [_clean_text(value) for value in values if _clean_text(value)]
@@ -14052,6 +14056,11 @@ async def _promote_import_control_source(
                     (row.get("metadata_json") or {}).get("plan_names") or []
                 )
             ),
+            "supersedes_urls": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("supersedes_urls") or []
+                )
+            ),
             **_import_control_source_context_metadata(row),
         },
     }
@@ -14126,6 +14135,34 @@ async def _mark_import_control_seed_promoted(
             )
         await resp.json()
     return True
+
+
+async def _supersede_import_control_replaced_urls(
+    session: aiohttp.ClientSession,
+    base: str,
+    row: dict[str, Any],
+) -> None:
+    """Hide catalog rows for explicitly replaced source URLs."""
+    metadata = row.get("metadata_json") or {}
+    for old_url in metadata.get("supersedes_urls") or []:
+        old_url_text = str(old_url or "").strip()
+        if not old_url_text:
+            continue
+        replacement_source_map = {
+            **row,
+            "index_url": old_url_text,
+            "human_url": old_url_text,
+            "canonical_url": _canonical_or_none(old_url_text),
+            "hosting_platform": classify_hosting_platform(old_url_text),
+        }
+        await _promote_import_control_source(
+            session,
+            base,
+            replacement_source_map,
+            visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
+            status="superseded",
+            preserve_operator_state=False,
+        )
 
 
 async def _push_import_control_catalog(
@@ -14278,6 +14315,9 @@ async def _push_import_control_catalog(
                         )
                         sources_synced += 1
                         synced_identity_keys.add(identity_key)
+                        await _supersede_import_control_replaced_urls(
+                            session, base, row
+                        )
                         progress_done += 1
                         emit_catalog_sync_progress(
                             f"synced catalog source {progress_done}/{progress_total}"
@@ -14312,6 +14352,7 @@ async def _push_import_control_catalog(
                     sources_synced += 1
                     plans_synced += source_plans
                     synced_identity_keys.add(identity_key)
+                    await _supersede_import_control_replaced_urls(session, base, row)
                     progress_done += 1
                     emit_catalog_sync_progress(
                         f"synced catalog source {progress_done}/{progress_total}"
