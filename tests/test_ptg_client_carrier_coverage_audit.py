@@ -1,9 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import json
 from types import SimpleNamespace
 
+import pytest
+
+import scripts.research.ptg_client_carrier_coverage_audit as audit
 from scripts.research.ptg_client_carrier_coverage_audit import (
     _add_optional_report_sections,
+    async_main,
     audit_carrier_rows,
     audit_non_importable_carrier_rows,
     audit_non_importable_reason_summary,
@@ -362,3 +367,46 @@ def test_optional_non_importable_summary_is_private_safe_with_redacted_labels():
     carrier = report_by_section["top_non_importable"]["medical"][0]["carrier"]
     assert carrier.startswith("carrier:")
     assert "Synthetic" not in carrier
+
+
+@pytest.mark.asyncio
+async def test_json_report_includes_aggregate_reason_summary_without_detail_labels(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    csv_path = tmp_path / "clients.csv"
+    csv_path.write_text(
+        "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
+        "synthetic,Synthetic Evidence,,\n",
+        encoding="utf-8",
+    )
+
+    async def fake_discovery_candidates(*, provider, limit):
+        assert provider == "master-list"
+        assert limit == 5000
+        return (
+            [
+                audit.discovery.SourceCandidate(
+                    payer_name="Synthetic Evidence",
+                    provider="synthetic",
+                    source_tier="coverage_evidence",
+                    status="active",
+                    human_url="https://example.test/evidence",
+                    benefit_lines=("medical",),
+                )
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(audit, "load_discovery_candidates", fake_discovery_candidates)
+
+    await async_main([str(csv_path), "--json", "--redact-labels"])
+
+    report_payload = json.loads(capsys.readouterr().out)
+    assert report_payload["csv_path"] == "<redacted>"
+    assert report_payload["non_importable_reason_summary"]["medical"] == {
+        "coverage_evidence_only": {"distinct": 1, "mentions": 1}
+    }
+    assert "top_non_importable" not in report_payload
+    assert "Synthetic Evidence" not in json.dumps(report_payload)

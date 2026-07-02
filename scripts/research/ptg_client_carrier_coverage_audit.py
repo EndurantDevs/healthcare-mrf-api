@@ -568,6 +568,14 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         "importable_candidates": len(importable_candidates),
         "coverage": [item.to_dict() for item in stats],
     }
+    if args.json:
+        payload["non_importable_reason_summary"] = (
+            audit_non_importable_reason_summary(
+                rows,
+                all_candidates=all_candidates,
+                importable_candidates=importable_candidates,
+            )
+        )
     _add_optional_report_sections(
         payload,
         parsed_args=args,
