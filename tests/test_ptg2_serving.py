@@ -4321,7 +4321,7 @@ async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_lega
     monkeypatch.setattr(ptg2_serving, "_manifest_rate_provider_groups_from_sidecar", sidecar_probe)
 
     session = FakeSession([])
-    result = await ptg2_serving._ptg2_manifest_location_provider_matches(
+    match_result = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         ptg2_types.PTG2ServingTables(
             serving_table="mrf.ptg2_serving_token",
@@ -4345,52 +4345,48 @@ async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_lega
         plan_id="010854205",
     )
 
-    assert result == (set(), {})
+    assert match_result == (set(), {})
     sidecar_probe.assert_awaited_once()
     assert session.calls == []
+
+
+def _fake_manifest_provider_location_row(group_id: str) -> dict[str, object]:
+    return {
+        "provider_group_global_id_128": group_id,
+        "npi": 1234567890,
+        "address_key": None,
+        "premise_key": None,
+        "location_hash": "npi_address:1234567890:primary:addr-1",
+        "state": "IL",
+        "city": "CHICAGO",
+        "zip5": "60601",
+        "distance_miles": 0.0,
+        "zip_match_type": "same_zip",
+        "anchor_zip5": "60601",
+        "zip_radius_miles": 75.0,
+        "location_source": "npi_address",
+        "location_confidence_code": "npi_address",
+        "address_payload": {"first_line": "100 Main", "city": "CHICAGO"},
+        "telephone_number": "312-555-0100",
+        "fax_number": None,
+        "phone_number": "3125550100",
+        "phone_extension": None,
+        "fax_number_digits": None,
+        "fax_extension": None,
+        "taxonomy_codes": ["103T00000X"],
+        "specialties": ["Psychologist"],
+        "classifications": ["Psychologist"],
+        "specializations": [],
+        "primary_specialty": "Psychologist",
+        "primary_specialization": None,
+        "provider_name": "Example Provider",
+    }
 
 
 @pytest.mark.asyncio
 async def test_manifest_location_provider_matches_prefers_provider_group_location_table(monkeypatch):
     group_id = "00000000-0000-0000-0000-000000000001"
-    session = FakeSession(
-        [
-            FakeResult(
-                rows=[
-                    {
-                        "provider_group_global_id_128": group_id,
-                        "npi": 1234567890,
-                        "address_key": None,
-                        "premise_key": None,
-                        "location_hash": "npi_address:1234567890:primary:addr-1",
-                        "state": "IL",
-                        "city": "CHICAGO",
-                        "zip5": "60601",
-                        "distance_miles": 0.0,
-                        "zip_match_type": "same_zip",
-                        "anchor_zip5": "60601",
-                        "zip_radius_miles": 75.0,
-                        "location_source": "npi_address",
-                        "location_confidence_code": "npi_address",
-                        "address_payload": {"first_line": "100 Main", "city": "CHICAGO"},
-                        "telephone_number": "312-555-0100",
-                        "fax_number": None,
-                        "phone_number": "3125550100",
-                        "phone_extension": None,
-                        "fax_number_digits": None,
-                        "fax_extension": None,
-                        "taxonomy_codes": ["103T00000X"],
-                        "specialties": ["Psychologist"],
-                        "classifications": ["Psychologist"],
-                        "specializations": [],
-                        "primary_specialty": "Psychologist",
-                        "primary_specialization": None,
-                        "provider_name": "Example Provider",
-                    }
-                ]
-            )
-        ]
-    )
+    session = FakeSession([FakeResult(rows=[_fake_manifest_provider_location_row(group_id)])])
     monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(

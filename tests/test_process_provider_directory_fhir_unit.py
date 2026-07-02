@@ -2897,7 +2897,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_to_fhir_roles():
+def test_address_corroboration_sql_links_overlay_roles():
     """Validate the corroboration view joins overlay NPI addresses to FHIR roles."""
     sql = importer.provider_directory_address_corroboration_sql("mrf")
 
