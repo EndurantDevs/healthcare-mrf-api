@@ -350,9 +350,9 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "AND c.npi = pn.npi" in page_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
     assert "c.zip5 = :zip_code" in page_sql
-    assert "NULLIF(c.phone_number, '') = :phone_digits" in page_sql
+    assert "c.phone_number = :phone_digits" in page_sql
     assert (
-        "NULLIF(c.phone_number, '') IS NULL AND "
+        "(c.phone_number IS NULL OR c.phone_number = '') AND "
         "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
     ) in page_sql
     assert "c.type = 'primary'" not in page_sql
@@ -361,7 +361,7 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     fallback_sql = conn.last_sql
     assert "SELECT c.*" in fallback_sql
     assert "FROM mrf.entity_address_unified AS c" in fallback_sql
-    assert "NULLIF(c.phone_number, '') = :phone_digits" in fallback_sql
+    assert "c.phone_number = :phone_digits" in fallback_sql
 
 
 @pytest.mark.asyncio
@@ -413,7 +413,7 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
     assert conn.last_params["phone_digits"] == "3125551212"
     assert "FROM mrf.entity_address_unified AS c" in conn.last_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in conn.last_sql
-    assert "NULLIF(c.phone_number, '') = :phone_digits" in conn.last_sql
+    assert "c.phone_number = :phone_digits" in conn.last_sql
 
 
 @pytest.mark.asyncio

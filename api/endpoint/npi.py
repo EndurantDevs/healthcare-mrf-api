@@ -1534,8 +1534,9 @@ def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
     raw_digits = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g')"
     if _address_table_is_unified(address_table_sql):
         return (
-            f"(NULLIF({alias}.phone_number, '') = :phone_digits "
-            f"OR (NULLIF({alias}.phone_number, '') IS NULL AND {raw_digits} = :phone_digits))"
+            f"({alias}.phone_number = :phone_digits "
+            f"OR (({alias}.phone_number IS NULL OR {alias}.phone_number = '') "
+            f"AND {raw_digits} = :phone_digits))"
         )
     return f"{raw_digits} = :phone_digits"
 
