@@ -14573,12 +14573,34 @@ async def main(
         result.urls_checked += len(probe_observations)
     if sync_import_control:
         try:
+            if control_run_id:
+                enqueue_live_progress(
+                    run_id=control_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="syncing import-control seeds",
+                    unit="sources",
+                    done=0,
+                    total=len(source_rows),
+                    message=f"syncing {len(source_rows)} source seed rows",
+                )
             result.import_control_synced = await _sync_import_control_seeds(
                 source_rows, limit=bounded_limit
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control", "message": str(exc)})
         try:
+            if control_run_id:
+                enqueue_live_progress(
+                    run_id=control_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="syncing import-control catalog",
+                    unit="sources",
+                    done=0,
+                    total=len(source_rows),
+                    message=f"syncing catalog plans for {len(source_rows)} source rows",
+                )
             sources_synced, plans_synced, catalog_errors = (
                 await _push_import_control_catalog(source_rows, limit=bounded_limit)
             )
