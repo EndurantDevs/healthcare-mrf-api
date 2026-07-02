@@ -2352,6 +2352,7 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
     assert "rate_provider_groups AS MATERIALIZED" in location_sql
     assert "FROM mrf.ptg2_provider_group_location_snap loc" in location_sql
     assert "JOIN rate_provider_groups rpg_location" in location_sql
+    assert "loc.taxonomy_array && (" in location_sql
     assert "FROM mrf.entity_address_unified addr" not in location_sql
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" not in location_sql
     assert provider_set_ids == {provider_set_id}
@@ -4440,6 +4441,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
     assert providers_by_set["provider-set-1"][0]["npi"] == 1234567890
     sql = str(session.calls[0][0][0])
     assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
+    assert "loc.taxonomy_array && (" in sql
     assert "FROM mrf.ptg2_provider_group_member_token pgm_scope" not in sql
 
 
