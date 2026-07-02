@@ -2762,12 +2762,26 @@ async def _ptg2_manifest_location_provider_matches(
     async def _query_provider_group_location_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]] | None:
         if not provider_group_location_table:
             return None
-        if not rate_provider_group_ids:
-            return [] if provider_group_location_scope_empty else None
+        location_rate_scope_cte = ""
+        location_rate_scope_join = ""
+        if rate_provider_group_ids:
+            location_group_filter = (
+                "loc.provider_group_global_id_128 = ANY("
+                f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
+            )
+        elif component_rate_scope_available:
+            location_rate_scope_cte = member_scope_cte
+            location_rate_scope_join = """
+                JOIN rate_provider_groups rpg_location
+                  ON rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128"""
+            location_group_filter = "TRUE"
+        elif provider_group_location_scope_empty:
+            return []
+        else:
+            return None
         location_filters = [
             "loc.npi IS NOT NULL",
-            "loc.provider_group_global_id_128 = ANY("
-            f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))",
+            location_group_filter,
         ]
         if state_value:
             location_filters.append("loc.state_name = :state_value")
@@ -2812,7 +2826,9 @@ async def _ptg2_manifest_location_provider_matches(
         result = await session.execute(
             text(
                 f"""
-            WITH raw_location_rows AS (
+            WITH
+            {location_rate_scope_cte}
+            raw_location_rows AS (
                 SELECT DISTINCT ON (loc.provider_group_global_id_128, loc.npi)
                     loc.provider_group_global_id_128,
                     loc.npi,
@@ -2857,6 +2873,7 @@ async def _ptg2_manifest_location_provider_matches(
                     {provider_name_sql} AS provider_name
                 FROM {provider_group_location_table} loc
                 {provider_location_join}
+                {location_rate_scope_join}
                 WHERE {" AND ".join(location_filters)}
                   AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
                 ORDER BY loc.provider_group_global_id_128,
