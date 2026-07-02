@@ -557,6 +557,47 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
     }
 
 
+def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(tmp_path, monkeypatch):
+    import zipfile
+
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+
+    raw_zip = tmp_path / "rates.zip"
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("rates.json", json.dumps({"in_network": []}))
+    raw_sha256, raw_size = ptg_artifacts.sha256_file(raw_zip)
+
+    async def fake_download_raw_artifact(*_args, store=None, **_kwargs):
+        store = store or ptg_artifacts.PTG2ArtifactStore()
+        return ptg_domain.PTG2RawArtifact(
+            original_url="https://example.com/rates.zip",
+            canonical_url="https://example.com/rates.zip",
+            raw_path=str(raw_zip),
+            raw_storage_uri=store.storage_uri(raw_zip),
+            raw_sha256=raw_sha256,
+            byte_count=raw_size,
+        )
+
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
+
+    downloaded = asyncio.run(
+        ptg_source_download._download_ptg_job_artifact(
+            {"type": "in_network", "url": "https://example.com/rates.zip"},
+            reuse_raw_artifacts=True,
+            max_bytes=None,
+            keep_partial_artifacts=True,
+        )
+    )
+
+    assert downloaded.error is None
+    assert downloaded.logical_artifact is not None
+    logical_path = Path(downloaded.logical_artifact.logical_path)
+    assert logical_path.exists()
+    assert artifact_root in logical_path.parents
+    assert json.loads(logical_path.read_text()) == {"in_network": []}
+
+
 def test_source_file_split_keeps_facade_helpers_stable():
     assert process_ptg._maybe_unzip is ptg_source_files._maybe_unzip
     assert process_ptg._extract_metadata_fields is ptg_source_files._extract_metadata_fields
