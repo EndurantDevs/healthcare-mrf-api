@@ -1487,6 +1487,56 @@ def test_provider_directory_coverage_audit_serving_readiness_respects_pod_safe_s
     assert checks["searchable_phone_overlay"]["required"] is False
 
 
+def test_provider_directory_coverage_audit_serving_readiness_uses_resource_summary_when_pod_safe():
+    summary = audit._serving_readiness_summary(
+        {
+            "source_summary": {
+                "available": True,
+                "source_count": 2,
+                "live_valid_count": 1,
+            },
+            "resource_summary": {
+                "provider_directory_practitioner": {
+                    "available": True,
+                    "row_count": 42,
+                },
+                "provider_directory_location": {
+                    "available": True,
+                    "row_count": 7,
+                },
+            },
+            "source_resource_coverage_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --pod-safe",
+            },
+            "unified_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-unified",
+            },
+            "plan_network_context_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-network-resolution",
+            },
+            "network_catalog_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-network-resolution",
+            },
+            "ptg_summary": audit._skipped_ptg_summary(),
+        }
+    )
+
+    checks = {check["name"]: check for check in summary["checks"]}
+
+    assert summary["status"] == "ready"
+    assert checks["resource_rows_imported"]["status"] == "pass"
+    assert checks["resource_rows_imported"]["metrics"]["resource_table_rows"] == 49
+    assert checks["resource_rows_imported"]["metrics"]["source_resource_coverage_skipped"] is True
+
+
 def test_provider_directory_coverage_audit_gap_wording_for_fast_probe_lower_bounds():
     gaps = audit._derive_gaps(
         {

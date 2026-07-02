@@ -4148,6 +4148,7 @@ def _readiness_check(
 def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
     source = report.get("source_summary") or {}
     source_coverage = report.get("source_resource_coverage_summary") or {}
+    resource_summary = report.get("resource_summary") or {}
     unified = report.get("unified_summary") or {}
     plan_network = report.get("plan_network_context_summary") or {}
     network_catalog = report.get("network_catalog_summary") or {}
@@ -4172,15 +4173,25 @@ def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
     )
 
     resource_sources = _int(source_coverage.get("sources_with_resource_rows"))
+    resource_table_rows = sum(
+        _int(summary.get("row_count"))
+        for summary in resource_summary.values()
+        if isinstance(summary, dict) and summary.get("available") is not False
+    )
+    resource_rows_available = bool(
+        source_coverage.get("available") and resource_sources > 0
+    ) or bool(resource_table_rows > 0)
     checks.append(
         _readiness_check(
             "resource_rows_imported",
-            passed=bool(source_coverage.get("available") and resource_sources > 0),
+            passed=resource_rows_available,
             reason="no Provider Directory source has imported FHIR resource rows",
             metrics={
                 "sources_with_resource_rows": resource_sources,
                 "source_count": _int(source_coverage.get("source_count")),
                 "resource_source_pct": source_coverage.get("resource_source_pct"),
+                "resource_table_rows": resource_table_rows,
+                "source_resource_coverage_skipped": bool(source_coverage.get("skipped")),
             },
         )
     )
