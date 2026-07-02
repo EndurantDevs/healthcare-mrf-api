@@ -1525,7 +1525,7 @@ def _ptg2_manifest_sidecar_members_many(
     return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
 
 
-async def _ptg2_manifest_provider_sets_for_groups(
+async def _manifest_sets_by_group(
     session,
     serving_tables: PTG2ServingTables,
     group_ids: list[str] | tuple[str, ...],
@@ -1536,9 +1536,9 @@ async def _ptg2_manifest_provider_sets_for_groups(
 
     component_table = _safe_table_name(serving_tables.provider_set_component_table)
     if component_table:
-        result_sets: dict[str, set[str]] = {group_id: set() for group_id in normalized_group_ids}
+        sets_by_group: dict[str, set[str]] = {group_id: set() for group_id in normalized_group_ids}
         try:
-            result = await session.execute(
+            component_rows = await session.execute(
                 text(
                     f"""
                     SELECT provider_group_global_id_128, provider_set_global_id_128
@@ -1554,13 +1554,13 @@ async def _ptg2_manifest_provider_sets_for_groups(
         except Exception:
             await _rollback_optional_ptg2_query(session)
         else:
-            for row in result:
-                data = _row_mapping(row)
-                group_id = _ptg2_manifest_id(data.get("provider_group_global_id_128"))
-                provider_set_id = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+            for component_row in component_rows:
+                component_mapping = _row_mapping(component_row)
+                group_id = _ptg2_manifest_id(component_mapping.get("provider_group_global_id_128"))
+                provider_set_id = _ptg2_manifest_id(component_mapping.get("provider_set_global_id_128"))
                 if group_id and provider_set_id:
-                    result_sets.setdefault(group_id, set()).add(provider_set_id)
-            return {group_id: tuple(sorted(provider_set_ids)) for group_id, provider_set_ids in result_sets.items()}
+                    sets_by_group.setdefault(group_id, set()).add(provider_set_id)
+            return {group_id: tuple(sorted(provider_set_ids)) for group_id, provider_set_ids in sets_by_group.items()}
 
     if not _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"):
         return None
@@ -2825,7 +2825,7 @@ async def _ptg2_manifest_location_provider_matches(
     )
     if not group_ids:
         return set(), {}
-    sets_by_group = await _ptg2_manifest_provider_sets_for_groups(session, serving_tables, group_ids)
+    sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
     if sets_by_group is None:
         return None
     provider_set_ids: set[str] = set()
@@ -3032,7 +3032,7 @@ async def _ptg2_manifest_provider_sets_for_npi(
     ]
     if not group_ids:
         return ()
-    sets_by_group = await _ptg2_manifest_provider_sets_for_groups(session, serving_tables, tuple(group_ids))
+    sets_by_group = await _manifest_sets_by_group(session, serving_tables, tuple(group_ids))
     if sets_by_group is None:
         return None
     provider_set_ids = tuple(

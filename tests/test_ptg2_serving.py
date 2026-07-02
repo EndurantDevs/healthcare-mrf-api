@@ -2235,50 +2235,18 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
 
 
 @pytest.mark.asyncio
-async def test_manifest_location_provider_matches_uses_component_table_without_sidecar(monkeypatch):
+async def test_manifest_location_uses_component_table(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
             FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
-            FakeResult(
-                rows=[
-                    {
-                        "provider_group_global_id_128": group_id,
-                        "npi": 1234567890,
-                        "location_hash": "entity_address_unified:1234567890:primary:1",
-                        "state": "CA",
-                        "city": "GLENDALE",
-                        "zip5": "91204",
-                        "distance_miles": 3.25,
-                        "zip_match_type": "radius",
-                        "anchor_zip5": "91204",
-                        "zip_radius_miles": 10.0,
-                        "telephone_number": "8185551212",
-                        "fax_number": "8185551213",
-                        "location_source": "entity_address_unified",
-                        "location_confidence_code": "entity_address_unified",
-                        "address_payload": '{"lat":34.14024131,"long":-118.255125}',
-                        "taxonomy_codes": ["207XS0114X"],
-                        "specialties": ["Orthopaedic Surgery Physician"],
-                        "classifications": ["Orthopaedic Surgery"],
-                        "specializations": ["Sports Medicine"],
-                        "primary_specialty": "Orthopaedic Surgery Physician",
-                        "primary_specialization": "Sports Medicine",
-                        "provider_name": "TiC provider",
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "provider_group_global_id_128": group_id,
-                        "provider_set_global_id_128": provider_set_id,
-                    }
-                ]
-            ),
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -2288,37 +2256,31 @@ async def test_manifest_location_provider_matches_uses_component_table_without_s
         id_storage="uuid",
     )
 
-    def fail_sidecar(*_args, **_kwargs):
-        raise AssertionError(
-            "provider_inverted sidecar should not be used when DB component table exists"
-        )
-
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fail_sidecar)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sidecar should not be used")),
+    )
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {
-            "plan_id": "010854205",
-            "code": "90837",
-            "code_system": "CPT",
-            "lat": "34.14024131",
-            "long": "-118.255125",
-            "radius_miles": "10",
-            "limit": "5",
-        },
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
         plan_id="010854205",
     )
 
     location_sql = str(session.calls[2][0][0])
     location_params = session.calls[2][0][1]
-    assert "rate_provider_groups AS MATERIALIZED" in location_sql
-    assert "FROM mrf.ptg2_serving_manifest_snap rate_scope" in location_sql
-    assert "JOIN mrf.ptg2_provider_set_component_snap psc" in location_sql
-    assert "rate_scope.plan_id = :location_plan_id" in location_sql
-    assert "rate_scope.reported_code = :location_reported_code" in location_sql
-    assert "JOIN rate_provider_groups rpg" in location_sql
+    for expected_sql in (
+        "rate_provider_groups AS MATERIALIZED",
+        "FROM mrf.ptg2_serving_manifest_snap rate_scope",
+        "JOIN mrf.ptg2_provider_set_component_snap psc",
+        "rate_scope.plan_id = :location_plan_id",
+        "rate_scope.reported_code = :location_reported_code",
+        "JOIN rate_provider_groups rpg",
+    ):
+        assert expected_sql in location_sql
     assert location_params["location_plan_id"] == "010854205"
     assert location_params["location_reported_code"] == "90837"
     assert location_params["location_reported_code_system"] == "CPT"

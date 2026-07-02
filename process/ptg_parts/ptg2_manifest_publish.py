@@ -165,7 +165,7 @@ async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, tar
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
 
 
-async def _copy_ptg2_manifest_provider_set_component_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_manifest_component_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
@@ -214,7 +214,7 @@ def _looks_like_unique_index_duplicate(exc: Exception) -> bool:
     )
 
 
-def _ptg2_manifest_provider_inverted_sidecar_entry(
+def _manifest_provider_inverted_entry(
     sidecar_artifacts: Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
     if not sidecar_artifacts:
@@ -245,20 +245,58 @@ def _ptg2_manifest_publish_sidecar_path(
     return path
 
 
-def _ptg2_manifest_sql_id_from_bytes(value: bytes) -> str:
+def _manifest_sql_id(value: bytes) -> str:
     if _ptg2_id_storage() == "uuid":
         return str(uuid.UUID(bytes=value))
     return value.hex()
 
 
-async def _materialize_ptg2_manifest_provider_set_component_table(
+def _write_manifest_component_copy(
+    sidecar_path: Path,
+    sidecar_entry: Mapping[str, Any],
+) -> tuple[Path | None, int]:
+    tmp_path: Path | None = None
+    row_count = 0
+    with tempfile.NamedTemporaryFile("wb", delete=False) as component_file:
+        tmp_path = Path(component_file.name)
+        for sidecar_owner in read_global_sidecar_entries(sidecar_path, metadata=sidecar_entry):
+            provider_group_id = _manifest_sql_id(sidecar_owner.owner)
+            for member in sidecar_owner.members:
+                provider_set_id = _manifest_sql_id(member)
+                component_file.write(f"{provider_set_id}\t{provider_group_id}\n".encode("ascii"))
+                row_count += 1
+    return tmp_path, row_count
+
+
+async def _index_manifest_components(schema_name: str, table_name: str) -> None:
+    primary_index = _ptg2_snapshot_index_name(table_name, "primary")
+    group_index = _ptg2_snapshot_index_name(table_name, "group_idx")
+    await db.status(
+        f"""
+        CREATE UNIQUE INDEX {_quote_ident(primary_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+        (provider_set_global_id_128, provider_group_global_id_128);
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX {_quote_ident(group_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+        (provider_group_global_id_128, provider_set_global_id_128);
+        """
+    )
+
+
+async def _materialize_manifest_components(
     *,
     schema_name: str,
     table_name: str,
     artifacts: Mapping[str, Any] | None,
     sidecar_artifacts: Mapping[str, Any] | None,
 ) -> str | None:
-    sidecar_entry = _ptg2_manifest_provider_inverted_sidecar_entry(sidecar_artifacts)
+    """Persist provider-inverted sidecar membership as an indexed SQL table."""
+
+    sidecar_entry = _manifest_provider_inverted_entry(sidecar_artifacts)
     if not sidecar_entry:
         return None
     if not str(sidecar_entry.get("path") or "").strip():
@@ -279,44 +317,21 @@ async def _materialize_ptg2_manifest_provider_set_component_table(
         """
     )
 
-    tmp_path: Path | None = None
-    row_count = 0
+    copy_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("wb", delete=False) as fp:
-            tmp_path = Path(fp.name)
-            for entry in read_global_sidecar_entries(sidecar_path, metadata=sidecar_entry):
-                provider_group_id = _ptg2_manifest_sql_id_from_bytes(entry.owner)
-                for member in entry.members:
-                    provider_set_id = _ptg2_manifest_sql_id_from_bytes(member)
-                    fp.write(f"{provider_set_id}\t{provider_group_id}\n".encode("ascii"))
-                    row_count += 1
-        if row_count <= 0 or tmp_path is None:
+        copy_path, row_count = _write_manifest_component_copy(sidecar_path, sidecar_entry)
+        if row_count <= 0 or copy_path is None:
             await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)} CASCADE;")
             return None
-        await _copy_ptg2_manifest_provider_set_component_file(tmp_path, target_table=table_name)
+        await _copy_manifest_component_file(copy_path, target_table=table_name)
     finally:
-        if tmp_path is not None:
+        if copy_path is not None:
             try:
-                tmp_path.unlink(missing_ok=True)
+                copy_path.unlink(missing_ok=True)
             except OSError:
-                logger.warning("Failed to remove PTG2 provider-set component copy file: %s", tmp_path)
+                logger.warning("Failed to remove PTG2 provider-set component copy file: %s", copy_path)
 
-    primary_index = _ptg2_snapshot_index_name(table_name, "primary")
-    group_index = _ptg2_snapshot_index_name(table_name, "group_idx")
-    await db.status(
-        f"""
-        CREATE UNIQUE INDEX {_quote_ident(primary_index)}
-        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
-        (provider_set_global_id_128, provider_group_global_id_128);
-        """
-    )
-    await db.status(
-        f"""
-        CREATE INDEX {_quote_ident(group_index)}
-        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
-        (provider_group_global_id_128, provider_set_global_id_128);
-        """
-    )
+    await _index_manifest_components(schema_name, table_name)
     return table_name
 
 
@@ -593,7 +608,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
             (npi, provider_group_global_id_128);
             """
         )
-    materialized_provider_set_component_table = await _materialize_ptg2_manifest_provider_set_component_table(
+    materialized_provider_set_component_table = await _materialize_manifest_components(
         schema_name=schema_name,
         table_name=provider_set_component_table,
         artifacts=artifacts,

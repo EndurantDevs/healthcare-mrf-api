@@ -42,7 +42,6 @@ ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
-ptg_manifest_artifacts = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
 ptg_manifest_cleanup = importlib.import_module("process.ptg_parts.ptg2_manifest_cleanup")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
@@ -4495,18 +4494,19 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "CREATE UNIQUE INDEX" in joined
 
 
-def test_ptg2_manifest_publish_materializes_provider_set_components_from_sidecar(tmp_path, monkeypatch):
+def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
+    artifact_module = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
     status_calls = []
-    copied = {}
+    copied_by_field = {}
     provider_group_id = bytes.fromhex("00000000000000000000000000000011")
     provider_set_id = bytes.fromhex("00000000000000000000000000000012")
-    manifest = ptg_manifest_artifacts.write_global_membership_sidecar(
+    sidecar_manifest = artifact_module.write_global_membership_sidecar(
         tmp_path,
         "provider_inverted",
         {provider_group_id: [provider_set_id]},
     )
-    sidecar = dict(manifest["sidecars"][0])
-    sidecar["name"] = "provider_inverted"
+    sidecar_metadata_dict = dict(sidecar_manifest["sidecars"][0])
+    sidecar_metadata_dict["name"] = "provider_inverted"
     manifest_path = tmp_path / "snapshot.manifest.json"
     manifest_path.write_text("{}", encoding="utf-8")
 
@@ -4514,29 +4514,29 @@ def test_ptg2_manifest_publish_materializes_provider_set_components_from_sidecar
         status_calls.append(statement)
 
     async def fake_copy(copy_path, *, target_table):
-        copied["target_table"] = target_table
-        copied["lines"] = Path(copy_path).read_text(encoding="ascii").splitlines()
+        copied_by_field["target_table"] = target_table
+        copied_by_field["lines"] = Path(copy_path).read_text(encoding="ascii").splitlines()
 
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(
         ptg_manifest_publish,
-        "_copy_ptg2_manifest_provider_set_component_file",
+        "_copy_manifest_component_file",
         fake_copy,
     )
 
-    result = asyncio.run(
-        ptg_manifest_publish._materialize_ptg2_manifest_provider_set_component_table(
+    materialized_table_name = asyncio.run(
+        ptg_manifest_publish._materialize_manifest_components(
             schema_name="mrf",
             table_name="ptg2_provider_set_component_snap",
             artifacts={"manifest_uri": f"file://{manifest_path}"},
-            sidecar_artifacts={"provider_inverted": sidecar},
+            sidecar_artifacts={"provider_inverted": sidecar_metadata_dict},
         )
     )
 
     joined = "\n".join(status_calls)
-    assert result == "ptg2_provider_set_component_snap"
-    assert copied["target_table"] == "ptg2_provider_set_component_snap"
-    assert copied["lines"] == [
+    assert materialized_table_name == "ptg2_provider_set_component_snap"
+    assert copied_by_field["target_table"] == "ptg2_provider_set_component_snap"
+    assert copied_by_field["lines"] == [
         "00000000-0000-0000-0000-000000000012\t00000000-0000-0000-0000-000000000011"
     ]
     assert "provider_set_global_id_128 uuid NOT NULL" in joined
