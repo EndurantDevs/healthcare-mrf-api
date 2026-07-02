@@ -3945,6 +3945,7 @@ async def _mymedicalshopper_entity_employers(
                     max_employers=max_employers,
                     tpa_name=tpa_name,
                     timeout_seconds=timeout_seconds,
+                    query_filter=target_query,
                 ),
             )
         )

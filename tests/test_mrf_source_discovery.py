@@ -3537,13 +3537,20 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Pacific Life Dental",
         "Renaissance Dental",
         "Transwestern Dental",
-        "Willamette Dental Group",
     ):
         assert by_name[coverage_evidence_dental_name].entity_type == "dental"
         assert by_name[coverage_evidence_dental_name].benefit_lines == ("dental",)
         assert by_name[coverage_evidence_dental_name].status == "active"
         assert by_name[coverage_evidence_dental_name].source_tier == "coverage_evidence"
         assert by_name[coverage_evidence_dental_name].index_url
+    assert by_name["Willamette Dental Group"].entity_type == "dental"
+    assert by_name["Willamette Dental Group"].benefit_lines == ("dental",)
+    assert by_name["Willamette Dental Group"].source_tier == "mrf_importable"
+    assert by_name["Willamette Dental Group"].hosting_platform == "html_mrf_links"
+    assert by_name["Willamette Dental Group"].index_url == (
+        "https://www.regence.com/transparency-in-coverage/"
+    )
+    assert "Willamette Dental Insurance" in by_name["Willamette Dental Group"].aliases
     assert by_name["Solstice Dental"].entity_type == "dental"
     assert by_name["Solstice Dental"].benefit_lines == ("dental", "vision")
     assert by_name["Solstice Dental"].status == "active"
@@ -6935,7 +6942,7 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
                         "slug": "example-packaging-choice-example-tpa-10001",
                         "status": "Enabled",
                     },
-                }
+                },
             ]
         raise AssertionError(f"unexpected subscription: {name}")
 
@@ -6981,6 +6988,51 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
             },
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_mms_primary_search_query_passes_local_filter(monkeypatch):
+    async def fake_subscribe_collect(_ws, *, name, **_kwargs):
+        assert name == "entityMRFsConfig"
+        return _mms_fallback_config_messages()
+
+    seen_queries = []
+
+    async def fake_employers_for_query(_ws, employer_query):
+        seen_queries.append(employer_query.query_filter)
+        return {
+            "example-packaging-example-tpa-10001": {
+                "slug": "example-packaging-example-tpa-10001",
+                "name": "Example Packaging",
+            }
+        }
+
+    monkeypatch.setattr(
+        discovery, "_mymedicalshopper_ddp_subscribe_collect", fake_subscribe_collect
+    )
+    monkeypatch.setattr(
+        discovery,
+        "_mymedicalshopper_entity_employers_for_query",
+        fake_employers_for_query,
+    )
+
+    employers = await discovery._mymedicalshopper_entity_employers(
+        object(),
+        source={
+            "metadata_json": {
+                "raw": {
+                    "target_payer_query": "Example Packaging",
+                    "query_expansion_source": True,
+                }
+            }
+        },
+        entity_slug="example-tpa",
+        resolver={},
+        timeout_seconds=5,
+    )
+
+    assert seen_queries == ["Example Packaging"]
+    assert employers[0]["slug"] == "example-packaging-example-tpa-10001"
 
 
 def _mms_fallback_config_messages():
