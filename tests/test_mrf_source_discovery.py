@@ -8656,6 +8656,70 @@ async def test_push_import_control_catalog_refreshes_existing_public_source_meta
 
 
 @pytest.mark.asyncio
+async def test_push_import_control_catalog_skips_existing_public_preview_reingest(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_existing"]
+        return {
+            "source_existing": [
+                {
+                    "canonical_url": "https://example.com/rates.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Carrier",
+                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_public_metadata_only_fake_session(calls),
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [_existing_public_catalog_source_row()]
+    )
+
+    assert sources_synced == 1
+    assert plans_synced == 0
+    assert errors == []
+    assert not [
+        call
+        for call in calls
+        if call["url"].endswith("/v1/ptg/discover/ingest-preview")
+    ]
+    assert not [
+        call for call in calls if call["url"].endswith("/v1/catalog/seeds/import")
+    ]
+
+
+def _existing_public_catalog_source_row():
+    return {
+        "source_id": "source_existing",
+        "index_url": "https://example.com/index.json",
+        "human_url": "https://example.com/transparency",
+        "display_name": "Example Carrier",
+        "source_key": "example-carrier",
+        "seed_provider": "master-list",
+        "access_model": "free",
+        "source_type": "toc_json",
+        "status": "active",
+        "metadata_json": {
+            "source_tier": "mrf_importable",
+            "aliases": ["Example Specialty Plan"],
+            "benefit_lines": ["medical", "dental"],
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     monkeypatch,
 ):

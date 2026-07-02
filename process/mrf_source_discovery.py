@@ -14247,6 +14247,11 @@ async def _push_import_control_catalog(
                         and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                     )
                     stored_status = str((stored or {}).get("status") or "").lower()
+                    should_ingest_preview = bool(
+                        items
+                        and not evidence_only
+                        and (staged or stored_status == "stale")
+                    )
                     if not items and source_status_lower == "active" and not evidence_only:
                         # Existing public sources still need metadata-only refreshes
                         # (aliases, benefit lines, source tier). Newly staged metadata-only
@@ -14268,7 +14273,7 @@ async def _push_import_control_catalog(
                         )
                         continue
                     source_plans = 0
-                    if items and not evidence_only:
+                    if should_ingest_preview:
                         for batch in _chunked(_split_preview_items(items), 100):
                             source_plans += await _ingest_import_control_preview(
                                 session, base, ic_source_id, batch
