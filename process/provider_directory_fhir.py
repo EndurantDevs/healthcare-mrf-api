@@ -649,6 +649,10 @@ def _country_restore_sql(value_sql: str) -> str:
     """
 
 
+def _country_restore_default_us_sql(value_sql: str) -> str:
+    return f"COALESCE(NULLIF(({_country_restore_sql(value_sql)}), ''), 'US')"
+
+
 def _bool_from_seed(value: Any) -> bool | None:
     if value is None:
         return None
@@ -9691,7 +9695,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                 NULLIF(TRIM(addr.value->>'city'), ''),
                 NULLIF(TRIM(addr.value->>'state'), ''),
                 NULLIF(TRIM(addr.value->>'postalCode'), ''),
-                COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')
+                {org_address_country_expr}
             ) AS address_key,
             NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
             NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
@@ -9699,7 +9703,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
             {qschema}.addr_state_code_v1(NULLIF(TRIM(addr.value->>'state'), ''))::varchar AS state_code,
             NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
-            COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')::varchar AS country_code,
+            {org_address_country_expr}::varchar AS country_code,
             org_phone.telephone_number::varchar AS telephone_number,
             org_fax.fax_number::varchar AS fax_number,
             NULL::varchar AS phone_number,
@@ -9748,7 +9752,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                     loc.city_name,
                     COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
                     loc.postal_code,
-                    COALESCE(NULLIF(loc.country_code, ''), 'US')
+                    {location_country_expr}
                 )
             END AS address_key,
             loc.first_line::varchar AS first_line,
@@ -9757,7 +9761,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
-            COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+            {location_country_expr}::varchar AS country_code,
             loc.telephone_number::varchar AS telephone_number,
             loc.fax_number::varchar AS fax_number,
             loc.phone_number::varchar AS phone_number,
@@ -9803,7 +9807,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                     loc.city_name,
                     COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
                     loc.postal_code,
-                    COALESCE(NULLIF(loc.country_code, ''), 'US')
+                    {location_country_expr}
                 )
             END AS address_key,
             loc.first_line::varchar AS first_line,
@@ -9812,7 +9816,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
-            COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+            {location_country_expr}::varchar AS country_code,
             loc.telephone_number::varchar AS telephone_number,
             loc.fax_number::varchar AS fax_number,
             loc.phone_number::varchar AS phone_number,
@@ -9899,6 +9903,8 @@ def provider_directory_address_overlay_insert_sql(
         stage_ref=stage_ref,
         columns=", ".join(_provider_directory_address_overlay_columns()),
         qschema=_q(schema),
+        org_address_country_expr=_country_restore_default_us_sql("addr.value->>'country'"),
+        location_country_expr=_country_restore_default_us_sql("loc.country_code"),
         uuid_re=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         org_scope=_provider_directory_overlay_scope_filter("organization", run_id=run_id, source_ids=source_ids),
         role_scope=_provider_directory_overlay_scope_filter("role", run_id=run_id, source_ids=source_ids),
@@ -9966,14 +9972,14 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                     NULLIF(TRIM(addr.value->>'city'), ''),
                     NULLIF(TRIM(addr.value->>'state'), ''),
                     NULLIF(TRIM(addr.value->>'postalCode'), ''),
-                    COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')
+                    {org_address_country_expr}
                 )::text::varchar AS address_lookup_key,
                 NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
                 NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
                 NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
                 NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
                 NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
-                COALESCE(NULLIF(TRIM(addr.value->>'country'), ''), 'US')::varchar AS country_code,
+                {org_address_country_expr}::varchar AS country_code,
                 organization_rows.telephone_number,
                 organization_rows.fax_number,
                 organization_rows.updated_at AS source_updated_at
@@ -10061,7 +10067,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                         loc.city_name,
                         COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
                         loc.postal_code,
-                        COALESCE(NULLIF(loc.country_code, ''), 'US')
+                        {location_country_expr}
                     )
                 END AS address_key,
                 loc.first_line::varchar AS first_line,
@@ -10070,7 +10076,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
-                COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+                {location_country_expr}::varchar AS country_code,
                 loc.telephone_number::varchar AS telephone_number,
                 loc.fax_number::varchar AS fax_number,
                 loc.phone_number::varchar AS phone_number,
@@ -10122,7 +10128,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                         loc.city_name,
                         COALESCE(NULLIF(loc.state_name, ''), loc.state_code),
                         loc.postal_code,
-                        COALESCE(NULLIF(loc.country_code, ''), 'US')
+                        {location_country_expr}
                     )
                 END AS address_key,
                 loc.first_line::varchar AS first_line,
@@ -10131,7 +10137,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
-                COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
+                {location_country_expr}::varchar AS country_code,
                 loc.telephone_number::varchar AS telephone_number,
                 loc.fax_number::varchar AS fax_number,
                 loc.phone_number::varchar AS phone_number,
@@ -10181,6 +10187,8 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
         "columns": ", ".join(_provider_directory_address_overlay_columns()),
         "qschema": _q(schema),
+        "org_address_country_expr": _country_restore_default_us_sql("addr.value->>'country'"),
+        "location_country_expr": _country_restore_default_us_sql("loc.country_code"),
         "uuid_re": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "organization_table": _qt(schema, "provider_directory_organization"),
         "practitioner_table": _qt(schema, "provider_directory_practitioner"),
@@ -10289,6 +10297,7 @@ async def _populate_address_overlay_stage(
             )
         )
     inserted = sum(inserted_by_component.values())
+    countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     duplicates_removed = await _dedupe_address_overlay_stage(stage_ref)
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
     await _create_provider_directory_address_overlay_indexes(schema, stage_table)
@@ -10297,9 +10306,24 @@ async def _populate_address_overlay_stage(
         "copied_existing": copied_existing,
         "inserted": inserted,
         "inserted_by_component": inserted_by_component,
+        "countries_normalized": countries_normalized,
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
+
+
+async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
+    normalized_country_expr = _country_restore_sql("stage_row.country_code")
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {stage_ref} AS stage_row
+               SET country_code = {normalized_country_expr}
+             WHERE NULLIF({normalized_country_expr}, '') IS NOT NULL
+               AND stage_row.country_code IS DISTINCT FROM {normalized_country_expr};
+            """
+        )
+    )
 
 
 async def _dedupe_address_overlay_stage(stage_ref: str) -> int:
@@ -10347,6 +10371,7 @@ def _address_overlay_publish_result(
         "rows": stage_metric_dict["stage_rows"],
         "inserted": stage_metric_dict["inserted"],
         "inserted_by_component": stage_metric_dict["inserted_by_component"],
+        "countries_normalized": stage_metric_dict.get("countries_normalized", 0),
         "duplicates_removed": stage_metric_dict["duplicates_removed"],
         "copied_existing": stage_metric_dict["copied_existing"],
         "source_ids": source_ids,

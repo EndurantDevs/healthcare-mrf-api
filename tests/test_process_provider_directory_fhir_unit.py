@@ -6721,6 +6721,8 @@ def test_address_overlay_sql_scope():
     assert "organization.last_seen_run_id = CAST(:run_id AS varchar)" in sql
     assert "organization.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
     assert "addr_key_v1" in sql
+    assert "UNITEDSTATESOFAMERICA" in sql
+    assert "THEN 'US'" in sql
 
 
 def test_address_overlay_component_sql_is_bounded_to_one_component():
@@ -6746,6 +6748,8 @@ def test_address_overlay_component_sql_is_bounded_to_one_component():
     assert "JOIN org_address_keys AS keys" in sql
     assert "keys.address_lookup_key = raw.address_lookup_key" in sql
     assert "IS NOT DISTINCT FROM raw" not in sql
+    assert "UNITEDSTATESOFAMERICA" in sql
+    assert "THEN 'US'" in sql
     assert sql.count("addr_key_v1(") == 1
 
 

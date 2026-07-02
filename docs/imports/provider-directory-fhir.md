@@ -439,6 +439,14 @@ developer-portal seed rows to
 `http_401` diagnostics until credentials are configured. Aetna's advertised
 token URL is
 `https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token`.
+For Provider Directory production client-credentials tokens, Aetna's published
+token-generation guide uses scope `Public NonPII` and Basic client
+authentication. Once authorized, Aetna still rejects broad unfiltered resource
+searches: `Practitioner` needs NPI or name plus location, `PractitionerRole`
+and `OrganizationAffiliation` need specialty, and `Location` /
+`InsurancePlan` need location/state filters. Treat Aetna as credentialed but
+not fully crawlable by the generic broad search importer until an Aetna-specific
+partitioner or exact product swagger bulk-export route is enabled.
 
 ALOHR / Alabama One Health Record is mixed-mode. The original seed URL
 `https://alohr.esante.us/public/providers` is a public React provider-search app,
