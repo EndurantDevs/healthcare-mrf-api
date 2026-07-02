@@ -7,7 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import bindparam, text
 
@@ -1220,6 +1220,31 @@ def _inferred_provider_taxonomy_code_sql(
     if code_placeholders:
         clauses.append(f"{nt_alias}.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})")
     return "(" + " OR ".join(clauses) + ")" if clauses else ""
+
+
+def _taxonomy_array_overlap_sql(
+    alias: str,
+    params: dict[str, Any],
+    param_prefix: str,
+    taxonomy_codes: Iterable[Any],
+) -> str:
+    code_placeholders: list[str] = []
+    seen: set[str] = set()
+    for idx, raw_code in enumerate(taxonomy_codes):
+        code = str(raw_code or "").strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        key = f"{param_prefix}_taxonomy_array_code_{idx}"
+        params[key] = code
+        code_placeholders.append(f":{key}")
+    if not code_placeholders:
+        return ""
+    return (
+        f"{alias}.taxonomy_array && ("
+        f"SELECT ARRAY_AGG(int_code) FROM {PTG2_SCHEMA}.nucc_taxonomy "
+        f"WHERE code IN ({', '.join(code_placeholders)}))"
+    )
 
 
 def _ptg2_manifest_storage_enabled(serving_tables: PTG2ServingTables) -> bool:
@@ -2524,6 +2549,12 @@ async def _ptg2_manifest_location_provider_matches(
         params=params,
         param_prefix="manifest_location_inferred_taxonomy",
     )
+    location_array_taxonomy_codes: list[str] = []
+    if location_specialty_filter.active:
+        location_array_taxonomy_codes.extend(location_specialty_filter.taxonomy_codes)
+    inferred_taxonomy_rule = _inferred_provider_taxonomy_rule(args)
+    if inferred_taxonomy_rule is not None:
+        location_array_taxonomy_codes.extend(inferred_taxonomy_rule.taxonomy_codes)
     member_entity_filter_sql = ""
     if location_inferred_taxonomy_sql:
         member_filters.append(
@@ -2814,6 +2845,14 @@ async def _ptg2_manifest_location_provider_matches(
                     schema=PTG2_SCHEMA,
                 )
             )
+        array_taxonomy_filter = _taxonomy_array_overlap_sql(
+            "loc",
+            params,
+            "manifest_location_table",
+            location_array_taxonomy_codes,
+        )
+        if array_taxonomy_filter:
+            location_filters.append(array_taxonomy_filter)
         if location_inferred_taxonomy_sql:
             location_filters.append(
                 f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
