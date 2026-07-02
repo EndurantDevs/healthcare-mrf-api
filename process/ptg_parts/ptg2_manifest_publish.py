@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,6 +17,7 @@ from process.ptg_parts.config import (
     PTG2_UNLOGGED_STAGE_ENV, _env_bool)
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
+from process.ptg_parts.ptg2_manifest_artifacts import read_global_sidecar_entries
 from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
                                                _ptg2_snapshot_table_name)
 
@@ -46,6 +49,10 @@ PTG2_MANIFEST_PRICE_ATOM_COLUMNS = [
 PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS = [
     "provider_group_global_id_128",
     "npi",
+]
+PTG2_MANIFEST_PROVIDER_SET_COMPONENT_COLUMNS = [
+    "provider_set_global_id_128",
+    "provider_group_global_id_128",
 ]
 
 
@@ -158,6 +165,14 @@ async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, tar
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
 
 
+async def _copy_ptg2_manifest_provider_set_component_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PROVIDER_SET_COMPONENT_COLUMNS,
+    )
+
+
 async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, columns: list[str]) -> None:
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
@@ -197,6 +212,112 @@ def _looks_like_unique_index_duplicate(exc: Exception) -> bool:
             and ("duplicate" in message or "duplicated" in message)
         )
     )
+
+
+def _ptg2_manifest_provider_inverted_sidecar_entry(
+    sidecar_artifacts: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not sidecar_artifacts:
+        return None
+    direct = sidecar_artifacts.get("provider_inverted")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+    for value in sidecar_artifacts.values():
+        if isinstance(value, Mapping) and value.get("name") == "provider_inverted":
+            return dict(value)
+    return None
+
+
+def _ptg2_manifest_publish_sidecar_path(
+    entry: Mapping[str, Any],
+    artifacts: Mapping[str, Any] | None,
+) -> Path:
+    raw_path = str(entry.get("path") or "").strip()
+    path = Path(raw_path)
+    if path.is_absolute() or path.exists():
+        return path
+    manifest_uri = str((artifacts or {}).get("manifest_uri") or "").strip()
+    if manifest_uri.startswith("file://"):
+        manifest_path = Path(manifest_uri.removeprefix("file://"))
+        candidate = manifest_path.parent / path
+        if candidate.exists():
+            return candidate
+    return path
+
+
+def _ptg2_manifest_sql_id_from_bytes(value: bytes) -> str:
+    if _ptg2_id_storage() == "uuid":
+        return str(uuid.UUID(bytes=value))
+    return value.hex()
+
+
+async def _materialize_ptg2_manifest_provider_set_component_table(
+    *,
+    schema_name: str,
+    table_name: str,
+    artifacts: Mapping[str, Any] | None,
+    sidecar_artifacts: Mapping[str, Any] | None,
+) -> str | None:
+    sidecar_entry = _ptg2_manifest_provider_inverted_sidecar_entry(sidecar_artifacts)
+    if not sidecar_entry:
+        return None
+    if not str(sidecar_entry.get("path") or "").strip():
+        return None
+    sidecar_path = _ptg2_manifest_publish_sidecar_path(sidecar_entry, artifacts)
+    if not sidecar_path.exists() or sidecar_path.stat().st_size <= 0:
+        return None
+
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)} CASCADE;")
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(table_name)} (
+            provider_set_global_id_128 {id_type} NOT NULL,
+            provider_group_global_id_128 {id_type} NOT NULL
+        );
+        """
+    )
+
+    tmp_path: Path | None = None
+    row_count = 0
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False) as fp:
+            tmp_path = Path(fp.name)
+            for entry in read_global_sidecar_entries(sidecar_path, metadata=sidecar_entry):
+                provider_group_id = _ptg2_manifest_sql_id_from_bytes(entry.owner)
+                for member in entry.members:
+                    provider_set_id = _ptg2_manifest_sql_id_from_bytes(member)
+                    fp.write(f"{provider_set_id}\t{provider_group_id}\n".encode("ascii"))
+                    row_count += 1
+        if row_count <= 0 or tmp_path is None:
+            await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)} CASCADE;")
+            return None
+        await _copy_ptg2_manifest_provider_set_component_file(tmp_path, target_table=table_name)
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove PTG2 provider-set component copy file: %s", tmp_path)
+
+    primary_index = _ptg2_snapshot_index_name(table_name, "primary")
+    group_index = _ptg2_snapshot_index_name(table_name, "group_idx")
+    await db.status(
+        f"""
+        CREATE UNIQUE INDEX {_quote_ident(primary_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+        (provider_set_global_id_128, provider_group_global_id_128);
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX {_quote_ident(group_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+        (provider_group_global_id_128, provider_set_global_id_128);
+        """
+    )
+    return table_name
 
 
 async def _dedupe_ptg2_manifest_serving_table(schema_name: str, final_table: str) -> dict[str, int]:
@@ -329,12 +450,16 @@ async def _publish_ptg2_manifest_serving_snapshot(
     provider_group_member_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_group_member")
     price_atom_table = _ptg2_snapshot_table_name("price_atom", source_key, snapshot_id)
     provider_group_member_table = _ptg2_snapshot_table_name("provider_group_member", source_key, snapshot_id)
+    provider_set_component_table = _ptg2_snapshot_table_name("provider_set_component", source_key, snapshot_id)
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     started_at = time.monotonic()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} CASCADE;"
+    )
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_component_table)} CASCADE;"
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
     await db.status(
@@ -468,6 +593,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
             (npi, provider_group_global_id_128);
             """
         )
+    materialized_provider_set_component_table = await _materialize_ptg2_manifest_provider_set_component_table(
+        schema_name=schema_name,
+        table_name=provider_set_component_table,
+        artifacts=artifacts,
+        sidecar_artifacts=sidecar_artifacts,
+    )
     await db.status(
         f"""
         CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
@@ -494,6 +625,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
     if await _table_exists(schema_name, provider_group_member_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
+    if materialized_provider_set_component_table:
+        await db.status(
+            f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_set_component_table)};"
+        )
     row_count = await _exact_table_rows(schema_name, final_table)
     elapsed_seconds = time.monotonic() - started_at
     artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
@@ -506,6 +641,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "table": f"{schema_name}.{final_table}",
         "price_atom_table": f"{schema_name}.{price_atom_table}",
         "provider_group_member_table": f"{schema_name}.{provider_group_member_table}",
+        "provider_set_component_table": (
+            f"{schema_name}.{materialized_provider_set_component_table}"
+            if materialized_provider_set_component_table
+            else None
+        ),
         "code_count_table": f"{schema_name}.{code_count_table}",
         "rate_count": row_count,
         "serving_rates": row_count,

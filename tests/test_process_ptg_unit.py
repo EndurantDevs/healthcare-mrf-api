@@ -42,6 +42,7 @@ ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
+ptg_manifest_artifacts = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
 ptg_manifest_cleanup = importlib.import_module("process.ptg_parts.ptg2_manifest_cleanup")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
@@ -4492,6 +4493,55 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "SELECT DISTINCT ON (price_atom_global_id_128)" not in joined
     assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" not in joined
     assert "CREATE UNIQUE INDEX" in joined
+
+
+def test_ptg2_manifest_publish_materializes_provider_set_components_from_sidecar(tmp_path, monkeypatch):
+    status_calls = []
+    copied = {}
+    provider_group_id = bytes.fromhex("00000000000000000000000000000011")
+    provider_set_id = bytes.fromhex("00000000000000000000000000000012")
+    manifest = ptg_manifest_artifacts.write_global_membership_sidecar(
+        tmp_path,
+        "provider_inverted",
+        {provider_group_id: [provider_set_id]},
+    )
+    sidecar = dict(manifest["sidecars"][0])
+    sidecar["name"] = "provider_inverted"
+    manifest_path = tmp_path / "snapshot.manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_copy(copy_path, *, target_table):
+        copied["target_table"] = target_table
+        copied["lines"] = Path(copy_path).read_text(encoding="ascii").splitlines()
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(
+        ptg_manifest_publish,
+        "_copy_ptg2_manifest_provider_set_component_file",
+        fake_copy,
+    )
+
+    result = asyncio.run(
+        ptg_manifest_publish._materialize_ptg2_manifest_provider_set_component_table(
+            schema_name="mrf",
+            table_name="ptg2_provider_set_component_snap",
+            artifacts={"manifest_uri": f"file://{manifest_path}"},
+            sidecar_artifacts={"provider_inverted": sidecar},
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result == "ptg2_provider_set_component_snap"
+    assert copied["target_table"] == "ptg2_provider_set_component_snap"
+    assert copied["lines"] == [
+        "00000000-0000-0000-0000-000000000012\t00000000-0000-0000-0000-000000000011"
+    ]
+    assert "provider_set_global_id_128 uuid NOT NULL" in joined
+    assert "(provider_set_global_id_128, provider_group_global_id_128)" in joined
+    assert "(provider_group_global_id_128, provider_set_global_id_128)" in joined
 
 
 def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):

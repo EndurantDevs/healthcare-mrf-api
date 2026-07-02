@@ -2235,6 +2235,82 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
 
 
 @pytest.mark.asyncio
+async def test_manifest_location_provider_matches_uses_component_table_without_sidecar(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            False,
+            FakeResult(
+                rows=[
+                    {
+                        "provider_group_global_id_128": group_id,
+                        "npi": 1234567890,
+                        "location_hash": "entity_address_unified:1234567890:primary:1",
+                        "state": "CA",
+                        "city": "GLENDALE",
+                        "zip5": "91204",
+                        "distance_miles": 3.25,
+                        "zip_match_type": "radius",
+                        "anchor_zip5": "91204",
+                        "zip_radius_miles": 10.0,
+                        "telephone_number": "8185551212",
+                        "fax_number": "8185551213",
+                        "location_source": "entity_address_unified",
+                        "location_confidence_code": "entity_address_unified",
+                        "address_payload": '{"lat":34.14024131,"long":-118.255125}',
+                        "taxonomy_codes": ["207XS0114X"],
+                        "specialties": ["Orthopaedic Surgery Physician"],
+                        "classifications": ["Orthopaedic Surgery"],
+                        "specializations": ["Sports Medicine"],
+                        "primary_specialty": "Orthopaedic Surgery Physician",
+                        "primary_specialization": "Sports Medicine",
+                        "provider_name": "TiC provider",
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "provider_group_global_id_128": group_id,
+                        "provider_set_global_id_128": provider_set_id,
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        id_storage="uuid",
+    )
+
+    def fail_sidecar(*_args, **_kwargs):
+        raise AssertionError(
+            "provider_inverted sidecar should not be used when DB component table exists"
+        )
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fail_sidecar)
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+    )
+
+    component_sql = str(session.calls[-1][0][0])
+    component_params = session.calls[-1][0][1]
+    assert "FROM mrf.ptg2_provider_set_component_snap" in component_sql
+    assert "CAST(:group_ids AS uuid[])" in component_sql
+    assert component_params["group_ids"] == [group_id]
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
 async def test_manifest_location_provider_phone_fallback_uses_uuid_key_indexes(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
