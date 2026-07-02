@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -337,7 +338,6 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
 
-
 async def load_discovery_candidates(
     *,
     provider: str,
@@ -361,25 +361,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Audit private client carrier coverage against PTG source discovery."
     )
-    parser.add_argument("csv_path", type=Path, help="Path to the private client/carrier CSV.")
-    parser.add_argument("--provider", default="master-list", help="Source-discovery provider to load.")
+    parser.add_argument("csv_path", type=Path, help="Private client/carrier CSV.")
+    parser.add_argument("--provider", default="master-list", help="Discovery provider.")
     parser.add_argument("--candidate-limit", type=int, default=5000)
     parser.add_argument(
         "--show-unmatched",
         action="store_true",
-        help="Print unmatched carrier labels. Keep output local because labels come from the private CSV.",
+        help="Print unmatched carrier labels. Keep output local.",
     )
     parser.add_argument("--top-unmatched", type=int, default=20)
     parser.add_argument(
         "--show-non-importable",
         action="store_true",
-        help=(
-            "Print catalog/evidence carrier labels that still lack an importable source. "
-            "Keep output local because labels come from the private CSV."
-        ),
+        help="Print catalog/evidence labels lacking importable sources. Keep output local.",
     )
     parser.add_argument("--top-non-importable", type=int, default=50)
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    parser.add_argument("--redact-labels", action="store_true", help="Redact detail labels.")
     return parser
 
 
@@ -392,10 +390,16 @@ def _add_optional_report_sections(
     importable_candidates: Sequence[Any],
     unmatched: Mapping[str, Sequence[tuple[str, int]]],
 ) -> None:
+    display_carrier = lambda label: (
+        f"carrier:{hashlib.sha256(normalize_carrier(label).encode('utf-8')).hexdigest()[:12]}"
+        if parsed_args.redact_labels
+        else label
+    )
+
     if parsed_args.show_unmatched:
         report_payload["top_unmatched"] = {
             benefit_line: [
-                {"carrier": carrier_label, "mentions": mention_count}
+                {"carrier": display_carrier(carrier_label), "mentions": mention_count}
                 for carrier_label, mention_count in carrier_counts[
                     : parsed_args.top_unmatched
                 ]
@@ -410,7 +414,7 @@ def _add_optional_report_sections(
         )
         report_payload["top_non_importable"] = {
             benefit_line: [
-                {"carrier": carrier_label, "mentions": mention_count}
+                {"carrier": display_carrier(carrier_label), "mentions": mention_count}
                 for carrier_label, mention_count in carrier_counts[
                     : parsed_args.top_non_importable
                 ]

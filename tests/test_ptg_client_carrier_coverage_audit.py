@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from scripts.research.ptg_client_carrier_coverage_audit import (
+    _add_optional_report_sections,
     audit_carrier_rows,
     audit_non_importable_carrier_rows,
     has_catalog_source_candidate,
@@ -219,3 +220,34 @@ def test_audit_non_importable_carrier_rows_reports_evidence_only_matches():
     assert non_importable["medical"] == [("Evidence Medical", 2)]
     assert non_importable["dental"] == [("Evidence Dental", 2)]
     assert non_importable["vision"] == []
+
+
+def test_optional_sections_redact_private_carrier_labels():
+    report_by_section = {}
+    client_rows = [
+        {
+            "MEDICAL_CARRIERS": "Private Evidence\nPrivate Missing",
+            "DENTAL_CARRIERS": "",
+            "VISION_CARRIERS": "",
+        }
+    ]
+    parsed_args = SimpleNamespace(
+        show_unmatched=True,
+        show_non_importable=False,
+        top_unmatched=5,
+        top_non_importable=5,
+        redact_labels=True,
+    )
+
+    _add_optional_report_sections(
+        report_by_section,
+        parsed_args=parsed_args,
+        client_rows=client_rows,
+        all_candidates=[SimpleNamespace(name="Private Evidence")],
+        importable_candidates=[],
+        unmatched={"medical": [("Private Missing", 1)]},
+    )
+
+    unmatched_carrier = report_by_section["top_unmatched"]["medical"][0]["carrier"]
+    assert unmatched_carrier.startswith("carrier:")
+    assert "Private" not in unmatched_carrier
