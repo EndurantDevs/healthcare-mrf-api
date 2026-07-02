@@ -3265,6 +3265,17 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Advantica" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
+    active_connecticare = next(
+        candidate
+        for candidate in candidates
+        if candidate.payer_name == "ConnectiCare" and candidate.status == "active"
+    )
+    assert (
+        "https://www.connecticare.com/about-us/transparency-coverage-compliance"
+        in discovery._candidate_metadata(
+            active_connecticare, active_connecticare.aliases
+        )["supersedes_urls"]
+    )
     assert by_name["Aspirus Health Plan"].hosting_platform == "healthsparq"
     assert by_name["Aspirus Health Plan"].index_url == (
         "https://aspirus.healthsparq.com/healthsparq/public/#/one/"
