@@ -380,8 +380,19 @@ def _private_query_context_paths() -> list[Path]:
         value = value.strip()
         if not value:
             continue
+        is_optional_path = False
+        if value.lower().startswith("optional="):
+            is_optional_path = True
+            value = value[len("optional=") :].strip()
+            if not value:
+                continue
         path = _resolve_config_path(os.path.expanduser(value))
         if not path.exists():
+            if is_optional_path:
+                logging.getLogger(__name__).warning(
+                    "private query context file not mounted: %s", path
+                )
+                continue
             raise ValueError(f"private query context file does not exist: {path}")
         paths.append(path)
     return paths

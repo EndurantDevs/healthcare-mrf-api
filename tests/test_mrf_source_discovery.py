@@ -1524,6 +1524,27 @@ def test_private_context_caches_carrier_matching(tmp_path, monkeypatch):
     ]
 
 
+def test_private_query_context_optional_path_skips_missing_file(tmp_path, monkeypatch):
+    missing_path = tmp_path / "not-mounted.csv"
+
+    monkeypatch.setenv(
+        discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV,
+        f"optional={missing_path}",
+    )
+
+    assert discovery._private_query_context_paths() == []
+    assert discovery._private_query_context_rows() == []
+
+
+def test_private_query_context_required_path_still_fails(tmp_path, monkeypatch):
+    missing_path = tmp_path / "not-mounted.csv"
+
+    monkeypatch.setenv(discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(missing_path))
+
+    with pytest.raises(ValueError, match="private query context file does not exist"):
+        discovery._private_query_context_paths()
+
+
 def test_query_expansion_sources_have_query_specific_source_identity():
     base = discovery.SourceCandidate(
         payer_name="Example Aetna",
