@@ -3119,10 +3119,12 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "entity_address_unified.geo_idx" in context["post_publish_skipped_indexes"]
     assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
     assert context["post_publish_index_concurrency"] in {1}
-    assert context["post_publish_index_total"] == len(statements)
-    assert context["post_publish_index_completed"] == len(statements)
+    index_statements = [s for s in statements if "CREATE EXTENSION" not in s]
+    assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
+    assert context["post_publish_index_total"] == len(index_statements)
+    assert context["post_publish_index_completed"] == len(index_statements)
     assert context["post_publish_index_pending"] is False
-    assert len(context["post_publish_index_timings"]) == len(statements)
+    assert len(context["post_publish_index_timings"]) == len(index_statements)
 
 
 @pytest.mark.asyncio
@@ -3154,8 +3156,10 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     assert context["post_publish_index_concurrency"] == 6
     assert "CREATE INDEX IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "CREATE INDEX CONCURRENTLY" not in joined
-    assert context["post_publish_index_total"] == len(statements)
-    assert context["post_publish_index_completed"] == len(statements)
+    index_statements = [s for s in statements if "CREATE EXTENSION" not in s]
+    assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
+    assert context["post_publish_index_total"] == len(index_statements)
+    assert context["post_publish_index_completed"] == len(index_statements)
     assert context["post_publish_index_pending"] is False
 
 

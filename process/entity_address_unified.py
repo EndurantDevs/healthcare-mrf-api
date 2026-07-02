@@ -1134,6 +1134,22 @@ async def _create_post_publish_indexes(
     phase_context["post_publish_index_total"] = len(statements)
     phase_context["post_publish_index_completed"] = 0
 
+    if any(" USING gin " in stmt for _name, stmt in statements):
+        # serving_zip5_taxonomy mixes a btree-typed expression into a GIN
+        # index, which needs the btree_gin extension. It is a trusted
+        # extension (DB owner can create it without superuser), so ensure it
+        # here instead of failing the whole post-publish index pass on a
+        # freshly provisioned database.
+        ensure_extension = "CREATE EXTENSION IF NOT EXISTS btree_gin"
+        if build_concurrently and hasattr(db, "execute_ddl"):
+            await db.execute_ddl(ensure_extension)
+        else:
+            await _run_sql_phase(
+                ensure_extension,
+                context=phase_context,
+                phase="entity-address-unified post-publish extension",
+            )
+
     configured_index_concurrency = _env_int(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY",
         _env_int(
