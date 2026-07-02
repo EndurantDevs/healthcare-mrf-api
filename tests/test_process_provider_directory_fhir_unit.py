@@ -2907,6 +2907,7 @@ def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_
     assert "WITH address_candidates AS" in sql
     assert "overlay.resource_type::varchar AS resource_type" in sql
     assert "overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')" in sql
+    assert "AND overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')" in sql
     assert "split_part(overlay.source_record_id, ':', 5)" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
     assert "practitioner.npi = e.npi" in sql
@@ -2914,8 +2915,8 @@ def test_provider_directory_address_corroboration_sql_links_overlay_npi_address_
     assert "loc.resource_id = e.location_resource_id" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
-    assert "organization_address_matches AS" in sql
-    assert "'organization_address'::varchar AS provider_directory_match_type" in sql
+    assert "organization_address_matches AS" not in sql
+    assert "'organization_address'::varchar AS provider_directory_match_type" not in sql
     assert 'LEFT JOIN "mrf"."provider_directory_network_catalog" network_catalog' in sql
     assert "network_catalog.network_resource_id = NULLIF(BTRIM(CASE" in sql
     assert "regexp_replace(network_ref.value, '^.*/Organization/', '')" in sql
@@ -2959,7 +2960,7 @@ def test_provider_directory_address_corroboration_sql_projects_network_plan_evid
     assert "NULL::varchar AS ptg_plan_id" in sql
     assert "'payer_directory_corroborated_location'" in sql
     assert "'provider_directory_address'" in sql
-    assert "'npi_address_key_organization_address'" in sql
+    assert "'npi_address_key_organization_address'" not in sql
     assert "UNION ALL" in sql
     assert 'provider_directory_organization_affiliation' in sql
 

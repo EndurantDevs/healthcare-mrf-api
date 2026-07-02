@@ -2685,10 +2685,12 @@ def provider_directory_address_corroboration_sql(
     *,
     view_name: str = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> str:
-    """Build a view that corroborates keyed Provider Directory addresses.
+    """Build a view that corroborates role-bound Provider Directory addresses.
 
-    The compact address overlay is the driving relation, so artifact publishes
-    do not scan the hot unified address table while API readers are active.
+    The compact address overlay is the driving relation, scoped to role and
+    affiliation rows that can carry network context. Direct Organization
+    address evidence stays in provider_directory_address_overlay for provider
+    APIs, but is intentionally excluded from this PTG corroboration artifact.
     """
 
     schema = db_schema or _schema()
@@ -2729,6 +2731,7 @@ def provider_directory_address_corroboration_sql(
           FROM {_qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)} overlay
          WHERE overlay.npi IS NOT NULL
            AND overlay.address_key IS NOT NULL
+           AND overlay.resource_type IN ('PractitionerRole', 'OrganizationAffiliation')
     ),
     practitioner_matches AS (
         SELECT
@@ -2967,66 +2970,10 @@ def provider_directory_address_corroboration_sql(
          WHERE e.npi IS NOT NULL
            AND e.address_key IS NOT NULL
     ),
-    organization_address_matches AS (
-        SELECT
-            NULL::varchar AS source_key,
-            NULL::varchar AS snapshot_id,
-            NULL::varchar AS plan_id,
-            NULL::varchar AS ptg_plan_id,
-            e.npi,
-            e.location_key,
-            e.address_key,
-            e.zip5,
-            e.state_code,
-            e.city_norm,
-            src.source_id AS provider_directory_source_id,
-            src.org_name AS provider_directory_org_name,
-            src.plan_name AS provider_directory_plan_name,
-            organization.resource_id AS provider_directory_provider_resource_id,
-            organization.name AS provider_directory_provider_name,
-            NULL::varchar AS provider_directory_role_resource_id,
-            NULL::varchar AS provider_directory_location_resource_id,
-            NULL::varchar AS provider_directory_location_name,
-            e.telephone_number AS provider_directory_telephone_number,
-            e.phone_number AS provider_directory_phone_number,
-            NULL::varchar AS provider_directory_phone_extension,
-            e.fax_number AS provider_directory_fax_number,
-            e.fax_number_digits AS provider_directory_fax_number_digits,
-            NULL::varchar AS provider_directory_fax_extension,
-            '[]'::jsonb AS provider_directory_network_refs,
-            '[]'::jsonb AS provider_directory_insurance_plan_refs,
-            ARRAY[]::varchar[] AS provider_directory_network_names,
-            '[]'::jsonb AS provider_directory_network_matches,
-            false AS provider_directory_plan_context_matched,
-            false AS provider_directory_network_context_present,
-            '[]'::jsonb AS provider_directory_insurance_plan_matches,
-            COALESCE(organization.type_codes::jsonb, '[]'::jsonb) AS provider_directory_specialty_codes,
-            '[]'::jsonb AS provider_directory_role_codes,
-            'organization_address'::varchar AS provider_directory_match_type,
-            true AS provider_directory_active_role,
-            (organization.active IS DISTINCT FROM false) AS provider_directory_active_provider,
-            true AS provider_directory_active_location,
-            GREATEST(
-                COALESCE(e.source_updated_at, TIMESTAMP 'epoch'),
-                COALESCE(organization.observed_at, TIMESTAMP 'epoch')
-            ) AS provider_directory_observed_at
-          FROM address_candidates e
-          JOIN {_qt(schema, "provider_directory_organization")} organization
-            ON e.resource_type = 'Organization'
-           AND organization.source_id = e.source_id
-           AND organization.resource_id = e.resource_id
-           AND organization.npi = e.npi
-          JOIN {_qt(schema, "provider_directory_source")} src
-            ON src.source_id = organization.source_id
-         WHERE e.npi IS NOT NULL
-           AND e.address_key IS NOT NULL
-    ),
     matches AS (
         SELECT * FROM practitioner_matches
         UNION ALL
         SELECT * FROM organization_affiliation_matches
-        UNION ALL
-        SELECT * FROM organization_address_matches
     )
     SELECT
         source_key,
@@ -3085,8 +3032,6 @@ def provider_directory_address_corroboration_sql(
                 CASE
                     WHEN provider_directory_plan_context_matched
                         THEN 'npi_address_key_role_location_plan'
-                    WHEN provider_directory_match_type = 'organization_address'
-                        THEN 'npi_address_key_organization_address'
                     ELSE 'npi_address_key_role_location'
                 END,
             'source_id', provider_directory_source_id,
