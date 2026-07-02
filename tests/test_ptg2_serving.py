@@ -4248,10 +4248,47 @@ async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_with
     assert "LOWER(COALESCE" not in sql
     assert "nucc_filter.display_name" not in sql
     assert "mrf.npi_taxonomy provider_specialty_nt" in sql
-    assert "provider_specialty_nt.npi = pgm_filter.npi" in sql
+    # Uncorrelated semi-joins, never per-member-row probes: correlated EXISTS
+    # re-descends npi_taxonomy for every member of whole-network provider sets.
+    # CPT 70551 also triggers the radiology inferred-taxonomy rule, so the
+    # inferred clause is pinned here too.
+    assert "pgm_filter.npi IN (SELECT provider_specialty_nt.npi" in sql
+    assert "provider_specialty_nt.npi = pgm_filter.npi" not in sql
+    assert "pgm_filter.npi IN (SELECT nt.npi FROM mrf.npi_taxonomy nt" in sql
+    assert "nt.npi = pgm_filter.npi" not in sql
     assert "healthcare_provider_primary_taxonomy_switch" in sql
     assert params["provider_specialty_taxonomy_code_0"] == "207Q00000X"
     assert params["provider_specialty_taxonomy_code_1"] == "208D00000X"
+
+
+def test_compact_location_filter_scopes_taxonomy_via_semijoin():
+    """filtered_locations taxonomy predicates must be uncorrelated semi-joins.
+
+    The location scan covers every row in the zip/geo set BEFORE the LIMIT; a
+    correlated EXISTS re-descends npi_taxonomy once per row — the pathology
+    that 502'd the manifest location matcher for sparse taxonomy codes.
+    """
+    params_by_name = {"limit": 25}
+    sql, has_filter = ptg2_serving._compact_provider_filter_sql(
+        _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token"),
+        {
+            "zip5": "60601",
+            "code": "90837",
+            "code_system": "CPT",
+            "taxonomy_codes": "101YM0800X,103T00000X",
+            "primary_only": "false",
+        },
+        params_by_name,
+    )
+    assert has_filter
+    assert "filtered_locations AS MATERIALIZED" in sql
+    assert "loc.npi IN (SELECT provider_specialty_loc_nt.npi" in sql
+    assert "provider_specialty_loc_nt.npi = loc.npi" not in sql
+    # The inferred CPT->behavioral taxonomy predicate is a semi-join too.
+    assert "loc.npi IN (SELECT nt.npi FROM mrf.npi_taxonomy nt" in sql
+    assert "nt.npi = loc.npi" not in sql
+    assert params_by_name["provider_specialty_loc_taxonomy_code_0"] == "101YM0800X"
+    assert params_by_name["provider_specialty_loc_taxonomy_code_1"] == "103T00000X"
 
 
 @pytest.mark.asyncio
@@ -4284,8 +4321,10 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
     assert "pgm_filter.provider_group_hash = r.provider_set_hash" in sql
     assert "JOIN mrf.ptg2_provider_group_member_token pgm" in sql
     assert "ON pgm.provider_group_hash = r.provider_set_hash" in sql
-    assert "provider_specialty_nt.npi = pgm_filter.npi" in sql
-    assert "provider_expansion_specialty_nt.npi = pgm.npi" in sql
+    assert "pgm_filter.npi IN (SELECT provider_specialty_nt.npi" in sql
+    assert "pgm.npi IN (SELECT provider_expansion_specialty_nt.npi" in sql
+    assert "provider_specialty_nt.npi = pgm_filter.npi" not in sql
+    assert "provider_expansion_specialty_nt.npi = pgm.npi" not in sql
     assert "LEFT JOIN LATERAL" in sql
     assert "tax.taxonomy_codes" in sql
     assert "363A00000X" not in params.values()
@@ -4625,6 +4664,11 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     assert payload["pagination"]["limit"] == 1
     assert payload["pagination"]["total"] == 1
     assert "n_entity.entity_type_code" in sql
+    # Inferred-taxonomy scoping in the provider expansion is an uncorrelated
+    # semi-join. The negative assertion is scoped to the EXISTS shape because
+    # the taxonomy-summary LATERAL legitimately correlates nt.npi = pgm.npi.
+    assert "pgm.npi IN (SELECT nt.npi FROM mrf.npi_taxonomy nt" in sql
+    assert "npi_taxonomy nt WHERE nt.npi = pgm.npi" not in sql
     assert params["limit"] == 1
     assert params["rate_candidate_limit"] > params["limit"]
 

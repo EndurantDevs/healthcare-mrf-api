@@ -4206,18 +4206,27 @@ def _compact_provider_filter_sql(
             clauses.append("UPPER(COALESCE(loc.city_name, '')) = :city_exact")
         if params.get("state_exact"):
             clauses.append("UPPER(COALESCE(loc.state_name, '')) = :state_exact")
+        # Taxonomy predicates are uncorrelated `npi IN (SELECT ...)` semi-joins,
+        # not correlated EXISTS: this scan covers every location row in the
+        # zip/geo set BEFORE the LIMIT, and a correlated probe re-descends
+        # npi_taxonomy once per row (the same pathology that 502'd the manifest
+        # location matcher). The semi-join resolves the taxonomy NPI set once
+        # off the (healthcare_provider_taxonomy_code, npi) index.
         if inferred_sql:
-            clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
+            clauses.append(
+                f"loc.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
+            )
             clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
         if specialty_filter.active:
             clauses.append(
-                provider_specialty_taxonomy_exists_sql(
-                    "loc.npi",
+                "loc.npi IN ("
+                + provider_specialty_taxonomy_semijoin_sql(
                     params,
                     "provider_specialty_loc",
                     specialty_filter,
                     schema=PTG2_SCHEMA,
                 )
+                + ")"
             )
         where = " AND ".join(clauses) or "TRUE"
         component_join = ""
@@ -4282,18 +4291,25 @@ def _compact_provider_filter_sql(
             clauses.append("UPPER(COALESCE(addr_filter.city_name, '')) = :city_exact")
         if params.get("state_exact"):
             clauses.append("UPPER(COALESCE(addr_filter.state_name, '')) = :state_exact")
+    # Uncorrelated IN semi-joins here too: the enclosing EXISTS walks each rate
+    # candidate's provider set, which for group plans can be a whole network.
+    # The subquery result is resolved/hashed once and probed per member row
+    # instead of re-descending npi_taxonomy per row.
     if specialty_filter.active:
         clauses.append(
-            provider_specialty_taxonomy_exists_sql(
-                "pgm_filter.npi",
+            "pgm_filter.npi IN ("
+            + provider_specialty_taxonomy_semijoin_sql(
                 params,
                 "provider_specialty",
                 specialty_filter,
                 schema=PTG2_SCHEMA,
             )
+            + ")"
         )
     if inferred_sql:
-        clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm_filter.npi AND {inferred_sql})")
+        clauses.append(
+            f"pgm_filter.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
+        )
         clauses.append(_ptg2_individual_npi_exists_sql("pgm_filter.npi"))
     where = " AND ".join(clauses) or "TRUE"
     return (
@@ -4350,15 +4366,19 @@ def _compact_provider_expansion_sql(
     params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
     member_predicates: list[str] = []
     specialty_filter = resolve_provider_specialty_filter(args)
+    # Uncorrelated IN semi-joins (see _compact_provider_filter_sql): the member
+    # join fans out per (rate x provider-group) pair, so correlated taxonomy
+    # probes scale with whole-network member counts.
     if specialty_filter.active:
         member_predicates.append(
-            provider_specialty_taxonomy_exists_sql(
-                "pgm.npi",
+            "pgm.npi IN ("
+            + provider_specialty_taxonomy_semijoin_sql(
                 params,
                 "provider_expansion_specialty",
                 specialty_filter,
                 schema=PTG2_SCHEMA,
             )
+            + ")"
         )
     inferred_sql = _inferred_provider_taxonomy_code_sql(
         args,
@@ -4369,7 +4389,7 @@ def _compact_provider_expansion_sql(
     )
     if inferred_sql:
         member_predicates.append(
-            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm.npi AND {inferred_sql})"
+            f"pgm.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE {inferred_sql})"
         )
         member_predicates.append(_ptg2_individual_npi_exists_sql("pgm.npi"))
     member_filter_sql = "".join(f"\n          AND {predicate}" for predicate in member_predicates)
