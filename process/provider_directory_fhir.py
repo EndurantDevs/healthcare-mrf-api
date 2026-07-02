@@ -851,41 +851,49 @@ async def _iter_scan_practitioner_role_seed_rows(
     options: ScanPractitionerRoleFetchOptions,
 ) -> AsyncIterator[tuple[str, str, str]]:
     if options.seed_stage_table and options.seed_source_ids:
-        stage_ref = _qt(_schema(), options.seed_stage_table)
-        source_ids = list(options.seed_source_ids)
-        page_size = max(1, options.seed_page_size)
-        for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
-            search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
-            last_resource_id = ""
-            while True:
-                rows = await db.all(
-                    f"""
-                    SELECT DISTINCT resource_id
-                      FROM {stage_ref}
-                     WHERE resource_type = :resource_type
-                       AND source_id = ANY(CAST(:source_ids AS varchar[]))
-                       AND resource_id > :last_resource_id
-                     ORDER BY resource_id
-                     LIMIT :limit;
-                    """,
-                    resource_type=resource_type,
-                    source_ids=source_ids,
-                    last_resource_id=last_resource_id,
-                    limit=page_size,
-                )
-                if not rows:
-                    break
-                for row in rows:
-                    resource_id = _clean_text(row[0])
-                    if not resource_id:
-                        continue
-                    last_resource_id = resource_id
-                    yield (search_param, resource_type, resource_id)
-                if len(rows) < page_size:
-                    break
+        async for seed in _scan_role_stage_seeds(options):
+            yield seed
         return
     for seed in _scan_practitioner_role_seed_rows(rows_by_resource):
         yield seed
+
+
+async def _scan_role_stage_seeds(
+    options: ScanPractitionerRoleFetchOptions,
+) -> AsyncIterator[tuple[str, str, str]]:
+    """Page reverse lookup seed resource ids from the current import stage."""
+    stage_ref = _qt(_schema(), options.seed_stage_table or "")
+    source_ids = list(options.seed_source_ids or ())
+    page_size = max(1, options.seed_page_size)
+    for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+        search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
+        last_resource_id = ""
+        while True:
+            resource_rows = await db.all(
+                f"""
+                SELECT DISTINCT resource_id
+                  FROM {stage_ref}
+                 WHERE resource_type = :resource_type
+                   AND source_id = ANY(CAST(:source_ids AS varchar[]))
+                   AND resource_id > :last_resource_id
+                 ORDER BY resource_id
+                 LIMIT :limit;
+                """,
+                resource_type=resource_type,
+                source_ids=source_ids,
+                last_resource_id=last_resource_id,
+                limit=page_size,
+            )
+            if not resource_rows:
+                break
+            for resource_row in resource_rows:
+                resource_id = _clean_text(resource_row[0])
+                if not resource_id:
+                    continue
+                last_resource_id = resource_id
+                yield (search_param, resource_type, resource_id)
+            if len(resource_rows) < page_size:
+                break
 
 
 def _scan_practitioner_role_reverse_lookup_url(
