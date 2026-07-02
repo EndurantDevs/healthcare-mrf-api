@@ -77,6 +77,7 @@ async def test_resolve_procedure_taxonomy_psychotherapy_prefers_behavioral_healt
         taxonomy_response_payload["resolution"]["taxonomy_source"]
         == "curated_code_range"
     )
+    assert "101YM0800X" in taxonomy_response_payload["resolution"]["taxonomy_codes"]
     assert "101YP2500X" in taxonomy_response_payload["resolution"]["taxonomy_codes"]
     assert "1041C0700X" in taxonomy_response_payload["resolution"]["taxonomy_codes"]
     assert "2084P0800X" in taxonomy_response_payload["resolution"]["taxonomy_codes"]
@@ -90,6 +91,7 @@ async def test_resolve_procedure_taxonomy_psychotherapy_prefers_behavioral_healt
 def test_psychotherapy_cpt_infers_behavioral_health_taxonomy_for_ptg2_serving():
     rule = ptg2_serving._inferred_provider_taxonomy_rule({"code": "90837", "code_system": "cpt"})
     assert rule is not None
+    assert "101YM0800X" in rule.taxonomy_codes
     assert "101YP2500X" in rule.taxonomy_codes
     assert "1041C0700X" in rule.taxonomy_codes
     assert "2084P0800X" in rule.taxonomy_codes

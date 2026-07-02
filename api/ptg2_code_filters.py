@@ -92,7 +92,8 @@ INFERRED_PROVIDER_TAXONOMY_RULES = (
         # mode and callers may surface unrelated specialties from broad plan searches.
         ranges=((90785, 90899),),
         taxonomy_codes=(
-            "101YP2500X",  # Counselor, Mental Health
+            "101YM0800X",  # Counselor, Mental Health
+            "101YP2500X",  # Counselor, Professional
             "103T00000X",  # Psychologist
             "103TC0700X",  # Clinical Psychologist
             "1041C0700X",  # Clinical Social Worker
