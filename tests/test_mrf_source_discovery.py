@@ -3441,6 +3441,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Guardian Life Insurance Company of America" in by_name["Guardian Dental"].aliases
     assert by_name["MetLife Dental"].status == "needs_review"
     assert by_name["MetLife Dental"].index_url is None
+    assert by_name["MetLife Dental"].source_tier == "coverage_evidence"
     assert "MetLife" in by_name["MetLife Dental"].aliases
     assert "Metlife DPPO" in by_name["MetLife Dental"].aliases
     assert "Metropolitan Life Insurance Company" in by_name["MetLife Dental"].aliases
@@ -4428,6 +4429,7 @@ def test_parse_master_list_skips_placeholder_source_urls():
     assert candidate.index_url is None
     assert candidate.status == "needs_review"
     assert candidate.access_model == "unknown"
+    assert candidate.source_tier == "coverage_evidence"
 
 
 def test_master_list_importable_source_filter_keeps_only_working_url_rows():

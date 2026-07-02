@@ -1715,9 +1715,13 @@ def _normalize_source_tier(value: Any) -> str:
     return _SOURCE_TIER_ALIASES.get(text, "mrf_importable")
 
 
-def _master_list_source_tier(notes: str) -> str:
+def _master_list_source_tier(notes: str, index_url: str | None = None) -> str:
     values = _master_list_note_values(notes, r"source[-_\s]*tier")
-    return _normalize_source_tier(values[0] if values else None)
+    if values:
+        return _normalize_source_tier(values[0])
+    if not index_url:
+        return "coverage_evidence"
+    return _normalize_source_tier(None)
 
 
 _BENEFIT_LINE_ALIASES = {
@@ -1854,7 +1858,7 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
                     entity_type=type_value,
                     aliases=_master_list_aliases(notes_text),
                     benefit_lines=_master_list_benefit_lines(notes_text),
-                    source_tier=_master_list_source_tier(notes_text),
+                    source_tier=_master_list_source_tier(notes_text, url),
                     source_coverage=_master_list_note_values(
                         notes_text, r"source[-_\s]*coverage"
                     ),
