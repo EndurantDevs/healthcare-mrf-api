@@ -149,6 +149,43 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
     "issuer_network_key_idx",
     "name_idx",
 )
+PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = (
+    "location_contacts",
+    "location_address_keys",
+    "location_archive",
+    "address_overlay",
+    "network_catalog",
+    "corroboration",
+)
+PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
+    "all": PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS,
+    "*": PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS,
+    "addresses": (
+        "location_contacts",
+        "location_address_keys",
+        "location_archive",
+        "address_overlay",
+    ),
+    "address_artifacts": (
+        "location_contacts",
+        "location_address_keys",
+        "location_archive",
+        "address_overlay",
+    ),
+    "location": (
+        "location_contacts",
+        "location_address_keys",
+        "location_archive",
+    ),
+    "locations": (
+        "location_contacts",
+        "location_address_keys",
+        "location_archive",
+    ),
+    "network": ("network_catalog",),
+    "networks": ("network_catalog",),
+    "ptg_corroboration": ("corroboration",),
+}
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
@@ -3684,9 +3721,13 @@ async def _publish_provider_directory_artifacts(
     publish_scope_run_id: str | None | object = _PUBLISH_SCOPE_UNSET,
     source_ids: list[str] | tuple[str, ...] | None = None,
     publish_corroboration: bool = False,
+    publish_artifacts_targets: set[str] | None = None,
 ) -> dict[str, Any]:
     effective_publish_scope_run_id = (
         run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
+    )
+    metrics["publish_artifacts_targets"] = (
+        sorted(publish_artifacts_targets) if publish_artifacts_targets is not None else "all"
     )
     await _mark_provider_directory_progress(
         run_id,
@@ -3696,75 +3737,109 @@ async def _publish_provider_directory_artifacts(
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
-    metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
+    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_contacts"):
+        metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
+        location_contacts_message = (
+            "backfilled Provider Directory location contacts; "
+            f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
+        )
+    else:
+        metrics["location_contacts_backfilled"] = _provider_directory_publish_target_skipped()
+        location_contacts_message = "skipped Provider Directory location contact backfill"
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=1,
         total=5,
-        message=(
-            "backfilled Provider Directory location contacts; "
-            f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
-        ),
+        message=location_contacts_message,
         metrics=metrics,
     )
     if seen_table:
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
-    metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
-        run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
-    )
+    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
+        metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
+            run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
+        )
+        location_address_keys_message = (
+            "stamped Provider Directory location address keys; "
+            f"rows={metrics['location_address_keys_stamped']}"
+        )
+    else:
+        metrics["location_address_keys_stamped"] = _provider_directory_publish_target_skipped()
+        location_address_keys_message = "skipped Provider Directory location address key stamping"
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=2,
         total=5,
-        message=(
-            "stamped Provider Directory location address keys; "
-            f"rows={metrics['location_address_keys_stamped']}"
-        ),
+        message=location_address_keys_message,
         metrics=metrics,
     )
-    metrics["location_archive"] = await publish_provider_directory_location_archive(
-        run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
+    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive"):
+        metrics["location_archive"] = await publish_provider_directory_location_archive(
+            run_id=effective_publish_scope_run_id, source_ids=source_ids, seen_table=seen_table,
+        )
+    else:
+        metrics["location_archive"] = _provider_directory_publish_target_skipped()
+    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
+        metrics["address_overlay"] = await publish_provider_directory_address_overlay(
+            run_id=effective_publish_scope_run_id, source_ids=source_ids
+        )
+    else:
+        metrics["address_overlay"] = _provider_directory_publish_target_skipped()
+    address_artifact_message = (
+        "published Provider Directory locations to address archive; "
+        f"inserted={metrics['location_archive'].get('inserted', 0)} "
+        f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
     )
-    metrics["address_overlay"] = await publish_provider_directory_address_overlay(
-        run_id=effective_publish_scope_run_id, source_ids=source_ids
-    )
+    if (
+        not _provider_directory_publish_target_enabled(publish_artifacts_targets, "location_archive")
+        and not _provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay")
+    ):
+        address_artifact_message = "skipped Provider Directory location archive and address overlay publish"
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=3,
         total=5,
-        message=(
-            "published Provider Directory locations to address archive; "
-            f"inserted={metrics['location_archive'].get('inserted', 0)} "
-            f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
-        ),
+        message=address_artifact_message,
         metrics=metrics,
     )
-    metrics["network_catalog"] = await publish_provider_directory_network_catalog(
-        run_id=effective_publish_scope_run_id,
-        source_ids=source_ids,
-    )
+    if _provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
+        metrics["network_catalog"] = await publish_provider_directory_network_catalog(
+            run_id=effective_publish_scope_run_id,
+            source_ids=source_ids,
+        )
+        network_catalog_message = (
+            "published Provider Directory network catalog; "
+            f"rows={metrics['network_catalog'].get('rows', 0)}"
+        )
+    else:
+        metrics["network_catalog"] = _provider_directory_publish_target_skipped()
+        network_catalog_message = "skipped Provider Directory network catalog publish"
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=4,
         total=5,
-        message=(
-            "published Provider Directory network catalog; "
-            f"rows={metrics['network_catalog'].get('rows', 0)}"
-        ),
+        message=network_catalog_message,
         metrics=metrics,
     )
     metrics["publish_corroboration"] = publish_corroboration
-    if publish_corroboration:
+    if publish_corroboration and _provider_directory_publish_target_enabled(
+        publish_artifacts_targets,
+        "corroboration",
+    ):
         metrics["ptg_corroboration_view_published"] = (
             await publish_provider_directory_address_corroboration_if_available(
                 refresh_network_catalog=False,
             )
         )
         message = "published Provider Directory PTG corroboration artifacts"
+    elif publish_corroboration:
+        metrics["ptg_corroboration_view_published"] = False
+        metrics["ptg_corroboration_view_skipped"] = _provider_directory_publish_target_skipped()
+        message = "skipped Provider Directory PTG corroboration artifacts"
     else:
         metrics["ptg_corroboration_view_published"] = False
         metrics["ptg_corroboration_view_skipped"] = {
@@ -8080,6 +8155,49 @@ def _publish_corroboration_enabled(value: Any) -> bool:
     )
 
 
+def _provider_directory_publish_artifact_targets(raw_targets: Any) -> set[str] | None:
+    if raw_targets in (None, ""):
+        return None
+    if isinstance(raw_targets, str):
+        target_values = raw_targets.split(",")
+    elif isinstance(raw_targets, (bytes, bytearray, dict)) or not hasattr(raw_targets, "__iter__"):
+        target_values = (raw_targets,)
+    else:
+        target_values = raw_targets
+
+    selected: set[str] = set()
+    for target_candidate in target_values:
+        target_text = _clean_text(target_candidate)
+        if not target_text:
+            continue
+        normalized = (
+            target_text.strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        expanded = PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES.get(normalized)
+        if expanded is not None:
+            selected.update(expanded)
+            continue
+        if normalized not in PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS:
+            raise ValueError(
+                "Unsupported Provider Directory publish_artifacts_targets value "
+                f"{target_text!r}; expected one of "
+                f"{', '.join(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS)}"
+            )
+        selected.add(normalized)
+    return selected or None
+
+
+def _provider_directory_publish_target_enabled(targets: set[str] | None, target: str) -> bool:
+    return targets is None or target in targets
+
+
+def _provider_directory_publish_target_skipped() -> dict[str, Any]:
+    return {"skipped": True, "reason": "target_not_requested"}
+
+
 def _apply_provider_directory_refresh_preset(task: dict[str, Any]) -> dict[str, Any]:
     preset = _clean_text(task.get("refresh_preset") or task.get("preset"))
     if not preset:
@@ -8979,6 +9097,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     contact_backfill_only = bool(task.get("contact_backfill_only", False))
     publish_artifacts_only = bool(task.get("publish_artifacts_only", False))
     publish_corroboration = _publish_corroboration_enabled(task.get("publish_corroboration"))
+    publish_artifacts_targets = _provider_directory_publish_artifact_targets(
+        task.get("publish_artifacts_targets")
+        or task.get("publish_artifact_targets")
+        or task.get("publish_targets")
+    )
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     include_supplemental_catalogs = _bool_or_default(task.get("include_supplemental_catalogs"), False)
@@ -9049,6 +9172,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             publish_scope_run_id=None,
             source_ids=requested_source_ids,
             publish_corroboration=publish_corroboration,
+            publish_artifacts_targets=publish_artifacts_targets,
         )
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
@@ -9274,6 +9398,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     publish_scope_run_id=run_id,
                     source_ids=artifact_source_ids,
                     publish_corroboration=publish_corroboration,
+                    publish_artifacts_targets=publish_artifacts_targets,
                 )
             else:
                 metrics["location_contacts_backfilled"] = {

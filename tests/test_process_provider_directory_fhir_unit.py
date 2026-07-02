@@ -4188,6 +4188,82 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     )
 
 
+def test_provider_directory_publish_artifact_targets_parse_aliases():
+    assert importer._provider_directory_publish_artifact_targets(None) is None
+    assert importer._provider_directory_publish_artifact_targets("network, ptg-corroboration") == {
+        "network_catalog",
+        "corroboration",
+    }
+    assert importer._provider_directory_publish_artifact_targets(["addresses"]) == {
+        "location_contacts",
+        "location_address_keys",
+        "location_archive",
+        "address_overlay",
+    }
+
+    with pytest.raises(ValueError, match="Unsupported Provider Directory publish_artifacts_targets"):
+        importer._provider_directory_publish_artifact_targets("bad-stage")
+
+
+@pytest.mark.asyncio
+async def test_process_data_publish_artifacts_only_can_target_network_catalog(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 0}),
+    )
+    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_location_archive",
+        AsyncMock(return_value={"inserted": 0}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_address_overlay",
+        AsyncMock(return_value={"rows": 0}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_network_catalog",
+        AsyncMock(return_value={"rows": 8}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_address_corroboration_if_available",
+        AsyncMock(return_value=True),
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "run_id": "run_artifact_only",
+            "publish_artifacts_only": True,
+            "publish_artifacts_targets": "network_catalog",
+            "publish_corroboration": True,
+        },
+    )
+
+    assert metrics["publish_artifacts_targets"] == ["network_catalog"]
+    assert metrics["location_contacts_backfilled"] == {"skipped": True, "reason": "target_not_requested"}
+    assert metrics["location_address_keys_stamped"] == {"skipped": True, "reason": "target_not_requested"}
+    assert metrics["location_archive"] == {"skipped": True, "reason": "target_not_requested"}
+    assert metrics["address_overlay"] == {"skipped": True, "reason": "target_not_requested"}
+    assert metrics["network_catalog"] == {"rows": 8}
+    assert metrics["ptg_corroboration_view_published"] is False
+    assert metrics["ptg_corroboration_view_skipped"] == {"skipped": True, "reason": "target_not_requested"}
+    importer.backfill_provider_directory_location_contacts.assert_not_awaited()
+    importer.publish_provider_directory_location_address_keys.assert_not_awaited()
+    importer.publish_provider_directory_location_archive.assert_not_awaited()
+    importer.publish_provider_directory_address_overlay.assert_not_awaited()
+    importer.publish_provider_directory_network_catalog.assert_awaited_once()
+    assert importer.publish_provider_directory_network_catalog.await_args.kwargs["run_id"] is None
+    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_process_data_probe_only_full_refresh_does_not_publish_artifacts_by_default(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
