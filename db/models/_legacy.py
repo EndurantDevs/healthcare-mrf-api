@@ -4228,6 +4228,16 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "taxonomy_plans_network",
             "where": "type='primary'",
         },
+        # Serving-type taxonomy overlap: BitmapAnds with serving_zip5_npi so a
+        # specialty+radius enumeration touches only rows matching both filters,
+        # instead of heap-reading every address in a dense-metro radius (the
+        # taxonomy_plans_network GIN above covers type='primary' only).
+        {
+            "index_elements": ("taxonomy_array gin__int_ops",),
+            "using": "gin",
+            "name": "serving_taxonomy",
+            "where": "type IN ('practice','site','primary','secondary')",
+        },
         {
             "index_elements": ("procedures_array gin__int_ops",),
             "using": "gin",

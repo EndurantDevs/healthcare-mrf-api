@@ -107,6 +107,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "primary_state_city_npi",
     "primary_zip5_npi",
     "serving_zip5_npi",
+    "serving_taxonomy",
     "primary_phone_npi",
     "service_phone_digits_npi",
     "service_phone_number_npi",

@@ -4685,6 +4685,22 @@ async def group_plan_providers(request):
             specialty_filter,
         )
         candidate_clauses = [clause for clause in location_clauses if clause != "addr.npi = gm.npi"]
+        if uses_unified_addresses and specialty_filter.taxonomy_codes:
+            # Cheap in-index pre-filter: taxonomy_array && the requested codes
+            # lets the planner BitmapAnd the serving zip and taxonomy GIN
+            # indexes, so only rows matching BOTH are read from the heap
+            # (~1k rows instead of ~100k+ for a dense-metro radius). The
+            # precise primary-taxonomy EXISTS below still decides membership.
+            taxonomy_code_keys = []
+            for idx, code in enumerate(specialty_filter.taxonomy_codes):
+                key = f"cand_array_taxonomy_code_{idx}"
+                params[key] = str(code or "").upper()
+                taxonomy_code_keys.append(f":{key}")
+            candidate_clauses.append(
+                "addr.taxonomy_array && ("
+                "SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy "
+                f"WHERE code IN ({', '.join(taxonomy_code_keys)}))"
+            )
         if candidate_taxonomy_predicate:
             candidate_clauses.append(candidate_taxonomy_predicate)
         candidate_where = "\n                      AND ".join(candidate_clauses)
