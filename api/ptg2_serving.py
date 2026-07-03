@@ -2826,6 +2826,7 @@ def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[st
     """Collapse duplicate provider/location rows while preserving every rate option."""
     merged: list[dict[str, Any]] = []
     grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    price_dirty: set[tuple[str, str, str, str]] = set()
     for item in items:
         group_key = _ptg2_provider_rate_group_key(item)
         if group_key is None:
@@ -2852,8 +2853,9 @@ def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[st
             _normalize_price_payload(existing.get("prices"))
             + _normalize_price_payload(item.get("prices"))
         )
-        price_fields = _price_response_fields(combined_prices)
-        existing.update(price_fields)
+        existing["prices"] = combined_prices
+        existing["tic_prices"] = combined_prices
+        price_dirty.add(group_key)
         _append_unique_value(existing.setdefault("price_set_hashes", []), item.get("price_set_hash"))
         _append_unique_value(existing.setdefault("rate_pack_hashes", []), item.get("rate_pack_hash"))
         _append_unique_value(existing.setdefault("provider_set_hashes", []), item.get("provider_set_hash"))
@@ -2863,6 +2865,8 @@ def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[st
         _merge_unique_payload_list(existing, "source_trace", item.get("source_trace"))
         existing["price_set_count"] = len(existing.get("price_set_hashes") or [])
         existing["rate_pack_count"] = len(existing.get("rate_pack_hashes") or [])
+    for group_key in price_dirty:
+        grouped[group_key].update(_price_response_fields(grouped[group_key].get("prices")))
     return merged
 
 

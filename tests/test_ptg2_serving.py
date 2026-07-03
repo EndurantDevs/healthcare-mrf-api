@@ -3063,6 +3063,41 @@ def test_merge_ptg2_provider_rate_items_preserves_same_provider_location_rates()
     assert merged[0]["rate_pack_count"] == 2
 
 
+def test_merge_ptg2_provider_rate_items_defers_duplicate_price_summary(monkeypatch):
+    calls = []
+    original_price_response_fields = ptg2_serving._price_response_fields
+
+    def count_price_response_fields(prices):
+        calls.append(list(prices or []))
+        return original_price_response_fields(prices)
+
+    monkeypatch.setattr(ptg2_serving, "_price_response_fields", count_price_response_fields)
+    base_item = {
+        "provider_name": "Example Provider",
+        "npi": "1255711370",
+        "reported_code_system": "CPT",
+        "reported_code": "90837",
+        "location_hash": "loc-1",
+        "address": {"address_key": "loc-1", "first_line": "101 E 9th St"},
+        "provider_set_hash": "provider-a",
+        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100.0}],
+    }
+    items = []
+    for idx, rate in enumerate((100.0, 150.0, 200.0), start=1):
+        item = dict(base_item)
+        item["price_set_hash"] = f"price-{idx}"
+        item["rate_pack_hash"] = f"rate-{idx}"
+        item["prices"] = [{"negotiated_type": "negotiated", "negotiated_rate": rate}]
+        items.append(item)
+
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+
+    assert len(merged) == 1
+    assert len(calls) == 2
+    assert [summary["rate"] for summary in merged[0]["price_summary"]] == [100.0, 150.0, 200.0]
+    assert merged[0]["rate_pack_count"] == 3
+
+
 def test_merge_ptg2_provider_rate_items_reuses_presummarized_unique_prices(monkeypatch):
     def fail_price_response_fields(_prices):
         raise AssertionError("unique presummarized rows should not rebuild price fields")
