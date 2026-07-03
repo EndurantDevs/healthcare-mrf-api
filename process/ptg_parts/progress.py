@@ -54,6 +54,23 @@ def _format_duration(seconds: float | None) -> str:
     return f"{secs}s"
 
 
+def _scale_stage_progress_pct(
+    phase_pct: Any,
+    start_pct: Any,
+    end_pct: Any,
+) -> float | None:
+    try:
+        phase = float(phase_pct)
+        start = float(start_pct)
+        end = float(end_pct)
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    phase = max(0.0, min(100.0, phase))
+    return max(0.0, min(100.0, start + ((end - start) * (phase / 100.0))))
+
+
 def _maybe_log_artifact_progress(
     path: str | Path,
     stream: Any,

@@ -182,7 +182,8 @@ from process.ptg_parts.json_streams import (
     _iter_top_level_object_bytes, _iter_top_level_objects,
     _iter_top_level_objects_fast, _iter_top_level_objects_jsondecoder,
     _json_loads)
-from process.ptg_parts.live_progress import (reset_live_progress_context,
+from process.ptg_parts.live_progress import (current_live_progress_context,
+                                             reset_live_progress_context,
                                              set_live_progress_context,
                                              write_live_progress)
 from process.ptg_parts.progress import (_artifact_progress_position,
@@ -2470,6 +2471,9 @@ async def main(
                 selected_jobs.append(job)
         processed_files = 0
         attempted_files = len(selected_jobs)
+        for progress_index, job in enumerate(selected_jobs):
+            job["_ptg_progress_index"] = progress_index
+            job["_ptg_progress_total"] = max(attempted_files, 1)
         write_live_progress(
             phase="download",
             unit="files",
@@ -2530,42 +2534,61 @@ async def main(
             for task in done:
                 await record_file_result(task.result())
 
+        def file_progress_context(job: dict[str, Any], *, start_pct: float, end_pct: float) -> dict[str, Any]:
+            try:
+                job_index = max(int(job.get("_ptg_progress_index") or 0), 0)
+            except (TypeError, ValueError):
+                job_index = 0
+            try:
+                job_total = max(int(job.get("_ptg_progress_total") or attempted_files or 1), 1)
+            except (TypeError, ValueError):
+                job_total = max(attempted_files, 1)
+            return {
+                **current_live_progress_context(),
+                "overall_progress_start_pct": start_pct + (job_index / job_total) * (end_pct - start_pct),
+                "overall_progress_end_pct": start_pct + ((job_index + 1) / job_total) * (end_pct - start_pct),
+            }
+
         async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
             job = downloaded.job
-            if job.get("type") == "in_network":
-                return await _process_in_network_file(
-                    job,
-                    classes,
-                    provider_ref_cache,
-                    test_mode,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    max_bytes=max_bytes,
-                    max_items=max_items,
-                    import_run_id=import_run_id,
-                    keep_partial_artifacts=keep_partial_artifacts,
-                    compact_import=compact_import,
-                    snapshot_id=snapshot_id,
-                    import_month=import_month_value,
-                    rust_stage_tables=None,
-                    ptg2_manifest_stage_table=ptg2_manifest_stage_table,
-                    source_network_names=job.get("source_network_names"),
-                    raw_artifact=downloaded.raw_artifact,
-                    logical_artifact=downloaded.logical_artifact,
-                )
-            if job.get("type") == "allowed_amounts":
-                return await _process_allowed_amounts_file(
-                    job,
-                    classes,
-                    test_mode,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    max_bytes=max_bytes,
-                    max_items=max_items,
-                    import_run_id=import_run_id,
-                    keep_partial_artifacts=keep_partial_artifacts,
-                    raw_artifact=downloaded.raw_artifact,
-                    logical_artifact=downloaded.logical_artifact,
-                )
-            return None
+            token = set_live_progress_context(**file_progress_context(job, start_pct=20.0, end_pct=90.0))
+            try:
+                if job.get("type") == "in_network":
+                    return await _process_in_network_file(
+                        job,
+                        classes,
+                        provider_ref_cache,
+                        test_mode,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        max_items=max_items,
+                        import_run_id=import_run_id,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                        compact_import=compact_import,
+                        snapshot_id=snapshot_id,
+                        import_month=import_month_value,
+                        rust_stage_tables=None,
+                        ptg2_manifest_stage_table=ptg2_manifest_stage_table,
+                        source_network_names=job.get("source_network_names"),
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                    )
+                if job.get("type") == "allowed_amounts":
+                    return await _process_allowed_amounts_file(
+                        job,
+                        classes,
+                        test_mode,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        max_items=max_items,
+                        import_run_id=import_run_id,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                    )
+                return None
+            finally:
+                reset_live_progress_context(token)
 
         try:
             async for downloaded in _iter_downloaded_ptg_jobs(

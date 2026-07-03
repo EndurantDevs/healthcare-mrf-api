@@ -268,6 +268,7 @@ def test_row_helper_split_keeps_facade_helpers_stable():
 def test_progress_split_keeps_facade_helpers_stable():
     assert process_ptg._utcnow is ptg_progress._utcnow
     assert process_ptg._artifact_progress_position is ptg_progress._artifact_progress_position
+    assert ptg_progress._scale_stage_progress_pct(50, 5, 20) == 12.5
 
 
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
@@ -536,6 +537,58 @@ def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg._iter_downloaded_ptg_jobs is ptg_source_download._iter_downloaded_ptg_jobs
     assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
     assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
+
+
+def test_source_download_progress_scales_to_overall_run_progress(monkeypatch):
+    events = []
+    monkeypatch.setattr(ptg_source_download, "write_live_progress", lambda **payload: events.append(payload))
+
+    token = ptg_live_progress.set_live_progress_context(
+        run_id="run_ptg",
+        overall_progress_start_pct=5,
+        overall_progress_end_pct=20,
+    )
+    try:
+        ptg_source_download._emit_download_progress(
+            url="https://example.com/rates.json.gz",
+            bytes_read=50,
+            total_bytes=100,
+            started_at=time.monotonic() - 1,
+            done=False,
+        )
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    assert events
+    assert events[0]["pct"] == 12.5
+    assert events[0]["phase_pct"] == 50.0
+    assert events[0]["detail"].startswith("download 50.00%")
+
+
+def test_download_worker_propagates_live_progress_context(monkeypatch):
+    captured = {}
+
+    def fake_downloader(job, **_kwargs):
+        captured.update(ptg_live_progress.current_live_progress_context())
+        return ptg_domain.PTG2DownloadedJob(job=dict(job), error="stubbed")
+
+    monkeypatch.setattr(process_ptg, "_download_ptg_job_artifact_sync", fake_downloader)
+
+    result = ptg_source_download._download_ptg_job_artifact_sync_from_facade(
+        {"type": "in_network", "url": "https://example.com/rates.json.gz"},
+        reuse_raw_artifacts=True,
+        max_bytes=None,
+        keep_partial_artifacts=True,
+        live_progress_context={
+            "run_id": "run_ptg",
+            "overall_progress_start_pct": 5,
+            "overall_progress_end_pct": 20,
+        },
+    )
+
+    assert result.error == "stubbed"
+    assert captured["run_id"] == "run_ptg"
+    assert captured["overall_progress_start_pct"] == 5
 
 
 def test_source_download_tls_override_is_host_scoped(monkeypatch):
@@ -844,6 +897,35 @@ def test_rust_scanner_progress_line_updates_live_progress(monkeypatch):
     assert payload["eta_seconds"] == 10.0
     assert payload["source"] == "ptg2-scanner-progress"
     assert payload["scanner_objects"] == {"provider_references": 2, "in_network": 5}
+
+
+def test_rust_scanner_progress_scales_to_overall_run_progress(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(ptg_rust_scanner, "write_live_progress", lambda **payload: events.append(payload))
+
+    ptg_rust_scanner._emit_scanner_live_progress(
+        "PTG2_SCANNER_PROGRESS\t"
+        "path=/work/raw/rates.json.gz\t"
+        "compressed_bytes=1048576\t"
+        "total_bytes=2097152\t"
+        "percent=50.00\t"
+        "compressed_mib_s=4.50\t"
+        "elapsed_seconds=10\t"
+        "eta_seconds=10\t"
+        "objects=7\t"
+        "done=false",
+        phase="compact-serving scanner",
+        live_progress_context={
+            "run_id": "run_ptg",
+            "overall_progress_start_pct": 20,
+            "overall_progress_end_pct": 90,
+        },
+    )
+
+    assert events
+    assert events[0]["pct"] == 55.0
+    assert events[0]["phase_pct"] == 50.0
 
 
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):

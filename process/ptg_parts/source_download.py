@@ -18,6 +18,7 @@ import time
 import zipfile
 import zlib
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -57,7 +58,13 @@ from process.ptg_parts.domain import (
     PTG2LogicalArtifact,
     PTG2RawArtifact,
 )
-from process.ptg_parts.live_progress import write_live_progress
+from process.ptg_parts.live_progress import (
+    current_live_progress_context,
+    reset_live_progress_context,
+    set_live_progress_context,
+    write_live_progress,
+)
+from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
 from process.url_security import UnsafeUrlError, assert_safe_url
 
@@ -73,6 +80,12 @@ _GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES
 _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
 DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
+
+
+@dataclass
+class RangeDownloadProgress:
+    completed_bytes: int
+    next_progress_bytes: int
 
 
 def _incomplete_tls_chain_hosts() -> set[str]:
@@ -227,15 +240,30 @@ def _emit_download_progress(
     )
     _emit_screen_line(line, stderr=True)
     logger.info(line)
+    live_context = current_live_progress_context()
+    overall_pct = _scale_stage_progress_pct(
+        percent,
+        live_context.get("overall_progress_start_pct"),
+        live_context.get("overall_progress_end_pct"),
+    )
+    pct = overall_pct if overall_pct is not None else percent
+    phase_detail = (
+        f"download {percent:.2f}% "
+        f"({bytes_read / (1024 ** 2):.1f} MiB/{(total_bytes or 0) / (1024 ** 2):.1f} MiB)"
+        if total_bytes and total_bytes > 0
+        else f"downloaded {bytes_read / (1024 ** 2):.1f} MiB"
+    )
     write_live_progress(
         phase="download",
         unit="bytes",
         done=bytes_read,
         total=total_bytes,
-        pct=percent,
+        pct=pct,
+        phase_pct=percent,
         rate={"mib_s": mib_s},
         eta_seconds=eta if total_bytes and total_bytes > 0 else None,
         message=f"downloading {_safe_download_label(url)}",
+        detail=phase_detail,
         label=url,
     )
 
@@ -246,6 +274,20 @@ def _safe_download_label(url: str) -> str:
         tail = parsed.path.rsplit("/", 1)[-1]
         return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
     return str(url)[:128]
+
+
+def _progress_job_index(job: dict[str, Any]) -> int:
+    try:
+        return max(int(job.get("_ptg_progress_index") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _progress_job_total(job: dict[str, Any], default: int) -> int:
+    try:
+        return max(int(job.get("_ptg_progress_total") or default), 1)
+    except (TypeError, ValueError):
+        return max(default, 1)
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
@@ -317,11 +359,11 @@ async def _download_raw_artifact_ranges(
     next_progress_bytes = _download_progress_interval_bytes()
     while completed_bytes >= next_progress_bytes:
         next_progress_bytes += _download_progress_interval_bytes()
+    progress = RangeDownloadProgress(completed_bytes, next_progress_bytes)
     lock = asyncio.Lock()
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
     pending_ranges = [item for item in ranges if item not in completed]
     async def fetch_range(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
-        nonlocal completed_bytes, next_progress_bytes
         start, end = item
         headers = {"Range": f"bytes={start}-{end}"}
         if etag:
@@ -344,19 +386,19 @@ async def _download_raw_artifact_ranges(
                         offset += len(chunk)
                         received += len(chunk)
                         async with lock:
-                            completed_bytes += len(chunk)
+                            progress.completed_bytes += len(chunk)
                             counted += len(chunk)
-                            if completed_bytes >= next_progress_bytes:
+                            if progress.completed_bytes >= progress.next_progress_bytes:
                                 _emit_download_progress(
                                     url=url,
-                                    bytes_read=min(completed_bytes, total_bytes),
+                                    bytes_read=min(progress.completed_bytes, total_bytes),
                                     total_bytes=total_bytes,
                                     started_at=started_at,
                                     done=False,
                                 )
                                 interval = _download_progress_interval_bytes()
-                                while completed_bytes >= next_progress_bytes:
-                                    next_progress_bytes += interval
+                                while progress.completed_bytes >= progress.next_progress_bytes:
+                                    progress.next_progress_bytes += interval
                 finally:
                     os.close(fd)
                 if received != expected_length:
@@ -370,11 +412,11 @@ async def _download_raw_artifact_ranges(
         finally:
             if not completed_ok and counted:
                 async with lock:
-                    completed_bytes = max(0, completed_bytes - counted)
-                    while next_progress_bytes > _download_progress_interval_bytes() and (
-                        completed_bytes < next_progress_bytes - _download_progress_interval_bytes()
+                    progress.completed_bytes = max(0, progress.completed_bytes - counted)
+                    while progress.next_progress_bytes > _download_progress_interval_bytes() and (
+                        progress.completed_bytes < progress.next_progress_bytes - _download_progress_interval_bytes()
                     ):
-                        next_progress_bytes -= _download_progress_interval_bytes()
+                        progress.next_progress_bytes -= _download_progress_interval_bytes()
 
     semaphore = asyncio.Semaphore(_range_download_tasks())
 
@@ -746,8 +788,15 @@ def _materialize_json_source_from_facade():
 
 
 def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
+    live_progress_context = kwargs.pop("live_progress_context", None)
     ptg_module = sys.modules.get("process.ptg")
     downloader = getattr(ptg_module, "_download_ptg_job_artifact_sync", _download_ptg_job_artifact_sync)
+    if isinstance(live_progress_context, dict) and live_progress_context:
+        token = set_live_progress_context(**live_progress_context)
+        try:
+            return downloader(job, **kwargs)
+        finally:
+            reset_live_progress_context(token)
     return downloader(job, **kwargs)
 
 
@@ -816,6 +865,8 @@ async def _iter_downloaded_ptg_jobs(
     )
     pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
     job_iter = iter(jobs)
+    base_live_progress_context = current_live_progress_context()
+    job_count = max(len(jobs), 1)
 
     def schedule_more() -> None:
         while len(pending) < download_tasks:
@@ -823,6 +874,15 @@ async def _iter_downloaded_ptg_jobs(
                 job = next(job_iter)
             except StopIteration:
                 return
+            job_index = _progress_job_index(job)
+            job_total = max(_progress_job_total(job, job_count), 1)
+            progress_start = 5.0 + (job_index / job_total) * 15.0
+            progress_end = 5.0 + ((job_index + 1) / job_total) * 15.0
+            live_progress_context = {
+                **base_live_progress_context,
+                "overall_progress_start_pct": progress_start,
+                "overall_progress_end_pct": progress_end,
+            }
             pending.add(
                 asyncio.wrap_future(
                     executor.submit(
@@ -831,6 +891,7 @@ async def _iter_downloaded_ptg_jobs(
                         reuse_raw_artifacts=reuse_raw_artifacts,
                         max_bytes=max_bytes,
                         keep_partial_artifacts=keep_partial_artifacts,
+                        live_progress_context=live_progress_context,
                     )
                 )
             )

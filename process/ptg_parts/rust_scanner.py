@@ -35,6 +35,7 @@ from process.ptg_parts.config import (
 )
 from process.ptg_parts.domain import PTG2_CONFIDENCE_TIC_RATE_NPI_TIN
 from process.ptg_parts.live_progress import current_live_progress_context, write_live_progress
+from process.ptg_parts.progress import _scale_stage_progress_pct
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,12 @@ def _emit_scanner_live_progress(
         for key, value in (live_progress_context or {}).items()
         if value not in (None, "")
     }
+    overall_pct = _scale_stage_progress_pct(
+        percent,
+        context.get("overall_progress_start_pct"),
+        context.get("overall_progress_end_pct"),
+    )
+    pct = overall_pct if overall_pct is not None else percent
     message_parts = [
         f"{phase} {percent:.2f}%" if percent is not None else phase,
         f"read {_format_progress_mib(compressed_bytes)} of {_format_progress_mib(total_bytes)}",
@@ -190,10 +197,12 @@ def _emit_scanner_live_progress(
         "unit": "compressed_bytes",
         "done": compressed_bytes,
         "total": total_bytes,
-        "pct": percent,
+        "pct": pct,
+        "phase_pct": percent,
         "eta_seconds": eta_seconds,
         "elapsed_seconds": elapsed_seconds,
         "message": ", ".join(message_parts),
+        "detail": ", ".join(message_parts),
         "source": "ptg2-scanner-progress",
         "confidence": "live",
         "scanner_path": fields.get("path"),
