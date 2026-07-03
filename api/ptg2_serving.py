@@ -3524,6 +3524,15 @@ async def _ptg2_manifest_location_provider_matches(
         missing_rows = [row for row in rows if not row.get("telephone_number") and not row.get("phone_number")]
         if not missing_rows:
             return rows
+        missing_npis: list[int] = []
+        for row in missing_rows:
+            try:
+                missing_npis.append(int(row.get("npi")))
+            except (TypeError, ValueError):
+                continue
+        missing_npis = sorted(set(missing_npis))
+        if not missing_npis:
+            return rows
         address_keys = sorted({str(row.get("address_key")) for row in missing_rows if row.get("address_key")})
         premise_keys = sorted({str(row.get("premise_key")) for row in missing_rows if row.get("premise_key")})
         if not address_keys and not premise_keys:
@@ -3543,14 +3552,21 @@ async def _ptg2_manifest_location_provider_matches(
                        type,
                        checksum
                   FROM {npi_address_table}
-                 WHERE NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
+                 WHERE npi = ANY(CAST(:fallback_npis AS bigint[]))
+                   AND type = ANY(CAST(:fallback_address_types AS varchar[]))
+                   AND NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
                    AND (
                         address_key = ANY(CAST(:address_keys AS uuid[]))
                         OR premise_key = ANY(CAST(:premise_keys AS uuid[]))
                    )
                 """
             ),
-            {"address_keys": address_keys, "premise_keys": premise_keys},
+            {
+                "fallback_npis": missing_npis,
+                "fallback_address_types": ["practice", "primary", "secondary", "site"],
+                "address_keys": address_keys,
+                "premise_keys": premise_keys,
+            },
         )
         candidates = [_row_mapping(row) for row in fallback_result]
         if not candidates:

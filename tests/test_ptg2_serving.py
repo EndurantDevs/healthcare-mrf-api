@@ -2498,6 +2498,87 @@ async def test_manifest_location_uses_provider_group_rate_scope_table_when_decla
 
 
 @pytest.mark.asyncio
+async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    address_key = "00000000-0000-0000-0000-000000000001"
+    premise_key = "00000000-0000-0000-0000-000000000002"
+    location_by_field = {
+        "provider_group_global_id_128": group_id,
+        "npi": 1234567890,
+        "address_key": address_key,
+        "premise_key": premise_key,
+        "address_payload": {"address_key": address_key},
+    }
+    phone_fallback = {
+        "npi": 1234567890,
+        "address_key": address_key,
+        "premise_key": premise_key,
+        "telephone_number": "3125550100",
+        "phone_number": "3125550100",
+        "phone_extension": None,
+        "fax_number": None,
+        "fax_number_digits": None,
+        "fax_extension": None,
+        "type": "practice",
+        "checksum": "phone-row",
+    }
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[phone_fallback]),
+            False,
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_location_table="mrf.ptg2_provider_group_location_snap",
+        provider_group_rate_scope_table="mrf.ptg2_provider_group_rate_scope_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(side_effect=AssertionError("component-backed lookup should not use sidecar rate scope")),
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    fallback_call = next(
+        (call for call in session.calls if "fallback_npis" in str(call[0][0])),
+        None,
+    )
+    assert fallback_call is not None
+    fallback_sql = str(fallback_call[0][0])
+    fallback_params = fallback_call[0][1]
+    assert "npi = ANY(CAST(:fallback_npis AS bigint[]))" in fallback_sql
+    assert "type = ANY(CAST(:fallback_address_types AS varchar[]))" in fallback_sql
+    assert fallback_params["fallback_npis"] == [1234567890]
+    assert fallback_params["address_keys"] == [address_key]
+    assert fallback_params["premise_keys"] == [premise_key]
+    assert provider_set_ids == {provider_set_id}
+    provider = providers_by_set[provider_set_id][0]
+    assert provider["telephone_number"] == "3125550100"
+
+
+@pytest.mark.asyncio
 async def test_manifest_location_zip_radius_uses_literal_taxonomy_lateral_fast_path(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     ptg2_serving._PTG2_TAXONOMY_INT_CODE_CACHE.clear()
