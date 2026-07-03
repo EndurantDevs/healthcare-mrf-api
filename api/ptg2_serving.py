@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import gc
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -2652,6 +2654,18 @@ _PTG2_ROUTE_ITEM_COLUMNS = {
 }
 
 
+@contextmanager
+def _suspend_gc_for_route_item_payload():
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def _ptg2_route_item_slug(value: Any, *, max_length: int = 32) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     return (slug or "none")[:max_length]
@@ -2836,9 +2850,10 @@ async def _search_ptg2_manifest_route_item_table(
 
     await _set_local_jit_off_for_manifest_location(session)
     try:
-        result = await session.execute(
-            text(
-                f"""
+        with _suspend_gc_for_route_item_payload():
+            result = await session.execute(
+                text(
+                    f"""
             WITH raw AS (
                 SELECT
                     r.item_payload,
@@ -2864,61 +2879,62 @@ async def _search_ptg2_manifest_route_item_table(
              ORDER BY {order_sql}
              LIMIT :limit OFFSET :offset
             """
-            ),
-            params,
-        )
+                ),
+                params,
+            )
     except Exception:
         await _rollback_optional_ptg2_query(session)
         return None
     items: list[dict[str, Any]] = []
-    for row in result:
-        data = _row_mapping(row)
-        payload = _coerce_json_payload(data.get("item_payload"), {})
-        if not isinstance(payload, dict):
-            continue
-        item = dict(payload)
-        item["distance_miles"] = data.get("distance_miles")
-        item["zip_match_type"] = "same_zip" if int(data.get("zip_rank") or 0) == 0 else "radius"
-        item["anchor_zip5"] = zip_value
-        item["zip_radius_miles"] = geo_radius_miles
-        items.append(item)
-    if not items:
-        return None
+    with _suspend_gc_for_route_item_payload():
+        for row in result:
+            data = _row_mapping(row)
+            payload = _coerce_json_payload(data.get("item_payload"), {})
+            if not isinstance(payload, dict):
+                continue
+            item = dict(payload)
+            item["distance_miles"] = data.get("distance_miles")
+            item["zip_match_type"] = "same_zip" if int(data.get("zip_rank") or 0) == 0 else "radius"
+            item["anchor_zip5"] = zip_value
+            item["zip_radius_miles"] = geo_radius_miles
+            items.append(item)
+        if not items:
+            return None
 
-    return _shape_ptg2_manifest_response(
-        {
-            "items": items,
-            "pagination": {
-                "total": int(pagination.offset) + len(items),
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+        return _shape_ptg2_manifest_response(
+            {
+                "items": items,
+                "pagination": {
+                    "total": int(pagination.offset) + len(items),
+                    "limit": pagination.limit,
+                    "offset": pagination.offset,
+                    "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                },
+                "query": {
+                    "plan_id": args.get("plan_id"),
+                    "plan_external_id": args.get("plan_external_id"),
+                    "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
+                    "source_key": args.get("source_key") or None,
+                    "snapshot_id": snapshot_id,
+                    "mode": mode_value,
+                    "code": args.get("code") or None,
+                    "code_system": args.get("code_system") or None,
+                    "state": args.get("state") or None,
+                    "city": args.get("city") or None,
+                    "zip5": zip_value,
+                    "lat": args.get("lat") or None,
+                    "long": args.get("long") or None,
+                    "radius_miles": geo_radius_miles,
+                    "npi": args.get("npi") or None,
+                    "source": "ptg2_db",
+                    "serving_table": _safe_table_name(serving_tables.serving_table),
+                    "route_item_table": table_name,
+                    "include_providers": True,
+                    "procedure_consolidation": "REPORTED_CODE",
+                },
             },
-            "query": {
-                "plan_id": args.get("plan_id"),
-                "plan_external_id": args.get("plan_external_id"),
-                "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
-                "source_key": args.get("source_key") or None,
-                "snapshot_id": snapshot_id,
-                "mode": mode_value,
-                "code": args.get("code") or None,
-                "code_system": args.get("code_system") or None,
-                "state": args.get("state") or None,
-                "city": args.get("city") or None,
-                "zip5": zip_value,
-                "lat": args.get("lat") or None,
-                "long": args.get("long") or None,
-                "radius_miles": geo_radius_miles,
-                "npi": args.get("npi") or None,
-                "source": "ptg2_db",
-                "serving_table": _safe_table_name(serving_tables.serving_table),
-                "route_item_table": table_name,
-                "include_providers": True,
-                "procedure_consolidation": "REPORTED_CODE",
-            },
-        },
-        args,
-    )
+            args,
+        )
 
 
 def _ptg2_provider_price_sort_value(item: dict[str, Any]) -> float:
