@@ -7012,6 +7012,26 @@ def _bulk_ndjson_headers() -> dict[str, str]:
     }
 
 
+def _bulk_export_log_url(url: str | None) -> str | None:
+    text = _clean_text(url)
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    if not parsed.netloc:
+        return parsed.path or text
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _bulk_export_log(event: str, **details: Any) -> None:
+    rendered = " ".join(
+        f"{key}={value}"
+        for key, value in details.items()
+        if value is not None and value != ""
+    )
+    suffix = f" {rendered}" if rendered else ""
+    print(f"Provider Directory bulk export {event}{suffix}", flush=True)
+
+
 async def _bulk_http_get_json(
     session: aiohttp.ClientSession,
     source: dict[str, Any],
@@ -7062,19 +7082,70 @@ async def _bulk_export_poll_outputs(
             timeout=timeout,
         )
         if error:
+            _bulk_export_log(
+                "poll_error",
+                source_id=source.get("source_id"),
+                resource=resource_type,
+                poll=polls,
+                max_polls=max_polls,
+                error=error,
+            )
             return None, error, polls
         if status_code == 202:
-            await asyncio.sleep(_retry_after_seconds(headers.get("retry-after")) or poll_seconds)
+            sleep_seconds = _retry_after_seconds(headers.get("retry-after")) or poll_seconds
+            if polls == 1 or polls % 10 == 0:
+                _bulk_export_log(
+                    "poll_wait",
+                    source_id=source.get("source_id"),
+                    resource=resource_type,
+                    poll=polls,
+                    max_polls=max_polls,
+                    status=status_code,
+                    sleep_seconds=sleep_seconds,
+                    status_url=_bulk_export_log_url(status_url),
+                )
+            await asyncio.sleep(sleep_seconds)
             continue
         if status_code == 200:
             if not _bulk_export_status_payload(payload):
+                _bulk_export_log(
+                    "poll_invalid_payload",
+                    source_id=source.get("source_id"),
+                    resource=resource_type,
+                    poll=polls,
+                    status=status_code,
+                )
                 return None, "bulk_export_status_non_bulk_payload", polls
             output_urls = _bulk_export_output_urls(payload, resource_type)
             payload_error = _bulk_export_payload_error(payload)
+            _bulk_export_log(
+                "poll_ready",
+                source_id=source.get("source_id"),
+                resource=resource_type,
+                poll=polls,
+                status=status_code,
+                outputs=len(output_urls),
+                payload_error=payload_error,
+            )
             if payload_error and not output_urls:
                 return None, payload_error, polls
             return output_urls, None, polls
+        _bulk_export_log(
+            "poll_http_error",
+            source_id=source.get("source_id"),
+            resource=resource_type,
+            poll=polls,
+            status=status_code,
+        )
         return None, f"bulk_export_status_http_{status_code}", polls
+    _bulk_export_log(
+        "poll_timeout",
+        source_id=source.get("source_id"),
+        resource=resource_type,
+        polls=polls,
+        max_polls=max_polls,
+        status_url=_bulk_export_log_url(status_url),
+    )
     return None, "bulk_export_timeout", polls
 
 
@@ -7139,6 +7210,13 @@ async def _stream_bulk_export_output_rows(
         return None
 
     try:
+        _bulk_export_log(
+            "stream_start",
+            source_id=source.get("source_id"),
+            resource=resource_type,
+            output_url=_bulk_export_log_url(url),
+            row_batch_size=row_batch_size,
+        )
         async with session.get(
             fetch_url,
             headers=headers,
@@ -7209,6 +7287,16 @@ async def _fetch_bulk_export_resource_rows(
             timeout=timeout,
             prefer_async=True,
         )
+        status_url = _clean_text(headers.get("content-location") or headers.get("location"))
+        _bulk_export_log(
+            "start",
+            source_id=source.get("source_id"),
+            resource=resource_type,
+            status=status_code,
+            error=error,
+            start_url=_bulk_export_log_url(url),
+            status_url=_bulk_export_log_url(status_url),
+        )
         if _bulk_export_pre_stream_should_fallback(status_code, error):
             return None
 
@@ -7234,7 +7322,6 @@ async def _fetch_bulk_export_resource_rows(
                     fetch_mode="bulk_export",
                 )
         else:
-            status_url = _clean_text(headers.get("content-location") or headers.get("location"))
             if not status_url:
                 return ResourceFetchResult(
                     model=model,
@@ -7290,6 +7377,15 @@ async def _fetch_bulk_export_resource_rows(
                 row_batch_handler=row_batch_handler,
                 row_batch_size=row_batch_size,
                 retain_rows=retain_rows,
+            )
+            _bulk_export_log(
+                "stream_output",
+                source_id=source.get("source_id"),
+                resource=resource_type,
+                fetched=fetched,
+                written=written,
+                limited=limited,
+                error=error,
             )
             rows.extend(batch_rows)
             rows_fetched += fetched
