@@ -91,6 +91,7 @@ ENTITY_ADDRESS_REFRESH_MODES = {
 }
 ARCHIVE_IDENTITY_VERSION = "v2"
 BASE_ADDRESS_VERSION = "address_archive_v2:v2"
+ARCHIVE_COORDINATE_EPSILON_DEGREES = "0.0000001"
 SUPPORT_TABLE_MODELS = (
     EntityAddressEvidence,
     EntityAddressPlanBridge,
@@ -112,6 +113,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "service_phone_digits_npi",
     "service_phone_number_npi",
     "service_address_key_npi",
+    "address_sources",
     # The API phone-fallback lookup filters "address_key = ANY(..) OR
     # premise_key = ANY(..)"; without a premise_key index the OR forces a full
     # seq scan of the serving table (~3M pages, ~5.7s per location search).
@@ -2300,6 +2302,7 @@ def _source_selects(
     test_limit_per_source: int | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | None = None,
     provider_directory_run_id: str | None = None,
+    address_canon_available: bool = True,
 ) -> list[str]:
     selects: list[str] = []
     has_npi = available.get("npi", False)
@@ -2371,6 +2374,14 @@ def _source_selects(
         state="pd.state_name",
         zip_code="pd.postal_code",
         country="pd.country_code",
+    )
+    provider_directory_organization_address_key = (
+        f"{db_schema}.addr_key_v1("
+        "pd.first_line, pd.second_line, pd.city_name, "
+        "pd.state_name, pd.postal_code, pd.country_code"
+        ")"
+        if address_canon_available
+        else "NULL::uuid"
     )
     provider_directory_role_scope_filter = _provider_directory_scope_filter_sql(
         "role",
@@ -3274,7 +3285,7 @@ def _source_selects(
                 NULL::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
-                NULL::uuid AS address_key,
+                {provider_directory_organization_address_key} AS address_key,
                 COALESCE(pd.organization_updated_at, NOW())::timestamp AS updated_at,
                 'provider_directory_fhir'::varchar AS address_source,
                 (
@@ -4202,6 +4213,21 @@ async def _invalid_coordinate_count(db_schema: str, table_name: str, *, db_clien
     )
 
 
+def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
+    return f"""
+    UPDATE {db_schema}.{table_name} AS t
+       SET lat = COALESCE(t.lat, a.lat),
+           long = COALESCE(t.long, a.long)
+      FROM {db_schema}.address_archive_v2 AS a
+     WHERE t.address_key IS NOT NULL
+       AND a.address_key = t.address_key
+       AND a.merged_into IS NULL
+       AND a.lat IS NOT NULL
+       AND a.long IS NOT NULL
+       AND (t.lat IS NULL OR t.long IS NULL);
+    """
+
+
 async def _location_key_primary_key_validated(db_schema: str, table_name: str) -> bool:
     """A valid PK on location_key proves both non-null and uniqueness."""
     return bool(
@@ -4312,8 +4338,10 @@ async def _validate_publish_integrity(
                    AND a.lat IS NOT NULL
                    AND a.long IS NOT NULL
                    AND (
-                       t.lat IS DISTINCT FROM a.lat
-                    OR t.long IS DISTINCT FROM a.long
+                       t.lat IS NULL
+                    OR t.long IS NULL
+                    OR ABS(t.lat - a.lat) > {ARCHIVE_COORDINATE_EPSILON_DEGREES}
+                    OR ABS(t.long - a.long) > {ARCHIVE_COORDINATE_EPSILON_DEGREES}
                    );
                 """
                 ),
@@ -9391,6 +9419,7 @@ async def process_data(ctx, task=None):
     )
     context["partial_provider_directory_source_batch_size"] = provider_directory_source_batch_size
     context["partial_provider_directory_source_batches"] = len(provider_directory_source_batches)
+    address_canon_available = await _address_canon_available(db_schema)
     source_selects: list[str] = []
     for provider_directory_source_batch in provider_directory_source_batches:
         source_selects.extend(
@@ -9400,6 +9429,7 @@ async def process_data(ctx, task=None):
                 test_limit_per_source=test_limit_per_source,
                 provider_directory_source_ids=provider_directory_source_batch,
                 provider_directory_run_id=provider_directory_run_id,
+                address_canon_available=address_canon_available,
             )
         )
     affected_group_table: str | None = None
@@ -9518,7 +9548,6 @@ async def process_data(ctx, task=None):
             ),
         )
     context["source_select_count"] = len(source_selects)
-    address_canon_available = await _address_canon_available(db_schema)
     if not address_canon_available:
         message = (
             "canonical address SQL functions are not available; "
@@ -10586,6 +10615,8 @@ async def process_data(ctx, task=None):
             message="promoting Provider Directory replacement stage",
             emit_done=True,
         )
+        context["stage_indexes_prepared"] = False
+        context["partial_provider_directory_replacement_stage_indexes_invalidated"] = True
         await _ensure_stage_primary_key(stage_cls, db_schema, context=context)
         await _run_sql_phase(
             f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};",
@@ -10830,6 +10861,23 @@ async def shutdown(ctx):
         and not partial_support_patch
         and _defer_publish_validation()
     )
+    if await _table_exists(db_schema, "address_archive_v2"):
+        archive_coordinate_backfill_rows = await _run_sql_phase(
+            _backfill_archive_coordinates_sql(db_schema, stage_cls.__tablename__),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified backfilling archive coordinates",
+            unit="rows",
+            done=0,
+            total=1,
+            pct=96,
+            message="backfilling missing coordinates from address archive",
+            emit_start=True,
+            emit_done=True,
+        )
+        context["archive_coordinate_backfill_rows"] = int(archive_coordinate_backfill_rows or 0)
+    else:
+        context["archive_coordinate_backfill_rows"] = 0
     context["publish_validation_deferred"] = defer_publish_validation
     if defer_publish_validation:
         context["publish_validation"] = {
@@ -10976,6 +11024,9 @@ async def shutdown(ctx):
             "support_counts": context.get("support_counts") or {},
             "serving_only_refresh": serving_only_refresh,
             "support_stage_skipped": bool(context.get("support_stage_skipped")),
+            "archive_coordinate_backfill_rows": int(
+                context.get("archive_coordinate_backfill_rows") or 0
+            ),
             **_runtime_config_metrics(context),
             "publish_validation": context.get("publish_validation") or {},
             "phase_timings": context.get("phase_timings") or {},
@@ -11000,6 +11051,24 @@ async def shutdown(ctx):
     context["preserve_control_run_finished_at"] = True
     if defer_publish_validation:
         try:
+            if await _table_exists(db_schema, "address_archive_v2"):
+                archive_coordinate_backfill_rows = await _run_sql_phase(
+                    _backfill_archive_coordinates_sql(db_schema, EntityAddressUnified.__main_table__),
+                    context=context,
+                    run_id=run_id,
+                    phase="entity-address-unified backfilling archive coordinates",
+                    unit="rows",
+                    done=0,
+                    total=1,
+                    pct=99,
+                    message="backfilling missing coordinates from address archive",
+                    emit_start=True,
+                    emit_done=True,
+                )
+                context["archive_coordinate_backfill_rows"] = (
+                    int(context.get("archive_coordinate_backfill_rows") or 0)
+                    + int(archive_coordinate_backfill_rows or 0)
+                )
             started = time.monotonic()
             publish_validation = await _validate_publish_integrity(
                 db_schema,

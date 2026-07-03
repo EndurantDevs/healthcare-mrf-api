@@ -1145,6 +1145,10 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     assert "organization.npi BETWEEN 1000000000 AND 9999999999" in sql
     assert "provider_directory_organization AS organization" in sql
     assert "provider_directory_organization_addresses" in sql
+    assert (
+        "mrf.addr_key_v1(pd.first_line, pd.second_line, pd.city_name, "
+        "pd.state_name, pd.postal_code, pd.country_code) AS address_key"
+    ) in sql
     assert "src.entity_id::varchar AS entity_id" in sql
     assert "END AS entity_npi" in sql
     index_sql = entity_address_unified._index_provider_directory_partial_affected_groups_sql(
@@ -1165,6 +1169,28 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
         "provider_directory_practitioner_role AS role" in source_select
         for source_select in filtered
     )
+
+
+def test_provider_directory_organization_address_sql_can_skip_address_key_without_canon():
+    source_selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "provider_directory_practitioner": False,
+            "provider_directory_organization": True,
+            "provider_directory_location": False,
+            "provider_directory_practitioner_role": False,
+            "provider_directory_organization_affiliation": False,
+            "npi_address": False,
+            "address_archive_v2": False,
+        },
+        address_canon_available=False,
+    )
+
+    sql = "\n".join(source_selects)
+
+    assert "provider_directory_fhir:organization_address:" in sql
+    assert "NULL::uuid AS address_key" in sql
+    assert "addr_key_v1(" not in sql
 
 
 def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
@@ -2657,6 +2683,7 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     assert "FROM mrf.entity_address_unified AS live" in prepare_affected_sql
     assert "JOIN affected_npis AS affected_npi" in prepare_affected_sql
     assert "FROM mrf.entity_address_unified_20260614 AS replacement" in prepare_affected_sql
+    assert prepare_affected_sql.count("FROM mrf.entity_address_unified_20260614 AS replacement") == 1
     assert "CREATE UNIQUE INDEX" in index_affected_sql
     assert f"ON mrf.{affected_location_table} (location_key)" in index_affected_sql
     assert f"INSERT INTO mrf.{heap_name}" in copy_live_sql
@@ -2667,6 +2694,20 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     assert "DELETE FROM" not in "\n".join((prepare_affected_sql, copy_live_sql, copy_stage_sql))
     assert f"INSERT INTO mrf.{heap_name}" in copy_stage_sql
     assert "FROM mrf.entity_address_unified_20260614 AS stage" in copy_stage_sql
+
+
+def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
+    source = inspect.getsource(entity_address_unified.process_data)
+    promote = "ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};"
+    invalidate = 'context["stage_indexes_prepared"] = False'
+    rebuild = "await _create_stage_indexes(stage_cls, db_schema, context=context)"
+
+    promote_at = source.index(promote)
+    invalidate_at = source.index(invalidate, promote_at)
+    rebuild_at = source.index(rebuild, promote_at)
+
+    assert promote_at < invalidate_at < rebuild_at
+    assert "partial_provider_directory_replacement_stage_indexes_invalidated" in source[promote_at:rebuild_at]
 
 
 @pytest.mark.asyncio
@@ -2683,6 +2724,67 @@ async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeyp
 
     with pytest.raises(RuntimeError, match="replacement-stage table swap"):
         await entity_address_unified.shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def scalar(self, statement):
+            if "COUNT(*) FROM mrf.entity_address_unified" in statement:
+                return 100
+            raise AssertionError(f"unexpected scalar SQL: {statement}")
+
+        async def status(self, statement):
+            statements.append(statement)
+            return "OK"
+
+        @asynccontextmanager
+        async def transaction(self):
+            statements.append("BEGIN")
+            yield
+            statements.append("COMMIT")
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "none")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address_unified, "_support_stage_classes", lambda _import_date: {})
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
+
+    ctx = {
+        "import_date": "20260614",
+        "context": {
+            "run": 1,
+            "test_mode": True,
+            "refresh_mode": "provider-directory-partial",
+            "stage_indexes_prepared": True,
+            "support_stage_indexes_prepared": True,
+            "partial_provider_directory_replacement_publish": True,
+            "partial_provider_directory_replacement_rows": 120,
+            "partial_provider_directory_unaffected_live_rows_copied": 100,
+            "partial_provider_directory_affected_stage_rows_copied": 20,
+            "staged_rows": 120,
+            "npi_rows": 0,
+            "inferred_rows": 0,
+            "multi_source_rows": 0,
+            "support_counts": {},
+        },
+    }
+
+    await entity_address_unified.shutdown(ctx)
+
+    joined = "\n".join(statements)
+    assert "DELETE FROM" not in joined
+    assert "BEGIN" in statements
+    assert "COMMIT" in statements
+    assert "DROP TABLE IF EXISTS mrf.entity_address_unified_old;" in statements
+    assert "ALTER TABLE IF EXISTS mrf.entity_address_unified RENAME TO entity_address_unified_old;" in statements
+    assert (
+        "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 "
+        "RENAME TO entity_address_unified;"
+    ) in statements
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
@@ -3011,6 +3113,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
                 "name": "service_address_key_npi",
                 "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
             },
+            {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
             {"index_elements": ("row_origin",), "name": "row_origin"},
             {"index_elements": ("zip5",), "name": "zip5"},
             {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
@@ -3042,6 +3145,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_service_phone_digits_npi" in joined
     assert "idx_service_phone_number_npi" in joined
     assert "idx_service_address_key_npi" in joined
+    assert "idx_address_sources" in joined
     assert "idx_primary_phone_digits_npi" not in joined
     assert "idx_geo_idx" not in joined
     assert "idx_inferred_npi" not in joined
@@ -3304,6 +3408,33 @@ def test_entity_address_unified_final_summary_counts_can_be_disabled(monkeypatch
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS", "false")
 
     assert entity_address_unified._final_summary_counts() is False
+
+
+def test_entity_address_unified_publish_validation_tolerates_coordinate_roundoff():
+    source = inspect.getsource(entity_address_unified._validate_publish_integrity)
+
+    assert "ABS(t.lat - a.lat) > {ARCHIVE_COORDINATE_EPSILON_DEGREES}" in source
+    assert "ABS(t.long - a.long) > {ARCHIVE_COORDINATE_EPSILON_DEGREES}" in source
+    assert "t.lat IS NULL" in source
+    assert "t.long IS NULL" in source
+    assert "t.lat IS DISTINCT FROM a.lat" not in source
+    assert "t.long IS DISTINCT FROM a.long" not in source
+
+
+def test_entity_address_unified_archive_coordinate_backfill_sql_only_fills_missing():
+    sql = entity_address_unified._backfill_archive_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+
+    assert "UPDATE mrf.entity_address_unified_20260614 AS t" in sql
+    assert "SET lat = COALESCE(t.lat, a.lat)" in sql
+    assert "long = COALESCE(t.long, a.long)" in sql
+    assert "FROM mrf.address_archive_v2 AS a" in sql
+    assert "a.merged_into IS NULL" in sql
+    assert "a.lat IS NOT NULL" in sql
+    assert "a.long IS NOT NULL" in sql
+    assert "(t.lat IS NULL OR t.long IS NULL)" in sql
 
 
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
