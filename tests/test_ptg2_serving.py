@@ -1730,11 +1730,11 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
     assert response["items"][0]["zip_match_type"] == "radius"
     assert response["items"][0]["anchor_zip5"] == "60601"
     assert "service_code" not in response["items"][0]
-    assert response["query"]["route_item_table"] == "mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837"
+    assert "route_item_table" not in response["query"]
     assert response["pagination"]["total"] == 1
     route_sql = str(session.calls[-1][0][0])
-    assert "FROM location_zip_scope zip_scope" in route_sql
-    assert "JOIN mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837 r" in route_sql
+    assert "FROM location_zip_scope zip_scope" not in route_sql
+    assert "FROM mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837 r" in route_sql
     assert "ORDER BY min_rate ASC NULLS LAST" in route_sql
 
 

@@ -2839,22 +2839,7 @@ async def _search_ptg2_manifest_route_item_table(
         result = await session.execute(
             text(
                 f"""
-            WITH location_zip_scope AS MATERIALIZED (
-                SELECT g.zip_code::text AS zip5
-                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
-                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
-                    ON g.latitude IS NOT NULL
-                   AND g.longitude IS NOT NULL
-                 WHERE anchor.zip_code = :zip5
-                   AND 69.0 * sqrt(
-                        power(g.latitude - anchor.latitude, 2)
-                        + power(
-                            (g.longitude - anchor.longitude)
-                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
-                            2
-                        )
-                   ) <= CAST(:geo_radius_miles AS double precision)
-            ), raw AS (
+            WITH raw AS (
                 SELECT
                     r.item_payload,
                     CASE WHEN r.zip5 = :zip5 THEN 0.0 ELSE {distance_sql} END AS distance_miles,
@@ -2862,9 +2847,7 @@ async def _search_ptg2_manifest_route_item_table(
                     r.min_rate,
                     r.provider_name,
                     r.npi
-                  FROM location_zip_scope zip_scope
-                  JOIN {table_name} r
-                    ON r.zip5 = zip_scope.zip5
+                  FROM {table_name} r
                  WHERE (
                         r.zip5 = :zip5
                         OR (

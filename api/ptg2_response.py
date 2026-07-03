@@ -43,6 +43,7 @@ PTG2_QUERY_DIAGNOSTIC_FIELDS = {
     "price_filter",
     "procedure_consolidation",
     "provider_reverse_index",
+    "route_item_table",
     "snapshot_id",
 }
 def _request_bool(value: Any, default: bool = False) -> bool:
