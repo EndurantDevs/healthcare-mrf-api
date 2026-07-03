@@ -661,6 +661,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
 def test_manifest_location_candidate_window_defaults_to_double_page_floor(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_MATCH_LIMIT", raising=False)
     monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_OVERFETCH_CAP", raising=False)
     monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", raising=False)
 
     class LimitFiftyPagination:
@@ -677,10 +678,25 @@ def test_manifest_location_candidate_window_defaults_to_double_page_floor(monkey
         == 100
     )
 
+    class LimitTwoHundredPagination:
+        limit = 200
+        offset = 0
+
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            LimitTwoHundredPagination(),
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 300
+    )
+
 
 def test_manifest_location_candidate_window_honors_env_multiplier(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_MATCH_LIMIT", raising=False)
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER", "3")
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_OVERFETCH_CAP", raising=False)
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_FLOOR", "25")
 
     class LimitFiftyPagination:
@@ -695,6 +711,20 @@ def test_manifest_location_candidate_window_honors_env_multiplier(monkeypatch):
             location_filter_requested=True,
         )
         == 150
+    )
+
+    class LimitTwoHundredPagination:
+        limit = 200
+        offset = 0
+
+    assert (
+        ptg2_serving._ptg2_manifest_rate_candidate_limit(
+            {},
+            LimitTwoHundredPagination(),
+            expand_providers=True,
+            location_filter_requested=True,
+        )
+        == 600
     )
 
 

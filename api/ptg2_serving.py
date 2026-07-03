@@ -2605,11 +2605,17 @@ def _ptg2_manifest_rate_candidate_limit(
         # and make the overfetch/floor tunable for dense metros without a code
         # deploy.
         candidate_multiplier = _ptg2_manifest_location_candidate_multiplier()
+        candidate_window = requested_limit * candidate_multiplier
+        if os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_MULTIPLIER") is None:
+            candidate_window = requested_limit + min(
+                max(candidate_window - requested_limit, 0),
+                _ptg2_manifest_location_candidate_overfetch_cap(),
+            )
         candidate_floor = _ptg2_manifest_location_candidate_floor()
         return min(
             _ptg2_manifest_location_match_limit(),
             max(
-                requested_limit * candidate_multiplier,
+                candidate_window,
                 requested_offset + requested_limit,
                 candidate_floor,
             ),
@@ -2926,6 +2932,14 @@ def _ptg2_manifest_location_candidate_multiplier() -> int:
         return max(int(raw_value), 1)
     except ValueError:
         return 2
+
+
+def _ptg2_manifest_location_candidate_overfetch_cap() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_CANDIDATE_OVERFETCH_CAP", "100")
+    try:
+        return max(int(raw_value), 0)
+    except ValueError:
+        return 100
 
 
 def _ptg2_manifest_location_candidate_floor() -> int:
