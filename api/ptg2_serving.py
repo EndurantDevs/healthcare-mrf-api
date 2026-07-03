@@ -3534,9 +3534,12 @@ async def _ptg2_manifest_location_provider_matches(
         if not missing_npis:
             return rows
         address_keys = sorted({str(row.get("address_key")) for row in missing_rows if row.get("address_key")})
-        premise_keys = sorted({str(row.get("premise_key")) for row in missing_rows if row.get("premise_key")})
-        if not address_keys and not premise_keys:
+        if not address_keys:
             return rows
+        # Keep this fallback on the existing (address_key, npi) index. Premise
+        # matching can fan out to thousands of same-building rows and has no
+        # composite premise+npi index, so it does not belong on the hot pricing
+        # path.
         fallback_result = await session.execute(
             text(
                 f"""
@@ -3557,7 +3560,6 @@ async def _ptg2_manifest_location_provider_matches(
                    AND NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
                    AND (
                         address_key = ANY(CAST(:address_keys AS uuid[]))
-                        OR premise_key = ANY(CAST(:premise_keys AS uuid[]))
                    )
                 """
             ),
@@ -3565,7 +3567,6 @@ async def _ptg2_manifest_location_provider_matches(
                 "fallback_npis": missing_npis,
                 "fallback_address_types": ["practice", "primary", "secondary", "site"],
                 "address_keys": address_keys,
-                "premise_keys": premise_keys,
             },
         )
         candidates = [_row_mapping(row) for row in fallback_result]

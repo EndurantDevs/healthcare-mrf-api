@@ -2570,9 +2570,9 @@ async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatc
     fallback_params = fallback_call[0][1]
     assert "npi = ANY(CAST(:fallback_npis AS bigint[]))" in fallback_sql
     assert "type = ANY(CAST(:fallback_address_types AS varchar[]))" in fallback_sql
+    assert "premise_key = ANY" not in fallback_sql
     assert fallback_params["fallback_npis"] == [1234567890]
     assert fallback_params["address_keys"] == [address_key]
-    assert fallback_params["premise_keys"] == [premise_key]
     assert provider_set_ids == {provider_set_id}
     provider = providers_by_set[provider_set_id][0]
     assert provider["telephone_number"] == "3125550100"
@@ -2804,7 +2804,7 @@ async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monke
 
 
 @pytest.mark.asyncio
-async def test_manifest_location_provider_phone_fallback_uses_uuid_key_indexes(monkeypatch):
+async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_index(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
@@ -2885,9 +2885,9 @@ async def test_manifest_location_provider_phone_fallback_uses_uuid_key_indexes(m
     assert provider["fax_number"] == "8185551213"
     fallback_sql = str(session.calls[3][0][0])
     assert "address_key = ANY(CAST(:address_keys AS uuid[]))" in fallback_sql
-    assert "premise_key = ANY(CAST(:premise_keys AS uuid[]))" in fallback_sql
+    assert "npi = ANY(CAST(:fallback_npis AS bigint[]))" in fallback_sql
+    assert "premise_key = ANY" not in fallback_sql
     assert "address_key::text = ANY(CAST(:address_keys AS text[]))" not in fallback_sql
-    assert "premise_key::text = ANY(CAST(:premise_keys AS text[]))" not in fallback_sql
 
 
 def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
