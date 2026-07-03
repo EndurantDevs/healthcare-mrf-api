@@ -11,6 +11,7 @@ import re
 import time
 from typing import Any, Mapping
 
+import orjson
 import sanic.exceptions
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
@@ -44,6 +45,14 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
 logger = logging.getLogger(__name__)
+
+
+def _json_response(payload: Any, *, status: int = 200):
+    return response.raw(
+        orjson.dumps(payload, default=str),
+        status=status,
+        content_type="application/json",
+    )
 
 
 provider_table = PricingProvider.__table__
@@ -5629,7 +5638,7 @@ async def list_provider_procedures(request, npi: str):
             year=year,
             has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
         )
-        return response.json(ptg2_payload)
+        return _json_response(ptg2_payload)
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     code_context = None
@@ -7744,7 +7753,7 @@ async def list_providers_by_procedure(request):
             year=year,
             has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
         )
-        return response.json(ptg2_payload)
+        return _json_response(ptg2_payload)
     if order_by == "cost_index":
         if not code:
             raise InvalidUsage("Parameter 'order_by=cost_index' requires 'code'")
