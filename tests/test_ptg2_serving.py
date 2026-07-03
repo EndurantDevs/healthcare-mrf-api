@@ -57,6 +57,12 @@ class FakePagination:
     offset = 0
 
 
+class _Pagination:
+    def __init__(self, *, limit=25, offset=0):
+        self.limit = limit
+        self.offset = offset
+
+
 def _fake_call_sql(session: FakeSession, pattern: str) -> str:
     for args, _kwargs in session.calls:
         sql = str(args[0])
@@ -1661,6 +1667,110 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
     assert payload["query"]["combined"] is True
     assert payload["query"]["snapshot_id"] is None
     assert {n["source_key"] for n in payload["query"]["networks"]} == {"c2", "ppo_ndc"}
+
+
+@pytest.mark.asyncio
+async def test_manifest_route_item_table_fast_path_shapes_payload():
+    columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
+    session = FakeSession(
+        [
+            FakeResult(scalar=True),
+            FakeResult(rows=[(column,) for column in columns]),
+            FakeResult(
+                rows=[
+                    {
+                        "item_payload": {
+                            "npi": 1234567890,
+                            "provider_name": "Example Provider",
+                            "reported_code": "90837",
+                            "reported_code_system": "CPT",
+                            "service_code": "90837",
+                            "service_code_system": "CPT",
+                            "price_summary": [{"rate": 101.0}],
+                        },
+                        "distance_miles": 4.25,
+                        "zip_rank": 1,
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        storage="manifest_snapshot",
+        id_storage="uuid",
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_route_item_table(
+        session,
+        "ptg2:202606:3f23541965bf",
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75.0,
+            "order_by": "total_allowed_amount",
+            "order": "asc",
+        },
+        _Pagination(limit=5, offset=0),
+        tables,
+        "product_search",
+        requested_plan="010854205",
+        requested_system="CPT",
+        requested_code="90837",
+    )
+
+    assert response is not None
+    assert response["items"][0]["npi"] == 1234567890
+    assert response["items"][0]["distance_miles"] == 4.25
+    assert response["items"][0]["zip_match_type"] == "radius"
+    assert response["items"][0]["anchor_zip5"] == "60601"
+    assert "service_code" not in response["items"][0]
+    assert response["query"]["route_item_table"] == "mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837"
+    assert response["pagination"]["total"] == 1
+    route_sql = str(session.calls[-1][0][0])
+    assert "FROM location_zip_scope zip_scope" in route_sql
+    assert "JOIN mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837 r" in route_sql
+    assert "ORDER BY min_rate ASC NULLS LAST" in route_sql
+
+
+@pytest.mark.asyncio
+async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_filter():
+    session = FakeSession([])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        storage="manifest_snapshot",
+        id_storage="uuid",
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_route_item_table(
+        session,
+        "ptg2:202606:3f23541965bf",
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75.0,
+            "specialty": "family medicine",
+        },
+        _Pagination(limit=5, offset=0),
+        tables,
+        "product_search",
+        requested_plan="010854205",
+        requested_system="CPT",
+        requested_code="90837",
+    )
+
+    assert response is None
+    assert session.calls == []
 
 
 @pytest.mark.asyncio

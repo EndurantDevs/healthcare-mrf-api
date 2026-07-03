@@ -2639,6 +2639,301 @@ def _ptg2_manifest_rate_candidate_limit(
     return requested_limit
 
 
+_PTG2_ROUTE_ITEM_COLUMNS = {
+    "npi",
+    "location_hash",
+    "zip5",
+    "lat",
+    "long",
+    "address_precision",
+    "item_payload",
+    "min_rate",
+    "provider_name",
+}
+
+
+def _ptg2_route_item_slug(value: Any, *, max_length: int = 32) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return (slug or "none")[:max_length]
+
+
+def _ptg2_route_item_table_candidates(
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    code_system: str | None,
+    code: str,
+) -> tuple[str, ...]:
+    serving_table = _safe_table_name(serving_tables.serving_table)
+    if not serving_table:
+        return ()
+    serving_name = serving_table.rsplit(".", 1)[-1]
+    serving_suffix = serving_name.removeprefix("ptg2_serving_")
+    if not serving_suffix or serving_suffix == serving_name:
+        return ()
+    plan_slug = _ptg2_route_item_slug(plan_id, max_length=24)
+    system_slug = _ptg2_route_item_slug(code_system or "code", max_length=12)
+    code_slug = _ptg2_route_item_slug(code, max_length=16)
+    suffixes = tuple(dict.fromkeys((serving_suffix, serving_suffix[:5])))
+    return tuple(
+        f"{PTG2_SCHEMA}.ptg2_route_item_{suffix}_{plan_slug}_{system_slug}_{code_slug}"
+        for suffix in suffixes
+        if suffix
+    )
+
+
+async def _ptg2_route_item_table(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    code_system: str | None,
+    code: str,
+) -> str | None:
+    for table_name in _ptg2_route_item_table_candidates(
+        serving_tables,
+        plan_id=plan_id,
+        code_system=code_system,
+        code=code,
+    ):
+        if not await _serving_table_available(session, table_name):
+            continue
+        if await _ptg2_table_has_columns(session, table_name, _PTG2_ROUTE_ITEM_COLUMNS):
+            return table_name
+    return None
+
+
+def _ptg2_route_item_fast_path_allowed(args: dict[str, Any]) -> bool:
+    if not _request_bool(args.get("include_providers")):
+        return False
+    if _include_ptg2_sources(args):
+        return False
+    variant_payload_keys = (
+        "include_code_details",
+        "include_debug",
+        "include_details",
+        "include_unverified_addresses",
+    )
+    if any(args.get(key) not in (None, "", "null") for key in variant_payload_keys):
+        return False
+    if args.get("q") or args.get("service_name"):
+        return False
+    if args.get("state") or args.get("city"):
+        return False
+    if args.get("specialty") or args.get("classification"):
+        return False
+    explicit_taxonomy_keys = (
+        "taxonomy_codes",
+        "taxonomy_code",
+        "taxonomy_classification",
+        "taxonomy_specialization",
+        "taxonomy_section",
+        "include_subspecialties",
+        "primary_only",
+    )
+    if any(args.get(key) not in (None, "", "null") for key in explicit_taxonomy_keys):
+        return False
+    price_filter_params: dict[str, Any] = {}
+    price_filter_clauses, _ = _price_filter_clauses(args, price_filter_params)
+    if price_filter_clauses:
+        return False
+    return bool(
+        args.get("zip5")
+        and args.get("lat") not in (None, "", "null")
+        and args.get("long") not in (None, "", "null")
+        and args.get("radius_miles") not in (None, "", "null")
+    )
+
+
+async def _search_ptg2_manifest_route_item_table(
+    session,
+    snapshot_id: str,
+    args: dict[str, Any],
+    pagination,
+    serving_tables: PTG2ServingTables,
+    mode_value: str,
+    *,
+    requested_plan: str,
+    requested_system: str | None,
+    requested_code: str,
+) -> dict[str, Any] | None:
+    if not _ptg2_route_item_fast_path_allowed(args):
+        return None
+    try:
+        geo_lat = float(args.get("lat"))
+        geo_long = float(args.get("long"))
+        geo_radius_miles = max(float(args.get("radius_miles")), 0.0)
+    except (TypeError, ValueError):
+        return None
+    zip_value = _normalize_zip5(args.get("zip5"))
+    if not zip_value:
+        return None
+    table_name = await _ptg2_route_item_table(
+        session,
+        serving_tables,
+        plan_id=requested_plan,
+        code_system=requested_system,
+        code=requested_code,
+    )
+    if not table_name:
+        return None
+
+    params: dict[str, Any] = {
+        "zip5": zip_value,
+        "geo_lat": geo_lat,
+        "geo_long": geo_long,
+        "geo_radius_miles": geo_radius_miles,
+        "geo_min_lat": geo_lat - geo_radius_miles / 69.0,
+        "geo_max_lat": geo_lat + geo_radius_miles / 69.0,
+        "geo_min_long": geo_long - geo_radius_miles / 69.0,
+        "geo_max_long": geo_long + geo_radius_miles / 69.0,
+        "limit": int(pagination.limit),
+        "offset": int(pagination.offset),
+        "empty": "",
+        "city_zip": "city_zip",
+    }
+    npi_value = args.get("npi")
+    npi_filter_sql = ""
+    if npi_value not in (None, "", "null"):
+        try:
+            params["provider_npi"] = int(npi_value)
+        except (TypeError, ValueError):
+            return None
+        npi_filter_sql = "AND r.npi = :provider_npi"
+
+    distance_sql = _ptg2_geo_distance_miles_sql("r.lat::float8", "r.long::float8")
+    order_by = str(args.get("order_by") or "").strip().lower()
+    order = str(args.get("order") or "").strip().lower()
+    descending = order == "desc"
+    cost_order_fields = {
+        "total_allowed_amount",
+        "total_drug_cost",
+        "cost",
+        "price",
+        "rate",
+        "negotiated_rate",
+        "amount",
+    }
+    distance_order_fields = {"", "distance", "distance_miles"}
+    if order_by in cost_order_fields:
+        direction = "DESC" if descending else "ASC"
+        distance_direction = "DESC" if descending else "ASC"
+        order_sql = (
+            f"min_rate {direction} NULLS LAST, "
+            f"distance_miles {distance_direction} NULLS LAST, "
+            "provider_name, npi"
+        )
+    elif order_by in distance_order_fields:
+        direction = "DESC" if descending else "ASC"
+        zip_direction = "DESC" if descending else "ASC"
+        order_sql = (
+            f"zip_rank {zip_direction}, "
+            f"distance_miles {direction} NULLS LAST, "
+            "min_rate ASC NULLS LAST, provider_name, npi"
+        )
+    else:
+        return None
+
+    await _set_local_jit_off_for_manifest_location(session)
+    result = await session.execute(
+        text(
+            f"""
+            WITH location_zip_scope AS MATERIALIZED (
+                SELECT g.zip_code::text AS zip5
+                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
+                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
+                    ON g.latitude IS NOT NULL
+                   AND g.longitude IS NOT NULL
+                 WHERE anchor.zip_code = :zip5
+                   AND 69.0 * sqrt(
+                        power(g.latitude - anchor.latitude, 2)
+                        + power(
+                            (g.longitude - anchor.longitude)
+                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
+                            2
+                        )
+                   ) <= CAST(:geo_radius_miles AS double precision)
+            ), raw AS (
+                SELECT
+                    r.item_payload,
+                    CASE WHEN r.zip5 = :zip5 THEN 0.0 ELSE {distance_sql} END AS distance_miles,
+                    CASE WHEN r.zip5 = :zip5 THEN 0 ELSE 1 END AS zip_rank,
+                    r.min_rate,
+                    r.provider_name,
+                    r.npi
+                  FROM location_zip_scope zip_scope
+                  JOIN {table_name} r
+                    ON r.zip5 = zip_scope.zip5
+                 WHERE (
+                        r.zip5 = :zip5
+                        OR (
+                            r.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat
+                            AND r.long::float8 BETWEEN :geo_min_long AND :geo_max_long
+                            AND {distance_sql} <= CAST(:geo_radius_miles AS double precision)
+                            AND COALESCE(r.address_precision, :empty) <> :city_zip
+                        )
+                    )
+                    {npi_filter_sql}
+            )
+            SELECT item_payload, distance_miles, zip_rank
+              FROM raw
+             ORDER BY {order_sql}
+             LIMIT :limit OFFSET :offset
+            """
+        ),
+        params,
+    )
+    items: list[dict[str, Any]] = []
+    for row in result:
+        data = _row_mapping(row)
+        payload = _coerce_json_payload(data.get("item_payload"), {})
+        if not isinstance(payload, dict):
+            continue
+        item = dict(payload)
+        item["distance_miles"] = data.get("distance_miles")
+        item["zip_match_type"] = "same_zip" if int(data.get("zip_rank") or 0) == 0 else "radius"
+        item["anchor_zip5"] = zip_value
+        item["zip_radius_miles"] = geo_radius_miles
+        items.append(item)
+    if not items:
+        return None
+
+    return _shape_ptg2_manifest_response(
+        {
+            "items": items,
+            "pagination": {
+                "total": int(pagination.offset) + len(items),
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+            },
+            "query": {
+                "plan_id": args.get("plan_id"),
+                "plan_external_id": args.get("plan_external_id"),
+                "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
+                "source_key": args.get("source_key") or None,
+                "snapshot_id": snapshot_id,
+                "mode": mode_value,
+                "code": args.get("code") or None,
+                "code_system": args.get("code_system") or None,
+                "state": args.get("state") or None,
+                "city": args.get("city") or None,
+                "zip5": zip_value,
+                "lat": args.get("lat") or None,
+                "long": args.get("long") or None,
+                "radius_miles": geo_radius_miles,
+                "npi": args.get("npi") or None,
+                "source": "ptg2_db",
+                "serving_table": _safe_table_name(serving_tables.serving_table),
+                "route_item_table": table_name,
+                "include_providers": True,
+                "procedure_consolidation": "REPORTED_CODE",
+            },
+        },
+        args,
+    )
+
+
 def _ptg2_provider_price_sort_value(item: dict[str, Any]) -> float:
     rates: list[float] = []
     for price in _coerce_json_payload(item.get("prices"), []):
@@ -4032,6 +4327,19 @@ async def _search_ptg2_manifest_db_serving_table(
         params["reported_code_system"] = requested_system
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if location_filter_requested:
+        route_item_payload = await _search_ptg2_manifest_route_item_table(
+            session,
+            snapshot_id,
+            args,
+            pagination,
+            serving_tables,
+            mode_value,
+            requested_plan=requested_plan,
+            requested_system=requested_system,
+            requested_code=requested_code,
+        )
+        if route_item_payload is not None:
+            return route_item_payload
         location_matches = await _ptg2_manifest_location_provider_matches(
             session,
             serving_tables,
