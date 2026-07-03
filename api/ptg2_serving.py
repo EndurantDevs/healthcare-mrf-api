@@ -2808,6 +2808,14 @@ def _merge_unique_payload_list(target: dict[str, Any], field: str, value: Any) -
         target_values.append(item)
 
 
+def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
+    prices = item.get("prices")
+    if isinstance(prices, list) and "price_summary" in item:
+        item["tic_prices"] = list(item.get("tic_prices") or prices)
+        return
+    item.update(_price_response_fields(prices))
+
+
 def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse duplicate provider/location rows while preserving every rate option."""
     merged: list[dict[str, Any]] = []
@@ -2820,9 +2828,7 @@ def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[st
         existing = grouped.get(group_key)
         if existing is None:
             existing = dict(item)
-            existing["prices"] = _normalize_price_payload(existing.get("prices"))
-            existing["tic_prices"] = list(existing["prices"])
-            existing["price_summary"] = _price_response_fields(existing["prices"])["price_summary"]
+            _ensure_provider_rate_price_fields(existing)
             existing.setdefault("price_set_hashes", [])
             existing.setdefault("rate_pack_hashes", [])
             existing.setdefault("provider_set_hashes", [])

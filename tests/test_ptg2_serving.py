@@ -3033,6 +3033,34 @@ def test_merge_ptg2_provider_rate_items_preserves_same_provider_location_rates()
     assert merged[0]["rate_pack_count"] == 2
 
 
+def test_merge_ptg2_provider_rate_items_reuses_presummarized_unique_prices(monkeypatch):
+    def fail_price_response_fields(_prices):
+        raise AssertionError("unique presummarized rows should not rebuild price fields")
+
+    monkeypatch.setattr(ptg2_serving, "_price_response_fields", fail_price_response_fields)
+    item = {
+        "provider_name": "Example Provider",
+        "npi": "1255711370",
+        "reported_code_system": "CPT",
+        "reported_code": "90837",
+        "location_hash": "loc-1",
+        "address": {"address_key": "loc-1", "first_line": "101 E 9th St"},
+        "price_set_hash": "price-a",
+        "rate_pack_hash": "rate-a",
+        "provider_set_hash": "provider-a",
+        "prices": [{"negotiated_rate": 107.0}],
+        "tic_prices": [{"negotiated_rate": 107.0}],
+        "price_summary": [{"rate": 107.0}],
+    }
+
+    merged = ptg2_serving._merge_ptg2_provider_rate_items([item])
+
+    assert len(merged) == 1
+    assert merged[0]["prices"] == [{"negotiated_rate": 107.0}]
+    assert merged[0]["tic_prices"] == [{"negotiated_rate": 107.0}]
+    assert merged[0]["price_summary"] == [{"rate": 107.0}]
+
+
 def test_compact_item_promotes_location_phone_from_address_payload():
     item = ptg2_serving._compact_item_from_row(
         {
