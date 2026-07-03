@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import datetime
 import os
-import sys
 from typing import Any
 
 from db.connection import db
-from db.models import PTG2CurrentPlanSource, PTG2CurrentSourceSnapshot
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident, _table_exists
 
@@ -36,21 +34,19 @@ def _ptg2_plan_source_key(
 
 
 async def _current_source_snapshot_id(source_key: str) -> str | None:
-    row = await (
-        db.select(PTG2CurrentSourceSnapshot.__table__.c.snapshot_id)
-        .where(PTG2CurrentSourceSnapshot.__table__.c.source_key == source_key)
-        .first()
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    row = await db.first(
+        f"""
+        SELECT snapshot_id
+          FROM {_quote_ident(schema_name)}.ptg2_current_source_snapshot
+         WHERE source_key = :source_key
+         LIMIT 1
+        """,
+        source_key=source_key,
     )
     if row is None:
         return None
     return str(row[0]) if row[0] else None
-
-
-async def _push_ptg2_objects_from_facade(rows: list[dict[str, Any]], cls, *, rewrite: bool = True) -> None:
-    ptg_module = sys.modules.get("process.ptg")
-    if ptg_module is None:
-        raise RuntimeError("process.ptg facade is not loaded")
-    await ptg_module._push_ptg2_objects(rows, cls, rewrite=rewrite)
 
 
 async def _source_plan_rows(
@@ -78,18 +74,32 @@ async def _source_plan_rows(
         table_value = str(serving_index["table"])
         table_name = table_value.split(".", 1)[1] if "." in table_value else table_value
         if await _table_exists(schema_name, table_name):
-            snapshot_filter = "" if serving_index.get("storage") == "manifest_snapshot" else "WHERE snapshot_id = :snapshot_id"
-            plan_filter = "WHERE" if not snapshot_filter else "AND"
-            rows = await db.all(
-                f"""
-                SELECT DISTINCT plan_id, '' AS plan_market_type
-                  FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
-                 {snapshot_filter}
-                 {plan_filter} plan_id IS NOT NULL
-                   AND plan_id <> ''
-                """,
-                snapshot_id=snapshot_id,
-            )
+            if str(serving_index.get("serving_table_layout") or "").strip().lower() == "lean_provider_key_v1":
+                code_count_value = str(serving_index.get("code_count_table") or "")
+                code_count_table = code_count_value.split(".", 1)[1] if "." in code_count_value else code_count_value
+                if code_count_table and await _table_exists(schema_name, code_count_table):
+                    rows = await db.all(
+                        f"""
+                        SELECT DISTINCT plan_id, '' AS plan_market_type
+                          FROM {_quote_ident(schema_name)}.{_quote_ident(code_count_table)}
+                         WHERE plan_id IS NOT NULL
+                           AND plan_id <> ''
+                        """,
+                        snapshot_id=snapshot_id,
+                    )
+            else:
+                snapshot_filter = "" if serving_index.get("storage") == "manifest_snapshot" else "WHERE snapshot_id = :snapshot_id"
+                plan_filter = "WHERE" if not snapshot_filter else "AND"
+                rows = await db.all(
+                    f"""
+                    SELECT DISTINCT plan_id, '' AS plan_market_type
+                      FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+                     {snapshot_filter}
+                     {plan_filter} plan_id IS NOT NULL
+                       AND plan_id <> ''
+                    """,
+                    snapshot_id=snapshot_id,
+                )
     result: list[dict[str, Any]] = []
     for row in rows:
         data = row if isinstance(row, dict) else row._mapping
@@ -123,19 +133,6 @@ async def _publish_ptg2_source_pointers(
     updated_at: datetime.datetime,
     serving_index: dict[str, Any] | None,
 ) -> None:
-    await _push_ptg2_objects_from_facade(
-        [
-            {
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "previous_snapshot_id": previous_snapshot_id,
-                "import_month": import_month,
-                "updated_at": updated_at,
-            }
-        ],
-        PTG2CurrentSourceSnapshot,
-        rewrite=True,
-    )
     plan_rows = await _source_plan_rows(
         snapshot_id=snapshot_id,
         source_key=source_key,
@@ -144,5 +141,52 @@ async def _publish_ptg2_source_pointers(
         updated_at=updated_at,
         serving_index=serving_index,
     )
-    if plan_rows:
-        await _push_ptg2_objects_from_facade(plan_rows, PTG2CurrentPlanSource, rewrite=True)
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {_quote_ident(schema_name)}.ptg2_current_source_snapshot
+                    (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
+                VALUES (:source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at)
+                ON CONFLICT (source_key) DO UPDATE SET
+                    snapshot_id = EXCLUDED.snapshot_id,
+                    previous_snapshot_id = EXCLUDED.previous_snapshot_id,
+                    import_month = EXCLUDED.import_month,
+                    updated_at = EXCLUDED.updated_at
+                """
+            ),
+            {
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "previous_snapshot_id": previous_snapshot_id,
+                "import_month": import_month,
+                "updated_at": updated_at,
+            },
+        )
+        await session.execute(
+            db.text(
+                f"DELETE FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE source_key = :source_key"
+            ),
+            {"source_key": source_key},
+        )
+        for row in plan_rows:
+            await session.execute(
+                db.text(
+                    f"""
+                    INSERT INTO {_quote_ident(schema_name)}.ptg2_current_plan_source
+                        (plan_source_key, plan_id, plan_market_type, import_month, source_key, snapshot_id, previous_snapshot_id, updated_at)
+                    VALUES
+                        (:plan_source_key, :plan_id, :plan_market_type, :import_month, :source_key, :snapshot_id, :previous_snapshot_id, :updated_at)
+                    ON CONFLICT (plan_source_key) DO UPDATE SET
+                        plan_id = EXCLUDED.plan_id,
+                        plan_market_type = EXCLUDED.plan_market_type,
+                        import_month = EXCLUDED.import_month,
+                        source_key = EXCLUDED.source_key,
+                        snapshot_id = EXCLUDED.snapshot_id,
+                        previous_snapshot_id = EXCLUDED.previous_snapshot_id,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                row,
+            )

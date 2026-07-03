@@ -5094,6 +5094,125 @@ def test_ptg2_source_plan_rows_uses_manifest_table_without_snapshot_column(monke
     assert rows[0]["snapshot_id"] == "snap"
 
 
+def test_ptg2_source_plan_rows_uses_code_count_for_lean_manifest(monkeypatch):
+    calls = []
+
+    async def fake_all(statement, **_params):
+        calls.append(statement)
+        if "FROM \"mrf\".\"ptg2_code_count_exact\"" in statement:
+            assert "FROM \"mrf\".\"ptg2_manifest_serving_exact\"" not in statement
+            return [{"plan_id": "010854205", "plan_market_type": ""}]
+        return []
+
+    monkeypatch.setattr(ptg_source_pointers.db, "all", fake_all)
+    monkeypatch.setattr(ptg_source_pointers, "_table_exists", AsyncMock(return_value=True))
+    updated_at = process_ptg._utcnow()
+
+    rows = asyncio.run(
+        process_ptg._source_plan_rows(
+            snapshot_id="snap",
+            source_key="example_dental",
+            import_month=process_ptg.normalize_import_month("2026-04"),
+            previous_snapshot_id="prev",
+            updated_at=updated_at,
+            serving_index={
+                "storage": "manifest_snapshot",
+                "serving_table_layout": "lean_provider_key_v1",
+                "table": "mrf.ptg2_manifest_serving_exact",
+                "code_count_table": "mrf.ptg2_code_count_exact",
+            },
+        )
+    )
+
+    assert rows[0]["plan_id"] == "010854205"
+    assert rows[0]["snapshot_id"] == "snap"
+    assert len(calls) == 2
+
+
+def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionally(monkeypatch):
+    executed = []
+    updated_at = process_ptg._utcnow()
+    import_month = process_ptg.normalize_import_month("2026-04")
+
+    async def fake_source_plan_rows(**_kwargs):
+        return [
+            {
+                "plan_source_key": "plan-source-key",
+                "plan_id": "010854205",
+                "plan_market_type": "group",
+                "import_month": import_month,
+                "source_key": "example_dental",
+                "snapshot_id": "snap",
+                "previous_snapshot_id": "prev",
+                "updated_at": updated_at,
+            }
+        ]
+
+    class FakeSession:
+        async def execute(self, statement, params=None):
+            executed.append((str(statement), params or {}))
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+
+    asyncio.run(
+        process_ptg._publish_ptg2_source_pointers(
+            source_key="example_dental",
+            snapshot_id="snap",
+            previous_snapshot_id="prev",
+            import_month=import_month,
+            updated_at=updated_at,
+            serving_index={"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_exact"},
+        )
+    )
+
+    joined = "\n".join(statement for statement, _params in executed)
+    assert "INSERT INTO \"mrf\".ptg2_current_source_snapshot" in joined
+    assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
+    assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
+    assert len(executed) == 3
+
+
+def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
+    transaction_started = False
+
+    async def fake_source_plan_rows(**_kwargs):
+        raise RuntimeError("plan resolution failed")
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            nonlocal transaction_started
+            transaction_started = True
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+
+    with pytest.raises(RuntimeError, match="plan resolution failed"):
+        asyncio.run(
+            process_ptg._publish_ptg2_source_pointers(
+                source_key="example_dental",
+                snapshot_id="snap",
+                previous_snapshot_id="prev",
+                import_month=process_ptg.normalize_import_month("2026-04"),
+                updated_at=process_ptg._utcnow(),
+                serving_index={"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_exact"},
+            )
+        )
+
+    assert transaction_started is False
+
+
 def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():
     names = process_ptg._snapshot_manifest_table_names(
         {
