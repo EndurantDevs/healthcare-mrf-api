@@ -2835,9 +2835,10 @@ async def _search_ptg2_manifest_route_item_table(
         return None
 
     await _set_local_jit_off_for_manifest_location(session)
-    result = await session.execute(
-        text(
-            f"""
+    try:
+        result = await session.execute(
+            text(
+                f"""
             WITH location_zip_scope AS MATERIALIZED (
                 SELECT g.zip_code::text AS zip5
                   FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
@@ -2880,9 +2881,12 @@ async def _search_ptg2_manifest_route_item_table(
              ORDER BY {order_sql}
              LIMIT :limit OFFSET :offset
             """
-        ),
-        params,
-    )
+            ),
+            params,
+        )
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return None
     items: list[dict[str, Any]] = []
     for row in result:
         data = _row_mapping(row)

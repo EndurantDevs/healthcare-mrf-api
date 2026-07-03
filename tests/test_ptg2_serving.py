@@ -1774,6 +1774,49 @@ async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_fi
 
 
 @pytest.mark.asyncio
+async def test_manifest_route_item_table_fast_path_falls_back_when_artifact_query_fails():
+    columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
+    session = FakeSession(
+        [
+            FakeResult(scalar=True),
+            FakeResult(rows=[(column,) for column in columns]),
+            RuntimeError("stale cached artifact"),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        storage="manifest_snapshot",
+        id_storage="uuid",
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_route_item_table(
+        session,
+        "ptg2:202606:3f23541965bf",
+        {
+            "plan_id": "010854205",
+            "code": "90837",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "zip5": "60601",
+            "lat": 41.88526,
+            "long": -87.62194,
+            "radius_miles": 75.0,
+            "order_by": "total_allowed_amount",
+            "order": "asc",
+        },
+        _Pagination(limit=5, offset=0),
+        tables,
+        "product_search",
+        requested_plan="010854205",
+        requested_system="CPT",
+        requested_code="90837",
+    )
+
+    assert response is None
+    assert session.rollback_count == 1
+
+
+@pytest.mark.asyncio
 async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monkeypatch):
     class RealishFakeSession(FakeSession):
         sync_session = object()
