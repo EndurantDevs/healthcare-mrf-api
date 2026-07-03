@@ -30,9 +30,9 @@ def _db_connection():
 
 
 def _sql_text(statement: str):
-    from sqlalchemy import text
+    from sqlalchemy import text as sqlalchemy_text
 
-    return _sql_text(statement)
+    return sqlalchemy_text(statement)
 
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
