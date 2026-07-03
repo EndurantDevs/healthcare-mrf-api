@@ -35,6 +35,8 @@ class PTG2ServingTables:
     serving_table: str | None = None
     price_code_set_table: str | None = None
     price_atom_table: str | None = None
+    price_atom_table_layout: str | None = None
+    price_atom_dictionary_table: str | None = None
     price_set_entry_table: str | None = None
     procedure_table: str | None = None
     code_count_table: str | None = None
@@ -45,6 +47,10 @@ class PTG2ServingTables:
     provider_group_member_table: str | None = None
     provider_group_location_table: str | None = None
     provider_group_rate_scope_table: str | None = None
+    provider_set_dictionary_table: str | None = None
+    serving_table_layout: str | None = None
+    source_trace_set_hash: str | None = None
+    network_names: list[str] | None = None
     storage: str | None = None
     type: str | None = None
     snapshot_scoped: bool = False

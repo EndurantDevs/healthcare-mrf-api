@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+import zipfile
 from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
@@ -558,8 +559,6 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
 
 
 def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(tmp_path, monkeypatch):
-    import zipfile
-
     artifact_root = tmp_path / "artifacts"
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
 
@@ -866,7 +865,7 @@ def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
                 plan_month_id="month",
                 source_trace_set_hash="trace",
             ):
-                pass
+                captured["records_seen"] = captured.get("records_seen", 0) + 1
         finally:
             ptg_live_progress.reset_live_progress_context(token)
 
@@ -1178,6 +1177,31 @@ def test_filter_reporting_plans_matches_name_contains_case_insensitive():
     )
 
     assert result == plans
+
+
+def test_filter_reporting_plans_name_contains_ignores_issuer_and_reporting_entity():
+    plans = [
+        {
+            "plan_name": "Small Business PPO",
+            "plan_id": "59-1031071",
+            "issuer_name": "Cigna Health Life Insurance Company",
+            "reporting_entity_name": "Cigna",
+            "plan_market_type": "group",
+        },
+        {
+            "plan_name": "Cigna MVP Health Care, Inc",
+            "plan_id": "123",
+            "plan_market_type": "group",
+        },
+    ]
+
+    result = process_ptg._filter_reporting_plans(
+        plans,
+        plan_name_contains=["cigna"],
+        plan_market_types=["group"],
+    )
+
+    assert result == [plans[1]]
 
 
 def test_filter_reporting_plans_returns_original_without_filters():
@@ -2710,6 +2734,39 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
     assert not list(tmp_path.glob("*_logical.json"))
     with process_ptg.open_json_artifact_stream(raw_path) as fp:
         assert fp.read() == expected
+
+
+def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_requested(tmp_path, monkeypatch):
+    raw_path = tmp_path / "rates.zip"
+    expected = b'{"in_network":[]}'
+    with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
+        zip_ref.writestr("nested/rates.json", expected)
+    raw_sha256, byte_count = process_ptg.sha256_file(raw_path)
+
+    async def fake_download_raw_artifact(url, **_kwargs):
+        return process_ptg.PTG2RawArtifact(
+            original_url=url,
+            canonical_url=url,
+            raw_path=str(raw_path),
+            raw_storage_uri=f"file://{raw_path}",
+            raw_sha256=raw_sha256,
+            byte_count=byte_count,
+        )
+
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
+
+    _raw, logical = asyncio.run(
+        process_ptg.materialize_json_source(
+            "https://example.test/rates.zip",
+            tmp_path / "logical",
+            materialize_logical=False,
+        )
+    )
+
+    assert logical.compression == "zip"
+    assert logical.member_name == "nested/rates.json"
+    assert logical.logical_path != str(raw_path)
+    assert Path(logical.logical_path).read_bytes() == expected
 
 
 def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
@@ -4570,6 +4627,153 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "CREATE UNIQUE INDEX" in joined
 
 
+def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    component_mock = AsyncMock(side_effect=AssertionError("lean provider-key snapshots should use sidecars by default"))
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_components", component_mock)
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result["serving_table_layout"] == "lean_provider_key_v1"
+    assert result["provider_set_dictionary_table"].startswith("mrf.ptg2_provider_set_dict_")
+    assert result["provider_set_component_table"] is None
+    assert result["provider_group_location_table"] is None
+    assert result["provider_group_rate_scope_table"] is None
+    assert result["source_trace_set_hash"] == "trace-set-hash"
+    assert result["network_names"] == ["C2"]
+    assert "provider_set_key" in joined
+    assert "price_set_global_id_128" in joined
+    assert "lean_code_idx" in joined
+    assert "(reported_code_system, reported_code)" in joined
+    assert "INCLUDE (code_key, plan_id, rate_count)" in joined
+    assert "(code_key, provider_count DESC NULLS LAST)" not in joined
+    assert "(code_key)" in joined
+    assert "INCLUDE (provider_set_global_id_128)" in joined
+    assert "plan_code_provider_set_idx" not in joined
+    component_mock.assert_not_awaited()
+
+
+def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table in {
+            "ptg2_manifest_stage_serving_abc",
+            "ptg2_manifest_stage_price_atom_abc",
+        } or table.startswith("ptg2_price_atom_")
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result["serving_table_layout"] == "lean_provider_key_v1"
+    assert result["price_atom_table_layout"] == "lean_dict_v1"
+    assert result["price_atom_dictionary_table"].startswith("mrf.ptg2_price_atom_dict_")
+    assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_price_atom_dict_" in joined
+    assert "negotiated_type_key integer NOT NULL" in joined
+    assert "service_code_key integer NOT NULL" in joined
+    assert "billing_code_modifier_key integer NOT NULL" in joined
+    assert "RENAME TO \"ptg2_price_atom_" in joined
+    assert "CREATE UNIQUE INDEX" in joined
+
+
+def test_ptg2_manifest_snapshot_publish_lean_can_opt_in_provider_set_component_table(monkeypatch):
+    status_calls = []
+    component_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    async def fake_materialize_components(**kwargs):
+        component_calls.append(kwargs)
+        return kwargs["table_name"]
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_components", fake_materialize_components)
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    assert result["serving_table_layout"] == "lean_provider_key_v1"
+    assert result["provider_set_component_table"].startswith("mrf.ptg2_provider_set_component_")
+    assert len(component_calls) == 1
+    assert component_calls[0]["table_name"].startswith("ptg2_provider_set_component_")
+    assert "ANALYZE \"mrf\".\"ptg2_provider_set_component_" in "\n".join(status_calls)
+
+
 def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
     artifact_module = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
     status_calls = []
@@ -4604,8 +4808,8 @@ def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
         ptg_manifest_publish._materialize_manifest_components(
             schema_name="mrf",
             table_name="ptg2_provider_set_component_snap",
-            artifacts={"manifest_uri": f"file://{manifest_path}"},
-            sidecar_artifacts={"provider_inverted": sidecar_metadata_dict},
+            artifacts={"manifest_uri": f"file://{manifest_path}", "sidecars": [sidecar_metadata_dict]},
+            sidecar_artifacts=None,
         )
     )
 
@@ -4618,6 +4822,49 @@ def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
     assert "provider_set_global_id_128 uuid NOT NULL" in joined
     assert "(provider_set_global_id_128, provider_group_global_id_128)" in joined
     assert "(provider_group_global_id_128, provider_set_global_id_128)" in joined
+
+
+def test_manifest_publish_materializes_lean_provider_group_rate_scope(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table in {
+            "ptg2_serving_snap",
+            "ptg2_code_count_snap",
+            "ptg2_provider_set_dict_snap",
+            "ptg2_provider_set_component_snap",
+        }
+
+    async def fake_table_has_rows(_schema, table):
+        return table == "ptg2_provider_group_rate_scope_snap"
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", fake_table_has_rows)
+
+    materialized_table_name = asyncio.run(
+        ptg_manifest_publish._materialize_manifest_provider_group_rate_scope(
+            schema_name="mrf",
+            table_name="ptg2_provider_group_rate_scope_snap",
+            serving_table="ptg2_serving_snap",
+            code_count_table="ptg2_code_count_snap",
+            provider_set_component_table="ptg2_provider_set_component_snap",
+            provider_set_dictionary_table="ptg2_provider_set_dict_snap",
+            lean_provider_key_layout=True,
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert materialized_table_name == "ptg2_provider_group_rate_scope_snap"
+    assert "provider_group_global_id_128 uuid NOT NULL" in joined
+    assert "JOIN \"mrf\".\"ptg2_code_count_snap\" code_count" in joined
+    assert "JOIN \"mrf\".\"ptg2_provider_set_dict_snap\" provider_set_dictionary" in joined
+    assert "JOIN \"mrf\".\"ptg2_provider_set_component_snap\" component" in joined
+    assert "(plan_id, reported_code, reported_code_system, provider_group_global_id_128)" in joined
+    assert "(provider_group_global_id_128, plan_id, reported_code, reported_code_system)" in joined
 
 
 def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
@@ -4855,6 +5102,7 @@ def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsa
             "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123",
             "provider_group_member_table": "mrf.ptg2_provider_group_member_abc123",
             "provider_set_table": "mrf.ptg2_provider_set_abc123",
+            "provider_set_dictionary_table": "mrf.ptg2_provider_set_dict_abc123",
             "provider_set_entry_table": "mrf.ptg2_provider_set_abc123",
             "price_atom_table": "mrf.ptg2_price_atom_bad-name",
             "procedure_table": "mrf.not_a_snapshot_table",
@@ -4865,6 +5113,7 @@ def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsa
     assert names == [
         "ptg2_serving_rate_compact_abc123",
         "ptg2_provider_set_abc123",
+        "ptg2_provider_set_dict_abc123",
         "ptg2_provider_group_member_abc123",
         "ptg2_provider_group_location_abc123",
     ]

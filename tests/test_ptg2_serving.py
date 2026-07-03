@@ -442,6 +442,68 @@ async def test_manifest_filter_npis_by_inferred_taxonomy_requires_individual_npi
 
 
 @pytest.mark.asyncio
+async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_dictionary(monkeypatch):
+    price_set_id = "00000000000000000000000000000004"
+    price_atom_id = "00000000000000000000000000000005"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "price_atom_global_id_128": price_atom_id,
+                        "negotiated_type": "fee schedule",
+                        "negotiated_rate": "36.23",
+                        "expiration_date": "9999-12-31",
+                        "service_code": ["11"],
+                        "billing_class": "professional",
+                        "setting": None,
+                        "billing_code_modifier": [],
+                        "additional_information": None,
+                    }
+                ]
+            )
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        price_atom_table="mrf.ptg2_price_atom_manifest_snap",
+        price_atom_table_layout="lean_dict_v1",
+        price_atom_dictionary_table="mrf.ptg2_price_atom_dict_manifest_snap",
+        id_storage="uuid",
+    )
+
+    def fake_sidecar_members_many(_serving_tables, sidecar_name, owner_ids):
+        assert sidecar_name == "price_forward"
+        assert owner_ids == (price_set_id,)
+        return {price_set_id: (price_atom_id,)}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_members_many)
+
+    prices_by_set = await ptg2_serving._ptg2_manifest_prices_for_price_sets(session, tables, [price_set_id])
+
+    sql = str(session.calls[0][0][0])
+    assert prices_by_set == {
+        price_set_id: [
+            {
+                "negotiated_type": "fee schedule",
+                "negotiated_rate": "36.23",
+                "expiration_date": "9999-12-31",
+                "service_code": ["11"],
+                "billing_class": "professional",
+                "setting": None,
+                "billing_code_modifier": [],
+                "additional_information": None,
+            }
+        ]
+    }
+    assert "FROM mrf.ptg2_price_atom_manifest_snap price_atom" in sql
+    assert "LEFT JOIN mrf.ptg2_price_atom_dict_manifest_snap negotiated_type" in sql
+    assert "LEFT JOIN mrf.ptg2_price_atom_dict_manifest_snap service_code" in sql
+    assert "LEFT JOIN mrf.ptg2_price_atom_dict_manifest_snap billing_code_modifier" in sql
+    assert "price_atom.negotiated_type_key" in sql
+    assert "price_atom_global_id_128 = ANY(CAST(:atom_ids AS uuid[]))" in sql
+
+
+@pytest.mark.asyncio
 async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
     provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
     price_sets = [f"{idx:032x}" for idx in range(101, 106)]
@@ -2784,6 +2846,102 @@ async def test_manifest_location_uses_provider_group_rate_scope_table_when_decla
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" not in location_sql
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_uses_rate_scope_table_without_provider_group_locations(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
+    component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=True),
+            FakeResult(scalar=True),
+            False,
+            FakeResult(rows=[location_by_field]),
+            FakeResult(rows=[component_by_field]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        provider_set_component_table="mrf.ptg2_provider_set_component_snap",
+        provider_group_rate_scope_table="mrf.ptg2_provider_group_rate_scope_snap",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(side_effect=AssertionError("rate-scope table should replace sidecar rate scope")),
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    location_sql = _fake_call_sql(session, "raw_location_npis AS")
+    assert "rate_provider_groups AS MATERIALIZED" in location_sql
+    assert "FROM mrf.ptg2_provider_group_rate_scope_snap rate_scope" in location_sql
+    assert "FROM mrf.ptg2_serving_manifest_snap rate_scope" not in location_sql
+    assert "JOIN mrf.ptg2_provider_set_component_snap psc" not in location_sql
+    assert "FROM mrf.ptg2_provider_group_location_snap loc" not in location_sql
+    assert "JOIN rate_provider_groups rpg_scope" in location_sql
+    assert "FROM mrf.entity_address_unified addr" in location_sql
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+
+
+@pytest.mark.asyncio
+async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_layout(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    group_id = "00000000000000000000000000000011"
+    session = FakeSession(
+        [
+            FakeResult(rows=[{"provider_set_global_id_128": provider_set_id}]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        code_count_table="mrf.ptg2_code_count_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_snap",
+        serving_table_layout="lean_provider_key_v1",
+        artifacts={"provider_forward": {"path": "provider-forward.bin"}},
+        id_storage="uuid",
+    )
+
+    def fake_sidecar_many(_serving_tables, sidecar_name, owner_ids):
+        assert sidecar_name == "provider_forward"
+        assert owner_ids == (provider_set_id,)
+        return {provider_set_id: (group_id,)}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_many)
+
+    result = await ptg2_serving._manifest_rate_provider_groups_from_sidecar(
+        session,
+        tables,
+        serving_table=tables.serving_table,
+        plan_id="010854205",
+        reported_code="90837",
+        code_system="CPT",
+    )
+
+    sql = str(session.calls[0][0][0])
+    assert result == (group_id,)
+    assert "JOIN mrf.ptg2_code_count_snap code_count" in sql
+    assert "JOIN mrf.ptg2_provider_set_dict_snap provider_set_dictionary" in sql
+    assert "code_count.code_key = serving.code_key" in sql
+    assert "provider_set_dictionary.provider_set_key = serving.provider_set_key" in sql
+    assert "code_count.plan_id = :plan_id" in sql
+    assert "code_count.reported_code = :reported_code" in sql
 
 
 @pytest.mark.asyncio

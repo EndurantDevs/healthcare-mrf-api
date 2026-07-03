@@ -190,6 +190,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         or manifest.get("artifact_uri")
         or manifest.get("storage_uri")
     )
+    network_names = serving_index.get("network_names")
     return _cache(PTG2ServingTables(
         storage=str(serving_index.get("storage") or "").strip() or None,
         type=str(serving_index.get("type") or "").strip() or None,
@@ -198,9 +199,14 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         artifact_uri=str(artifact_uri or "").strip() or None,
         artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
         id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
+        serving_table_layout=str(serving_index.get("serving_table_layout") or "").strip() or None,
+        source_trace_set_hash=str(serving_index.get("source_trace_set_hash") or "").strip() or None,
+        network_names=[str(value) for value in network_names] if isinstance(network_names, list) else None,
         serving_table=_safe_table_name(serving_index.get("table")),
         price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
+        price_atom_table_layout=str(serving_index.get("price_atom_table_layout") or "").strip() or None,
+        price_atom_dictionary_table=_safe_table_name(serving_index.get("price_atom_dictionary_table")),
         price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
         procedure_table=_safe_table_name(serving_index.get("procedure_table")),
         code_count_table=_safe_table_name(serving_index.get("code_count_table")),
@@ -211,4 +217,5 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
         provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
         provider_group_rate_scope_table=_safe_table_name(serving_index.get("provider_group_rate_scope_table")),
+        provider_set_dictionary_table=_safe_table_name(serving_index.get("provider_set_dictionary_table")),
     ))

@@ -1769,6 +1769,10 @@ def _ptg2_manifest_storage_enabled(serving_tables: PTG2ServingTables) -> bool:
     return (serving_tables.storage or "").strip().lower() == "manifest_snapshot"
 
 
+def _ptg2_manifest_uses_lean_provider_key_layout(serving_tables: PTG2ServingTables) -> bool:
+    return (serving_tables.serving_table_layout or "").strip().lower() == "lean_provider_key_v1"
+
+
 def _shape_ptg2_manifest_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     manifest_payload = dict(payload)
     manifest_payload["query"] = {
@@ -2157,7 +2161,7 @@ async def _manifest_rate_provider_groups_from_sidecar(
     serving_table: str | None,
     plan_id: str,
     reported_code: str,
-    code_system: str,
+    code_system: str | None,
 ) -> tuple[str, ...]:
     table_name = _safe_table_name(serving_table)
     if (
@@ -2167,21 +2171,44 @@ async def _manifest_rate_provider_groups_from_sidecar(
         or not _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
     ):
         return ()
-    rate_scope_filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
     query_params_by_name: dict[str, Any] = {"plan_id": plan_id, "reported_code": reported_code}
-    if code_system:
-        rate_scope_filters.append("reported_code_system = :reported_code_system")
-        query_params_by_name["reported_code_system"] = code_system
-    try:
-        provider_set_result = await session.execute(
-            text(
-                f"""
+    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
+    if lean_provider_key_layout:
+        code_count_table = _safe_table_name(serving_tables.code_count_table)
+        provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
+        if not code_count_table or not provider_set_dictionary_table:
+            return ()
+        rate_scope_filters = [
+            "code_count.plan_id = :plan_id",
+            "code_count.reported_code = :reported_code",
+        ]
+        if code_system:
+            rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
+            query_params_by_name["reported_code_system"] = code_system
+        provider_set_sql = f"""
+                SELECT DISTINCT provider_set_dictionary.provider_set_global_id_128
+                FROM {table_name} serving
+                JOIN {code_count_table} code_count
+                  ON code_count.code_key = serving.code_key
+                JOIN {provider_set_dictionary_table} provider_set_dictionary
+                  ON provider_set_dictionary.provider_set_key = serving.provider_set_key
+                WHERE {" AND ".join(rate_scope_filters)}
+                ORDER BY provider_set_dictionary.provider_set_global_id_128
+                """
+    else:
+        rate_scope_filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
+        if code_system:
+            rate_scope_filters.append("reported_code_system = :reported_code_system")
+            query_params_by_name["reported_code_system"] = code_system
+        provider_set_sql = f"""
                 SELECT DISTINCT provider_set_global_id_128
                 FROM {table_name}
                 WHERE {" AND ".join(rate_scope_filters)}
                 ORDER BY provider_set_global_id_128
                 """
-            ),
+    try:
+        provider_set_result = await session.execute(
+            text(provider_set_sql),
             query_params_by_name,
         )
     except Exception:
@@ -2301,6 +2328,59 @@ def _ptg2_manifest_filter_prices(prices: list[dict[str, Any]], args: dict[str, A
     return [price for price in prices if _ptg2_manifest_price_matches_filter(price, args)]
 
 
+def _ptg2_manifest_price_atom_select_sql(serving_tables: PTG2ServingTables, price_atom_table: str) -> str:
+    price_atom_layout = (serving_tables.price_atom_table_layout or "").strip().lower()
+    price_atom_dictionary_table = _safe_table_name(serving_tables.price_atom_dictionary_table)
+    if price_atom_layout == "lean_dict_v1" and price_atom_dictionary_table:
+        return f"""
+            SELECT
+                price_atom.price_atom_global_id_128,
+                negotiated_type.text_value AS negotiated_type,
+                price_atom.negotiated_rate,
+                expiration_date.text_value AS expiration_date,
+                COALESCE(service_code.text_array, ARRAY[]::text[]) AS service_code,
+                billing_class.text_value AS billing_class,
+                setting.text_value AS setting,
+                COALESCE(billing_code_modifier.text_array, ARRAY[]::text[]) AS billing_code_modifier,
+                additional_information.text_value AS additional_information
+            FROM {price_atom_table} price_atom
+            LEFT JOIN {price_atom_dictionary_table} negotiated_type
+              ON negotiated_type.attr_kind = 'negotiated_type'
+             AND negotiated_type.attr_key = price_atom.negotiated_type_key
+            LEFT JOIN {price_atom_dictionary_table} expiration_date
+              ON expiration_date.attr_kind = 'expiration_date'
+             AND expiration_date.attr_key = price_atom.expiration_date_key
+            LEFT JOIN {price_atom_dictionary_table} service_code
+              ON service_code.attr_kind = 'service_code'
+             AND service_code.attr_key = price_atom.service_code_key
+            LEFT JOIN {price_atom_dictionary_table} billing_class
+              ON billing_class.attr_kind = 'billing_class'
+             AND billing_class.attr_key = price_atom.billing_class_key
+            LEFT JOIN {price_atom_dictionary_table} setting
+              ON setting.attr_kind = 'setting'
+             AND setting.attr_key = price_atom.setting_key
+            LEFT JOIN {price_atom_dictionary_table} billing_code_modifier
+              ON billing_code_modifier.attr_kind = 'billing_code_modifier'
+             AND billing_code_modifier.attr_key = price_atom.billing_code_modifier_key
+            LEFT JOIN {price_atom_dictionary_table} additional_information
+              ON additional_information.attr_kind = 'additional_information'
+             AND additional_information.attr_key = price_atom.additional_information_key
+        """
+    return f"""
+            SELECT
+                price_atom_global_id_128,
+                negotiated_type,
+                negotiated_rate,
+                expiration_date,
+                service_code,
+                billing_class,
+                setting,
+                billing_code_modifier,
+                additional_information
+            FROM {price_atom_table}
+    """
+
+
 async def _ptg2_manifest_prices_for_price_set(
     session,
     serving_tables: PTG2ServingTables,
@@ -2315,19 +2395,10 @@ async def _ptg2_manifest_prices_for_price_set(
         return []
     atom_ids = list(price_members)
     atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
+    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
     stmt = text(
         f"""
-            SELECT
-                price_atom_global_id_128,
-                negotiated_type,
-                negotiated_rate,
-                expiration_date,
-                service_code,
-                billing_class,
-                setting,
-                billing_code_modifier,
-                additional_information
-            FROM {price_atom_table}
+            {price_atom_select_sql}
             WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
             """
     )
@@ -2367,19 +2438,10 @@ async def _ptg2_manifest_prices_for_price_sets(
     if not atom_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
     atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
+    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
     stmt = text(
         f"""
-            SELECT
-                price_atom_global_id_128,
-                negotiated_type,
-                negotiated_rate,
-                expiration_date,
-                service_code,
-                billing_class,
-                setting,
-                billing_code_modifier,
-                additional_information
-            FROM {price_atom_table}
+            {price_atom_select_sql}
             WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
             """
     )
@@ -3441,6 +3503,7 @@ async def _ptg2_manifest_location_provider_matches(
         if requested_system
         else str(args.get("code") or args.get("reported_code") or "").strip()
     )
+    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
     if (
         component_table
         and serving_table
@@ -3468,7 +3531,15 @@ async def _ptg2_manifest_location_provider_matches(
             )
             if has_route_scope:
                 active_provider_group_rate_scope_table = provider_group_rate_scope_table
-        member_scope_cte = f"""
+        if active_provider_group_rate_scope_table:
+            member_scope_cte = f"""
+            rate_provider_groups AS MATERIALIZED (
+                SELECT DISTINCT rate_scope.provider_group_global_id_128
+                FROM {active_provider_group_rate_scope_table} rate_scope
+                WHERE {" AND ".join(rate_scope_filters)}
+            ),"""
+        elif not lean_provider_key_layout:
+            member_scope_cte = f"""
             rate_provider_groups AS MATERIALIZED (
                 SELECT DISTINCT psc.provider_group_global_id_128
                 FROM {serving_table} rate_scope
@@ -3476,13 +3547,16 @@ async def _ptg2_manifest_location_provider_matches(
                   ON psc.provider_set_global_id_128 = rate_scope.provider_set_global_id_128
                 WHERE {" AND ".join(rate_scope_filters)}
             ),"""
-        member_scope_join = """
+        else:
+            has_component_rate_scope = False
+        if has_component_rate_scope:
+            member_scope_join = """
                 JOIN rate_provider_groups rpg_scope
                   ON rpg_scope.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
-        final_member_scope_join = """
+            final_member_scope_join = """
             JOIN rate_provider_groups rpg
               ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
-    elif serving_table and requested_plan_id and requested_code:
+    if not has_component_rate_scope and serving_table and requested_plan_id and requested_code:
         rate_provider_group_ids = await _manifest_rate_provider_groups_from_sidecar(
             session,
             serving_tables,
@@ -4310,6 +4384,7 @@ async def _search_ptg2_manifest_db_serving_table(
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
         return None
 
+    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
     rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
         args,
         pagination,
@@ -4390,12 +4465,151 @@ async def _search_ptg2_manifest_db_serving_table(
                 },
                 args,
             )
-        filters.append(f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))")
-        params["provider_set_ids"] = sorted(provider_set_ids)
+        if not lean_provider_key_layout:
+            filters.append(
+                f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
+            )
+            params["provider_set_ids"] = sorted(provider_set_ids)
     where_sql = " AND ".join(filters)
     total: int | None = None
     code_count_table = _safe_table_name(serving_tables.code_count_table)
-    if code_count_table and requested_system and not location_filter_requested:
+    if lean_provider_key_layout:
+        provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
+        if not code_count_table or not provider_set_dictionary_table:
+            return None
+        code_result = await session.execute(
+            text(
+                f"""
+                SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
+                FROM {code_count_table}
+                WHERE plan_id = :plan_id
+                  AND reported_code = :reported_code
+                  AND reported_code_system IS NOT DISTINCT FROM :reported_code_system
+                LIMIT 1
+                """
+            ),
+            {
+                "plan_id": requested_plan,
+                "reported_code": requested_code,
+                "reported_code_system": requested_system or None,
+            },
+        )
+        code_rows = [_row_mapping(row) for row in code_result]
+        if not code_rows:
+            return None
+        code_data = code_rows[0]
+        params["code_key"] = code_data.get("code_key")
+        if not location_filter_requested:
+            total = int(code_data.get("rate_count") or 0)
+            if total <= 0:
+                return None
+        lean_filters = ["serving.code_key = :code_key"]
+        if location_filter_requested:
+            provider_key_result = await session.execute(
+                text(
+                    f"""
+                    SELECT provider_set_key
+                    FROM {provider_set_dictionary_table}
+                    WHERE provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))
+                    """
+                ),
+                {"provider_set_ids": sorted(provider_set_ids)},
+            )
+            provider_set_keys = [
+                int(data.get("provider_set_key"))
+                for data in (_row_mapping(row) for row in provider_key_result)
+                if data.get("provider_set_key") is not None
+            ]
+            if not provider_set_keys:
+                return _shape_ptg2_manifest_response(
+                    {
+                        "items": [],
+                        "pagination": {
+                            "total": 0,
+                            "limit": pagination.limit,
+                            "offset": pagination.offset,
+                            "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                        },
+                        "query": {
+                            "plan_id": args.get("plan_id"),
+                            "plan_external_id": args.get("plan_external_id"),
+                            "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
+                            "source_key": args.get("source_key") or None,
+                            "snapshot_id": snapshot_id,
+                            "mode": mode_value,
+                            "code": args.get("code") or None,
+                            "code_system": args.get("code_system") or None,
+                            "state": args.get("state") or None,
+                            "city": args.get("city") or None,
+                            "zip5": args.get("zip5") or None,
+                            "lat": args.get("lat") or None,
+                            "long": args.get("long") or None,
+                            "radius_miles": args.get("radius_miles") or None,
+                            "npi": args.get("npi") or None,
+                            "source": "ptg2_db",
+                            "serving_table": table_name,
+                            "include_providers": expand_providers,
+                            "procedure_consolidation": "REPORTED_CODE",
+                            "status": "no_match",
+                        },
+                    },
+                    args,
+                )
+            params["provider_set_keys"] = provider_set_keys
+            lean_filters.append("serving.provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))")
+        source_trace_set_hash = serving_tables.source_trace_set_hash or None
+        network_names = serving_tables.network_names or []
+        serving_hash_sql = (
+            "md5(serving_page.code_key::text || ':' || serving_page.provider_set_key::text "
+            "|| ':' || serving_page.price_set_global_id_128::text)"
+        )
+        if serving_tables.uses_uuid_ids:
+            serving_hash_sql = f"{serving_hash_sql}::uuid"
+        manifest_id_sql_type = "uuid" if serving_tables.uses_uuid_ids else "char(32)"
+        row_result = await session.execute(
+            text(
+                f"""
+                WITH serving_page AS MATERIALIZED (
+                    SELECT
+                        serving.code_key,
+                        serving.provider_set_key,
+                        serving.provider_count,
+                        serving.price_set_global_id_128
+                    FROM {table_name} serving
+                    WHERE {" AND ".join(lean_filters)}
+                    ORDER BY serving.provider_count DESC NULLS LAST
+                    LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
+                )
+                SELECT
+                    {serving_hash_sql} AS serving_content_hash_128,
+                    :lean_plan_id AS plan_id,
+                    :lean_reported_code_system AS reported_code_system,
+                    :lean_reported_code AS reported_code,
+                    NULL::{manifest_id_sql_type} AS procedure_global_id_128,
+                    (
+                        SELECT provider_sets.provider_set_global_id_128
+                        FROM {provider_set_dictionary_table} provider_sets
+                        WHERE provider_sets.provider_set_key = serving_page.provider_set_key
+                    ) AS provider_set_global_id_128,
+                    serving_page.provider_count,
+                    serving_page.price_set_global_id_128,
+                    :lean_source_trace_set_hash AS source_trace_set_hash,
+                    CAST(:lean_network_names AS varchar[]) AS network_names
+                FROM serving_page
+                ORDER BY serving_page.provider_count DESC NULLS LAST
+                """
+            ),
+            {
+                **params,
+                "lean_plan_id": code_data.get("plan_id"),
+                "lean_reported_code_system": code_data.get("reported_code_system"),
+                "lean_reported_code": code_data.get("reported_code"),
+                "lean_source_trace_set_hash": source_trace_set_hash,
+                "lean_network_names": network_names,
+            },
+        )
+        row_data = [_row_mapping(row) for row in row_result]
+    elif code_count_table and requested_system and not location_filter_requested:
         count_result = await session.execute(
             text(
                 f"""
@@ -4421,35 +4635,36 @@ async def _search_ptg2_manifest_db_serving_table(
         if total <= 0:
             return None
 
-    network_names_select_sql = (
-        "network_names"
-        if await _ptg2_table_has_columns(session, table_name, {"network_names"})
-        else "NULL::varchar[] AS network_names"
-    )
-    row_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                serving_content_hash_128,
-                plan_id,
-                reported_code_system,
-                reported_code,
-                procedure_global_id_128,
-                provider_set_global_id_128,
-                provider_count,
-                price_set_global_id_128,
-                source_trace_set_hash,
-                {network_names_select_sql}
-            FROM {table_name}
-            WHERE {where_sql}
-            ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
-            LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
-            """
-        ),
-        params,
-    )
+    if not lean_provider_key_layout:
+        network_names_select_sql = (
+            "network_names"
+            if await _ptg2_table_has_columns(session, table_name, {"network_names"})
+            else "NULL::varchar[] AS network_names"
+        )
+        row_result = await session.execute(
+            text(
+                f"""
+                SELECT
+                    serving_content_hash_128,
+                    plan_id,
+                    reported_code_system,
+                    reported_code,
+                    procedure_global_id_128,
+                    provider_set_global_id_128,
+                    provider_count,
+                    price_set_global_id_128,
+                    source_trace_set_hash,
+                    {network_names_select_sql}
+                FROM {table_name}
+                WHERE {where_sql}
+                ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
+                LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
+                """
+            ),
+            params,
+        )
+        row_data = [_row_mapping(row) for row in row_result]
     items: list[dict[str, Any]] = []
-    row_data = [_row_mapping(row) for row in row_result]
     if not row_data:
         return None
     source_traces_by_set = (

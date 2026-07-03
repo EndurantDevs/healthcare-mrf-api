@@ -388,6 +388,78 @@ async def test_ptg2_manifest_db_snapshot_serves_exact_plan_code_lookup():
 
 
 @pytest.mark.asyncio
+async def test_ptg2_manifest_db_snapshot_serves_lean_provider_key_layout():
+    provider_set_id = "00000000000000000000000000000003"
+    price_set_id = "00000000000000000000000000000004"
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
+        code_count_table="mrf.ptg2_code_count_snap_manifest",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_snap_manifest",
+        serving_table_layout="lean_provider_key_v1",
+        source_trace_set_hash="trace-set-hash",
+        network_names=["C2"],
+        id_storage="uuid",
+    )
+    session = FakeSession(
+        [
+            True,
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 123,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "serving_content_hash_128": UUID("00000000000000000000000000000009"),
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "procedure_global_id_128": None,
+                        "provider_set_global_id_128": UUID(provider_set_id),
+                        "provider_count": 42,
+                        "price_set_global_id_128": UUID(price_set_id),
+                        "source_trace_set_hash": "trace-set-hash",
+                        "network_names": ["C2"],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    payload = await ptg2_serving.search_ptg2_serving_table(
+        session,
+        "snap-manifest",
+        {
+            "plan_id": "010854205",
+            "code": "70551",
+            "code_system": "CPT",
+            "include_providers": "false",
+        },
+        FakePagination(),
+        serving_tables=tables,
+    )
+
+    assert payload["pagination"]["total"] == 123
+    item = payload["items"][0]
+    assert item["reported_code"] == "70551"
+    assert item["provider_count"] == 42
+    row_sql = str(session.calls[2][0][0])
+    row_params = session.calls[2][0][1]
+    assert "serving.code_key = :code_key" in row_sql
+    assert "provider_sets.provider_set_global_id_128" in row_sql
+    assert "serving.price_set_global_id_128" in row_sql
+    assert row_params["lean_network_names"] == ["C2"]
+
+
+@pytest.mark.asyncio
 async def test_ptg2_manifest_db_snapshot_defers_provider_expansion():
     tables = ptg2_serving.PTG2ServingTables(
         storage="manifest_snapshot",
