@@ -1349,6 +1349,69 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_manifest_db_serving_skips_source_trace_for_compact_response(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    price_set_id = "00000000000000000000000000000101"
+    row = {
+        "serving_content_hash_128": "00000000000000000000000000000201",
+        "plan_id": "010854205",
+        "reported_code_system": "CPT",
+        "reported_code": "29888",
+        "procedure_global_id_128": "00000000000000000000000000000301",
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": 2,
+        "price_set_global_id_128": price_set_id,
+        "source_trace_set_hash": "trace-set-1",
+        "network_names": ["C2"],
+    }
+    session = FakeSession([1, FakeResult(rows=[row])])
+    tables = ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_manifest_token")
+
+    async def fake_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_manifest_token"
+        return True
+
+    async def fake_has_columns(_session, _table_name, required_columns):
+        assert required_columns == {"network_names"}
+        return True
+
+    async def fake_prices(_session, _tables, price_set_ids):
+        assert price_set_ids == [price_set_id]
+        return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1138.57}]}
+
+    async def fake_procedure_details(_session, row_data):
+        assert row_data[0]["source_trace_set_hash"] == "trace-set-1"
+        return {("CPT", "29888"): {"procedure_name": "ACL reconstruction"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_table_has_columns", fake_has_columns)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_source_traces_for_trace_sets",
+        AsyncMock(side_effect=AssertionError("compact responses should not hydrate source traces")),
+    )
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202606:test",
+        {
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "29888",
+            "code_system": "CPT",
+        },
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert "source_trace" not in payload["items"][0]
+    assert not any("ptg2_source_trace_set" in str(call[0][0]) for call in session.calls if call[0])
+
+
+@pytest.mark.asyncio
 async def test_search_current_ptg2_index_can_include_full_details():
     session = _db_serving_session()
 

@@ -4106,9 +4106,13 @@ async def _search_ptg2_manifest_db_serving_table(
     row_data = [_row_mapping(row) for row in row_result]
     if not row_data:
         return None
-    source_traces_by_set = await _ptg2_source_traces_for_trace_sets(
-        session,
-        [data.get("source_trace_set_hash") for data in row_data],
+    source_traces_by_set = (
+        await _ptg2_source_traces_for_trace_sets(
+            session,
+            [data.get("source_trace_set_hash") for data in row_data],
+        )
+        if _include_ptg2_sources(args)
+        else {}
     )
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
