@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 def _bootstrap_import_path() -> None:
@@ -61,6 +62,72 @@ def _is_truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dedupe_preserve(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def _without_query(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _uhc_toc_url_candidates(url: str) -> list[str]:
+    """Return equivalent UHC TOC URLs when a stored signed/blob URL goes stale."""
+    value = str(url or "").strip()
+    if not value:
+        return []
+    parts = urlsplit(value)
+    host = parts.netloc.lower()
+    path = parts.path
+    candidates = [value]
+    queryless = _without_query(value)
+    if queryless != value:
+        candidates.append(queryless)
+    if host == "mrfstore.uhc.com" and path.startswith("/public-mrf/"):
+        blob_path = path.removeprefix("/public-mrf/")
+        candidates.append(f"https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/{blob_path}")
+    if host in {"transparency-in-coverage.uhc.com", "transparency-in-coverage.optum.com"}:
+        prefix = "/api/v1/uhc/blobs/download/"
+        if path.startswith(prefix):
+            blob_path = path.removeprefix(prefix)
+            candidates.append(f"https://mrfstore.uhc.com/public-mrf/{blob_path}")
+            candidates.append(f"https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/{blob_path}")
+    return _dedupe_preserve(candidates)
+
+
+async def _toc_head_ok(url: str) -> bool:
+    from process.ptg_parts.source_download import fetch_head_metadata
+
+    await fetch_head_metadata(url)
+    return True
+
+
+async def _resolve_toc_url(url: str, *, refresh_toc_urls: bool) -> str:
+    if not refresh_toc_urls:
+        return url
+    candidates = _uhc_toc_url_candidates(url)
+    if len(candidates) <= 1:
+        return url
+    for candidate in candidates:
+        try:
+            if await _toc_head_ok(candidate):
+                return candidate
+        except Exception:
+            continue
+    return url
+
+
+async def _resolve_toc_urls(urls: list[str], *, refresh_toc_urls: bool) -> list[str]:
+    return [await _resolve_toc_url(url, refresh_toc_urls=refresh_toc_urls) for url in urls]
 
 
 async def _load_snapshot_options(snapshot_id: str) -> dict[str, Any]:
@@ -118,6 +185,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Keep partial artifacts for post-run debugging.",
     )
+    parser.add_argument(
+        "--refresh-toc-urls",
+        dest="refresh_toc_urls",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Probe UHC TOC URL equivalents and use the first reachable URL.",
+    )
     return parser
 
 
@@ -132,9 +206,11 @@ async def _execute_rebuild(cli_args: argparse.Namespace) -> dict[str, Any]:
     if not import_id:
         stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         import_id = f"space_rebuild_{source_key[-10:]}_{stamp}"
+    toc_urls = _as_list(options.get("toc_urls"))
+    resolved_toc_urls = await _resolve_toc_urls(toc_urls, refresh_toc_urls=bool(cli_args.refresh_toc_urls))
     ptg_run_result = await run_ptg(
         test_mode=_is_truthy(options.get("test_mode")),
-        toc_urls=_as_list(options.get("toc_urls")),
+        toc_urls=resolved_toc_urls,
         toc_list=str(options.get("toc_list") or "").strip() or None,
         in_network_url=str(options.get("in_network_url") or "").strip() or None,
         allowed_url=str(options.get("allowed_url") or "").strip() or None,
@@ -163,6 +239,8 @@ async def _execute_rebuild(cli_args: argparse.Namespace) -> dict[str, Any]:
         "files_processed": ptg_run_result.get("files_processed"),
         "files_failed": ptg_run_result.get("files_failed"),
         "serving_rates": ptg_run_result.get("serving_rates"),
+        "toc_urls_original": toc_urls,
+        "toc_urls_used": resolved_toc_urls,
     }
 
 

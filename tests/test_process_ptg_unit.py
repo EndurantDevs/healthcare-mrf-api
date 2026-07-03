@@ -2893,17 +2893,46 @@ def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
     async def fake_status(statement):
         statements.append(statement)
 
+    async def fake_scalar(_statement, **_params):
+        return True
+
     model = SimpleNamespace(
         __tablename__="example_ptg_table",
         __my_index_elements__=["id"],
         __my_additional_indexes__=[],
         __table__=SimpleNamespace(primary_key=[SimpleNamespace(name="id")]),
     )
+    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
 
     asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
 
     assert not any("example_ptg_table_idx_primary" in statement for statement in statements)
+
+
+def test_ptg2_ensure_indexes_skips_missing_optional_table(monkeypatch):
+    statements = []
+
+    async def fake_scalar(_statement, **_params):
+        return False
+
+    async def fake_status(statement):
+        statements.append(statement)
+
+    model = SimpleNamespace(
+        __tablename__="missing_ptg_table",
+        __my_index_elements__=[],
+        __my_additional_indexes__=[
+            {"name": "missing_ptg_table_idx", "index_elements": ("payment_hash",)},
+        ],
+        __table__=SimpleNamespace(primary_key=[]),
+    )
+    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+
+    asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
+
+    assert statements == []
 
 
 def test_ptg2_in_network_download_failure_returns_failed_result(monkeypatch, tmp_path):

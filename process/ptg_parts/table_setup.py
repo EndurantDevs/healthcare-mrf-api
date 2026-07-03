@@ -94,7 +94,24 @@ PTG2_MODEL_CLASSES = (
 )
 
 
+async def _table_exists(obj, db_schema: str) -> bool:
+    relation_name = f"{db_schema}.{obj.__tablename__}"
+    try:
+        return bool(
+            await db.scalar(
+                "SELECT to_regclass(:relation_name) IS NOT NULL",
+                relation_name=relation_name,
+            )
+        )
+    except Exception as exc:
+        logger.debug("Could not check whether PTG table %s exists before index ensure: %s", relation_name, exc)
+        return True
+
+
 async def _ensure_indexes(obj, db_schema: str) -> None:
+    if not await _table_exists(obj, db_schema):
+        logger.warning("Skipping PTG index ensure for missing table %s.%s", db_schema, obj.__tablename__)
+        return
     if _env_bool(
         PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
         _env_bool(PTG2_COMPACT_BULK_DROP_INDEXES_ENV, False),

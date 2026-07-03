@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib.util
+import asyncio
 from pathlib import Path
 
 
@@ -31,3 +32,42 @@ def test_ptg_devops_scripts_import_without_database_connection():
         "ptg2_remove_source_snapshot",
     ):
         assert _load_script(module_name).__name__ == module_name
+
+
+def test_ptg_rebuild_expands_uhc_toc_url_candidates():
+    module = _load_script("ptg2_rebuild_snapshot_from_options")
+
+    candidates = module._uhc_toc_url_candidates(
+        "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json?sig=stale"
+    )
+
+    assert candidates == [
+        "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json?sig=stale",
+        "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json",
+        "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/2026-07-01/example_index.json",
+    ]
+
+
+def test_ptg_rebuild_uses_first_reachable_uhc_toc_candidate(monkeypatch):
+    module = _load_script("ptg2_rebuild_snapshot_from_options")
+    checked = []
+
+    async def fake_head_ok(url):
+        checked.append(url)
+        return "blobs/download" in url
+
+    monkeypatch.setattr(module, "_toc_head_ok", fake_head_ok)
+
+    resolved = asyncio.run(
+        module._resolve_toc_url(
+            "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json?sig=stale",
+            refresh_toc_urls=True,
+        )
+    )
+
+    assert resolved == "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/2026-07-01/example_index.json"
+    assert checked == [
+        "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json?sig=stale",
+        "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json",
+        "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/2026-07-01/example_index.json",
+    ]
