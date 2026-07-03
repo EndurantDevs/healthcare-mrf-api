@@ -480,7 +480,7 @@ def _manifest_location_zip_scope_sql(query_context: _ManifestProviderLocationQue
         return ""
     return f"""
             location_zip_scope AS MATERIALIZED (
-                SELECT g.zip_code::text AS zip5
+                SELECT ARRAY_AGG(g.zip_code::text ORDER BY g.zip_code::text) AS zip5_values
                   FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
                   JOIN {PTG2_SCHEMA}.geo_zip_lookup g
                     ON g.latitude IS NOT NULL
@@ -504,16 +504,12 @@ def _manifest_location_from_sql(query_context: _ManifestProviderLocationQuery) -
     zip_or_geo_sql = _manifest_location_zip_or_geo_sql(query_context, alias="loc") or "TRUE"
     return f"""
                 FROM location_zip_scope zip_scope
-                JOIN LATERAL (
-                    SELECT loc.*
-                      FROM {query_context.provider_group_location_table} loc
-                     WHERE loc.zip5 = zip_scope.zip5
-                       AND loc.npi IS NOT NULL
-                       AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
-                       AND loc.taxonomy_array && {taxonomy_filter_sql}
-                       AND {zip_or_geo_sql}
-                     OFFSET 0
-                ) loc ON TRUE"""
+                JOIN {query_context.provider_group_location_table} loc
+                  ON loc.zip5 = ANY(zip_scope.zip5_values)
+                 AND loc.npi IS NOT NULL
+                 AND loc.address_type = ANY(CAST(:address_types AS varchar[]))
+                 AND loc.taxonomy_array && {taxonomy_filter_sql}
+                 AND {zip_or_geo_sql}"""
 
 
 def _ptg2_manifest_provider_location_filters(
