@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import math
 import os
 import re
 import time
+from contextlib import contextmanager
 from typing import Any, Mapping
 
 import orjson
@@ -48,11 +50,25 @@ logger = logging.getLogger(__name__)
 
 
 def _json_response(payload: Any, *, status: int = 200):
+    with _suspend_gc_for_large_ptg2_response():
+        body = orjson.dumps(payload, default=str)
     return response.raw(
-        orjson.dumps(payload, default=str),
+        body,
         status=status,
         content_type="application/json",
     )
+
+
+@contextmanager
+def _suspend_gc_for_large_ptg2_response():
+    was_enabled = gc.isenabled()
+    if was_enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 provider_table = PricingProvider.__table__
