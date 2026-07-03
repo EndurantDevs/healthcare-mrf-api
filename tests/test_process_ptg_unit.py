@@ -4558,6 +4558,10 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "RENAME TO" in joined
     assert "snapshot_id" not in joined
     assert "plan_id, reported_code_system, reported_code" in joined
+    assert (
+        "plan_id, reported_code_system, reported_code, provider_set_global_id_128, "
+        "provider_count DESC NULLS LAST, serving_content_hash_128"
+    ) in joined
     assert "CREATE UNLOGGED TABLE" in joined
     assert "provider_group_global_id_128 uuid NOT NULL" in joined
     assert "SELECT DISTINCT ON (serving_content_hash_128)" not in joined

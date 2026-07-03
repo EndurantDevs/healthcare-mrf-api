@@ -783,6 +783,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         serving_deduped = True
     unique_index = _ptg2_snapshot_index_name(final_table, "content_uidx")
     lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_lookup_idx")
+    provider_set_lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_provider_set_idx")
     try:
         await db.status(
             f"""
@@ -815,6 +816,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
         CREATE INDEX {_quote_ident(lookup_index)}
         ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
         (plan_id, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128);
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX {_quote_ident(provider_set_lookup_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        (plan_id, reported_code_system, reported_code, provider_set_global_id_128, provider_count DESC NULLS LAST, serving_content_hash_128);
         """
     )
     # The unique index is a publish-time correctness guard. Once it builds, the
