@@ -1664,6 +1664,49 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
 
 
 @pytest.mark.asyncio
+async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monkeypatch):
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    checked_snapshots: list[str] = []
+    searched_snapshots: list[str] = []
+
+    async def fake_tables(_session, _snapshot_id):
+        return ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_test")
+
+    async def fake_has_plan_code(_session, snapshot_id, _args, *, serving_tables=None):
+        assert serving_tables is not None
+        checked_snapshots.append(snapshot_id)
+        return snapshot_id != "snap-empty"
+
+    async def fake_one(_session, snapshot_id, _args, pagination, *, serving_tables=None):
+        assert serving_tables is not None
+        searched_snapshots.append(snapshot_id)
+        return {
+            "items": [{"npi": 111, "provider_name": "Ambrose", "prices": [{"negotiated_rate": 1138.57}]}],
+            "pagination": {"total": 1, "limit": pagination.limit, "offset": pagination.offset},
+            "query": {"snapshot_id": snapshot_id, "code": "90837"},
+        }
+
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_tables)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_snapshot_has_plan_code", fake_has_plan_code)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+
+    payload = await ptg2_serving._search_multi_ptg2_snapshots(
+        RealishFakeSession([]),
+        [("empty", "snap-empty"), ("c2", "snap-c2")],
+        {"plan_id": "010854205", "code": "90837", "code_system": "CPT"},
+        FakePagination(),
+    )
+
+    assert checked_snapshots == ["snap-empty", "snap-c2"]
+    assert searched_snapshots == ["snap-c2"]
+    assert payload["items"][0]["network"] == "c2"
+    assert payload["pagination"]["total"] == 1
+    assert payload["query"]["combined"] is True
+
+
+@pytest.mark.asyncio
 async def test_search_current_ptg2_index_single_network_plan_uses_single_path(monkeypatch):
     seen = {}
 

@@ -136,6 +136,7 @@ _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR = "_ptg2_manifest_location_jit_disabled"
 _PTG2_TAXONOMY_INT_CODE_CACHE: dict[tuple[str, ...], tuple[int, ...]] = {}
+_PTG2_TABLE_COLUMNS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 
 
 @dataclass(frozen=True)
@@ -1406,6 +1407,13 @@ async def _ptg2_table_has_columns(session, table_name: str, required_columns: se
     safe_table_name = _safe_table_name(table_name)
     if not safe_table_name:
         return False
+    cache_enabled = hasattr(session, "sync_session")
+    if cache_enabled:
+        cached = _PTG2_TABLE_COLUMNS_CACHE.get(safe_table_name)
+        if cached is not None:
+            cached_at, columns = cached
+            if PTG2_INDEX_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= PTG2_INDEX_CACHE_TTL_SECONDS:
+                return bool(columns) and set(required_columns).issubset(columns)
     schema_name, bare_table_name = safe_table_name.split(".", 1)
     try:
         result = await session.execute(
@@ -1428,7 +1436,10 @@ async def _ptg2_table_has_columns(session, table_name: str, required_columns: se
                 value = row[0] if row else None
             if value:
                 columns.add(str(value))
-        return bool(columns) and set(required_columns).issubset(columns)
+        frozen_columns = frozenset(columns)
+        if cache_enabled:
+            _PTG2_TABLE_COLUMNS_CACHE[safe_table_name] = (time.monotonic(), frozen_columns)
+        return bool(frozen_columns) and set(required_columns).issubset(frozen_columns)
     except Exception:
         await _rollback_optional_ptg2_query(session)
         return False
@@ -5655,14 +5666,82 @@ def _ptg2_location_filter_requested(args: dict[str, Any]) -> bool:
     )
 
 
+def _ptg2_manifest_plan_code_values(args: dict[str, Any]) -> tuple[str, str | None, str] | None:
+    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_code = (
+        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
+        if requested_system
+        else str(args.get("code") or args.get("reported_code") or "").strip()
+    )
+    if not requested_plan or not requested_code:
+        return None
+    return requested_plan, requested_system or None, requested_code
+
+
+async def _ptg2_manifest_snapshot_has_plan_code(
+    session,
+    snapshot_id: str,
+    args: dict[str, Any],
+    *,
+    serving_tables: PTG2ServingTables | None = None,
+) -> bool:
+    """Cheaply rule out network snapshots that cannot price the requested route."""
+    # Unit-test fakes and non-SQLAlchemy call sites should retain the old
+    # fan-out behavior unless they explicitly patch this helper.
+    if not hasattr(session, "sync_session"):
+        return True
+    requested = _ptg2_manifest_plan_code_values(args)
+    if requested is None:
+        return True
+    requested_plan, requested_system, requested_code = requested
+    try:
+        serving_tables = serving_tables or await snapshot_serving_tables(session, snapshot_id)
+        table_name = _safe_table_name(serving_tables.serving_table)
+        if not table_name or not await _serving_table_available(session, table_name):
+            return True
+        params: dict[str, Any] = {
+            "plan_id": requested_plan,
+            "reported_code": requested_code,
+        }
+        system_sql = ""
+        if requested_system:
+            params["reported_code_system"] = requested_system
+            system_sql = "AND reported_code_system = :reported_code_system"
+        result = await session.execute(
+            text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {table_name}
+                    WHERE plan_id = :plan_id
+                      AND reported_code = :reported_code
+                      {system_sql}
+                    LIMIT 1
+                )
+                """
+            ),
+            params,
+        )
+        return bool(result.scalar())
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return True
+
+
 async def _search_one_ptg2_snapshot(
-    session, snapshot_id: str, args: dict[str, Any], pagination
+    session,
+    snapshot_id: str,
+    args: dict[str, Any],
+    pagination,
+    *,
+    serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
     cache_key = _ptg2_response_cache_key(snapshot_id, args, pagination)
     cached_payload = _ptg2_response_cache_get(cache_key)
     if cached_payload is not _CACHE_MISS:
         return cached_payload
-    serving_tables = await snapshot_serving_tables(session, snapshot_id)
+    serving_tables = serving_tables or await snapshot_serving_tables(session, snapshot_id)
     db_payload = await search_ptg2_serving_table(
         session,
         snapshot_id,
@@ -5709,7 +5788,26 @@ async def _search_multi_ptg2_snapshots(
     base_query: dict[str, Any] | None = None
     matched_networks: list[dict[str, str]] = []
     for source_key, snapshot_id in network_snapshots:
-        payload = await _search_one_ptg2_snapshot(session, snapshot_id, args, sub_pagination)
+        serving_tables: PTG2ServingTables | None = None
+        if hasattr(session, "sync_session"):
+            serving_tables = await snapshot_serving_tables(session, snapshot_id)
+            if not await _ptg2_manifest_snapshot_has_plan_code(
+                session,
+                snapshot_id,
+                args,
+                serving_tables=serving_tables,
+            ):
+                continue
+        if serving_tables is None:
+            payload = await _search_one_ptg2_snapshot(session, snapshot_id, args, sub_pagination)
+        else:
+            payload = await _search_one_ptg2_snapshot(
+                session,
+                snapshot_id,
+                args,
+                sub_pagination,
+                serving_tables=serving_tables,
+            )
         if not payload:
             continue
         if base_query is None:
