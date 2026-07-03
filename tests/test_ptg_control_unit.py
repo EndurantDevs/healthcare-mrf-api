@@ -118,6 +118,42 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
     assert stopped
 
 
+def test_ptg_thread_heartbeat_preserves_importer_progress_source(monkeypatch):
+    events = []
+
+    class FakeEvent:
+        def __init__(self):
+            self.calls = 0
+            self.set_called = False
+
+        def wait(self, _interval):
+            self.calls += 1
+            return self.calls > 1
+
+        def set(self):
+            self.set_called = True
+
+    class FakeThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(ptg_control.threading, "Event", FakeEvent)
+    monkeypatch.setattr(ptg_control.threading, "Thread", FakeThread)
+    monkeypatch.setattr(ptg_control, "write_live_progress", lambda **payload: events.append(payload))
+
+    stop_event = ptg_control._start_threaded_ptg_heartbeat("run_ptg", "2026-07-03T12:00:00+00:00")
+    ptg_control._stop_threaded_ptg_heartbeat(stop_event)
+
+    assert events
+    assert events[0]["source"] == ptg_control.PTG_CONTROL_HEARTBEAT_SOURCE
+    assert events[0]["confidence"] == "heartbeat"
+    assert events[0]["publish_event"] is False
+    assert stop_event.set_called
+
+
 @pytest.mark.asyncio
 async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
     async def fake_ptg_main(**_kwargs):

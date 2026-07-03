@@ -36,6 +36,7 @@ from process.ptg_parts.config import (
 )
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
+PTG_CONTROL_HEARTBEAT_SOURCE = "import-control-heartbeat"
 _TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _TERMINAL_SOURCE_IMPORT_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "unsupported", "dead_letter"}
 
@@ -133,7 +134,7 @@ def _start_threaded_ptg_heartbeat(run_id: str, started_at: str) -> threading.Eve
                 pct=0,
                 message="running",
                 started_at=started_at,
-                source="ptg-control-thread-heartbeat",
+                source=PTG_CONTROL_HEARTBEAT_SOURCE,
                 confidence="heartbeat",
                 publish_event=False,
             )
