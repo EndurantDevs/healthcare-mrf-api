@@ -136,6 +136,56 @@ def test_build_ptg2_source_snapshot_remove_plan_refuses_current_references(monke
     assert plan["artifact_manifest_ids"] == ["artifact_1"]
 
 
+def test_build_ptg2_source_snapshot_remove_plan_includes_manifest_snapshot_tables(monkeypatch):
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_old",
+                "status": "published",
+                "import_month": "2026-07-01",
+                "manifest": {
+                    "serving_index": {
+                        "storage": "manifest_snapshot",
+                        "source_key": "source_a",
+                        "table": "mrf.ptg2_serving_abcd1234",
+                        "price_atom_table": "mrf.ptg2_price_atom_abcd1234",
+                        "provider_group_member_table": "mrf.ptg2_provider_group_member_abcd1234",
+                        "provider_group_location_table": "mrf.ptg2_provider_group_location_abcd1234",
+                        "provider_set_component_table": "mrf.ptg2_provider_set_component_abcd1234",
+                        "code_count_table": "mrf.ptg2_code_count_abcd1234",
+                        "ignored_table": "mrf.provider_directory_canonical_resource",
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_references",
+        AsyncMock(return_value={"global_slots": [], "source_keys": [], "plan_source_keys": []}),
+    )
+    monkeypatch.setattr(source_snapshot_control, "_artifact_manifest_ids", AsyncMock(return_value=[]))
+
+    plan = asyncio.run(
+        source_snapshot_control.build_ptg2_source_snapshot_remove_plan(
+            snapshot_id="snap_old",
+            source_key="source_a",
+        )
+    )
+
+    assert plan["removable"] is True
+    assert plan["tables"] == [
+        "ptg2_serving_abcd1234",
+        "ptg2_price_atom_abcd1234",
+        "ptg2_provider_set_component_abcd1234",
+        "ptg2_provider_group_member_abcd1234",
+        "ptg2_provider_group_location_abcd1234",
+        "ptg2_code_count_abcd1234",
+    ]
+
+
 def test_remove_ptg2_source_snapshot_delegates_table_drop_and_metadata_delete(monkeypatch):
     dropped_tables = []
     status_calls = []

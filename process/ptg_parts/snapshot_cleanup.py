@@ -23,7 +23,7 @@ def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
 
 
 def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list[str]:
-    if not serving_index or serving_index.get("storage") != "db_compact_snapshot":
+    if not serving_index or serving_index.get("storage") not in {"db_compact_snapshot", "manifest_snapshot"}:
         return []
     table_values = [
         serving_index.get("table"),
@@ -33,14 +33,18 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         serving_index.get("price_set_entry_table"),
         serving_index.get("procedure_table"),
         serving_index.get("provider_set_table"),
+        serving_index.get("provider_set_component_table"),
         serving_index.get("provider_set_entry_table"),
         serving_index.get("provider_entry_component_table"),
         serving_index.get("provider_group_member_table"),
         serving_index.get("provider_group_location_table"),
         serving_index.get("provider_group_rate_scope_table"),
+        serving_index.get("code_count_table"),
     ]
     allowed_prefixes = (
+        "ptg2_serving_",
         "ptg2_serving_rate_compact_",
+        "ptg2_code_count_",
         "ptg2_price_atom_",
         "ptg2_price_set_",
         "ptg2_price_set_entry_",
