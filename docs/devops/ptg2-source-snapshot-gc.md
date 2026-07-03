@@ -58,7 +58,7 @@ From a deployed API pod, run the command with the normal app environment. From
 the host, connect as the `postgres` system user for ad hoc verification:
 
 ```bash
-ssh ubuntu@ns1033171.ip-40-160-70.us
+ssh ubuntu@<dev-node-host>
 sudo -u postgres psql -p 5440 -d healthporta
 ```
 

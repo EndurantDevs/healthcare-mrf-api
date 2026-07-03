@@ -6922,15 +6922,15 @@ def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | 
     api_base = _canonical_base(source.get("api_base"))
     if not api_base:
         return None
-    query_params = {"_type": resource_type}
+    query_params_by_name = {"_type": resource_type}
     metadata = _source_metadata(source)
-    omit_output_format = (
+    should_omit_output_format = (
         api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE
         or metadata.get("provider_directory_bulk_export_omit_output_format") is True
     )
-    if not omit_output_format:
-        query_params["_outputFormat"] = "application/fhir+ndjson"
-    query = urllib.parse.urlencode(query_params)
+    if not should_omit_output_format:
+        query_params_by_name["_outputFormat"] = "application/fhir+ndjson"
+    query = urllib.parse.urlencode(query_params_by_name)
     return f"{api_base}/$export?{query}"
 
 
@@ -7067,14 +7067,13 @@ async def _bulk_export_poll_outputs(
     resource_type: str,
     timeout: int,
 ) -> tuple[list[str] | None, str | None, int]:
+    """Poll a Bulk Data status URL until output URLs, an error, or timeout."""
     max_polls = _env_int("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_POLLS", DEFAULT_BULK_EXPORT_MAX_POLLS)
     poll_seconds = _env_int(
         "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_POLL_SECONDS",
         DEFAULT_BULK_EXPORT_POLL_SECONDS,
     )
-    polls = 0
-    while polls < max(1, max_polls):
-        polls += 1
+    for poll in range(1, max(1, max_polls) + 1):
         status_code, headers, payload, error = await _bulk_http_get_json(
             session,
             source,
@@ -7082,71 +7081,125 @@ async def _bulk_export_poll_outputs(
             timeout=timeout,
         )
         if error:
-            _bulk_export_log(
-                "poll_error",
-                source_id=source.get("source_id"),
-                resource=resource_type,
-                poll=polls,
-                max_polls=max_polls,
-                error=error,
-            )
-            return None, error, polls
+            _bulk_export_log_poll_error(source, resource_type, poll, max_polls, error)
+            return None, error, poll
         if status_code == 202:
-            sleep_seconds = _retry_after_seconds(headers.get("retry-after")) or poll_seconds
-            if polls == 1 or polls % 10 == 0:
-                _bulk_export_log(
-                    "poll_wait",
-                    source_id=source.get("source_id"),
-                    resource=resource_type,
-                    poll=polls,
-                    max_polls=max_polls,
-                    status=status_code,
-                    sleep_seconds=sleep_seconds,
-                    status_url=_bulk_export_log_url(status_url),
-                )
-            await asyncio.sleep(sleep_seconds)
+            await _bulk_export_sleep_after_poll_wait(
+                source,
+                resource_type,
+                poll,
+                max_polls,
+                headers,
+                poll_seconds,
+                status_url,
+            )
             continue
         if status_code == 200:
-            if not _bulk_export_status_payload(payload):
-                _bulk_export_log(
-                    "poll_invalid_payload",
-                    source_id=source.get("source_id"),
-                    resource=resource_type,
-                    poll=polls,
-                    status=status_code,
-                )
-                return None, "bulk_export_status_non_bulk_payload", polls
-            output_urls = _bulk_export_output_urls(payload, resource_type)
-            payload_error = _bulk_export_payload_error(payload)
-            _bulk_export_log(
-                "poll_ready",
-                source_id=source.get("source_id"),
-                resource=resource_type,
-                poll=polls,
-                status=status_code,
-                outputs=len(output_urls),
-                payload_error=payload_error,
+            output_urls, payload_error = _bulk_export_poll_ready_result(
+                source,
+                resource_type,
+                poll,
+                payload,
             )
-            if payload_error and not output_urls:
-                return None, payload_error, polls
-            return output_urls, None, polls
-        _bulk_export_log(
-            "poll_http_error",
-            source_id=source.get("source_id"),
-            resource=resource_type,
-            poll=polls,
-            status=status_code,
-        )
-        return None, f"bulk_export_status_http_{status_code}", polls
+            return output_urls, payload_error, poll
+        _bulk_export_log_poll_http_error(source, resource_type, poll, status_code)
+        return None, f"bulk_export_status_http_{status_code}", poll
     _bulk_export_log(
         "poll_timeout",
         source_id=source.get("source_id"),
         resource=resource_type,
-        polls=polls,
+        polls=max(1, max_polls),
         max_polls=max_polls,
         status_url=_bulk_export_log_url(status_url),
     )
-    return None, "bulk_export_timeout", polls
+    return None, "bulk_export_timeout", max(1, max_polls)
+
+
+def _bulk_export_log_poll_error(
+    source: dict[str, Any],
+    resource_type: str,
+    poll: int,
+    max_polls: int,
+    error: str,
+) -> None:
+    _bulk_export_log(
+        "poll_error",
+        source_id=source.get("source_id"),
+        resource=resource_type,
+        poll=poll,
+        max_polls=max_polls,
+        error=error,
+    )
+
+
+async def _bulk_export_sleep_after_poll_wait(
+    source: dict[str, Any],
+    resource_type: str,
+    poll: int,
+    max_polls: int,
+    headers: dict[str, str],
+    poll_seconds: int,
+    status_url: str,
+) -> None:
+    sleep_seconds = _retry_after_seconds(headers.get("retry-after")) or poll_seconds
+    if poll == 1 or poll % 10 == 0:
+        _bulk_export_log(
+            "poll_wait",
+            source_id=source.get("source_id"),
+            resource=resource_type,
+            poll=poll,
+            max_polls=max_polls,
+            status=202,
+            sleep_seconds=sleep_seconds,
+            status_url=_bulk_export_log_url(status_url),
+        )
+    await asyncio.sleep(sleep_seconds)
+
+
+def _bulk_export_poll_ready_result(
+    source: dict[str, Any],
+    resource_type: str,
+    poll: int,
+    payload: dict[str, Any] | None,
+) -> tuple[list[str] | None, str | None]:
+    if not _bulk_export_status_payload(payload):
+        _bulk_export_log(
+            "poll_invalid_payload",
+            source_id=source.get("source_id"),
+            resource=resource_type,
+            poll=poll,
+            status=200,
+        )
+        return None, "bulk_export_status_non_bulk_payload"
+    output_urls = _bulk_export_output_urls(payload, resource_type)
+    payload_error = _bulk_export_payload_error(payload)
+    _bulk_export_log(
+        "poll_ready",
+        source_id=source.get("source_id"),
+        resource=resource_type,
+        poll=poll,
+        status=200,
+        outputs=len(output_urls),
+        payload_error=payload_error,
+    )
+    if payload_error and not output_urls:
+        return None, payload_error
+    return output_urls, None
+
+
+def _bulk_export_log_poll_http_error(
+    source: dict[str, Any],
+    resource_type: str,
+    poll: int,
+    status_code: int | None,
+) -> None:
+    _bulk_export_log(
+        "poll_http_error",
+        source_id=source.get("source_id"),
+        resource=resource_type,
+        poll=poll,
+        status=status_code,
+    )
 
 
 async def _stream_bulk_export_output_rows(
