@@ -576,6 +576,20 @@ def test_ptg2_manifest_sidecar_path_resolver_remaps_stale_hash_suffix(tmp_path, 
     assert resolved == actual
 
 
+def test_ptg2_manifest_sidecar_path_resolver_remaps_work_artifact_root(tmp_path, monkeypatch):
+    artifact_root = tmp_path / "ptg2-artifacts"
+    current_dir = artifact_root / "serving" / "current"
+    current_dir.mkdir(parents=True)
+    actual = current_dir / "price_forward_0ad5cd3fa87618bb.ptg2sc"
+    actual.write_bytes(b"ptg2")
+    stale = "/work/ptg2-artifacts/serving/stale/price_forward_0ad5cd3fa87618bb.ptg2sc"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+
+    resolved = ptg2_serving._resolve_ptg2_manifest_sidecar_path(stale)
+
+    assert resolved == actual
+
+
 @pytest.mark.asyncio
 async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(tmp_path):
     provider_group_id = "00000000000000000000000000000011"

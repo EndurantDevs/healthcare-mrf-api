@@ -1961,12 +1961,14 @@ def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
         candidate = artifact_root / path
         return candidate if candidate.exists() else path
 
-    marker = "healthporta-ptg2-artifacts"
-    try:
-        marker_index = path.parts.index(marker)
-    except ValueError:
-        return path
-    suffix_parts = path.parts[marker_index + 1 :]
+    suffix_parts: tuple[str, ...] = ()
+    for marker in ("healthporta-ptg2-artifacts", "ptg2-artifacts"):
+        try:
+            marker_index = path.parts.index(marker)
+        except ValueError:
+            continue
+        suffix_parts = path.parts[marker_index + 1 :]
+        break
     if not suffix_parts:
         return path
     candidate = artifact_root.joinpath(*suffix_parts)
