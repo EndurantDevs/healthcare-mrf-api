@@ -2672,7 +2672,7 @@ async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_manifest_location_zip_radius_uses_literal_taxonomy_zip_array_fast_path(monkeypatch):
+async def test_manifest_location_zip_radius_uses_literal_taxonomy_lateral_fast_path(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     ptg2_serving._PTG2_TAXONOMY_INT_CODE_CACHE.clear()
     group_id = "00000000000000000000000000000011"
@@ -2720,10 +2720,10 @@ async def test_manifest_location_zip_radius_uses_literal_taxonomy_zip_array_fast
     location_sql = _fake_call_sql(session, "raw_location_rows AS")
     assert "location_zip_scope AS MATERIALIZED" in location_sql
     assert "FROM mrf.geo_zip_lookup anchor" in location_sql
-    assert "ARRAY_AGG(g.zip_code::text ORDER BY g.zip_code::text) AS zip5_values" in location_sql
-    assert "SELECT loc.*" not in location_sql
-    assert "loc.zip5 = ANY(zip_scope.zip5_values)" in location_sql
+    assert "JOIN LATERAL" in location_sql
+    assert "loc.zip5 = zip_scope.zip5" in location_sql
     assert "loc.taxonomy_array && ARRAY[101,202]::integer[]" in location_sql
+    assert "OFFSET 0" in location_sql
     assert "JOIN mrf.ptg2_provider_group_rate_scope_snap rpg_location" in location_sql
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
@@ -4950,7 +4950,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
     assert provider_set_ids == {"provider-set-1"}
     assert providers_by_set["provider-set-1"][0]["npi"] == 1234567890
     sql = str(session.calls[0][0][0])
-    assert "JOIN mrf.ptg2_provider_group_location_token loc" in sql
+    assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
     assert "loc.taxonomy_array && (" in sql
     assert "FROM mrf.ptg2_provider_group_member_token pgm_scope" not in sql
 
