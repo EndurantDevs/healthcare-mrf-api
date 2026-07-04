@@ -995,23 +995,30 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         cancel_signal = await _set_cancel_flag(run_id)
         cancel_signal["kubernetes"] = await _delete_active_worker_jobs(current)
     metrics["cancel_signal"] = cancel_signal
+    terminalized_active_worker = _cancel_signal_terminalized_active_worker(cancel_signal)
     canceled_before_start = pending_adapter or queued_arq
-    status = "canceled" if canceled_before_start else "canceling"
+    canceled_now = canceled_before_start or terminalized_active_worker
+    status = "canceled" if canceled_now else "canceling"
+    phase_detail = "cancel requested"
+    if canceled_before_start:
+        phase_detail = "canceled before start"
+    elif terminalized_active_worker:
+        phase_detail = "canceled active worker"
     progress = {
         "unit": "run",
         "total": 1,
-        "done": 1 if canceled_before_start else 0,
-        "pct": 100 if canceled_before_start else current_progress.get("pct", 0),
-        "message": "canceled" if canceled_before_start else "cancel requested",
+        "done": 1 if canceled_now else 0,
+        "pct": 100 if canceled_now else current_progress.get("pct", 0),
+        "message": "canceled" if canceled_now else "cancel requested",
     }
     await db.execute(
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
         .values(
             status=status,
-            phase_detail="canceled before start" if canceled_before_start else "cancel requested",
+            phase_detail=phase_detail,
             heartbeat_at=now,
-            finished_at=now if canceled_before_start else current.get("finished_at"),
+            finished_at=now if canceled_now else current.get("finished_at"),
             progress=progress,
             metrics=metrics,
         )
@@ -1021,6 +1028,27 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         _write_run_live_progress({**updated, "progress": progress}, publish_event=False)
         enqueue_status_event({**updated, "progress": progress, "metrics": metrics})
     return updated
+
+
+def _cancel_signal_terminalized_active_worker(cancel_signal: dict[str, Any]) -> bool:
+    kubernetes = cancel_signal.get("kubernetes") if isinstance(cancel_signal, dict) else None
+    if not isinstance(kubernetes, dict) or not kubernetes.get("enabled"):
+        return False
+    if kubernetes.get("errors"):
+        return False
+    try:
+        deleted = int(kubernetes.get("deleted") or 0)
+    except (TypeError, ValueError):
+        deleted = 0
+    if deleted > 0:
+        return True
+    items = kubernetes.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    return all(
+        isinstance(item, dict) and not item.get("deleted") and item.get("reason") == "terminal"
+        for item in items
+    )
 
 
 def _write_run_live_progress(run: dict[str, Any], *, publish_event: bool) -> None:

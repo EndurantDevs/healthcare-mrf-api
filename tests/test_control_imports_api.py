@@ -1378,7 +1378,14 @@ async def test_request_cancel_records_kubernetes_worker_job_deletion(monkeypatch
         calls["get"] += 1
         if calls["get"] == 1:
             return current
-        return {**current, "status": "canceling", "metrics": executed[-1]["metrics"]}
+        return {
+            **current,
+            "status": executed[-1]["status"],
+            "phase_detail": executed[-1]["phase_detail"],
+            "finished_at": executed[-1]["finished_at"],
+            "progress": executed[-1]["progress"],
+            "metrics": executed[-1]["metrics"],
+        }
 
     async def fake_set_cancel_flag(run_id):
         return {"redis": True, "key": f"cancel:{run_id}", "ttl_seconds": 10}
@@ -1401,13 +1408,84 @@ async def test_request_cancel_records_kubernetes_worker_job_deletion(monkeypatch
 
     result = await control_imports.request_cancel("run_ptg")
 
-    assert result["status"] == "canceling"
+    assert result["status"] == "canceled"
+    assert result["phase_detail"] == "canceled active worker"
+    assert result["finished_at"] is not None
+    assert result["progress"] == {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "canceled"}
     assert result["metrics"]["cancel_signal"]["redis"] is True
     assert result["metrics"]["cancel_signal"]["kubernetes"] == {
         "enabled": True,
         "namespace": "healthporta-dev",
         "deleted": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_finishes_when_kubernetes_worker_job_already_terminal(monkeypatch):
+    calls = {"get": 0}
+    executed: list[dict[str, object]] = []
+    current = {
+        "run_id": "run_ptg_terminal",
+        "importer": "ptg",
+        "status": "running",
+        "progress": {"pct": 40},
+        "metrics": {"queue": "arq:PTGNormal", "worker_class": "process.PTGNormal"},
+        "params": {"resource_class": "normal"},
+        "finished_at": None,
+    }
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeDb:
+        async def execute(self, statement):
+            executed.append(statement.compile().params)
+            return FakeResult()
+
+    async def fake_get(_run_id):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return current
+        return {
+            **current,
+            "status": executed[-1]["status"],
+            "phase_detail": executed[-1]["phase_detail"],
+            "finished_at": executed[-1]["finished_at"],
+            "progress": executed[-1]["progress"],
+            "metrics": executed[-1]["metrics"],
+        }
+
+    async def fake_set_cancel_flag(run_id):
+        return {"redis": True, "key": f"cancel:{run_id}", "ttl_seconds": 10}
+
+    async def fake_delete_active_worker_jobs(_run):
+        return {
+            "enabled": True,
+            "namespace": "healthporta-dev",
+            "deleted": 0,
+            "items": [
+                {
+                    "job_name": "hpw-mrf-process-ptgnormal-start-c5cded3c22",
+                    "worker_class": "process.PTGNormal",
+                    "deleted": False,
+                    "reason": "terminal",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
+    monkeypatch.setattr(control_imports, "_delete_active_worker_jobs", fake_delete_active_worker_jobs)
+
+    result = await control_imports.request_cancel("run_ptg_terminal")
+
+    assert result["status"] == "canceled"
+    assert result["phase_detail"] == "canceled active worker"
+    assert result["finished_at"] is not None
+    assert result["progress"] == {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "canceled"}
+    assert result["metrics"]["cancel_signal"]["kubernetes"]["items"][0]["reason"] == "terminal"
 
 
 @pytest.mark.asyncio
