@@ -4154,7 +4154,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("npi",), "name": "npi"},
         {"index_elements": ("npi",), "name": "primary_npi", "where": "type='primary'"},
-        {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
+        {"index_elements": ("inferred_npi",), "name": "inferred_npi", "where": "inferred_npi IS NOT NULL"},
         {"index_elements": ("coalesce(npi, inferred_npi)",), "name": "coalesced_npi"},
         {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
         {"index_elements": ("state_name", "city_name", "npi"), "name": "primary_state_city_npi", "where": "type='primary'"},
