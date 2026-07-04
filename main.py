@@ -24,7 +24,7 @@ from asyncpg import connection
 from asyncpg.connection import ServerCapabilities
 from arq.logs import default_log_config
 from arq.utils import import_string
-from arq.worker import run_worker
+from arq.worker import create_worker
 from sanic import Sanic
 
 from api import init_api
@@ -127,7 +127,45 @@ def worker_once(worker_settings: str, verbose: bool, custom_log_dict: str | None
     settings = import_string(worker_settings)
     log_config = import_string(custom_log_dict) if custom_log_dict else default_log_config(verbose)
     logging.config.dictConfig(log_config)
-    run_worker(settings, burst=True, max_burst_jobs=1)
+    worker = _create_single_job_worker(settings)
+    worker.run()
+
+
+def _create_single_job_worker(settings):
+    scan_limit = _worker_once_scan_limit(settings)
+    worker = create_worker(
+        settings,
+        burst=True,
+        max_jobs=1,
+        max_burst_jobs=scan_limit,
+        queue_read_limit=scan_limit,
+    )
+    original_start_jobs = worker.start_jobs
+
+    async def start_jobs_once(job_ids):
+        """Clamp burst accounting once this worker claims one real job."""
+        jobs_started_before = worker._jobs_started()
+        await original_start_jobs(job_ids)
+        if worker._jobs_started() > jobs_started_before:
+            worker.max_burst_jobs = worker._jobs_started()
+
+    worker.start_jobs = start_jobs_once
+    return worker
+
+
+def _worker_once_scan_limit(settings) -> int:
+    configured = _positive_int(os.environ.get("HLTHPRT_WORKER_ONCE_QUEUE_SCAN_LIMIT"))
+    if configured:
+        return configured
+    return max(_positive_int(getattr(settings, "queue_read_limit", None)) or 16, 16)
+
+
+def _positive_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 @click.group()
