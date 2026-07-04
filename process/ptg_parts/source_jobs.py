@@ -411,7 +411,6 @@ def _filter_jobs_by_url_contains(
             for value in (
                 job.get("url"),
                 job.get("description"),
-                job.get("from_index_url"),
             )
         ).lower()
         if any(needle in haystack for needle in needles):

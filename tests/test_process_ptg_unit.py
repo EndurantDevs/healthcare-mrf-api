@@ -3622,6 +3622,31 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
     )
 
 
+def test_ptg_source_job_filter_ignores_scoped_parent_index_url():
+    jobs = [
+        {
+            "url": "https://cdn.example.com/2026-07_111_11A0_in-network-rates.json.gz",
+            "description": "111|11A0",
+            "from_index_url": (
+                "https://bcbsla.sapphiremrfhub.com/tocs/current/plastipak-packaging-inc"
+                "?hp_content_domain=in_network&hp_file_url_contains=2026-07_932_67B0-in-network-rates.json.gz"
+            ),
+        },
+        {
+            "url": "https://cdn.example.com/2026-07_932_67B0-in-network-rates_01_of_02.json.gz",
+            "description": "932|67B0",
+            "from_index_url": "https://bcbsla.sapphiremrfhub.com/tocs/current/plastipak-packaging-inc",
+        },
+    ]
+
+    filtered = ptg_source_jobs._filter_jobs_by_url_contains(
+        jobs,
+        ["2026-07_932_67B0-in-network-rates"],
+    )
+
+    assert filtered == [jobs[1]]
+
+
 def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
     if process_ptg._ptg2_rust_scanner_binary() is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
