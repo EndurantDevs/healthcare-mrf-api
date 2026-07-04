@@ -1,5 +1,6 @@
 //! Input readers for compressed and plain TiC artifacts.
 
+use crate::config::READ_BUF_SIZE;
 use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -105,15 +106,14 @@ impl<R: Read> LossyUtf8Reader<R> {
                 }
                 break;
             }
-            let bytes = if self.pending.is_empty() {
-                raw[..read].to_vec()
+            if self.pending.is_empty() {
+                self.append_valid_utf8_lossy(&raw[..read], false);
             } else {
                 let mut bytes = Vec::with_capacity(self.pending.len() + read);
                 bytes.extend_from_slice(&self.pending);
                 bytes.extend_from_slice(&raw[..read]);
-                bytes
-            };
-            self.append_valid_utf8_lossy(&bytes, false);
+                self.append_valid_utf8_lossy(&bytes, false);
+            }
         }
         Ok(!self.output.is_empty())
     }
@@ -156,11 +156,14 @@ pub fn open_reader(
 ) -> io::Result<Box<dyn Read>> {
     let fp = File::open(path)?;
     if is_gzip(path)? {
-        let compressed_reader = CountingReader::new(BufReader::new(fp), compressed_bytes_read);
+        let compressed_reader = CountingReader::new(
+            BufReader::with_capacity(READ_BUF_SIZE, fp),
+            compressed_bytes_read,
+        );
         Ok(Box::new(MultiGzDecoder::new(compressed_reader)))
     } else {
         Ok(Box::new(CountingReader::new(
-            BufReader::new(fp),
+            BufReader::with_capacity(READ_BUF_SIZE, fp),
             compressed_bytes_read,
         )))
     }

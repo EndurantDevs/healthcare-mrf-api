@@ -4203,7 +4203,9 @@ def test_ptg2_rust_top_level_byte_scan_matches_default_compact_output(tmp_path):
     top_level_summary = [row for kind, row in top_level_frames if kind == "scanner_summary"][0]
     assert "top_level_byte_scan" not in default_summary
     assert top_level_config["top_level_byte_scan"] is True
+    assert top_level_config["raw_rate_byte_capture"] is True
     assert top_level_summary["top_level_byte_scan"] is True
+    assert top_level_summary["raw_rate_byte_capture"] is True
     assert top_level_summary["provider_ref_raw_chunk_count"] == 2
     assert top_level_summary["provider_refs_seconds"] >= 0
 

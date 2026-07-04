@@ -15,7 +15,7 @@ use ptg2_scanner::hashing::{
     checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text, make_checksum,
     semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
 };
-use ptg2_scanner::input::{lossy_utf8_reader, open_json_reader, open_reader};
+use ptg2_scanner::input::{open_json_reader, open_reader};
 use ptg2_scanner::manifest::{
     normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
     provider_set_global_id_from_entry_hashes, write_dense_member_sidecar, write_global_sidecar,
@@ -2965,7 +2965,7 @@ fn process_provider_ref_raw_batch(
 ) -> io::Result<u64> {
     let mut processed = 0u64;
     for raw_ref in raw_refs {
-        let value: Value = serde_json::from_slice(raw_ref).map_err(to_io_error)?;
+        let value = parse_json_value_from_raw_bytes(raw_ref)?;
         if let Some(key_value) = value.get("provider_group_id") {
             if let (Some(key), Some(entry)) = (
                 provider_ref_key(key_value),
@@ -3033,6 +3033,229 @@ impl<R: Read> Read for PrefixReader<R> {
         }
         self.inner.read(buf)
     }
+}
+
+struct BufferedJsonByteReader<R: Read> {
+    inner: R,
+    buffer: Vec<u8>,
+    pos: usize,
+    filled: usize,
+}
+
+impl<R: Read> BufferedJsonByteReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffer: vec![0u8; READ_BUF_SIZE],
+            pos: 0,
+            filled: 0,
+        }
+    }
+
+    fn fill(&mut self) -> io::Result<bool> {
+        if self.pos < self.filled {
+            return Ok(true);
+        }
+        self.filled = self.inner.read(&mut self.buffer)?;
+        self.pos = 0;
+        Ok(self.filled > 0)
+    }
+
+    fn peek_byte(&mut self) -> io::Result<Option<u8>> {
+        if !self.fill()? {
+            return Ok(None);
+        }
+        Ok(Some(self.buffer[self.pos]))
+    }
+
+    fn next_byte(&mut self) -> io::Result<Option<u8>> {
+        if !self.fill()? {
+            return Ok(None);
+        }
+        let byte = self.buffer[self.pos];
+        self.pos += 1;
+        Ok(Some(byte))
+    }
+
+    fn skip_whitespace(&mut self) -> io::Result<()> {
+        while matches!(self.peek_byte()?, Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn consume_if(&mut self, expected: u8) -> io::Result<bool> {
+        self.skip_whitespace()?;
+        if self.peek_byte()? == Some(expected) {
+            self.pos += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> io::Result<()> {
+        self.skip_whitespace()?;
+        match self.next_byte()? {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected JSON byte {:?}, got {:?}",
+                    expected as char, actual as char
+                ),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected JSON byte {:?}", expected as char),
+            )),
+        }
+    }
+
+    fn read_string_bytes(&mut self) -> io::Result<Vec<u8>> {
+        self.skip_whitespace()?;
+        if self.next_byte()? != Some(b'"') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected JSON string",
+            ));
+        }
+        let mut bytes = vec![b'"'];
+        let mut escape = false;
+        loop {
+            let Some(byte) = self.next_byte()? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated JSON string",
+                ));
+            };
+            bytes.push(byte);
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    fn read_string(&mut self) -> io::Result<String> {
+        let bytes = self.read_string_bytes()?;
+        serde_json::from_slice(&bytes).map_err(to_io_error)
+    }
+
+    fn capture_value_bytes(&mut self) -> io::Result<Vec<u8>> {
+        self.skip_whitespace()?;
+        let Some(first) = self.next_byte()? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "expected JSON value",
+            ));
+        };
+        let mut bytes = vec![first];
+        match first {
+            b'"' => {
+                self.capture_string_tail(&mut bytes)?;
+            }
+            b'{' | b'[' => {
+                self.capture_nested_tail(&mut bytes, first)?;
+            }
+            _ => {
+                while let Some(byte) = self.peek_byte()? {
+                    if matches!(byte, b',' | b']' | b'}' | b' ' | b'\n' | b'\r' | b'\t') {
+                        break;
+                    }
+                    bytes.push(byte);
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn capture_string_tail(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
+        let mut escape = false;
+        loop {
+            let Some(byte) = self.next_byte()? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated JSON string",
+                ));
+            };
+            bytes.push(byte);
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                return Ok(());
+            }
+        }
+    }
+
+    fn capture_nested_tail(&mut self, bytes: &mut Vec<u8>, first: u8) -> io::Result<()> {
+        let mut stack = vec![match first {
+            b'{' => b'}',
+            b'[' => b']',
+            _ => unreachable!(),
+        }];
+        let mut in_string = false;
+        let mut escape = false;
+        while let Some(byte) = self.next_byte()? {
+            bytes.push(byte);
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if byte == b'\\' {
+                    escape = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => {
+                    in_string = true;
+                    escape = false;
+                }
+                b'{' => stack.push(b'}'),
+                b'[' => stack.push(b']'),
+                b'}' | b']' => {
+                    if stack.pop() != Some(byte) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "mismatched JSON delimiter",
+                        ));
+                    }
+                    if stack.is_empty() {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unterminated JSON value",
+        ))
+    }
+}
+
+fn next_array_value<R: Read>(
+    reader: &mut BufferedJsonByteReader<R>,
+    first: &mut bool,
+) -> io::Result<bool> {
+    reader.skip_whitespace()?;
+    if reader.consume_if(b']')? {
+        return Ok(false);
+    }
+    if *first {
+        *first = false;
+    } else {
+        reader.expect_byte(b',')?;
+        reader.skip_whitespace()?;
+    }
+    Ok(true)
 }
 
 fn join_provider_ref_workers<W: Write>(
@@ -3726,8 +3949,27 @@ fn transfer_next_value_to_bytes<R: Read>(
     Ok(bytes)
 }
 
+fn parse_json_value_from_raw_bytes(raw: &[u8]) -> io::Result<Value> {
+    match serde_json::from_slice(raw) {
+        Ok(value) => Ok(value),
+        Err(error) if std::str::from_utf8(raw).is_err() => {
+            let repaired = String::from_utf8_lossy(raw);
+            serde_json::from_str(repaired.as_ref()).map_err(to_io_error)
+        }
+        Err(error) => Err(to_io_error(error)),
+    }
+}
+
 fn read_rate_lite_bytes(raw: &[u8]) -> io::Result<Option<RateLite>> {
-    let mut json_reader = JsonStreamReader::new(raw);
+    if std::str::from_utf8(raw).is_err() {
+        let repaired = String::from_utf8_lossy(raw);
+        return read_rate_lite_from_reader(repaired.as_bytes());
+    }
+    read_rate_lite_from_reader(raw)
+}
+
+fn read_rate_lite_from_reader<R: Read>(reader: R) -> io::Result<Option<RateLite>> {
+    let mut json_reader = JsonStreamReader::new(reader);
     let rate = read_rate_lite_struson(&mut json_reader)?;
     json_reader
         .consume_trailing_whitespace()
@@ -3916,6 +4158,94 @@ struct InNetworkEnqueueIo<'a, W: Write> {
     writer: &'a mut W,
     producer_blocked_micros: &'a mut u128,
     raw_chunk_stats: &'a mut RawChunkStats,
+}
+
+fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
+    reader: &mut BufferedJsonByteReader<R>,
+    io_state: &mut InNetworkEnqueueIo<'_, W>,
+    options: InNetworkEnqueueOptions,
+) -> io::Result<u64> {
+    let chunk_size = options.chunk_size;
+    let raw_chunk_byte_limit = options.raw_chunk_byte_limit;
+    let mut procedure = Map::new();
+    let mut raw_rate_chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
+    let mut raw_rate_chunk_bytes = 0usize;
+    let mut rate_count = 0u64;
+    reader.expect_byte(b'{')?;
+    let mut first_field = true;
+    loop {
+        reader.skip_whitespace()?;
+        if reader.consume_if(b'}')? {
+            break;
+        }
+        if first_field {
+            first_field = false;
+        } else {
+            reader.expect_byte(b',')?;
+        }
+        let name = reader.read_string()?;
+        reader.expect_byte(b':')?;
+        match name.as_str() {
+            "billing_code_type"
+            | "billing_code_type_version"
+            | "billing_code"
+            | "name"
+            | "description" => {
+                let raw_value = reader.capture_value_bytes()?;
+                let value = parse_json_value_from_raw_bytes(&raw_value)?;
+                procedure.insert(name, value);
+            }
+            "negotiated_rates" => {
+                reader.expect_byte(b'[')?;
+                let mut first_rate = true;
+                while next_array_value(reader, &mut first_rate)? {
+                    rate_count += 1;
+                    let raw_rate = reader.capture_value_bytes()?;
+                    raw_rate_chunk_bytes = raw_rate_chunk_bytes.saturating_add(raw_rate.len());
+                    raw_rate_chunk.push(raw_rate);
+                    if raw_rate_chunk.len() >= chunk_size
+                        || raw_rate_chunk_bytes >= raw_chunk_byte_limit
+                    {
+                        let raw_rates =
+                            std::mem::replace(&mut raw_rate_chunk, Vec::with_capacity(chunk_size));
+                        let raw_bytes = std::mem::take(&mut raw_rate_chunk_bytes);
+                        io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
+                        send_worker_job(
+                            io_state.tx,
+                            io_state.event_rx,
+                            io_state.writer,
+                            io_state.producer_blocked_micros,
+                            WorkerJob::RawRates {
+                                procedure: procedure.clone(),
+                                raw_rates,
+                            },
+                        )?;
+                        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+                    }
+                }
+            }
+            _ => {
+                let _ = reader.capture_value_bytes()?;
+            }
+        }
+    }
+    if !raw_rate_chunk.is_empty() {
+        io_state
+            .raw_chunk_stats
+            .record(raw_rate_chunk.len(), raw_rate_chunk_bytes);
+        send_worker_job(
+            io_state.tx,
+            io_state.event_rx,
+            io_state.writer,
+            io_state.producer_blocked_micros,
+            WorkerJob::RawRates {
+                procedure,
+                raw_rates: raw_rate_chunk,
+            },
+        )?;
+        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
+    }
+    Ok(rate_count)
 }
 
 fn enqueue_in_network_struson<R: Read, W: Write>(
@@ -4253,7 +4583,9 @@ fn scan_compact_byte_top_level_parallel(
             "event_queue": event_queue_size,
             "split_negotiated_rates": negotiated_rate_chunk_size,
             "raw_chunk_bytes": raw_chunk_byte_limit,
+            "read_buffer_bytes": READ_BUF_SIZE,
             "parse_in_workers": parse_in_workers,
+            "raw_rate_byte_capture": parse_in_workers,
             "provider_refs_in_workers": true,
             "provider_ref_workers": provider_ref_worker_count,
             "provider_ref_queue": provider_ref_queue_size,
@@ -4427,62 +4759,122 @@ fn scan_compact_byte_top_level_parallel(
                     let mut prefix = Vec::with_capacity(read.saturating_sub(idx) + 1);
                     prefix.push(b'[');
                     prefix.extend_from_slice(&buffer[idx + 1..read]);
-                    let prefixed_reader = PrefixReader::new(prefix, reader);
-                    let mut json_reader = JsonStreamReader::new(lossy_utf8_reader(prefixed_reader));
                     let in_network_started_at = Instant::now();
-                    json_reader.begin_array().map_err(to_io_error)?;
-                    while json_reader.has_next().map_err(to_io_error)? {
-                        let mut enqueue_io = InNetworkEnqueueIo {
-                            tx: &tx,
-                            event_rx: &event_rx,
-                            writer: &mut writer,
-                            producer_blocked_micros: &mut producer_blocked_micros,
-                            raw_chunk_stats: &mut raw_chunk_stats,
-                        };
-                        let rate_count = enqueue_in_network_struson(
-                            &mut json_reader,
-                            &mut enqueue_io,
-                            InNetworkEnqueueOptions {
-                                chunk_size: negotiated_rate_chunk_size,
-                                raw_chunk_byte_limit,
-                                parse_in_workers,
-                            },
-                        )?;
-                        drain_copy_file_events(&event_rx, &mut writer)?;
-                        *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                        *object_counts
-                            .entry("negotiated_rates".to_string())
-                            .or_insert(0) += rate_count;
-                        let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                        let objects: u64 = object_counts.values().sum();
-                        if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                            emit_progress(
-                                path,
-                                total_bytes,
-                                &compressed_bytes_read,
-                                &object_counts,
-                                started_at,
-                                false,
-                            );
-                            while bytes >= next_progress_bytes {
-                                next_progress_bytes += progress_bytes_interval;
-                            }
-                        } else if progress_objects_interval > 0 && objects >= next_progress_objects
-                        {
-                            emit_progress(
-                                path,
-                                total_bytes,
-                                &compressed_bytes_read,
-                                &object_counts,
-                                started_at,
-                                false,
-                            );
-                            while objects >= next_progress_objects {
-                                next_progress_objects += progress_objects_interval;
+                    if parse_in_workers {
+                        let prefixed_reader = PrefixReader::new(prefix, reader);
+                        let mut byte_reader = BufferedJsonByteReader::new(prefixed_reader);
+                        byte_reader.expect_byte(b'[')?;
+                        let mut first_item = true;
+                        while next_array_value(&mut byte_reader, &mut first_item)? {
+                            let mut enqueue_io = InNetworkEnqueueIo {
+                                tx: &tx,
+                                event_rx: &event_rx,
+                                writer: &mut writer,
+                                producer_blocked_micros: &mut producer_blocked_micros,
+                                raw_chunk_stats: &mut raw_chunk_stats,
+                            };
+                            let rate_count = enqueue_in_network_raw_byte_scan(
+                                &mut byte_reader,
+                                &mut enqueue_io,
+                                InNetworkEnqueueOptions {
+                                    chunk_size: negotiated_rate_chunk_size,
+                                    raw_chunk_byte_limit,
+                                    parse_in_workers,
+                                },
+                            )?;
+                            drain_copy_file_events(&event_rx, &mut writer)?;
+                            *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
+                            *object_counts
+                                .entry("negotiated_rates".to_string())
+                                .or_insert(0) += rate_count;
+                            let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                            let objects: u64 = object_counts.values().sum();
+                            if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                emit_progress(
+                                    path,
+                                    total_bytes,
+                                    &compressed_bytes_read,
+                                    &object_counts,
+                                    started_at,
+                                    false,
+                                );
+                                while bytes >= next_progress_bytes {
+                                    next_progress_bytes += progress_bytes_interval;
+                                }
+                            } else if progress_objects_interval > 0
+                                && objects >= next_progress_objects
+                            {
+                                emit_progress(
+                                    path,
+                                    total_bytes,
+                                    &compressed_bytes_read,
+                                    &object_counts,
+                                    started_at,
+                                    false,
+                                );
+                                while objects >= next_progress_objects {
+                                    next_progress_objects += progress_objects_interval;
+                                }
                             }
                         }
+                    } else {
+                        let prefixed_reader = PrefixReader::new(prefix, reader);
+                        let mut json_reader = JsonStreamReader::new(prefixed_reader);
+                        json_reader.begin_array().map_err(to_io_error)?;
+                        while json_reader.has_next().map_err(to_io_error)? {
+                            let mut enqueue_io = InNetworkEnqueueIo {
+                                tx: &tx,
+                                event_rx: &event_rx,
+                                writer: &mut writer,
+                                producer_blocked_micros: &mut producer_blocked_micros,
+                                raw_chunk_stats: &mut raw_chunk_stats,
+                            };
+                            let rate_count = enqueue_in_network_struson(
+                                &mut json_reader,
+                                &mut enqueue_io,
+                                InNetworkEnqueueOptions {
+                                    chunk_size: negotiated_rate_chunk_size,
+                                    raw_chunk_byte_limit,
+                                    parse_in_workers,
+                                },
+                            )?;
+                            drain_copy_file_events(&event_rx, &mut writer)?;
+                            *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
+                            *object_counts
+                                .entry("negotiated_rates".to_string())
+                                .or_insert(0) += rate_count;
+                            let bytes = compressed_bytes_read.load(Ordering::Relaxed);
+                            let objects: u64 = object_counts.values().sum();
+                            if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
+                                emit_progress(
+                                    path,
+                                    total_bytes,
+                                    &compressed_bytes_read,
+                                    &object_counts,
+                                    started_at,
+                                    false,
+                                );
+                                while bytes >= next_progress_bytes {
+                                    next_progress_bytes += progress_bytes_interval;
+                                }
+                            } else if progress_objects_interval > 0
+                                && objects >= next_progress_objects
+                            {
+                                emit_progress(
+                                    path,
+                                    total_bytes,
+                                    &compressed_bytes_read,
+                                    &object_counts,
+                                    started_at,
+                                    false,
+                                );
+                                while objects >= next_progress_objects {
+                                    next_progress_objects += progress_objects_interval;
+                                }
+                            }
+                        }
+                        json_reader.end_array().map_err(to_io_error)?;
                     }
-                    json_reader.end_array().map_err(to_io_error)?;
                     in_network_enqueue_seconds += in_network_started_at.elapsed().as_secs_f64();
 
                     drop(tx);
@@ -4557,6 +4949,7 @@ fn scan_compact_byte_top_level_parallel(
                             "in_network_enqueue_seconds": in_network_enqueue_seconds,
                             "worker_join_seconds": worker_join_seconds,
                             "top_level_byte_scan": true,
+                            "raw_rate_byte_capture": parse_in_workers,
                             "elapsed_seconds": started_at.elapsed().as_secs_f64(),
                         }),
                     )?;
@@ -4763,6 +5156,7 @@ fn scan_compact_struson_parallel(
             "event_queue": event_queue_size,
             "split_negotiated_rates": negotiated_rate_chunk_size,
             "raw_chunk_bytes": raw_chunk_byte_limit,
+            "read_buffer_bytes": READ_BUF_SIZE,
             "parse_in_workers": parse_in_workers,
             "provider_refs_in_workers": provider_refs_in_workers,
             "provider_ref_workers": provider_ref_worker_count,
@@ -5922,6 +6316,58 @@ mod tests {
         assert_eq!(provider_map["8"].provider_count, 1);
         assert!(provider_map["7"].npi.is_empty());
         assert!(!provider_map["7"].provider_group_hashes.is_empty());
+    }
+
+    #[test]
+    fn raw_worker_parsers_repair_invalid_utf8_values() {
+        let mut raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"additional_information":"A"#.to_vec();
+        raw_rate.push(0xff);
+        raw_rate.extend_from_slice(br#"B"}]}"#);
+        let rate = read_rate_lite_bytes(&raw_rate).unwrap().unwrap();
+        let expected = format!("A{}B", char::REPLACEMENT_CHARACTER);
+        assert_eq!(
+            rate.prices[0].additional_information.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let paths = CopyPathConfig {
+            compact: None,
+            manifest_serving: None,
+            manifest_provider_forward_sidecar: None,
+            manifest_provider_inverted_sidecar: None,
+            manifest_provider_npi_sidecar: None,
+            manifest_price_forward_sidecar: None,
+            manifest_price_atom: None,
+            manifest_provider_group_member: None,
+            procedure: None,
+            price_code_set: None,
+            price_atom: None,
+            price_set_entry: None,
+            provider_set: None,
+            provider_set_component: None,
+            provider_set_entry: None,
+            provider_entry_component: None,
+            provider_group_member: None,
+            manifest_only: true,
+        };
+        let mut sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let mut provider_map = HashMap::new();
+        let mut raw_ref = br#"{"provider_group_id":"9","provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890],"bad":"A"#.to_vec();
+        raw_ref.push(0xff);
+        raw_ref.extend_from_slice(br#"B"}]}"#);
+
+        let processed = process_provider_ref_raw_batch(
+            &[raw_ref],
+            false,
+            &mut provider_map,
+            &mut sinks,
+            &dedupe,
+        )
+        .unwrap();
+
+        assert_eq!(processed, 1);
+        assert!(provider_map.contains_key("9"));
     }
 
     #[test]
