@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Commit message policy
+        run: python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
       - name: Check public repository hygiene
         run: python scripts/ci/public_hygiene.py
 
