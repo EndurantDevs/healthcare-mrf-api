@@ -22,6 +22,9 @@ import click
 import uvloop
 from asyncpg import connection
 from asyncpg.connection import ServerCapabilities
+from arq.logs import default_log_config
+from arq.utils import import_string
+from arq.worker import run_worker
 from sanic import Sanic
 
 from api import init_api
@@ -85,7 +88,7 @@ def start(host, port, workers, debug, accesslog):
 
 @click.group()
 def server():
-    pass
+    """Server commands."""
 
 
 server.add_command(start)
@@ -112,6 +115,19 @@ cli.add_command(server)
 cli.add_command(process_group, name="start")
 cli.add_command(process_group_end, name="finish")
 cli.add_command(db_group, name="db")
+
+
+@click.command(help="Run a single queued ARQ job and exit.")
+@click.argument("worker_settings", type=str, required=True)
+@click.option("-v", "--verbose", is_flag=True, help=arq.cli.verbose_help)
+@click.option("--custom-log-dict", type=str, help=arq.cli.logdict_help)
+def worker_once(worker_settings: str, verbose: bool, custom_log_dict: str | None) -> None:
+    """Run one job for per-import launcher workers."""
+    sys.path.append(os.getcwd())
+    settings = import_string(worker_settings)
+    log_config = import_string(custom_log_dict) if custom_log_dict else default_log_config(verbose)
+    logging.config.dictConfig(log_config)
+    run_worker(settings, burst=True, max_burst_jobs=1)
 
 
 @click.group()
@@ -264,6 +280,7 @@ def stop_pharmacy_license(burst: bool, import_id: str | None):
 
 
 cli.add_command(stop, name="stop")
+cli.add_command(worker_once, name="worker-once")
 cli.add_command(arq.cli.cli, name="worker")
 cli.add_command(manage, name="manage")
 

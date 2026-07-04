@@ -176,7 +176,7 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(spec)
-    cmd = [sys.executable, str(_main_path()), "worker", spec.worker_class, "--burst"]
+    cmd = _worker_command(sys.executable, spec)
     env = os.environ.copy()
     env["HLTHPRT_ACTIVE_WORKER_CLASS"] = spec.worker_class
     env["HLTHPRT_ACTIVE_WORKER_QUEUE"] = spec.queue
@@ -222,7 +222,7 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         "pid": pid if running else None,
         "pid_path": str(_pid_path(spec)),
         "log_path": str(_log_path(spec)),
-        "command": " ".join([sys.executable, str(_main_path()), "worker", spec.worker_class, "--burst"]),
+        "command": " ".join(_worker_command(sys.executable, spec)),
     }
 
 
@@ -386,7 +386,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         "running": False,
         "pid": None,
         "launcher": "kubernetes",
-        "command": " ".join([_worker_python(), str(_main_path()), "worker", spec.worker_class, "--burst"]),
+        "command": " ".join(_worker_command(_worker_python(), spec)),
     }
     if not _kubernetes_configured():
         return {**base, "job_name": _worker_job_name(spec, payload or {}), "job_status": "unconfigured"}
@@ -455,7 +455,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
         "image": image,
         "imagePullPolicy": os.getenv("HLTHPRT_WORKER_JOB_IMAGE_PULL_POLICY", "IfNotPresent"),
         "workingDir": str(_repo_root()),
-        "command": [_worker_python(), str(_main_path()), "worker", spec.worker_class, "--burst"],
+        "command": _worker_command(_worker_python(), spec),
         "env": env,
         "securityContext": _worker_job_container_security_context(),
     }
@@ -706,6 +706,12 @@ def _worker_python() -> str:
     return os.getenv("HLTHPRT_WORKER_JOB_PYTHON", "/opt/venv/bin/python")
 
 
+def _worker_command(python: str, spec: WorkerSpec) -> list[str]:
+    if spec.role == "start" and spec.worker_class.startswith("process.PTG"):
+        return [python, str(_main_path()), "worker-once", spec.worker_class]
+    return [python, str(_main_path()), "worker", spec.worker_class, "--burst"]
+
+
 def _kubernetes_namespace() -> str:
     override = os.getenv("HLTHPRT_WORKER_JOB_NAMESPACE", "").strip()
     if override:
@@ -861,7 +867,7 @@ def _process_matches_worker_spec(process_text: str, spec: WorkerSpec) -> bool:
         return False
     parts = process_text.split()
     for index, part in enumerate(parts[:-2]):
-        if part.endswith("main.py") and parts[index + 1] == "worker" and parts[index + 2] == spec.worker_class:
+        if part.endswith("main.py") and parts[index + 1] in {"worker", "worker-once"} and parts[index + 2] == spec.worker_class:
             return True
     return False
 

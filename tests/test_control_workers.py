@@ -126,7 +126,7 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
 
     assert result["status"] == "started"
     assert result["items"][0]["worker_class"] == "process.PTGSmall"
-    assert captured["cmd"][-2:] == ["process.PTGSmall", "--burst"]
+    assert captured["cmd"][-2:] == ["worker-once", "process.PTGSmall"]
     assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert captured["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
 
@@ -261,6 +261,7 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
         "requests": {"cpu": "2", "memory": "4Gi"},
         "limits": {"cpu": "4", "memory": "8Gi"},
     }
+    assert container["command"][-2:] == ["worker-once", "process.PTGSmall"]
     env = {item["name"]: item["value"] for item in container["env"]}
     assert env["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert env["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
@@ -472,3 +473,19 @@ def test_find_running_pid_requires_exact_worker_class(monkeypatch):
 
     assert control_workers._find_running_pid(start_spec) == 222
     assert control_workers._find_running_pid(finish_spec) == 111
+
+
+def test_find_running_pid_matches_ptg_worker_once(monkeypatch):
+    output = """
+111 /opt/python main.py worker-once process.PTGSmall HLTHPRT_IMPORT_NODE_ID=local_mrf
+222 /opt/python main.py worker process.PTGNormal --burst HLTHPRT_IMPORT_NODE_ID=local_mrf
+"""
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
+    monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
+
+    small_spec = control_workers._BY_QUEUE["arq:PTGSmall"]
+    normal_spec = control_workers._BY_QUEUE["arq:PTGNormal"]
+
+    assert control_workers._find_running_pid(small_spec) == 111
+    assert control_workers._find_running_pid(normal_spec) == 222

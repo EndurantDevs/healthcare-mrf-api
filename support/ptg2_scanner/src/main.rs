@@ -6297,6 +6297,7 @@ mod tests {
         let raw_refs = vec![
             br#"{"provider_group_id":"7","provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,1234567891]}]}"#.to_vec(),
             br#"{"provider_group_id":8,"provider_groups":[{"tin":{"type":"npi","value":"9876543210"},"npi":["2222222222"]}]}"#.to_vec(),
+            br#"{"provider_group_id":121591448686103182592848195376305442061,"provider_groups":[{"tin":{"type":"ein","value":"462560124"},"npi":[1265502504]}]}"#.to_vec(),
         ];
 
         let processed = process_provider_ref_raw_batch(
@@ -6308,12 +6309,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(processed, 2);
-        assert_eq!(provider_map.len(), 2);
+        assert_eq!(processed, 3);
+        assert_eq!(provider_map.len(), 3);
         assert!(provider_map.contains_key("7"));
         assert!(provider_map.contains_key("8"));
+        assert!(provider_map.contains_key(
+            "121591448686103182592848195376305442061"
+        ));
         assert_eq!(provider_map["7"].provider_count, 2);
         assert_eq!(provider_map["8"].provider_count, 1);
+        assert_eq!(
+            provider_map["121591448686103182592848195376305442061"].provider_count,
+            1
+        );
         assert!(provider_map["7"].npi.is_empty());
         assert!(!provider_map["7"].provider_group_hashes.is_empty());
     }
