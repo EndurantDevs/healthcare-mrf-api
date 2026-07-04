@@ -65,14 +65,14 @@ def _is_truthy(value: Any) -> bool:
 
 
 def _dedupe_preserve(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
+    seen_values: set[str] = set()
+    deduped_values: list[str] = []
     for value in values:
-        if value in seen:
+        if value in seen_values:
             continue
-        seen.add(value)
-        output.append(value)
-    return output
+        seen_values.add(value)
+        deduped_values.append(value)
+    return deduped_values
 
 
 def _without_query(url: str) -> str:
@@ -104,7 +104,7 @@ def _uhc_toc_url_candidates(url: str) -> list[str]:
     return _dedupe_preserve(candidates)
 
 
-async def _toc_head_ok(url: str) -> bool:
+async def _is_toc_head_reachable(url: str) -> bool:
     from process.ptg_parts.source_download import fetch_head_metadata
 
     await fetch_head_metadata(url)
@@ -119,7 +119,7 @@ async def _resolve_toc_url(url: str, *, refresh_toc_urls: bool) -> str:
         return url
     for candidate in candidates:
         try:
-            if await _toc_head_ok(candidate):
+            if await _is_toc_head_reachable(candidate):
                 return candidate
         except Exception:
             continue

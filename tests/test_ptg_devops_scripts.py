@@ -50,13 +50,13 @@ def test_ptg_rebuild_expands_uhc_toc_url_candidates():
 
 def test_ptg_rebuild_uses_first_reachable_uhc_toc_candidate(monkeypatch):
     module = _load_script("ptg2_rebuild_snapshot_from_options")
-    checked = []
+    checked_urls = []
 
-    async def fake_head_ok(url):
-        checked.append(url)
+    async def is_toc_head_reachable(url):
+        checked_urls.append(url)
         return "blobs/download" in url
 
-    monkeypatch.setattr(module, "_toc_head_ok", fake_head_ok)
+    monkeypatch.setattr(module, "_is_toc_head_reachable", is_toc_head_reachable)
 
     resolved = asyncio.run(
         module._resolve_toc_url(
@@ -66,7 +66,7 @@ def test_ptg_rebuild_uses_first_reachable_uhc_toc_candidate(monkeypatch):
     )
 
     assert resolved == "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/2026-07-01/example_index.json"
-    assert checked == [
+    assert checked_urls == [
         "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json?sig=stale",
         "https://mrfstore.uhc.com/public-mrf/2026-07-01/example_index.json",
         "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/download/2026-07-01/example_index.json",

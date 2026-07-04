@@ -2353,6 +2353,7 @@ async def main(
     current_pointer_published = False
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
+        """Persist import failure state and drop unpublished source-scoped staging tables."""
         error_text = str(error) or "worker task was cancelled"
         write_live_progress(
             status="failed",
@@ -2503,7 +2504,7 @@ async def main(
                 break
             if job.get("type") in {"in_network", "allowed_amounts"}:
                 selected_jobs.append(job)
-        processed_files = 0
+        processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
         for progress_index, job in enumerate(selected_jobs):
             job["_ptg_progress_index"] = progress_index
@@ -2533,29 +2534,27 @@ async def main(
         processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
 
         async def record_file_result(result: PTG2FileProcessResult | None) -> None:
-            nonlocal processed_files
             if result is None:
                 return
             if result.success:
                 if result.skipped:
                     skipped_files.append(asdict(result))
                 else:
-                    processed_files += 1
+                    processed_file_count_map["done"] += 1
                     successful_files.append(asdict(result))
                     if attempted_files:
                         write_live_progress(
                             phase="processing files",
                             unit="files",
-                            done=processed_files,
+                            done=processed_file_count_map["done"],
                             total=attempted_files,
-                            pct=min(90.0, 20.0 + (processed_files / attempted_files) * 70.0),
-                            message=f"processed {processed_files} of {attempted_files} PTG file(s)",
+                            pct=min(90.0, 20.0 + (processed_file_count_map["done"] / attempted_files) * 70.0),
+                            message=f"processed {processed_file_count_map['done']} of {attempted_files} PTG file(s)",
                         )
             else:
                 failed_files.append(asdict(result))
 
         async def drain_processing_tasks(*, force: bool = False) -> None:
-            nonlocal processing_tasks
             if not processing_tasks:
                 return
             if force:
@@ -2564,7 +2563,8 @@ async def main(
                 return
             else:
                 done, pending = await asyncio.wait(processing_tasks, return_when=asyncio.FIRST_COMPLETED)
-            processing_tasks = set(pending)
+            processing_tasks.clear()
+            processing_tasks.update(pending)
             for task in done:
                 await record_file_result(task.result())
 
@@ -2687,7 +2687,7 @@ async def main(
             "duplicate_jobs_skipped": duplicate_jobs_skipped,
             "duplicate_raw_files_skipped": duplicate_raw_files_skipped,
             "files_attempted": attempted_files,
-            "files_processed": processed_files,
+            "files_processed": processed_file_count_map["done"],
             "files_failed": len(failed_files),
             "files_skipped": len(skipped_files),
             "successful_files": successful_files,
@@ -2697,7 +2697,7 @@ async def main(
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
         }
-        if jobs and processed_files == 0:
+        if jobs and processed_file_count_map["done"] == 0:
             raise RuntimeError(
                 f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
             )
@@ -2891,7 +2891,7 @@ async def main(
             f"\timport_run_id={import_run_id}"
             f"\tsnapshot_id={snapshot_id}"
             f"\tstatus={PTG2_STATUS_VALIDATED}"
-            f"\tfiles_processed={processed_files}"
+            f"\tfiles_processed={processed_file_count_map['done']}"
             f"\tfiles_failed={len(failed_files)}"
             f"\tserving_rates={report_payload.get('serving_rates', 'unknown')}"
             f"\ttotal_seconds={timing_payload['total_seconds']:.2f}"
@@ -2906,7 +2906,7 @@ async def main(
             status="succeeded",
             phase="succeeded",
             unit="files",
-            done=processed_files,
+            done=processed_file_count_map["done"],
             total=attempted_files,
             pct=100,
             eta_seconds=0,
@@ -2923,7 +2923,7 @@ async def main(
             "duplicate_jobs_skipped": duplicate_jobs_skipped,
             "duplicate_raw_files_skipped": duplicate_raw_files_skipped,
             "files_attempted": attempted_files,
-            "files_processed": processed_files,
+            "files_processed": processed_file_count_map["done"],
             "files_failed": len(failed_files),
             "files_skipped": len(skipped_files),
             "serving_rates": report_payload.get("serving_rates"),

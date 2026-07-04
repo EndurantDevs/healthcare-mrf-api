@@ -2893,7 +2893,7 @@ def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
     async def fake_status(statement):
         statements.append(statement)
 
-    async def fake_scalar(_statement, **_params):
+    async def is_table_present(_statement, **_params):
         return True
 
     model = SimpleNamespace(
@@ -2902,7 +2902,7 @@ def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
         __my_additional_indexes__=[],
         __table__=SimpleNamespace(primary_key=[SimpleNamespace(name="id")]),
     )
-    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_ptg.db, "scalar", is_table_present)
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
 
     asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
@@ -2910,10 +2910,34 @@ def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
     assert not any("example_ptg_table_idx_primary" in statement for statement in statements)
 
 
+def test_ptg2_ensure_indexes_ignores_concurrent_create_index_race(monkeypatch):
+    async def fake_status(_statement):
+        raise RuntimeError(
+            'duplicate key value violates unique constraint "pg_class_relname_nsp_index" '
+            "DETAIL: Key (relname, relnamespace)=(example_payment_idx, 123) already exists."
+        )
+
+    async def is_table_present(_statement, **_params):
+        return True
+
+    model = SimpleNamespace(
+        __tablename__="example_ptg_table",
+        __my_index_elements__=[],
+        __my_additional_indexes__=[
+            {"name": "example_payment_idx", "index_elements": ("payment_hash",)},
+        ],
+        __table__=SimpleNamespace(primary_key=[]),
+    )
+    monkeypatch.setattr(process_ptg.db, "scalar", is_table_present)
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+
+    asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
+
+
 def test_ptg2_ensure_indexes_skips_missing_optional_table(monkeypatch):
     statements = []
 
-    async def fake_scalar(_statement, **_params):
+    async def is_table_present(_statement, **_params):
         return False
 
     async def fake_status(statement):
@@ -2927,7 +2951,7 @@ def test_ptg2_ensure_indexes_skips_missing_optional_table(monkeypatch):
         ],
         __table__=SimpleNamespace(primary_key=[]),
     )
-    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_ptg.db, "scalar", is_table_present)
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
 
     asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
@@ -5292,15 +5316,14 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
 
 
 def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
-    transaction_started = False
+    transaction_started_map = {"value": False}
 
     async def fake_source_plan_rows(**_kwargs):
         raise RuntimeError("plan resolution failed")
 
     class FakeTransaction:
         async def __aenter__(self):
-            nonlocal transaction_started
-            transaction_started = True
+            transaction_started_map["value"] = True
             return object()
 
         async def __aexit__(self, exc_type, exc, tb):
@@ -5321,7 +5344,7 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
             )
         )
 
-    assert transaction_started is False
+    assert transaction_started_map["value"] is False
 
 
 def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():

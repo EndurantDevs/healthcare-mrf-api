@@ -2753,7 +2753,7 @@ async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monke
     monkeypatch.setattr(entity_address_unified, "_support_stage_classes", lambda _import_date: {})
     monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
 
-    ctx = {
+    shutdown_payload_map = {
         "import_date": "20260614",
         "context": {
             "run": 1,
@@ -2773,7 +2773,7 @@ async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monke
         },
     }
 
-    await entity_address_unified.shutdown(ctx)
+    await entity_address_unified.shutdown(shutdown_payload_map)
 
     joined = "\n".join(statements)
     assert "DELETE FROM" not in joined

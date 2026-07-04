@@ -94,7 +94,7 @@ PTG2_MODEL_CLASSES = (
 )
 
 
-async def _table_exists(obj, db_schema: str) -> bool:
+async def _is_ptg_table_present(obj, db_schema: str) -> bool:
     relation_name = f"{db_schema}.{obj.__tablename__}"
     try:
         return bool(
@@ -109,7 +109,7 @@ async def _table_exists(obj, db_schema: str) -> bool:
 
 
 async def _ensure_indexes(obj, db_schema: str) -> None:
-    if not await _table_exists(obj, db_schema):
+    if not await _is_ptg_table_present(obj, db_schema):
         logger.warning("Skipping PTG index ensure for missing table %s.%s", db_schema, obj.__tablename__)
         return
     if _env_bool(
@@ -138,9 +138,10 @@ async def _ensure_indexes(obj, db_schema: str) -> None:
             logger.debug("Skipping duplicate primary unique index ensure for %s", obj.__tablename__)
         else:
             cols = ", ".join(index_elements)
-            await db.status(
+            await _create_index_if_not_exists(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
-                + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
+                + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});",
+                index_name=f"{obj.__tablename__}_idx_primary",
             )
     if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
         for idx in obj.__my_additional_indexes__:
@@ -161,7 +162,28 @@ async def _ensure_indexes(obj, db_schema: str) -> None:
             if where:
                 statement += f" WHERE {where}"
             statement += ";"
-            await db.status(statement)
+            await _create_index_if_not_exists(statement, index_name=name)
+
+
+async def _create_index_if_not_exists(statement: str, *, index_name: str) -> None:
+    try:
+        await db.status(statement)
+    except Exception as exc:
+        if _is_concurrent_index_exists_race(exc, index_name):
+            logger.info("Skipping concurrent PTG index ensure race for %s", index_name)
+            return
+        raise
+
+
+def _is_concurrent_index_exists_race(exc: Exception, index_name: str) -> bool:
+    message = str(exc).lower()
+    normalized_name = str(index_name or "").lower()
+    if normalized_name and normalized_name not in message:
+        return False
+    return (
+        "duplicate key value violates unique constraint" in message
+        and "pg_class_relname_nsp_index" in message
+    ) or "already exists" in message
 
 
 async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
