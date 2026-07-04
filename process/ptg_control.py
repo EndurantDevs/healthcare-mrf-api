@@ -89,6 +89,16 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         await mark_control_run(run_id, status="canceled", phase_detail="ptg import canceled", progress_message="canceled")
         await _flush_terminal_status_events()
         return {"status": "canceled", "run_id": run_id}
+    except asyncio.CancelledError:
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail="ptg import interrupted",
+            progress_message="interrupted",
+            error={"code": "import_interrupted", "message": "worker task was cancelled"},
+        )
+        await _flush_terminal_status_events()
+        raise
     except Exception as exc:
         await mark_control_run(
             run_id,

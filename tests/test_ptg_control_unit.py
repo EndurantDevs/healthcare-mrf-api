@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
+
 import pytest
 
 from process import ptg_control
@@ -43,6 +45,41 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     assert calls[0]["max_files"] == 1
     assert calls[0]["control_run_id"] == "run_ptg"
     assert [kwargs["status"] for _args, kwargs in marks] == ["running", "succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_start_marks_failed_and_reraises_cancelled_ptg_main(monkeypatch):
+    marks = []
+    flushes = []
+
+    async def fake_ptg_main(**_kwargs):
+        raise asyncio.CancelledError()
+
+    async def fake_mark_control_run(*args, **kwargs):
+        marks.append((args, kwargs))
+
+    async def fake_flush_terminal_status_events():
+        flushes.append(True)
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", fake_flush_terminal_status_events)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ptg_control.ptg_control_start(
+            {},
+            {"run_id": "run_ptg", "params": {"test_mode": True, "source_key": "demo_source"}},
+        )
+
+    assert [kwargs["status"] for _args, kwargs in marks] == ["running", "failed"]
+    failed_mark = marks[-1][1]
+    assert failed_mark["phase_detail"] == "ptg import interrupted"
+    assert failed_mark["progress_message"] == "interrupted"
+    assert failed_mark["error"] == {
+        "code": "import_interrupted",
+        "message": "worker task was cancelled",
+    }
+    assert flushes == [True]
 
 
 @pytest.mark.asyncio

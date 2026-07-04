@@ -2351,6 +2351,40 @@ async def main(
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
     current_pointer_published = False
+
+    async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
+        error_text = str(error) or "worker task was cancelled"
+        write_live_progress(
+            status="failed",
+            phase="failed",
+            pct=100,
+            eta_seconds=0,
+            message=progress_message or f"PTG import failed: {error_text}",
+        )
+        if source_scoped_compact and not current_pointer_published:
+            serving_index = failure_report.get("serving_index")
+            try:
+                await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
+                if ptg2_manifest_stage_table:
+                    await _drop_ptg2_snapshot_table_names(
+                        [
+                            ptg2_manifest_stage_table,
+                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
+                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
+                        ]
+                    )
+            except Exception:
+                logger.debug("Failed to clean PTG2 source-scoped tables for failed import", exc_info=True)
+        await _mark_ptg2_import_failed(
+            import_run_id,
+            snapshot_id,
+            import_month_value,
+            now,
+            error_text,
+            report=failure_report,
+            options=options_payload,
+        )
+
     try:
         assert source_key_val is not None
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
@@ -2897,37 +2931,14 @@ async def main(
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
         }
+    except asyncio.CancelledError:
+        await mark_import_failed(
+            "worker task was cancelled",
+            progress_message="PTG import interrupted: worker task was cancelled",
+        )
+        raise
     except Exception as exc:
-        write_live_progress(
-            status="failed",
-            phase="failed",
-            pct=100,
-            eta_seconds=0,
-            message=f"PTG import failed: {exc}",
-        )
-        if source_scoped_compact and not current_pointer_published:
-            serving_index = failure_report.get("serving_index")
-            try:
-                await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
-                if ptg2_manifest_stage_table:
-                    await _drop_ptg2_snapshot_table_names(
-                        [
-                            ptg2_manifest_stage_table,
-                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
-                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
-                        ]
-                    )
-            except Exception:
-                logger.debug("Failed to clean PTG2 source-scoped tables for failed import", exc_info=True)
-        await _mark_ptg2_import_failed(
-            import_run_id,
-            snapshot_id,
-            import_month_value,
-            now,
-            exc,
-            report=failure_report,
-            options=options_payload,
-        )
+        await mark_import_failed(exc)
         raise
     finally:
         reset_live_progress_context(live_token)
