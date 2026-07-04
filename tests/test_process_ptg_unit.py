@@ -4858,9 +4858,13 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
     assert result["price_atom_table_layout"] == "lean_dict_v1"
     assert result["price_atom_dictionary_table"].startswith("mrf.ptg2_price_atom_dict_")
     assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_price_atom_dict_" in joined
-    assert "negotiated_type_key integer NOT NULL" in joined
-    assert "service_code_key integer NOT NULL" in joined
-    assert "billing_code_modifier_key integer NOT NULL" in joined
+    assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_price_atom_" in joined
+    assert "price_atom.price_atom_global_id_128::uuid AS price_atom_global_id_128" in joined
+    assert "negotiated_type.attr_key::integer AS negotiated_type_key" in joined
+    assert "service_code.attr_key::integer AS service_code_key" in joined
+    assert "billing_code_modifier.attr_key::integer AS billing_code_modifier_key" in joined
+    assert "INSERT INTO \"mrf\".\"ptg2_price_atom_" not in joined
+    assert "ALTER COLUMN price_atom_global_id_128 SET NOT NULL" in joined
     assert "RENAME TO \"ptg2_price_atom_" in joined
     assert "CREATE UNIQUE INDEX" in joined
 

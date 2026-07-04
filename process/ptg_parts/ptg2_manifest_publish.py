@@ -890,42 +890,17 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     )
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} (
-            price_atom_global_id_128 {id_type} NOT NULL,
-            negotiated_type_key integer NOT NULL,
-            negotiated_rate varchar(64),
-            expiration_date_key integer NOT NULL,
-            service_code_key integer NOT NULL,
-            billing_class_key integer NOT NULL,
-            setting_key integer NOT NULL,
-            billing_code_modifier_key integer NOT NULL,
-            additional_information_key integer NOT NULL
-        );
-        """
-    )
-    await db.status(
-        f"""
-        INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(lean_table)} (
-            price_atom_global_id_128,
-            negotiated_type_key,
-            negotiated_rate,
-            expiration_date_key,
-            service_code_key,
-            billing_class_key,
-            setting_key,
-            billing_code_modifier_key,
-            additional_information_key
-        )
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
-            price_atom.price_atom_global_id_128,
-            negotiated_type.attr_key,
-            price_atom.negotiated_rate,
-            expiration_date.attr_key,
-            service_code.attr_key,
-            billing_class.attr_key,
-            setting.attr_key,
-            billing_code_modifier.attr_key,
-            additional_information.attr_key
+            price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128,
+            negotiated_type.attr_key::integer AS negotiated_type_key,
+            price_atom.negotiated_rate::varchar(64) AS negotiated_rate,
+            expiration_date.attr_key::integer AS expiration_date_key,
+            service_code.attr_key::integer AS service_code_key,
+            billing_class.attr_key::integer AS billing_class_key,
+            setting.attr_key::integer AS setting_key,
+            billing_code_modifier.attr_key::integer AS billing_code_modifier_key,
+            additional_information.attr_key::integer AS additional_information_key
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} price_atom
         JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} negotiated_type
           ON negotiated_type.attr_kind = 'negotiated_type'
@@ -948,6 +923,19 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} additional_information
           ON additional_information.attr_kind = 'additional_information'
          AND additional_information.text_value IS NOT DISTINCT FROM price_atom.additional_information;
+        """
+    )
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)}
+            ALTER COLUMN price_atom_global_id_128 SET NOT NULL,
+            ALTER COLUMN negotiated_type_key SET NOT NULL,
+            ALTER COLUMN expiration_date_key SET NOT NULL,
+            ALTER COLUMN service_code_key SET NOT NULL,
+            ALTER COLUMN billing_class_key SET NOT NULL,
+            ALTER COLUMN setting_key SET NOT NULL,
+            ALTER COLUMN billing_code_modifier_key SET NOT NULL,
+            ALTER COLUMN additional_information_key SET NOT NULL;
         """
     )
     await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
