@@ -858,8 +858,6 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
 
     job_payload = _adapter_payload(adapter, row, params)
     kwargs = {"_queue_name": adapter["queue"]}
-    if adapter.get("function") in {"control_single_job_start", "ptg_control_start"}:
-        kwargs["_max_tries"] = 1
     if adapter.get("job_prefix"):
         kwargs["_job_id"] = f"{adapter['job_prefix']}_{row['run_id']}"
     try:
@@ -995,14 +993,14 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         cancel_signal = await _set_cancel_flag(run_id)
         cancel_signal["kubernetes"] = await _delete_active_worker_jobs(current)
     metrics["cancel_signal"] = cancel_signal
-    terminalized_active_worker = _cancel_signal_terminalized_active_worker(cancel_signal)
+    has_terminalized_active_worker = _has_terminalized_active_worker_cancel_signal(cancel_signal)
     canceled_before_start = pending_adapter or queued_arq
-    canceled_now = canceled_before_start or terminalized_active_worker
+    canceled_now = canceled_before_start or has_terminalized_active_worker
     status = "canceled" if canceled_now else "canceling"
     phase_detail = "cancel requested"
     if canceled_before_start:
         phase_detail = "canceled before start"
-    elif terminalized_active_worker:
+    elif has_terminalized_active_worker:
         phase_detail = "canceled active worker"
     progress = {
         "unit": "run",
@@ -1030,7 +1028,7 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     return updated
 
 
-def _cancel_signal_terminalized_active_worker(cancel_signal: dict[str, Any]) -> bool:
+def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any]) -> bool:
     kubernetes = cancel_signal.get("kubernetes") if isinstance(cancel_signal, dict) else None
     if not isinstance(kubernetes, dict) or not kubernetes.get("enabled"):
         return False

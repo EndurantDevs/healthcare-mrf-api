@@ -4,6 +4,7 @@ import asyncio
 import os
 
 import click
+from arq.worker import func as arq_func
 
 try:
     import uvloop
@@ -27,7 +28,7 @@ from process.attributes import (process_attributes, process_benefits,
                                 save_attributes)
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
-from process.control_lifecycle import control_single_job_start
+from process.control_lifecycle import control_single_job_start as _control_single_job_start
 from process.ext.utils import db_startup
 from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
@@ -139,6 +140,9 @@ from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
 
+control_single_job_start = arq_func(_control_single_job_start, max_tries=1)
+
+
 class MRF:
     functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
@@ -173,7 +177,7 @@ def _ptg_queue_read_limit(name: str, max_jobs: int) -> int:
         try:
             return max(int(raw), 1)
         except ValueError:
-            pass
+            return max(16, 4 * max_jobs)
     return max(16, 4 * max_jobs)
 
 
@@ -185,9 +189,7 @@ def _ptg_job_timeout(name: str | None = None) -> int:
 
 
 def _ptg_control_functions(timeout: int):
-    from arq.worker import func as arq_func
-
-    return [arq_func(ptg_control_start, timeout=timeout)]
+    return [arq_func(ptg_control_start, timeout=timeout, max_tries=1)]
 
 
 class PTG:

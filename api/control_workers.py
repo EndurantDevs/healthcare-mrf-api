@@ -268,12 +268,13 @@ def _delete_kubernetes_job(namespace: str, job_name: str) -> None:
     _kubernetes_request("DELETE", f"/apis/batch/v1/namespaces/{namespace}/jobs/{encoded}", body)
 
 
-def delete_kubernetes_worker_jobs(payload: dict[str, Any]) -> dict[str, Any]:
+def delete_kubernetes_worker_jobs(cancel_request: dict[str, Any]) -> dict[str, Any]:
+    """Delete active Kubernetes worker jobs matching a cancel request."""
     if _launcher_mode() != "kubernetes":
         return {"enabled": False, "launcher": _launcher_mode(), "deleted": 0}
 
-    specs = _resolve_specs(payload)
-    if not specs:
+    worker_specs = _resolve_specs(cancel_request)
+    if not worker_specs:
         return {"enabled": True, "deleted": 0, "reason": "no matching worker spec"}
 
     namespace = _kubernetes_namespace()
@@ -285,60 +286,95 @@ def delete_kubernetes_worker_jobs(payload: dict[str, Any]) -> dict[str, Any]:
             "error": "kubernetes worker launcher is not configured",
         }
 
-    items: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    for spec in specs:
-        selector = _kubernetes_label_selector(spec, payload)
-        path = f"/apis/batch/v1/namespaces/{namespace}/jobs?{urllib.parse.urlencode({'labelSelector': selector})}"
-        try:
-            body = _kubernetes_request("GET", path)
-        except _KubernetesApiError as exc:
-            errors.append({"worker_class": spec.worker_class, "status": exc.status, "error": str(exc)})
-            continue
+    deletion_records: list[dict[str, Any]] = []
+    deletion_errors: list[dict[str, Any]] = []
+    for worker_spec in worker_specs:
+        worker_records, worker_errors = _delete_kubernetes_worker_jobs_for_spec(namespace, worker_spec, cancel_request)
+        deletion_records.extend(worker_records)
+        deletion_errors.extend(worker_errors)
 
-        jobs = [item for item in (body.get("items") if isinstance(body, dict) else []) if isinstance(item, dict)]
-        for job in jobs:
-            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
-            job_name = str(metadata.get("name") or "").strip()
-            if not job_name:
-                continue
-            status = job.get("status") if isinstance(job.get("status"), dict) else {}
-            active = int(status.get("active") or 0)
-            succeeded = int(status.get("succeeded") or 0)
-            failed = int(status.get("failed") or 0)
-            if not active and (succeeded or failed):
-                items.append(
-                    {"job_name": job_name, "worker_class": spec.worker_class, "deleted": False, "reason": "terminal"}
-                )
-                continue
-            try:
-                _delete_kubernetes_job(namespace, job_name)
-            except _KubernetesApiError as exc:
-                if exc.status == 404:
-                    items.append(
-                        {
-                            "job_name": job_name,
-                            "worker_class": spec.worker_class,
-                            "deleted": False,
-                            "reason": "not_found",
-                        }
-                    )
-                    continue
-                errors.append(
-                    {"job_name": job_name, "worker_class": spec.worker_class, "status": exc.status, "error": str(exc)}
-                )
-                continue
-            items.append({"job_name": job_name, "worker_class": spec.worker_class, "deleted": True})
-
-    result: dict[str, Any] = {
+    delete_summary_dict: dict[str, Any] = {
         "enabled": True,
         "namespace": namespace,
-        "deleted": sum(1 for item in items if item.get("deleted")),
-        "items": items,
+        "deleted": sum(1 for deletion_record in deletion_records if deletion_record.get("deleted")),
+        "items": deletion_records,
     }
-    if errors:
-        result["errors"] = errors
-    return result
+    if deletion_errors:
+        delete_summary_dict["errors"] = deletion_errors
+    return delete_summary_dict
+
+
+def _delete_kubernetes_worker_jobs_for_spec(
+    namespace: str,
+    worker_spec: WorkerSpec,
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Delete cancelable jobs for one worker spec and collect API errors."""
+    selector = _kubernetes_label_selector(worker_spec, payload)
+    path = f"/apis/batch/v1/namespaces/{namespace}/jobs?{urllib.parse.urlencode({'labelSelector': selector})}"
+    try:
+        body = _kubernetes_request("GET", path)
+    except _KubernetesApiError as exc:
+        return [], [{"worker_class": worker_spec.worker_class, "status": exc.status, "error": str(exc)}]
+
+    deletion_records: list[dict[str, Any]] = []
+    deletion_errors: list[dict[str, Any]] = []
+    for job_record in _kubernetes_job_records(body):
+        deletion_record, deletion_error = _delete_kubernetes_worker_job(namespace, worker_spec, job_record)
+        if deletion_record:
+            deletion_records.append(deletion_record)
+        if deletion_error:
+            deletion_errors.append(deletion_error)
+    return deletion_records, deletion_errors
+
+
+def _kubernetes_job_records(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return Kubernetes Job records from a list response body."""
+    raw_records = body.get("items") if isinstance(body, dict) else []
+    return [record for record in raw_records if isinstance(record, dict)]
+
+
+def _delete_kubernetes_worker_job(
+    namespace: str,
+    worker_spec: WorkerSpec,
+    job_record: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Delete one active job or report why it was left alone."""
+    metadata = job_record.get("metadata") if isinstance(job_record.get("metadata"), dict) else {}
+    job_name = str(metadata.get("name") or "").strip()
+    if not job_name:
+        return None, None
+    status = job_record.get("status") if isinstance(job_record.get("status"), dict) else {}
+    active_count = int(status.get("active") or 0)
+    succeeded_count = int(status.get("succeeded") or 0)
+    failed_count = int(status.get("failed") or 0)
+    if not active_count and (succeeded_count or failed_count):
+        return _kubernetes_delete_record(job_name, worker_spec, deleted=False, reason="terminal"), None
+    try:
+        _delete_kubernetes_job(namespace, job_name)
+    except _KubernetesApiError as exc:
+        if exc.status == 404:
+            return _kubernetes_delete_record(job_name, worker_spec, deleted=False, reason="not_found"), None
+        return None, {"job_name": job_name, "worker_class": worker_spec.worker_class, "status": exc.status, "error": str(exc)}
+    return _kubernetes_delete_record(job_name, worker_spec, deleted=True), None
+
+
+def _kubernetes_delete_record(
+    job_name: str,
+    worker_spec: WorkerSpec,
+    *,
+    deleted: bool,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Build the public delete summary for one Kubernetes worker job."""
+    deletion_summary_dict: dict[str, Any] = {
+        "job_name": job_name,
+        "worker_class": worker_spec.worker_class,
+        "deleted": deleted,
+    }
+    if reason:
+        deletion_summary_dict["reason"] = reason
+    return deletion_summary_dict
 
 
 def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -390,7 +426,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
 
 
 def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str:
-    labels = {
+    selector_label_map = {
         "app.kubernetes.io/managed-by": "healthporta-worker-launcher",
         "healthporta.com/engine": _ENGINE_LABEL,
         "healthporta.com/worker-class-hash": _label_hash(spec.worker_class),
@@ -398,8 +434,8 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     }
     run_id = str(payload.get("run_id") or "").strip()
     if run_id:
-        labels["healthporta.com/run-id-hash"] = _label_hash(run_id)
-    return ",".join(f"{key}={value}" for key, value in labels.items())
+        selector_label_map["healthporta.com/run-id-hash"] = _label_hash(run_id)
+    return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
 def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) -> dict[str, Any]:
@@ -844,7 +880,7 @@ def _remove_stale_pid(spec: WorkerSpec) -> None:
     try:
         _pid_path(spec).unlink()
     except OSError:
-        pass
+        return
 
 
 def _repo_root() -> Path:
