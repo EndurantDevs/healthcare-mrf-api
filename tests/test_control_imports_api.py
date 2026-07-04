@@ -1352,6 +1352,65 @@ async def test_request_cancel_marks_running_run_canceling(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_request_cancel_records_kubernetes_worker_job_deletion(monkeypatch):
+    calls = {"get": 0}
+    executed: list[dict[str, object]] = []
+    current = {
+        "run_id": "run_ptg",
+        "importer": "ptg",
+        "status": "running",
+        "progress": {"pct": 25},
+        "metrics": {"queue": "arq:PTGLarge", "worker_class": "process.PTGLarge"},
+        "params": {"resource_class": "large"},
+        "finished_at": None,
+    }
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeDb:
+        async def execute(self, statement):
+            executed.append(statement.compile().params)
+            return FakeResult()
+
+    async def fake_get(_run_id):
+        calls["get"] += 1
+        if calls["get"] == 1:
+            return current
+        return {**current, "status": "canceling", "metrics": executed[-1]["metrics"]}
+
+    async def fake_set_cancel_flag(run_id):
+        return {"redis": True, "key": f"cancel:{run_id}", "ttl_seconds": 10}
+
+    async def fake_delete_active_worker_jobs(run):
+        assert control_imports._active_worker_cancel_payload(run) == {
+            "run_id": "run_ptg",
+            "importer": "ptg",
+            "status": "running",
+            "queue": "arq:PTGLarge",
+            "worker_class": "process.PTGLarge",
+            "resource_class": "large",
+        }
+        return {"enabled": True, "namespace": "healthporta-dev", "deleted": 1}
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
+    monkeypatch.setattr(control_imports, "_delete_active_worker_jobs", fake_delete_active_worker_jobs)
+
+    result = await control_imports.request_cancel("run_ptg")
+
+    assert result["status"] == "canceling"
+    assert result["metrics"]["cancel_signal"]["redis"] is True
+    assert result["metrics"]["cancel_signal"]["kubernetes"] == {
+        "enabled": True,
+        "namespace": "healthporta-dev",
+        "deleted": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_request_cancel_rejects_running_non_cancelable_importer(monkeypatch):
     async def fake_get(_run_id):
         return {

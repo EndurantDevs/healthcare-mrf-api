@@ -993,6 +993,7 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         cancel_signal = await _remove_queued_job(current)
     else:
         cancel_signal = await _set_cancel_flag(run_id)
+        cancel_signal["kubernetes"] = await _delete_active_worker_jobs(current)
     metrics["cancel_signal"] = cancel_signal
     canceled_before_start = pending_adapter or queued_arq
     status = "canceled" if canceled_before_start else "canceling"
@@ -1049,6 +1050,31 @@ async def _set_cancel_flag(run_id: str) -> dict[str, Any]:
         return {"redis": True, "key": f"cancel:{run_id}", "ttl_seconds": CANCEL_FLAG_TTL_SECONDS}
     except Exception as exc:
         return {"redis": False, "error": str(exc)}
+
+
+async def _delete_active_worker_jobs(run: dict[str, Any]) -> dict[str, Any]:
+    payload = _active_worker_cancel_payload(run)
+    try:
+        from api.control_workers import delete_kubernetes_worker_jobs
+
+        return await asyncio.to_thread(delete_kubernetes_worker_jobs, payload)
+    except Exception as exc:
+        return {"enabled": False, "deleted": 0, "error": str(exc)}
+
+
+def _active_worker_cancel_payload(run: dict[str, Any]) -> dict[str, Any]:
+    params = run.get("params") if isinstance(run.get("params"), dict) else {}
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    payload = {
+        "run_id": run.get("run_id"),
+        "importer": run.get("importer"),
+        "status": run.get("status"),
+        "import_id": run.get("import_id") or params.get("import_id"),
+        "queue": metrics.get("queue") or params.get("_expected_queue"),
+        "worker_class": metrics.get("worker_class") or params.get("_expected_worker_class"),
+        "resource_class": params.get("resource_class") or params.get("_resource_class"),
+    }
+    return {key: value for key, value in payload.items() if value not in (None, "")}
 
 
 def _supports_active_cancel(importer: str) -> bool:

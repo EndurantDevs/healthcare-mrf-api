@@ -408,6 +408,42 @@ def test_kubernetes_completed_worker_job_is_recreated(monkeypatch):
     assert any(call[0] == "POST" and call[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs" for call in calls)
 
 
+def test_delete_kubernetes_worker_jobs_deletes_active_matching_run(monkeypatch):
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            return {
+                "items": [
+                    {"metadata": {"name": "active-job"}, "status": {"active": 1}},
+                    {"metadata": {"name": "done-job"}, "status": {"succeeded": 1}},
+                ]
+            }
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    result = control_workers.delete_kubernetes_worker_jobs(
+        {"importer": "ptg", "queue": "arq:PTGLarge", "worker_class": "process.PTGLarge", "run_id": "run_ptg"}
+    )
+
+    assert result["deleted"] == 1
+    assert result["items"] == [
+        {"job_name": "active-job", "worker_class": "process.PTGLarge", "deleted": True},
+        {"job_name": "done-job", "worker_class": "process.PTGLarge", "deleted": False, "reason": "terminal"},
+    ]
+    get_call = calls[0]
+    assert get_call[0] == "GET"
+    assert "healthporta.com%2Frun-id-hash%3D" in get_call[1]
+    assert "healthporta.com%2Fworker-class-hash%3D" in get_call[1]
+    assert any(call[0] == "DELETE" and call[1].endswith("/jobs/active-job") for call in calls)
+    assert not any(call[0] == "DELETE" and call[1].endswith("/jobs/done-job") for call in calls)
+
+
 def test_find_running_pid_ignores_other_node_worker(monkeypatch):
     output = """
 111 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=mrf-local-smoke-b
