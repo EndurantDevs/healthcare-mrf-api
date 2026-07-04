@@ -520,7 +520,7 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
     assert args[1]["source_file_import_id"] == "source_file_import_1"
     assert args[1]["params"]["source_key"] == "asr_1208"
     assert kwargs["_job_id"] == "ptg_start_run_ptg"
-    assert kwargs == {"_queue_name": "arq:PTG", "_job_id": "ptg_start_run_ptg"}
+    assert kwargs == {"_queue_name": "arq:PTG", "_max_tries": 1, "_job_id": "ptg_start_run_ptg"}
 
 
 @pytest.mark.asyncio
@@ -560,7 +560,7 @@ async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
     args, kwargs = calls[0]
     assert args[0] == "ptg_control_start"
     assert args[1]["params"]["_expected_queue"] == "arq:PTGSmall"
-    assert kwargs == {"_queue_name": "arq:PTGSmall", "_job_id": "ptg_start_run_ptg_lane"}
+    assert kwargs == {"_queue_name": "arq:PTGSmall", "_max_tries": 1, "_job_id": "ptg_start_run_ptg_lane"}
 
 
 @pytest.mark.asyncio

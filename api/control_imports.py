@@ -858,7 +858,7 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
 
     job_payload = _adapter_payload(adapter, row, params)
     kwargs = {"_queue_name": adapter["queue"]}
-    if adapter.get("function") == "control_single_job_start":
+    if adapter.get("function") in {"control_single_job_start", "ptg_control_start"}:
         kwargs["_max_tries"] = 1
     if adapter.get("job_prefix"):
         kwargs["_job_id"] = f"{adapter['job_prefix']}_{row['run_id']}"
