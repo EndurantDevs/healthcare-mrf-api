@@ -2023,6 +2023,53 @@ async def test_current_ptg2_snapshot_prefers_loaded_serving_table():
     assert "cps.import_month DESC NULLS LAST" in sql
 
 
+@pytest.mark.asyncio
+async def test_current_plan_source_lookup_is_not_memory_cached():
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    session = RealishFakeSession(["snap-before-publish", "snap-after-publish"])
+
+    first_snapshot = await ptg2_snapshot.current_source_snapshot_id_for_plan(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+    second_snapshot = await ptg2_snapshot.current_source_snapshot_id_for_plan(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+
+    assert first_snapshot == "snap-before-publish"
+    assert second_snapshot == "snap-after-publish"
+    assert len(session.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_current_plan_source_network_list_is_not_memory_cached():
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    session = RealishFakeSession(
+        [
+            FakeResult(rows=[("ppo", "snap-ppo")]),
+            FakeResult(rows=[("ppo", "snap-ppo"), ("c2", "snap-c2")]),
+        ]
+    )
+
+    first_networks = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+    second_networks = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+
+    assert first_networks == [("ppo", "snap-ppo")]
+    assert second_networks == [("ppo", "snap-ppo"), ("c2", "snap-c2")]
+    assert len(session.calls) == 2
+
+
 def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
     for code in ("29888", "27447", "20000", "29999"):
         rule = ptg2_serving._inferred_provider_taxonomy_rule({"code": code, "code_system": "cpt"})

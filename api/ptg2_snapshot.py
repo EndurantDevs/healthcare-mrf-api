@@ -64,11 +64,9 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     plan_variants = ein_plan_id_variants(requested_plan)
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
-    cache_key = ("source_plan", tuple(plan_variants), market_type, source_key)
-    if _snapshot_cache_enabled(session):
-        cached = _snapshot_cache_get(cache_key)
-        if cached is not None:
-            return cached
+    # Plan-source pointers are updated by importer worker processes while API
+    # servers keep their own memory. Do not cache this lookup in-process, or a
+    # just-published network can stay invisible until the API pod's TTL expires.
     params: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
@@ -109,10 +107,10 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
                 await rollback()
             except Exception as rollback_exc:
                 logger.debug("failed to rollback source snapshot lookup: %s", rollback_exc)
-        return _snapshot_cache_set(cache_key, None) if _snapshot_cache_enabled(session) else None
+        return None
     value = result.scalar()
     value = str(value) if value else None
-    return _snapshot_cache_set(cache_key, value) if _snapshot_cache_enabled(session) else value
+    return value
 
 
 async def current_source_snapshot_ids_for_plan(
@@ -137,11 +135,8 @@ async def current_source_snapshot_ids_for_plan(
     plan_variants = ein_plan_id_variants(requested_plan)
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
-    cache_key = ("source_plan_all", tuple(plan_variants), market_type, source_key)
-    if _snapshot_cache_enabled(session):
-        cached = _snapshot_cache_get(cache_key)
-        if cached is not None:
-            return [tuple(pair) for pair in cached]
+    # This list changes whenever a source/network publish completes. API pods
+    # cannot see cache invalidation from importer workers, so resolve it live.
     params: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
@@ -181,16 +176,12 @@ async def current_source_snapshot_ids_for_plan(
                 await rollback()
             except Exception as rollback_exc:
                 logger.debug("failed to rollback source snapshot lookup: %s", rollback_exc)
-        if _snapshot_cache_enabled(session):
-            _snapshot_cache_set(cache_key, ())
         return []
     pairs = [
         (str(row[0] or ""), str(row[1]))
         for row in result
         if row[1]
     ]
-    if _snapshot_cache_enabled(session):
-        _snapshot_cache_set(cache_key, tuple(pairs))
     return pairs
 
 
