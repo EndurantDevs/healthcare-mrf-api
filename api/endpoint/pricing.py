@@ -5583,7 +5583,7 @@ async def list_provider_procedures(request, npi: str):
             normalize_ptg2_mode(mode)
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
-    if plan_id or plan_external_id or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id:
         ptg2_payload = await search_ptg2_provider_procedures(
             session,
             provider_npi,
@@ -7623,7 +7623,7 @@ async def list_providers_by_procedure(request):
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
     await ensure_specialty_resolution_cache(session)
-    if plan_id or plan_external_id or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id:
         # Plan-scoped searches filter via taxonomy codes; an unresolvable
         # specialty would otherwise silently return every specialty as if
         # filtered. Claims mode keeps its own LIKE/terminology fallback.
@@ -7653,7 +7653,7 @@ async def list_providers_by_procedure(request):
             normalize_ptg2_mode(mode)
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
-    if plan_id or plan_external_id or snapshot_id:
+    if plan_id or plan_external_id or source_key or snapshot_id:
         ptg_latitude = latitude
         ptg_longitude = longitude
         ptg_radius_miles = coordinate_radius_miles if latitude is not None else None

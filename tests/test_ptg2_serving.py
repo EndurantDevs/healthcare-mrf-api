@@ -576,6 +576,68 @@ async def _search_lean_source_case(session, tables, args):
     )
 
 
+def _nonlean_source_level_case(monkeypatch):
+    """Return fake non-lean manifest state with source-level plan ids."""
+    provider_hash = "00000000000000000000000000000022"
+    price_hash = "00000000000000000000000000000202"
+    session = FakeSession(
+        [
+            FakeResult(scalar=2),
+            FakeResult(rows=[("network_names",)]),
+            FakeResult(
+                rows=[
+                    {
+                        "serving_content_hash_128": "00000000000000000000000000000301",
+                        "plan_id": "",
+                        "reported_code_system": "CPT",
+                        "reported_code": "49452",
+                        "procedure_global_id_128": None,
+                        "provider_set_global_id_128": provider_hash,
+                        "provider_count": 17,
+                        "price_set_global_id_128": price_hash,
+                        "source_trace_set_hash": None,
+                        "network_names": ["020|02IO"],
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_plastipak_snap",
+        code_count_table="mrf.ptg2_code_count_plastipak_snap",
+        source_key="ptg_plastipak",
+        id_storage="uuid",
+    )
+
+    async def is_table_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_plastipak_snap"
+        return True
+
+    async def price_rows(_session, _tables, price_hashes):
+        assert price_hashes == [price_hash]
+        return {price_hash: [{"negotiated_type": "fee schedule", "negotiated_rate": "101.23"}]}
+
+    async def procedure_rows(_session, row_data):
+        assert row_data[0]["reported_code"] == "49452"
+        return {("CPT", "49452"): {"procedure_name": "Gastrostomy tube replacement"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", is_table_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
+    return session, tables
+
+
+async def _search_nonlean_source_case(session, tables, args):
+    return await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:plastipak",
+        args,
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+
 @pytest.mark.asyncio
 async def test_lean_serving_uses_source_level_code_count(monkeypatch):
     session, tables = _lean_source_level_case(monkeypatch)
@@ -603,6 +665,51 @@ async def test_lean_serving_uses_source_level_code_count(monkeypatch):
     assert payload["items"][0]["procedure_code"] == "0001A"
     assert payload["items"][0]["procedure_name"] == "Immunization administration"
     assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+
+
+@pytest.mark.asyncio
+async def test_nonlean_manifest_serving_uses_source_level_plan_rows(monkeypatch):
+    session, tables = _nonlean_source_level_case(monkeypatch)
+    payload = await _search_nonlean_source_case(
+        session,
+        tables,
+        {
+            "plan_id": "382418014",
+            "market_type": "group",
+            "source_key": "ptg_plastipak",
+            "code": "49452",
+            "code_system": "CPT",
+        },
+    )
+
+    count_sql = str(session.calls[0][0][0])
+    row_sql = _fake_call_sql(session, "serving_content_hash_128")
+    assert "plan_id = :plan_id OR COALESCE(plan_id, '') = ''" in count_sql
+    assert "COALESCE(SUM(rate_count), 0)" in count_sql
+    assert "plan_id = :plan_id OR COALESCE(plan_id, '') = ''" in row_sql
+    assert "ORDER BY CASE WHEN plan_id = :plan_id THEN 0" in row_sql
+    assert payload["pagination"]["total"] == 2
+    assert payload["items"][0]["procedure_code"] == "49452"
+    assert payload["items"][0]["procedure_name"] == "Gastrostomy tube replacement"
+    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
+
+
+@pytest.mark.asyncio
+async def test_nonlean_manifest_serving_accepts_source_key_only(monkeypatch):
+    session, tables = _nonlean_source_level_case(monkeypatch)
+    payload = await _search_nonlean_source_case(
+        session,
+        tables,
+        {"source_key": "ptg_plastipak", "code": "49452", "code_system": "CPT"},
+    )
+
+    count_sql = str(session.calls[0][0][0])
+    count_params = session.calls[0][0][1]
+    assert "COALESCE(plan_id, '') = ''" in count_sql
+    assert count_params["plan_id"] == ""
+    assert payload["query"]["plan_id"] is None
+    assert payload["items"][0]["procedure_code"] == "49452"
+    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
 
 
 @pytest.mark.asyncio
@@ -3462,7 +3569,8 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     rate_set_params = session.calls[1][0][1]
     location_sql = str(session.calls[3][0][0])
     location_params = session.calls[3][0][1]
-    assert "SELECT DISTINCT provider_set_global_id_128" in rate_set_sql
+    assert "SELECT provider_set_global_id_128" in rate_set_sql
+    assert "GROUP BY provider_set_global_id_128" in rate_set_sql
     assert "FROM mrf.ptg2_serving_manifest_snap" in rate_set_sql
     assert rate_set_params["plan_id"] == "010854205"
     assert rate_set_params["reported_code"] == "90837"

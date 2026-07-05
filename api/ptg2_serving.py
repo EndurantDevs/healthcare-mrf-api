@@ -317,9 +317,14 @@ def _ptg2_manifest_provider_location_scope(
         return _ManifestProviderLocationScope("", "", group_filter_sql)
     if query_context.has_component_rate_scope:
         if query_context.provider_group_rate_scope_table:
+            plan_filter, _ = _code_plan_scope_sql(
+                query_context.params.get("location_plan_id"),
+                column="rpg_location.plan_id",
+                param_name="location_plan_id",
+            )
             route_filters = [
                 "rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128",
-                "rpg_location.plan_id = :location_plan_id",
+                plan_filter,
                 "rpg_location.reported_code = :location_reported_code",
             ]
             if "location_reported_code_system" in query_context.params:
@@ -347,8 +352,9 @@ async def _manifest_provider_group_rate_scope_available(
 ) -> bool:
     if not provider_group_rate_scope_table or not plan_id or not reported_code:
         return False
+    plan_filter, _ = _code_plan_scope_sql(plan_id)
     filters = [
-        "plan_id = :plan_id",
+        plan_filter,
         "reported_code = :reported_code",
     ]
     params: dict[str, Any] = {
@@ -1800,13 +1806,19 @@ def _ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_manifest_id(value))))
 
 
-def _code_plan_scope_sql(requested_plan: str, *, column: str = "plan_id") -> tuple[str, str]:
+def _code_plan_scope_sql(
+    requested_plan: str,
+    *,
+    column: str = "plan_id",
+    param_name: str = "plan_id",
+) -> tuple[str, str]:
     """Prefer exact plan-scoped code rows, but allow source-level rows as fallback."""
     plan_column = column.strip() or "plan_id"
+    plan_param = param_name.strip() or "plan_id"
     if str(requested_plan or "").strip():
         return (
-            f"({plan_column} = :plan_id OR COALESCE({plan_column}, '') = '')",
-            f"CASE WHEN {plan_column} = :plan_id THEN 0 WHEN COALESCE({plan_column}, '') = '' THEN 1 ELSE 2 END",
+            f"({plan_column} = :{plan_param} OR COALESCE({plan_column}, '') = '')",
+            f"CASE WHEN {plan_column} = :{plan_param} THEN 0 WHEN COALESCE({plan_column}, '') = '' THEN 1 ELSE 2 END",
         )
     return f"COALESCE({plan_column}, '') = ''", f"{plan_column} NULLS FIRST"
 
@@ -2189,33 +2201,37 @@ async def _manifest_rate_provider_groups_from_sidecar(
         provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
         if not code_count_table or not provider_set_dictionary_table:
             return ()
+        plan_filter, plan_order = _code_plan_scope_sql(plan_id, column="code_count.plan_id")
         rate_scope_filters = [
-            "code_count.plan_id = :plan_id",
+            plan_filter,
             "code_count.reported_code = :reported_code",
         ]
         if code_system:
             rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
         provider_set_sql = f"""
-                SELECT DISTINCT provider_set_dictionary.provider_set_global_id_128
+                SELECT provider_set_dictionary.provider_set_global_id_128
                 FROM {table_name} serving
                 JOIN {code_count_table} code_count
                   ON code_count.code_key = serving.code_key
                 JOIN {provider_set_dictionary_table} provider_set_dictionary
                   ON provider_set_dictionary.provider_set_key = serving.provider_set_key
                 WHERE {" AND ".join(rate_scope_filters)}
-                ORDER BY provider_set_dictionary.provider_set_global_id_128
+                GROUP BY provider_set_dictionary.provider_set_global_id_128
+                ORDER BY MIN({plan_order}), provider_set_dictionary.provider_set_global_id_128
                 """
     else:
-        rate_scope_filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
+        plan_filter, plan_order = _code_plan_scope_sql(plan_id)
+        rate_scope_filters = [plan_filter, "reported_code = :reported_code"]
         if code_system:
             rate_scope_filters.append("reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
         provider_set_sql = f"""
-                SELECT DISTINCT provider_set_global_id_128
+                SELECT provider_set_global_id_128
                 FROM {table_name}
                 WHERE {" AND ".join(rate_scope_filters)}
-                ORDER BY provider_set_global_id_128
+                GROUP BY provider_set_global_id_128
+                ORDER BY MIN({plan_order}), provider_set_global_id_128
                 """
     try:
         provider_set_result = await session.execute(
@@ -3525,8 +3541,13 @@ async def _ptg2_manifest_location_provider_matches(
         has_component_rate_scope = True
         params["location_plan_id"] = requested_plan_id
         params["location_reported_code"] = requested_code
+        plan_filter, _ = _code_plan_scope_sql(
+            requested_plan_id,
+            column="rate_scope.plan_id",
+            param_name="location_plan_id",
+        )
         rate_scope_filters = [
-            "rate_scope.plan_id = :location_plan_id",
+            plan_filter,
             "rate_scope.reported_code = :location_reported_code",
         ]
         if requested_system:
@@ -4401,7 +4422,7 @@ async def _search_ptg2_manifest_db_serving_table(
     lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
     explicit_source_scope = bool(str(args.get("source_key") or "").strip() or str(args.get("snapshot_id") or "").strip())
     unsupported_filters = args.get("q")
-    if unsupported_filters or not requested_code or (not requested_plan and not (lean_provider_key_layout and explicit_source_scope)):
+    if unsupported_filters or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
     has_provider_npi_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_npi"))
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
@@ -4413,7 +4434,8 @@ async def _search_ptg2_manifest_db_serving_table(
         expand_providers=expand_providers,
         location_filter_requested=location_filter_requested,
     )
-    filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
+    plan_filter, plan_order = _code_plan_scope_sql(requested_plan)
+    filters = [plan_filter, "reported_code = :reported_code"]
     params: dict[str, Any] = {
         "plan_id": requested_plan,
         "reported_code": requested_code,
@@ -4637,9 +4659,9 @@ async def _search_ptg2_manifest_db_serving_table(
         count_result = await session.execute(
             text(
                 f"""
-                SELECT rate_count
+                SELECT COALESCE(SUM(rate_count), 0) AS rate_count
                 FROM {code_count_table}
-                WHERE plan_id = :plan_id
+                WHERE {plan_filter}
                   AND reported_code = :reported_code
                   AND reported_code_system IS NOT DISTINCT FROM :reported_code_system
                 """
@@ -4681,7 +4703,7 @@ async def _search_ptg2_manifest_db_serving_table(
                     {network_names_select_sql}
                 FROM {table_name}
                 WHERE {where_sql}
-                ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
+                ORDER BY {plan_order}, provider_count DESC NULLS LAST, serving_content_hash_128
                 LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
                 """
             ),
@@ -5867,8 +5889,11 @@ async def _search_ptg2_manifest_provider_procedures(
     )
     filters = [f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"]
     if requested_plan:
-        filters.append("plan_id = :plan_id")
+        plan_filter, plan_order = _code_plan_scope_sql(requested_plan)
+        filters.append(plan_filter)
         params["plan_id"] = requested_plan
+    else:
+        plan_order = "plan_id NULLS FIRST"
     _append_manifest_reported_code_filter(
         filters,
         params,
@@ -5918,7 +5943,7 @@ async def _search_ptg2_manifest_provider_procedures(
                 {network_names_select_sql}
             FROM {table_name}
             WHERE {where_sql}
-            ORDER BY reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
+            ORDER BY {plan_order}, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
             {limit_sql} {offset_sql}
             """
     )
