@@ -704,7 +704,7 @@ async def _parse_in_network_file_serving_only(
 
     copy_tmp_dir = ptg2_temp_parent()
     manifest_stage_table = ptg2_manifest_stage_table
-    manifest_copy_rows = 0
+    manifest_copy_row_counter_by_name = {"serving": 0}
     rust_records = 0
     rust_dedupe_summary: dict[str, Any] = {}
     rust_scanner_config: dict[str, Any] = {}
@@ -716,6 +716,7 @@ async def _parse_in_network_file_serving_only(
         "price_atom": [],
         "provider_group_member": [],
     }
+    deferred_copy_file_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in deferred_copy_files}
     compact_copy_tasks: set[asyncio.Task] = set()
     compact_copy_task_limit = max(_env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS), 1)
     compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
@@ -725,6 +726,37 @@ async def _parse_in_network_file_serving_only(
         fd, name = tempfile.mkstemp(prefix=prefix, suffix=".copy", dir=copy_tmp_dir)
         os.close(fd)
         return Path(name)
+
+    def _copy_file_key(copy_file: Path) -> str:
+        try:
+            return str(copy_file.resolve())
+        except Exception:
+            return str(copy_file)
+
+    def _record_deferred_copy_file_once(kind: str, copy_file: Path, row_count: int) -> int:
+        path_key = _copy_file_key(copy_file)
+        seen_paths = deferred_copy_file_paths_by_kind.setdefault(kind, set())
+        if path_key in seen_paths:
+            return 0
+        seen_paths.add(path_key)
+        deferred_copy_files[kind].append({"path": str(copy_file), "row_count": row_count})
+        return row_count
+
+    def _manifest_copy_candidates(copy_path: Path) -> list[Path]:
+        candidate_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        if copy_path.exists():
+            candidate_paths.append(copy_path)
+            seen_paths.add(_copy_file_key(copy_path))
+        for worker_copy_path in sorted(copy_path.parent.glob(f"{copy_path.name}*")):
+            if not worker_copy_path.is_file():
+                continue
+            path_key = _copy_file_key(worker_copy_path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            candidate_paths.append(worker_copy_path)
+        return candidate_paths
 
     manifest_serving_copy_path = _new_copy_path("ptg2_manifest_serving_")
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
@@ -760,7 +792,6 @@ async def _parse_in_network_file_serving_only(
         _emit_screen_line(json.dumps(payload, sort_keys=True))
 
     async def copy_ready_manifest_serving_file(copy_row: dict[str, Any]) -> None:
-        nonlocal manifest_copy_rows
         raw_copy_path = str(copy_row.get("path") or "").strip()
         if not raw_copy_path:
             return
@@ -769,15 +800,18 @@ async def _parse_in_network_file_serving_only(
         if defer_manifest_copy:
             if copied_rows <= 0:
                 copied_rows = _ptg2_copy_file_row_count(copy_file)
-            manifest_copy_rows += copied_rows
-            deferred_copy_files["manifest_serving"].append({"path": str(copy_file), "row_count": copied_rows})
+            manifest_copy_row_counter_by_name["serving"] += _record_deferred_copy_file_once(
+                "manifest_serving",
+                copy_file,
+                copied_rows,
+            )
             return
         async with compact_copy_semaphore:
             started_at = time.monotonic()
             emit_copy_status("START", kind="manifest_serving", copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table)
             await _copy_ptg2_manifest_serving_file(copy_file, target_table=manifest_stage_table)
             emit_copy_status("DONE", kind="manifest_serving", copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table, started_at=started_at)
-        manifest_copy_rows += copied_rows
+        manifest_copy_row_counter_by_name["serving"] += copied_rows
         copy_file.unlink(missing_ok=True)
 
     async def copy_ready_manifest_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
@@ -797,7 +831,7 @@ async def _parse_in_network_file_serving_only(
         else:
             return
         if defer_manifest_copy:
-            deferred_copy_files[kind].append({"path": str(copy_file), "row_count": copied_rows})
+            _record_deferred_copy_file_once(kind, copy_file, copied_rows)
             return
         async with compact_copy_semaphore:
             started_at = time.monotonic()
@@ -807,16 +841,16 @@ async def _parse_in_network_file_serving_only(
         copy_file.unlink(missing_ok=True)
 
     async def wait_for_some_copy_tasks(force: bool = False) -> None:
-        nonlocal compact_copy_tasks
         if not compact_copy_tasks:
             return
         if force:
-            done, compact_copy_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.ALL_COMPLETED)
-            compact_copy_tasks = set()
+            done, _pending_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.ALL_COMPLETED)
+            compact_copy_tasks.clear()
         elif len(compact_copy_tasks) < compact_copy_task_limit * 2:
             return
         else:
-            done, compact_copy_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, pending_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.FIRST_COMPLETED)
+            compact_copy_tasks.intersection_update(pending_tasks)
         for task in done:
             task.result()
 
@@ -864,10 +898,14 @@ async def _parse_in_network_file_serving_only(
             (manifest_price_atom_copy_path, lambda row: copy_ready_manifest_dictionary_file("price_atom", row)),
             (manifest_provider_group_member_copy_path, lambda row: copy_ready_manifest_dictionary_file("provider_group_member", row)),
         ):
-            if copy_path.exists() and copy_path.stat().st_size > 0:
-                await copy_func({"path": str(copy_path), "row_count": 0})
-        if manifest_copy_rows == 0 and not defer_manifest_copy:
-            manifest_copy_rows = await _estimated_table_rows(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", manifest_stage_table)
+            for candidate_copy_path in _manifest_copy_candidates(copy_path):
+                if candidate_copy_path.exists() and candidate_copy_path.stat().st_size > 0:
+                    await copy_func({"path": str(candidate_copy_path), "row_count": 0})
+        if manifest_copy_row_counter_by_name["serving"] == 0 and not defer_manifest_copy:
+            manifest_copy_row_counter_by_name["serving"] = await _estimated_table_rows(
+                os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                manifest_stage_table,
+            )
         copy_completed = True
     finally:
         for task in compact_copy_tasks:
@@ -895,14 +933,14 @@ async def _parse_in_network_file_serving_only(
     summary = {
         "provider_refs": 0,
         "in_network_items": len(procedure_hashes),
-        "serving_rates": manifest_copy_rows,
+        "serving_rates": manifest_copy_row_counter_by_name["serving"],
         "serving_only": True,
         "serving_workers": 0,
         "worker_chunk_items": 0,
         "rust_manifest_serving": True,
         "rust_records": rust_records,
         "manifest": {
-            "serving_rows": manifest_copy_rows,
+            "serving_rows": manifest_copy_row_counter_by_name["serving"],
             "sidecars": manifest_artifacts,
             "sidecar_paths": {
                 name: str(path)
@@ -2741,14 +2779,14 @@ async def main(
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
         }
-        if jobs and processed_file_count_map["done"] == 0:
-            raise RuntimeError(
-                f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
-            )
         if failed_files and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
             raise RuntimeError(
                 f"PTG2 import failed {len(failed_files)} of {attempted_files} attempted file(s); "
                 "set HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT=true to publish a partial snapshot"
+            )
+        if jobs and processed_file_count_map["done"] == 0:
+            raise RuntimeError(
+                f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
             )
 
         await flush_error_log(classes["ImportLog"])

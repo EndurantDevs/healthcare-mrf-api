@@ -3269,7 +3269,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     monkeypatch.setattr(process_ptg, "build_ptg2_snapshot_index_artifact", AsyncMock())
     monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
 
-    with pytest.raises(RuntimeError, match="processed zero files"):
+    with pytest.raises(RuntimeError, match="failed 1 of 1 attempted file"):
         asyncio.run(
             process_ptg.main(
                 in_network_url="https://example.test/rates.json.gz",
@@ -5950,6 +5950,67 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
     assert logical.member_name == "nested/rates.json"
     assert logical.logical_path != str(raw_path)
     assert Path(logical.logical_path).read_bytes() == expected
+
+
+def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
+    artifact_dir = tmp_path / "artifacts"
+    recovered_paths_by_kind = {}
+
+    async def fake_push_ptg2_objects(*_args, **_kwargs):
+        return None
+
+    async def fake_flush_error_log(*_args, **_kwargs):
+        return None
+
+    async def fake_scanner(*_args, **kwargs):
+        serving_worker = Path(f"{kwargs['manifest_serving_copy_path']}.worker0003")
+        price_worker = Path(f"{kwargs['manifest_price_atom_copy_path']}.worker0003")
+        member_worker = Path(f"{kwargs['manifest_provider_group_member_copy_path']}.provider_refs.worker0003")
+        serving_worker.write_text("serving-1\nserving-2\n")
+        price_worker.write_text("price-1\n")
+        member_worker.write_text("member-1\n")
+        recovered_paths_by_kind.update(
+            serving=str(serving_worker),
+            price=str(price_worker),
+            member=str(member_worker),
+        )
+        yield "scanner_config", {"worker_count": 2}
+
+    monkeypatch.setenv(process_ptg.PTG2_MANIFEST_PRECOPY_MERGE_ENV, "true")
+    monkeypatch.setattr(process_ptg, "ptg2_temp_parent", lambda: tmp_path)
+    monkeypatch.setattr(process_ptg, "resolve_ptg2_artifact_dir", lambda: artifact_dir)
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push_ptg2_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", fake_flush_error_log)
+    monkeypatch.setattr(process_ptg, "_aiter_compact_serving_records_rust", fake_scanner)
+
+    summary = asyncio.run(
+        process_ptg._parse_in_network_file_serving_only(
+            str(tmp_path / "rates.json.gz"),
+            1,
+            {"reporting_entity_name": "Example"},
+            [{"plan_id": "plan", "plan_id_type": "ein", "plan_name": "Example PPO"}],
+            provider_map={},
+            test_mode=True,
+            import_log_cls=SimpleNamespace(__name__="ImportLog"),
+            source_url="https://example.test/rates.json.gz",
+            source_version=None,
+            snapshot_id="ptg2:test",
+            import_month=process_ptg.normalize_import_month("2026-07"),
+            ptg2_manifest_stage_table="ptg2_stage_test",
+        )
+    )
+
+    assert summary["serving_rates"] == 2
+    assert summary["manifest"]["serving_rows"] == 2
+    assert summary["manifest"]["copy_files"]["manifest_serving"] == [
+        {"path": recovered_paths_by_kind["serving"], "row_count": 2}
+    ]
+    assert summary["manifest"]["copy_files"]["price_atom"] == [
+        {"path": recovered_paths_by_kind["price"], "row_count": 1}
+    ]
+    assert summary["manifest"]["copy_files"]["provider_group_member"] == [
+        {"path": recovered_paths_by_kind["member"], "row_count": 1}
+    ]
 
 
 def test_scanner_error_labels_sigterm():
