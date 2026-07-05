@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process.ptg_parts import source_snapshot_control
+from process.ptg_parts import source_pointers
 
 
 def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypatch):
@@ -74,6 +75,45 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
     assert any("DELETE FROM \"mrf\".ptg2_current_plan_source" in statement for statement, _ in executed)
     assert any("ptg2_current_plan_source" in statement and "ON CONFLICT" in statement for statement, _ in executed)
     assert clear_calls == [True]
+
+
+def test_source_plan_rows_falls_back_to_import_catalog(monkeypatch):
+    captured_sql_calls = []
+
+    async def fake_database_all(statement, **params):
+        captured_sql_calls.append((str(statement), params))
+        if "hp_import_control" in str(statement):
+            return [
+                {"plan_id": "386004849", "plan_market_type": "group"},
+                {"plan_id": "611480273", "plan_market_type": "Group"},
+            ]
+        return []
+
+    async def is_catalog_table_present(schema, table_name):
+        return (schema, table_name) in {
+            ("hp_import_control", "source_file_import"),
+            ("hp_import_control", "discovered_plan_file"),
+            ("hp_import_control", "discovered_plan"),
+        }
+
+    monkeypatch.setattr(source_pointers.db, "all", fake_database_all)
+    monkeypatch.setattr(source_pointers, "_table_exists", is_catalog_table_present)
+
+    plan_source_rows = asyncio.run(
+        source_pointers._source_plan_rows(
+            snapshot_id="ptg2:202607:abc",
+            source_key="ptg_source",
+            import_month=datetime.date(2026, 7, 1),
+            previous_snapshot_id=None,
+            updated_at=datetime.datetime(2026, 7, 5, 1, 0, 0),
+            serving_index={"serving_table_layout": "lean_provider_key_v1"},
+        )
+    )
+
+    assert [plan_source_row["plan_id"] for plan_source_row in plan_source_rows] == ["386004849", "611480273"]
+    assert {plan_source_row["plan_market_type"] for plan_source_row in plan_source_rows} == {"group"}
+    assert all(plan_source_row["source_key"] == "ptg_source" for plan_source_row in plan_source_rows)
+    assert any("hp_import_control" in statement for statement, _params in captured_sql_calls)
 
 
 def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch):

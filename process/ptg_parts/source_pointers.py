@@ -100,6 +100,8 @@ async def _source_plan_rows(
                     """,
                     snapshot_id=snapshot_id,
                 )
+    if not rows:
+        rows = await _source_plan_rows_from_import_catalog(snapshot_id=snapshot_id, source_key=source_key)
     result: list[dict[str, Any]] = []
     for row in rows:
         data = row if isinstance(row, dict) else row._mapping
@@ -122,6 +124,36 @@ async def _source_plan_rows(
             }
         )
     return result
+
+
+async def _source_plan_rows_from_import_catalog(*, snapshot_id: str, source_key: str) -> list[Any]:
+    """Recover source-plan pointers for compact snapshots whose rate rows carry no plan id."""
+    catalog_schema = "hp_import_control"
+    if not (
+        await _table_exists(catalog_schema, "source_file_import")
+        and await _table_exists(catalog_schema, "discovered_plan_file")
+        and await _table_exists(catalog_schema, "discovered_plan")
+    ):
+        return []
+    return await db.all(
+        f"""
+        SELECT DISTINCT dp.plan_id, lower(COALESCE(dp.market_type, '')) AS plan_market_type
+          FROM {_quote_ident(catalog_schema)}.source_file_import sfi
+          JOIN {_quote_ident(catalog_schema)}.discovered_plan_file dpf
+            ON dpf.source_file_id = sfi.source_file_id
+           AND dpf.content_version = sfi.content_version
+          JOIN {_quote_ident(catalog_schema)}.discovered_plan dp
+            ON dp.discovered_plan_id = dpf.discovered_plan_id
+         WHERE sfi.snapshot_id = :snapshot_id
+           AND sfi.source_key = :source_key
+           AND sfi.status = 'succeeded'
+           AND dp.plan_id IS NOT NULL
+           AND dp.plan_id <> ''
+           AND dp.status = 'active'
+        """,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
 
 
 async def _publish_ptg2_source_pointers(
