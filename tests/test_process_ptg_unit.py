@@ -4607,6 +4607,35 @@ def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     assert artifacts["provider_forward"]["path"] == str(provider_forward)
 
 
+def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
+    price_forward = tmp_path / "price_forward.ptg2sc"
+    price_forward.write_bytes(b"PTG2MNSC" + b"\0" * 32)
+    provider_forward = tmp_path / "provider_forward.ptg2sc"
+    provider_forward.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+
+    artifact_dict = process_ptg._collect_manifest_artifacts(
+        [
+            {
+                "summary": {
+                    "manifest": {
+                        "sidecars": {},
+                        "sidecar_paths": {
+                            "price_forward": str(price_forward),
+                            "provider_forward": str(provider_forward),
+                        },
+                    }
+                }
+            }
+        ]
+    )
+
+    sidecar_map = {sidecar["name"]: sidecar for sidecar in artifact_dict["sidecars"]}
+    assert set(sidecar_map) == {"price_forward", "provider_forward"}
+    assert sidecar_map["price_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_MEMBERSHIP_FORMAT
+    assert sidecar_map["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
+    assert sidecar_map["provider_forward"]["path"] == str(provider_forward)
+
+
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
     status_calls = []
     scalar_values = iter([3, 1, 2])

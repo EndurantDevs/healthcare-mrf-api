@@ -4192,33 +4192,43 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
         if not provider_group_member_table:
             return None
+        has_provider_forward_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_forward"))
         groups_by_set = _ptg2_manifest_sidecar_members_many(serving_tables, "provider_forward", missing_provider_set_ids)
         group_ids = tuple(dict.fromkeys(group_id for group_ids in groups_by_set.values() for group_id in group_ids))
         if not group_ids:
-            return None
-        group_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-        npi_stmt = text(
-            f"""
-                SELECT DISTINCT pgm.provider_group_global_id_128, pgm.npi
-                FROM {provider_group_member_table} pgm
-                WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
-                  AND pgm.npi > 0
-                ORDER BY pgm.provider_group_global_id_128, pgm.npi
-                """
-        )
-        npi_result = await session.execute(npi_stmt, {"group_ids": group_ids})
-        npis_by_group: dict[str, set[int]] = {}
-        for row in npi_result:
-            data = _row_mapping(row)
-            group_id = _ptg2_manifest_id(data.get("provider_group_global_id_128"))
-            npi = data.get("npi")
-            if group_id and npi is not None:
-                npis_by_group.setdefault(group_id, set()).add(int(npi))
-        for provider_set_id in missing_provider_set_ids:
-            npis: set[int] = set()
-            for group_id in groups_by_set.get(provider_set_id, ()):
-                npis.update(npis_by_group.get(group_id, set()))
-            npis_by_set[provider_set_id] = tuple(sorted(npis))
+            if has_provider_forward_sidecar:
+                for provider_set_id in missing_provider_set_ids:
+                    npis_by_set.setdefault(provider_set_id, ())
+                group_ids = ()
+            else:
+                return None
+        if group_ids:
+            group_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
+            npi_stmt = text(
+                f"""
+                    SELECT DISTINCT pgm.provider_group_global_id_128, pgm.npi
+                    FROM {provider_group_member_table} pgm
+                    WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
+                      AND pgm.npi > 0
+                    ORDER BY pgm.provider_group_global_id_128, pgm.npi
+                    """
+            )
+            npi_result = await session.execute(npi_stmt, {"group_ids": group_ids})
+            npis_by_group: dict[str, set[int]] = {}
+            for row in npi_result:
+                data = _row_mapping(row)
+                group_id = _ptg2_manifest_id(data.get("provider_group_global_id_128"))
+                npi = data.get("npi")
+                if group_id and npi is not None:
+                    npis_by_group.setdefault(group_id, set()).add(int(npi))
+            for provider_set_id in missing_provider_set_ids:
+                npis: set[int] = set()
+                for group_id in groups_by_set.get(provider_set_id, ()):
+                    npis.update(npis_by_group.get(group_id, set()))
+                npis_by_set[provider_set_id] = tuple(sorted(npis))
+        else:
+            for provider_set_id in missing_provider_set_ids:
+                npis_by_set.setdefault(provider_set_id, ())
 
     if provider_taxonomy_filter_requested:
         filtered_npis_by_set: dict[str, tuple[int, ...]] = {}

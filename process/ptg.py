@@ -904,6 +904,11 @@ async def _parse_in_network_file_serving_only(
         "manifest": {
             "serving_rows": manifest_copy_rows,
             "sidecars": manifest_artifacts,
+            "sidecar_paths": {
+                name: str(path)
+                for name, path in manifest_sidecar_paths.items()
+                if path is not None
+            },
             "copy_files": deferred_copy_files if defer_manifest_copy else {},
             "precopy_merge_deferred": defer_manifest_copy,
         },
@@ -2765,22 +2770,7 @@ async def main(
                 manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
                 if isinstance(manifest_payload, dict):
                     manifest_payload.pop("copy_files", None)
-        manifest_artifacts: dict[str, Any] = {"sidecars": []}
-        for file_summary in successful_files:
-            summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
-            if not isinstance(summary_payload, dict):
-                continue
-            sidecars = ((summary_payload.get("manifest") or {}).get("sidecars") or {})
-            if isinstance(sidecars, dict):
-                for sidecar in sidecars.values():
-                    if isinstance(sidecar, dict):
-                        manifest_artifacts["sidecars"].append(dict(sidecar))
-            elif isinstance(sidecars, list):
-                for sidecar in sidecars:
-                    if isinstance(sidecar, dict):
-                        manifest_artifacts["sidecars"].append(dict(sidecar))
-        if not manifest_artifacts["sidecars"]:
-            manifest_artifacts = {}
+        manifest_artifacts = _collect_manifest_artifacts(successful_files)
         assert source_key_val is not None
         if has_serving_files:
             if not ptg2_manifest_stage_table:
@@ -3077,3 +3067,39 @@ __all__ = [
     "sha256_file",
     "stream_logical_artifact",
 ]
+
+
+def _manifest_sidecars_list(manifest_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_sidecars = manifest_payload.get("sidecars") or {}
+    if isinstance(raw_sidecars, dict):
+        return [dict(sidecar) for sidecar in raw_sidecars.values() if isinstance(sidecar, dict)]
+    if isinstance(raw_sidecars, list):
+        return [dict(sidecar) for sidecar in raw_sidecars if isinstance(sidecar, dict)]
+    return []
+
+
+def _collect_manifest_artifacts(
+    successful_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sidecar_entries: list[dict[str, Any]] = []
+    for file_summary in successful_files:
+        summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
+        if not isinstance(summary_payload, dict):
+            continue
+        manifest_payload = summary_payload.get("manifest")
+        if not isinstance(manifest_payload, dict):
+            continue
+        existing_sidecars = _manifest_sidecars_list(manifest_payload)
+        if existing_sidecars:
+            sidecar_entries.extend(existing_sidecars)
+            continue
+        raw_sidecar_path_map = manifest_payload.get("sidecar_paths")
+        if not isinstance(raw_sidecar_path_map, dict):
+            continue
+        sidecar_path_map: dict[str, Path | None] = {}
+        for name, raw_path in raw_sidecar_path_map.items():
+            path = Path(str(raw_path)) if raw_path else None
+            sidecar_path_map[str(name)] = path
+        fallback_sidecar_map = _collect_ptg2_manifest_sidecar_artifacts(sidecar_path_map)
+        sidecar_entries.extend(dict(sidecar) for sidecar in fallback_sidecar_map.values())
+    return {"sidecars": sidecar_entries} if sidecar_entries else {}

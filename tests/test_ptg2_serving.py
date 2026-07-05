@@ -504,6 +504,54 @@ async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_diction
 
 
 @pytest.mark.asyncio
+async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_missing(monkeypatch):
+    expanded_set_id = "00000000000000000000000000000011"
+    missing_set_id = "00000000000000000000000000000012"
+    group_id = "00000000000000000000000000000021"
+    session = FakeSession(
+        [
+            FakeResult(rows=[{"provider_group_global_id_128": group_id, "npi": 1234567890}]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_forward": {"name": "provider_forward", "path": "/tmp/provider_forward.ptg2sc"}},
+        id_storage="uuid",
+    )
+
+    def fake_sidecar_members_many(_serving_tables, sidecar_name, owner_ids, **_kwargs):
+        if sidecar_name == "provider_npi":
+            return {owner_id: () for owner_id in owner_ids}
+        if sidecar_name == "provider_forward":
+            return {expanded_set_id: (group_id,), missing_set_id: ()}
+        raise AssertionError(sidecar_name)
+
+    async def fake_enriched_provider_rows(_session, *, npis, limit, **_kwargs):
+        assert npis == (1234567890,)
+        assert limit == 1
+        return [{"npi": 1234567890, "provider_name": "Example Provider"}]
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_members_many)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        fake_enriched_provider_rows,
+    )
+
+    providers_by_set = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_sets(
+        session,
+        tables,
+        [expanded_set_id, missing_set_id],
+        limit_per_set=1,
+    )
+
+    assert providers_by_set == {
+        expanded_set_id: [{"npi": 1234567890, "provider_name": "Example Provider"}],
+        missing_set_id: [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
     provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
     price_sets = [f"{idx:032x}" for idx in range(101, 106)]
