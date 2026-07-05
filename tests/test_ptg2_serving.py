@@ -503,6 +503,126 @@ async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_diction
     assert "price_atom_global_id_128 = ANY(CAST(:atom_ids AS uuid[]))" in sql
 
 
+def _lean_source_level_case(monkeypatch):
+    """Return fake lean serving state with a source-level code-count row."""
+    provider_hash = "00000000000000000000000000000012"
+    price_hash = "00000000000000000000000000000101"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "",
+                        "reported_code_system": "CPT",
+                        "reported_code": "0001A",
+                        "rate_count": 3,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "serving_content_hash_128": "00000000000000000000000000000201",
+                        "plan_id": "",
+                        "reported_code_system": "CPT",
+                        "reported_code": "0001A",
+                        "procedure_global_id_128": None,
+                        "provider_set_global_id_128": provider_hash,
+                        "provider_count": 53,
+                        "price_set_global_id_128": price_hash,
+                        "source_trace_set_hash": None,
+                        "network_names": ["WPPCC000001N"],
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        source_key="ptg_providence",
+        id_storage="uuid",
+    )
+
+    async def is_table_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_manifest_snap"
+        return True
+
+    async def price_rows(_session, _tables, price_hashes):
+        assert price_hashes == [price_hash]
+        return {price_hash: [{"negotiated_type": "fee schedule", "negotiated_rate": "66.55"}]}
+
+    async def procedure_rows(_session, row_data):
+        assert row_data[0]["reported_code"] == "0001A"
+        return {("CPT", "0001A"): {"procedure_name": "Immunization administration"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", is_table_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
+    return session, tables
+
+
+async def _search_lean_source_case(session, tables, args):
+    return await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:providence",
+        args,
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lean_serving_uses_source_level_code_count(monkeypatch):
+    session, tables = _lean_source_level_case(monkeypatch)
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:providence",
+        {
+            "plan_id": "56707OR1390003-00",
+            "market_type": "individual",
+            "source_key": "ptg_providence",
+            "code": "0001A",
+            "code_system": "CPT",
+        },
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    code_sql = str(session.calls[0][0][0])
+    code_params = session.calls[0][0][1]
+    assert "plan_id = :plan_id OR COALESCE(plan_id, '') = ''" in code_sql
+    assert "ORDER BY CASE WHEN plan_id = :plan_id THEN 0" in code_sql
+    assert code_params["plan_id"] == "56707OR1390003-00"
+    assert payload["pagination"]["total"] == 3
+    assert payload["items"][0]["procedure_code"] == "0001A"
+    assert payload["items"][0]["procedure_name"] == "Immunization administration"
+    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+
+
+@pytest.mark.asyncio
+async def test_lean_serving_accepts_source_key_only(monkeypatch):
+    session, tables = _lean_source_level_case(monkeypatch)
+    payload = await _search_lean_source_case(
+        session,
+        tables,
+        {"source_key": "ptg_providence", "code": "0001A", "code_system": "CPT"},
+    )
+
+    code_sql = str(session.calls[0][0][0])
+    code_params = session.calls[0][0][1]
+    assert "COALESCE(plan_id, '') = ''" in code_sql
+    assert code_params["plan_id"] == ""
+    assert payload["query"]["plan_id"] is None
+    assert payload["items"][0]["procedure_code"] == "0001A"
+    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+
+
 @pytest.mark.asyncio
 async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_missing(monkeypatch):
     expanded_set_id = "00000000000000000000000000000011"

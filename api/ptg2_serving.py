@@ -1800,6 +1800,17 @@ def _ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_manifest_id(value))))
 
 
+def _code_plan_scope_sql(requested_plan: str, *, column: str = "plan_id") -> tuple[str, str]:
+    """Prefer exact plan-scoped code rows, but allow source-level rows as fallback."""
+    plan_column = column.strip() or "plan_id"
+    if str(requested_plan or "").strip():
+        return (
+            f"({plan_column} = :plan_id OR COALESCE({plan_column}, '') = '')",
+            f"CASE WHEN {plan_column} = :plan_id THEN 0 WHEN COALESCE({plan_column}, '') = '' THEN 1 ELSE 2 END",
+        )
+    return f"COALESCE({plan_column}, '') = ''", f"{plan_column} NULLS FIRST"
+
+
 def _append_manifest_reported_code_filter(
     filters: list[str],
     params: dict[str, Any],
@@ -4387,14 +4398,15 @@ async def _search_ptg2_manifest_db_serving_table(
         or args.get("long") is not None
         or args.get("radius_miles") is not None
     )
+    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
+    explicit_source_scope = bool(str(args.get("source_key") or "").strip() or str(args.get("snapshot_id") or "").strip())
     unsupported_filters = args.get("q")
-    if unsupported_filters or not requested_plan or not requested_code:
+    if unsupported_filters or not requested_code or (not requested_plan and not (lean_provider_key_layout and explicit_source_scope)):
         return None
     has_provider_npi_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_npi"))
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
         return None
 
-    lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
     rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
         args,
         pagination,
@@ -4487,14 +4499,16 @@ async def _search_ptg2_manifest_db_serving_table(
         provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
         if not code_count_table or not provider_set_dictionary_table:
             return None
+        code_plan_filter, code_plan_order = _code_plan_scope_sql(requested_plan)
         code_result = await session.execute(
             text(
                 f"""
                 SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
                 FROM {code_count_table}
-                WHERE plan_id = :plan_id
+                WHERE {code_plan_filter}
                   AND reported_code = :reported_code
                   AND reported_code_system IS NOT DISTINCT FROM :reported_code_system
+                ORDER BY {code_plan_order}, code_key
                 LIMIT 1
                 """
             ),
@@ -6227,6 +6241,7 @@ async def _has_ptg2_table_plan_code(
         "plan_id": requested_plan,
         "reported_code": requested_code,
     }
+    plan_filter_sql, _ = _code_plan_scope_sql(requested_plan)
     system_sql = ""
     if requested_system:
         query_params_by_name["reported_code_system"] = requested_system
@@ -6237,7 +6252,7 @@ async def _has_ptg2_table_plan_code(
             SELECT EXISTS (
                 SELECT 1
                 FROM {table_name}
-                WHERE plan_id = :plan_id
+                WHERE {plan_filter_sql}
                   AND reported_code = :reported_code
                   {system_sql}
                 LIMIT 1
