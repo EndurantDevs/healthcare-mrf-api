@@ -839,10 +839,12 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     lean_table = _ptg2_snapshot_index_name(price_atom_table, "lean")
+    keyed_dictionary_table = _ptg2_snapshot_index_name(price_atom_dictionary_table, "lookup")
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} CASCADE;"
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(lean_table)} CASCADE;")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} CASCADE;")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
@@ -890,6 +892,66 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     )
     await db.status(
         f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} AS
+        SELECT
+            attr_kind,
+            attr_key,
+            CASE
+                WHEN attr_kind IN ('service_code', 'billing_code_modifier') THEN NULL
+                WHEN text_value IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(text_value)
+            END AS text_lookup_key,
+            CASE
+                WHEN attr_kind NOT IN ('service_code', 'billing_code_modifier') THEN NULL
+                WHEN text_array IS NULL THEN 'NULL'
+                ELSE 'ARRAY:' || md5(to_json(text_array)::text)
+            END AS array_lookup_key
+        FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)};
+        """
+    )
+    lookup_collisions = await db.scalar(
+        f"""
+        SELECT count(*)
+          FROM (
+            SELECT attr_kind, text_lookup_key AS lookup_key
+              FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+             WHERE text_lookup_key IS NOT NULL
+             GROUP BY attr_kind, text_lookup_key
+            HAVING count(*) > 1
+            UNION ALL
+            SELECT attr_kind, array_lookup_key
+              FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+             WHERE array_lookup_key IS NOT NULL
+             GROUP BY attr_kind, array_lookup_key
+            HAVING count(*) > 1
+          ) collisions;
+        """
+    )
+    if int(lookup_collisions or 0) > 0:
+        raise RuntimeError(
+            f"PTG2 price atom dictionary lookup key collision in {schema_name}.{price_atom_dictionary_table}"
+        )
+    keyed_text_index = _ptg2_snapshot_index_name(keyed_dictionary_table, "text_key_idx")
+    keyed_array_index = _ptg2_snapshot_index_name(keyed_dictionary_table, "array_key_idx")
+    await db.status(
+        f"""
+        CREATE UNIQUE INDEX {_quote_ident(keyed_text_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+        (attr_kind, text_lookup_key)
+        WHERE text_lookup_key IS NOT NULL;
+        """
+    )
+    await db.status(
+        f"""
+        CREATE UNIQUE INDEX {_quote_ident(keyed_array_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+        (attr_kind, array_lookup_key)
+        WHERE array_lookup_key IS NOT NULL;
+        """
+    )
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)};")
+    await db.status(
+        f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
             price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128,
@@ -902,27 +964,48 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
             billing_code_modifier.attr_key::integer AS billing_code_modifier_key,
             additional_information.attr_key::integer AS additional_information_key
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} price_atom
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} negotiated_type
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} negotiated_type
           ON negotiated_type.attr_kind = 'negotiated_type'
-         AND negotiated_type.text_value IS NOT DISTINCT FROM price_atom.negotiated_type
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} expiration_date
+         AND negotiated_type.text_lookup_key = CASE
+                WHEN price_atom.negotiated_type IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(price_atom.negotiated_type)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} expiration_date
           ON expiration_date.attr_kind = 'expiration_date'
-         AND expiration_date.text_value IS NOT DISTINCT FROM price_atom.expiration_date
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} service_code
+         AND expiration_date.text_lookup_key = CASE
+                WHEN price_atom.expiration_date IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(price_atom.expiration_date)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} service_code
           ON service_code.attr_kind = 'service_code'
-         AND service_code.text_array IS NOT DISTINCT FROM price_atom.service_code
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} billing_class
+         AND service_code.array_lookup_key = CASE
+                WHEN price_atom.service_code IS NULL THEN 'NULL'
+                ELSE 'ARRAY:' || md5(to_json(price_atom.service_code)::text)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} billing_class
           ON billing_class.attr_kind = 'billing_class'
-         AND billing_class.text_value IS NOT DISTINCT FROM price_atom.billing_class
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} setting
+         AND billing_class.text_lookup_key = CASE
+                WHEN price_atom.billing_class IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(price_atom.billing_class)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} setting
           ON setting.attr_kind = 'setting'
-         AND setting.text_value IS NOT DISTINCT FROM price_atom.setting
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} billing_code_modifier
+         AND setting.text_lookup_key = CASE
+                WHEN price_atom.setting IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(price_atom.setting)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} billing_code_modifier
           ON billing_code_modifier.attr_kind = 'billing_code_modifier'
-         AND billing_code_modifier.text_array IS NOT DISTINCT FROM price_atom.billing_code_modifier
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} additional_information
+         AND billing_code_modifier.array_lookup_key = CASE
+                WHEN price_atom.billing_code_modifier IS NULL THEN 'NULL'
+                ELSE 'ARRAY:' || md5(to_json(price_atom.billing_code_modifier)::text)
+             END
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} additional_information
           ON additional_information.attr_kind = 'additional_information'
-         AND additional_information.text_value IS NOT DISTINCT FROM price_atom.additional_information;
+         AND additional_information.text_lookup_key = CASE
+                WHEN price_atom.additional_information IS NULL THEN 'NULL'
+                ELSE 'TEXT:' || md5(price_atom.additional_information)
+             END;
         """
     )
     await db.status(
@@ -945,6 +1028,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         RENAME TO {_quote_ident(price_atom_table)};
         """
     )
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)};")
     dictionary_index = _ptg2_snapshot_index_name(price_atom_dictionary_table, "key_idx")
     await db.status(
         f"""

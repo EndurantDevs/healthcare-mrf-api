@@ -4957,12 +4957,17 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
         assert "GROUP BY source_trace_set_hash, network_names" in statement
         return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
 
+    async def fake_scalar(statement, **_params):
+        assert "collisions" in statement
+        return 0
+
     monkeypatch.setenv(
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
         ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "scalar", fake_scalar)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
     monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
@@ -4986,6 +4991,11 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
     assert "negotiated_type.attr_key::integer AS negotiated_type_key" in joined
     assert "service_code.attr_key::integer AS service_code_key" in joined
     assert "billing_code_modifier.attr_key::integer AS billing_code_modifier_key" in joined
+    assert "text_lookup_key" in joined
+    assert "array_lookup_key" in joined
+    assert "WHERE text_lookup_key IS NOT NULL" in joined
+    assert "WHERE array_lookup_key IS NOT NULL" in joined
+    assert "md5(to_json(price_atom.service_code)::text)" in joined
     assert "INSERT INTO \"mrf\".\"ptg2_price_atom_" not in joined
     assert "ALTER COLUMN price_atom_global_id_128 SET NOT NULL" in joined
     assert "RENAME TO \"ptg2_price_atom_" in joined
