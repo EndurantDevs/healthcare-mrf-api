@@ -1922,6 +1922,38 @@ async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monke
 
 
 @pytest.mark.asyncio
+async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(monkeypatch):
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    session = RealishFakeSession([FakeResult(scalar=True)])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_snap",
+        code_count_table="mrf.ptg2_code_count_snap",
+        serving_table_layout="lean_provider_key_v1",
+    )
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+
+    result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+        session,
+        "ptg2:test",
+        {"plan_id": "010854205", "code": "99213", "code_system": "CPT"},
+        serving_tables=tables,
+    )
+
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert result is True
+    assert "FROM mrf.ptg2_code_count_snap" in sql
+    assert "FROM mrf.ptg2_serving_snap" not in sql
+    assert params == {
+        "plan_id": "010854205",
+        "reported_code": "99213",
+        "reported_code_system": "CPT",
+    }
+
+
+@pytest.mark.asyncio
 async def test_search_current_ptg2_index_single_network_plan_uses_single_path(monkeypatch):
     seen = {}
 

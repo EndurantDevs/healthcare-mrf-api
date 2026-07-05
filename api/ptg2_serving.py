@@ -6205,6 +6205,40 @@ def _ptg2_manifest_plan_code_values(args: dict[str, Any]) -> tuple[str, str | No
     return requested_plan, requested_system or None, requested_code
 
 
+async def _has_ptg2_table_plan_code(
+    session,
+    table_name: str,
+    *,
+    requested_plan: str,
+    requested_system: str | None,
+    requested_code: str,
+) -> bool:
+    query_params_by_name: dict[str, Any] = {
+        "plan_id": requested_plan,
+        "reported_code": requested_code,
+    }
+    system_sql = ""
+    if requested_system:
+        query_params_by_name["reported_code_system"] = requested_system
+        system_sql = "AND reported_code_system = :reported_code_system"
+    exists_result = await session.execute(
+        text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {table_name}
+                WHERE plan_id = :plan_id
+                  AND reported_code = :reported_code
+                  {system_sql}
+                LIMIT 1
+            )
+            """
+        ),
+        query_params_by_name,
+    )
+    return bool(exists_result.scalar())
+
+
 async def _ptg2_manifest_snapshot_has_plan_code(
     session,
     snapshot_id: str,
@@ -6226,30 +6260,24 @@ async def _ptg2_manifest_snapshot_has_plan_code(
         table_name = _safe_table_name(serving_tables.serving_table)
         if not table_name or not await _serving_table_available(session, table_name):
             return True
-        params: dict[str, Any] = {
-            "plan_id": requested_plan,
-            "reported_code": requested_code,
-        }
-        system_sql = ""
-        if requested_system:
-            params["reported_code_system"] = requested_system
-            system_sql = "AND reported_code_system = :reported_code_system"
-        result = await session.execute(
-            text(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {table_name}
-                    WHERE plan_id = :plan_id
-                      AND reported_code = :reported_code
-                      {system_sql}
-                    LIMIT 1
-                )
-                """
-            ),
-            params,
+        if _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
+            code_count_table = _safe_table_name(serving_tables.code_count_table)
+            if not code_count_table or not await _serving_table_available(session, code_count_table):
+                return True
+            return await _has_ptg2_table_plan_code(
+                session,
+                code_count_table,
+                requested_plan=requested_plan,
+                requested_system=requested_system,
+                requested_code=requested_code,
+            )
+        return await _has_ptg2_table_plan_code(
+            session,
+            table_name,
+            requested_plan=requested_plan,
+            requested_system=requested_system,
+            requested_code=requested_code,
         )
-        return bool(result.scalar())
     except Exception:
         await _rollback_optional_ptg2_query(session)
         return True
