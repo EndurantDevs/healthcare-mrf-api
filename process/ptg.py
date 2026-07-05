@@ -1774,6 +1774,28 @@ async def _parse_in_network_file_compact(
     return summary
 
 
+def _toc_file_url_match_tokens(file_url_contains: list[str] | None) -> list[str]:
+    """Normalize targeted source-file URL filters for early TOC entry checks."""
+    return [
+        str(value or "").strip().lower()
+        for value in (file_url_contains or [])
+        if str(value or "").strip()
+    ]
+
+
+def _is_requested_toc_body_file_url(location: str, file_url_match_tokens: list[str]) -> bool:
+    """Return whether a TOC body-file URL satisfies the requested file filters."""
+    if not file_url_match_tokens:
+        return True
+    normalized_location = str(location or "").lower()
+    return any(token in normalized_location for token in file_url_match_tokens)
+
+
+def _has_reached_toc_file_limit(jobs: list[dict[str, Any]], max_files: int | None) -> bool:
+    """Return whether TOC processing has selected enough body-file jobs."""
+    return max_files is not None and len(jobs) >= max_files
+
+
 async def _process_table_of_contents(
     toc_url: str,
     classes: dict[str, type],
@@ -1781,6 +1803,8 @@ async def _process_table_of_contents(
     plan_ids: list[str] | None = None,
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
+    file_url_contains: list[str] | None = None,
+    max_files: int | None = None,
     import_run_id: str | None = None,
     reuse_raw_artifacts: bool = True,
     max_bytes: int | None = None,
@@ -1817,7 +1841,10 @@ async def _process_table_of_contents(
                 import_run_id=import_run_id,
             )
 
-    if import_run_id:
+    file_url_match_tokens = _toc_file_url_match_tokens(file_url_contains)
+    targeted_file_import = bool(file_url_match_tokens) and max_files is not None
+
+    if import_run_id and not targeted_file_import:
         catalog_rows = []
         for entry in parse_toc_catalog_entries(
             toc_content,
@@ -1870,6 +1897,8 @@ async def _process_table_of_contents(
     )
 
     for structure in toc_content.get("reporting_structure", []):
+        if _has_reached_toc_file_limit(jobs, max_files):
+            break
         plans = _filter_reporting_plans(
             [_normalize_plan_payload(plan) for plan in (structure.get("reporting_plans") or [])],
             plan_ids=plan_ids,
@@ -1895,6 +1924,8 @@ async def _process_table_of_contents(
             if not _looks_like_toc_body_file_location(location):
                 continue
             location = normalize_tic_source_url(location)
+            if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
+                continue
             meta = dict(toc_meta)
             file_row = _build_file_row(location, "in-network", meta, plans, entry.get("description"), toc_url)
             if file_row["file_id"] not in seen_files:
@@ -1912,12 +1943,18 @@ async def _process_table_of_contents(
             )
             if test_mode and len(jobs) >= TEST_TOC_JOBS:
                 break
+            if _has_reached_toc_file_limit(jobs, max_files):
+                break
 
         for allowed_amount_file in allowed_amount_files:
+            if _has_reached_toc_file_limit(jobs, max_files):
+                break
             location = allowed_amount_file.get("location")
             if not _looks_like_toc_body_file_location(location):
                 continue
             location = normalize_tic_source_url(location)
+            if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
+                continue
             meta = dict(toc_meta)
             file_row = _build_file_row(
                 location, "allowed-amounts", meta, plans, allowed_amount_file.get("description"), toc_url
@@ -2416,6 +2453,8 @@ async def main(
                     plan_ids=plan_ids,
                     plan_name_contains=plan_name_contains,
                     plan_market_types=plan_market_types,
+                    file_url_contains=file_url_contains,
+                    max_files=max_files,
                     import_run_id=import_run_id,
                     reuse_raw_artifacts=reuse_raw_artifacts,
                     max_bytes=max_bytes,

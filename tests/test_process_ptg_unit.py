@@ -1870,6 +1870,75 @@ def test_ptg2_toc_jobs_repair_ucare_json_and_allowed_amount_lists(
     ]
 
 
+def _write_targeted_toc_fixture(tmp_path, source_file_locations):
+    """Create a minimal TOC fixture with the requested source-file locations."""
+    table_of_contents_path = tmp_path / "toc.json"
+    table_of_contents_path.write_text(
+        json.dumps(
+            {
+                "reporting_entity_name": "Cigna Health Life Insurance Company",
+                "reporting_entity_type": "health insurance issuer",
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [{"plan_name": "OAP", "plan_id": "473435755", "plan_market_type": "group"}],
+                        "in_network_files": [
+                            {"location": source_file_location} for source_file_location in source_file_locations
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return table_of_contents_path
+
+
+def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(monkeypatch, tmp_path):
+    """Targeted TOC imports avoid expanding all catalog entries before source-file filtering."""
+    target_source_url = "https://cdn.example.test/target-473435755-in-network.json.gz"
+    source_file_locations = [
+        "https://cdn.example.test/large-unused-in-network.json.gz",
+        target_source_url,
+        "https://cdn.example.test/another-unused-in-network.json.gz",
+    ]
+    table_of_contents_path = _write_targeted_toc_fixture(tmp_path, source_file_locations)
+    pushed_ptg_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        table_of_contents_artifact = SimpleNamespace(logical_path=table_of_contents_path)
+        return table_of_contents_artifact, table_of_contents_artifact
+
+    async def fake_push_objects(ptg_rows_to_push, _cls, **_kwargs):
+        pushed_ptg_file_rows.extend(ptg_rows_to_push)
+
+    def fail_catalog_expansion(*_args, **_kwargs):
+        raise AssertionError("targeted source-file imports should not expand the full TOC catalog")
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "_record_source_version", AsyncMock())
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "parse_toc_catalog_entries", fail_catalog_expansion)
+
+    filtered_toc_jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://cdn.example.test/cigna-index.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            import_run_id="ptg2:test",
+            file_url_contains=["target-473435755"],
+            max_files=1,
+        )
+    )
+
+    assert [toc_job["url"] for toc_job in filtered_toc_jobs] == [target_source_url]
+    assert [ptg_file_row["file_type"] for ptg_file_row in pushed_ptg_file_rows] == [
+        "table-of-contents",
+        "in-network",
+    ]
+    assert pushed_ptg_file_rows[1]["url"] == target_source_url
+
+
 def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
     toc_path = tmp_path / "toc.json"
     toc_path.write_text(
