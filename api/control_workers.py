@@ -105,6 +105,29 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": status, "items": items}
 
 
+def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return current process or Kubernetes worker state for a launch payload."""
+    specs = _resolve_specs(payload)
+    if not specs:
+        importer = str(payload.get("importer") or "").strip()
+        queue = str(payload.get("queue") or "").strip()
+        return {
+            "status": "unsupported",
+            "items": [],
+            "message": f"no worker is registered for {queue or importer or 'request'}",
+        }
+
+    items = [_worker_state(spec, payload) for spec in specs]
+    status = "running" if any(item.get("running") for item in items) else "inactive"
+    if any(item.get("job_status") == "failed" for item in items):
+        status = "failed"
+    elif items and all(item.get("job_status") == "succeeded" for item in items):
+        status = "succeeded"
+    elif items and all(item.get("job_status") == "missing" for item in items):
+        status = "missing"
+    return {"status": status, "items": items}
+
+
 def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
     worker_class = str(payload.get("worker_class") or "").strip()
     queue = str(payload.get("queue") or "").strip()
@@ -208,11 +231,7 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         pid = _find_running_pid(spec)
         running = _pid_running(pid)
         if running and pid:
-            try:
-                _state_dir().mkdir(parents=True, exist_ok=True)
-                _pid_path(spec).write_text(str(pid), encoding="utf-8")
-            except OSError:
-                pass
+            _write_pid_file(spec, pid)
     return {
         "queue": spec.queue,
         "worker_class": spec.worker_class,
@@ -224,6 +243,14 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         "log_path": str(_log_path(spec)),
         "command": " ".join(_worker_command(sys.executable, spec)),
     }
+
+
+def _write_pid_file(spec: WorkerSpec, pid: int) -> None:
+    try:
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        _pid_path(spec).write_text(str(pid), encoding="utf-8")
+    except OSError:
+        return
 
 
 def _launcher_mode() -> str:
@@ -414,7 +441,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         job_status = "succeeded"
     else:
         job_status = "missing"
-    return {
+    state_map = {
         **base,
         "running": active > 0,
         "job_name": latest_name,
@@ -423,6 +450,74 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         "succeeded_jobs": succeeded,
         "failed_jobs": failed,
     }
+    if job_status == "failed":
+        failure = _kubernetes_worker_failure(namespace, selector)
+        if failure:
+            state_map["failure"] = failure
+    return state_map
+
+
+def _kubernetes_worker_failure(namespace: str, selector: str) -> dict[str, Any] | None:
+    path = f"/api/v1/namespaces/{namespace}/pods?{urllib.parse.urlencode({'labelSelector': selector})}"
+    try:
+        body = _kubernetes_request("GET", path)
+    except _KubernetesApiError as exc:
+        return {"lookup_status": "error", "message": str(exc)}
+
+    pods = _kubernetes_pod_records(body)
+    failures = [_pod_container_failure(pod) for pod in pods]
+    failures = [failure for failure in failures if failure is not None]
+    if not failures:
+        return None
+    return failures[-1]
+
+
+def _kubernetes_pod_records(body: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_records = body.get("items") if isinstance(body, dict) else []
+    return [record for record in raw_records if isinstance(record, dict)]
+
+
+def _pod_container_failure(pod: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+    status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+    for container_status in _pod_container_statuses(status):
+        terminated = _container_termination(container_status)
+        if not terminated:
+            continue
+        reason = str(terminated.get("reason") or "").strip()
+        exit_code = terminated.get("exitCode")
+        if reason == "Completed" and int(exit_code or 0) == 0:
+            continue
+        return {
+            "pod_name": metadata.get("name"),
+            "container": container_status.get("name"),
+            "reason": reason or None,
+            "exitCode": exit_code,
+            "message": terminated.get("message"),
+            "startedAt": terminated.get("startedAt"),
+            "finishedAt": terminated.get("finishedAt"),
+        }
+    return None
+
+
+def _pod_container_statuses(status: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for key in ("initContainerStatuses", "containerStatuses"):
+        values = status.get(key)
+        if isinstance(values, list):
+            records.extend(value for value in values if isinstance(value, dict))
+    return records
+
+
+def _container_termination(container_status: dict[str, Any]) -> dict[str, Any] | None:
+    for state_key in ("state", "lastState"):
+        state = container_status.get(state_key)
+        if not isinstance(state, dict):
+            continue
+        terminated = state.get("terminated")
+        if isinstance(terminated, dict):
+            return terminated
+    return None
 
 
 def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str:

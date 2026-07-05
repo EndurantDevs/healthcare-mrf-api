@@ -690,7 +690,92 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
     result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
     row = result.scalar_one_or_none()
-    return normalize_run(row) if row else None
+    if not row:
+        return None
+    return await _sync_terminal_worker_failure(normalize_run(row))
+
+
+async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
+    if run.get("status") not in {"starting", "running", "finalizing"}:
+        return run
+    worker_status = await _active_worker_state(run)
+    failed_item = _failed_worker_state_item(worker_status)
+    if failed_item is None:
+        return run
+
+    now = utc_now()
+    progress_dict = {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "worker job failed"}
+    metrics_map = dict(run.get("metrics") or {})
+    metrics_map["terminal_worker_state"] = worker_status
+    error_dict = _worker_job_failure_error(failed_item)
+    await db.execute(
+        update(ImportRun)
+        .where(ImportRun.run_id == run["run_id"])
+        .values(
+            status="failed",
+            phase_detail="worker job failed",
+            heartbeat_at=now,
+            finished_at=now,
+            progress=progress_dict,
+            metrics=metrics_map,
+            error=error_dict,
+        )
+    )
+    return {
+        **run,
+        "status": "failed",
+        "phase_detail": "worker job failed",
+        "heartbeat_at": isoformat_utc(now),
+        "finished_at": isoformat_utc(now),
+        "progress": progress_dict,
+        "metrics": metrics_map,
+        "error": error_dict,
+    }
+
+
+async def _active_worker_state(run: dict[str, Any]) -> dict[str, Any]:
+    payload = _active_worker_cancel_payload(run)
+    if not payload:
+        return {"status": "unsupported", "items": []}
+    try:
+        from api.control_workers import worker_state
+
+        return await asyncio.to_thread(worker_state, payload)
+    except Exception as exc:
+        return {"status": "error", "items": [], "message": str(exc)}
+
+
+def _failed_worker_state_item(worker_status: dict[str, Any]) -> dict[str, Any] | None:
+    items = worker_status.get("items") if isinstance(worker_status, dict) else None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and item.get("job_status") == "failed":
+            return item
+    return None
+
+
+def _worker_job_failure_error(worker_item: dict[str, Any]) -> dict[str, Any]:
+    failure = worker_item.get("failure") if isinstance(worker_item.get("failure"), dict) else {}
+    job_name = str(worker_item.get("job_name") or "worker job")
+    reason = str(failure.get("reason") or worker_item.get("job_status") or "failed").strip()
+    message = f"Kubernetes worker job {job_name} failed"
+    if reason:
+        message = f"{message}: {reason}"
+
+    error_dict: dict[str, Any] = {
+        "code": "worker_job_failed",
+        "message": message,
+        "reason": reason or "failed",
+        "job_name": worker_item.get("job_name"),
+        "worker_class": worker_item.get("worker_class"),
+        "queue": worker_item.get("queue"),
+        "job_status": worker_item.get("job_status"),
+        "kubernetes_evidence": {"items": [worker_item]},
+    }
+    if "exitCode" in failure:
+        error_dict["exitCode"] = failure.get("exitCode")
+    return error_dict
 
 
 async def finalize_import_run(run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:

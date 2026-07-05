@@ -1286,6 +1286,55 @@ def _install_running_cancel_stubs(monkeypatch, source_run: dict[str, object], de
 
 
 @pytest.mark.asyncio
+async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
+    source_run = _running_ptg_cancel_run(
+        "run_ptg_oom",
+        pct=80,
+        queue="arq:PTGNormal",
+        worker_class="process.PTGNormal",
+        resource_class="normal",
+    )
+    terminal_state_map = {
+        "status": "failed",
+        "items": [
+            {
+                "queue": "arq:PTGNormal",
+                "worker_class": "process.PTGNormal",
+                "job_name": "hpw-mrf-process-ptgnormal-start-9d32f9a072",
+                "job_status": "failed",
+                "failure": {
+                    "pod_name": "hpw-mrf-process-ptgnormal-start-9d32f9a072-72nnt",
+                    "container": "worker",
+                    "reason": "OOMKilled",
+                    "exitCode": 137,
+                },
+            }
+        ],
+    }
+
+    async def fake_active_worker_state(run):
+        assert run == source_run
+        return terminal_state_map
+
+    database_recorder = _CancelDbUpdateRecorder()
+    monkeypatch.setattr(control_imports, "db", database_recorder)
+    monkeypatch.setattr(control_imports, "_active_worker_state", fake_active_worker_state)
+
+    synced_run = await control_imports._sync_terminal_worker_failure(source_run)
+
+    assert synced_run["status"] == "failed"
+    assert synced_run["phase_detail"] == "worker job failed"
+    assert synced_run["progress"] == {"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "worker job failed"}
+    assert synced_run["metrics"]["terminal_worker_state"] == terminal_state_map
+    assert synced_run["error"]["code"] == "worker_job_failed"
+    assert synced_run["error"]["reason"] == "OOMKilled"
+    assert synced_run["error"]["exitCode"] == 137
+    assert synced_run["error"]["kubernetes_evidence"]["items"][0]["failure"]["exitCode"] == 137
+    assert database_recorder.update_parameters[-1]["status"] == "failed"
+    assert database_recorder.update_parameters[-1]["error"]["reason"] == "OOMKilled"
+
+
+@pytest.mark.asyncio
 async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
     calls = {"get": 0}
     current = {
