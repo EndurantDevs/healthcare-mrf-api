@@ -25,6 +25,43 @@ def test_ptg_compare_sql_helper_returns_text_clause():
     assert str(clause) == "SELECT 1"
 
 
+def test_ptg_compare_parser_accepts_latency_benchmark_options():
+    module = _load_script("ptg2_compare_snapshots")
+
+    args = module._build_parser().parse_args(
+        [
+            "--old-snapshot-id",
+            "ptg2:old",
+            "--new-snapshot-id",
+            "ptg2:new",
+            "--benchmark-cases",
+            "5",
+            "--benchmark-iterations",
+            "3",
+            "--benchmark-limit",
+            "7",
+        ]
+    )
+
+    assert args.benchmark_cases == 5
+    assert args.benchmark_iterations == 3
+    assert args.benchmark_limit == 7
+
+
+def test_ptg_compare_summarize_ms_reports_percentile():
+    module = _load_script("ptg2_compare_snapshots")
+
+    summary = module._summarize_ms([10.0, 20.0, 30.0])
+
+    assert summary == {
+        "count": 3,
+        "min_ms": 10.0,
+        "avg_ms": 20.0,
+        "p95_ms": 30.0,
+        "max_ms": 30.0,
+    }
+
+
 def test_ptg_devops_scripts_import_without_database_connection():
     for module_name in (
         "ptg2_compare_snapshots",

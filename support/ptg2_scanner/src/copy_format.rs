@@ -28,6 +28,15 @@ pub struct ManifestServingCopyRow<'a> {
     pub network_names: &'a [String],
 }
 
+pub struct ManifestLeanServingCopyRow<'a> {
+    pub plan_id: &'a str,
+    pub reported_code_system: Option<&'a str>,
+    pub reported_code: Option<&'a str>,
+    pub provider_set_global_id_128: &'a str,
+    pub provider_count: i64,
+    pub price_set_global_id_128: &'a str,
+}
+
 pub fn pg_text_copy_field(value: Option<&str>) -> String {
     match value {
         None => "\\N".to_string(),
@@ -158,11 +167,30 @@ pub fn emit_manifest_serving_copy_row<W: Write>(
     )
 }
 
+pub fn emit_manifest_lean_serving_copy_row<W: Write>(
+    writer: &mut W,
+    row: &ManifestLeanServingCopyRow<'_>,
+) -> io::Result<()> {
+    let provider_count_text = row.provider_count.to_string();
+    write_copy_text_fields(
+        writer,
+        &[
+            Some(row.plan_id),
+            row.reported_code_system,
+            row.reported_code,
+            Some(row.provider_set_global_id_128),
+            Some(&provider_count_text),
+            Some(row.price_set_global_id_128),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field,
-        pg_text_copy_field, CompactCopyRow, ManifestServingCopyRow,
+        emit_compact_copy_row, emit_manifest_lean_serving_copy_row, emit_manifest_serving_copy_row,
+        pg_text_array_field, pg_text_copy_field, CompactCopyRow, ManifestLeanServingCopyRow,
+        ManifestServingCopyRow,
     };
 
     #[test]
@@ -236,6 +264,26 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntracesuffix\t{\"C2\"}\n"
+        );
+    }
+
+    #[test]
+    fn manifest_lean_serving_copy_rows_emit_natural_lean_source_columns() {
+        let row = ManifestLeanServingCopyRow {
+            plan_id: "plan\t1",
+            reported_code_system: Some("CPT"),
+            reported_code: None,
+            provider_set_global_id_128: "provider",
+            provider_count: 12,
+            price_set_global_id_128: "price",
+        };
+        let mut out = Vec::new();
+
+        emit_manifest_lean_serving_copy_row(&mut out, &row).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "plan\\t1\tCPT\t\\N\tprovider\t12\tprice\n"
         );
     }
 }

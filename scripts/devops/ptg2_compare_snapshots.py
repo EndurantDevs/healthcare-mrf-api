@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,9 @@ async def _snapshot_info(session, snapshot_id: str) -> dict[str, Any]:
         "status": snapshot_record["status"],
         "previous_snapshot_id": snapshot_record["previous_snapshot_id"],
         "source_key": options.get("source_key") or serving_index.get("source_key"),
+        "arch_version": serving_index.get("arch_version") or "legacy_implicit",
+        "provider_scope_strategy": serving_index.get("provider_scope_strategy") or "legacy_implicit",
+        "materialized_tables": serving_index.get("materialized_tables") or {},
         "serving_rates": manifest.get("serving_rates") or serving_index.get("serving_rates") or report.get("serving_rates"),
         "files_processed": manifest.get("files_processed") or report.get("files_processed"),
         "serving_layout": serving_index.get("serving_table_layout") or "legacy_or_default",
@@ -194,6 +198,44 @@ def _serving_exists_sql(new_info: dict[str, Any]) -> str:
            AND ns.provider_count::bigint IS NOT DISTINCT FROM sample.provider_count
            AND ns.price_set_global_id_128::text = sample.price_set_global_id_128
          LIMIT 1
+    """
+
+
+def _serving_sample_sql(info: dict[str, Any], limit: int, sample_pct: float) -> str:
+    table_names = info["tables"]
+    serving = _qtable(table_names["serving"])
+    if info["serving_layout"] == "lean_provider_key_v1":
+        code_count = _qtable(table_names["code_count"])
+        provider_dict = _qtable(table_names["provider_set_dict"])
+        return f"""
+            SELECT
+                cc.plan_id::text AS plan_id,
+                cc.reported_code_system::text AS reported_code_system,
+                cc.reported_code::text AS reported_code,
+                psd.provider_set_global_id_128::text AS provider_set_global_id_128,
+                sample.provider_count::bigint AS provider_count,
+                sample.price_set_global_id_128::text AS price_set_global_id_128
+              FROM (
+                    SELECT code_key, provider_set_key, provider_count, price_set_global_id_128
+                      FROM {serving} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (42)
+                     LIMIT {limit}
+              ) sample
+              JOIN {code_count} cc ON cc.code_key = sample.code_key
+              JOIN {provider_dict} psd ON psd.provider_set_key = sample.provider_set_key
+             WHERE cc.reported_code IS NOT NULL
+             LIMIT {limit}
+        """
+    return f"""
+            SELECT
+                plan_id::text AS plan_id,
+                reported_code_system::text AS reported_code_system,
+                reported_code::text AS reported_code,
+                provider_set_global_id_128::text AS provider_set_global_id_128,
+                provider_count::bigint AS provider_count,
+                price_set_global_id_128::text AS price_set_global_id_128
+              FROM {serving} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (42)
+             WHERE reported_code IS NOT NULL
+             LIMIT {limit}
     """
 
 
@@ -246,6 +288,59 @@ def _price_exists_sql(new_info: dict[str, Any]) -> str:
     """
 
 
+def _price_sample_sql(info: dict[str, Any], limit: int, sample_pct: float) -> str:
+    table_names = info["tables"]
+    price_atom = _qtable(table_names["price_atom"])
+    if info["price_atom_layout"] == "lean_dict_v1":
+        dictionary = _qtable(table_names["price_atom_dict"])
+        join_sql_parts = []
+        for kind, alias, column in (
+            ("negotiated_type", "nt", "negotiated_type_key"),
+            ("expiration_date", "ed", "expiration_date_key"),
+            ("service_code", "sc", "service_code_key"),
+            ("billing_class", "bc", "billing_class_key"),
+            ("setting", "st", "setting_key"),
+            ("billing_code_modifier", "bcm", "billing_code_modifier_key"),
+            ("additional_information", "ai", "additional_information_key"),
+        ):
+            join_sql_parts.append(
+                f"JOIN {dictionary} {alias} ON {alias}.attr_kind = '{kind}' AND {alias}.attr_key = sample.{column}"
+            )
+        return f"""
+            SELECT
+                sample.price_atom_global_id_128::text AS price_atom_global_id_128,
+                coalesce(nt.text_value, '') AS negotiated_type,
+                coalesce(sample.negotiated_rate::text, '') AS negotiated_rate,
+                coalesce(ed.text_value, '') AS expiration_date,
+                coalesce(sc.text_array::text, '') AS service_code,
+                coalesce(bc.text_value, '') AS billing_class,
+                coalesce(st.text_value, '') AS setting,
+                coalesce(bcm.text_array::text, '') AS billing_code_modifier,
+                coalesce(ai.text_value, '') AS additional_information
+              FROM (
+                    SELECT *
+                      FROM {price_atom} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (43)
+                     LIMIT {limit}
+              ) sample
+              {' '.join(join_sql_parts)}
+             LIMIT {limit}
+        """
+    return f"""
+            SELECT
+                price_atom_global_id_128::text AS price_atom_global_id_128,
+                coalesce(negotiated_type::text, '') AS negotiated_type,
+                coalesce(negotiated_rate::text, '') AS negotiated_rate,
+                coalesce(expiration_date::text, '') AS expiration_date,
+                coalesce(service_code::text, '') AS service_code,
+                coalesce(billing_class::text, '') AS billing_class,
+                coalesce(setting::text, '') AS setting,
+                coalesce(billing_code_modifier::text, '') AS billing_code_modifier,
+                coalesce(additional_information::text, '') AS additional_information
+              FROM {price_atom} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (43)
+             LIMIT {limit}
+    """
+
+
 async def _sample_serving(
     session,
     old_info: dict[str, Any],
@@ -253,22 +348,12 @@ async def _sample_serving(
     limit: int,
     sample_pct: float,
 ) -> dict[str, Any]:
-    old_serving = _qtable(old_info["tables"]["serving"])
     await session.execute(_sql_text("DROP TABLE IF EXISTS sample_serving"))
     await session.execute(
         _sql_text(
             f"""
             CREATE TEMP TABLE sample_serving ON COMMIT DROP AS
-            SELECT
-                plan_id::text AS plan_id,
-                reported_code_system::text AS reported_code_system,
-                reported_code::text AS reported_code,
-                provider_set_global_id_128::text AS provider_set_global_id_128,
-                provider_count::bigint AS provider_count,
-                price_set_global_id_128::text AS price_set_global_id_128
-              FROM {old_serving} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (42)
-             WHERE reported_code IS NOT NULL
-             LIMIT {limit}
+            {_serving_sample_sql(old_info, limit, sample_pct)}
             """
         )
     )
@@ -311,24 +396,12 @@ async def _sample_price_atoms(
     limit: int,
     sample_pct: float,
 ) -> dict[str, Any]:
-    old_price = _qtable(old_info["tables"]["price_atom"])
     await session.execute(_sql_text("DROP TABLE IF EXISTS sample_price_atom"))
     await session.execute(
         _sql_text(
             f"""
             CREATE TEMP TABLE sample_price_atom ON COMMIT DROP AS
-            SELECT
-                price_atom_global_id_128::text AS price_atom_global_id_128,
-                coalesce(negotiated_type::text, '') AS negotiated_type,
-                coalesce(negotiated_rate::text, '') AS negotiated_rate,
-                coalesce(expiration_date::text, '') AS expiration_date,
-                coalesce(service_code::text, '') AS service_code,
-                coalesce(billing_class::text, '') AS billing_class,
-                coalesce(setting::text, '') AS setting,
-                coalesce(billing_code_modifier::text, '') AS billing_code_modifier,
-                coalesce(additional_information::text, '') AS additional_information
-              FROM {old_price} TABLESAMPLE SYSTEM ({sample_pct}) REPEATABLE (43)
-             LIMIT {limit}
+            {_price_sample_sql(old_info, limit, sample_pct)}
             """
         )
     )
@@ -422,6 +495,159 @@ async def _sample_provider_members(
     return dict(sample_result.mappings().first())
 
 
+def _summarize_ms(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "min_ms": None, "avg_ms": None, "p95_ms": None, "max_ms": None}
+    ordered = sorted(values)
+    p95_index = min(len(ordered) - 1, int(round((len(ordered) - 1) * 0.95)))
+    return {
+        "count": len(values),
+        "min_ms": round(ordered[0], 3),
+        "avg_ms": round(sum(values) / len(values), 3),
+        "p95_ms": round(ordered[p95_index], 3),
+        "max_ms": round(ordered[-1], 3),
+    }
+
+
+async def _benchmark_cases(session, info: dict[str, Any], case_count: int, sample_pct: float) -> list[dict[str, Any]]:
+    case_count = max(int(case_count), 0)
+    if case_count <= 0:
+        return []
+
+    async def _load_cases(candidate_pct: float) -> list[dict[str, Any]]:
+        sample_sql = _serving_sample_sql(info, max(case_count * 20, case_count), candidate_pct)
+        result = await session.execute(
+            _sql_text(
+                f"""
+                WITH sample AS (
+                    {sample_sql}
+                )
+                SELECT DISTINCT plan_id, reported_code_system, reported_code
+                  FROM sample
+                 WHERE NULLIF(BTRIM(plan_id), '') IS NOT NULL
+                   AND NULLIF(BTRIM(reported_code), '') IS NOT NULL
+                 ORDER BY plan_id, reported_code_system NULLS LAST, reported_code
+                 LIMIT {case_count}
+                """
+            )
+        )
+        return [dict(row) for row in result.mappings().all()]
+
+    cases = await _load_cases(sample_pct)
+    if cases:
+        return cases
+    return await _load_cases(100.0)
+
+
+async def _time_serving_case(
+    session,
+    *,
+    snapshot_id: str,
+    case: dict[str, Any],
+    iterations: int,
+    limit: int,
+) -> dict[str, Any]:
+    from api.endpoint.pagination import PaginationParams
+    from api.ptg2_serving import search_current_ptg2_index
+
+    iterations = max(int(iterations), 1)
+    pagination = PaginationParams(page=1, limit=max(int(limit), 1), offset=0, source="ptg2_compare_snapshots")
+    args = {
+        "snapshot_id": snapshot_id,
+        "plan_id": case.get("plan_id"),
+        "code_system": case.get("reported_code_system"),
+        "code": case.get("reported_code"),
+        "limit": str(pagination.limit),
+        "include_sources": "false",
+        "include_details": "false",
+    }
+
+    warmup_started = time.perf_counter()
+    warmup_payload = await search_current_ptg2_index(session, args, pagination)
+    warmup_ms = (time.perf_counter() - warmup_started) * 1000.0
+
+    elapsed_values: list[float] = []
+    result_totals: list[Any] = []
+    item_counts: list[int] = []
+    for _ in range(iterations):
+        started = time.perf_counter()
+        payload = await search_current_ptg2_index(session, args, pagination)
+        elapsed_values.append((time.perf_counter() - started) * 1000.0)
+        payload = payload or {}
+        pagination_payload = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        result_totals.append(pagination_payload.get("total"))
+        items = payload.get("items")
+        item_counts.append(len(items) if isinstance(items, list) else 0)
+
+    warmup_pagination = (
+        warmup_payload.get("pagination")
+        if isinstance(warmup_payload, dict) and isinstance(warmup_payload.get("pagination"), dict)
+        else {}
+    )
+    warmup_items = warmup_payload.get("items") if isinstance(warmup_payload, dict) else None
+    return {
+        "snapshot_id": snapshot_id,
+        "warmup_ms": round(warmup_ms, 3),
+        "warmup_total": warmup_pagination.get("total"),
+        "warmup_items": len(warmup_items) if isinstance(warmup_items, list) else 0,
+        "iterations": iterations,
+        "timing": _summarize_ms(elapsed_values),
+        "result_totals": result_totals,
+        "item_counts": item_counts,
+    }
+
+
+async def _latency_benchmark(
+    session,
+    old_info: dict[str, Any],
+    new_info: dict[str, Any],
+    *,
+    case_count: int,
+    iterations: int,
+    limit: int,
+    sample_pct: float,
+) -> dict[str, Any]:
+    if case_count <= 0:
+        return {"enabled": False}
+    cases = await _benchmark_cases(session, old_info, case_count, sample_pct)
+    rows = []
+    for case in cases:
+        rows.append(
+            {
+                "case": case,
+                "old": await _time_serving_case(
+                    session,
+                    snapshot_id=old_info["snapshot_id"],
+                    case=case,
+                    iterations=iterations,
+                    limit=limit,
+                ),
+                "new": await _time_serving_case(
+                    session,
+                    snapshot_id=new_info["snapshot_id"],
+                    case=case,
+                    iterations=iterations,
+                    limit=limit,
+                ),
+            }
+        )
+    old_warmup = [row["old"]["warmup_ms"] for row in rows]
+    new_warmup = [row["new"]["warmup_ms"] for row in rows]
+    old_measured = [row["old"]["timing"]["avg_ms"] for row in rows if row["old"]["timing"]["avg_ms"] is not None]
+    new_measured = [row["new"]["timing"]["avg_ms"] for row in rows if row["new"]["timing"]["avg_ms"] is not None]
+    return {
+        "enabled": True,
+        "case_count": len(rows),
+        "iterations": max(int(iterations), 1),
+        "limit": max(int(limit), 1),
+        "old_warmup": _summarize_ms(old_warmup),
+        "new_warmup": _summarize_ms(new_warmup),
+        "old_measured_avg_ms": _summarize_ms(old_measured),
+        "new_measured_avg_ms": _summarize_ms(new_measured),
+        "cases": rows,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-snapshot-id", required=True, help="Existing snapshot being replaced.")
@@ -429,6 +655,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-limit", type=int, default=500, help="Rows to sample from each checked table.")
     parser.add_argument("--sample-pct", type=float, default=0.1, help="Postgres TABLESAMPLE SYSTEM percentage.")
     parser.add_argument("--skip-sidecars", action="store_true", help="Do not fail on sidecar hash/size mismatch.")
+    parser.add_argument("--benchmark-cases", type=int, default=0, help="Plan/code cases to time against both snapshots.")
+    parser.add_argument("--benchmark-iterations", type=int, default=3, help="Measured iterations per benchmark case.")
+    parser.add_argument("--benchmark-limit", type=int, default=5, help="Serving result limit for latency benchmark cases.")
     return parser
 
 
@@ -451,6 +680,15 @@ async def _compare_snapshots(cli_args: argparse.Namespace) -> dict[str, Any]:
             "serving_sample": await _sample_serving(session, old_info, new_info, limit, sample_pct),
             "price_atom_sample": await _sample_price_atoms(session, old_info, new_info, limit, sample_pct),
             "provider_member_sample": await _sample_provider_members(session, old_info, new_info, limit, sample_pct),
+            "latency_benchmark": await _latency_benchmark(
+                session,
+                old_info,
+                new_info,
+                case_count=max(int(cli_args.benchmark_cases), 0),
+                iterations=max(int(cli_args.benchmark_iterations), 1),
+                limit=max(int(cli_args.benchmark_limit), 1),
+                sample_pct=sample_pct,
+            ),
         }
     missing_counts = [
         int(check_result_by_name["serving_sample"]["missing"] or 0),
@@ -470,15 +708,22 @@ async def _compare_snapshots(cli_args: argparse.Namespace) -> dict[str, Any]:
     return {"old": old_info, "new": new_info, "checks": check_result_by_name}
 
 
+async def _run_cli(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        return await _compare_snapshots(args)
+    finally:
+        await _db_connection().disconnect()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the snapshot comparison CLI and print a JSON result."""
     args = _build_parser().parse_args(argv)
+    output = asyncio.run(_run_cli(args))
     try:
-        output = asyncio.run(_compare_snapshots(args))
         print(json.dumps(output, indent=2, sort_keys=True, default=str))
         return 0 if output["checks"]["passed"] else 2
-    finally:
-        asyncio.run(_db_connection().disconnect())
+    except BrokenPipeError:
+        return 1
 
 
 if __name__ == "__main__":

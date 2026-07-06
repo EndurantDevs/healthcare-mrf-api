@@ -244,15 +244,22 @@ async def _execute_rebuild(cli_args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+async def _run_cli(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        return await _execute_rebuild(args)
+    finally:
+        await _db_connection().disconnect()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the rebuild CLI and print a JSON result."""
     args = _build_parser().parse_args(argv)
+    output = asyncio.run(_run_cli(args))
     try:
-        output = asyncio.run(_execute_rebuild(args))
         print(json.dumps(output, indent=2, sort_keys=True, default=str))
         return 0 if output.get("status") == "succeeded" else 2
-    finally:
-        asyncio.run(_db_connection().disconnect())
+    except BrokenPipeError:
+        return 1
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ PTG2_UNLOGGED_STAGE_ENV = "HLTHPRT_PTG2_UNLOGGED_STAGE"
 PTG2_UNLOGGED_FINAL_ENV = "HLTHPRT_PTG2_UNLOGGED_FINAL"
 PTG2_BINARY_IDS_ENV = "HLTHPRT_PTG2_BINARY_IDS"
 PTG2_MANIFEST_PRECOPY_MERGE_ENV = "HLTHPRT_PTG2_MANIFEST_PRECOPY_MERGE"
+PTG2_MANIFEST_STREAM_MERGE_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY"
 PTG2_FILE_PROCESS_CONCURRENCY_ENV = "HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY"
 PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED"
 PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV = "HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK"
@@ -105,6 +106,15 @@ PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS_ENV = "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_I
 PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV = "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES"
 PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV = "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES"
 PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV = "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS"
+PTG2_SNAPSHOT_ARCH_ENV = "HLTHPRT_PTG2_SNAPSHOT_ARCH"
+PTG2_SNAPSHOT_ARCH_VARIANT_ENV = "HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT"
+
+PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1 = "materialized_v1"
+PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 = "sidecar_scope_v1"
+PTG2_SNAPSHOT_ARCH_LEGACY_MIXED_V1 = "legacy_mixed_v1"
+PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE = "materialized_rate_scope"
+PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE = "component_table"
+PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR = "sidecar_provider_scope"
 
 PTG2_DEFAULT_COMPACT_COPY_TASKS = 2
 PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS = 1
@@ -148,6 +158,40 @@ def _env_int(name: str, default: int) -> int:
         return int(str(raw).strip())
     except ValueError:
         return default
+
+
+def _ptg2_snapshot_arch_from_env() -> str | None:
+    raw = os.getenv(PTG2_SNAPSHOT_ARCH_ENV)
+    if raw is None or not str(raw).strip():
+        return PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1
+    normalized = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+        "materialized_v1": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+        "legacy": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+        "legacy_materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+        "legacy_materialized_v1": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+        "sidecar": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
+        "sidecar_only": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
+        "sidecar_scope": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
+        "sidecar_scope_v1": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported {PTG2_SNAPSHOT_ARCH_ENV}={raw!r}; "
+            f"expected {PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1!r} or {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1!r}"
+        )
+    return aliases[normalized]
+
+
+def _ptg2_snapshot_arch_variant(arch_version: str | None = None) -> str | None:
+    raw = os.getenv(PTG2_SNAPSHOT_ARCH_VARIANT_ENV)
+    if raw is None and os.getenv(PTG2_SNAPSHOT_ARCH_ENV) is not None:
+        raw = arch_version or _ptg2_snapshot_arch_from_env()
+    if raw is None or not str(raw).strip():
+        return None
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(raw).strip().lower()).strip("_")
+    return normalized or None
 
 
 def _ptg2_stage_copy_dedupe_enabled(kind: str) -> bool:

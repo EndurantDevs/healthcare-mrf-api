@@ -318,6 +318,7 @@ def _iter_compact_serving_records_rust(
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
     manifest_serving_copy_path: str | Path | None = None,
+    manifest_lean_serving_copy_path: str | Path | None = None,
     manifest_provider_forward_sidecar_path: str | Path | None = None,
     manifest_provider_inverted_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
@@ -367,6 +368,8 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"] = str(provider_entry_component_copy_path)
     if manifest_serving_copy_path is not None:
         env["HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"] = str(manifest_serving_copy_path)
+    if manifest_lean_serving_copy_path is not None:
+        env["HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"] = str(manifest_lean_serving_copy_path)
     if manifest_provider_forward_sidecar_path is not None:
         env["HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"] = str(manifest_provider_forward_sidecar_path)
     if manifest_provider_inverted_sidecar_path is not None:
@@ -484,6 +487,7 @@ async def _aiter_compact_serving_records_rust(
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
     manifest_serving_copy_path: str | Path | None = None,
+    manifest_lean_serving_copy_path: str | Path | None = None,
     manifest_provider_forward_sidecar_path: str | Path | None = None,
     manifest_provider_inverted_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
@@ -512,6 +516,7 @@ async def _aiter_compact_serving_records_rust(
         provider_set_entry_copy_path=provider_set_entry_copy_path,
         provider_entry_component_copy_path=provider_entry_component_copy_path,
         manifest_serving_copy_path=manifest_serving_copy_path,
+        manifest_lean_serving_copy_path=manifest_lean_serving_copy_path,
         manifest_provider_forward_sidecar_path=manifest_provider_forward_sidecar_path,
         manifest_provider_inverted_sidecar_path=manifest_provider_inverted_sidecar_path,
         manifest_provider_npi_sidecar_path=manifest_provider_npi_sidecar_path,

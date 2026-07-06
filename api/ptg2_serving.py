@@ -177,6 +177,18 @@ class _ManifestProviderLocationScope:
     is_empty: bool = False
 
 
+def _manifest_provider_set_component_table(serving_tables: PTG2ServingTables) -> str | None:
+    if serving_tables.uses_sidecar_provider_scope:
+        return None
+    return _safe_table_name(serving_tables.provider_set_component_table)
+
+
+def _manifest_provider_group_rate_scope_table(serving_tables: PTG2ServingTables) -> str | None:
+    if serving_tables.uses_sidecar_provider_scope:
+        return None
+    return _safe_table_name(serving_tables.provider_group_rate_scope_table)
+
+
 async def _set_local_jit_off_for_manifest_location(session) -> None:
     if getattr(session, _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR, False):
         return
@@ -364,20 +376,24 @@ async def _manifest_provider_group_rate_scope_available(
     if code_system:
         filters.append("reported_code_system = :reported_code_system")
         params["reported_code_system"] = code_system
-    result = await session.execute(
-        text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {provider_group_rate_scope_table}
-                WHERE {" AND ".join(filters)}
-                LIMIT 1
-            )
-            """
-        ),
-        params,
-    )
-    return bool(result.scalar())
+    try:
+        result = await session.execute(
+            text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {provider_group_rate_scope_table}
+                    WHERE {" AND ".join(filters)}
+                    LIMIT 1
+                )
+                """
+            ),
+            params,
+        )
+        return bool(result.scalar())
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return False
 
 
 async def _taxonomy_int_codes_for_codes(
@@ -2121,7 +2137,7 @@ async def _manifest_sets_by_group(
         return {}
 
     sidecar_available = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"))
-    component_table = _safe_table_name(serving_tables.provider_set_component_table)
+    component_table = _manifest_provider_set_component_table(serving_tables)
     if component_table:
         sets_by_group: dict[str, set[str]] = {group_id: set() for group_id in normalized_group_ids}
         try:
@@ -3366,7 +3382,7 @@ async def _ptg2_manifest_location_provider_matches(
     if (
         not provider_group_member_table
         or not (
-            serving_tables.provider_set_component_table
+            _manifest_provider_set_component_table(serving_tables)
             or _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
         )
     ):
@@ -3514,10 +3530,10 @@ async def _ptg2_manifest_location_provider_matches(
     final_member_scope_join = ""
     final_member_filters: list[str] = []
     member_scope_cte = ""
-    component_table = _safe_table_name(serving_tables.provider_set_component_table)
+    component_table = _manifest_provider_set_component_table(serving_tables)
     serving_table = _safe_table_name(serving_tables.serving_table)
     provider_group_location_table = _safe_table_name(serving_tables.provider_group_location_table)
-    provider_group_rate_scope_table = _safe_table_name(serving_tables.provider_group_rate_scope_table)
+    provider_group_rate_scope_table = _manifest_provider_group_rate_scope_table(serving_tables)
     active_provider_group_rate_scope_table = ""
     rate_provider_group_ids: tuple[str, ...] = ()
     has_component_rate_scope = False
@@ -4309,7 +4325,7 @@ async def _ptg2_manifest_provider_sets_for_npi(
     if (
         not provider_group_member_table
         or not (
-            serving_tables.provider_set_component_table
+            _manifest_provider_set_component_table(serving_tables)
             or _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
         )
     ):
@@ -5065,9 +5081,10 @@ def _compact_provider_filter_sql(
         where = " AND ".join(clauses) or "TRUE"
         component_join = ""
         provider_match_predicate = "FALSE"
-        if serving_tables.provider_set_component_table:
+        component_table = _manifest_provider_set_component_table(serving_tables)
+        if component_table:
             component_join = f"""
-                JOIN {serving_tables.provider_set_component_table} psc_filter
+                JOIN {component_table} psc_filter
                   ON psc_filter.provider_set_hash = r.provider_set_hash"""
             provider_match_predicate = "pgm_filter.provider_group_hash = psc_filter.provider_group_hash"
         elif serving_tables.provider_group_member_table:
@@ -5095,8 +5112,9 @@ def _compact_provider_filter_sql(
     clauses = []
     joins = []
     provider_set_predicate = ""
-    if serving_tables.provider_set_component_table:
-        joins.append(f"FROM {serving_tables.provider_set_component_table} psc_filter")
+    component_table = _manifest_provider_set_component_table(serving_tables)
+    if component_table:
+        joins.append(f"FROM {component_table} psc_filter")
         joins.append(f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash")
         provider_set_predicate = "psc_filter.provider_set_hash = r.provider_set_hash"
     elif serving_tables.provider_group_member_table:
@@ -5229,9 +5247,10 @@ def _compact_provider_expansion_sql(
     member_filter_sql = "".join(f"\n          AND {predicate}" for predicate in member_predicates)
     component_join = ""
     member_join = ""
-    if serving_tables.provider_set_component_table:
+    component_table = _manifest_provider_set_component_table(serving_tables)
+    if component_table:
         component_join = f"""
-        JOIN {serving_tables.provider_set_component_table} psc
+        JOIN {component_table} psc
           ON psc.provider_set_hash = r.provider_set_hash"""
         member_join = f"""
         JOIN {serving_tables.provider_group_member_table} pgm
@@ -6049,7 +6068,8 @@ async def _search_compact_provider_procedures(
     table_name = _safe_table_name(serving_tables.serving_table)
     if not table_name or not await _serving_table_available(session, table_name):
         return None
-    if not serving_tables.provider_set_component_table or not serving_tables.provider_group_member_table:
+    component_table = _manifest_provider_set_component_table(serving_tables)
+    if not component_table or not serving_tables.provider_group_member_table:
         return None
     params: dict[str, Any] = {
         "npi": int(npi),
@@ -6100,7 +6120,7 @@ async def _search_compact_provider_procedures(
         f"""
         WITH provider_sets AS MATERIALIZED (
             SELECT DISTINCT psc.provider_set_hash
-            FROM {serving_tables.provider_set_component_table} psc
+            FROM {component_table} psc
             JOIN {serving_tables.provider_group_member_table} pgm
               ON pgm.provider_group_hash = psc.provider_group_hash
             WHERE pgm.npi = :npi
@@ -6204,9 +6224,10 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
         return None
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
     table_name = _safe_table_name(serving_tables.serving_table)
+    component_table = _manifest_provider_set_component_table(serving_tables)
     if table_name and (
         _is_compact_serving_table(table_name)
-        or (serving_tables.provider_set_component_table and not _ptg2_manifest_storage_enabled(serving_tables))
+        or (component_table and not _ptg2_manifest_storage_enabled(serving_tables))
     ):
         return await _search_compact_provider_procedures(
             session,

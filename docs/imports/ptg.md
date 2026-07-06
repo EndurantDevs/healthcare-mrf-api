@@ -85,6 +85,35 @@ python main.py worker process.EntityAddressUnified --burst
 - Snapshot support tables for price atoms, provider group members, and precomputed plan/code counts
 - Binary sidecars for provider-set, provider-NPI, provider reverse, and price-set membership
 
+## Snapshot Architecture
+
+PTG2 snapshots record their serving architecture in
+`manifest.serving_index.arch_version`. Serving code reads that value so one
+deployment can serve both old and new snapshots while operators compare them.
+
+Supported import modes:
+
+- Default / `HLTHPRT_PTG2_SNAPSHOT_ARCH=sidecar_scope_v1` omits both
+  provider-scope materialization tables and uses retained sidecars plus the
+  compact serving dictionaries at query time. This is the storage-saving layout
+  for carriers where `provider_group_rate_scope` dominates disk.
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=materialized_v1` materializes
+  `provider_set_component` and `provider_group_rate_scope` tables. This is the
+  fastest lookup path for very broad provider expansion but can consume large
+  PostgreSQL space on high-cardinality files.
+
+The default import-id fingerprint includes the effective snapshot architecture.
+That lets the same carrier/source/month be imported in both architectures
+without table-name collisions. Use `HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT` when you
+need a stable, human-readable A/B label such as `heartland_sidecar_v1`.
+
+Snapshots without explicit architecture metadata are inferred from their
+manifest tables:
+
+- both scope tables present -> `materialized_v1`
+- manifest snapshot with both scope tables absent -> `sidecar_scope_v1`
+- any mixed legacy shape -> `legacy_mixed_v1`
+
 ## Notes
 - Raw artifacts are retained under `HLTHPRT_PTG2_ARTIFACT_DIR` when set, otherwise under the system temp directory. Files are stored by SHA-256 prefix.
 - Before downloading, PTG2 checks server metadata. Strong ETag plus content length allows reuse; length plus last-modified is allowed for metadata reuse; otherwise the local SHA-256 is verified before reuse.

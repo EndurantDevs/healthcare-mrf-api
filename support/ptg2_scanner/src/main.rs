@@ -5836,6 +5836,7 @@ fn scan_compact(path: &Path) -> io::Result<()> {
 
 fn manifest_copy_key(kind: &str, line: &[u8]) -> Vec<u8> {
     match kind {
+        "manifest_lean_serving" => line.strip_suffix(b"\n").unwrap_or(line).to_vec(),
         "provider_group_member" => {
             let mut tabs_seen = 0;
             for (index, byte) in line.iter().enumerate() {
@@ -6313,9 +6314,7 @@ mod tests {
         assert_eq!(provider_map.len(), 3);
         assert!(provider_map.contains_key("7"));
         assert!(provider_map.contains_key("8"));
-        assert!(provider_map.contains_key(
-            "121591448686103182592848195376305442061"
-        ));
+        assert!(provider_map.contains_key("121591448686103182592848195376305442061"));
         assert_eq!(provider_map["7"].provider_count, 2);
         assert_eq!(provider_map["8"].provider_count, 1);
         assert_eq!(
@@ -6533,6 +6532,34 @@ mod tests {
     }
 
     #[test]
+    fn manifest_copy_merge_dedupes_lean_serving_by_full_row() {
+        let base =
+            std::env::temp_dir().join(format!("ptg2-lean-merge-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let input_a = base.join("a.copy");
+        let input_b = base.join("b.copy");
+        let output = base.join("out.copy");
+        let row_a = "plan\tCPT\t29888\tprovider-set\t2\tprice-set-a\n";
+        let row_b = "plan\tCPT\t29888\tprovider-set\t2\tprice-set-b\n";
+        std::fs::write(&input_a, format!("{row_b}{row_b}")).unwrap();
+        std::fs::write(&input_b, row_a).unwrap();
+
+        merge_manifest_copy_files(
+            "manifest_lean_serving",
+            &output,
+            &[
+                input_a.to_string_lossy().to_string(),
+                input_b.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let merged = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(merged, format!("{row_a}{row_b}"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
         let base =
             std::env::temp_dir().join(format!("ptg2-merge-parallel-test-{}", std::process::id()));
@@ -6682,11 +6709,11 @@ fn main() -> io::Result<()> {
         })?;
         if !matches!(
             kind.as_str(),
-            "manifest_serving" | "price_atom" | "provider_group_member"
+            "manifest_serving" | "manifest_lean_serving" | "price_atom" | "provider_group_member"
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "manifest copy merge kind must be manifest_serving, price_atom, or provider_group_member",
+                "manifest copy merge kind must be manifest_serving, manifest_lean_serving, price_atom, or provider_group_member",
             ));
         }
         let output_path = args.next().ok_or_else(|| {

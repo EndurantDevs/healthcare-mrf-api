@@ -47,6 +47,11 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
                     "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
                     "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
                     "provider_group_rate_scope_table": "mrf.ptg2_provider_group_rate_scope_token",
+                    "arch_version": "materialized_v1",
+                    "provider_scope_strategy": "materialized_rate_scope",
+                    "materialized_tables": {
+                        "provider_group_rate_scope": "mrf.ptg2_provider_group_rate_scope_token"
+                    },
                 }
             }
         ]
@@ -62,6 +67,11 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
     assert tables.price_atom_table == "mrf.ptg2_price_atom_token"
     assert tables.provider_group_member_table == "mrf.ptg2_provider_group_member_token"
     assert tables.provider_group_rate_scope_table == "mrf.ptg2_provider_group_rate_scope_token"
+    assert tables.arch_version == "materialized_v1"
+    assert tables.effective_arch_version == "materialized_v1"
+    assert tables.provider_scope_strategy == "materialized_rate_scope"
+    assert tables.materialized_tables == {"provider_group_rate_scope": "mrf.ptg2_provider_group_rate_scope_token"}
+    assert tables.uses_sidecar_provider_scope is False
     assert tables.is_manifest_backed_snapshot is False
 
 
@@ -93,6 +103,8 @@ async def test_snapshot_serving_tables_represents_manifest_snapshot_without_v2_t
     assert tables.serving_table is None
     assert tables.provider_group_member_table is None
     assert tables.is_manifest_backed_snapshot is True
+    assert tables.effective_arch_version == "sidecar_scope_v1"
+    assert tables.uses_sidecar_provider_scope is True
 
 
 @pytest.mark.asyncio

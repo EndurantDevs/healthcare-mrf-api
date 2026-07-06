@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tempfile
 import time
 import uuid
@@ -15,7 +16,12 @@ from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from db.connection import db
 from process.ptg_parts.config import (
     PTG2_BINARY_IDS_ENV, PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV,
-    PTG2_UNLOGGED_STAGE_ENV, _env_bool)
+    PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE,
+    PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE,
+    PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR,
+    PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+    PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
+    PTG2_UNLOGGED_STAGE_ENV, _env_bool, _ptg2_snapshot_arch_from_env)
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
 from process.ptg_parts.ptg2_manifest_artifacts import read_global_sidecar_entries
@@ -23,6 +29,8 @@ from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
                                                _ptg2_snapshot_table_name)
 
 PTG2_MANIFEST_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"
+PTG2_MANIFEST_LEAN_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"
+PTG2_MANIFEST_LEAN_DIRECT_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY"
 PTG2_MANIFEST_SERVING_LAYOUT_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT"
 PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY = "lean_provider_key_v1"
 PTG2_MANIFEST_PRICE_ATOM_LAYOUT_ENV = "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT"
@@ -55,6 +63,14 @@ PTG2_MANIFEST_SERVING_COLUMNS = [
     "price_set_global_id_128",
     "source_trace_set_hash",
     "network_names",
+]
+PTG2_MANIFEST_LEAN_SERVING_COLUMNS = [
+    "plan_id",
+    "reported_code_system",
+    "reported_code",
+    "provider_set_global_id_128",
+    "provider_count",
+    "price_set_global_id_128",
 ]
 PTG2_MANIFEST_PRICE_ATOM_COLUMNS = [
     "price_atom_global_id_128",
@@ -180,6 +196,12 @@ def _ptg2_manifest_serving_layout() -> str:
     return str(os.getenv(PTG2_MANIFEST_SERVING_LAYOUT_ENV) or "").strip().lower()
 
 
+def _ptg2_manifest_lean_direct_copy_enabled() -> bool:
+    if _ptg2_manifest_serving_layout() != PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY:
+        return False
+    return _env_bool(PTG2_MANIFEST_LEAN_DIRECT_COPY_ENV, True)
+
+
 def _ptg2_manifest_price_atom_layout() -> str:
     configured = str(os.getenv(PTG2_MANIFEST_PRICE_ATOM_LAYOUT_ENV) or "").strip().lower()
     if configured:
@@ -195,7 +217,16 @@ def _ptg2_manifest_provider_group_location_enabled() -> bool:
     return _ptg2_manifest_serving_layout() != PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY
 
 
+def _ptg2_manifest_snapshot_arch() -> str:
+    return _ptg2_snapshot_arch_from_env() or PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1
+
+
 def _ptg2_manifest_provider_set_component_enabled() -> bool:
+    arch_version = _ptg2_manifest_snapshot_arch()
+    if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
+        return True
+    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1:
+        return False
     if os.getenv(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV, True)
     if _ptg2_manifest_provider_group_rate_scope_enabled():
@@ -204,6 +235,11 @@ def _ptg2_manifest_provider_set_component_enabled() -> bool:
 
 
 def _ptg2_manifest_provider_group_rate_scope_enabled() -> bool:
+    arch_version = _ptg2_manifest_snapshot_arch()
+    if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
+        return True
+    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1:
+        return False
     return _env_bool(PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV, False)
 
 
@@ -227,22 +263,36 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-    await db.status(
-        f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
-            serving_content_hash_128 {id_type} NOT NULL,
-            plan_id varchar(64) NOT NULL,
-            procedure_global_id_128 {id_type} NOT NULL,
-            reported_code_system varchar(64),
-            reported_code varchar(64),
-            provider_set_global_id_128 {id_type} NOT NULL,
-            provider_count integer,
-            price_set_global_id_128 {id_type} NOT NULL,
-            source_trace_set_hash varchar(64),
-            network_names varchar[] NOT NULL DEFAULT '{{}}'
-        );
-        """
-    )
+    if _ptg2_manifest_lean_direct_copy_enabled():
+        await db.status(
+            f"""
+            CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+                plan_id varchar(64) NOT NULL,
+                reported_code_system varchar(64),
+                reported_code varchar(64),
+                provider_set_global_id_128 {id_type} NOT NULL,
+                provider_count integer,
+                price_set_global_id_128 {id_type} NOT NULL
+            );
+            """
+        )
+    else:
+        await db.status(
+            f"""
+            CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+                serving_content_hash_128 {id_type} NOT NULL,
+                plan_id varchar(64) NOT NULL,
+                procedure_global_id_128 {id_type} NOT NULL,
+                reported_code_system varchar(64),
+                reported_code varchar(64),
+                provider_set_global_id_128 {id_type} NOT NULL,
+                provider_count integer,
+                price_set_global_id_128 {id_type} NOT NULL,
+                source_trace_set_hash varchar(64),
+                network_names varchar[] NOT NULL DEFAULT '{{}}'
+            );
+            """
+        )
     try:
         await db.status(
             f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
@@ -300,6 +350,14 @@ async def _copy_ptg2_manifest_serving_file(copy_path: Path, *, target_table: str
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_SERVING_COLUMNS)
 
 
+async def _copy_ptg2_manifest_lean_serving_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_LEAN_SERVING_COLUMNS,
+    )
+
+
 async def _copy_ptg2_manifest_price_atom_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS)
 
@@ -317,7 +375,10 @@ async def _copy_manifest_component_file(copy_path: Path, *, target_table: str) -
 
 
 async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, columns: list[str]) -> None:
-    if not copy_path.exists() or copy_path.stat().st_size <= 0:
+    if not copy_path.exists():
+        return
+    file_status = copy_path.stat()
+    if file_status.st_size <= 0 and not stat.S_ISFIFO(file_status.st_mode):
         return
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.acquire() as conn:
@@ -1110,6 +1171,21 @@ async def _ptg2_manifest_serving_constants(
     }
 
 
+def _ptg2_manifest_serving_constants_from_artifacts(
+    artifacts: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not artifacts:
+        return None
+    source_trace_set_hash = str(artifacts.get("source_trace_set_hash") or "").strip()
+    network_names = _coerce_network_names(artifacts.get("network_names"))
+    if not source_trace_set_hash and not network_names:
+        return None
+    return {
+        "source_trace_set_hash": source_trace_set_hash or None,
+        "network_names": network_names,
+    }
+
+
 async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     *,
     schema_name: str,
@@ -1218,6 +1294,151 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     }
 
 
+async def _dedupe_ptg2_manifest_lean_source_table(schema_name: str, final_table: str) -> dict[str, int]:
+    serving_rows_before_dedupe = await _exact_table_rows(schema_name, final_table)
+    dedup_table = _ptg2_snapshot_index_name(final_table, "dedup")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(dedup_table)};")
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)} AS
+        SELECT DISTINCT ON (
+            plan_id,
+            reported_code_system,
+            reported_code,
+            provider_set_global_id_128,
+            price_set_global_id_128
+        )
+            plan_id,
+            reported_code_system,
+            reported_code,
+            provider_set_global_id_128,
+            provider_count,
+            price_set_global_id_128
+        FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        ORDER BY
+            plan_id,
+            reported_code_system,
+            reported_code,
+            provider_set_global_id_128,
+            price_set_global_id_128,
+            provider_count DESC NULLS LAST;
+        """
+    )
+    await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)}
+        RENAME TO {_quote_ident(final_table)};
+        """
+    )
+    serving_rows_after_dedupe = await _exact_table_rows(schema_name, final_table)
+    return {
+        "before": serving_rows_before_dedupe,
+        "after": serving_rows_after_dedupe,
+        "dropped": max(serving_rows_before_dedupe - serving_rows_after_dedupe, 0),
+    }
+
+
+async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
+    *,
+    schema_name: str,
+    final_table: str,
+    code_count_table: str,
+    provider_set_dictionary_table: str,
+    constants: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    lean_table = _ptg2_snapshot_index_name(final_table, "lean")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} CASCADE;"
+    )
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(lean_table)} CASCADE;")
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
+        SELECT
+            row_number() OVER (ORDER BY plan_id, reported_code_system, reported_code)::integer AS code_key,
+            plan_id,
+            reported_code_system,
+            reported_code,
+            COUNT(*)::bigint AS rate_count
+        FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        GROUP BY plan_id, reported_code_system, reported_code;
+        """
+    )
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} AS
+        SELECT
+            row_number() OVER (ORDER BY provider_set_global_id_128)::integer AS provider_set_key,
+            provider_set_global_id_128
+        FROM (
+            SELECT DISTINCT provider_set_global_id_128
+            FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        ) provider_sets;
+        """
+    )
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
+        SELECT
+            code_count.code_key,
+            provider_set_dictionary.provider_set_key,
+            serving.provider_count,
+            serving.price_set_global_id_128
+        FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)} serving
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} code_count
+          ON code_count.plan_id = serving.plan_id
+         AND code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system
+         AND code_count.reported_code = serving.reported_code
+        JOIN {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} provider_set_dictionary
+          ON provider_set_dictionary.provider_set_global_id_128 = serving.provider_set_global_id_128;
+        """
+    )
+    await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)}
+        RENAME TO {_quote_ident(final_table)};
+        """
+    )
+    lookup_index = _ptg2_snapshot_index_name(final_table, "lean_code_lookup_idx")
+    code_lookup_index = _ptg2_snapshot_index_name(code_count_table, "lean_code_idx")
+    provider_set_key_index = _ptg2_snapshot_index_name(provider_set_dictionary_table, "key_idx")
+    await db.status(
+        f"""
+        CREATE INDEX {_quote_ident(code_lookup_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(code_count_table)}
+        (reported_code_system, reported_code)
+        INCLUDE (code_key, plan_id, rate_count);
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX {_quote_ident(lookup_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        (code_key);
+        """
+    )
+    await db.status(
+        f"""
+        CREATE UNIQUE INDEX {_quote_ident(provider_set_key_index)}
+        ON {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)}
+        (provider_set_key)
+        INCLUDE (provider_set_global_id_128);
+        """
+    )
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)};")
+    return {
+        "serving_table_layout": PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+        "provider_set_dictionary_table": f"{schema_name}.{provider_set_dictionary_table}",
+        "source_trace_set_hash": (constants or {}).get("source_trace_set_hash"),
+        "network_names": _coerce_network_names((constants or {}).get("network_names")),
+        "serving_stage_layout": "lean_source_v1",
+    }
+
+
 async def _publish_ptg2_manifest_serving_snapshot(
     stage_table: str,
     *,
@@ -1245,6 +1466,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     price_atom_dictionary_table = _ptg2_snapshot_table_name("price_atom_dict", source_key, snapshot_id)
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     started_at = time.monotonic()
+    lean_source_stage = _ptg2_manifest_lean_direct_copy_enabled()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
     await db.status(
@@ -1293,51 +1515,105 @@ async def _publish_ptg2_manifest_serving_snapshot(
     )
     dedupe_metrics: dict[str, Any] = {"db_dedupe": use_db_dedupe}
     serving_deduped = False
-    if use_db_dedupe:
+    if use_db_dedupe and lean_source_stage:
+        dedupe_metrics["serving"] = {"skipped": "lean_source_stage"}
+    elif use_db_dedupe:
         dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
         serving_deduped = True
     unique_index = _ptg2_snapshot_index_name(final_table, "content_uidx")
     lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_lookup_idx")
     provider_set_lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_provider_set_idx")
-    try:
-        await db.status(
-            f"""
-            CREATE UNIQUE INDEX {_quote_ident(unique_index)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-            (serving_content_hash_128);
-            """
-        )
-    except Exception as exc:
-        if serving_deduped or not _looks_like_unique_index_duplicate(exc):
-            raise
-        logger.warning(
-            "PTG2 manifest serving unique index found duplicate rows after direct publish; "
-            "running DB dedupe rescue",
-            exc_info=True,
-        )
-        dedupe_metrics["db_dedupe"] = True
-        dedupe_metrics["rescue"] = True
-        dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
-        serving_deduped = True
-        await db.status(
-            f"""
-            CREATE UNIQUE INDEX {_quote_ident(unique_index)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-            (serving_content_hash_128);
-            """
-        )
-    # The unique index is a publish-time correctness guard. Once it builds, the
-    # immutable snapshot has proven there are no duplicate manifest serving identities;
-    # retaining the 128-bit-only btree adds several GB and is not on the API hot path.
-    await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(unique_index)};")
+    if lean_source_stage:
+        lean_source_unique_index = _ptg2_snapshot_index_name(final_table, "lean_src_uidx")
+        try:
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                (
+                    plan_id,
+                    reported_code_system,
+                    reported_code,
+                    provider_set_global_id_128,
+                    price_set_global_id_128
+                );
+                """
+            )
+        except Exception as exc:
+            if serving_deduped or not _looks_like_unique_index_duplicate(exc):
+                raise
+            logger.warning(
+                "PTG2 manifest lean-source unique index found duplicate rows after direct publish; "
+                "running narrow DB dedupe rescue",
+                exc_info=True,
+            )
+            dedupe_metrics["db_dedupe"] = True
+            dedupe_metrics["rescue"] = True
+            dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_lean_source_table(schema_name, final_table)
+            serving_deduped = True
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                (
+                    plan_id,
+                    reported_code_system,
+                    reported_code,
+                    provider_set_global_id_128,
+                    price_set_global_id_128
+                );
+                """
+            )
+        await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(lean_source_unique_index)};")
+    else:
+        try:
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(unique_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                (serving_content_hash_128);
+                """
+            )
+        except Exception as exc:
+            if serving_deduped or not _looks_like_unique_index_duplicate(exc):
+                raise
+            logger.warning(
+                "PTG2 manifest serving unique index found duplicate rows after direct publish; "
+                "running DB dedupe rescue",
+                exc_info=True,
+            )
+            dedupe_metrics["db_dedupe"] = True
+            dedupe_metrics["rescue"] = True
+            dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
+            serving_deduped = True
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(unique_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                (serving_content_hash_128);
+                """
+            )
+        # The unique index is a publish-time correctness guard. Once it builds, the
+        # immutable snapshot has proven there are no duplicate manifest serving identities;
+        # retaining the 128-bit-only btree adds several GB and is not on the API hot path.
+        await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(unique_index)};")
     lean_serving_manifest: dict[str, Any] | None = None
     if _ptg2_manifest_serving_layout() == PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY:
-        lean_serving_manifest = await _rewrite_ptg2_manifest_serving_table_lean_provider_key(
-            schema_name=schema_name,
-            final_table=final_table,
-            code_count_table=code_count_table,
-            provider_set_dictionary_table=provider_set_dictionary_table,
-        )
+        if lean_source_stage:
+            lean_serving_manifest = await _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
+                schema_name=schema_name,
+                final_table=final_table,
+                code_count_table=code_count_table,
+                provider_set_dictionary_table=provider_set_dictionary_table,
+                constants=_ptg2_manifest_serving_constants_from_artifacts(artifacts),
+            )
+        else:
+            lean_serving_manifest = await _rewrite_ptg2_manifest_serving_table_lean_provider_key(
+                schema_name=schema_name,
+                final_table=final_table,
+                code_count_table=code_count_table,
+                provider_set_dictionary_table=provider_set_dictionary_table,
+            )
     if lean_serving_manifest is None:
         await db.status(
             f"""
@@ -1485,12 +1761,44 @@ async def _publish_ptg2_manifest_serving_snapshot(
     row_count = await _exact_table_rows(schema_name, final_table)
     elapsed_seconds = time.monotonic() - started_at
     artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
+    arch_version = _ptg2_manifest_snapshot_arch()
+    materialized_tables = {
+        "serving": f"{schema_name}.{final_table}",
+        "price_atom": f"{schema_name}.{price_atom_table}",
+        "provider_group_member": f"{schema_name}.{provider_group_member_table}",
+        "code_count": f"{schema_name}.{code_count_table}",
+    }
+    if (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"):
+        materialized_tables["price_atom_dictionary"] = (lean_price_atom_manifest or {})[
+            "price_atom_dictionary_table"
+        ]
+    if (lean_serving_manifest or {}).get("provider_set_dictionary_table"):
+        materialized_tables["provider_set_dictionary"] = (lean_serving_manifest or {})[
+            "provider_set_dictionary_table"
+        ]
+    if materialized_provider_group_location_table:
+        materialized_tables["provider_group_location"] = f"{schema_name}.{materialized_provider_group_location_table}"
+    if materialized_provider_set_component_table:
+        materialized_tables["provider_set_component"] = f"{schema_name}.{materialized_provider_set_component_table}"
+    if materialized_provider_group_rate_scope_table:
+        materialized_tables["provider_group_rate_scope"] = (
+            f"{schema_name}.{materialized_provider_group_rate_scope_table}"
+        )
+    if materialized_provider_group_rate_scope_table:
+        provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE
+    elif materialized_provider_set_component_table:
+        provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE
+    else:
+        provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR
     serving_manifest = {
         "storage": "manifest_snapshot",
         "type": "ptg2_serving",
         "id_storage": _ptg2_id_storage(),
         "snapshot_scoped": True,
         "source_key": source_key,
+        "arch_version": arch_version,
+        "provider_scope_strategy": provider_scope_strategy,
+        "materialized_tables": materialized_tables,
         "table": f"{schema_name}.{final_table}",
         "price_atom_table": f"{schema_name}.{price_atom_table}",
         "price_atom_table_layout": (lean_price_atom_manifest or {}).get("price_atom_table_layout"),

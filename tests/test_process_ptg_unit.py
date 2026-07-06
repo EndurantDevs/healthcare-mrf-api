@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -61,10 +62,25 @@ def test_default_ptg2_import_id_includes_source_inputs():
         "ptg_39d5fb35eae985f2",
         in_network_url="https://example.com/optum-rates.json.gz",
     )
+    materialized_id = process_ptg._default_ptg2_import_id(
+        month,
+        "ptg_39d5fb35eae985f2",
+        in_network_url="https://example.com/optum-rates.json.gz",
+        arch_variant="materialized_v1",
+    )
+    sidecar_id = process_ptg._default_ptg2_import_id(
+        month,
+        "ptg_39d5fb35eae985f2",
+        in_network_url="https://example.com/optum-rates.json.gz",
+        arch_variant="sidecar_scope_v1",
+    )
 
     assert example_dental_id != "20260601"
     assert optum_id != "20260601"
     assert example_dental_id != optum_id
+    assert materialized_id != optum_id
+    assert sidecar_id != optum_id
+    assert materialized_id != sidecar_id
 
 
 def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
@@ -4304,6 +4320,123 @@ def test_ptg2_rust_top_level_byte_scan_matches_default_compact_output(tmp_path):
     assert top_level_summary["provider_refs_seconds"] >= 0
 
 
+def test_ptg2_manifest_copy_file_reads_fifo(tmp_path, monkeypatch):
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO copy test requires POSIX named pipes")
+
+    fifo_path = tmp_path / "manifest.copy"
+    os.mkfifo(fifo_path)
+    copied_payloads = []
+
+    class FakeDriver:
+        async def copy_to_table(self, target_table, *, source, schema_name, columns, format, delimiter, null):
+            copied_payloads.append(
+                {
+                    "target_table": target_table,
+                    "schema_name": schema_name,
+                    "columns": columns,
+                    "format": format,
+                    "delimiter": delimiter,
+                    "null": null,
+                    "payload": source.read().decode("utf-8"),
+                }
+            )
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=FakeDriver()))
+
+        async def __aexit__(self, *_exc_info):
+            return False
+
+    def writer():
+        with fifo_path.open("wb") as fp:
+            fp.write(b"serving\tplan\n")
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "acquire", lambda: FakeAcquire())
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    asyncio.run(
+        ptg_manifest_publish._copy_ptg2_manifest_file(
+            fifo_path,
+            target_table="stage_table",
+            columns=["serving_content_hash_128", "plan_id"],
+        )
+    )
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert copied_payloads == [
+        {
+            "target_table": "stage_table",
+            "schema_name": "mrf",
+            "columns": ["serving_content_hash_128", "plan_id"],
+            "format": "text",
+            "delimiter": "\t",
+            "null": "\\N",
+            "payload": "serving\tplan\n",
+        }
+    ]
+
+
+def test_ptg2_manifest_stream_merge_copies_from_fifo(tmp_path, monkeypatch):
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
+        pytest.skip("streaming merge test requires POSIX named pipes")
+
+    producer_script = tmp_path / "producer.py"
+    producer_script.write_text(
+        """
+import json
+import sys
+
+fifo_path = sys.argv[1]
+with open(fifo_path, "wb") as fp:
+    fp.write(b"serving\\tplan\\n")
+summary = {
+    "kind": "manifest_serving",
+    "input_files": 1,
+    "input_rows": 2,
+    "output_rows": 1,
+    "dropped_rows": 1,
+    "output_path": fifo_path,
+}
+payload = json.dumps(summary, sort_keys=True).encode("utf-8")
+sys.stdout.buffer.write(b"manifest_copy_merge_summary\\t" + str(len(payload)).encode("ascii") + b"\\n")
+sys.stdout.buffer.write(payload + b"\\n")
+""".lstrip()
+    )
+    input_path = tmp_path / "input.copy"
+    input_path.write_text("serving\tplan\nserving\tplan\n")
+    copied_payloads = []
+
+    async def fake_copy(copy_path, *, target_table):
+        assert target_table == "stage_table"
+        with copy_path.open("rb") as fp:
+            copied_payloads.append(fp.read().decode("utf-8"))
+
+    def fake_command(_kind, output_path, _existing_paths):
+        return [sys.executable, str(producer_script), str(output_path)]
+
+    monkeypatch.setattr(process_ptg, "ptg2_temp_parent", lambda: tmp_path)
+    monkeypatch.setattr(process_ptg, "_ptg2_manifest_copy_merge_command", fake_command)
+
+    metrics = asyncio.run(
+        process_ptg._stream_ptg2_manifest_copy_merge(
+            "manifest_serving",
+            target_table="stage_table",
+            input_paths=[input_path],
+            copy_func=fake_copy,
+        )
+    )
+
+    assert copied_payloads == ["serving\tplan\n"]
+    assert metrics["kind"] == "manifest_serving"
+    assert metrics["input_rows"] == 2
+    assert metrics["output_rows"] == 1
+    assert metrics["dropped_rows"] == 1
+
+
 def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
@@ -4904,6 +5037,7 @@ def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeyp
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
         ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "false")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
@@ -4939,6 +5073,162 @@ def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeyp
     assert "INCLUDE (provider_set_global_id_128)" in joined
     assert "plan_code_provider_set_idx" not in joined
     component_mock.assert_not_awaited()
+
+
+def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    db_all_mock = AsyncMock(side_effect=AssertionError("direct lean publish should use artifact constants"))
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", db_all_mock)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    component_mock = AsyncMock(side_effect=AssertionError("lean provider-key snapshots should use sidecars by default"))
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_components", component_mock)
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+            artifacts={"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]},
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result["serving_table_layout"] == "lean_provider_key_v1"
+    assert result["serving_stage_layout"] == "lean_source_v1"
+    assert result["provider_set_dictionary_table"].startswith("mrf.ptg2_provider_set_dict_")
+    assert result["source_trace_set_hash"] == "trace-set-hash"
+    assert result["network_names"] == ["C2"]
+    assert "serving_content_hash_128" not in joined
+    assert "procedure_global_id_128" not in joined
+    assert "source_trace_set_hash" not in joined
+    assert "GROUP BY source_trace_set_hash, network_names" not in joined
+    assert "SELECT DISTINCT ON (serving_content_hash_128)" not in joined
+    assert "CREATE UNIQUE INDEX" in joined
+    assert "plan_id,\n                    reported_code_system,\n                    reported_code" in joined
+    assert "provider_set_global_id_128,\n                    price_set_global_id_128" in joined
+    component_mock.assert_not_awaited()
+    db_all_mock.assert_not_awaited()
+
+
+def test_ptg2_manifest_snapshot_publish_sidecar_arch_overrides_scope_table_env(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    component_mock = AsyncMock(side_effect=AssertionError("sidecar arch must not materialize components"))
+    rate_scope_mock = AsyncMock(side_effect=AssertionError("sidecar arch must not materialize rate scope"))
+    location_mock = AsyncMock(return_value="ptg2_provider_group_location_snap")
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_components", component_mock)
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_provider_group_rate_scope", rate_scope_mock)
+    monkeypatch.setattr(ptg_manifest_publish, "_build_manifest_provider_group_location_table", location_mock)
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    assert result["arch_version"] == "sidecar_scope_v1"
+    assert result["provider_scope_strategy"] == "sidecar_provider_scope"
+    assert result["provider_set_component_table"] is None
+    assert result["provider_group_rate_scope_table"] is None
+    assert result["provider_group_location_table"] == "mrf.ptg2_provider_group_location_snap"
+    assert result["materialized_tables"]["provider_group_location"] == "mrf.ptg2_provider_group_location_snap"
+    assert "provider_set_component" not in result["materialized_tables"]
+    assert "provider_group_rate_scope" not in result["materialized_tables"]
+    component_mock.assert_not_awaited()
+    rate_scope_mock.assert_not_awaited()
+    location_mock.assert_awaited_once()
+
+
+def test_ptg2_manifest_snapshot_publish_materialized_arch_forces_scope_tables(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_materialize_components(**kwargs):
+        return kwargs["table_name"]
+
+    async def fake_materialize_rate_scope(**kwargs):
+        assert kwargs["provider_set_component_table"].startswith("ptg2_provider_set_component_")
+        return kwargs["table_name"]
+
+    location_mock = AsyncMock(return_value="ptg2_provider_group_location_snap")
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "materialized_v1")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_components", fake_materialize_components)
+    monkeypatch.setattr(ptg_manifest_publish, "_materialize_manifest_provider_group_rate_scope", fake_materialize_rate_scope)
+    monkeypatch.setattr(ptg_manifest_publish, "_build_manifest_provider_group_location_table", location_mock)
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    assert result["arch_version"] == "materialized_v1"
+    assert result["provider_scope_strategy"] == "materialized_rate_scope"
+    assert result["provider_set_component_table"].startswith("mrf.ptg2_provider_set_component_")
+    assert result["provider_group_rate_scope_table"].startswith("mrf.ptg2_provider_group_rate_scope_")
+    assert result["provider_group_location_table"] == "mrf.ptg2_provider_group_location_snap"
+    assert result["materialized_tables"]["provider_set_component"].startswith("mrf.ptg2_provider_set_component_")
+    assert result["materialized_tables"]["provider_group_rate_scope"].startswith("mrf.ptg2_provider_group_rate_scope_")
+    location_mock.assert_awaited_once()
 
 
 def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypatch):
@@ -5002,7 +5292,7 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
     assert "CREATE UNIQUE INDEX" in joined
 
 
-def test_ptg2_manifest_snapshot_publish_lean_can_opt_in_provider_set_component_table(monkeypatch):
+def test_ptg2_manifest_snapshot_publish_materialized_arch_can_build_provider_set_component_table(monkeypatch):
     status_calls = []
     component_calls = []
 
@@ -5024,6 +5314,7 @@ def test_ptg2_manifest_snapshot_publish_lean_can_opt_in_provider_set_component_t
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
         ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "materialized_v1")
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
@@ -5241,6 +5532,7 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
         source_path.write_text("row\n", encoding="utf-8")
         source_files[kind] = source_path
 
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", "false")
     monkeypatch.setattr(process_ptg, "_run_ptg2_manifest_copy_merge", fake_merge)
     monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_serving_file", fake_copy)
     monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", fake_copy)
@@ -5273,6 +5565,108 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     assert all(not path.exists() for path in source_files.values())
 
 
+def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
+    stream_calls = []
+    source_files = {}
+    for kind in ("manifest_serving", "price_atom", "provider_group_member"):
+        source_path = tmp_path / f"{kind}.copy"
+        source_path.write_text("row\n", encoding="utf-8")
+        source_files[kind] = source_path
+
+    async def fake_stream(kind, *, target_table, input_paths, copy_func):
+        stream_calls.append((kind, target_table, tuple(input_paths), copy_func))
+        return {
+            "kind": kind,
+            "input_files": len(input_paths),
+            "input_rows": 2,
+            "output_rows": 1,
+            "dropped_rows": 1,
+        }
+
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", raising=False)
+    monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fake_stream)
+
+    metrics = asyncio.run(
+        process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=[
+                {
+                    "summary": {
+                        "manifest": {
+                            "copy_files": {
+                                kind: [{"path": str(path), "row_count": 1}]
+                                for kind, path in source_files.items()
+                            }
+                        }
+                    }
+                }
+            ],
+            manifest_stage_table="ptg2_manifest_stage_serving_abc",
+        )
+    )
+
+    assert metrics["enabled"] is True
+    assert metrics["streamed_to_copy"] is True
+    assert metrics["serving_rows"] == 1
+    assert [call[0] for call in stream_calls] == ["manifest_serving", "price_atom", "provider_group_member"]
+    assert stream_calls[0][1] == "ptg2_manifest_stage_serving_abc"
+    assert stream_calls[1][1] == "ptg2_manifest_stage_price_atom_abc"
+    assert stream_calls[2][1] == "ptg2_manifest_stage_provider_group_member_abc"
+    assert all(not path.exists() for path in source_files.values())
+
+
+def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatch, tmp_path):
+    stream_calls = []
+    source_files = {}
+    for kind in ("manifest_lean_serving", "price_atom", "provider_group_member"):
+        source_path = tmp_path / f"{kind}.copy"
+        source_path.write_text("row\n", encoding="utf-8")
+        source_files[kind] = source_path
+
+    async def fake_stream(kind, *, target_table, input_paths, copy_func):
+        stream_calls.append((kind, target_table, tuple(input_paths), copy_func))
+        return {
+            "kind": kind,
+            "input_files": len(input_paths),
+            "input_rows": 2,
+            "output_rows": 1,
+            "dropped_rows": 1,
+        }
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
+    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", raising=False)
+    monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fake_stream)
+
+    metrics = asyncio.run(
+        process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=[
+                {
+                    "summary": {
+                        "manifest": {
+                            "copy_files": {
+                                kind: [{"path": str(path), "row_count": 1}]
+                                for kind, path in source_files.items()
+                            }
+                        }
+                    }
+                }
+            ],
+            manifest_stage_table="ptg2_manifest_stage_serving_abc",
+        )
+    )
+
+    assert metrics["enabled"] is True
+    assert metrics["streamed_to_copy"] is True
+    assert metrics["serving_rows"] == 1
+    assert [call[0] for call in stream_calls] == ["manifest_lean_serving", "price_atom", "provider_group_member"]
+    assert stream_calls[0][1] == "ptg2_manifest_stage_serving_abc"
+    assert stream_calls[0][3] is process_ptg._copy_ptg2_manifest_lean_serving_file
+    assert all(not path.exists() for path in source_files.values())
+
+
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     status_calls = []
 
@@ -5293,6 +5687,35 @@ def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     assert "price_atom_global_id_128 uuid NOT NULL" in joined
     assert "provider_group_global_id_128 uuid NOT NULL" in joined
     assert ptg_manifest_publish.PTG2_MANIFEST_SERVING_COLUMNS[-1] == "network_names"
+
+
+def test_ptg2_manifest_stage_uses_direct_lean_source_columns(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+
+    asyncio.run(process_ptg._create_ptg2_manifest_serving_stage_table("abc"))
+
+    joined = "\n".join(status_calls)
+    assert "plan_id varchar(64) NOT NULL" in joined
+    assert "reported_code_system varchar(64)" in joined
+    assert "reported_code varchar(64)" in joined
+    assert "provider_set_global_id_128 uuid NOT NULL" in joined
+    assert "provider_count integer" in joined
+    assert "price_set_global_id_128 uuid NOT NULL" in joined
+    assert "serving_content_hash_128" not in joined
+    assert "procedure_global_id_128" not in joined
+    assert "source_trace_set_hash" not in joined
+    assert "network_names" not in joined
 
 
 def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):

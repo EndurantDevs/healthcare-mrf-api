@@ -33,6 +33,9 @@ class PTG2ServingIndex:
 @dataclass(frozen=True)
 class PTG2ServingTables:
     serving_table: str | None = None
+    arch_version: str | None = None
+    provider_scope_strategy: str | None = None
+    materialized_tables: dict[str, Any] | None = None
     price_code_set_table: str | None = None
     price_atom_table: str | None = None
     price_atom_table_layout: str | None = None
@@ -67,3 +70,23 @@ class PTG2ServingTables:
     @property
     def uses_uuid_ids(self) -> bool:
         return (self.id_storage or "").strip().lower() == "uuid"
+
+    @property
+    def effective_arch_version(self) -> str:
+        arch_version = (self.arch_version or "").strip().lower()
+        if arch_version:
+            return arch_version
+        if self.provider_group_rate_scope_table and self.provider_set_component_table:
+            return "materialized_v1"
+        if (
+            self.is_manifest_backed_snapshot
+            and not self.provider_group_rate_scope_table
+            and not self.provider_set_component_table
+        ):
+            return "sidecar_scope_v1"
+        return "legacy_mixed_v1"
+
+    @property
+    def uses_sidecar_provider_scope(self) -> bool:
+        strategy = (self.provider_scope_strategy or "").strip().lower()
+        return strategy == "sidecar_provider_scope" or self.effective_arch_version == "sidecar_scope_v1"

@@ -80,7 +80,10 @@ After the rebuild publishes the new snapshot, compare before any cleanup:
   --old-snapshot-id ptg2:202606:old_snapshot_id \
   --new-snapshot-id ptg2:202606:new_snapshot_id \
   --sample-limit 500 \
-  --sample-pct 0.1
+  --sample-pct 0.1 \
+  --benchmark-cases 5 \
+  --benchmark-iterations 3 \
+  --benchmark-limit 5
 ```
 
 The compare must pass all of these checks:
@@ -93,6 +96,10 @@ The compare must pass all of these checks:
 - sampled price atoms have zero misses
 - sampled provider group members have zero misses
 - sidecar byte counts and sha256 hashes match
+
+The `--benchmark-*` options are non-gating. They add warm-cache,
+snapshot-scoped serving timings for sampled plan/code pairs so storage changes
+can be reviewed next to real query latency.
 
 Do not remove the old snapshot if any check fails.
 

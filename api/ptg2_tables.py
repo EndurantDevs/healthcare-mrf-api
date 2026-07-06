@@ -198,6 +198,13 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         source_key=str(serving_index.get("source_key") or "").strip() or None,
         artifact_uri=str(artifact_uri or "").strip() or None,
         artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
+        arch_version=str(serving_index.get("arch_version") or "").strip() or None,
+        provider_scope_strategy=str(serving_index.get("provider_scope_strategy") or "").strip() or None,
+        materialized_tables=(
+            dict(serving_index.get("materialized_tables") or {})
+            if isinstance(serving_index.get("materialized_tables"), dict)
+            else None
+        ),
         id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
         serving_table_layout=str(serving_index.get("serving_table_layout") or "").strip() or None,
         source_trace_set_hash=str(serving_index.get("source_trace_set_hash") or "").strip() or None,
