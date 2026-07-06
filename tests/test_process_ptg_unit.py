@@ -703,6 +703,109 @@ def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
     assert process_ptg._cleanup_old_ptg2_source_tables is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
 
 
+def test_snapshot_cleanup_collects_tables_for_any_storage():
+    tables = ptg_snapshot_cleanup._snapshot_manifest_table_names(
+        {
+            "storage": "future_snapshot_layout",
+            "table": "mrf.ptg2_serving_future",
+            "price_atom_table": "ptg2_price_atom_future",
+            "provider_set_table": "mrf.plan",
+            "provider_group_member_table": "ptg2_provider_group_member_future",
+        }
+    )
+
+    assert tables == [
+        "ptg2_serving_future",
+        "ptg2_price_atom_future",
+        "ptg2_provider_group_member_future",
+    ]
+
+
+def _old_snapshot_cleanup_rows():
+    """Return mixed storage rows used to prove source cleanup is storage-agnostic."""
+    return [
+        {
+            "snapshot_id": "snap-current",
+            "manifest": {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "source_key": "ptg_heartland",
+                    "table": "ptg2_serving_keep",
+                }
+            },
+        },
+        {
+            "snapshot_id": "snap-compact-old",
+            "manifest": {
+                "serving_index": {
+                    "storage": "db_compact_snapshot",
+                    "source_key": "ptg_heartland",
+                    "table": "ptg2_serving_compact_old",
+                }
+            },
+        },
+        {
+            "snapshot_id": "snap-manifest-old",
+            "manifest": {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "source_key": "ptg_heartland",
+                    "price_atom_table": "ptg2_price_atom_manifest_old",
+                    "provider_set_table": "mrf.ptg2_provider_set_manifest_old",
+                }
+            },
+        },
+        {
+            "snapshot_id": "snap-future-old",
+            "manifest": {
+                "serving_index": {
+                    "storage": "future_snapshot_layout",
+                    "source_key": "ptg_heartland",
+                    "provider_group_member_table": "ptg2_provider_group_member_future_old",
+                    "provider_group_location_table": "mrf.unrelated_table",
+                }
+            },
+        },
+    ]
+
+
+def test_cleanup_old_ptg2_source_tables_scans_all_storage_generations(monkeypatch):
+    queries = []
+    dropped_tables = []
+
+    async def fake_all(statement, **params):
+        queries.append((statement, params))
+        assert params == {"source_key": "ptg_heartland"}
+        return _old_snapshot_cleanup_rows()
+
+    async def fake_status(statement, **_params):
+        dropped_tables.append(statement)
+        return "DROP TABLE"
+
+    monkeypatch.setattr(ptg_snapshot_cleanup.db, "all", fake_all)
+    monkeypatch.setattr(ptg_snapshot_cleanup.db, "status", fake_status)
+
+    asyncio.run(
+        ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables(
+            "ptg_heartland",
+            {"snap-current"},
+        )
+    )
+
+    cleanup_query = queries[0][0]
+    assert "manifest->'serving_index'->>'source_key' = :source_key" in cleanup_query
+    assert "db_compact_snapshot" not in cleanup_query
+    assert "manifest_snapshot" not in cleanup_query
+    assert "\n".join(dropped_tables) == "\n".join(
+        [
+            'DROP TABLE IF EXISTS "mrf"."ptg2_serving_compact_old";',
+            'DROP TABLE IF EXISTS "mrf"."ptg2_price_atom_manifest_old";',
+            'DROP TABLE IF EXISTS "mrf"."ptg2_provider_set_manifest_old";',
+            'DROP TABLE IF EXISTS "mrf"."ptg2_provider_group_member_future_old";',
+        ]
+    )
+
+
 def test_snapshot_artifact_split_keeps_facade_helpers_stable():
     assert process_ptg._row_mapping is ptg_snapshot_artifacts._row_mapping
     assert process_ptg.build_ptg2_snapshot_index_artifact is ptg_snapshot_artifacts.build_ptg2_snapshot_index_artifact

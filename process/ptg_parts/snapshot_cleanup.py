@@ -23,7 +23,7 @@ def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
 
 
 def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list[str]:
-    if not serving_index or serving_index.get("storage") not in {"db_compact_snapshot", "manifest_snapshot"}:
+    if not serving_index:
         return []
     table_values = [
         serving_index.get("table"),
@@ -87,7 +87,6 @@ async def _cleanup_old_ptg2_source_tables(source_key: str, keep_snapshot_ids: se
         SELECT snapshot_id, manifest
           FROM {_quote_ident(schema_name)}.ptg2_snapshot
          WHERE manifest->'serving_index'->>'source_key' = :source_key
-           AND manifest->'serving_index'->>'storage' = 'db_compact_snapshot'
         """,
         source_key=source_key,
     )
