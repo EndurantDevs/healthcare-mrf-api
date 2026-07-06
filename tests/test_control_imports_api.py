@@ -1803,6 +1803,27 @@ async def test_control_ptg_source_snapshot_remove_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_retire_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_retire(**kwargs):
+        calls.append(kwargs)
+        return {"snapshot_id": kwargs["snapshot_id"], "source_key": kwargs["source_key"], "retired": True}
+
+    monkeypatch.setattr(control, "retire_ptg2_source_snapshot", fake_retire)
+
+    response = await control.control_ptg_source_snapshot_retire(
+        authed_request(json={"snapshot_id": "snap_live", "source_key": "source_a"})
+    )
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["retired"] is True
+    assert calls == [{"snapshot_id": "snap_live", "source_key": "source_a"}]
+
+
+@pytest.mark.asyncio
 async def test_control_create_import_returns_created(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     async def fake_create(payload):

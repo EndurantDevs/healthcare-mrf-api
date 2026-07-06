@@ -27,6 +27,7 @@ from process.ptg_parts.source_snapshot_control import (
     build_ptg2_source_snapshot_remove_plan,
     promote_ptg2_source_snapshot,
     remove_ptg2_source_snapshot,
+    retire_ptg2_source_snapshot,
 )
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
@@ -163,6 +164,20 @@ async def control_ptg_source_snapshot_remove(request):
     payload = request.json if isinstance(request.json, dict) else {}
     try:
         result = await remove_ptg2_source_snapshot(
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            source_key=str(payload.get("source_key") or "") or None,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(result, default=str)
+
+
+@blueprint.post("/ptg/source-snapshots/retire")
+async def control_ptg_source_snapshot_retire(request):
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    try:
+        result = await retire_ptg2_source_snapshot(
             snapshot_id=str(payload.get("snapshot_id") or ""),
             source_key=str(payload.get("source_key") or "") or None,
         )

@@ -261,3 +261,52 @@ def test_remove_ptg2_source_snapshot_delegates_table_drop_and_metadata_delete(mo
     assert result["deleted_snapshots"] == 1
     assert len(status_calls) == 2
     assert all(call[1]["snapshot_id"] == "snap_old" for call in status_calls)
+
+
+def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):
+    status_calls = []
+    reference_calls = []
+
+    async def fake_status(statement, **params):
+        status_calls.append((statement, params))
+        return 1
+
+    async def fake_current_references(_schema, snapshot_id):
+        reference_calls.append(snapshot_id)
+        if len(reference_calls) == 1:
+            return {"global_slots": [], "source_keys": ["source_a"], "plan_source_keys": ["ps_1"]}
+        return {"global_slots": [], "source_keys": [], "plan_source_keys": []}
+
+    clear_calls = []
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_live",
+                "status": "published",
+                "manifest": {"serving_index": {"source_key": "source_a"}},
+            }
+        ),
+    )
+    monkeypatch.setattr(source_snapshot_control, "_current_references", fake_current_references)
+    monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
+    monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: clear_calls.append(True))
+
+    result = asyncio.run(
+        source_snapshot_control.retire_ptg2_source_snapshot(
+            snapshot_id="snap_live",
+            source_key="source_a",
+        )
+    )
+
+    assert result["retired"] is True
+    assert result["deleted_plan_pointers"] == 1
+    assert result["deleted_source_pointers"] == 1
+    assert result["previous_current_references"]["source_keys"] == ["source_a"]
+    assert result["current_references"]["source_keys"] == []
+    assert len(status_calls) == 2
+    assert all(call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"} for call in status_calls)
+    assert any("ptg2_current_plan_source" in call[0] for call in status_calls)
+    assert any("ptg2_current_source_snapshot" in call[0] for call in status_calls)
+    assert clear_calls == [True]

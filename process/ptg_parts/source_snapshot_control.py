@@ -223,6 +223,60 @@ async def remove_ptg2_source_snapshot(
     }
 
 
+async def retire_ptg2_source_snapshot(
+    *,
+    snapshot_id: str,
+    source_key: str | None = None,
+) -> dict[str, Any]:
+    snapshot_id = str(snapshot_id or "").strip()
+    source_key = str(source_key or "").strip() or None
+    if not snapshot_id:
+        raise ValueError("snapshot_id is required")
+    schema = _schema_name()
+    snapshot = await _snapshot_row(schema, snapshot_id)
+    manifest_source_key = None
+    if snapshot:
+        manifest = _manifest_dict(snapshot.get("manifest"))
+        serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
+        manifest_source_key = str(serving_index.get("source_key") or "").strip() or None
+    if source_key and manifest_source_key and source_key != manifest_source_key:
+        raise ValueError("snapshot source_key does not match requested source_key")
+    before = await _current_references(schema, snapshot_id)
+    if before.get("global_slots"):
+        raise ValueError("snapshot is referenced by current global pointer")
+    params: dict[str, Any] = {"snapshot_id": snapshot_id}
+    source_filter = ""
+    if source_key:
+        params["source_key"] = source_key
+        source_filter = " AND source_key = :source_key"
+    deleted_plan_pointers = await db.status(
+        f"""
+        DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source
+         WHERE snapshot_id = :snapshot_id{source_filter}
+        """,
+        **params,
+    )
+    deleted_source_pointers = await db.status(
+        f"""
+        DELETE FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
+         WHERE snapshot_id = :snapshot_id{source_filter}
+        """,
+        **params,
+    )
+    _clear_ptg2_snapshot_cache()
+    after = await _current_references(schema, snapshot_id)
+    return {
+        "snapshot_id": snapshot_id,
+        "source_key": source_key or manifest_source_key,
+        "exists": bool(snapshot),
+        "retired": True,
+        "deleted_plan_pointers": int(deleted_plan_pointers or 0),
+        "deleted_source_pointers": int(deleted_source_pointers or 0),
+        "previous_current_references": before,
+        "current_references": after,
+    }
+
+
 async def _snapshot_row(schema: str, snapshot_id: str) -> dict[str, Any]:
     rows = await db.all(
         f"""
