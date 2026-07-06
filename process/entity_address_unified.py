@@ -113,6 +113,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "service_phone_digits_npi",
     "service_phone_number_npi",
     "service_address_key_npi",
+    "service_premise_key_npi",
     "address_sources",
     # The API phone-fallback lookup filters "address_key = ANY(..) OR
     # premise_key = ANY(..)"; without a premise_key index the OR forces a full

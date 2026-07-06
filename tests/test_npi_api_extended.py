@@ -2175,6 +2175,7 @@ async def test_get_npi_exposes_address_key_and_hides_premise_key(monkeypatch):
     response = await npi_module.get_npi(request, '1518379601')
     payload = json.loads(response.body)
     assert payload['address_list'][0]['address_key'] == '00000000-0000-0000-0000-000000000001'
+    assert payload['address_list'][0]['address_site_key'] == '00000000-0000-0000-0000-000000000002'
     assert 'premise_key' not in payload['address_list'][0]
     assert 'premise_key' not in json.dumps(payload)
 
@@ -2232,6 +2233,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
     assert address['source_record_ids'] == ['npi:1518379601', 'mrf:row-1']
     assert address['source_count'] == 2
     assert address['address_key'] == '00000000-0000-0000-0000-000000000001'
+    assert address['address_site_key'] == '00000000-0000-0000-0000-000000000002'
     assert 'premise_key' not in address
 
 

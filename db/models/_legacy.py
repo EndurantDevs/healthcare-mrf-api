@@ -4212,6 +4212,11 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "service_address_key_npi",
             "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
         },
+        {
+            "index_elements": ("premise_key", "npi"),
+            "name": "service_premise_key_npi",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
+        },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},

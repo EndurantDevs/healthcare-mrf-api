@@ -510,6 +510,103 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
 
 
 @pytest.mark.asyncio
+async def test_get_all_unified_address_site_key_lookup_returns_provider_directory_only_row(monkeypatch):
+    address_site_key = "00000000-0000-0000-0000-000000000002"
+
+    class ProviderDirectoryOnlyConnection:
+        def __init__(self):
+            self.sql_calls = []
+
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            self.sql_calls.append((sql_text, dict(params)))
+            if "page_npis AS" in sql_text:
+                return []
+            if "SELECT c.*" in sql_text:
+                return [
+                    {
+                        "npi": 1033213624,
+                        "inferred_npi": None,
+                        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
+                        "type": "practice",
+                        "first_line": "115 Harper Ct",
+                        "second_line": "Suite 100",
+                        "city_name": "Tuscaloosa",
+                        "state_name": "AL",
+                        "postal_code": "35401",
+                        "country_code": "US",
+                        "telephone_number": "+12053663010",
+                        "phone_number": "2053663010",
+                        "address_key": "00000000-0000-0000-0000-000000000001",
+                        "premise_key": address_site_key,
+                        "address_sources": ["provider_directory_fhir"],
+                        "source_record_ids": [
+                            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
+                        ],
+                        "source_count": 1,
+                        "taxonomy_array": [],
+                        "plans_network_array": [],
+                        "procedures_array": [],
+                        "medications_array": [],
+                    }
+                ]
+            return []
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_column_keys() | {
+                "address_precision",
+                "location_key",
+                "premise_key",
+                "source_count",
+                "updated_at",
+                "zip5",
+                "phone_number",
+            }
+        return set()
+
+    async def fake_provider_enrichment_summary(*_args, **_kwargs):
+        return {}
+
+    conn = ProviderDirectoryOnlyConnection()
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "address_site_key": address_site_key.upper(),
+            "limit": "5",
+            "start": "0",
+            "include_total": "0",
+        }
+    )
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert data["total"] == 1
+    assert data["total_source"] == "estimated_page_floor"
+    assert len(data["rows"]) == 1
+    row = data["rows"][0]
+    assert row["npi"] == 1033213624
+    assert row["address_key"] == "00000000-0000-0000-0000-000000000001"
+    assert row["address_site_key"] == address_site_key
+    assert "premise_key" not in row
+    page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    fallback_sql = next(sql for sql, _params in conn.sql_calls if "SELECT c.*" in sql)
+    assert "FROM mrf.entity_address_unified as c" in page_sql
+    assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
+    assert "c.premise_key = CAST(:address_site_key AS uuid)" in page_sql
+    assert "c.premise_key = CAST(:address_site_key AS uuid)" in fallback_sql
+    assert any(params.get("address_site_key") == address_site_key for _sql, params in conn.sql_calls)
+
+
+@pytest.mark.asyncio
 async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_row(monkeypatch):
     class ProviderDirectoryOnlyConnection:
         def __init__(self):

@@ -65,6 +65,7 @@ CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
 PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"premise_key"}
+PUBLIC_ADDRESS_SITE_KEY = "address_site_key"
 PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
     "location_key",
     "entity_type",
@@ -170,8 +171,15 @@ FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
 }
 
 
+def _attach_public_address_site_key(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    premise_key = source.get("premise_key")
+    if premise_key not in (None, ""):
+        target.setdefault(PUBLIC_ADDRESS_SITE_KEY, premise_key)
+
+
 def _redact_internal_address_fields(value: Any) -> Any:
     if isinstance(value, dict):
+        _attach_public_address_site_key(value, value)
         for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
             value.pop(key, None)
         for child in value.values():
@@ -735,6 +743,8 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
         "lat",
         "long",
         "place_id",
+        "premise_key",
+        PUBLIC_ADDRESS_SITE_KEY,
     ):
         if base.get(key) in (None, "") and duplicate.get(key) not in (None, ""):
             base[key] = duplicate.get(key)
@@ -1346,7 +1356,7 @@ def _normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
     return digits
 
 
-def _normalize_address_key(raw: Optional[str]) -> Optional[str]:
+def _normalize_uuid_key(raw: Optional[str], param_name: str) -> Optional[str]:
     if raw is None:
         return None
     text_value = str(raw).strip()
@@ -1355,7 +1365,11 @@ def _normalize_address_key(raw: Optional[str]) -> Optional[str]:
     try:
         return str(uuid.UUID(text_value))
     except (TypeError, ValueError) as exc:
-        raise sanic.exceptions.InvalidUsage("address_key must be a valid UUID") from exc
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be a valid UUID") from exc
+
+
+def _normalize_address_key(raw: Optional[str]) -> Optional[str]:
+    return _normalize_uuid_key(raw, "address_key")
 
 
 def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
@@ -1545,6 +1559,12 @@ def _address_npi_filter(alias: str, address_table_sql: str) -> str:
     if _address_table_is_unified(address_table_sql):
         return f"({alias}.npi = :npi_filter OR {alias}.inferred_npi = :npi_filter)"
     return f"{alias}.npi = :npi_filter"
+
+
+def _address_site_key_filter(alias: str, address_table_sql: str) -> str:
+    if _address_table_is_unified(address_table_sql):
+        return f"{alias}.premise_key = CAST(:address_site_key AS uuid)"
+    return "1=0"
 
 
 def _provider_list_address_type_clause(
@@ -2530,6 +2550,7 @@ async def get_all(request):
     npi_raw = request.args.get("npi")
     phone = request.args.get("phone")
     address_key_raw = request.args.get("address_key")
+    address_site_key_raw = request.args.get(PUBLIC_ADDRESS_SITE_KEY)
     zip_code_raw = request.args.get("zip_code")
     postal_code_raw = request.args.get("postal_code")
     entity_type_code_raw = request.args.get("entity_type_code")
@@ -2662,6 +2683,7 @@ async def get_all(request):
 
     phone_digits = _normalize_phone_digits(phone)
     address_key = _normalize_address_key(address_key_raw)
+    address_site_key = _normalize_uuid_key(address_site_key_raw, PUBLIC_ADDRESS_SITE_KEY)
     exact_npi = _normalize_exact_npi(npi_raw)
     entity_type_code: Optional[int] = None
     if entity_type_code_raw not in (None, ""):
@@ -2687,6 +2709,7 @@ async def get_all(request):
         "npi": exact_npi,
         "phone_digits": phone_digits,
         "address_key": address_key,
+        PUBLIC_ADDRESS_SITE_KEY: address_site_key,
         "zip_code": zip_code,
         "entity_type_code": entity_type_code,
         "plan_network": plan_network,
@@ -2725,6 +2748,7 @@ async def get_all(request):
             "npi",
             "phone_digits",
             "address_key",
+            PUBLIC_ADDRESS_SITE_KEY,
             "zip_code",
             "entity_type_code",
             "plan_network",
@@ -2793,8 +2817,11 @@ async def get_all(request):
 
         return params
 
+    address_required_columns = _public_address_column_keys()
+    if address_site_key:
+        address_required_columns = set(address_required_columns) | {"premise_key"}
     address_table_sql = await _address_serving_table_sql(
-        _public_address_column_keys(),
+        address_required_columns,
         session=request_session,
     )
 
@@ -2816,6 +2843,7 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters.get("npi")
 
         taxonomy_filters = []
@@ -2840,7 +2868,7 @@ async def get_all(request):
         )
 
         use_taxonomy_filter = bool(taxonomy_filters)
-        include_service_locations = bool(address_key or phone_digits or exact_npi)
+        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -2864,6 +2892,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if address_site_key:
+            address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
@@ -2929,6 +2959,7 @@ async def get_all(request):
             "zip_code": zip_code,
             "phone_digits": phone_digits,
             "address_key": address_key,
+            "address_site_key": address_site_key,
             "npi_filter": exact_npi,
             "specialization": specialization,
             "first_name": first_name,
@@ -2980,6 +3011,7 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters.get("npi")
 
         taxonomy_filters = []
@@ -3003,7 +3035,7 @@ async def get_all(request):
             entity_type_code,
         )
 
-        include_service_locations = bool(address_key or phone_digits or exact_npi)
+        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -3025,6 +3057,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if address_site_key:
+            address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
@@ -3037,16 +3071,17 @@ async def get_all(request):
         taxonomy_subquery = _taxonomy_classification_subquery(taxonomy_conditions)
         query = text(
             f"""
-            WITH filtered_addresses AS (
-                SELECT DISTINCT c.npi, c.taxonomy_array
+            WITH filtered_taxonomy AS (
+                SELECT DISTINCT c.npi, code.int_code
                   FROM {address_table_sql} AS c
+                  CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)
                  WHERE {' AND '.join(address_where)}
             )
             SELECT q.classification AS key,
-                   COUNT(DISTINCT fa.npi) AS value
-              FROM filtered_addresses AS fa
+                   COUNT(DISTINCT ft.npi) AS value
+              FROM filtered_taxonomy AS ft
               JOIN {taxonomy_subquery}
-                ON fa.taxonomy_array && ARRAY[q.int_code]::INTEGER[]
+                ON ft.int_code = q.int_code
              GROUP BY q.classification
             """
         )
@@ -3061,6 +3096,7 @@ async def get_all(request):
             "zip_code": zip_code,
             "phone_digits": phone_digits,
             "address_key": address_key,
+            "address_site_key": address_site_key,
             "npi_filter": exact_npi,
             "specialization": specialization,
             "first_name": first_name,
@@ -3187,9 +3223,10 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        address_site_key = filters.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters.get("npi")
         where = []
-        include_service_locations = bool(address_key or phone_digits or exact_npi)
+        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -3222,6 +3259,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if address_site_key:
+            address_where.append(_address_site_key_filter("c", address_table_sql))
         if exact_npi is not None:
             address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
@@ -3309,6 +3348,7 @@ async def get_all(request):
                 zip_code=zip_code,
                 phone_digits=phone_digits,
                 address_key=address_key,
+                address_site_key=address_site_key,
                 npi_filter=exact_npi,
                 **npi_params,
                 **dynamic_code_params,
@@ -3339,6 +3379,7 @@ async def get_all(request):
                                 continue
                             if c.key in row_mapping:
                                 obj[c.key] = row_mapping.get(c.key)
+                        _attach_public_address_site_key(obj, row_mapping)
                         # Unified serving: include per-address source/plan attribution
                         # (not declared on the legacy NPIAddress model) so list results
                         # match the detail + geo endpoints.
@@ -3409,7 +3450,7 @@ async def get_all(request):
 
             if (
                 _address_table_is_unified(address_table_sql)
-                and (address_key or phone_digits or exact_npi is not None)
+                and (address_key or address_site_key or phone_digits or exact_npi is not None)
                 and len(res) < limit
                 and not npi_where
                 and not use_taxonomy_filter
@@ -3428,6 +3469,7 @@ async def get_all(request):
                     "zip_code": zip_code,
                     "phone_digits": phone_digits,
                     "address_key": address_key,
+                    "address_site_key": address_site_key,
                     "npi_filter": exact_npi,
                     **dynamic_code_params,
                 }
@@ -3470,6 +3512,7 @@ async def get_all(request):
                             continue
                         if column.key in mapping:
                             obj[column.key] = mapping.get(column.key)
+                    _attach_public_address_site_key(obj, mapping)
                     for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
                         if key in mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                             obj[key] = mapping.get(key)
@@ -3529,6 +3572,7 @@ async def get_all(request):
                 exact_npi,
                 phone_digits,
                 address_key,
+                address_site_key,
                 zip_code,
                 entity_type_code,
                 plan_network,
@@ -4246,6 +4290,7 @@ async def get_near_npi(request):
                     continue
                 if c.key in row_dict:
                     obj[c.key] = row_dict[c.key]
+            _attach_public_address_site_key(obj, row_dict)
             # Unified serving carries per-address source/plan attribution that the
             # legacy NPIAddress model doesn't declare, so the loop above skips it.
             # Surface it here so geo results show WHERE each address came from and
@@ -4876,6 +4921,7 @@ async def get_npi(request, npi):
         data["address_list"] = []
     for address in data["address_list"]:
         if isinstance(address, dict):
+            _attach_public_address_site_key(address, address)
             for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 address.pop(key, None)
             if not include_evidence:

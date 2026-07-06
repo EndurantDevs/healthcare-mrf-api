@@ -3113,6 +3113,11 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
                 "name": "service_address_key_npi",
                 "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
             },
+            {
+                "index_elements": ("premise_key", "npi"),
+                "name": "service_premise_key_npi",
+                "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
+            },
             {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
             {"index_elements": ("row_origin",), "name": "row_origin"},
             {"index_elements": ("zip5",), "name": "zip5"},
@@ -3145,6 +3150,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_service_phone_digits_npi" in joined
     assert "idx_service_phone_number_npi" in joined
     assert "idx_service_address_key_npi" in joined
+    assert "idx_service_premise_key_npi" in joined
     assert "idx_address_sources" in joined
     assert "idx_primary_phone_digits_npi" not in joined
     assert "idx_geo_idx" not in joined
@@ -3219,6 +3225,8 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "ON mrf.entity_address_unified (npi)" in joined
     assert "entity_address_unified_idx_geo_bbox" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
+    assert "entity_address_unified_idx_service_premise_key_npi" in joined
+    assert "ON mrf.entity_address_unified (premise_key, npi)" in joined
     assert "entity_address_unified_idx_geo_idx" not in joined
     assert "entity_address_unified.geo_idx" in context["post_publish_skipped_indexes"]
     assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
@@ -3259,6 +3267,7 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     assert context["post_publish_index_concurrently"] is False
     assert context["post_publish_index_concurrency"] == 6
     assert "CREATE INDEX IF NOT EXISTS entity_address_unified_idx_npi" in joined
+    assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "CREATE INDEX CONCURRENTLY" not in joined
     index_statements = [s for s in statements if "CREATE EXTENSION" not in s]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
@@ -3494,6 +3503,11 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "index_elements": ("address_key", "npi"),
         "name": "service_address_key_npi",
         "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
+    }
+    assert indexes["service_premise_key_npi"] == {
+        "index_elements": ("premise_key", "npi"),
+        "name": "service_premise_key_npi",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
     }
     assert indexes["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),
