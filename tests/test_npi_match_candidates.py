@@ -236,6 +236,33 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
     assert query_params["zip_code"] == params["zip_code"]
 
 
+def test_match_candidate_query_materializes_raw_address_locator():
+    params = {
+        "address_site_key": None,
+        "address_key": None,
+        "lat": None,
+        "long": None,
+        "radius_miles": None,
+        "phone_digits": None,
+        "first_line_norm": "6025walnutgroverdste400",
+        "zip_code": "38120",
+        "entity_type_code": None,
+        "taxonomy_exact": (),
+        "taxonomy_prefixes": (),
+        "provider_type": None,
+        "specialty_filter": None,
+        "limit": 5,
+    }
+
+    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    sql = str(query)
+
+    assert "raw_location_matches AS MATERIALIZED" in sql
+    assert "a.location_key IN (SELECT location_key FROM raw_location_matches)" in sql
+    assert "REGEXP_REPLACE(LOWER(COALESCE(rz.first_line, ''))" in sql
+    assert query_params["raw_candidate_limit"] == 1000
+
+
 def test_match_candidate_output_scores_and_hides_internal_fields():
     row = {
         "npi": 1013995133,

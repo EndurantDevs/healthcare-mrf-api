@@ -2850,11 +2850,19 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
             f"AND {_address_zip5_filter('a', address_table_sql)}"
         )
-    exact_locator_where = [
-        locator
-        for locator in (address_site_locator, address_key_locator, phone_locator, raw_address_locator)
-        if locator
-    ][:1]
+    locator_candidates = [
+        ("address_site_key", address_site_locator),
+        ("address_key", address_key_locator),
+        ("phone", phone_locator),
+        ("raw_address", raw_address_locator),
+    ]
+    selected_locator_name = None
+    selected_locator = None
+    for locator_name, locator_sql in locator_candidates:
+        if locator_sql:
+            selected_locator_name = locator_name
+            selected_locator = locator_sql
+            break
     geo_distance_expr = _match_geo_distance_expr(params)
     geo_locator_where: list[str] = []
     if params.get("lat") is not None and params.get("long") is not None:
@@ -2886,10 +2894,33 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             "AND a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric) "
             f"AND ({geo_distance_expr}) <= :radius_miles"
         )
+    raw_location_matches_cte = ""
+    if selected_locator_name == "raw_address":
+        raw_type_clause = _provider_list_address_type_clause(
+            "rz",
+            address_table_sql,
+            include_service_locations=True,
+        )
+        raw_provider_npi = columns["provider_npi"].replace("a.", "rz.")
+        raw_location_key = columns["location_key"].replace("a.", "rz.")
+        query_params["raw_candidate_limit"] = min(max(int(params["limit"]) * 50, 1000), 10_000)
+        raw_location_matches_cte = f"""
+        raw_location_matches AS MATERIALIZED (
+            SELECT {raw_location_key} AS location_key
+              FROM {address_table_sql} AS rz
+             WHERE {raw_type_clause}
+               AND {raw_provider_npi} IS NOT NULL
+               AND {_address_zip5_filter('rz', address_table_sql)}
+               AND REGEXP_REPLACE(LOWER(COALESCE(rz.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm
+          ORDER BY {raw_location_key}
+             LIMIT :raw_candidate_limit
+        ),
+        """
+        selected_locator = f"{columns['location_key']} IN (SELECT location_key FROM raw_location_matches)"
     # Use the most precise locator supplied. Keeping less selective locators as
     # scoring signals avoids OR plans that combine indexed keys with broad raw
     # address/geo predicates over the 35M-row serving table.
-    locator_where = exact_locator_where or geo_locator_where
+    locator_where = ([selected_locator] if selected_locator else []) or geo_locator_where
     address_where.append(f"({' OR '.join(locator_where)})")
 
     npi_where: list[str] = []
@@ -2919,7 +2950,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
         f"""
-        WITH candidate_locations AS (
+        WITH {raw_location_matches_cte}candidate_locations AS (
             SELECT DISTINCT ON ({columns['provider_npi']})
                    {columns['provider_npi']}::bigint AS npi,
                    a.type AS address_type,
@@ -3047,11 +3078,16 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
 
 
 async def _rollback_match_candidate_session(session: Any) -> None:
-    if session is not None and hasattr(session, "rollback"):
-        with contextlib.suppress(Exception):
-            rollback_result = session.rollback()
-            if asyncio.iscoroutine(rollback_result):
-                await rollback_result
+    if session is None:
+        return
+    for method_name in ("rollback", "close"):
+        method = getattr(session, method_name, None)
+        if method is None:
+            continue
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            result = method()
+            if asyncio.iscoroutine(result):
+                await asyncio.shield(result)
 
 
 def _json_array_value(value: Any) -> list[Any]:
