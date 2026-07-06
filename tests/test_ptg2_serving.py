@@ -5444,7 +5444,9 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     assert "FROM mrf.npi_address addr" not in sql
     assert "'entity_address_unified' AS location_source" in sql
     assert "'entity_address_unified' AS location_confidence_code" in sql
-    assert "(to_jsonb(addr.*) - 'premise_key') AS address_payload" in sql
+    assert "to_jsonb(addr.*) - 'premise_key'" in sql
+    assert "jsonb_build_object('address_site_key', addr.premise_key::text)" in sql
+    assert "AS address_payload" in sql
     assert "addr.npi = pgm.npi" in sql
     assert "addr.npi = sp.npi" not in sql
     # Provider name is resolved from the canonical NPI table (mrf.npi), never

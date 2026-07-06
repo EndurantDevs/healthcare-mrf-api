@@ -3249,6 +3249,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                         'fax_number_digits', {_eff_enrich('fax_number_digits')},
                         'fax_extension', {_eff_enrich('fax_extension')},
                         'address_key', addr.address_key::text,
+                        'address_site_key', addr.premise_key::text,
                         'lat', {_eff_enrich('lat')},
                         'long', {_eff_enrich('long')}
                     )
@@ -3765,6 +3766,7 @@ def _ptg2_provider_rate_group_key(item: dict[str, Any]) -> tuple[str, str, str, 
     location_key = (
         item.get("location_hash")
         or address_payload.get("address_key")
+        or address_payload.get("address_site_key")
         or address_payload.get("premise_key")
     )
     if not location_key:
@@ -4560,6 +4562,7 @@ async def _ptg2_manifest_location_provider_matches(
                         'fax_number_digits', {_eff('fax_number_digits')},
                         'fax_extension', {_eff('fax_extension')},
                         'address_key', addr.address_key::text,
+                        'address_site_key', addr.premise_key::text,
                         'lat', {_eff('lat')},
                         'long', {_eff('long')}
                     )
@@ -5941,7 +5944,7 @@ def _compact_provider_expansion_sql(
                     'country_code', loc.country_code,
                     'zip5', loc.zip5,
                     'address_key', loc.address_key::text,
-                    'premise_key', loc.premise_key::text,
+                    'address_site_key', loc.premise_key::text,
                     'address_checksum', loc.address_checksum,
                     'address_precision', loc.address_precision,
                     'formatted_address', loc.formatted_address,
@@ -6207,7 +6210,7 @@ async def _search_compact_serving_table(
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
             f"'{address_location_source}' AS location_source, "
             f"'{address_location_source}' AS location_confidence_code, "
-            "(to_jsonb(addr.*) - 'premise_key') AS address_payload, "
+            "((to_jsonb(addr.*) - 'premise_key') || jsonb_build_object('address_site_key', addr.premise_key::text)) AS address_payload, "
             "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
             "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
             "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "

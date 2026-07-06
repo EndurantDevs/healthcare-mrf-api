@@ -25,6 +25,10 @@ from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
                               INTERNAL_PROCEDURE_CODE_SYSTEM,
                               INTERNAL_RX_CODE_SYSTEM)
 from api.endpoint.pagination import parse_pagination
+from api.provider_specialty_filters import (
+    ensure_specialty_resolution_cache,
+    resolve_provider_specialty_filter,
+)
 from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        NPIAddress, NPIData, NPIDataOtherIdentifier,
                        NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy,
@@ -306,6 +310,11 @@ _NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = N
 _NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
+_MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "2.0"))
+_MATCH_CANDIDATES_DEFAULT_LIMIT = 5
+_MATCH_CANDIDATES_MAX_LIMIT = 50
+_MATCH_CANDIDATES_DEFAULT_RADIUS_MILES = 5.0
+_MATCH_CANDIDATES_MAX_RADIUS_MILES = 100.0
 _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS = max(
     float(os.getenv("HLTHPRT_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", "300")),
     0.0,
@@ -2494,6 +2503,833 @@ async def pharmacists_per_pharmacy(request):
     return response.json(payload)
 
 
+def _normalize_match_candidate_float(
+    raw_value: Any,
+    *,
+    param_name: str,
+    minimum: float,
+    maximum: float,
+) -> Optional[float]:
+    if raw_value in (None, "", "null"):
+        return None
+    try:
+        parsed = float(str(raw_value).strip())
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be a number") from exc
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        raise sanic.exceptions.InvalidUsage(
+            f"{param_name} must be between {minimum:g} and {maximum:g}"
+        )
+    return parsed
+
+
+def _normalize_match_candidate_limit(raw_value: Any) -> int:
+    if raw_value in (None, "", "null"):
+        return _MATCH_CANDIDATES_DEFAULT_LIMIT
+    try:
+        parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("limit must be an integer") from exc
+    if parsed < 1 or parsed > _MATCH_CANDIDATES_MAX_LIMIT:
+        raise sanic.exceptions.InvalidUsage(
+            f"limit must be between 1 and {_MATCH_CANDIDATES_MAX_LIMIT}"
+        )
+    return parsed
+
+
+def _normalize_match_candidate_entity_kind(raw_value: Any) -> Optional[int]:
+    if raw_value in (None, "", "null"):
+        return None
+    value = str(raw_value).strip().lower()
+    if value == "individual":
+        return 1
+    if value == "organization":
+        return 2
+    raise sanic.exceptions.InvalidUsage("entity_kind must be either individual or organization")
+
+
+def _entity_kind_from_code(entity_type_code: Any) -> Optional[str]:
+    if entity_type_code == 1:
+        return "individual"
+    if entity_type_code == 2:
+        return "organization"
+    return None
+
+
+def _normalize_match_candidate_entity_type(raw_code: Any, raw_kind: Any) -> Optional[int]:
+    entity_type_code: Optional[int] = None
+    if raw_code not in (None, "", "null"):
+        try:
+            entity_type_code = int(str(raw_code).strip())
+        except (TypeError, ValueError) as exc:
+            raise sanic.exceptions.InvalidUsage(
+                "entity_type_code must be either 1 (individual) or 2 (organization)"
+            ) from exc
+        if entity_type_code not in (1, 2):
+            raise sanic.exceptions.InvalidUsage(
+                "entity_type_code must be either 1 (individual) or 2 (organization)"
+            )
+    kind_code = _normalize_match_candidate_entity_kind(raw_kind)
+    if entity_type_code is not None and kind_code is not None and entity_type_code != kind_code:
+        raise sanic.exceptions.InvalidUsage("entity_kind and entity_type_code disagree")
+    return entity_type_code if entity_type_code is not None else kind_code
+
+
+def _normalize_match_candidate_line(raw_value: Any) -> Optional[str]:
+    value = _normalize_text_filter(raw_value, param_name="first_line", max_length=256)
+    if value is None:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
+    if not normalized:
+        raise sanic.exceptions.InvalidUsage("first_line must include letters or digits")
+    return normalized
+
+
+def _normalize_match_candidate_term(raw_value: Any, *, param_name: str) -> Optional[str]:
+    return _normalize_text_filter(raw_value, param_name=param_name, max_length=128)
+
+
+def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if raw_value in (None, "", "null"):
+        return (), ()
+    exact_codes: list[str] = []
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for raw_item in re.split(r"[,;]", str(raw_value)):
+        item = raw_item.strip().upper()
+        if not item:
+            continue
+        is_prefix = item.endswith("*")
+        token = item[:-1] if is_prefix else item
+        if not re.fullmatch(r"[A-Z0-9]{2,16}", token):
+            raise sanic.exceptions.InvalidUsage(
+                "taxonomy_scope must contain NUCC codes or prefixes like 261Q*"
+            )
+        dedupe_key = f"{token}*" if is_prefix else token
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        if is_prefix:
+            prefixes.append(token)
+        else:
+            exact_codes.append(token)
+    return tuple(exact_codes), tuple(prefixes)
+
+
+async def _normalize_match_candidate_params(request) -> dict[str, Any]:
+    args = request.args
+    args.get("address_site_key")
+    args.get("address_key")
+    args.get("lat")
+    args.get("long")
+    args.get("radius_miles")
+    args.get("phone")
+    args.get("first_line")
+    args.get("zip")
+    args.get("zip_code")
+    args.get("entity_type_code")
+    args.get("entity_kind")
+    args.get("taxonomy_scope")
+    args.get("provider_type")
+    args.get("specialty")
+    args.get("include_subspecialties")
+    args.get("limit")
+    args.get("include_sources")
+    args.get("include_evidence")
+    args.get("debug")
+
+    address_site_key = _normalize_uuid_key(args.get("address_site_key"), "address_site_key")
+    address_key = _normalize_address_key(args.get("address_key"))
+    latitude = _normalize_match_candidate_float(
+        args.get("lat"),
+        param_name="lat",
+        minimum=-90.0,
+        maximum=90.0,
+    )
+    longitude = _normalize_match_candidate_float(
+        args.get("long"),
+        param_name="long",
+        minimum=-180.0,
+        maximum=180.0,
+    )
+    if (latitude is None) != (longitude is None):
+        raise sanic.exceptions.InvalidUsage("lat and long must be provided together")
+    radius_miles = _normalize_match_candidate_float(
+        args.get("radius_miles"),
+        param_name="radius_miles",
+        minimum=0.01,
+        maximum=_MATCH_CANDIDATES_MAX_RADIUS_MILES,
+    )
+    if latitude is not None and radius_miles is None:
+        radius_miles = _MATCH_CANDIDATES_DEFAULT_RADIUS_MILES
+
+    phone_digits = _normalize_phone_digits(args.get("phone"))
+    first_line_norm = _normalize_match_candidate_line(args.get("first_line"))
+    zip_code = _normalize_zip_code(args.get("zip_code"), "zip_code")
+    zip_alias = _normalize_zip_code(args.get("zip"), "zip")
+    if zip_code and zip_alias and zip_code != zip_alias:
+        raise sanic.exceptions.InvalidUsage("zip and zip_code must match when both are provided")
+    zip_code = zip_code or zip_alias
+    if (first_line_norm is None) != (zip_code is None):
+        raise sanic.exceptions.InvalidUsage("first_line and zip_code must be provided together")
+
+    entity_type_code = _normalize_match_candidate_entity_type(
+        args.get("entity_type_code"),
+        args.get("entity_kind"),
+    )
+    taxonomy_exact, taxonomy_prefixes = _taxonomy_scope_tokens(args.get("taxonomy_scope"))
+    provider_type = _normalize_match_candidate_term(args.get("provider_type"), param_name="provider_type")
+    specialty = _normalize_match_candidate_term(args.get("specialty"), param_name="specialty")
+    if provider_type and specialty and provider_type.strip().lower() != specialty.strip().lower():
+        raise sanic.exceptions.InvalidUsage("provider_type and specialty must match when both are provided")
+    provider_type = provider_type or specialty
+    include_subspecialties = _parse_bool_arg(args.get("include_subspecialties"), default=True)
+    include_sources = _parse_bool_arg(args.get("include_sources"), default=False)
+    include_evidence = _parse_bool_arg(args.get("include_evidence"), default=False)
+    debug = _parse_bool_arg(args.get("debug"), default=False)
+    if debug:
+        include_sources = True
+        include_evidence = True
+    limit = _normalize_match_candidate_limit(args.get("limit"))
+
+    locator_count = sum(
+        bool(value)
+        for value in (
+            address_site_key,
+            address_key,
+            latitude is not None and longitude is not None,
+            phone_digits,
+            first_line_norm and zip_code,
+        )
+    )
+    if locator_count == 0:
+        raise sanic.exceptions.InvalidUsage(
+            "provide at least one locator: address_site_key, address_key, lat+long, phone, or first_line+zip_code"
+        )
+
+    request_session = _request_session(request)
+    specialty_filter = None
+    if provider_type:
+        if request_session is not None:
+            await ensure_specialty_resolution_cache(request_session)
+        else:
+            async with db.acquire() as conn:
+                await ensure_specialty_resolution_cache(conn)
+        specialty_filter = resolve_provider_specialty_filter(
+            {
+                "specialty": provider_type,
+                "include_subspecialties": include_subspecialties,
+            }
+        )
+        if specialty_filter.unresolved_specialty:
+            suggestion_note = ""
+            if specialty_filter.suggested_specialties:
+                suggestion_note = f" Suggestions: {', '.join(specialty_filter.suggested_specialties)}."
+            raise sanic.exceptions.InvalidUsage(
+                f"Unrecognized provider_type: {provider_type}.{suggestion_note}"
+            )
+
+    return {
+        "address_site_key": address_site_key,
+        "address_key": address_key,
+        "lat": latitude,
+        "long": longitude,
+        "radius_miles": radius_miles,
+        "phone_digits": phone_digits,
+        "first_line_norm": first_line_norm,
+        "zip_code": zip_code,
+        "entity_type_code": entity_type_code,
+        "entity_kind": _entity_kind_from_code(entity_type_code),
+        "taxonomy_exact": taxonomy_exact,
+        "taxonomy_prefixes": taxonomy_prefixes,
+        "provider_type": provider_type,
+        "specialty_filter": specialty_filter,
+        "include_subspecialties": include_subspecialties,
+        "include_sources": include_sources,
+        "include_evidence": include_evidence,
+        "debug": debug,
+        "limit": limit,
+    }
+
+
+def _match_geo_distance_expr(params: dict[str, Any], alias: str = "a") -> str:
+    if params.get("lat") is None or params.get("long") is None:
+        return "NULL::double precision"
+    return (
+        "3958.8 * 2 * ASIN(LEAST(1.0, SQRT("
+        f"POWER(SIN(RADIANS(({alias}.lat::double precision - :lat) / 2)), 2) + "
+        f"COS(RADIANS(:lat)) * COS(RADIANS({alias}.lat::double precision)) * "
+        f"POWER(SIN(RADIANS(({alias}.long::double precision - :long) / 2)), 2)"
+        ")))"
+    )
+
+
+def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
+    unified = _address_table_is_unified(address_table_sql)
+    return {
+        "provider_npi": "COALESCE(a.npi, a.inferred_npi)" if unified else "a.npi",
+        "premise_key": "a.premise_key::text" if unified else "NULL::text",
+        "address_precision": "a.address_precision" if unified else "NULL::text",
+        "address_sources": "a.address_sources" if unified else "ARRAY[]::varchar[]",
+        "source_record_ids": "a.source_record_ids" if unified else "ARRAY[]::varchar[]",
+        "source_count": "a.source_count" if unified else "0",
+        "independent_source_count": "a.independent_source_count" if unified else "0",
+        "multi_source_confirmed": "a.multi_source_confirmed" if unified else "false",
+        "entity_name": "a.entity_name" if unified else "NULL::text",
+        "location_key": "a.location_key" if unified else "a.checksum::text",
+        "updated_at": "a.updated_at" if unified else "a.date_added::timestamp",
+    }
+
+
+def _match_candidate_taxonomy_filter_sql(params: dict[str, Any], query_params: dict[str, Any]) -> str:
+    specialty_filter = params.get("specialty_filter")
+    taxonomy_codes = list(params.get("taxonomy_exact") or [])
+    if specialty_filter is not None:
+        taxonomy_codes.extend(str(code).upper() for code in specialty_filter.taxonomy_codes)
+    taxonomy_codes = list(dict.fromkeys(code for code in taxonomy_codes if code))
+    taxonomy_prefixes = list(params.get("taxonomy_prefixes") or [])
+    taxonomy_conditions: list[str] = []
+    if taxonomy_codes:
+        query_params["match_taxonomy_codes"] = taxonomy_codes
+        taxonomy_conditions.append("t.healthcare_provider_taxonomy_code = ANY(:match_taxonomy_codes)")
+    for idx, prefix in enumerate(taxonomy_prefixes):
+        key = f"match_taxonomy_prefix_{idx}"
+        query_params[key] = f"{prefix}%"
+        taxonomy_conditions.append(f"t.healthcare_provider_taxonomy_code LIKE :{key}")
+    if specialty_filter is not None and specialty_filter.classification and not specialty_filter.taxonomy_codes:
+        query_params["match_taxonomy_classification"] = specialty_filter.classification
+        taxonomy_conditions.append("nu.classification = :match_taxonomy_classification")
+    if not taxonomy_conditions:
+        return "1=1"
+    taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
+    nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {taxonomy_table_sql} AS t
+         LEFT JOIN {nucc_table_sql} AS nu
+                ON nu.code = t.healthcare_provider_taxonomy_code
+             WHERE t.npi = cl.npi
+               AND ({' OR '.join(taxonomy_conditions)})
+        )
+    """
+
+
+def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tuple[Any, dict[str, Any]]:
+    columns = _match_candidate_column_sql(address_table_sql)
+    query_params: dict[str, Any] = {
+        "limit": int(params["limit"]),
+        "candidate_limit": min(max(int(params["limit"]) * 8, 25), 500),
+    }
+    address_where = [
+        _provider_list_address_type_clause(
+            "a",
+            address_table_sql,
+            include_service_locations=True,
+        ),
+        f"{columns['provider_npi']} IS NOT NULL",
+    ]
+    locator_where: list[str] = []
+    if params.get("address_site_key"):
+        query_params["address_site_key"] = params["address_site_key"]
+        locator_where.append(_address_site_key_filter("a", address_table_sql))
+    if params.get("address_key"):
+        query_params["address_key"] = params["address_key"]
+        locator_where.append("a.address_key = CAST(:address_key AS uuid)")
+    if params.get("phone_digits"):
+        query_params["phone_digits"] = params["phone_digits"]
+        locator_where.append(_address_phone_digits_filter("a", address_table_sql))
+    if params.get("first_line_norm") and params.get("zip_code"):
+        query_params["first_line_norm"] = params["first_line_norm"]
+        query_params["zip_code"] = params["zip_code"]
+        locator_where.append(
+            "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
+            f"AND {_address_zip5_filter('a', address_table_sql)}"
+        )
+    geo_distance_expr = _match_geo_distance_expr(params)
+    if params.get("lat") is not None and params.get("long") is not None:
+        latitude = float(params["lat"])
+        longitude = float(params["long"])
+        radius = float(params["radius_miles"])
+        lat_delta = radius / 69.0
+        lon_delta = radius / max(1.0, 69.0 * abs(math.cos(math.radians(latitude))))
+        query_params.update(
+            {
+                "lat": latitude,
+                "long": longitude,
+                "radius_miles": radius,
+                "lat_min": latitude - lat_delta,
+                "lat_max": latitude + lat_delta,
+                "long_min": longitude - lon_delta,
+                "long_max": longitude + lon_delta,
+            }
+        )
+        locator_where.append(
+            "a.lat IS NOT NULL AND a.long IS NOT NULL "
+            "AND a.lat::double precision BETWEEN :lat_min AND :lat_max "
+            "AND a.long::double precision BETWEEN :long_min AND :long_max "
+            f"AND ({geo_distance_expr}) <= :radius_miles"
+        )
+    address_where.append(f"({' OR '.join(locator_where)})")
+
+    npi_where: list[str] = []
+    if params.get("entity_type_code") is not None:
+        query_params["entity_type_code"] = params["entity_type_code"]
+        npi_where.append("n.entity_type_code = :entity_type_code")
+    taxonomy_filter = _match_candidate_taxonomy_filter_sql(params, query_params)
+    if taxonomy_filter != "1=1":
+        npi_where.append(taxonomy_filter)
+    npi_where_sql = " AND ".join(npi_where) if npi_where else "1=1"
+
+    address_site_match = (
+        "a.premise_key = CAST(:address_site_key AS uuid)"
+        if _address_table_is_unified(address_table_sql) and params.get("address_site_key")
+        else "false"
+    )
+    address_key_match = "a.address_key = CAST(:address_key AS uuid)" if params.get("address_key") else "false"
+    phone_match = _address_phone_digits_filter("a", address_table_sql) if params.get("phone_digits") else "false"
+    raw_address_match = (
+        "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
+        f"AND {_address_zip5_filter('a', address_table_sql)}"
+        if params.get("first_line_norm") and params.get("zip_code")
+        else "false"
+    )
+    npi_table_sql = _schema_cache_key(NPIData.__tablename__)
+    taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
+    nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
+    query = text(
+        f"""
+        WITH candidate_locations AS (
+            SELECT DISTINCT ON ({columns['provider_npi']})
+                   {columns['provider_npi']}::bigint AS npi,
+                   a.type AS address_type,
+                   a.first_line,
+                   a.second_line,
+                   a.city_name,
+                   a.state_name,
+                   a.postal_code,
+                   a.country_code,
+                   a.telephone_number,
+                   a.phone_number,
+                   a.lat::double precision AS lat,
+                   a.long::double precision AS long,
+                   a.address_key::text AS address_key,
+                   {columns['premise_key']} AS address_site_key,
+                   {columns['address_precision']} AS address_precision,
+                   {columns['address_sources']} AS address_sources,
+                   {columns['source_record_ids']} AS source_record_ids,
+                   {columns['source_count']}::integer AS source_count,
+                   {columns['independent_source_count']}::integer AS independent_source_count,
+                   {columns['multi_source_confirmed']}::boolean AS multi_source_confirmed,
+                   {columns['entity_name']} AS entity_name,
+                   {columns['location_key']} AS location_key,
+                   {columns['updated_at']} AS address_updated_at,
+                   ({address_site_match})::boolean AS address_site_key_matched,
+                   ({address_key_match})::boolean AS address_key_matched,
+                   ({phone_match})::boolean AS phone_matched,
+                   ({raw_address_match})::boolean AS raw_address_matched,
+                   ({geo_distance_expr}) AS geo_distance_miles
+              FROM {address_table_sql} AS a
+             WHERE {' AND '.join(address_where)}
+          ORDER BY {columns['provider_npi']},
+                   address_site_key_matched DESC,
+                   address_key_matched DESC,
+                   phone_matched DESC,
+                   raw_address_matched DESC,
+                   geo_distance_miles ASC NULLS LAST,
+                   source_count DESC NULLS LAST,
+                   location_key
+             LIMIT :candidate_limit
+        ),
+        filtered AS (
+            SELECT cl.*,
+                   n.entity_type_code,
+                   n.provider_organization_name,
+                   n.provider_other_organization_name,
+                   n.provider_first_name,
+                   n.provider_last_name,
+                   n.provider_credential_text,
+                   n.do_business_as
+              FROM candidate_locations AS cl
+              JOIN {npi_table_sql} AS n
+                ON n.npi = cl.npi
+             WHERE {npi_where_sql}
+        )
+        SELECT f.*,
+               COALESCE(
+                   (
+                       SELECT json_agg(
+                                  json_build_object(
+                                      'taxonomy_code', t.healthcare_provider_taxonomy_code,
+                                      'primary', UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y',
+                                      'classification', nu.classification,
+                                      'specialization', nu.specialization,
+                                      'section', nu.section,
+                                      'display_name', nu.display_name
+                                  )
+                                  ORDER BY (UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC,
+                                           t.healthcare_provider_taxonomy_code
+                              )
+                         FROM {taxonomy_table_sql} AS t
+                    LEFT JOIN {nucc_table_sql} AS nu
+                           ON nu.code = t.healthcare_provider_taxonomy_code
+                        WHERE t.npi = f.npi
+                   ),
+                   '[]'::json
+               ) AS taxonomy_list
+          FROM filtered AS f
+      ORDER BY f.address_site_key_matched DESC,
+               f.address_key_matched DESC,
+               f.phone_matched DESC,
+               f.raw_address_matched DESC,
+               f.geo_distance_miles ASC NULLS LAST,
+               f.source_count DESC NULLS LAST,
+               f.npi
+         LIMIT :limit
+        """
+    )
+    return query, query_params
+
+
+async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = None) -> list[dict[str, Any]]:
+    required_columns = {
+        "npi",
+        "type",
+        "first_line",
+        "postal_code",
+        "telephone_number",
+        "phone_number",
+        "lat",
+        "long",
+        "address_key",
+        "taxonomy_array",
+    }
+    if params.get("address_site_key"):
+        required_columns.add("premise_key")
+    address_table_sql = await _address_serving_table_sql(required_columns, session=session)
+    query, query_params = _match_candidate_query(params, address_table_sql)
+    result = await asyncio.wait_for(
+        _execute_stmt(query, session=session, params=query_params),
+        timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
+    )
+    rows: list[dict[str, Any]] = []
+    for row in result.all():
+        mapping = getattr(row, "_mapping", row)
+        rows.append(dict(mapping))
+    return rows
+
+
+def _json_array_value(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _match_candidate_name(row: Mapping[str, Any]) -> str:
+    organization_name = row.get("provider_organization_name") or row.get("provider_other_organization_name")
+    if organization_name:
+        return str(organization_name)
+    parts = [
+        row.get("provider_first_name"),
+        row.get("provider_last_name"),
+        row.get("provider_credential_text"),
+    ]
+    display = " ".join(str(part).strip() for part in parts if str(part or "").strip())
+    return display or str(row.get("entity_name") or row.get("npi") or "Unknown")
+
+
+def _primary_taxonomy(taxonomy_list: Sequence[Any]) -> dict[str, Any]:
+    first: dict[str, Any] = {}
+    for raw in taxonomy_list:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        if not first:
+            first = item
+        if item.get("primary") is True:
+            return item
+    return first
+
+
+def _facility_payload(
+    row: Mapping[str, Any],
+    taxonomy_list: Sequence[Any],
+    enrichment: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    primary = _primary_taxonomy(taxonomy_list)
+    taxonomy_code = str(primary.get("taxonomy_code") or "")
+    facility_type = primary.get("display_name") or primary.get("classification")
+    evidence: list[str] = []
+    confidence = "medium" if taxonomy_code else "low"
+    if taxonomy_code:
+        evidence.append(f"primary_taxonomy_{taxonomy_code}")
+    if taxonomy_code.startswith("282N"):
+        facility_type = facility_type or "General Acute Care Hospital"
+        confidence = "high"
+    if enrichment:
+        flag_map = {
+            "has_hospital_enrollment": "hospital_enrollment",
+            "has_fqhc_enrollment": "fqhc_enrollment",
+            "has_rhc_enrollment": "rhc_enrollment",
+            "has_snf_enrollment": "snf_enrollment",
+            "has_hha_enrollment": "hha_enrollment",
+            "has_hospice_enrollment": "hospice_enrollment",
+        }
+        for key, label in flag_map.items():
+            if enrichment.get(key):
+                evidence.append(label)
+                confidence = "high"
+        provider_type = enrichment.get("primary_provider_type_text") or enrichment.get("primary_provider_type_code")
+        if provider_type:
+            evidence.append(f"ffs_provider_type:{provider_type}")
+    if not facility_type and not evidence:
+        return None
+    return {
+        "type": facility_type,
+        "taxonomy": taxonomy_code or None,
+        "classification_confidence": confidence,
+        "evidence": evidence,
+    }
+
+
+def _match_signal_payload(
+    row: Mapping[str, Any],
+    params: Mapping[str, Any],
+    taxonomy_matched: bool,
+    fhir_matched: bool,
+    ffs_matched: bool,
+) -> tuple[dict[str, Any], float]:
+    signals: dict[str, Any] = {
+        "address_site_key": {"matched": bool(row.get("address_site_key_matched"))},
+        "address_key": {"matched": bool(row.get("address_key_matched"))},
+        "phone": {"matched": bool(row.get("phone_matched"))},
+        "raw_address": {"matched": bool(row.get("raw_address_matched"))},
+        "taxonomy": {"matched": taxonomy_matched},
+        "fhir": {"matched": fhir_matched},
+        "ffs": {"matched": ffs_matched},
+    }
+    score = 0.0
+    if row.get("address_site_key_matched"):
+        score += 0.55
+        signals["address_site_key"]["contribution"] = 0.55
+    if row.get("address_key_matched"):
+        score += 0.50
+        signals["address_key"]["contribution"] = 0.50
+    if row.get("phone_matched"):
+        score += 0.25
+        signals["phone"]["contribution"] = 0.25
+    if row.get("raw_address_matched"):
+        score += 0.25
+        signals["raw_address"]["contribution"] = 0.25
+    distance = row.get("geo_distance_miles")
+    if distance is not None:
+        distance_float = float(distance)
+        radius = float(params.get("radius_miles") or _MATCH_CANDIDATES_DEFAULT_RADIUS_MILES)
+        contribution = max(0.0, 0.55 * (1.0 - min(distance_float / max(radius, 0.01), 1.0)))
+        contribution = round(contribution, 4)
+        score += contribution
+        signals["geo_distance"] = {
+            "miles": round(distance_float, 4),
+            "contribution": contribution,
+        }
+    else:
+        signals["geo_distance"] = {"matched": False}
+    if taxonomy_matched:
+        score += 0.10
+        signals["taxonomy"]["contribution"] = 0.10
+    if fhir_matched:
+        score += 0.05
+        signals["fhir"]["contribution"] = 0.05
+    if ffs_matched:
+        score += 0.05
+        signals["ffs"]["contribution"] = 0.05
+    return signals, round(min(score, 1.0), 4)
+
+
+def _confidence_band(score: float) -> str:
+    if score >= 0.75:
+        return "high"
+    if score >= 0.45:
+        return "medium"
+    return "low"
+
+
+def _provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
+    if not (params.get("taxonomy_exact") or params.get("taxonomy_prefixes") or params.get("provider_type")):
+        return False
+    taxonomy_list = _json_array_value(row.get("taxonomy_list"))
+    exact_codes = set(params.get("taxonomy_exact") or [])
+    specialty_filter = params.get("specialty_filter")
+    if specialty_filter is not None:
+        exact_codes.update(str(code).upper() for code in specialty_filter.taxonomy_codes)
+    prefixes = tuple(params.get("taxonomy_prefixes") or ())
+    for item in taxonomy_list:
+        if not isinstance(item, Mapping):
+            continue
+        code = str(item.get("taxonomy_code") or "").upper()
+        if code in exact_codes or any(code.startswith(prefix) for prefix in prefixes):
+            return True
+        if specialty_filter is not None and specialty_filter.classification:
+            if item.get("classification") == specialty_filter.classification:
+                return True
+    return False
+
+
+def _match_candidate_output(
+    row: Mapping[str, Any],
+    params: Mapping[str, Any],
+    enrichment: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    public_row = dict(row)
+    _redact_internal_address_fields(public_row)
+    taxonomy_list = _json_array_value(row.get("taxonomy_list"))
+    fhir_sources = _json_array_value(public_row.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY))
+    address_sources = _json_array_value(row.get("address_sources"))
+    fhir_matched = bool(fhir_sources) or "provider_directory_fhir" in address_sources
+    ffs_matched = bool(enrichment and (
+        enrichment.get("has_any_enrollment")
+        or enrichment.get("has_ffs_enrollment")
+        or enrichment.get("has_medicare_claims")
+    ))
+    taxonomy_matched = _provider_type_filter_matched(row, params)
+    match_signals, match_score = _match_signal_payload(
+        row,
+        params,
+        taxonomy_matched,
+        fhir_matched,
+        ffs_matched,
+    )
+    address = {
+        "type": row.get("address_type"),
+        "first_line": row.get("first_line"),
+        "second_line": row.get("second_line"),
+        "city_name": row.get("city_name"),
+        "state_name": row.get("state_name"),
+        "postal_code": row.get("postal_code"),
+        "country_code": row.get("country_code"),
+        "telephone_number": row.get("telephone_number"),
+        "phone_number": row.get("phone_number"),
+        "lat": row.get("lat"),
+        "long": row.get("long"),
+        "address_key": row.get("address_key"),
+        "address_site_key": row.get("address_site_key"),
+    }
+    address = {key: value for key, value in address.items() if value not in (None, "", [])}
+    sources = {
+        "nppes": {"matched": True},
+        "fhir": {
+            "matched": fhir_matched,
+            "source_count": row.get("source_count") or len(fhir_sources),
+        },
+        "ffs": {
+            "matched": ffs_matched,
+            "has_ffs_enrollment": bool(enrichment and enrichment.get("has_ffs_enrollment")),
+            "has_medicare_claims": bool(enrichment and enrichment.get("has_medicare_claims")),
+        },
+    }
+    candidate = {
+        "npi": row.get("npi"),
+        "display_name": _match_candidate_name(row),
+        "organization_name": row.get("provider_organization_name"),
+        "entity_type_code": row.get("entity_type_code"),
+        "entity_kind": _entity_kind_from_code(row.get("entity_type_code")),
+        "address_key": row.get("address_key"),
+        "address_site_key": row.get("address_site_key"),
+        "match_score": match_score,
+        "confidence_band": _confidence_band(match_score),
+        "match_signals": match_signals,
+        "facility": _facility_payload(row, taxonomy_list, enrichment),
+        "address": address,
+        "sources": sources,
+    }
+    if taxonomy_list:
+        candidate["taxonomy"] = taxonomy_list
+    if params.get("include_sources") and fhir_sources:
+        candidate["provider_directory_sources"] = fhir_sources
+    if params.get("include_evidence"):
+        candidate["evidence"] = {
+            "provider_enrichment_summary": dict(enrichment or {}),
+            "source_record_ids": _json_array_value(row.get("source_record_ids")),
+            "address_sources": address_sources,
+        }
+    return {key: value for key, value in candidate.items() if value is not None}
+
+
+@blueprint.get("/match-candidates")
+async def match_candidates(request):
+    started = time.monotonic()
+    request.args.get("address_site_key")
+    request.args.get("address_key")
+    request.args.get("lat")
+    request.args.get("long")
+    request.args.get("radius_miles")
+    request.args.get("phone")
+    request.args.get("first_line")
+    request.args.get("zip")
+    request.args.get("zip_code")
+    request.args.get("entity_type_code")
+    request.args.get("entity_kind")
+    request.args.get("taxonomy_scope")
+    request.args.get("provider_type")
+    request.args.get("specialty")
+    request.args.get("include_subspecialties")
+    request.args.get("limit")
+    request.args.get("include_sources")
+    request.args.get("include_evidence")
+    request.args.get("debug")
+    params = await _normalize_match_candidate_params(request)
+    request_session = _request_session(request)
+    try:
+        rows = await _fetch_match_candidate_rows(params, session=request_session)
+    except asyncio.TimeoutError as exc:
+        raise sanic.exceptions.ServiceUnavailable(
+            "match candidate lookup exceeded the 2 second query budget"
+        ) from exc
+    if params.get("include_sources") or params.get("include_evidence"):
+        await _attach_provider_directory_source_details(rows, session=request_session)
+    enrichment_map = await _fetch_provider_enrichment_summary_map(
+        [row.get("npi") for row in rows],
+        session=request_session,
+    )
+    candidates = [
+        _match_candidate_output(row, params, enrichment_map.get(int(row["npi"])))
+        for row in rows
+        if row.get("npi") is not None
+    ]
+    candidates.sort(key=lambda item: (-float(item.get("match_score") or 0), int(item.get("npi") or 0)))
+    candidates = candidates[: int(params["limit"])]
+    return response.json(
+        {
+            "candidates": candidates,
+            "total": len(candidates),
+            "query": {
+                "entity_type_code": params.get("entity_type_code"),
+                "entity_kind": params.get("entity_kind"),
+                "taxonomy_scope": list(params.get("taxonomy_exact") or [])
+                + [f"{prefix}*" for prefix in (params.get("taxonomy_prefixes") or [])],
+                "provider_type": params.get("provider_type"),
+                "include_subspecialties": params.get("include_subspecialties"),
+                "limit": params.get("limit"),
+            },
+            "meta": {
+                "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
+                "timeout_ms": int(_MATCH_CANDIDATES_TIMEOUT_SECONDS * 1000),
+            },
+        },
+        default=str,
+    )
+
+
 @blueprint.get("/all")
 async def get_all(request):
     count_only = str(request.args.get("count_only", "0")).strip() == "1"
@@ -2511,6 +3347,7 @@ async def get_all(request):
     request.args.get("include_evidence")
     request.args.get("view")
     request.args.get("npi")
+    request.args.get("address_site_key")
     include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
     include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
     if _parse_bool_arg(request.args.get("debug"), default=False):

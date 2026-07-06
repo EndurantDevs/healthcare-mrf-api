@@ -1930,6 +1930,156 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/PharmacyPharmacistCount'
+  /npi/match-candidates:
+    get:
+      operationId: getNpiMatchCandidates
+      summary: Find provider candidates from a location or contact locator
+      description: |
+        Locator-first provider candidate matcher. At least one locator is required:
+        `address_site_key`, `address_key`, `lat` + `long`, `phone`, or `first_line` + `zip_code`.
+        NPPES/address data is the matching spine; Provider Directory FHIR and FFS/CMS
+        enrichment are returned as source, classification, and evidence signals.
+      parameters:
+        - name: address_site_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Public site/premise key; groups suite/unit variants at the same physical site.
+        - name: address_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Exact canonical address key.
+        - name: lat
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: long
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0.01
+            maximum: 100
+            default: 5
+        - name: phone
+          in: query
+          schema:
+            type: string
+          description: Phone number; punctuation is ignored.
+        - name: first_line
+          in: query
+          schema:
+            type: string
+          description: Street address line 1. Must be paired with `zip_code`.
+        - name: zip
+          in: query
+          schema:
+            type: string
+          description: Alias for `zip_code`; rejected when both are present and differ.
+        - name: zip_code
+          in: query
+          schema:
+            type: string
+        - name: entity_type_code
+          in: query
+          schema:
+            type: integer
+            enum: [1, 2]
+        - name: entity_kind
+          in: query
+          schema:
+            type: string
+            enum: [individual, organization]
+          description: Friendly alias for `entity_type_code`; rejected when both disagree.
+        - name: taxonomy_scope
+          in: query
+          schema:
+            type: string
+          description: Comma-separated NUCC codes or prefixes, for example `282N00000X,261Q*`.
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+          description: Friendly provider type/specialty term resolved through NUCC and synonym data.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+          description: Alias for `provider_type`; rejected when both differ.
+        - name: include_subspecialties
+          in: query
+          schema:
+            type: boolean
+            default: true
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 5
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_evidence
+          in: query
+          schema:
+            type: boolean
+        - name: debug
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Provider candidate matches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [candidates, total, query, meta]
+                properties:
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  query:
+                    type: object
+                  meta:
+                    type: object
+              examples:
+                hospitalBySite:
+                  value:
+                    candidates:
+                      - npi: 1013995133
+                        organization_name: UMASS MEMORIAL HEALTHALLIANCE CLINTON HOSPITAL INC
+                        entity_type_code: 2
+                        entity_kind: organization
+                        address_key: cb329e77-08b7-a9c4-5a2e-34f6ca32b670
+                        address_site_key: 68d0c41a-8871-1b9e-0000-000000000000
+                        match_score: 0.94
+                        confidence_band: high
+                        match_signals:
+                          address_site_key: {matched: true, contribution: 0.55}
+                          fhir: {matched: true, contribution: 0.05}
+                          ffs: {matched: true, contribution: 0.05}
+                    total: 1
+                    query: {provider_type: hospital, limit: 5}
+                    meta: {timeout_ms: 2000}
+        '400':
+          description: Invalid or insufficient locator/filter parameters.
+        '503':
+          description: Query exceeded the matcher timeout budget.
   /npi/all:
     get:
       operationId: getNpiAll
@@ -2046,6 +2196,12 @@ paths:
             type: string
             format: uuid
           description: Canonical provider address UUID filter for unified-address searches
+        - name: address_site_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Public site/premise UUID filter for unified-address searches
         - name: zip_code
           in: query
           schema:

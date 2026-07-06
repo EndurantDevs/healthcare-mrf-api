@@ -608,6 +608,10 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
         {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
         {"index_elements": ("source_id", "organization_ref"), "name": "provider_directory_role_source_organization_idx"},
         {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_role_run_source_idx"},
+        {"index_elements": ("location_refs",), "using": "gin", "name": "provider_directory_role_location_refs_gin_idx"},
+        {"index_elements": ("specialty_codes",), "using": "gin", "name": "provider_directory_role_specialty_codes_gin_idx"},
+        {"index_elements": ("code_codes",), "using": "gin", "name": "provider_directory_role_code_codes_gin_idx"},
+        {"index_elements": ("network_refs",), "using": "gin", "name": "provider_directory_role_network_refs_gin_idx"},
     ]
 
     source_id = Column(String(64), nullable=False)
