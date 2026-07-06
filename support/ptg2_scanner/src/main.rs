@@ -7,8 +7,9 @@ use ptg2_scanner::config::{
     DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
 };
 use ptg2_scanner::copy_format::{
-    emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field, pg_text_copy_field,
-    write_copy_fields, CompactCopyRow, ManifestServingCopyRow,
+    emit_compact_copy_row, emit_manifest_lean_serving_copy_row, emit_manifest_serving_copy_row,
+    pg_text_array_field, pg_text_copy_field, write_copy_fields, CompactCopyRow,
+    ManifestLeanServingCopyRow, ManifestServingCopyRow,
 };
 use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
 use ptg2_scanner::hashing::{
@@ -330,6 +331,7 @@ type PriceCodeSetHashCache = HashMap<Vec<String>, String>;
 struct CopyPathConfig {
     compact: Option<String>,
     manifest_serving: Option<String>,
+    manifest_lean_serving: Option<String>,
     manifest_provider_forward_sidecar: Option<String>,
     manifest_provider_inverted_sidecar: Option<String>,
     manifest_provider_npi_sidecar: Option<String>,
@@ -353,6 +355,7 @@ impl CopyPathConfig {
         Self {
             compact: env_path("HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"),
             manifest_serving: env_path("HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"),
+            manifest_lean_serving: env_path("HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"),
             manifest_provider_forward_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH",
             ),
@@ -385,6 +388,7 @@ impl CopyPathConfig {
     fn has_file_paths(&self) -> bool {
         self.compact.is_some()
             || self.manifest_serving.is_some()
+            || self.manifest_lean_serving.is_some()
             || self.has_manifest_sidecar_paths()
             || self.manifest_price_atom.is_some()
             || self.manifest_provider_group_member.is_some()
@@ -412,6 +416,10 @@ impl CopyPathConfig {
             compact: self.compact.as_ref().map(|path| format!("{path}{suffix}")),
             manifest_serving: self
                 .manifest_serving
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            manifest_lean_serving: self
+                .manifest_lean_serving
                 .as_ref()
                 .map(|path| format!("{path}{suffix}")),
             manifest_provider_forward_sidecar: self.manifest_provider_forward_sidecar.clone(),
@@ -471,6 +479,7 @@ impl CopyPathConfig {
         Self {
             compact: None,
             manifest_serving: None,
+            manifest_lean_serving: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
             manifest_provider_npi_sidecar: None,
@@ -493,6 +502,20 @@ impl CopyPathConfig {
                 .as_ref()
                 .map(|path| format!("{path}{suffix}")),
             manifest_only: self.manifest_only,
+        }
+    }
+
+    fn manifest_serving_copy_path(&self) -> Option<&String> {
+        self.manifest_lean_serving
+            .as_ref()
+            .or(self.manifest_serving.as_ref())
+    }
+
+    fn manifest_serving_copy_layout(&self) -> ManifestServingCopyLayout {
+        if self.manifest_lean_serving.is_some() {
+            ManifestServingCopyLayout::Lean
+        } else {
+            ManifestServingCopyLayout::Full
         }
     }
 }
@@ -931,6 +954,21 @@ struct ManifestServingIdentityHex {
     procedure_global_id_128: String,
     provider_set_global_id_128: String,
     price_set_global_id_128: String,
+}
+
+#[derive(Clone, Copy)]
+enum ManifestServingCopyLayout {
+    Full,
+    Lean,
+}
+
+impl ManifestServingCopyLayout {
+    fn record_kind(self) -> &'static str {
+        match self {
+            ManifestServingCopyLayout::Full => "manifest_serving_copy_file",
+            ManifestServingCopyLayout::Lean => "manifest_lean_serving_copy_file",
+        }
+    }
 }
 
 fn manifest_serving_identity_hex(
@@ -1473,6 +1511,7 @@ fn emit_configured_manifest_sidecars<W: Write>(
 struct CompactCopySink {
     base_path: Option<String>,
     record_kind: String,
+    manifest_serving_layout: ManifestServingCopyLayout,
     writer: Option<BufWriter<File>>,
     chunk_index: u64,
     row_count: u64,
@@ -1485,6 +1524,7 @@ impl CompactCopySink {
             writer: Some(Self::open_writer(&base_path)?),
             base_path: Some(base_path),
             record_kind: "compact_copy_file".to_string(),
+            manifest_serving_layout: ManifestServingCopyLayout::Full,
             chunk_index: 0,
             row_count: 0,
             rotate_bytes,
@@ -1496,6 +1536,23 @@ impl CompactCopySink {
             writer: Some(Self::open_writer(&base_path)?),
             base_path: Some(base_path),
             record_kind: record_kind.to_string(),
+            manifest_serving_layout: ManifestServingCopyLayout::Full,
+            chunk_index: 0,
+            row_count: 0,
+            rotate_bytes,
+        })
+    }
+
+    fn new_manifest_serving_file(
+        base_path: String,
+        rotate_bytes: u64,
+        layout: ManifestServingCopyLayout,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            writer: Some(Self::open_writer(&base_path)?),
+            base_path: Some(base_path),
+            record_kind: layout.record_kind().to_string(),
+            manifest_serving_layout: layout,
             chunk_index: 0,
             row_count: 0,
             rotate_bytes,
@@ -1528,7 +1585,20 @@ impl CompactCopySink {
                 "manifest serving copy writer is closed",
             )
         })?;
-        emit_manifest_serving_copy_row(writer, row)?;
+        match self.manifest_serving_layout {
+            ManifestServingCopyLayout::Full => emit_manifest_serving_copy_row(writer, row)?,
+            ManifestServingCopyLayout::Lean => emit_manifest_lean_serving_copy_row(
+                writer,
+                &ManifestLeanServingCopyRow {
+                    plan_id: row.plan_id,
+                    reported_code_system: row.reported_code_system,
+                    reported_code: row.reported_code,
+                    provider_set_global_id_128: row.provider_set_global_id_128,
+                    provider_count: row.provider_count,
+                    price_set_global_id_128: row.price_set_global_id_128,
+                },
+            )?,
+        }
         self.row_count += 1;
         Ok(())
     }
@@ -4401,14 +4471,14 @@ fn compact_worker_loop(
         .as_ref()
         .map(|path| CompactCopySink::new_file(path.clone(), config.rotate_bytes))
         .transpose()?;
+    let manifest_serving_layout = worker_paths.manifest_serving_copy_layout();
     let mut manifest_serving_copy_writer = worker_paths
-        .manifest_serving
-        .as_ref()
+        .manifest_serving_copy_path()
         .map(|path| {
-            CompactCopySink::new_named_file(
+            CompactCopySink::new_manifest_serving_file(
                 path.clone(),
                 config.rotate_bytes,
-                "manifest_serving_copy_file",
+                manifest_serving_layout,
             )
         })
         .transpose()?;
@@ -5660,11 +5730,11 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         None => None,
     };
     let mut manifest_serving_copy_writer: Option<CompactCopySink> =
-        match copy_paths.manifest_serving.as_ref() {
-            Some(copy_path) => Some(CompactCopySink::new_named_file(
+        match copy_paths.manifest_serving_copy_path() {
+            Some(copy_path) => Some(CompactCopySink::new_manifest_serving_file(
                 copy_path.clone(),
                 compact_copy_rotate_bytes,
-                "manifest_serving_copy_file",
+                copy_paths.manifest_serving_copy_layout(),
             )?),
             None => None,
         };
@@ -6135,6 +6205,7 @@ mod tests {
         let paths = CopyPathConfig {
             compact: None,
             manifest_serving: None,
+            manifest_lean_serving: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
             manifest_provider_npi_sidecar: None,
@@ -6182,6 +6253,7 @@ mod tests {
                     .to_string_lossy()
                     .to_string(),
             ),
+            manifest_lean_serving: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
             manifest_provider_npi_sidecar: None,
@@ -6275,6 +6347,7 @@ mod tests {
         let paths = CopyPathConfig {
             compact: None,
             manifest_serving: None,
+            manifest_lean_serving: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
             manifest_provider_npi_sidecar: None,
@@ -6326,6 +6399,45 @@ mod tests {
     }
 
     #[test]
+    fn lean_manifest_serving_sink_emits_lean_copy_event_and_columns() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-lean-manifest-serving-{}.copy",
+            std::process::id()
+        ));
+        let mut sink = CompactCopySink::new_manifest_serving_file(
+            base.to_string_lossy().to_string(),
+            0,
+            ManifestServingCopyLayout::Lean,
+        )
+        .unwrap();
+
+        sink.write_manifest_serving_row(&ManifestServingCopyRow {
+            serving_content_hash_128: "unused_content_id",
+            plan_id: "plan-a",
+            reported_code_system: Some("CPT"),
+            reported_code: Some("29888"),
+            procedure_global_id_128: "unused_procedure_id",
+            provider_set_global_id_128: "provider-set-id",
+            provider_count: 3,
+            price_set_global_id_128: "price-set-id",
+            source_trace_set_hash: "unused_source_trace",
+            network_names: &["C2".to_string()],
+        })
+        .unwrap();
+
+        let event = sink.finish_silent().unwrap().unwrap();
+        let body = std::fs::read_to_string(&base).unwrap();
+
+        assert_eq!(event.record_kind, "manifest_lean_serving_copy_file");
+        assert_eq!(event.row_count, 1);
+        assert_eq!(
+            body,
+            "plan-a\tCPT\t29888\tprovider-set-id\t3\tprice-set-id\n"
+        );
+        let _ = std::fs::remove_file(base);
+    }
+
+    #[test]
     fn raw_worker_parsers_repair_invalid_utf8_values() {
         let mut raw_rate = br#"{"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100,"additional_information":"A"#.to_vec();
         raw_rate.push(0xff);
@@ -6340,6 +6452,7 @@ mod tests {
         let paths = CopyPathConfig {
             compact: None,
             manifest_serving: None,
+            manifest_lean_serving: None,
             manifest_provider_forward_sidecar: None,
             manifest_provider_inverted_sidecar: None,
             manifest_provider_npi_sidecar: None,
