@@ -8069,6 +8069,16 @@ components:
           type: string
         country_code:
           type: string
+        address_key:
+          type: string
+          format: uuid
+          nullable: true
+          description: Canonical address key for matching the normalized full address across sources.
+        address_site_key:
+          type: string
+          format: uuid
+          nullable: true
+          description: Canonical address-site key for matching rows at the same premise/building.
         telephone_number:
           type: string
         fax_number:

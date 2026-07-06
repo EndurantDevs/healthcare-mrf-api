@@ -166,6 +166,47 @@ def _set_near_address_column(row: list, key: str, value):
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
 
+def test_dedupe_addresses_keeps_distinct_address_sites():
+    addresses = [
+        {
+            "address_key": "00000000-0000-0000-0000-000000000001",
+            "premise_key": "00000000-0000-0000-0000-000000000002",
+            "first_line": "1 Main St",
+            "type": "primary",
+        },
+        {
+            "address_key": "00000000-0000-0000-0000-000000000001",
+            "premise_key": "00000000-0000-0000-0000-000000000003",
+            "first_line": "1 Main St",
+            "type": "primary",
+        },
+        {
+            "address_key": "00000000-0000-0000-0000-000000000001",
+            "premise_key": "00000000-0000-0000-0000-000000000002",
+            "first_line": "1 Main St",
+            "type": "secondary",
+            "telephone_number": "3125551212",
+        },
+    ]
+
+    deduped = npi_module._dedupe_addresses_by_key(addresses)
+
+    assert len(deduped) == 2
+    assert {
+        address.get("premise_key")
+        for address in deduped
+    } == {
+        "00000000-0000-0000-0000-000000000002",
+        "00000000-0000-0000-0000-000000000003",
+    }
+    merged = next(
+        address
+        for address in deduped
+        if address.get("premise_key") == "00000000-0000-0000-0000-000000000002"
+    )
+    assert merged["telephone_number"] == "3125551212"
+
+
 @pytest.mark.asyncio
 async def test_get_all_returns_rows(monkeypatch):
     result_row = _build_result_row(1234567890)
@@ -304,7 +345,7 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys()
+            return npi_module._public_address_serving_column_keys()
         return set()
 
     class RecordingConnection:

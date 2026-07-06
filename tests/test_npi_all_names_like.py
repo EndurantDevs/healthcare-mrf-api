@@ -317,7 +317,7 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "source_count",
@@ -384,7 +384,7 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "source_count",
@@ -462,7 +462,7 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "source_count",
@@ -558,7 +558,7 @@ async def test_get_all_unified_address_site_key_lookup_returns_provider_director
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "premise_key",
@@ -652,7 +652,7 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "source_count",
@@ -748,7 +748,7 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     async def fake_table_columns(table_name, *, session=None):
         assert session is None
         if table_name == "entity_address_unified":
-            return npi_module._public_address_column_keys() | {
+            return npi_module._public_address_serving_column_keys() | {
                 "address_precision",
                 "location_key",
                 "source_count",
@@ -1035,7 +1035,7 @@ async def _provider_directory_test_columns(table_name, *, session=None):
     assert session is None
     if table_name != "entity_address_unified":
         return set()
-    return npi_module._public_address_column_keys() | {
+    return npi_module._public_address_serving_column_keys() | {
         "address_precision",
         "location_key",
         "source_count",

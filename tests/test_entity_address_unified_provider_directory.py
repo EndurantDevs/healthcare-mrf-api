@@ -73,7 +73,9 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "organization.active IS DISTINCT FROM false" in sql
     assert "NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line" in sql
     assert "NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code" in sql
-    assert "NULL::uuid AS address_key" in sql
+    assert "pd.address_key AS address_key" in sql
+    assert "mrf.addr_key_v1(" in sql
+    assert "pd.first_line, pd.second_line, pd.city_name" in sql
 
 
 def test_provider_directory_source_selects_precompute_primary_npi_attributes():

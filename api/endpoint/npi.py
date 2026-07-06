@@ -804,6 +804,18 @@ def _add_canonical_contact_fields_to_address(address: dict[str, Any]) -> dict[st
     return address
 
 
+def _address_dedupe_key(address: Mapping[str, Any]) -> str:
+    raw_address_key = address.get("address_key")
+    address_key = str(raw_address_key).strip().lower() if raw_address_key not in (None, "") else ""
+    if not address_key:
+        return ""
+    raw_site_key = address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key")
+    site_key = str(raw_site_key).strip().lower() if raw_site_key not in (None, "") else ""
+    if site_key:
+        return f"{address_key}:{site_key}"
+    return address_key
+
+
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
     keyed: dict[str, dict[str, Any]] = {}
     unkeyed: list[dict[str, Any]] = []
@@ -811,8 +823,7 @@ def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
         (entry for entry in addresses if isinstance(entry, dict)),
         key=lambda entry: (_address_type_rank(entry), str(entry.get("first_line") or "")),
     ):
-        raw_key = address.get("address_key")
-        key = str(raw_key).strip().lower() if raw_key not in (None, "") else ""
+        key = _address_dedupe_key(address)
         if not key:
             unkeyed.append(address)
             continue
@@ -1608,6 +1619,10 @@ def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
 
 def _public_address_column_keys() -> set[str]:
     return _model_table_columns(NPIAddress) - PUBLIC_ADDRESS_EXCLUDED_COLUMNS
+
+
+def _public_address_serving_column_keys() -> set[str]:
+    return _public_address_column_keys() | {"premise_key"}
 
 
 async def _address_serving_model(required_columns: set[str] | None = None, *, session: Any = None):
@@ -3732,9 +3747,7 @@ async def get_all(request):
 
         return params
 
-    address_required_columns = _public_address_column_keys()
-    if address_site_key:
-        address_required_columns = set(address_required_columns) | {"premise_key"}
+    address_required_columns = _public_address_serving_column_keys()
     address_table_sql = await _address_serving_table_sql(
         address_required_columns,
         session=request_session,
@@ -5055,7 +5068,7 @@ async def get_near_npi(request):
                     in_long = float(r[1])
 
     address_table_sql = await _address_serving_table_sql(
-        _public_address_column_keys(),
+        _public_address_serving_column_keys(),
         session=request_session,
     )
 
@@ -5950,7 +5963,7 @@ async def _build_npi_details(
     procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
     medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
     address_model = await _address_serving_model(
-        _public_address_column_keys() - {"procedures_array", "medications_array"},
+        _public_address_serving_column_keys() - {"procedures_array", "medications_array"},
         session=session,
     )
     address_table = address_model.__table__
@@ -5960,6 +5973,9 @@ async def _build_npi_details(
 
     allowed_address_columns = set(_model_table_columns(NPIAddress))
     if address_model is EntityAddressUnified:
+        # Keep premise_key internally so public response redaction can expose it
+        # as address_site_key without leaking the internal column name.
+        allowed_address_columns.add("premise_key")
         # Surface per-address source + plan/network attribution by default so the
         # unified table fulfils its purpose: see where each address came from and
         # which plans/networks it belongs to. Heavier internals stay behind flags.
@@ -5975,7 +5991,7 @@ async def _build_npi_details(
 
     address_columns = []
     for column in address_table.columns:
-        if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+        if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key not in allowed_address_columns:
             continue
         if column.key not in allowed_address_columns:
             continue
