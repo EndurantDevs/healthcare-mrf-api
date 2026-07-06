@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "title": "PTG2 Serving Sidecar Local Comparison",
+  "description": "Local A/B suite comparing table-backed PTG2 serving storage against tableless forward and reverse serving sidecars using the same Heartland-shaped fixture.",
+  "scanner_binary": "support/ptg2_scanner/target/release/ptg2_scanner",
+  "gates": {
+    "min_improvement_pct": 0.0,
+    "max_memory_growth_pct": 50.0,
+    "min_storage_ratio": 15.0
+  },
+  "variants": [
+    {
+      "id": "table_serving_current",
+      "description": "Current lean serving table path with serving sidecars disabled.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "sidecar_scope_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v1",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED": "false",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "false"
+      }
+    },
+    {
+      "id": "tableless_serving_sidecar",
+      "description": "Proposed tableless serving path with forward and reverse sidecars.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "sidecar_scope_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v1",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "true"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "local-serving-sidecar-heartland-compare-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "billing_codes": 64,
+      "provider_sets": 4,
+      "price_reuse_mod": 256,
+      "source_key": "local-serving-sidecar-heartland-compare",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": false,
+      "analyze_serving_sidecar": false,
+      "max_bytes": 268435456,
+      "gates": {
+        "performance": false
+      },
+      "variants": [
+        "table_serving_current",
+        "tableless_serving_sidecar"
+      ]
+    }
+  ]
+}

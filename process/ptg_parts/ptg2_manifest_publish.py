@@ -22,11 +22,17 @@ from process.ptg_parts.config import (
     PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
     PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
     PTG2_UNLOGGED_STAGE_ENV, _env_bool, _ptg2_snapshot_arch_from_env)
+from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
-from process.ptg_parts.ptg2_manifest_artifacts import read_global_sidecar_entries
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    read_global_sidecar_entries,
+    write_serving_by_code_sidecar_async,
+    write_serving_by_provider_set_sidecar_async,
+)
 from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
-                                               _ptg2_snapshot_table_name)
+                                               _ptg2_snapshot_table_name,
+                                               _ptg2_snapshot_table_token)
 
 PTG2_MANIFEST_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"
 PTG2_MANIFEST_LEAN_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_LEAN_SERVING_COPY_PATH"
@@ -38,6 +44,8 @@ PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT = "lean_dict_v1"
 PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE"
 PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE"
 PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE"
+PTG2_MANIFEST_SERVING_SIDECARS_ENABLED_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED"
+PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS_ENV = "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS"
 logger = logging.getLogger(__name__)
 _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
 
@@ -454,6 +462,86 @@ def _ptg2_manifest_publish_sidecar_path(
         if candidate.exists():
             return candidate
     return path
+
+
+def _ptg2_manifest_serving_sidecars_enabled() -> bool:
+    return _env_bool(PTG2_MANIFEST_SERVING_SIDECARS_ENABLED_ENV, True)
+
+
+def _ptg2_manifest_drop_serving_table_after_sidecars() -> bool:
+    return _env_bool(PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS_ENV, True)
+
+
+def _ptg2_manifest_serving_sidecar_dir(
+    *,
+    artifacts: Mapping[str, Any] | None,
+    source_key: str,
+    snapshot_id: str,
+) -> Path:
+    payload = artifacts or {}
+    for value in payload.values():
+        if isinstance(value, Mapping):
+            raw_path = str(value.get("path") or "").strip()
+            if raw_path:
+                return Path(raw_path).parent
+    sidecars = payload.get("sidecars")
+    if isinstance(sidecars, list):
+        for value in sidecars:
+            if isinstance(value, Mapping):
+                raw_path = str(value.get("path") or "").strip()
+                if raw_path:
+                    return Path(raw_path).parent
+    return resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(source_key, snapshot_id)
+
+
+async def _iter_ptg2_serving_sidecar_rows(sql: str):
+    async with db.session() as session:
+        result = await session.stream(db.text(sql))
+        async for row in result:
+            yield row
+
+
+async def _write_ptg2_manifest_serving_sidecars(
+    *,
+    schema_name: str,
+    final_table: str,
+    artifacts: Mapping[str, Any] | None,
+    source_key: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    if not _ptg2_manifest_serving_sidecars_enabled():
+        return {}
+    artifact_dir = _ptg2_manifest_serving_sidecar_dir(
+        artifacts=artifacts,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    qualified_table = f"{_quote_ident(schema_name)}.{_quote_ident(final_table)}"
+    by_code_sql = f"""
+        SELECT code_key, provider_set_key, provider_count, price_set_global_id_128
+        FROM {qualified_table}
+        ORDER BY code_key, provider_set_key, price_set_global_id_128
+    """
+    by_provider_set_sql = f"""
+        SELECT provider_set_key, code_key, provider_count, price_set_global_id_128
+        FROM {qualified_table}
+        ORDER BY provider_set_key, code_key, price_set_global_id_128
+    """
+    by_code = await write_serving_by_code_sidecar_async(
+        artifact_dir / "serving_by_code_v1.ptg2sbc",
+        _iter_ptg2_serving_sidecar_rows(by_code_sql),
+        name="serving_by_code",
+    )
+    by_provider_set = await write_serving_by_provider_set_sidecar_async(
+        artifact_dir / "serving_by_provider_set_v1.ptg2sbp",
+        _iter_ptg2_serving_sidecar_rows(by_provider_set_sql),
+        name="serving_by_provider_set",
+    )
+    return {
+        "serving_by_code": by_code,
+        "serving_by_provider_set": by_provider_set,
+    }
 
 
 def _manifest_sql_id(value: bytes) -> str:
@@ -1823,9 +1911,31 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(
             f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_group_location_table)};"
         )
+    serving_sidecar_artifacts: dict[str, Any] = {}
+    if lean_serving_manifest is not None:
+        serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
+            schema_name=schema_name,
+            final_table=final_table,
+            artifacts=artifacts,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+        )
     row_count = await _exact_table_rows(schema_name, final_table)
+    serving_table_retained = True
+    if (
+        lean_serving_manifest is not None
+        and serving_sidecar_artifacts
+        and _ptg2_manifest_drop_serving_table_after_sidecars()
+    ):
+        await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+        serving_table_retained = False
     elapsed_seconds = time.monotonic() - started_at
-    artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
+    combined_sidecar_artifacts = dict(sidecar_artifacts or {})
+    combined_sidecar_artifacts.update(serving_sidecar_artifacts)
+    artifact_manifest = _ptg2_manifest_artifacts_manifest(
+        artifacts=artifacts,
+        sidecar_artifacts=combined_sidecar_artifacts,
+    )
     arch_version = _ptg2_manifest_snapshot_arch()
     materialized_table_map = {
         "serving": f"{schema_name}.{final_table}",
@@ -1863,6 +1973,8 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "source_key": source_key,
         "arch_version": arch_version,
         "provider_scope_strategy": provider_scope_strategy,
+        "serving_row_strategy": "table_and_sidecar" if serving_table_retained else "sidecar",
+        "serving_table_retained": serving_table_retained,
         "materialized_tables": materialized_table_map,
         "table": f"{schema_name}.{final_table}",
         "price_atom_table": f"{schema_name}.{price_atom_table}",

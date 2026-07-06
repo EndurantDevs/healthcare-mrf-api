@@ -255,6 +255,60 @@ def test_gate_evaluation_accepts_case_baseline_variant():
     assert result["cases"]["case-a"][0]["variant_id"] == "smaller_chunks"
 
 
+def test_gate_evaluation_accepts_storage_only_case():
+    report = {
+        "results": [
+            {
+                "case_id": "storage-case",
+                "variant_id": "serving_sidecar",
+                "status": "succeeded",
+                "import_run": {
+                    "verification": {"status": "passed"},
+                    "storage": {
+                        "status": "passed",
+                        "reduction_ratio_vs_pg_total": 19.96,
+                        "gzip_reduction_ratio_vs_pg_total": 684.46,
+                        "candidate": {"roundtrip": "passed"},
+                    },
+                },
+            }
+        ]
+    }
+
+    result = harness.evaluate_gates(report, {"min_storage_ratio": 15.0})
+
+    assert result["overall"] == "passed"
+    candidate = result["cases"]["storage-case"][0]
+    assert candidate["overall"] == "passed"
+    assert candidate["checks"]["storage"]["ratio"] == 19.96
+    assert candidate["checks"]["storage"]["required_ratio"] == 15.0
+
+
+def test_gate_evaluation_fails_storage_ratio_below_threshold():
+    report = {
+        "results": [
+            {
+                "case_id": "storage-case",
+                "variant_id": "serving_sidecar",
+                "status": "succeeded",
+                "import_run": {
+                    "verification": {"status": "passed"},
+                    "storage": {
+                        "status": "passed",
+                        "reduction_ratio_vs_pg_total": 3.4,
+                        "candidate": {"roundtrip": "passed"},
+                    },
+                },
+            }
+        ]
+    }
+
+    result = harness.evaluate_gates(report, {"min_storage_ratio": 15.0})
+
+    assert result["overall"] == "failed"
+    assert result["cases"]["storage-case"][0]["checks"]["storage"]["status"] == "failed"
+
+
 def test_dry_run_writes_report(tmp_path):
     suite = {
         "variants": [{"id": "baseline"}],
@@ -311,6 +365,7 @@ def test_original_file_summary_counts_unique_prices(tmp_path):
     assert summary["in_network_items"] == 1
     assert summary["negotiated_rates"] == 3
     assert summary["negotiated_prices"] == 3
+    assert summary["unique_serving_rates"] == 3
     assert summary["unique_price_atoms"] == 3
     assert summary["unique_provider_npis"] == 1
     assert len(summary["price_atom_digest"]) == 32
@@ -327,6 +382,99 @@ def test_large_fixture_can_add_bulky_rate_payload():
 
     price = payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0]
     assert len(price["additional_information"]) == 128
+
+
+def test_large_fixture_can_shape_codes_and_reused_prices(tmp_path):
+    payload = harness.build_fixture_payload(
+        {
+            "fixture": "large_in_network",
+            "negotiated_rates": 8,
+            "billing_codes": 4,
+            "provider_sets": 2,
+            "price_reuse_mod": 2,
+        }
+    )
+
+    assert len(payload["provider_references"]) == 2
+    assert len(payload["in_network"]) == 4
+    assert [len(item["negotiated_rates"]) for item in payload["in_network"]] == [2, 2, 2, 2]
+    rates = [
+        price["negotiated_rate"]
+        for item in payload["in_network"]
+        for rate in item["negotiated_rates"]
+        for price in rate["negotiated_prices"]
+    ]
+    assert rates == [100, 101, 100, 101, 100, 101, 100, 101]
+
+    harness.write_ptg_toc_fixture(
+            {
+                "id": "reuse",
+                "fixture": "large_in_network",
+                "negotiated_rates": 8,
+                "billing_codes": 4,
+                "provider_sets": 2,
+                "price_reuse_mod": 2,
+            },
+        tmp_path,
+        base_url="http://127.0.0.1:1",
+    )
+    summary = harness.expected_original_file_summary(tmp_path / "rates.json.gz")
+    assert summary["unique_price_atoms"] == 2
+    assert summary["unique_serving_rates"] == 8
+
+
+def test_serving_index_table_reads_materialized_table_names():
+    serving_index = {
+        "materialized_tables": {
+            "serving": "mrf.ptg2_serving_snap",
+            "price_atom": "mrf.ptg2_price_atom_snap",
+            "provider_group_member": "mrf.ptg2_provider_group_member_snap",
+        }
+    }
+
+    assert harness.serving_index_table(serving_index, "table", "serving_table") == "mrf.ptg2_serving_snap"
+    assert harness.serving_index_table(serving_index, "price_atom_table") == "mrf.ptg2_price_atom_snap"
+    assert harness.serving_index_table(serving_index, "provider_group_member_table") == "mrf.ptg2_provider_group_member_snap"
+
+
+def test_serving_by_code_candidate_roundtrips_and_compresses(tmp_path):
+    rows = [
+        (1, 10, 2, "00000000-0000-0000-0000-000000000001"),
+        (1, 12, 3, "00000000-0000-0000-0000-000000000002"),
+        (2, 7, 1, "00000000-0000-0000-0000-000000000001"),
+    ]
+
+    result = harness.write_serving_by_code_candidate(rows, tmp_path / "serving.ptg2sbc")
+
+    assert result["roundtrip"] == "passed"
+    assert result["row_count"] == 3
+    assert result["code_count"] == 2
+    assert result["price_set_count"] == 2
+    assert result["artifact_bytes"] > 0
+    assert result["gzip_bytes"] > 0
+    assert result["source_sha256"] == result["decoded_sha256"]
+
+
+def test_serving_by_provider_set_candidate_roundtrips_and_groups_patterns(tmp_path):
+    rows = [
+        (10, 1, 2, "00000000-0000-0000-0000-000000000001"),
+        (10, 1, 2, "00000000-0000-0000-0000-000000000002"),
+        (10, 2, 2, "00000000-0000-0000-0000-000000000001"),
+        (10, 2, 2, "00000000-0000-0000-0000-000000000002"),
+        (12, 1, 1, "00000000-0000-0000-0000-000000000001"),
+    ]
+
+    result = harness.write_serving_by_provider_set_candidate(rows, tmp_path / "serving.ptg2sbp")
+
+    assert result["roundtrip"] == "passed"
+    assert result["row_count"] == 5
+    assert result["provider_set_count"] == 2
+    assert result["code_count"] == 2
+    assert result["price_set_count"] == 2
+    assert result["pattern_count"] == 2
+    assert result["artifact_bytes"] > 0
+    assert result["gzip_bytes"] > 0
+    assert result["source_sha256"] == result["decoded_sha256"]
 
 
 def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
@@ -465,6 +613,13 @@ def test_markdown_report_includes_scanner_and_import_summary():
                         "expected": {"unique_price_atoms": 7, "unique_provider_npis": 1},
                         "db": {"price_atom_rows": 7, "provider_npis": 1},
                     },
+                    "storage": {
+                        "status": "passed",
+                        "storage": {"total_bytes": 4096},
+                        "candidate": {"artifact_bytes": 1024, "gzip_bytes": 512, "roundtrip": "passed"},
+                        "reduction_ratio_vs_pg_total": 4.0,
+                        "gzip_reduction_ratio_vs_pg_total": 8.0,
+                    },
                 },
             }
         ],
@@ -476,6 +631,7 @@ def test_markdown_report_includes_scanner_and_import_summary():
     assert "raw_chunks=3<br>max_raw_chunk_bytes=1024<br>max_raw_chunk_rates=8" in markdown
     assert "validated<br>files=1<br>rates=7" in markdown
     assert "passed<br>prices=7/7<br>npis=1/1" in markdown
+    assert "passed<br>pg=4.00 KiB<br>artifact=1.00 KiB<br>gzip=512 B<br>ratio=4.0x" in markdown
 
 
 def test_markdown_report_includes_generic_import_control_summary():

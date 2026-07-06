@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "title": "PTG2 Serving Sidecar Local Storage Probe",
+  "description": "Local self-harness suite for testing whether the narrow PTG2 serving table can be represented as exact compact forward and reverse sidecars.",
+  "scanner_binary": "support/ptg2_scanner/target/release/ptg2_scanner",
+  "gates": {
+    "min_improvement_pct": 0.0,
+    "max_memory_growth_pct": 50.0,
+    "min_storage_ratio": 15.0
+  },
+  "variants": [
+    {
+      "id": "sidecar_scope_default",
+      "description": "Current sidecar-scope PTG2 import with storage probe enabled.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "sidecar_scope_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v1",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "false"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "local-serving-sidecar-probe-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "source_key": "local-serving-sidecar-probe",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": true,
+      "serving_sidecar_max_rows": 1000000,
+      "max_bytes": 268435456,
+      "gates": {
+        "performance": false,
+        "min_storage_ratio": 3.0
+      },
+      "variants": ["sidecar_scope_default"]
+    },
+    {
+      "id": "local-serving-sidecar-heartland-shape-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "billing_codes": 64,
+      "provider_sets": 4,
+      "price_reuse_mod": 256,
+      "source_key": "local-serving-sidecar-heartland-shape",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": true,
+      "env": {
+        "HLTHPRT_PTG2_RESEARCH_REVERSE_SIDECAR": "1"
+      },
+      "serving_sidecar_max_rows": 1000000,
+      "max_bytes": 268435456,
+      "gates": {
+        "performance": false
+      },
+      "variants": ["sidecar_scope_default"]
+    }
+  ]
+}

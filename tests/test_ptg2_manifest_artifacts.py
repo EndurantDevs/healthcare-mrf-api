@@ -17,8 +17,13 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     read_global_membership_sidecar,
     read_global_sidecar_entries,
     read_global_local_id_mapping,
+    lookup_serving_by_code_sidecar,
+    lookup_serving_by_provider_set_patterns,
+    lookup_serving_by_provider_set_sidecar,
     lookup_global_sidecar_members,
     lookup_global_sidecar_members_many,
+    write_serving_by_code_sidecar,
+    write_serving_by_provider_set_sidecar,
     write_global_membership_sidecar,
     write_global_local_id_mapping,
 )
@@ -27,6 +32,9 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 GLOBAL_A = bytes.fromhex("0000000000000000000000000000000a")
 GLOBAL_B = bytes.fromhex("0000000000000000000000000000000b")
 GLOBAL_C = bytes.fromhex("0000000000000000000000000000000c")
+PRICE_A = "00000000000000000000000000000101"
+PRICE_B = "00000000000000000000000000000102"
+PRICE_C = "00000000000000000000000000000103"
 
 
 def test_manifest_artifact_provider_address_verification_marks_inferred_nppes_address():
@@ -70,6 +78,58 @@ def test_manifest_artifact_does_not_treat_bare_ptg_source_as_payer_confirmed():
     assert verification["address_evidence_level"] == "nppes_provider_address"
     assert verification["requires_location_confirmation"] is True
     assert verification["address_sources"] == ["nppes"]
+
+
+def test_serving_by_code_sidecar_lookup_filters_provider_sets(tmp_path):
+    sidecar = tmp_path / "serving_by_code.ptg2sbc"
+    metadata = write_serving_by_code_sidecar(
+        sidecar,
+        [
+            (7, 1, 10, PRICE_A),
+            (7, 3, 11, PRICE_B),
+            (8, 1, 12, PRICE_C),
+        ],
+    )
+
+    rows = lookup_serving_by_code_sidecar(sidecar, 7, metadata=metadata)
+    filtered = lookup_serving_by_code_sidecar(sidecar, 7, provider_set_keys=[3], metadata=metadata)
+
+    assert metadata["row_count"] == 3
+    assert [(row.code_key, row.provider_set_key, row.provider_count, row.price_set_global_id_128) for row in rows] == [
+        (7, 1, 10, PRICE_A),
+        (7, 3, 11, PRICE_B),
+    ]
+    assert [(row.provider_set_key, row.price_set_global_id_128) for row in filtered] == [(3, PRICE_B)]
+
+
+def test_serving_by_provider_set_sidecar_groups_repeated_code_vectors(tmp_path):
+    sidecar = tmp_path / "serving_by_provider_set.ptg2sbp"
+    metadata = write_serving_by_provider_set_sidecar(
+        sidecar,
+        [
+            (2, 7, 10, PRICE_A),
+            (2, 8, 10, PRICE_A),
+            (2, 9, 11, PRICE_B),
+            (3, 7, 12, PRICE_C),
+        ],
+    )
+
+    rows = lookup_serving_by_provider_set_sidecar(sidecar, 2, metadata=metadata)
+    filtered = lookup_serving_by_provider_set_sidecar(sidecar, 2, code_keys=[8], metadata=metadata)
+    patterns = lookup_serving_by_provider_set_patterns(sidecar, 2, metadata=metadata)
+
+    assert metadata["row_count"] == 4
+    assert metadata["pattern_count"] == 3
+    assert [(row.provider_set_key, row.code_key, row.provider_count, row.price_set_global_id_128) for row in rows] == [
+        (2, 7, 10, PRICE_A),
+        (2, 8, 10, PRICE_A),
+        (2, 9, 11, PRICE_B),
+    ]
+    assert [(row.code_key, row.price_set_global_id_128) for row in filtered] == [(8, PRICE_A)]
+    assert [(pattern.code_keys, pattern.entries) for pattern in patterns] == [
+        ((7, 8), ((10, PRICE_A),)),
+        ((9,), ((11, PRICE_B),)),
+    ]
 
 
 def test_manifest_artifact_marks_explicit_payer_location_as_payer_confirmed():

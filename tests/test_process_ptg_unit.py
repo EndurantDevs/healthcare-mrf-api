@@ -5142,6 +5142,7 @@ def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeyp
     )
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "false")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
@@ -5178,6 +5179,70 @@ def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeyp
     component_mock.assert_not_awaited()
 
 
+def test_ptg2_manifest_snapshot_publish_attaches_serving_sidecars_and_drops_table(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def is_fake_table_present(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    async def fake_write_sidecars(**kwargs):
+        assert kwargs["schema_name"] == "mrf"
+        assert kwargs["final_table"].startswith("ptg2_serving_")
+        return {
+            "serving_by_code": {
+                "name": "serving_by_code",
+                "kind": "ptg2_serving_by_code",
+                "path": "/tmp/serving_by_code_v1.ptg2sbc",
+                "sha256": "a" * 64,
+                "byte_count": 123,
+                "row_count": 321,
+            },
+            "serving_by_provider_set": {
+                "name": "serving_by_provider_set",
+                "kind": "ptg2_serving_by_provider_set",
+                "path": "/tmp/serving_by_provider_set_v1.ptg2sbp",
+                "sha256": "b" * 64,
+                "byte_count": 45,
+                "row_count": 321,
+            },
+        }
+
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "_write_ptg2_manifest_serving_sidecars", fake_write_sidecars)
+
+    publish_manifest = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    sidecar_names = [entry["name"] for entry in publish_manifest["artifacts"]["sidecars"]]
+    assert "serving_by_code" in sidecar_names
+    assert "serving_by_provider_set" in sidecar_names
+    assert publish_manifest["serving_row_strategy"] == "sidecar"
+    assert publish_manifest["serving_table_retained"] is False
+    assert any("DROP TABLE \"mrf\".\"ptg2_serving_" in statement for statement in status_calls)
+
+
 def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkeypatch):
     status_calls = []
 
@@ -5195,6 +5260,7 @@ def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkey
     )
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", db_all_mock)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
@@ -5256,6 +5322,7 @@ def test_ptg2_manifest_snapshot_publish_sidecar_arch_overrides_scope_table_env(m
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
@@ -5359,6 +5426,7 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
         ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "scalar", fake_scalar)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
@@ -5420,6 +5488,7 @@ def test_materialized_publish_builds_component_table(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "materialized_v1")
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE", "true")
     monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)

@@ -17,6 +17,10 @@ from api import ptg2_code_details
 from api import ptg2_code_context
 from api import ptg2_snapshot
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    write_serving_by_code_sidecar,
+    write_serving_by_provider_set_sidecar,
+)
 
 
 class FakeResult:
@@ -665,6 +669,79 @@ async def test_lean_serving_uses_source_level_code_count(monkeypatch):
     assert payload["items"][0]["procedure_code"] == "0001A"
     assert payload["items"][0]["procedure_name"] == "Immunization administration"
     assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+
+
+@pytest.mark.asyncio
+async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_path, monkeypatch):
+    provider_set_a = "0000000000000000000000000000000a"
+    provider_set_b = "0000000000000000000000000000000b"
+    price_a = "00000000000000000000000000000101"
+    price_b = "00000000000000000000000000000102"
+    sidecar = write_serving_by_code_sidecar(
+        tmp_path / "serving_by_code.ptg2sbc",
+        [
+            (7, 1, 3, price_a),
+            (7, 2, 9, price_b),
+        ],
+    )
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 2,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {"provider_set_key": 1, "provider_set_global_id_128": provider_set_a},
+                    {"provider_set_key": 2, "provider_set_global_id_128": provider_set_b},
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        source_key="ptg_heartland",
+        artifacts={"serving_by_code": sidecar},
+    )
+
+    async def price_rows(_session, _tables, price_hashes):
+        assert price_hashes == [price_b, price_a]
+        return {
+            price_a: [{"negotiated_type": "negotiated", "negotiated_rate": "100.00"}],
+            price_b: [{"negotiated_type": "negotiated", "negotiated_rate": "200.00"}],
+        }
+
+    async def procedure_rows(_session, row_data):
+        assert [row["provider_count"] for row in row_data] == [9, 3]
+        return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:heartland",
+        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload["pagination"]["total"] == 2
+    prices_by_provider_set = {
+        item["provider_set_hash"]: item["prices"][0]["negotiated_rate"]
+        for item in payload["items"]
+    }
+    assert prices_by_provider_set == {provider_set_a: 100.0, provider_set_b: 200.0}
 
 
 @pytest.mark.asyncio
@@ -2606,6 +2683,172 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
     assert payload["query"]["snapshot_id"] == "snap-token"
     assert payload["query"]["status"] == "no_match"
     assert payload["query"]["source"] == "ptg2_db"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(tmp_path, monkeypatch):
+    provider_set_id = "0000000000000000000000000000000a"
+    price_set_id = "00000000000000000000000000000101"
+    sidecar = write_serving_by_provider_set_sidecar(
+        tmp_path / "serving_by_provider_set.ptg2sbp",
+        [
+            (3, 7, 1, price_set_id),
+        ],
+    )
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 1,
+                    }
+                ]
+            ),
+            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        artifacts={"serving_by_provider_set": sidecar},
+    )
+
+    async def provider_sets_for_npi(_session, _tables, npi):
+        assert npi == 1234567890
+        return (provider_set_id,)
+
+    async def resolve_code_context(_session, *, code, code_system):
+        assert code == "70551"
+        assert code_system == "CPT"
+        return {}
+
+    async def source_traces(_session, _trace_sets):
+        return {}
+
+    async def price_rows(_session, _tables, price_hashes):
+        assert price_hashes == [price_set_id]
+        return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": "451.25"}]}
+
+    async def procedure_rows(_session, row_data):
+        assert row_data[0]["provider_set_global_id_128"] == provider_set_id
+        return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
+
+    async def provider_context(_session, *, npis, limit, plan_id=None, snapshot_id=None, source_key=None):
+        assert npis == [1234567890]
+        return [{"npi": 1234567890, "provider_name": "Lean Provider"}]
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_sets_for_npi", provider_sets_for_npi)
+    monkeypatch.setattr(ptg2_serving, "_resolve_ptg2_code_search_context", resolve_code_context)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_source_traces_for_trace_sets", source_traces)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_enriched_provider_rows_for_npis", provider_context)
+
+    payload = await ptg2_serving._search_ptg2_manifest_provider_procedures(
+        session,
+        1234567890,
+        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        FakePagination(),
+        snapshot_id="ptg2:202607:heartland",
+        serving_tables=tables,
+    )
+
+    assert payload["query"]["provider_reverse_index"] is True
+    assert payload["items"][0]["npi"] == 1234567890
+    assert payload["items"][0]["provider_set_hash"] == provider_set_id
+    assert payload["items"][0]["reported_code"] == "70551"
+    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 451.25
+
+
+@pytest.mark.asyncio
+async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
+    provider_set_id = "0000000000000000000000000000000a"
+    price_set_id = "00000000000000000000000000000101"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 1,
+                    }
+                ]
+            ),
+            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+            FakeResult(
+                rows=[
+                    {
+                        "code_order": 0,
+                        "code_key": 7,
+                        "provider_set_key": 3,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "provider_set_global_id_128": provider_set_id,
+                        "provider_count": 1,
+                        "price_set_global_id_128": price_set_id,
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_serving_manifest_snap",
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+    )
+
+    rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_lean_table(
+        session,
+        tables,
+        provider_set_ids=(provider_set_id,),
+        requested_plan="010854205",
+        code_value="70551",
+        code_system="CPT",
+        q_text="",
+        code_context={},
+        source_trace_set_hash="trace-set",
+        network_names=["network-a"],
+        limit=25,
+        offset=0,
+    )
+
+    assert rows == [
+        {
+            "serving_content_hash_128": ptg2_serving._ptg2_manifest_serving_content_hash(
+                7,
+                3,
+                price_set_id,
+            ),
+            "plan_id": "010854205",
+            "reported_code_system": "CPT",
+            "reported_code": "70551",
+            "procedure_global_id_128": None,
+            "provider_set_global_id_128": provider_set_id,
+            "provider_count": 1,
+            "price_set_global_id_128": price_set_id,
+            "source_trace_set_hash": "trace-set",
+            "network_names": ["network-a"],
+        }
+    ]
+    row_sql = str(session.calls[2][0][0])
+    row_params = session.calls[2][0][1]
+    assert "serving_content_hash_128" not in row_sql
+    assert "JOIN mrf.ptg2_code_count_manifest_snap code_count" in row_sql
+    assert "JOIN mrf.ptg2_provider_set_dict_manifest_snap provider_sets" in row_sql
+    assert row_params["code_keys"] == [7]
+    assert row_params["provider_set_keys"] == [3]
 
 
 @pytest.mark.asyncio

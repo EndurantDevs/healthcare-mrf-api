@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import gc
+import hashlib
 import os
 import re
 import time
@@ -109,7 +110,13 @@ from api.ptg2_tables import (
 from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
 from api.ptg2_manifest_artifacts import search_ptg2_manifest_serving_snapshot
 from process.ext.contact_canon import canonicalize_one
-from process.ptg_parts.ptg2_manifest_artifacts import lookup_global_sidecar_members, lookup_global_sidecar_members_many
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    lookup_global_sidecar_members,
+    lookup_global_sidecar_members_many,
+    lookup_serving_by_code_sidecar,
+    lookup_serving_by_provider_set_patterns,
+    lookup_serving_by_provider_set_sidecar,
+)
 from api.ptg2_serving_utils import (
     _normalize_zip5,
     _price_filter_clauses,
@@ -2008,6 +2015,10 @@ def _ptg2_manifest_artifact_entry(serving_tables: PTG2ServingTables, name: str) 
     return entries[0] if entries else None
 
 
+def _ptg2_manifest_sidecar_metadata(entry: dict[str, Any], sidecar_path: Path, raw_path: str) -> dict[str, Any] | None:
+    return entry if sidecar_path == Path(raw_path) else None
+
+
 def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
     path = Path(raw_path)
     if path.exists():
@@ -2046,6 +2057,523 @@ def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
                 if len(prefix_matches) == 1:
                     return prefix_matches[0]
     return path
+
+
+def _ptg2_manifest_serving_content_hash(
+    code_key: Any,
+    provider_set_key: Any,
+    price_set_global_id: Any,
+) -> str:
+    price_set_id = _ptg2_manifest_id(price_set_global_id)
+    return hashlib.md5(f"{int(code_key)}:{int(provider_set_key)}:{price_set_id}".encode("utf-8")).hexdigest()
+
+
+async def _ptg2_manifest_provider_set_ids_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int],
+) -> dict[int, str]:
+    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
+    keys = sorted({int(value) for value in provider_set_keys if value is not None})
+    if not provider_set_dictionary_table or not keys:
+        return {}
+    result = await session.execute(
+        text(
+            f"""
+            SELECT provider_set_key, provider_set_global_id_128
+            FROM {provider_set_dictionary_table}
+            WHERE provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
+            """
+        ),
+        {"provider_set_keys": keys},
+    )
+    return {
+        int(data.get("provider_set_key")): _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+        for data in (_row_mapping(row) for row in result)
+        if data.get("provider_set_key") is not None and _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+    }
+
+
+async def _ptg2_manifest_provider_set_keys_for_ids(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: Iterable[str],
+) -> dict[str, int]:
+    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
+    normalized_ids = list(_ptg2_manifest_ids(tuple(provider_set_ids)))
+    if not provider_set_dictionary_table or not normalized_ids:
+        return {}
+    result = await session.execute(
+        text(
+            f"""
+            SELECT provider_set_key, provider_set_global_id_128
+            FROM {provider_set_dictionary_table}
+            WHERE provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))
+            """
+        ),
+        {"provider_set_ids": normalized_ids},
+    )
+    return {
+        _ptg2_manifest_id(data.get("provider_set_global_id_128")): int(data.get("provider_set_key"))
+        for data in (_row_mapping(row) for row in result)
+        if data.get("provider_set_key") is not None and _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+    }
+
+
+def _ptg2_manifest_lookup_serving_by_code_sidecar(
+    serving_tables: PTG2ServingTables,
+    code_key: int,
+    *,
+    provider_set_keys: Iterable[int] | None = None,
+):
+    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    if not entry:
+        return ()
+    raw_path = str(entry.get("path") or "").strip()
+    if not raw_path:
+        return ()
+    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
+    return lookup_serving_by_code_sidecar(
+        sidecar_path,
+        int(code_key),
+        provider_set_keys=provider_set_keys,
+        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
+    )
+
+
+def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+    serving_tables: PTG2ServingTables,
+    provider_set_key: int,
+    *,
+    code_keys: Iterable[int] | None = None,
+):
+    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+    if not entry:
+        return ()
+    raw_path = str(entry.get("path") or "").strip()
+    if not raw_path:
+        return ()
+    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
+    return lookup_serving_by_provider_set_sidecar(
+        sidecar_path,
+        int(provider_set_key),
+        code_keys=code_keys,
+        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
+    )
+
+
+def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+    serving_tables: PTG2ServingTables,
+    provider_set_key: int,
+    *,
+    code_keys: Iterable[int] | None = None,
+):
+    entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+    if not entry:
+        return ()
+    raw_path = str(entry.get("path") or "").strip()
+    if not raw_path:
+        return ()
+    sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
+    return lookup_serving_by_provider_set_patterns(
+        sidecar_path,
+        int(provider_set_key),
+        code_keys=code_keys,
+        metadata=_ptg2_manifest_sidecar_metadata(entry, sidecar_path, raw_path),
+    )
+
+
+async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_data: Mapping[str, Any],
+    provider_set_keys: Iterable[int] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+) -> list[dict[str, Any]] | None:
+    code_key = code_data.get("code_key")
+    if code_key is None:
+        return None
+    sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+        serving_tables,
+        int(code_key),
+        provider_set_keys=provider_set_keys,
+    )
+    if not sidecar_rows:
+        return []
+    provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        [row.provider_set_key for row in sidecar_rows],
+    )
+    rows: list[dict[str, Any]] = []
+    for row in sidecar_rows:
+        provider_set_id = provider_set_ids_by_key.get(row.provider_set_key)
+        if not provider_set_id:
+            continue
+        rows.append(
+            {
+                "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                    row.code_key,
+                    row.provider_set_key,
+                    row.price_set_global_id_128,
+                ),
+                "plan_id": code_data.get("plan_id"),
+                "reported_code_system": code_data.get("reported_code_system"),
+                "reported_code": code_data.get("reported_code"),
+                "procedure_global_id_128": None,
+                "provider_set_global_id_128": provider_set_id,
+                "provider_count": row.provider_count,
+                "price_set_global_id_128": row.price_set_global_id_128,
+                "source_trace_set_hash": source_trace_set_hash,
+                "network_names": network_names,
+            }
+        )
+    rows.sort(
+        key=lambda data: (
+            -(int(data.get("provider_count") or 0)),
+            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+            _ptg2_manifest_id(data.get("price_set_global_id_128")),
+        )
+    )
+    return rows
+
+
+async def _ptg2_manifest_code_rows_for_provider_reverse(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    requested_plan: str,
+    code_value: str,
+    code_system: Any,
+    q_text: str,
+    code_context: dict[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    code_count_table = _safe_table_name(serving_tables.code_count_table)
+    if not code_count_table:
+        return None
+    params: dict[str, Any] = {}
+    filters: list[str] = []
+    if requested_plan:
+        plan_filter, plan_order = _code_plan_scope_sql(requested_plan, column="plan_id")
+        filters.append(plan_filter)
+        params["plan_id"] = requested_plan
+    else:
+        plan_order = "plan_id NULLS FIRST"
+    _append_manifest_reported_code_filter(
+        filters,
+        params,
+        code=code_value,
+        code_system=code_system,
+        code_context=code_context,
+    )
+    if q_text:
+        filters.append(
+            """
+            (
+                LOWER(COALESCE(reported_code, '')) LIKE :q_like
+             OR LOWER(COALESCE(reported_code_system, '')) LIKE :q_like
+            )
+            """
+        )
+        params["q_like"] = f"%{q_text}%"
+    where_sql = "WHERE " + " AND ".join(filters) if filters else ""
+    result = await session.execute(
+        text(
+            f"""
+            SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
+            FROM {code_count_table}
+            {where_sql}
+            ORDER BY {plan_order}, reported_code_system, reported_code, code_key
+            """
+        ),
+        params,
+    )
+    return [_row_mapping(row) for row in result]
+
+
+async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    provider_set_ids: Iterable[str],
+    requested_plan: str,
+    code_value: str,
+    code_system: Any,
+    q_text: str,
+    code_context: dict[str, Any] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int | None = None,
+    offset: int = 0,
+    apply_window: bool = False,
+) -> list[dict[str, Any]] | None:
+    if not _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set"):
+        return None
+    code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        serving_tables,
+        requested_plan=requested_plan,
+        code_value=code_value,
+        code_system=code_system,
+        q_text=q_text,
+        code_context=code_context,
+    )
+    if code_rows is None:
+        return None
+    if not code_rows:
+        return []
+    code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
+    provider_set_keys_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        provider_set_ids,
+    )
+    if not provider_set_keys_by_id:
+        return []
+    provider_set_ids_by_key = {value: key for key, value in provider_set_keys_by_id.items()}
+
+    def _sidecar_row_payload(
+        *,
+        code_key: int,
+        provider_set_id: str | None,
+        provider_set_key: int,
+        provider_count: int,
+        price_set_global_id_128: str,
+    ) -> dict[str, Any]:
+        code_data = code_by_key.get(int(code_key))
+        if not code_data:
+            return {}
+        return {
+            "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                int(code_key),
+                int(provider_set_key),
+                price_set_global_id_128,
+            ),
+            "plan_id": code_data.get("plan_id"),
+            "reported_code_system": code_data.get("reported_code_system"),
+            "reported_code": code_data.get("reported_code"),
+            "procedure_global_id_128": None,
+            "provider_set_global_id_128": provider_set_id or provider_set_ids_by_key.get(int(provider_set_key)),
+            "provider_count": provider_count,
+            "price_set_global_id_128": price_set_global_id_128,
+            "source_trace_set_hash": source_trace_set_hash,
+            "network_names": network_names,
+            "_code_key": int(code_key),
+        }
+
+    if apply_window:
+        page_limit = max(int(limit or 0), 0)
+        if page_limit <= 0:
+            return []
+        page_offset = max(int(offset or 0), 0)
+        entries_by_provider_code: list[tuple[str, int, dict[int, list[tuple[int, str]]]]] = []
+        for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
+            patterns = _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+                serving_tables,
+                provider_set_key,
+                code_keys=code_by_key.keys(),
+            )
+            entries_by_code: dict[int, list[tuple[int, str]]] = {}
+            for pattern in patterns:
+                for code_key in pattern.code_keys:
+                    if int(code_key) in code_by_key:
+                        entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
+            if entries_by_code:
+                entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
+
+        rows: list[dict[str, Any]] = []
+        skipped = 0
+        for code_key in code_by_key:
+            code_candidates: list[dict[str, Any]] = []
+            for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code:
+                for provider_count, price_set_id in entries_by_code.get(int(code_key), ()):
+                    payload = _sidecar_row_payload(
+                        code_key=int(code_key),
+                        provider_set_id=provider_set_id,
+                        provider_set_key=int(provider_set_key),
+                        provider_count=int(provider_count),
+                        price_set_global_id_128=price_set_id,
+                    )
+                    if payload:
+                        code_candidates.append(payload)
+            code_candidates.sort(
+                key=lambda data: (
+                    -(int(data.get("provider_count") or 0)),
+                    _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+                    _ptg2_manifest_id(data.get("price_set_global_id_128")),
+                )
+            )
+            candidate_count = len(code_candidates)
+            if skipped + candidate_count <= page_offset:
+                skipped += candidate_count
+                continue
+            local_start = max(page_offset - skipped, 0)
+            local_end = local_start + (page_limit - len(rows))
+            rows.extend(code_candidates[local_start:local_end])
+            skipped += candidate_count
+            if len(rows) >= page_limit:
+                break
+        for data in rows:
+            data.pop("_code_key", None)
+        return rows
+
+    rows: list[dict[str, Any]] = []
+    for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
+        sidecar_rows = _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+            serving_tables,
+            provider_set_key,
+            code_keys=code_by_key.keys(),
+        )
+        for row in sidecar_rows:
+            payload = _sidecar_row_payload(
+                code_key=row.code_key,
+                provider_set_id=provider_set_id,
+                provider_set_key=row.provider_set_key,
+                provider_count=row.provider_count,
+                price_set_global_id_128=row.price_set_global_id_128,
+            )
+            if payload:
+                rows.append(payload)
+    code_order = {code_key: index for index, code_key in enumerate(code_by_key)}
+    rows.sort(
+        key=lambda data: (
+            code_order.get(int(data.get("_code_key") or 0), 0),
+            str(data.get("reported_code_system") or ""),
+            str(data.get("reported_code") or ""),
+            -(int(data.get("provider_count") or 0)),
+            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+            _ptg2_manifest_id(data.get("price_set_global_id_128")),
+        )
+    )
+    for data in rows:
+        data.pop("_code_key", None)
+    return rows
+
+
+async def _ptg2_manifest_provider_procedure_rows_from_lean_table(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    provider_set_ids: Iterable[str],
+    requested_plan: str,
+    code_value: str,
+    code_system: Any,
+    q_text: str,
+    code_context: dict[str, Any] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    table_name = _safe_table_name(serving_tables.serving_table)
+    if not table_name:
+        return None
+    code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        serving_tables,
+        requested_plan=requested_plan,
+        code_value=code_value,
+        code_system=code_system,
+        q_text=q_text,
+        code_context=code_context,
+    )
+    if code_rows is None:
+        return None
+    if not code_rows:
+        return []
+    provider_set_keys_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        provider_set_ids,
+    )
+    if not provider_set_keys_by_id:
+        return []
+    code_keys: list[int] = []
+    code_orders: list[int] = []
+    for index, row in enumerate(code_rows):
+        if row.get("code_key") is None:
+            continue
+        code_keys.append(int(row["code_key"]))
+        code_orders.append(index)
+    if not code_keys:
+        return []
+    provider_set_keys = [int(value) for value in provider_set_keys_by_id.values()]
+    if not provider_set_keys:
+        return []
+    code_count_table = _safe_table_name(serving_tables.code_count_table)
+    provider_set_dictionary_table = _safe_table_name(serving_tables.provider_set_dictionary_table)
+    if not code_count_table or not provider_set_dictionary_table:
+        return None
+    row_result = await session.execute(
+        text(
+            f"""
+            WITH requested_codes AS MATERIALIZED (
+                SELECT *
+                FROM unnest(CAST(:code_keys AS integer[]), CAST(:code_orders AS integer[]))
+                     AS requested(code_key, code_order)
+            )
+            SELECT
+                requested_codes.code_order,
+                serving.code_key,
+                serving.provider_set_key,
+                code_count.plan_id,
+                code_count.reported_code_system,
+                code_count.reported_code,
+                provider_sets.provider_set_global_id_128,
+                serving.provider_count,
+                serving.price_set_global_id_128
+            FROM {table_name} serving
+            JOIN requested_codes
+              ON requested_codes.code_key = serving.code_key
+            JOIN {code_count_table} code_count
+              ON code_count.code_key = serving.code_key
+            JOIN {provider_set_dictionary_table} provider_sets
+              ON provider_sets.provider_set_key = serving.provider_set_key
+            WHERE serving.provider_set_key = ANY(CAST(:provider_set_keys AS integer[]))
+            ORDER BY requested_codes.code_order,
+                     code_count.reported_code_system,
+                     code_count.reported_code,
+                     serving.provider_count DESC NULLS LAST,
+                     provider_sets.provider_set_global_id_128,
+                     serving.price_set_global_id_128
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {
+            "code_keys": code_keys,
+            "code_orders": code_orders,
+            "provider_set_keys": provider_set_keys,
+            "limit": max(int(limit), 0),
+            "offset": max(int(offset), 0),
+        },
+    )
+    rows: list[dict[str, Any]] = []
+    for row in row_result:
+        data = _row_mapping(row)
+        code_key = int(data.get("code_key") or 0)
+        provider_set_key = int(data.get("provider_set_key") or 0)
+        price_set_id = _ptg2_manifest_id(data.get("price_set_global_id_128"))
+        rows.append(
+            {
+                "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                    code_key,
+                    provider_set_key,
+                    price_set_id,
+                ),
+                "plan_id": data.get("plan_id"),
+                "reported_code_system": data.get("reported_code_system"),
+                "reported_code": data.get("reported_code"),
+                "procedure_global_id_128": None,
+                "provider_set_global_id_128": _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+                "provider_count": data.get("provider_count"),
+                "price_set_global_id_128": price_set_id,
+                "source_trace_set_hash": source_trace_set_hash,
+                "network_names": network_names,
+            }
+        )
+    return rows
 
 
 def _ptg2_manifest_sidecar_members(
@@ -2204,8 +2732,7 @@ async def _manifest_rate_provider_groups_from_sidecar(
 ) -> tuple[str, ...]:
     table_name = _safe_table_name(serving_table)
     if (
-        not table_name
-        or not plan_id
+        not plan_id
         or not reported_code
         or not _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
     ):
@@ -2225,6 +2752,44 @@ async def _manifest_rate_provider_groups_from_sidecar(
         if code_system:
             rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
+        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
+            code_result = await session.execute(
+                text(
+                    f"""
+                    SELECT code_count.code_key
+                    FROM {code_count_table} code_count
+                    WHERE {" AND ".join(rate_scope_filters)}
+                    ORDER BY {plan_order}, code_count.code_key
+                    LIMIT 1
+                    """
+                ),
+                query_params_by_name,
+            )
+            code_key = None
+            for code_row in code_result:
+                code_key = _row_mapping(code_row).get("code_key")
+                break
+            if code_key is not None:
+                sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+                    serving_tables,
+                    int(code_key),
+                )
+                provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+                    session,
+                    serving_tables,
+                    [row.provider_set_key for row in sidecar_rows],
+                )
+                provider_set_ids = tuple(sorted(provider_set_ids_by_key.values()))
+                if not provider_set_ids:
+                    return ()
+                groups_by_set = _ptg2_manifest_sidecar_members_many(
+                    serving_tables,
+                    "provider_forward",
+                    provider_set_ids,
+                )
+                return tuple(sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids}))
+        if not table_name:
+            return ()
         provider_set_sql = f"""
                 SELECT provider_set_dictionary.provider_set_global_id_128
                 FROM {table_name} serving
@@ -2237,6 +2802,8 @@ async def _manifest_rate_provider_groups_from_sidecar(
                 ORDER BY MIN({plan_order}), provider_set_dictionary.provider_set_global_id_128
                 """
     else:
+        if not table_name:
+            return ()
         plan_filter, plan_order = _code_plan_scope_sql(plan_id)
         rate_scope_filters = [plan_filter, "reported_code = :reported_code"]
         if code_system:
@@ -2593,13 +3160,37 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     # Same street-fill as the location search: when the unified row has no
     # first_line (or no row at all), fall back to the NPPES npi_address row.
     if using_unified_enrich:
+        fallback_column_result = await session.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = :schema_name
+                  AND table_name = 'npi_address'
+                """
+            ),
+            {"schema_name": PTG2_SCHEMA},
+        )
+        fallback_columns = {
+            str(data.get("column_name"))
+            for data in (_row_mapping(row) for row in fallback_column_result)
+            if data.get("column_name")
+        }
+
+        def _fallback_column(column: str, sql_type: str = "varchar") -> str:
+            return f"na.{column}" if column in fallback_columns else f"NULL::{sql_type} AS {column}"
+
         enrich_address_fallback_cte = f"""
             , fallback_addresses AS MATERIALIZED (
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code, na.telephone_number, na.fax_number,
-                       na.phone_number, na.phone_extension,
-                       na.fax_number_digits, na.fax_extension,
+                       na.postal_code, na.country_code,
+                       {_fallback_column('telephone_number')},
+                       {_fallback_column('fax_number')},
+                       {_fallback_column('phone_number')},
+                       {_fallback_column('phone_extension')},
+                       {_fallback_column('fax_number_digits')},
+                       {_fallback_column('fax_extension')},
                        na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN source_npis source_filter ON source_filter.npi = na.npi
@@ -3535,6 +4126,7 @@ async def _ptg2_manifest_location_provider_matches(
     provider_group_location_table = _safe_table_name(serving_tables.provider_group_location_table)
     provider_group_rate_scope_table = _manifest_provider_group_rate_scope_table(serving_tables)
     active_provider_group_rate_scope_table = ""
+    has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
     rate_provider_group_ids: tuple[str, ...] = ()
     has_component_rate_scope = False
     has_checked_rate_provider_group_sidecar = False
@@ -3604,7 +4196,7 @@ async def _ptg2_manifest_location_provider_matches(
             final_member_scope_join = """
             JOIN rate_provider_groups rpg
               ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
-    if not has_component_rate_scope and serving_table and requested_plan_id and requested_code:
+    if not has_component_rate_scope and (serving_table or has_serving_by_code_sidecar) and requested_plan_id and requested_code:
         rate_provider_group_ids = await _manifest_rate_provider_groups_from_sidecar(
             session,
             serving_tables,
@@ -3627,7 +4219,7 @@ async def _ptg2_manifest_location_provider_matches(
         and not rate_provider_group_ids
         and not has_checked_rate_provider_group_sidecar
         and not has_component_rate_scope
-        and serving_table
+        and (serving_table or has_serving_by_code_sidecar)
         and requested_plan_id
         and requested_code
     ):
@@ -3742,14 +4334,48 @@ async def _ptg2_manifest_location_provider_matches(
     # internally consistent instead of mixing one source's street with another's
     # city. Only applies when the unified table is the primary source.
     if using_unified_address_table:
+        if hasattr(session, "sync_session"):
+            fallback_column_result = await session.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema_name
+                      AND table_name = 'npi_address'
+                    """
+                ),
+                {"schema_name": PTG2_SCHEMA},
+            )
+            fallback_columns = {
+                str(data.get("column_name"))
+                for data in (_row_mapping(row) for row in fallback_column_result)
+                if data.get("column_name")
+            }
+        else:
+            fallback_columns = {
+                "telephone_number",
+                "fax_number",
+                "phone_number",
+                "phone_extension",
+                "fax_number_digits",
+                "fax_extension",
+            }
+
+        def _fallback_column(column: str, sql_type: str = "varchar") -> str:
+            return f"na.{column}" if column in fallback_columns else f"NULL::{sql_type} AS {column}"
+
         premise_key_select_sql = "addr.premise_key,"
         address_fallback_cte = f"""
             , fallback_addresses AS MATERIALIZED (
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code, na.telephone_number, na.fax_number,
-                       na.phone_number, na.phone_extension,
-                       na.fax_number_digits, na.fax_extension,
+                       na.postal_code, na.country_code,
+                       {_fallback_column('telephone_number')},
+                       {_fallback_column('fax_number')},
+                       {_fallback_column('phone_number')},
+                       {_fallback_column('phone_extension')},
+                       {_fallback_column('fax_number_digits')},
+                       {_fallback_column('fax_extension')},
                        na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN location_npis loc ON loc.npi = na.npi
@@ -4415,7 +5041,9 @@ async def _search_ptg2_manifest_db_serving_table(
     this path intentionally bounded until those readers are wired into the API.
     """
     table_name = _safe_table_name(serving_tables.serving_table)
-    if not table_name or not await _serving_table_available(session, table_name):
+    has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
+    table_available = bool(table_name and await _serving_table_available(session, table_name))
+    if not table_available and not has_serving_by_code_sidecar:
         return None
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
@@ -4628,49 +5256,68 @@ async def _search_ptg2_manifest_db_serving_table(
         if serving_tables.uses_uuid_ids:
             serving_hash_sql = f"{serving_hash_sql}::uuid"
         manifest_id_sql_type = "uuid" if serving_tables.uses_uuid_ids else "char(32)"
-        row_result = await session.execute(
-            text(
-                f"""
-                WITH serving_page AS MATERIALIZED (
+        sidecar_row_data = None
+        if has_serving_by_code_sidecar:
+            sidecar_rows = await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+                session,
+                serving_tables,
+                code_data=code_data,
+                provider_set_keys=params.get("provider_set_keys") if location_filter_requested else None,
+                source_trace_set_hash=source_trace_set_hash,
+                network_names=network_names,
+            )
+            if sidecar_rows is not None:
+                start = 0 if expand_providers else int(params.get("rate_candidate_offset") or 0)
+                end = start + int(params.get("rate_candidate_limit") or pagination.limit)
+                sidecar_row_data = sidecar_rows[start:end]
+        if sidecar_row_data is not None:
+            row_data = sidecar_row_data
+        else:
+            if not table_available or not table_name:
+                return None
+            row_result = await session.execute(
+                text(
+                    f"""
+                    WITH serving_page AS MATERIALIZED (
+                        SELECT
+                            serving.code_key,
+                            serving.provider_set_key,
+                            serving.provider_count,
+                            serving.price_set_global_id_128
+                        FROM {table_name} serving
+                        WHERE {" AND ".join(lean_filters)}
+                        ORDER BY serving.provider_count DESC NULLS LAST
+                        LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
+                    )
                     SELECT
-                        serving.code_key,
-                        serving.provider_set_key,
-                        serving.provider_count,
-                        serving.price_set_global_id_128
-                    FROM {table_name} serving
-                    WHERE {" AND ".join(lean_filters)}
-                    ORDER BY serving.provider_count DESC NULLS LAST
-                    LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
-                )
-                SELECT
-                    {serving_hash_sql} AS serving_content_hash_128,
-                    :lean_plan_id AS plan_id,
-                    :lean_reported_code_system AS reported_code_system,
-                    :lean_reported_code AS reported_code,
-                    NULL::{manifest_id_sql_type} AS procedure_global_id_128,
-                    (
-                        SELECT provider_sets.provider_set_global_id_128
-                        FROM {provider_set_dictionary_table} provider_sets
-                        WHERE provider_sets.provider_set_key = serving_page.provider_set_key
-                    ) AS provider_set_global_id_128,
-                    serving_page.provider_count,
-                    serving_page.price_set_global_id_128,
-                    :lean_source_trace_set_hash AS source_trace_set_hash,
-                    CAST(:lean_network_names AS varchar[]) AS network_names
-                FROM serving_page
-                ORDER BY serving_page.provider_count DESC NULLS LAST
-                """
-            ),
-            {
-                **params,
-                "lean_plan_id": code_data.get("plan_id"),
-                "lean_reported_code_system": code_data.get("reported_code_system"),
-                "lean_reported_code": code_data.get("reported_code"),
-                "lean_source_trace_set_hash": source_trace_set_hash,
-                "lean_network_names": network_names,
-            },
-        )
-        row_data = [_row_mapping(row) for row in row_result]
+                        {serving_hash_sql} AS serving_content_hash_128,
+                        :lean_plan_id AS plan_id,
+                        :lean_reported_code_system AS reported_code_system,
+                        :lean_reported_code AS reported_code,
+                        NULL::{manifest_id_sql_type} AS procedure_global_id_128,
+                        (
+                            SELECT provider_sets.provider_set_global_id_128
+                            FROM {provider_set_dictionary_table} provider_sets
+                            WHERE provider_sets.provider_set_key = serving_page.provider_set_key
+                        ) AS provider_set_global_id_128,
+                        serving_page.provider_count,
+                        serving_page.price_set_global_id_128,
+                        :lean_source_trace_set_hash AS source_trace_set_hash,
+                        CAST(:lean_network_names AS varchar[]) AS network_names
+                    FROM serving_page
+                    ORDER BY serving_page.provider_count DESC NULLS LAST
+                    """
+                ),
+                {
+                    **params,
+                    "lean_plan_id": code_data.get("plan_id"),
+                    "lean_reported_code_system": code_data.get("reported_code_system"),
+                    "lean_reported_code": code_data.get("reported_code"),
+                    "lean_source_trace_set_hash": source_trace_set_hash,
+                    "lean_network_names": network_names,
+                },
+            )
+            row_data = [_row_mapping(row) for row in row_result]
     elif code_count_table and requested_system and not location_filter_requested:
         count_result = await session.execute(
             text(
@@ -5857,7 +6504,9 @@ async def _search_ptg2_manifest_provider_procedures(
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any] | None:
     table_name = _safe_table_name(serving_tables.serving_table)
-    if not table_name or not await _serving_table_available(session, table_name):
+    has_reverse_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set"))
+    table_available = bool(table_name and await _serving_table_available(session, table_name))
+    if not table_available and not has_reverse_sidecar:
         return None
     provider_set_ids = await _ptg2_manifest_provider_sets_for_npi(session, serving_tables, npi)
     if provider_set_ids is None:
@@ -5942,32 +6591,73 @@ async def _search_ptg2_manifest_provider_procedures(
         limit_sql = "LIMIT :limit"
         offset_sql = "OFFSET :offset"
     where_sql = " AND ".join(filters)
-    network_names_select_sql = (
-        "network_names"
-        if await _ptg2_table_has_columns(session, table_name, {"network_names"})
-        else "NULL::varchar[] AS network_names"
-    )
-    row_stmt = text(
-        f"""
-            SELECT
-                serving_content_hash_128,
-                plan_id,
-                reported_code_system,
-                reported_code,
-                procedure_global_id_128,
-                provider_set_global_id_128,
-                provider_count,
-                price_set_global_id_128,
-                source_trace_set_hash,
-                {network_names_select_sql}
-            FROM {table_name}
-            WHERE {where_sql}
-            ORDER BY {plan_order}, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
-            {limit_sql} {offset_sql}
-            """
-    )
-    row_result = await session.execute(row_stmt, params)
-    row_data = [_row_mapping(row) for row in row_result]
+    row_data: list[dict[str, Any]] | None = None
+    if has_reverse_sidecar and _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
+        sidecar_rows = await _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+            session,
+            serving_tables,
+            provider_set_ids=provider_set_ids,
+            requested_plan=requested_plan,
+            code_value=code_value,
+            code_system=args.get("code_system"),
+            q_text=q_text,
+            code_context=code_context,
+            source_trace_set_hash=serving_tables.source_trace_set_hash or None,
+            network_names=serving_tables.network_names or [],
+            limit=None if has_price_filter else int(pagination.limit),
+            offset=0 if has_price_filter else int(pagination.offset),
+            apply_window=not has_price_filter,
+        )
+        if sidecar_rows is not None:
+            if has_price_filter:
+                row_data = sidecar_rows[: int(params["candidate_limit"])]
+            else:
+                row_data = sidecar_rows
+    if row_data is None:
+        if table_available and _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
+            row_data = await _ptg2_manifest_provider_procedure_rows_from_lean_table(
+                session,
+                serving_tables,
+                provider_set_ids=provider_set_ids,
+                requested_plan=requested_plan,
+                code_value=code_value,
+                code_system=args.get("code_system"),
+                q_text=q_text,
+                code_context=code_context,
+                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
+                network_names=serving_tables.network_names or [],
+                limit=int(params["candidate_limit"]) if has_price_filter else int(pagination.limit),
+                offset=0 if has_price_filter else int(pagination.offset),
+            )
+    if row_data is None:
+        if not table_available or not table_name:
+            return None
+        network_names_select_sql = (
+            "network_names"
+            if await _ptg2_table_has_columns(session, table_name, {"network_names"})
+            else "NULL::varchar[] AS network_names"
+        )
+        row_stmt = text(
+            f"""
+                SELECT
+                    serving_content_hash_128,
+                    plan_id,
+                    reported_code_system,
+                    reported_code,
+                    procedure_global_id_128,
+                    provider_set_global_id_128,
+                    provider_count,
+                    price_set_global_id_128,
+                    source_trace_set_hash,
+                    {network_names_select_sql}
+                FROM {table_name}
+                WHERE {where_sql}
+                ORDER BY {plan_order}, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
+                {limit_sql} {offset_sql}
+                """
+        )
+        row_result = await session.execute(row_stmt, params)
+        row_data = [_row_mapping(row) for row in row_result]
     source_traces_by_set = await _ptg2_source_traces_for_trace_sets(
         session,
         [data.get("source_trace_set_hash") for data in row_data],
