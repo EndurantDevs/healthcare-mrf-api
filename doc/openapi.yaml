@@ -1936,7 +1936,7 @@ paths:
       summary: Find provider candidates from a location or contact locator
       description: |
         Locator-first provider candidate matcher. At least one locator is required:
-        `address_site_key`, `address_key`, `lat` + `long`, `phone`, or `first_line` + `zip_code`.
+        `address_site_key`, `address_key`, `lat` + `long`, or `phone`.
         NPPES/address data is the matching spine; Provider Directory FHIR and FFS/CMS
         enrichment are returned as source, classification, and evidence signals.
       parameters:
@@ -1974,20 +1974,6 @@ paths:
           schema:
             type: string
           description: Phone number; punctuation is ignored.
-        - name: first_line
-          in: query
-          schema:
-            type: string
-          description: Street address line 1. Must be paired with `zip_code`.
-        - name: zip
-          in: query
-          schema:
-            type: string
-          description: Alias for `zip_code`; rejected when both are present and differ.
-        - name: zip_code
-          in: query
-          schema:
-            type: string
         - name: entity_type_code
           in: query
           schema:

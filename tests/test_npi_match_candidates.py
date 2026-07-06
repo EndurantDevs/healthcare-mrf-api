@@ -35,14 +35,14 @@ async def test_match_candidate_params_reject_entity_conflict():
 
 
 @pytest.mark.asyncio
-async def test_match_candidate_params_reject_zip_alias_conflict():
+async def test_match_candidate_params_do_not_accept_line1_zip_locator():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         await npi_module._normalize_match_candidate_params(
             _request(
                 {
                     "first_line": "326 Nichols Rd",
                     "zip": "01420",
-                    "zip_code": "01421",
+                    "zip_code": "01420",
                 }
             )
         )
@@ -80,9 +80,6 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
             "long": "-71.80791638",
             "radius_miles": "0.5",
             "phone": "(978) 343-5270",
-            "first_line": "326 Nichols Rd.",
-            "zip": "01420-1234",
-            "zip_code": "01420",
             "entity_kind": "organization",
             "entity_type_code": "2",
             "taxonomy_scope": "261Q*, 282N00000X",
@@ -105,8 +102,6 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
     assert params["long"] == -71.80791638
     assert params["radius_miles"] == 0.5
     assert params["phone_digits"] == "9783435270"
-    assert params["first_line_norm"] == "326nicholsrd"
-    assert params["zip_code"] == "01420"
     assert params["entity_type_code"] == 2
     assert params["entity_kind"] == "organization"
     assert params["taxonomy_exact"] == ("282N00000X",)
@@ -157,8 +152,6 @@ def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
         "long": None,
         "radius_miles": None,
         "phone_digits": None,
-        "first_line_norm": None,
-        "zip_code": None,
         "entity_type_code": 2,
         "taxonomy_exact": ("282N00000X",),
         "taxonomy_prefixes": ("261Q",),
@@ -186,8 +179,6 @@ def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator(
         "long": -89.86039355,
         "radius_miles": 0.5,
         "phone_digits": None,
-        "first_line_norm": None,
-        "zip_code": None,
         "entity_type_code": None,
         "taxonomy_exact": (),
         "taxonomy_prefixes": (),
@@ -213,8 +204,6 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
         "long": -89.86039355,
         "radius_miles": 0.5,
         "phone_digits": "9012261309",
-        "first_line_norm": "6025walnutgroverdste400",
-        "zip_code": "38120",
         "entity_type_code": None,
         "taxonomy_exact": (),
         "taxonomy_prefixes": (),
@@ -232,37 +221,6 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
     assert query_params["lat"] == params["lat"]
     assert query_params["address_key"] == params["address_key"]
     assert query_params["phone_digits"] == params["phone_digits"]
-    assert query_params["first_line_norm"] == params["first_line_norm"]
-    assert query_params["zip_code"] == params["zip_code"]
-
-
-def test_match_candidate_query_materializes_raw_address_locator():
-    params = {
-        "address_site_key": None,
-        "address_key": None,
-        "lat": None,
-        "long": None,
-        "radius_miles": None,
-        "phone_digits": None,
-        "first_line_norm": "6025walnutgroverdste400",
-        "zip_code": "38120",
-        "entity_type_code": None,
-        "taxonomy_exact": (),
-        "taxonomy_prefixes": (),
-        "provider_type": None,
-        "specialty_filter": None,
-        "limit": 5,
-    }
-
-    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
-    sql = str(query)
-
-    assert "raw_zip_matches AS MATERIALIZED" in sql
-    assert "raw_location_matches AS MATERIALIZED" in sql
-    assert "a.location_key IN (SELECT location_key FROM raw_location_matches)" in sql
-    assert "REGEXP_REPLACE(LOWER(COALESCE(raw_zip.first_line, ''))" in sql
-    assert query_params["raw_zip_candidate_limit"] == 100000
-    assert query_params["raw_candidate_limit"] == 1000
 
 
 def test_match_candidate_output_scores_and_hides_internal_fields():
@@ -276,7 +234,6 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
         "address_site_key_matched": True,
         "address_key_matched": False,
         "phone_matched": True,
-        "raw_address_matched": False,
         "geo_distance_miles": 0.14,
         "address_type": "practice",
         "first_line": "326 Nichols Rd",
@@ -337,7 +294,6 @@ async def test_match_candidates_route_shapes_payload(monkeypatch):
                 "address_site_key_matched": False,
                 "address_key_matched": True,
                 "phone_matched": False,
-                "raw_address_matched": False,
                 "geo_distance_miles": None,
                 "address_sources": [],
                 "source_count": 0,

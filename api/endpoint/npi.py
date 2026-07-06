@@ -2591,16 +2591,6 @@ def _normalize_match_candidate_entity_type(raw_code: Any, raw_kind: Any) -> Opti
     return entity_type_code if entity_type_code is not None else kind_code
 
 
-def _normalize_match_candidate_line(raw_value: Any) -> Optional[str]:
-    value = _normalize_text_filter(raw_value, param_name="first_line", max_length=256)
-    if value is None:
-        return None
-    normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
-    if not normalized:
-        raise sanic.exceptions.InvalidUsage("first_line must include letters or digits")
-    return normalized
-
-
 def _normalize_match_candidate_term(raw_value: Any, *, param_name: str) -> Optional[str]:
     return _normalize_text_filter(raw_value, param_name=param_name, max_length=128)
 
@@ -2640,9 +2630,6 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     args.get("long")
     args.get("radius_miles")
     args.get("phone")
-    args.get("first_line")
-    args.get("zip")
-    args.get("zip_code")
     args.get("entity_type_code")
     args.get("entity_kind")
     args.get("taxonomy_scope")
@@ -2680,14 +2667,6 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
         radius_miles = _MATCH_CANDIDATES_DEFAULT_RADIUS_MILES
 
     phone_digits = _normalize_phone_digits(args.get("phone"))
-    first_line_norm = _normalize_match_candidate_line(args.get("first_line"))
-    zip_code = _normalize_zip_code(args.get("zip_code"), "zip_code")
-    zip_alias = _normalize_zip_code(args.get("zip"), "zip")
-    if zip_code and zip_alias and zip_code != zip_alias:
-        raise sanic.exceptions.InvalidUsage("zip and zip_code must match when both are provided")
-    zip_code = zip_code or zip_alias
-    if (first_line_norm is None) != (zip_code is None):
-        raise sanic.exceptions.InvalidUsage("first_line and zip_code must be provided together")
 
     entity_type_code = _normalize_match_candidate_entity_type(
         args.get("entity_type_code"),
@@ -2715,12 +2694,11 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
             address_key,
             latitude is not None and longitude is not None,
             phone_digits,
-            first_line_norm and zip_code,
         )
     )
     if locator_count == 0:
         raise sanic.exceptions.InvalidUsage(
-            "provide at least one locator: address_site_key, address_key, lat+long, phone, or first_line+zip_code"
+            "provide at least one locator: address_site_key, address_key, lat+long, or phone"
         )
 
     request_session = _request_session(request)
@@ -2752,8 +2730,6 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
         "long": longitude,
         "radius_miles": radius_miles,
         "phone_digits": phone_digits,
-        "first_line_norm": first_line_norm,
-        "zip_code": zip_code,
         "entity_type_code": entity_type_code,
         "entity_kind": _entity_kind_from_code(entity_type_code),
         "taxonomy_exact": taxonomy_exact,
@@ -2857,25 +2833,14 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     if params.get("phone_digits"):
         query_params["phone_digits"] = params["phone_digits"]
         phone_locator = _address_phone_digits_filter("a", address_table_sql)
-    raw_address_locator = None
-    if params.get("first_line_norm") and params.get("zip_code"):
-        query_params["first_line_norm"] = params["first_line_norm"]
-        query_params["zip_code"] = params["zip_code"]
-        raw_address_locator = (
-            "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
-            f"AND {_address_zip5_filter('a', address_table_sql)}"
-        )
     locator_candidates = [
         ("address_site_key", address_site_locator),
         ("address_key", address_key_locator),
         ("phone", phone_locator),
-        ("raw_address", raw_address_locator),
     ]
-    selected_locator_name = None
     selected_locator = None
-    for locator_name, locator_sql in locator_candidates:
+    for _locator_name, locator_sql in locator_candidates:
         if locator_sql:
-            selected_locator_name = locator_name
             selected_locator = locator_sql
             break
     geo_distance_expr = _match_geo_distance_expr(params)
@@ -2909,39 +2874,9 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             "AND a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric) "
             f"AND ({geo_distance_expr}) <= :radius_miles"
         )
-    raw_location_matches_cte = ""
-    if selected_locator_name == "raw_address":
-        raw_type_clause = _provider_list_address_type_clause(
-            "rz",
-            address_table_sql,
-            include_service_locations=True,
-        )
-        raw_provider_npi = columns["provider_npi"].replace("a.", "rz.")
-        raw_location_key = columns["location_key"].replace("a.", "rz.")
-        query_params["raw_zip_candidate_limit"] = 100_000
-        query_params["raw_candidate_limit"] = min(max(int(params["limit"]) * 50, 1000), 10_000)
-        raw_location_matches_cte = f"""
-        raw_zip_matches AS MATERIALIZED (
-            SELECT {raw_location_key} AS location_key,
-                   rz.first_line
-              FROM {address_table_sql} AS rz
-             WHERE {raw_type_clause}
-               AND {raw_provider_npi} IS NOT NULL
-               AND {_address_zip5_filter('rz', address_table_sql)}
-             LIMIT :raw_zip_candidate_limit
-        ),
-        raw_location_matches AS MATERIALIZED (
-            SELECT location_key
-              FROM raw_zip_matches AS raw_zip
-             WHERE REGEXP_REPLACE(LOWER(COALESCE(raw_zip.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm
-          ORDER BY location_key
-             LIMIT :raw_candidate_limit
-        ),
-        """
-        selected_locator = f"{columns['location_key']} IN (SELECT location_key FROM raw_location_matches)"
     # Use the most precise locator supplied. Keeping less selective locators as
-    # scoring signals avoids OR plans that combine indexed keys with broad raw
-    # address/geo predicates over the 35M-row serving table.
+    # scoring signals avoids OR plans that combine indexed keys with broad geo
+    # predicates over the serving table.
     locator_where = ([selected_locator] if selected_locator else []) or geo_locator_where
     address_where.append(f"({' OR '.join(locator_where)})")
 
@@ -2961,18 +2896,12 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     )
     address_key_match = "a.address_key = CAST(:address_key AS uuid)" if params.get("address_key") else "false"
     phone_match = _address_phone_digits_filter("a", address_table_sql) if params.get("phone_digits") else "false"
-    raw_address_match = (
-        "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
-        f"AND {_address_zip5_filter('a', address_table_sql)}"
-        if params.get("first_line_norm") and params.get("zip_code")
-        else "false"
-    )
     npi_table_sql = _schema_cache_key(NPIData.__tablename__)
     taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
         f"""
-        WITH {raw_location_matches_cte}candidate_locations AS (
+        WITH candidate_locations AS (
             SELECT DISTINCT ON ({columns['provider_npi']})
                    {columns['provider_npi']}::bigint AS npi,
                    a.type AS address_type,
@@ -3000,7 +2929,6 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    ({address_site_match})::boolean AS address_site_key_matched,
                    ({address_key_match})::boolean AS address_key_matched,
                    ({phone_match})::boolean AS phone_matched,
-                   ({raw_address_match})::boolean AS raw_address_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
               FROM {address_table_sql} AS a
              WHERE {' AND '.join(address_where)}
@@ -3008,7 +2936,6 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    address_site_key_matched DESC,
                    address_key_matched DESC,
                    phone_matched DESC,
-                   raw_address_matched DESC,
                    geo_distance_miles ASC NULLS LAST,
                    source_count DESC NULLS LAST,
                    location_key
@@ -3054,7 +2981,6 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
       ORDER BY f.address_site_key_matched DESC,
                f.address_key_matched DESC,
                f.phone_matched DESC,
-               f.raw_address_matched DESC,
                f.geo_distance_miles ASC NULLS LAST,
                f.source_count DESC NULLS LAST,
                f.npi
@@ -3075,10 +3001,9 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
         "lat",
         "long",
         "address_key",
+        "premise_key",
         "taxonomy_array",
     }
-    if params.get("address_site_key"):
-        required_columns.add("premise_key")
     address_table_sql = await _address_serving_table_sql(required_columns, session=session)
     query, query_params = _match_candidate_query(params, address_table_sql)
     try:
@@ -3206,7 +3131,6 @@ def _match_signal_payload(
         "address_site_key": {"matched": bool(row.get("address_site_key_matched"))},
         "address_key": {"matched": bool(row.get("address_key_matched"))},
         "phone": {"matched": bool(row.get("phone_matched"))},
-        "raw_address": {"matched": bool(row.get("raw_address_matched"))},
         "taxonomy": {"matched": taxonomy_matched},
         "fhir": {"matched": fhir_matched},
         "ffs": {"matched": ffs_matched},
@@ -3221,9 +3145,6 @@ def _match_signal_payload(
     if row.get("phone_matched"):
         score += 0.25
         signals["phone"]["contribution"] = 0.25
-    if row.get("raw_address_matched"):
-        score += 0.25
-        signals["raw_address"]["contribution"] = 0.25
     distance = row.get("geo_distance_miles")
     if distance is not None:
         distance_float = float(distance)
@@ -3367,9 +3288,6 @@ async def match_candidates(request):
     request.args.get("long")
     request.args.get("radius_miles")
     request.args.get("phone")
-    request.args.get("first_line")
-    request.args.get("zip")
-    request.args.get("zip_code")
     request.args.get("entity_type_code")
     request.args.get("entity_kind")
     request.args.get("taxonomy_scope")
@@ -5664,6 +5582,8 @@ async def get_npi(request, npi):
         t_addr = t_addr.replace(" , ", " ")
 
         d = x
+        for key in ("lat", "long", "formatted_address", "place_id"):
+            d.setdefault(key, None)
         if force_address_update:
             d["long"] = None
             d["lat"] = None
