@@ -1244,6 +1244,7 @@ def lookup_serving_by_code_sidecar(
     if row_count <= 0:
         return ()
     provider_filter = {int(value) for value in provider_set_keys} if provider_set_keys is not None else None
+    provider_filter_max = max(provider_filter) if provider_filter else None
     cursor = body_start + body_offset
     provider_set_key = 0
     rows: list[PTG2ServingSidecarRow] = []
@@ -1255,7 +1256,7 @@ def lookup_serving_by_code_sidecar(
             raise PTG2ManifestArtifactError("serving-by-code sidecar price key is out of range")
         provider_set_key += provider_delta
         if provider_filter is not None and provider_set_key not in provider_filter:
-            if provider_filter and provider_set_key > max(provider_filter):
+            if provider_filter_max is not None and provider_set_key > provider_filter_max:
                 break
             continue
         price_offset = price_start + price_key * 16

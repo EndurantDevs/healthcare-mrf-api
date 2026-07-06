@@ -2309,7 +2309,10 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
     offset: int = 0,
     apply_window: bool = False,
 ) -> list[dict[str, Any]] | None:
-    if not _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set"):
+    if not (
+        _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    ):
         return None
     code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
         session,
@@ -2364,6 +2367,59 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         }
 
     if apply_window:
+        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
+            page_limit = max(int(limit or 0), 0)
+            if page_limit <= 0:
+                return []
+            page_offset = max(int(offset or 0), 0)
+            requested_provider_set_keys = tuple(
+                sorted({int(value) for value in provider_set_keys_by_id.values()})
+            )
+            rows: list[dict[str, Any]] = []
+            skipped = 0
+            for code_key in code_by_key:
+                sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+                    serving_tables,
+                    int(code_key),
+                    provider_set_keys=requested_provider_set_keys,
+                )
+                if not sidecar_rows:
+                    continue
+                code_candidates: list[dict[str, Any]] = []
+                for row in sidecar_rows:
+                    provider_set_id = provider_set_ids_by_key.get(int(row.provider_set_key))
+                    payload = _sidecar_row_payload(
+                        code_key=int(row.code_key),
+                        provider_set_id=provider_set_id,
+                        provider_set_key=int(row.provider_set_key),
+                        provider_count=int(row.provider_count),
+                        price_set_global_id_128=row.price_set_global_id_128,
+                    )
+                    if payload:
+                        code_candidates.append(payload)
+                if not code_candidates:
+                    continue
+                code_candidates.sort(
+                    key=lambda data: (
+                        -(int(data.get("provider_count") or 0)),
+                        _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+                        _ptg2_manifest_id(data.get("price_set_global_id_128")),
+                    )
+                )
+                candidate_count = len(code_candidates)
+                if skipped + candidate_count <= page_offset:
+                    skipped += candidate_count
+                    continue
+                local_start = max(page_offset - skipped, 0)
+                local_end = local_start + (page_limit - len(rows))
+                rows.extend(code_candidates[local_start:local_end])
+                skipped += candidate_count
+                if len(rows) >= page_limit:
+                    break
+            for data in rows:
+                data.pop("_code_key", None)
+            return rows
+
         page_limit = max(int(limit or 0), 0)
         if page_limit <= 0:
             return []
@@ -6507,7 +6563,10 @@ async def _search_ptg2_manifest_provider_procedures(
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any] | None:
     table_name = _safe_table_name(serving_tables.serving_table)
-    has_reverse_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set"))
+    has_reverse_sidecar = bool(
+        _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    )
     table_available = bool(table_name and await _serving_table_available(session, table_name))
     if not table_available and not has_reverse_sidecar:
         return None

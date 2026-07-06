@@ -2767,6 +2767,82 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
 
 
 @pytest.mark.asyncio
+async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
+    provider_set_a = "0000000000000000000000000000000a"
+    provider_set_b = "0000000000000000000000000000000b"
+    price_a = "00000000000000000000000000000101"
+    price_b = "00000000000000000000000000000102"
+    price_c = "00000000000000000000000000000103"
+    sidecar = write_serving_by_code_sidecar(
+        tmp_path / "serving_by_code.ptg2sbc",
+        [
+            (7, 3, 5, price_a),
+            (7, 4, 9, price_b),
+            (8, 3, 11, price_c),
+        ],
+    )
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 2,
+                    },
+                    {
+                        "code_key": 8,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70552",
+                        "rate_count": 1,
+                    },
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {"provider_set_key": 3, "provider_set_global_id_128": provider_set_a},
+                    {"provider_set_key": 4, "provider_set_global_id_128": provider_set_b},
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        artifacts={"serving_by_code": sidecar},
+    )
+
+    rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+        session,
+        tables,
+        provider_set_ids=(provider_set_a, provider_set_b),
+        requested_plan="010854205",
+        code_value="",
+        code_system=None,
+        q_text="",
+        code_context=None,
+        source_trace_set_hash="trace-set",
+        network_names=["network"],
+        limit=2,
+        offset=1,
+        apply_window=True,
+    )
+
+    assert [
+        (row["reported_code"], row["provider_set_global_id_128"], row["provider_count"], row["price_set_global_id_128"])
+        for row in rows
+    ] == [
+        ("70551", provider_set_a, 5, price_a),
+        ("70552", provider_set_a, 11, price_c),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
     provider_set_id = "0000000000000000000000000000000a"
     price_set_id = "00000000000000000000000000000101"
