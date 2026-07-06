@@ -1641,12 +1641,20 @@ async def _publish_ptg2_manifest_serving_snapshot(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} CASCADE;"
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
-    await db.status(
-        f"""
-        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
-        RENAME TO {_quote_ident(final_table)};
-        """
+    skip_final_serving_table = (
+        use_lean_source_stage
+        and _ptg2_manifest_serving_layout() == PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY
+        and _ptg2_manifest_serving_sidecars_enabled()
+        and _ptg2_manifest_drop_serving_table_after_sidecars()
     )
+    serving_work_table = stage_table if skip_final_serving_table else final_table
+    if not skip_final_serving_table:
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+            RENAME TO {_quote_ident(final_table)};
+            """
+        )
     if await _table_exists(schema_name, price_atom_stage):
         await db.status(
             f"""
@@ -1671,18 +1679,18 @@ async def _publish_ptg2_manifest_serving_snapshot(
     if use_db_dedupe and use_lean_source_stage:
         dedupe_metrics["serving"] = {"skipped": "use_lean_source_stage"}
     elif use_db_dedupe:
-        dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
+        dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, serving_work_table)
         serving_deduped = True
-    unique_index = _ptg2_snapshot_index_name(final_table, "content_uidx")
-    lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_lookup_idx")
-    provider_set_lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_provider_set_idx")
+    unique_index = _ptg2_snapshot_index_name(serving_work_table, "content_uidx")
+    lookup_index = _ptg2_snapshot_index_name(serving_work_table, "plan_code_lookup_idx")
+    provider_set_lookup_index = _ptg2_snapshot_index_name(serving_work_table, "plan_code_provider_set_idx")
     if use_lean_source_stage:
-        lean_source_unique_index = _ptg2_snapshot_index_name(final_table, "lean_src_uidx")
+        lean_source_unique_index = _ptg2_snapshot_index_name(serving_work_table, "lean_src_uidx")
         try:
             await db.status(
                 f"""
                 CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
                 (
                     plan_id,
                     reported_code_system,
@@ -1702,12 +1710,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
             )
             dedupe_metrics["db_dedupe"] = True
             dedupe_metrics["rescue"] = True
-            dedupe_metrics["serving"] = await _dedupe_lean_manifest_stage(schema_name, final_table)
+            dedupe_metrics["serving"] = await _dedupe_lean_manifest_stage(schema_name, serving_work_table)
             serving_deduped = True
             await db.status(
                 f"""
                 CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
                 (
                     plan_id,
                     reported_code_system,
@@ -1723,7 +1731,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
             await db.status(
                 f"""
                 CREATE UNIQUE INDEX {_quote_ident(unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
                 (serving_content_hash_128);
                 """
             )
@@ -1737,12 +1745,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
             )
             dedupe_metrics["db_dedupe"] = True
             dedupe_metrics["rescue"] = True
-            dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
+            dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, serving_work_table)
             serving_deduped = True
             await db.status(
                 f"""
                 CREATE UNIQUE INDEX {_quote_ident(unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
                 (serving_content_hash_128);
                 """
             )
@@ -1755,7 +1763,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         if use_lean_source_stage:
             lean_serving_manifest = await _rewrite_direct_lean_manifest_stage(
                 schema_name=schema_name,
-                final_table=final_table,
+                final_table=serving_work_table,
                 code_count_table=code_count_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
                 constants=_manifest_constants_from_artifacts(artifacts),
@@ -1763,7 +1771,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         else:
             lean_serving_manifest = await _rewrite_ptg2_manifest_serving_table_lean_provider_key(
                 schema_name=schema_name,
-                final_table=final_table,
+                final_table=serving_work_table,
                 code_count_table=code_count_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
             )
@@ -1771,14 +1779,14 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(
             f"""
             CREATE INDEX {_quote_ident(lookup_index)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
             (plan_id, reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128);
             """
         )
         await db.status(
             f"""
             CREATE INDEX {_quote_ident(provider_set_lookup_index)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
             (plan_id, reported_code_system, reported_code, provider_set_global_id_128, provider_count DESC NULLS LAST, serving_content_hash_128);
             """
         )
@@ -1863,7 +1871,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         materialized_provider_group_rate_scope_table = await _materialize_manifest_provider_group_rate_scope(
             schema_name=schema_name,
             table_name=provider_group_rate_scope_table,
-            serving_table=final_table,
+            serving_table=serving_work_table,
             code_count_table=code_count_table,
             provider_set_component_table=materialized_provider_set_component_table,
             provider_set_dictionary_table=provider_set_dictionary_table if lean_serving_manifest else None,
@@ -1885,7 +1893,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 reported_code_system,
                 reported_code,
                 COUNT(*)::bigint AS rate_count
-            FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            FROM {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
             GROUP BY plan_id, reported_code_system, reported_code;
             """
         )
@@ -1897,7 +1905,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
             (plan_id, reported_code_system, reported_code);
             """
         )
-    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
     await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)};")
     if await _table_exists(schema_name, price_atom_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
@@ -1915,19 +1923,19 @@ async def _publish_ptg2_manifest_serving_snapshot(
     if lean_serving_manifest is not None:
         serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
             schema_name=schema_name,
-            final_table=final_table,
+            final_table=serving_work_table,
             artifacts=artifacts,
             source_key=source_key,
             snapshot_id=snapshot_id,
         )
-    row_count = await _exact_table_rows(schema_name, final_table)
+    row_count = await _exact_table_rows(schema_name, serving_work_table)
     serving_table_retained = True
     if (
         lean_serving_manifest is not None
         and serving_sidecar_artifacts
         and _ptg2_manifest_drop_serving_table_after_sidecars()
     ):
-        await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+        await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
         serving_table_retained = False
     elapsed_seconds = time.monotonic() - started_at
     combined_sidecar_artifacts = dict(sidecar_artifacts or {})
