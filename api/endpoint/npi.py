@@ -2830,25 +2830,33 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         ),
         f"{columns['provider_npi']} IS NOT NULL",
     ]
-    non_geo_locator_where: list[str] = []
-    geo_locator_where: list[str] = []
+    address_site_locator = None
     if params.get("address_site_key"):
         query_params["address_site_key"] = params["address_site_key"]
-        non_geo_locator_where.append(_address_site_key_filter("a", address_table_sql))
+        address_site_locator = _address_site_key_filter("a", address_table_sql)
+    address_key_locator = None
     if params.get("address_key"):
         query_params["address_key"] = params["address_key"]
-        non_geo_locator_where.append("a.address_key = CAST(:address_key AS uuid)")
+        address_key_locator = "a.address_key = CAST(:address_key AS uuid)"
+    phone_locator = None
     if params.get("phone_digits"):
         query_params["phone_digits"] = params["phone_digits"]
-        non_geo_locator_where.append(_address_phone_digits_filter("a", address_table_sql))
+        phone_locator = _address_phone_digits_filter("a", address_table_sql)
+    raw_address_locator = None
     if params.get("first_line_norm") and params.get("zip_code"):
         query_params["first_line_norm"] = params["first_line_norm"]
         query_params["zip_code"] = params["zip_code"]
-        non_geo_locator_where.append(
+        raw_address_locator = (
             "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
             f"AND {_address_zip5_filter('a', address_table_sql)}"
         )
+    exact_locator_where = [
+        locator
+        for locator in (address_site_locator, address_key_locator, phone_locator, raw_address_locator)
+        if locator
+    ][:1]
     geo_distance_expr = _match_geo_distance_expr(params)
+    geo_locator_where: list[str] = []
     if params.get("lat") is not None and params.get("long") is not None:
         latitude = float(params["lat"])
         longitude = float(params["long"])
@@ -2866,16 +2874,22 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                 "long_max": longitude + lon_delta,
             }
         )
+        geo_precision_clause = (
+            "AND COALESCE(a.address_precision, '') <> 'city_zip' "
+            if _address_table_is_unified(address_table_sql)
+            else ""
+        )
         geo_locator_where.append(
             "a.lat IS NOT NULL AND a.long IS NOT NULL "
+            f"{geo_precision_clause}"
             "AND a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric) "
             "AND a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric) "
             f"AND ({geo_distance_expr}) <= :radius_miles"
         )
-    # Exact locators are normally user-selected identifiers for one site. When
-    # geo is also supplied, keep it as a scoring signal but avoid OR-ing it into
-    # the locator predicate, which can force a 35M-row geo scan on all-param calls.
-    locator_where = non_geo_locator_where or geo_locator_where
+    # Use the most precise locator supplied. Keeping less selective locators as
+    # scoring signals avoids OR plans that combine indexed keys with broad raw
+    # address/geo predicates over the 35M-row serving table.
+    locator_where = exact_locator_where or geo_locator_where
     address_where.append(f"({' OR '.join(locator_where)})")
 
     npi_where: list[str] = []
@@ -3020,17 +3034,24 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
             timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
         )
     except asyncio.TimeoutError:
-        if session is not None and hasattr(session, "rollback"):
-            with contextlib.suppress(Exception):
-                rollback_result = session.rollback()
-                if asyncio.iscoroutine(rollback_result):
-                    await rollback_result
+        await _rollback_match_candidate_session(session)
+        raise
+    except asyncio.CancelledError:
+        await _rollback_match_candidate_session(session)
         raise
     rows: list[dict[str, Any]] = []
     for row in result.all():
         mapping = getattr(row, "_mapping", row)
         rows.append(dict(mapping))
     return rows
+
+
+async def _rollback_match_candidate_session(session: Any) -> None:
+    if session is not None and hasattr(session, "rollback"):
+        with contextlib.suppress(Exception):
+            rollback_result = session.rollback()
+            if asyncio.iscoroutine(rollback_result):
+                await rollback_result
 
 
 def _json_array_value(value: Any) -> list[Any]:

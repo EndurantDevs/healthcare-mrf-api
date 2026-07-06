@@ -208,13 +208,13 @@ def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator(
 def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
     params = {
         "address_site_key": "c4147429-6998-8eb4-d3f8-c89ea64af4ca",
-        "address_key": None,
+        "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
         "lat": 35.1295378,
         "long": -89.86039355,
         "radius_miles": 0.5,
-        "phone_digits": None,
-        "first_line_norm": None,
-        "zip_code": None,
+        "phone_digits": "9012261309",
+        "first_line_norm": "6025walnutgroverdste400",
+        "zip_code": "38120",
         "entity_type_code": None,
         "taxonomy_exact": (),
         "taxonomy_prefixes": (),
@@ -230,6 +230,10 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
     assert "geo_distance_miles" in sql
     assert "a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric)" not in sql
     assert query_params["lat"] == params["lat"]
+    assert query_params["address_key"] == params["address_key"]
+    assert query_params["phone_digits"] == params["phone_digits"]
+    assert query_params["first_line_norm"] == params["first_line_norm"]
+    assert query_params["zip_code"] == params["zip_code"]
 
 
 def test_match_candidate_output_scores_and_hides_internal_fields():
@@ -367,6 +371,35 @@ async def test_fetch_match_candidate_rows_rolls_back_session_after_timeout(monke
     monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
 
     with pytest.raises(asyncio.TimeoutError):
+        await npi_module._fetch_match_candidate_rows({"address_key": "x"}, session=session)
+
+    assert session.rollback_called is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_candidate_rows_rolls_back_session_after_cancellation(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.rollback_called = False
+
+        async def rollback(self):
+            self.rollback_called = True
+
+    async def fake_address_table(required_columns, *, session=None):
+        return "mrf.entity_address_unified"
+
+    def fake_query(params, address_table_sql):
+        return object(), {}
+
+    async def fake_execute(stmt, *, session=None, params=None):
+        raise asyncio.CancelledError()
+
+    session = FakeSession()
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", fake_address_table)
+    monkeypatch.setattr(npi_module, "_match_candidate_query", fake_query)
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+
+    with pytest.raises(asyncio.CancelledError):
         await npi_module._fetch_match_candidate_rows({"address_key": "x"}, session=session)
 
     assert session.rollback_called is True
