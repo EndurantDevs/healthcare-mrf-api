@@ -178,6 +178,60 @@ def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
     assert query_params["match_taxonomy_prefix_0"] == "261Q%"
 
 
+def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator():
+    params = {
+        "address_site_key": None,
+        "address_key": None,
+        "lat": 35.1295378,
+        "long": -89.86039355,
+        "radius_miles": 0.5,
+        "phone_digits": None,
+        "first_line_norm": None,
+        "zip_code": None,
+        "entity_type_code": None,
+        "taxonomy_exact": (),
+        "taxonomy_prefixes": (),
+        "provider_type": None,
+        "specialty_filter": None,
+        "limit": 5,
+    }
+
+    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    sql = str(query)
+
+    assert "a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric)" in sql
+    assert "a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric)" in sql
+    assert query_params["lat_min"] < params["lat"] < query_params["lat_max"]
+    assert query_params["long_min"] < params["long"] < query_params["long_max"]
+
+
+def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
+    params = {
+        "address_site_key": "c4147429-6998-8eb4-d3f8-c89ea64af4ca",
+        "address_key": None,
+        "lat": 35.1295378,
+        "long": -89.86039355,
+        "radius_miles": 0.5,
+        "phone_digits": None,
+        "first_line_norm": None,
+        "zip_code": None,
+        "entity_type_code": None,
+        "taxonomy_exact": (),
+        "taxonomy_prefixes": (),
+        "provider_type": None,
+        "specialty_filter": None,
+        "limit": 5,
+    }
+
+    query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
+    sql = str(query)
+
+    assert "a.premise_key = CAST(:address_site_key AS uuid)" in sql
+    assert "geo_distance_miles" in sql
+    assert "a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric)" not in sql
+    assert query_params["lat"] == params["lat"]
+
+
 def test_match_candidate_output_scores_and_hides_internal_fields():
     row = {
         "npi": 1013995133,
@@ -286,3 +340,33 @@ async def test_match_candidates_route_returns_503_on_timeout(monkeypatch):
         await npi_module.match_candidates(
             _request({"address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"})
         )
+
+
+@pytest.mark.asyncio
+async def test_fetch_match_candidate_rows_rolls_back_session_after_timeout(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.rollback_called = False
+
+        async def rollback(self):
+            self.rollback_called = True
+
+    async def fake_address_table(required_columns, *, session=None):
+        return "mrf.entity_address_unified"
+
+    def fake_query(params, address_table_sql):
+        return object(), {}
+
+    async def fake_execute(stmt, *, session=None, params=None):
+        await asyncio.sleep(1)
+
+    session = FakeSession()
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", fake_address_table)
+    monkeypatch.setattr(npi_module, "_match_candidate_query", fake_query)
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+    monkeypatch.setattr(npi_module, "_MATCH_CANDIDATES_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await npi_module._fetch_match_candidate_rows({"address_key": "x"}, session=session)
+
+    assert session.rollback_called is True

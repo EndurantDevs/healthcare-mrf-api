@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -2829,20 +2830,21 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         ),
         f"{columns['provider_npi']} IS NOT NULL",
     ]
-    locator_where: list[str] = []
+    non_geo_locator_where: list[str] = []
+    geo_locator_where: list[str] = []
     if params.get("address_site_key"):
         query_params["address_site_key"] = params["address_site_key"]
-        locator_where.append(_address_site_key_filter("a", address_table_sql))
+        non_geo_locator_where.append(_address_site_key_filter("a", address_table_sql))
     if params.get("address_key"):
         query_params["address_key"] = params["address_key"]
-        locator_where.append("a.address_key = CAST(:address_key AS uuid)")
+        non_geo_locator_where.append("a.address_key = CAST(:address_key AS uuid)")
     if params.get("phone_digits"):
         query_params["phone_digits"] = params["phone_digits"]
-        locator_where.append(_address_phone_digits_filter("a", address_table_sql))
+        non_geo_locator_where.append(_address_phone_digits_filter("a", address_table_sql))
     if params.get("first_line_norm") and params.get("zip_code"):
         query_params["first_line_norm"] = params["first_line_norm"]
         query_params["zip_code"] = params["zip_code"]
-        locator_where.append(
+        non_geo_locator_where.append(
             "REGEXP_REPLACE(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm "
             f"AND {_address_zip5_filter('a', address_table_sql)}"
         )
@@ -2864,12 +2866,16 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                 "long_max": longitude + lon_delta,
             }
         )
-        locator_where.append(
+        geo_locator_where.append(
             "a.lat IS NOT NULL AND a.long IS NOT NULL "
-            "AND a.lat::double precision BETWEEN :lat_min AND :lat_max "
-            "AND a.long::double precision BETWEEN :long_min AND :long_max "
+            "AND a.lat BETWEEN CAST(:lat_min AS numeric) AND CAST(:lat_max AS numeric) "
+            "AND a.long BETWEEN CAST(:long_min AS numeric) AND CAST(:long_max AS numeric) "
             f"AND ({geo_distance_expr}) <= :radius_miles"
         )
+    # Exact locators are normally user-selected identifiers for one site. When
+    # geo is also supplied, keep it as a scoring signal but avoid OR-ing it into
+    # the locator predicate, which can force a 35M-row geo scan on all-param calls.
+    locator_where = non_geo_locator_where or geo_locator_where
     address_where.append(f"({' OR '.join(locator_where)})")
 
     npi_where: list[str] = []
@@ -3008,10 +3014,18 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
         required_columns.add("premise_key")
     address_table_sql = await _address_serving_table_sql(required_columns, session=session)
     query, query_params = _match_candidate_query(params, address_table_sql)
-    result = await asyncio.wait_for(
-        _execute_stmt(query, session=session, params=query_params),
-        timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
-    )
+    try:
+        result = await asyncio.wait_for(
+            _execute_stmt(query, session=session, params=query_params),
+            timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
+        )
+    except asyncio.TimeoutError:
+        if session is not None and hasattr(session, "rollback"):
+            with contextlib.suppress(Exception):
+                rollback_result = session.rollback()
+                if asyncio.iscoroutine(rollback_result):
+                    await rollback_result
+        raise
     rows: list[dict[str, Any]] = []
     for row in result.all():
         mapping = getattr(row, "_mapping", row)
