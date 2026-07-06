@@ -257,9 +257,11 @@ def test_match_candidate_query_materializes_raw_address_locator():
     query, query_params = npi_module._match_candidate_query(params, "mrf.entity_address_unified")
     sql = str(query)
 
+    assert "raw_zip_matches AS MATERIALIZED" in sql
     assert "raw_location_matches AS MATERIALIZED" in sql
     assert "a.location_key IN (SELECT location_key FROM raw_location_matches)" in sql
-    assert "REGEXP_REPLACE(LOWER(COALESCE(rz.first_line, ''))" in sql
+    assert "REGEXP_REPLACE(LOWER(COALESCE(raw_zip.first_line, ''))" in sql
+    assert query_params["raw_zip_candidate_limit"] == 100000
     assert query_params["raw_candidate_limit"] == 1000
 
 

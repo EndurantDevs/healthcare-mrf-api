@@ -2903,16 +2903,23 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         )
         raw_provider_npi = columns["provider_npi"].replace("a.", "rz.")
         raw_location_key = columns["location_key"].replace("a.", "rz.")
+        query_params["raw_zip_candidate_limit"] = 100_000
         query_params["raw_candidate_limit"] = min(max(int(params["limit"]) * 50, 1000), 10_000)
         raw_location_matches_cte = f"""
-        raw_location_matches AS MATERIALIZED (
-            SELECT {raw_location_key} AS location_key
+        raw_zip_matches AS MATERIALIZED (
+            SELECT {raw_location_key} AS location_key,
+                   rz.first_line
               FROM {address_table_sql} AS rz
              WHERE {raw_type_clause}
                AND {raw_provider_npi} IS NOT NULL
                AND {_address_zip5_filter('rz', address_table_sql)}
-               AND REGEXP_REPLACE(LOWER(COALESCE(rz.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm
-          ORDER BY {raw_location_key}
+             LIMIT :raw_zip_candidate_limit
+        ),
+        raw_location_matches AS MATERIALIZED (
+            SELECT location_key
+              FROM raw_zip_matches AS raw_zip
+             WHERE REGEXP_REPLACE(LOWER(COALESCE(raw_zip.first_line, '')), '[^a-z0-9]', '', 'g') = :first_line_norm
+          ORDER BY location_key
              LIMIT :raw_candidate_limit
         ),
         """
