@@ -5611,10 +5611,31 @@ def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypa
     assert result["dedupe"]["serving"] == {"before": 10, "after": 9, "dropped": 1}
 
 
-def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
-    merge_calls = []
-    copy_calls = []
+def _manifest_copy_successful_files(source_files_by_kind):
+    return [
+        {
+            "summary": {
+                "manifest": {
+                    "copy_files": {
+                        kind: [{"path": str(path), "row_count": 1}]
+                        for kind, path in source_files_by_kind.items()
+                    }
+                }
+            }
+        }
+    ]
 
+
+def _write_manifest_copy_files(tmp_path):
+    source_files_by_kind = {}
+    for kind in ("manifest_serving", "price_atom", "provider_group_member"):
+        source_path = tmp_path / f"{kind}.copy"
+        source_path.write_text("row\n", encoding="utf-8")
+        source_files_by_kind[kind] = source_path
+    return source_files_by_kind
+
+
+def _fake_manifest_merge_recorder(merge_calls):
     async def fake_merge(kind, output_path, input_paths):
         merge_calls.append((kind, output_path, tuple(input_paths)))
         output_path.write_text(f"{kind}\n", encoding="utf-8")
@@ -5626,35 +5647,41 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
             "dropped_rows": 1,
         }
 
+    return fake_merge
+
+
+def _fake_manifest_copy_recorder(copy_calls):
     async def fake_copy(copy_path, *, target_table):
         copy_calls.append((copy_path.read_text(encoding="utf-8").strip(), target_table))
 
-    source_files_by_kind = {}
-    for kind in ("manifest_serving", "price_atom", "provider_group_member"):
-        source_path = tmp_path / f"{kind}.copy"
-        source_path.write_text("row\n", encoding="utf-8")
-        source_files_by_kind[kind] = source_path
+    return fake_copy
+
+
+def _publish_steps(progress_events):
+    return [event["publish_step"] for event in progress_events]
+
+
+def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
+    """Pre-copy merge emits progress while merging and copying manifest files."""
+    merge_calls = []
+    copy_calls = []
+    progress_events = []
+    source_files_by_kind = _write_manifest_copy_files(tmp_path)
 
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", "false")
-    monkeypatch.setattr(process_ptg, "_run_ptg2_manifest_copy_merge", fake_merge)
-    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_serving_file", fake_copy)
-    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", fake_copy)
-    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_run_ptg2_manifest_copy_merge", _fake_manifest_merge_recorder(merge_calls))
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_serving_file", _fake_manifest_copy_recorder(copy_calls))
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", _fake_manifest_copy_recorder(copy_calls))
+    monkeypatch.setattr(
+        process_ptg,
+        "_copy_ptg2_manifest_provider_group_member_file",
+        _fake_manifest_copy_recorder(copy_calls),
+    )
+    monkeypatch.setattr(process_ptg, "write_live_progress", lambda **payload: progress_events.append(payload))
 
     metrics = asyncio.run(
         process_ptg._merge_and_copy_ptg2_manifest_files(
-            successful_files=[
-                {
-                    "summary": {
-                        "manifest": {
-                            "copy_files": {
-                                kind: [{"path": str(path), "row_count": 1}]
-                                for kind, path in source_files_by_kind.items()
-                            }
-                        }
-                    }
-                }
-            ],
+            successful_files=_manifest_copy_successful_files(source_files_by_kind),
             manifest_stage_table="ptg2_manifest_stage_serving_abc",
         )
     )
@@ -5666,15 +5693,30 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     assert ("price_atom", "ptg2_manifest_stage_price_atom_abc") in copy_calls
     assert ("provider_group_member", "ptg2_manifest_stage_provider_group_member_abc") in copy_calls
     assert all(not path.exists() for path in source_files_by_kind.values())
+    assert _publish_steps(progress_events) == [
+        "merging manifest_serving",
+        "merged manifest_serving",
+        "merging price_atom",
+        "merged price_atom",
+        "merging provider_group_member",
+        "merged provider_group_member",
+        "copying manifest_serving",
+        "copied manifest_serving",
+        "copying price_atom",
+        "copied price_atom",
+        "copying provider_group_member",
+        "copied provider_group_member",
+    ]
+    assert progress_events[0]["pct"] == 92.0
+    assert progress_events[-1]["pct"] == 95.0
+    assert progress_events[-1]["source"] == "ptg2-publish-progress"
 
 
 def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
+    """Streaming pre-copy merge emits progress around each direct COPY stream."""
     stream_calls = []
-    source_files_by_kind = {}
-    for kind in ("manifest_serving", "price_atom", "provider_group_member"):
-        source_path = tmp_path / f"{kind}.copy"
-        source_path.write_text("row\n", encoding="utf-8")
-        source_files_by_kind[kind] = source_path
+    progress_events = []
+    source_files_by_kind = _write_manifest_copy_files(tmp_path)
 
     async def fake_stream(kind, *, target_table, input_paths, copy_func):
         stream_calls.append((kind, target_table, tuple(input_paths), copy_func))
@@ -5688,21 +5730,11 @@ def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
 
     monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", raising=False)
     monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fake_stream)
+    monkeypatch.setattr(process_ptg, "write_live_progress", lambda **payload: progress_events.append(payload))
 
     metrics = asyncio.run(
         process_ptg._merge_and_copy_ptg2_manifest_files(
-            successful_files=[
-                {
-                    "summary": {
-                        "manifest": {
-                            "copy_files": {
-                                kind: [{"path": str(path), "row_count": 1}]
-                                for kind, path in source_files_by_kind.items()
-                            }
-                        }
-                    }
-                }
-            ],
+            successful_files=_manifest_copy_successful_files(source_files_by_kind),
             manifest_stage_table="ptg2_manifest_stage_serving_abc",
         )
     )
@@ -5715,6 +5747,17 @@ def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
     assert stream_calls[1][1] == "ptg2_manifest_stage_price_atom_abc"
     assert stream_calls[2][1] == "ptg2_manifest_stage_provider_group_member_abc"
     assert all(not path.exists() for path in source_files_by_kind.values())
+    assert _publish_steps(progress_events) == [
+        "copying manifest_serving",
+        "copied manifest_serving",
+        "copying price_atom",
+        "copied price_atom",
+        "copying provider_group_member",
+        "copied provider_group_member",
+    ]
+    assert progress_events[0]["message"] == "streaming manifest_serving merge into ptg2_manifest_stage_serving_abc"
+    assert progress_events[-1]["output_rows"] == 1
+    assert progress_events[-1]["streamed_to_copy"] is True
 
 
 def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatch, tmp_path):

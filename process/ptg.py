@@ -191,7 +191,8 @@ from process.ptg_parts.live_progress import (current_live_progress_context,
                                              write_live_progress)
 from process.ptg_parts.progress import (_artifact_progress_position,
                                         _format_duration,
-                                        _maybe_log_artifact_progress, _utcnow)
+                                        _maybe_log_artifact_progress,
+                                        _scale_stage_progress_pct, _utcnow)
 from process.ptg_parts.provider_cache import (
     PTG2InMemoryProviderReferenceCache, PTG2ProviderReferenceCache,
     _normalize_provider_ref, _provider_cache_get, _provider_cache_hashes,
@@ -577,6 +578,41 @@ def _manifest_merge_summary_from_stdout(
     }
 
 
+def _emit_ptg2_publish_progress(
+    publish_step: str,
+    *,
+    completed_steps: int,
+    total_steps: int,
+    message_text: str | None = None,
+    stage_start_pct: float = 92.0,
+    stage_end_pct: float = 99.0,
+    **progress_details: Any,
+) -> None:
+    total_steps = max(int(total_steps or 1), 1)
+    completed_steps = max(0, min(int(completed_steps), total_steps))
+    phase_pct = (completed_steps / total_steps) * 100.0
+    progress_pct = _scale_stage_progress_pct(phase_pct, stage_start_pct, stage_end_pct)
+    progress_message = message_text or f"publishing {publish_step}"
+    progress_payload_dict = {
+        "phase": f"publishing: {publish_step}"[:128],
+        "unit": "publish_steps",
+        "done": completed_steps,
+        "total": total_steps,
+        "pct": progress_pct,
+        "phase_pct": phase_pct,
+        "message": progress_message,
+        "detail": progress_message,
+        "source": "ptg2-publish-progress",
+        "confidence": "live",
+        "publish_step": publish_step,
+        **{detail_key: detail_value for detail_key, detail_value in progress_details.items() if detail_value is not None},
+    }
+    try:
+        write_live_progress(**progress_payload_dict)
+    except Exception:
+        logger.debug("Failed to write PTG2 publish live progress", exc_info=True)
+
+
 def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     if not existing_paths:
@@ -750,6 +786,122 @@ def _collect_manifest_copy_files(
     return copy_files_by_kind, emitted_rows_by_kind
 
 
+async def _stream_manifest_copy_kind_with_progress(
+    kind: str,
+    *,
+    target_table: str,
+    input_paths: list[Path],
+    copy_func,
+    completed_steps_before_copy: int,
+    total_steps: int,
+    emitted_rows: int | None,
+) -> dict[str, Any]:
+    _emit_ptg2_publish_progress(
+        f"copying {kind}",
+        completed_steps=completed_steps_before_copy,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"streaming {kind} merge into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+        input_files=len(_ptg2_existing_manifest_copy_paths(input_paths)),
+        emitted_rows=emitted_rows,
+        streamed_to_copy=True,
+    )
+    copy_metrics = await _stream_ptg2_manifest_copy_merge(
+        kind,
+        target_table=target_table,
+        input_paths=input_paths,
+        copy_func=copy_func,
+    )
+    _emit_ptg2_publish_progress(
+        f"copied {kind}",
+        completed_steps=completed_steps_before_copy + 1,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"copied {int(copy_metrics.get('output_rows') or 0)} {kind} row(s) into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+        input_files=copy_metrics.get("input_files"),
+        input_rows=copy_metrics.get("input_rows"),
+        output_rows=copy_metrics.get("output_rows"),
+        dropped_rows=copy_metrics.get("dropped_rows"),
+        streamed_to_copy=True,
+    )
+    return copy_metrics
+
+
+async def _merge_manifest_copy_kind_with_progress(
+    kind: str,
+    output_path: Path,
+    input_paths: list[Path],
+    *,
+    completed_steps_before_merge: int,
+    total_steps: int,
+    emitted_rows: int | None,
+) -> dict[str, Any]:
+    _emit_ptg2_publish_progress(
+        f"merging {kind}",
+        completed_steps=completed_steps_before_merge,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"merging {kind} copy files",
+        copy_kind=kind,
+        input_files=len(_ptg2_existing_manifest_copy_paths(input_paths)),
+        emitted_rows=emitted_rows,
+    )
+    merge_metrics = await _run_ptg2_manifest_copy_merge(kind, output_path, input_paths)
+    _emit_ptg2_publish_progress(
+        f"merged {kind}",
+        completed_steps=completed_steps_before_merge + 1,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"merged {int(merge_metrics.get('output_rows') or 0)} {kind} row(s)",
+        copy_kind=kind,
+        input_files=merge_metrics.get("input_files"),
+        input_rows=merge_metrics.get("input_rows"),
+        output_rows=merge_metrics.get("output_rows"),
+        dropped_rows=merge_metrics.get("dropped_rows"),
+    )
+    return merge_metrics
+
+
+async def _copy_merged_manifest_kind_with_progress(
+    kind: str,
+    copy_path: Path,
+    *,
+    target_table: str,
+    copy_func,
+    completed_steps_before_copy: int,
+    total_steps: int,
+) -> None:
+    _emit_ptg2_publish_progress(
+        f"copying {kind}",
+        completed_steps=completed_steps_before_copy,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"copying merged {kind} rows into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+    )
+    await copy_func(copy_path, target_table=target_table)
+    _emit_ptg2_publish_progress(
+        f"copied {kind}",
+        completed_steps=completed_steps_before_copy + 1,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"copied merged {kind} rows into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+    )
+
+
 def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
     for copy_file_paths in copy_files_by_kind.values():
         for copy_file_path in copy_file_paths:
@@ -781,24 +933,35 @@ async def _merge_and_copy_ptg2_manifest_files(
     provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
     if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, True):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
+        progress_total = 3
+
         try:
-            serving_metrics = await _stream_ptg2_manifest_copy_merge(
+            serving_metrics = await _stream_manifest_copy_kind_with_progress(
                 manifest_serving_copy_kind,
                 target_table=manifest_stage_table,
                 input_paths=copy_files_by_kind[manifest_serving_copy_kind],
                 copy_func=manifest_serving_copy_func,
+                completed_steps_before_copy=0,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
             )
-            price_atom_metrics = await _stream_ptg2_manifest_copy_merge(
+            price_atom_metrics = await _stream_manifest_copy_kind_with_progress(
                 "price_atom",
                 target_table=price_atom_table,
                 input_paths=copy_files_by_kind["price_atom"],
                 copy_func=_copy_ptg2_manifest_price_atom_file,
+                completed_steps_before_copy=1,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("price_atom"),
             )
-            provider_group_member_metrics = await _stream_ptg2_manifest_copy_merge(
+            provider_group_member_metrics = await _stream_manifest_copy_kind_with_progress(
                 "provider_group_member",
                 target_table=provider_group_member_table,
                 input_paths=copy_files_by_kind["provider_group_member"],
                 copy_func=_copy_ptg2_manifest_provider_group_member_file,
+                completed_steps_before_copy=2,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
             )
             merge_metrics["kinds"] = {
                 manifest_serving_copy_kind: serving_metrics,
@@ -819,27 +982,56 @@ async def _merge_and_copy_ptg2_manifest_files(
     merged_price_atom = _new_merge_path("ptg2_manifest_price_atom_merged_")
     merged_provider_group_member = _new_merge_path("ptg2_manifest_provider_group_member_merged_")
     merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
+    progress_total = 6
+
     try:
-        serving_metrics = await _run_ptg2_manifest_copy_merge(
+        serving_metrics = await _merge_manifest_copy_kind_with_progress(
             manifest_serving_copy_kind,
             merged_serving,
             copy_files_by_kind[manifest_serving_copy_kind],
+            completed_steps_before_merge=0,
+            total_steps=progress_total,
+            emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
         )
-        price_atom_metrics = await _run_ptg2_manifest_copy_merge(
+        price_atom_metrics = await _merge_manifest_copy_kind_with_progress(
             "price_atom",
             merged_price_atom,
             copy_files_by_kind["price_atom"],
+            completed_steps_before_merge=1,
+            total_steps=progress_total,
+            emitted_rows=emitted_rows_by_kind.get("price_atom"),
         )
-        provider_group_member_metrics = await _run_ptg2_manifest_copy_merge(
+        provider_group_member_metrics = await _merge_manifest_copy_kind_with_progress(
             "provider_group_member",
             merged_provider_group_member,
             copy_files_by_kind["provider_group_member"],
+            completed_steps_before_merge=2,
+            total_steps=progress_total,
+            emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
         )
-        await manifest_serving_copy_func(merged_serving, target_table=manifest_stage_table)
-        await _copy_ptg2_manifest_price_atom_file(merged_price_atom, target_table=price_atom_table)
-        await _copy_ptg2_manifest_provider_group_member_file(
+        await _copy_merged_manifest_kind_with_progress(
+            manifest_serving_copy_kind,
+            merged_serving,
+            target_table=manifest_stage_table,
+            copy_func=manifest_serving_copy_func,
+            completed_steps_before_copy=3,
+            total_steps=progress_total,
+        )
+        await _copy_merged_manifest_kind_with_progress(
+            "price_atom",
+            merged_price_atom,
+            target_table=price_atom_table,
+            copy_func=_copy_ptg2_manifest_price_atom_file,
+            completed_steps_before_copy=4,
+            total_steps=progress_total,
+        )
+        await _copy_merged_manifest_kind_with_progress(
+            "provider_group_member",
             merged_provider_group_member,
             target_table=provider_group_member_table,
+            copy_func=_copy_ptg2_manifest_provider_group_member_file,
+            completed_steps_before_copy=5,
+            total_steps=progress_total,
         )
         merge_metrics["kinds"] = {
             manifest_serving_copy_kind: serving_metrics,
@@ -3002,26 +3194,61 @@ async def main(
         data_seconds = time.monotonic() - data_started_monotonic
         publish_started_monotonic = time.monotonic()
         write_live_progress(phase="publishing", pct=92, message="publishing PTG snapshot")
+        publish_progress_total = 8
+        _emit_ptg2_publish_progress(
+            "starting",
+            completed_steps=0,
+            total_steps=publish_progress_total,
+            message_text="starting PTG snapshot publish",
+        )
         manifest_merge_metrics: dict[str, Any] = {"enabled": False}
         has_serving_files = any(
             file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
             for file_summary in successful_files
         )
         if has_serving_files and _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
+            _emit_ptg2_publish_progress(
+                "pre-copy merge",
+                completed_steps=0,
+                total_steps=publish_progress_total,
+                message_text="merging manifest copy files before publish",
+            )
             manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
+            )
+            _emit_ptg2_publish_progress(
+                "pre-copy merge complete",
+                completed_steps=4,
+                total_steps=publish_progress_total,
+                message_text="manifest copy files loaded into staging tables",
+                serving_rows=manifest_merge_metrics.get("serving_rows"),
+                streamed_to_copy=manifest_merge_metrics.get("streamed_to_copy"),
             )
             for file_summary in successful_files:
                 summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
                 manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
                 if isinstance(manifest_payload, dict):
                     manifest_payload.pop("copy_files", None)
+        else:
+            _emit_ptg2_publish_progress(
+                "pre-copy merge skipped",
+                completed_steps=4,
+                total_steps=publish_progress_total,
+                message_text="manifest pre-copy merge skipped",
+                has_serving_files=has_serving_files,
+            )
         manifest_artifacts = _collect_manifest_artifacts(successful_files)
         assert source_key_val is not None
         if has_serving_files:
             if not ptg2_manifest_stage_table:
                 raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
+            _emit_ptg2_publish_progress(
+                "publishing snapshot tables",
+                completed_steps=5,
+                total_steps=publish_progress_total,
+                message_text="publishing PTG manifest snapshot tables",
+            )
             serving_index = await _publish_ptg2_manifest_serving_snapshot(
                 ptg2_manifest_stage_table,
                 snapshot_id=snapshot_id,
@@ -3033,8 +3260,22 @@ async def main(
                 db_dedupe_fallback=True,
             )
             ptg2_manifest_stage_table = None
+            _emit_ptg2_publish_progress(
+                "snapshot tables published",
+                completed_steps=6,
+                total_steps=publish_progress_total,
+                message_text="PTG manifest snapshot tables published",
+                serving_rates=serving_index.get("serving_rates") if isinstance(serving_index, dict) else None,
+                rate_count=serving_index.get("rate_count") if isinstance(serving_index, dict) else None,
+            )
         else:
             if ptg2_manifest_stage_table:
+                _emit_ptg2_publish_progress(
+                    "dropping empty staging tables",
+                    completed_steps=5,
+                    total_steps=publish_progress_total,
+                    message_text="dropping PTG staging tables without serving files",
+                )
                 await _drop_ptg2_snapshot_table_names(
                     [
                         ptg2_manifest_stage_table,
@@ -3109,6 +3350,12 @@ async def main(
             rewrite=True,
         )
         if has_serving_files and source_scoped_compact and source_key_val:
+            _emit_ptg2_publish_progress(
+                "updating source pointer",
+                completed_steps=6,
+                total_steps=publish_progress_total,
+                message_text="updating PTG source snapshot pointer",
+            )
             await _publish_ptg2_source_pointers(
                 source_key=source_key_val,
                 snapshot_id=snapshot_id,
@@ -3132,10 +3379,22 @@ async def main(
             )
             current_pointer_published = True
         if has_serving_files and source_scoped_compact and source_key_val:
+            _emit_ptg2_publish_progress(
+                "cleaning old source tables",
+                completed_steps=7,
+                total_steps=publish_progress_total,
+                message_text="cleaning old PTG source tables",
+            )
             keep_snapshot_ids = {snapshot_id}
             if previous_snapshot_id:
                 keep_snapshot_ids.add(previous_snapshot_id)
             await _cleanup_old_ptg2_source_tables(source_key_val, keep_snapshot_ids)
+        _emit_ptg2_publish_progress(
+            "address refresh",
+            completed_steps=7,
+            total_steps=publish_progress_total,
+            message_text="checking PTG address-refresh follow-up",
+        )
         address_refresh_result = await _enqueue_ptg2_auto_address_refresh_after_import(
             source_key=source_key_val,
             snapshot_id=snapshot_id,
@@ -3143,6 +3402,13 @@ async def main(
             has_serving_files=has_serving_files,
             source_scoped_compact=source_scoped_compact,
             test_mode=test_mode,
+        )
+        _emit_ptg2_publish_progress(
+            "validated",
+            completed_steps=8,
+            total_steps=publish_progress_total,
+            message_text="PTG publish validation complete",
+            address_refresh_status=address_refresh_result.get("status") if isinstance(address_refresh_result, dict) else None,
         )
         report_payload["address_refresh"] = address_refresh_result
         await _push_ptg2_objects(
