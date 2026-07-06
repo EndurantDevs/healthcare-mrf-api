@@ -165,7 +165,7 @@ def _ptg2_snapshot_arch_from_env() -> str | None:
     if raw is None or not str(raw).strip():
         return PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1
     normalized = str(raw).strip().lower().replace("-", "_")
-    aliases = {
+    arch_alias_map = {
         "materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
         "materialized_v1": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
         "legacy": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
@@ -176,12 +176,12 @@ def _ptg2_snapshot_arch_from_env() -> str | None:
         "sidecar_scope": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
         "sidecar_scope_v1": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
     }
-    if normalized not in aliases:
+    if normalized not in arch_alias_map:
         raise ValueError(
             f"Unsupported {PTG2_SNAPSHOT_ARCH_ENV}={raw!r}; "
             f"expected {PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1!r} or {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1!r}"
         )
-    return aliases[normalized]
+    return arch_alias_map[normalized]
 
 
 def _ptg2_snapshot_arch_variant(arch_version: str | None = None) -> str | None:

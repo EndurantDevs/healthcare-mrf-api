@@ -73,6 +73,7 @@ class PTG2ServingTables:
 
     @property
     def effective_arch_version(self) -> str:
+        """Return the serving architecture, inferring legacy manifests when needed."""
         arch_version = (self.arch_version or "").strip().lower()
         if arch_version:
             return arch_version
@@ -88,5 +89,6 @@ class PTG2ServingTables:
 
     @property
     def uses_sidecar_provider_scope(self) -> bool:
+        """Return true when provider-set membership is served from sidecar artifacts."""
         strategy = (self.provider_scope_strategy or "").strip().lower()
         return strategy == "sidecar_provider_scope" or self.effective_arch_version == "sidecar_scope_v1"

@@ -603,14 +603,14 @@ def _nonlean_source_level_case(monkeypatch):
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
-        serving_table="mrf.ptg2_serving_plastipak_snap",
-        code_count_table="mrf.ptg2_code_count_plastipak_snap",
-        source_key="ptg_plastipak",
+        serving_table="mrf.ptg2_serving_example_packaging_snap",
+        code_count_table="mrf.ptg2_code_count_example_packaging_snap",
+        source_key="ptg_example_packaging",
         id_storage="uuid",
     )
 
     async def is_table_available(_session, table_name):
-        assert table_name == "mrf.ptg2_serving_plastipak_snap"
+        assert table_name == "mrf.ptg2_serving_example_packaging_snap"
         return True
 
     async def price_rows(_session, _tables, price_hashes):
@@ -630,7 +630,7 @@ def _nonlean_source_level_case(monkeypatch):
 async def _search_nonlean_source_case(session, tables, args):
     return await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
-        "ptg2:202607:plastipak",
+        "ptg2:202607:example-packaging",
         args,
         FakePagination(),
         tables,
@@ -676,7 +676,7 @@ async def test_nonlean_manifest_serving_uses_source_level_plan_rows(monkeypatch)
         {
             "plan_id": "382418014",
             "market_type": "group",
-            "source_key": "ptg_plastipak",
+            "source_key": "ptg_example_packaging",
             "code": "49452",
             "code_system": "CPT",
         },
@@ -700,7 +700,7 @@ async def test_nonlean_manifest_serving_accepts_source_key_only(monkeypatch):
     payload = await _search_nonlean_source_case(
         session,
         tables,
-        {"source_key": "ptg_plastipak", "code": "49452", "code_system": "CPT"},
+        {"source_key": "ptg_example_packaging", "code": "49452", "code_system": "CPT"},
     )
 
     count_sql = str(session.calls[0][0][0])

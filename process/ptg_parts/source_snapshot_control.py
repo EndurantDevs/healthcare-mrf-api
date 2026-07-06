@@ -228,6 +228,7 @@ async def retire_ptg2_source_snapshot(
     snapshot_id: str,
     source_key: str | None = None,
 ) -> dict[str, Any]:
+    """Retire one source-scoped PTG2 snapshot and delete its serving artifacts."""
     snapshot_id = str(snapshot_id or "").strip()
     source_key = str(source_key or "").strip() or None
     if not snapshot_id:
@@ -236,32 +237,34 @@ async def retire_ptg2_source_snapshot(
     snapshot = await _snapshot_row(schema, snapshot_id)
     manifest_source_key = None
     if snapshot:
-        manifest = _manifest_dict(snapshot.get("manifest"))
-        serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
-        manifest_source_key = str(serving_index.get("source_key") or "").strip() or None
+        manifest_map = _manifest_dict(snapshot.get("manifest"))
+        serving_index_map = (
+            manifest_map.get("serving_index") if isinstance(manifest_map.get("serving_index"), dict) else {}
+        )
+        manifest_source_key = str(serving_index_map.get("source_key") or "").strip() or None
     if source_key and manifest_source_key and source_key != manifest_source_key:
         raise ValueError("snapshot source_key does not match requested source_key")
     before = await _current_references(schema, snapshot_id)
     if before.get("global_slots"):
         raise ValueError("snapshot is referenced by current global pointer")
-    params: dict[str, Any] = {"snapshot_id": snapshot_id}
+    query_param_map: dict[str, Any] = {"snapshot_id": snapshot_id}
     source_filter = ""
     if source_key:
-        params["source_key"] = source_key
+        query_param_map["source_key"] = source_key
         source_filter = " AND source_key = :source_key"
     deleted_plan_pointers = await db.status(
         f"""
         DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source
          WHERE snapshot_id = :snapshot_id{source_filter}
         """,
-        **params,
+        **query_param_map,
     )
     deleted_source_pointers = await db.status(
         f"""
         DELETE FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
          WHERE snapshot_id = :snapshot_id{source_filter}
         """,
-        **params,
+        **query_param_map,
     )
     _clear_ptg2_snapshot_cache()
     after = await _current_references(schema, snapshot_id)

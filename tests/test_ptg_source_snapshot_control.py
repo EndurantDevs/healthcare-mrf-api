@@ -252,13 +252,15 @@ def test_remove_ptg2_source_snapshot_delegates_table_drop_and_metadata_delete(mo
     monkeypatch.setattr(source_snapshot_control, "_drop_ptg2_snapshot_table_names", AsyncMock(side_effect=dropped_tables.append))
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
 
-    result = asyncio.run(source_snapshot_control.remove_ptg2_source_snapshot(snapshot_id="snap_old", source_key="source_a"))
+    cleanup_summary = asyncio.run(
+        source_snapshot_control.remove_ptg2_source_snapshot(snapshot_id="snap_old", source_key="source_a")
+    )
 
     assert dropped_tables == [["ptg2_rates_old", "ptg2_providers_old"]]
-    assert result["executed"] is True
-    assert result["deleted_tables"] == 2
-    assert result["deleted_artifact_manifests"] == 1
-    assert result["deleted_snapshots"] == 1
+    assert cleanup_summary["executed"] is True
+    assert cleanup_summary["deleted_tables"] == 2
+    assert cleanup_summary["deleted_artifact_manifests"] == 1
+    assert cleanup_summary["deleted_snapshots"] == 1
     assert len(status_calls) == 2
     assert all(call[1]["snapshot_id"] == "snap_old" for call in status_calls)
 
@@ -293,18 +295,18 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(mo
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: clear_calls.append(True))
 
-    result = asyncio.run(
+    retire_summary = asyncio.run(
         source_snapshot_control.retire_ptg2_source_snapshot(
             snapshot_id="snap_live",
             source_key="source_a",
         )
     )
 
-    assert result["retired"] is True
-    assert result["deleted_plan_pointers"] == 1
-    assert result["deleted_source_pointers"] == 1
-    assert result["previous_current_references"]["source_keys"] == ["source_a"]
-    assert result["current_references"]["source_keys"] == []
+    assert retire_summary["retired"] is True
+    assert retire_summary["deleted_plan_pointers"] == 1
+    assert retire_summary["deleted_source_pointers"] == 1
+    assert retire_summary["previous_current_references"]["source_keys"] == ["source_a"]
+    assert retire_summary["current_references"]["source_keys"] == []
     assert len(status_calls) == 2
     assert all(call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"} for call in status_calls)
     assert any("ptg2_current_plan_source" in call[0] for call in status_calls)

@@ -196,7 +196,7 @@ def _ptg2_manifest_serving_layout() -> str:
     return str(os.getenv(PTG2_MANIFEST_SERVING_LAYOUT_ENV) or "").strip().lower()
 
 
-def _ptg2_manifest_lean_direct_copy_enabled() -> bool:
+def _use_direct_lean_manifest_copy() -> bool:
     if _ptg2_manifest_serving_layout() != PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY:
         return False
     return _env_bool(PTG2_MANIFEST_LEAN_DIRECT_COPY_ENV, True)
@@ -263,7 +263,7 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-    if _ptg2_manifest_lean_direct_copy_enabled():
+    if _use_direct_lean_manifest_copy():
         await db.status(
             f"""
             CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
@@ -350,7 +350,7 @@ async def _copy_ptg2_manifest_serving_file(copy_path: Path, *, target_table: str
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_SERVING_COLUMNS)
 
 
-async def _copy_ptg2_manifest_lean_serving_file(copy_path: Path, *, target_table: str) -> None:
+async def _copy_lean_manifest_serving_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(
         copy_path,
         target_table=target_table,
@@ -1171,7 +1171,7 @@ async def _ptg2_manifest_serving_constants(
     }
 
 
-def _ptg2_manifest_serving_constants_from_artifacts(
+def _manifest_constants_from_artifacts(
     artifacts: Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
     if not artifacts:
@@ -1294,7 +1294,7 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     }
 
 
-async def _dedupe_ptg2_manifest_lean_source_table(schema_name: str, final_table: str) -> dict[str, int]:
+async def _dedupe_lean_manifest_stage(schema_name: str, final_table: str) -> dict[str, int]:
     serving_rows_before_dedupe = await _exact_table_rows(schema_name, final_table)
     dedup_table = _ptg2_snapshot_index_name(final_table, "dedup")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(dedup_table)};")
@@ -1339,21 +1339,14 @@ async def _dedupe_ptg2_manifest_lean_source_table(schema_name: str, final_table:
     }
 
 
-async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
+async def _build_direct_lean_code_counts(
     *,
     schema_name: str,
     final_table: str,
     code_count_table: str,
-    provider_set_dictionary_table: str,
-    constants: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
-    lean_table = _ptg2_snapshot_index_name(final_table, "lean")
+    storage_mode: str,
+) -> None:
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
-    await db.status(
-        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} CASCADE;"
-    )
-    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(lean_table)} CASCADE;")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
@@ -1367,6 +1360,18 @@ async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
         GROUP BY plan_id, reported_code_system, reported_code;
         """
     )
+
+
+async def _build_direct_lean_provider_sets(
+    *,
+    schema_name: str,
+    final_table: str,
+    provider_set_dictionary_table: str,
+    storage_mode: str,
+) -> None:
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} CASCADE;"
+    )
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} AS
@@ -1379,6 +1384,18 @@ async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
         ) provider_sets;
         """
     )
+
+
+async def _swap_direct_lean_stage(
+    *,
+    schema_name: str,
+    final_table: str,
+    lean_table: str,
+    code_count_table: str,
+    provider_set_dictionary_table: str,
+    storage_mode: str,
+) -> None:
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(lean_table)} CASCADE;")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
@@ -1403,6 +1420,15 @@ async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
         RENAME TO {_quote_ident(final_table)};
         """
     )
+
+
+async def _index_direct_lean_tables(
+    *,
+    schema_name: str,
+    final_table: str,
+    code_count_table: str,
+    provider_set_dictionary_table: str,
+) -> None:
     lookup_index = _ptg2_snapshot_index_name(final_table, "lean_code_lookup_idx")
     code_lookup_index = _ptg2_snapshot_index_name(code_count_table, "lean_code_idx")
     provider_set_key_index = _ptg2_snapshot_index_name(provider_set_dictionary_table, "key_idx")
@@ -1430,6 +1456,45 @@ async def _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
         """
     )
     await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)};")
+
+
+async def _rewrite_direct_lean_manifest_stage(
+    *,
+    schema_name: str,
+    final_table: str,
+    code_count_table: str,
+    provider_set_dictionary_table: str,
+    constants: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Rewrite the narrow direct-copy stage into lean provider-key serving tables."""
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    lean_table = _ptg2_snapshot_index_name(final_table, "lean")
+    await _build_direct_lean_code_counts(
+        schema_name=schema_name,
+        final_table=final_table,
+        code_count_table=code_count_table,
+        storage_mode=storage_mode,
+    )
+    await _build_direct_lean_provider_sets(
+        schema_name=schema_name,
+        final_table=final_table,
+        provider_set_dictionary_table=provider_set_dictionary_table,
+        storage_mode=storage_mode,
+    )
+    await _swap_direct_lean_stage(
+        schema_name=schema_name,
+        final_table=final_table,
+        lean_table=lean_table,
+        code_count_table=code_count_table,
+        provider_set_dictionary_table=provider_set_dictionary_table,
+        storage_mode=storage_mode,
+    )
+    await _index_direct_lean_tables(
+        schema_name=schema_name,
+        final_table=final_table,
+        code_count_table=code_count_table,
+        provider_set_dictionary_table=provider_set_dictionary_table,
+    )
     return {
         "serving_table_layout": PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
         "provider_set_dictionary_table": f"{schema_name}.{provider_set_dictionary_table}",
@@ -1466,7 +1531,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     price_atom_dictionary_table = _ptg2_snapshot_table_name("price_atom_dict", source_key, snapshot_id)
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     started_at = time.monotonic()
-    lean_source_stage = _ptg2_manifest_lean_direct_copy_enabled()
+    use_lean_source_stage = _use_direct_lean_manifest_copy()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
     await db.status(
@@ -1515,15 +1580,15 @@ async def _publish_ptg2_manifest_serving_snapshot(
     )
     dedupe_metrics: dict[str, Any] = {"db_dedupe": use_db_dedupe}
     serving_deduped = False
-    if use_db_dedupe and lean_source_stage:
-        dedupe_metrics["serving"] = {"skipped": "lean_source_stage"}
+    if use_db_dedupe and use_lean_source_stage:
+        dedupe_metrics["serving"] = {"skipped": "use_lean_source_stage"}
     elif use_db_dedupe:
         dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
         serving_deduped = True
     unique_index = _ptg2_snapshot_index_name(final_table, "content_uidx")
     lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_lookup_idx")
     provider_set_lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_provider_set_idx")
-    if lean_source_stage:
+    if use_lean_source_stage:
         lean_source_unique_index = _ptg2_snapshot_index_name(final_table, "lean_src_uidx")
         try:
             await db.status(
@@ -1549,7 +1614,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
             )
             dedupe_metrics["db_dedupe"] = True
             dedupe_metrics["rescue"] = True
-            dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_lean_source_table(schema_name, final_table)
+            dedupe_metrics["serving"] = await _dedupe_lean_manifest_stage(schema_name, final_table)
             serving_deduped = True
             await db.status(
                 f"""
@@ -1599,13 +1664,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(unique_index)};")
     lean_serving_manifest: dict[str, Any] | None = None
     if _ptg2_manifest_serving_layout() == PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY:
-        if lean_source_stage:
-            lean_serving_manifest = await _rewrite_ptg2_manifest_lean_source_table_lean_provider_key(
+        if use_lean_source_stage:
+            lean_serving_manifest = await _rewrite_direct_lean_manifest_stage(
                 schema_name=schema_name,
                 final_table=final_table,
                 code_count_table=code_count_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
-                constants=_ptg2_manifest_serving_constants_from_artifacts(artifacts),
+                constants=_manifest_constants_from_artifacts(artifacts),
             )
         else:
             lean_serving_manifest = await _rewrite_ptg2_manifest_serving_table_lean_provider_key(
@@ -1762,26 +1827,26 @@ async def _publish_ptg2_manifest_serving_snapshot(
     elapsed_seconds = time.monotonic() - started_at
     artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
     arch_version = _ptg2_manifest_snapshot_arch()
-    materialized_tables = {
+    materialized_table_map = {
         "serving": f"{schema_name}.{final_table}",
         "price_atom": f"{schema_name}.{price_atom_table}",
         "provider_group_member": f"{schema_name}.{provider_group_member_table}",
         "code_count": f"{schema_name}.{code_count_table}",
     }
     if (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"):
-        materialized_tables["price_atom_dictionary"] = (lean_price_atom_manifest or {})[
+        materialized_table_map["price_atom_dictionary"] = (lean_price_atom_manifest or {})[
             "price_atom_dictionary_table"
         ]
     if (lean_serving_manifest or {}).get("provider_set_dictionary_table"):
-        materialized_tables["provider_set_dictionary"] = (lean_serving_manifest or {})[
+        materialized_table_map["provider_set_dictionary"] = (lean_serving_manifest or {})[
             "provider_set_dictionary_table"
         ]
     if materialized_provider_group_location_table:
-        materialized_tables["provider_group_location"] = f"{schema_name}.{materialized_provider_group_location_table}"
+        materialized_table_map["provider_group_location"] = f"{schema_name}.{materialized_provider_group_location_table}"
     if materialized_provider_set_component_table:
-        materialized_tables["provider_set_component"] = f"{schema_name}.{materialized_provider_set_component_table}"
+        materialized_table_map["provider_set_component"] = f"{schema_name}.{materialized_provider_set_component_table}"
     if materialized_provider_group_rate_scope_table:
-        materialized_tables["provider_group_rate_scope"] = (
+        materialized_table_map["provider_group_rate_scope"] = (
             f"{schema_name}.{materialized_provider_group_rate_scope_table}"
         )
     if materialized_provider_group_rate_scope_table:
@@ -1798,7 +1863,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "source_key": source_key,
         "arch_version": arch_version,
         "provider_scope_strategy": provider_scope_strategy,
-        "materialized_tables": materialized_tables,
+        "materialized_tables": materialized_table_map,
         "table": f"{schema_name}.{final_table}",
         "price_atom_table": f"{schema_name}.{price_atom_table}",
         "price_atom_table_layout": (lean_price_atom_manifest or {}).get("price_atom_table_layout"),

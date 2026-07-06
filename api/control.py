@@ -174,6 +174,7 @@ async def control_ptg_source_snapshot_remove(request):
 
 @blueprint.post("/ptg/source-snapshots/retire")
 async def control_ptg_source_snapshot_retire(request):
+    """Retire a source-scoped PTG2 snapshot after validating control-plane auth."""
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:

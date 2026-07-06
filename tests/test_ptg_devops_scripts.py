@@ -49,7 +49,7 @@ def test_ptg_compare_parser_accepts_latency_benchmark_options():
 
 
 def test_ptg_compare_summarize_ms_reports_percentile():
-    module = _load_script("ptg2_compare_snapshots")
+    module = _load_script("ptg2_compare_snapshot_checks")
 
     summary = module._summarize_ms([10.0, 20.0, 30.0])
 

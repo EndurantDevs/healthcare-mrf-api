@@ -203,12 +203,12 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT)
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
-    _copy_ptg2_manifest_lean_serving_file,
+    _copy_lean_manifest_serving_file,
     _copy_ptg2_manifest_price_atom_file,
     _copy_ptg2_manifest_provider_group_member_file,
     _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
-    _ptg2_manifest_lean_direct_copy_enabled,
+    _use_direct_lean_manifest_copy,
     _ptg2_manifest_serving_layout,
     _ptg2_manifest_support_stage_table,
     _publish_ptg2_manifest_serving_snapshot)
@@ -550,7 +550,7 @@ def _ptg2_manifest_copy_merge_command(kind: str, output_path: Path, input_paths:
     ]
 
 
-def _parse_ptg2_manifest_copy_merge_summary(
+def _manifest_merge_summary_from_stdout(
     stdout: bytes,
     *,
     kind: str,
@@ -592,7 +592,7 @@ def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(f"PTG2 manifest pre-COPY merge failed for {kind}: {stderr[-1000:]}")
-    return _parse_ptg2_manifest_copy_merge_summary(
+    return _manifest_merge_summary_from_stdout(
         process.stdout,
         kind=kind,
         input_paths=existing_paths,
@@ -604,6 +604,65 @@ async def _run_ptg2_manifest_copy_merge(kind: str, output_path: Path, input_path
     return await asyncio.to_thread(_run_ptg2_manifest_copy_merge_sync, kind, output_path, input_paths)
 
 
+def _manifest_stream_fifo_path(kind: str) -> Path:
+    fd, raw_fifo_path = tempfile.mkstemp(prefix=f"ptg2_{kind}_stream_", suffix=".copy", dir=ptg2_temp_parent())
+    os.close(fd)
+    fifo_path = Path(raw_fifo_path)
+    fifo_path.unlink(missing_ok=True)
+    os.mkfifo(fifo_path)
+    return fifo_path
+
+
+def _close_manifest_fifo_fd(file_descriptor: int) -> None:
+    try:
+        os.close(file_descriptor)
+    except OSError as exc:
+        logger.debug("failed to close PTG2 manifest FIFO descriptor %s: %s", file_descriptor, exc)
+
+
+def _start_manifest_fifo_closer(process: subprocess.Popen[bytes], file_descriptor: int) -> threading.Thread:
+    def wait_for_process_and_close_fifo() -> None:
+        """Close the dummy FIFO writer after the Rust merge process exits."""
+        process.wait()
+        _close_manifest_fifo_fd(file_descriptor)
+
+    closer_thread = threading.Thread(target=wait_for_process_and_close_fifo, daemon=True)
+    closer_thread.start()
+    return closer_thread
+
+
+async def _terminate_manifest_merge_process(process: subprocess.Popen[bytes], kind: str) -> None:
+    if process.poll() is None:
+        process.terminate()
+    _stdout, stderr = await asyncio.to_thread(process.communicate)
+    if process.returncode:
+        logger.warning(
+            "PTG2 manifest streaming pre-COPY merge failed during COPY for %s: %s",
+            kind,
+            stderr.decode("utf-8", errors="replace")[-1000:],
+        )
+
+
+async def _copy_manifest_fifo_and_collect_stdout(
+    *,
+    kind: str,
+    fifo_path: Path,
+    target_table: str,
+    copy_func,
+    process: subprocess.Popen[bytes],
+) -> bytes:
+    try:
+        await copy_func(fifo_path, target_table=target_table)
+    except Exception:
+        await _terminate_manifest_merge_process(process, kind)
+        raise
+    stdout, stderr = await asyncio.to_thread(process.communicate)
+    if process.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"PTG2 manifest streaming pre-COPY merge failed for {kind}: {stderr_text[-1000:]}")
+    return stdout
+
+
 async def _stream_ptg2_manifest_copy_merge(
     kind: str,
     *,
@@ -611,62 +670,33 @@ async def _stream_ptg2_manifest_copy_merge(
     input_paths: list[Path],
     copy_func,
 ) -> dict[str, Any]:
+    """Run the Rust merge producer directly into a PostgreSQL COPY reader."""
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     if not existing_paths:
         return {"kind": kind, "input_files": 0, "input_rows": 0, "output_rows": 0, "dropped_rows": 0}
     if not hasattr(os, "mkfifo"):
         raise RuntimeError("PTG2 manifest streaming pre-COPY merge requires POSIX named pipes")
 
-    fd, raw_fifo_path = tempfile.mkstemp(prefix=f"ptg2_{kind}_stream_", suffix=".copy", dir=ptg2_temp_parent())
-    os.close(fd)
-    fifo_path = Path(raw_fifo_path)
-    fifo_path.unlink(missing_ok=True)
-    os.mkfifo(fifo_path)
-    dummy_fd: int | None = None
-    process: subprocess.Popen[bytes] | None = None
+    fifo_path = _manifest_stream_fifo_path(kind)
+    dummy_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
     closer_thread: threading.Thread | None = None
 
-    def close_dummy_when_process_exits() -> None:
-        nonlocal dummy_fd
-        if process is None:
-            return
-        try:
-            process.wait()
-        finally:
-            if dummy_fd is not None:
-                try:
-                    os.close(dummy_fd)
-                except OSError:
-                    pass
-                dummy_fd = None
-
     try:
-        dummy_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
         process = subprocess.Popen(
             _ptg2_manifest_copy_merge_command(kind, fifo_path, existing_paths),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        closer_thread = threading.Thread(target=close_dummy_when_process_exits, daemon=True)
-        closer_thread.start()
-        try:
-            await copy_func(fifo_path, target_table=target_table)
-        except Exception:
-            if process.poll() is None:
-                process.terminate()
-            stdout, stderr = await asyncio.to_thread(process.communicate)
-            if process.returncode:
-                logger.warning(
-                    "PTG2 manifest streaming pre-COPY merge failed during COPY for %s: %s",
-                    kind,
-                    stderr.decode("utf-8", errors="replace")[-1000:],
-                )
-            raise
-        stdout, stderr = await asyncio.to_thread(process.communicate)
-        if process.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"PTG2 manifest streaming pre-COPY merge failed for {kind}: {stderr_text[-1000:]}")
-        summary = _parse_ptg2_manifest_copy_merge_summary(
+        closer_thread = _start_manifest_fifo_closer(process, dummy_fd)
+        dummy_fd = -1
+        stdout = await _copy_manifest_fifo_and_collect_stdout(
+            kind=kind,
+            fifo_path=fifo_path,
+            target_table=target_table,
+            copy_func=copy_func,
+            process=process,
+        )
+        summary = _manifest_merge_summary_from_stdout(
             stdout,
             kind=kind,
             input_paths=existing_paths,
@@ -675,14 +705,58 @@ async def _stream_ptg2_manifest_copy_merge(
         summary["streamed_to_copy"] = True
         return summary
     finally:
-        if dummy_fd is not None:
-            try:
-                os.close(dummy_fd)
-            except OSError:
-                pass
+        if dummy_fd >= 0:
+            _close_manifest_fifo_fd(dummy_fd)
         if closer_thread is not None:
             closer_thread.join(timeout=1)
         fifo_path.unlink(missing_ok=True)
+
+
+def _manifest_serving_copy_settings():
+    use_direct_lean_copy = _use_direct_lean_manifest_copy()
+    if use_direct_lean_copy:
+        return "manifest_lean_serving", _copy_lean_manifest_serving_file, True
+    return "manifest_serving", _copy_ptg2_manifest_serving_file, False
+
+
+def _copy_file_row_count(copy_file_entry: dict[str, Any]) -> int:
+    try:
+        return int(copy_file_entry.get("row_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _collect_manifest_copy_files(
+    successful_files: list[dict[str, Any]],
+    copy_kinds: list[str],
+) -> tuple[dict[str, list[Path]], dict[str, int]]:
+    copy_files_by_kind: dict[str, list[Path]] = {kind: [] for kind in copy_kinds}
+    emitted_rows_by_kind: dict[str, int] = {kind: 0 for kind in copy_kinds}
+    for file_summary in successful_files:
+        summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
+        manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
+        copy_files = manifest_payload.get("copy_files") if isinstance(manifest_payload, dict) else None
+        if not isinstance(copy_files, dict):
+            continue
+        for kind in copy_kinds:
+            for copy_file_entry in copy_files.get(kind) or []:
+                if not isinstance(copy_file_entry, dict):
+                    continue
+                raw_path = str(copy_file_entry.get("path") or "").strip()
+                if not raw_path:
+                    continue
+                copy_files_by_kind[kind].append(Path(raw_path))
+                emitted_rows_by_kind[kind] += _copy_file_row_count(copy_file_entry)
+    return copy_files_by_kind, emitted_rows_by_kind
+
+
+def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
+    for copy_file_paths in copy_files_by_kind.values():
+        for copy_file_path in copy_file_paths:
+            try:
+                copy_file_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to remove PTG2 manifest merge file %s", copy_file_path, exc_info=True)
 
 
 async def _merge_and_copy_ptg2_manifest_files(
@@ -690,38 +764,9 @@ async def _merge_and_copy_ptg2_manifest_files(
     successful_files: list[dict[str, Any]],
     manifest_stage_table: str,
 ) -> dict[str, Any]:
-    lean_direct_manifest_copy = _ptg2_manifest_lean_direct_copy_enabled()
-    manifest_serving_copy_kind = "manifest_lean_serving" if lean_direct_manifest_copy else "manifest_serving"
-    manifest_serving_copy_func = (
-        _copy_ptg2_manifest_lean_serving_file if lean_direct_manifest_copy else _copy_ptg2_manifest_serving_file
-    )
-    copy_files_by_kind: dict[str, list[Path]] = {
-        manifest_serving_copy_kind: [],
-        "price_atom": [],
-        "provider_group_member": [],
-    }
-    emitted_rows_by_kind: dict[str, int] = {kind: 0 for kind in copy_files_by_kind}
-    for file_summary in successful_files:
-        summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
-        manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
-        copy_files = manifest_payload.get("copy_files") if isinstance(manifest_payload, dict) else None
-        if not isinstance(copy_files, dict):
-            continue
-        for kind in copy_files_by_kind:
-            entries = copy_files.get(kind) or []
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                raw_path = str(entry.get("path") or "").strip()
-                if not raw_path:
-                    continue
-                copy_files_by_kind[kind].append(Path(raw_path))
-                try:
-                    emitted_rows_by_kind[kind] += int(entry.get("row_count") or 0)
-                except (TypeError, ValueError):
-                    pass
+    manifest_serving_copy_kind, manifest_serving_copy_func, use_direct_lean_copy = _manifest_serving_copy_settings()
+    copy_kinds = [manifest_serving_copy_kind, "price_atom", "provider_group_member"]
+    copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(successful_files, copy_kinds)
     if not any(copy_files_by_kind.values()):
         return {"enabled": False, "reason": "no_deferred_copy_files"}
 
@@ -765,18 +810,10 @@ async def _merge_and_copy_ptg2_manifest_files(
             _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
             return merge_metrics
         finally:
-            for path in (
-                *copy_files_by_kind[manifest_serving_copy_kind],
-                *copy_files_by_kind["price_atom"],
-                *copy_files_by_kind["provider_group_member"],
-            ):
-                try:
-                    path.unlink(missing_ok=True)
-                except Exception:
-                    logger.debug("Failed to remove PTG2 manifest merge file %s", path, exc_info=True)
+            _cleanup_manifest_copy_paths(copy_files_by_kind)
 
     serving_merge_prefix = (
-        "ptg2_manifest_lean_serving_merged_" if lean_direct_manifest_copy else "ptg2_manifest_serving_merged_"
+        "ptg2_manifest_lean_serving_merged_" if use_direct_lean_copy else "ptg2_manifest_serving_merged_"
     )
     merged_serving = _new_merge_path(serving_merge_prefix)
     merged_price_atom = _new_merge_path("ptg2_manifest_price_atom_merged_")
@@ -813,18 +850,12 @@ async def _merge_and_copy_ptg2_manifest_files(
         _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
         return merge_metrics
     finally:
-        for path in (
-            merged_serving,
-            merged_price_atom,
-            merged_provider_group_member,
-            *copy_files_by_kind[manifest_serving_copy_kind],
-            *copy_files_by_kind["price_atom"],
-            *copy_files_by_kind["provider_group_member"],
-        ):
+        for path in (merged_serving, merged_price_atom, merged_provider_group_member):
             try:
                 path.unlink(missing_ok=True)
             except Exception:
                 logger.debug("Failed to remove PTG2 manifest merge file %s", path, exc_info=True)
+        _cleanup_manifest_copy_paths(copy_files_by_kind)
 
 
 async def _parse_in_network_file_serving_only(
@@ -871,13 +902,13 @@ async def _parse_in_network_file_serving_only(
     rust_scanner_summary: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
     defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True)
-    lean_direct_manifest_copy = _ptg2_manifest_lean_direct_copy_enabled()
-    manifest_serving_copy_kind = "manifest_lean_serving" if lean_direct_manifest_copy else "manifest_serving"
+    use_direct_lean_copy = _use_direct_lean_manifest_copy()
+    manifest_serving_copy_kind = "manifest_lean_serving" if use_direct_lean_copy else "manifest_serving"
     manifest_serving_record_kind = (
-        "manifest_lean_serving_copy_file" if lean_direct_manifest_copy else "manifest_serving_copy_file"
+        "manifest_lean_serving_copy_file" if use_direct_lean_copy else "manifest_serving_copy_file"
     )
     manifest_serving_copy_func = (
-        _copy_ptg2_manifest_lean_serving_file if lean_direct_manifest_copy else _copy_ptg2_manifest_serving_file
+        _copy_lean_manifest_serving_file if use_direct_lean_copy else _copy_ptg2_manifest_serving_file
     )
     deferred_copy_files: dict[str, list[dict[str, Any]]] = {
         manifest_serving_copy_kind: [],
@@ -927,7 +958,7 @@ async def _parse_in_network_file_serving_only(
         return candidate_paths
 
     manifest_serving_copy_path = _new_copy_path(
-        "ptg2_manifest_lean_serving_" if lean_direct_manifest_copy else "ptg2_manifest_serving_"
+        "ptg2_manifest_lean_serving_" if use_direct_lean_copy else "ptg2_manifest_serving_"
     )
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
     manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
@@ -1031,8 +1062,8 @@ async def _parse_in_network_file_serving_only(
             plan_id=str(plan_fields.get("plan_id") or ""),
             plan_month_id=str(plan_month_row["plan_month_id"]),
             source_trace_set_hash=source_trace_set_hash,
-            manifest_serving_copy_path=None if lean_direct_manifest_copy else manifest_serving_copy_path,
-            manifest_lean_serving_copy_path=manifest_serving_copy_path if lean_direct_manifest_copy else None,
+            manifest_serving_copy_path=None if use_direct_lean_copy else manifest_serving_copy_path,
+            manifest_lean_serving_copy_path=manifest_serving_copy_path if use_direct_lean_copy else None,
             manifest_provider_forward_sidecar_path=manifest_sidecar_paths.get("provider_forward"),
             manifest_provider_inverted_sidecar_path=manifest_sidecar_paths.get("provider_inverted"),
             manifest_provider_npi_sidecar_path=manifest_sidecar_paths.get("provider_npi"),
