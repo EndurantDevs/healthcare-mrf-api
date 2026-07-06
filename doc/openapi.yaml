@@ -1968,7 +1968,7 @@ paths:
             type: number
             minimum: 0.01
             maximum: 100
-            default: 5
+            default: 1
         - name: phone
           in: query
           schema:

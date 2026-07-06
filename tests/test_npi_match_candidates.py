@@ -120,7 +120,7 @@ async def test_match_candidate_params_geo_defaults_radius():
         _request({"lat": "42.59734038", "long": "-71.80791638"})
     )
 
-    assert params["radius_miles"] == 5.0
+    assert params["radius_miles"] == 1.0
 
 
 @pytest.mark.asyncio
