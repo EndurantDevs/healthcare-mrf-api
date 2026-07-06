@@ -3952,7 +3952,7 @@ fn transfer_next_value_to_bytes<R: Read>(
 fn parse_json_value_from_raw_bytes(raw: &[u8]) -> io::Result<Value> {
     match serde_json::from_slice(raw) {
         Ok(value) => Ok(value),
-        Err(error) if std::str::from_utf8(raw).is_err() => {
+        Err(_) if std::str::from_utf8(raw).is_err() => {
             let repaired = String::from_utf8_lossy(raw);
             serde_json::from_str(repaired.as_ref()).map_err(to_io_error)
         }
