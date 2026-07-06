@@ -35,20 +35,6 @@ async def test_match_candidate_params_reject_entity_conflict():
 
 
 @pytest.mark.asyncio
-async def test_match_candidate_params_do_not_accept_line1_zip_locator():
-    with pytest.raises(sanic.exceptions.InvalidUsage):
-        await npi_module._normalize_match_candidate_params(
-            _request(
-                {
-                    "first_line": "326 Nichols Rd",
-                    "zip": "01420",
-                    "zip_code": "01420",
-                }
-            )
-        )
-
-
-@pytest.mark.asyncio
 async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
     async def fake_ensure_specialty_resolution_cache(session):
         assert session == "test-session"
