@@ -716,7 +716,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         code_count_table="mrf.ptg2_code_count_manifest_snap",
         provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
         serving_table_layout="lean_provider_key_v1",
-        source_key="ptg_heartland",
+        source_key="ptg_group_fixture",
         artifacts={"serving_by_code": sidecar},
     )
 
@@ -736,7 +736,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
 
     payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
-        "ptg2:202607:heartland",
+        "ptg2:202607:group_fixture",
         {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
         tables,
@@ -2762,7 +2762,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
         1234567890,
         {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
-        snapshot_id="ptg2:202607:heartland",
+        snapshot_id="ptg2:202607:group_fixture",
         serving_tables=tables,
     )
 
@@ -5507,6 +5507,46 @@ async def test_compact_serving_geo_filter_uses_unified_address_table_when_compat
         "(addr_filter.lat)::double precision))"
     ) in sql
     assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" not in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_zip_geo_filter_uses_unified_zip_index_expression(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(rows=[]),
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "70551",
+            "zip5": "60601",
+            "lat": "41.8820",
+            "long": "-87.6278",
+            "radius_miles": "10",
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[1][0][0])
+    assert "JOIN mrf.entity_address_unified addr_filter" in sql
+    assert "COALESCE(addr_filter.zip5" in sql
+    assert "LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5" not in sql
+    assert "addr_filter.type IN ('primary', 'secondary', 'practice', 'site')" in sql
+    assert sql.index("addr_filter.type IN ('primary', 'secondary', 'practice', 'site')") < sql.index(
+        "(COALESCE(addr_filter.zip5"
+    )
 
 
 @pytest.mark.asyncio

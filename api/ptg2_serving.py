@@ -6098,13 +6098,14 @@ def _compact_provider_filter_sql(
     else:
         return "", False
     if has_geo:
+        address_filter_is_unified = _is_unified_address_table(address_table)
+        address_filter_zip5_sql = _ptg2_address_zip5_sql("addr_filter", unified=address_filter_is_unified)
         joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
         geo_clauses = []
         if params.get("geo_lat") is not None:
-            if _is_unified_address_table(address_table):
+            if address_filter_is_unified:
                 geo_clauses.append("addr_filter.lat IS NOT NULL")
                 geo_clauses.append("addr_filter.long IS NOT NULL")
-                geo_clauses.append("addr_filter.type IN ('primary', 'secondary', 'practice', 'site')")
                 geo_clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
                 geo_clauses.append(_ptg2_geo_dwithin_sql("addr_filter.lat", "addr_filter.long"))
             else:
@@ -6113,10 +6114,12 @@ def _compact_provider_filter_sql(
                 geo_clauses.append(
                     f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
                 )
+        if address_filter_is_unified and (params.get("zip5") or geo_clauses):
+            clauses.append("addr_filter.type IN ('primary', 'secondary', 'practice', 'site')")
         if params.get("zip5") and geo_clauses:
-            clauses.append(f"(LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
+            clauses.append(f"({address_filter_zip5_sql} = :zip5 OR ({' AND '.join(geo_clauses)}))")
         elif params.get("zip5"):
-            clauses.append("LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5")
+            clauses.append(f"{address_filter_zip5_sql} = :zip5")
         elif geo_clauses:
             clauses.extend(geo_clauses)
         if params.get("city_exact"):

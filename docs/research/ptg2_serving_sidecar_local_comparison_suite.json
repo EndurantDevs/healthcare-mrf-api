@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "PTG2 Serving Sidecar Local Comparison",
-  "description": "Local A/B suite comparing table-backed PTG2 serving storage against tableless forward and reverse serving sidecars using the same Heartland-shaped fixture.",
+  "description": "Local A/B suite comparing table-backed PTG2 serving storage against tableless forward and reverse serving sidecars using the same group-plan fixture.",
   "scanner_binary": "support/ptg2_scanner/target/release/ptg2_scanner",
   "gates": {
     "min_improvement_pct": 0.0,
@@ -46,14 +46,14 @@
   ],
   "cases": [
     {
-      "id": "local-serving-sidecar-heartland-compare-64k",
+      "id": "local-serving-sidecar-group-compare-64k",
       "kind": "local_ptg_cli",
       "fixture": "large_in_network",
       "negotiated_rates": 65536,
       "billing_codes": 64,
       "provider_sets": 4,
       "price_reuse_mod": 256,
-      "source_key": "local-serving-sidecar-heartland-compare",
+      "source_key": "local-serving-sidecar-group-compare",
       "import_month": "2026-07",
       "max_files": 1,
       "full_file": true,

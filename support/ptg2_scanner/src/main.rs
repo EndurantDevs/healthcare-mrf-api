@@ -327,6 +327,9 @@ struct PriceSetLite {
 }
 
 type PriceCodeSetHashCache = HashMap<Vec<String>, String>;
+type ServingProviderEntries = Vec<(u64, u32)>;
+type ServingProviderPattern = (ServingProviderEntries, Vec<i32>);
+type ServingProviderPatternMap = HashMap<ServingProviderEntries, Vec<i32>>;
 
 #[derive(Clone)]
 struct CopyPathConfig {
@@ -6397,8 +6400,8 @@ fn write_serving_by_code_from_copy(input_path: &Path, output_path: &Path) -> io:
 
 fn flush_serving_provider_code(
     current_code: Option<i32>,
-    current_code_entries: &mut Vec<(u64, u32)>,
-    current_patterns: &mut HashMap<Vec<(u64, u32)>, Vec<i32>>,
+    current_code_entries: &mut ServingProviderEntries,
+    current_patterns: &mut ServingProviderPatternMap,
 ) {
     if let Some(code_key) = current_code {
         let entries = std::mem::take(current_code_entries);
@@ -6412,9 +6415,9 @@ fn write_serving_provider_block<W: Write>(
     blocks: &mut Vec<ServingBlock>,
     body_offset: &mut u64,
     pattern_count: &mut u64,
-    current_patterns: &mut HashMap<Vec<(u64, u32)>, Vec<i32>>,
+    current_patterns: &mut ServingProviderPatternMap,
 ) -> io::Result<()> {
-    let mut ordered_patterns: Vec<(Vec<(u64, u32)>, Vec<i32>)> = current_patterns.drain().collect();
+    let mut ordered_patterns: Vec<ServingProviderPattern> = current_patterns.drain().collect();
     ordered_patterns.sort_unstable_by(|left, right| {
         let left_first = left.1.iter().min().copied().unwrap_or(-1);
         let right_first = right.1.iter().min().copied().unwrap_or(-1);
@@ -6491,8 +6494,8 @@ fn write_serving_by_provider_set_from_copy(
     let mut pattern_count = 0u64;
     let mut current_provider_set: Option<i32> = None;
     let mut current_code: Option<i32> = None;
-    let mut current_code_entries: Vec<(u64, u32)> = Vec::new();
-    let mut current_patterns: HashMap<Vec<(u64, u32)>, Vec<i32>> = HashMap::new();
+    let mut current_code_entries: ServingProviderEntries = Vec::new();
+    let mut current_patterns: ServingProviderPatternMap = HashMap::new();
 
     let mut reader = BufReader::new(File::open(input_path).map_err(|error| {
         io::Error::new(
