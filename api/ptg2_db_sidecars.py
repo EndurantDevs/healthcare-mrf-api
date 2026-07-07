@@ -244,6 +244,71 @@ def _index_lookup(index_bytes: bytes, key: bytes, entry_count: int) -> tuple[int
     return None
 
 
+async def _index_lookup_from_db(
+    reader: PTG2DbArtifactReader,
+    *,
+    index_start: int,
+    entry_count: int,
+    key: bytes,
+) -> tuple[int, int] | None:
+    low = 0
+    high = int(entry_count) - 1
+    while low <= high:
+        mid = (low + high) // 2
+        record_offset = int(index_start) + mid * _MEMBERSHIP_INDEX_RECORD.size
+        candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack(
+            await reader.read_at(record_offset, _MEMBERSHIP_INDEX_RECORD.size)
+        )
+        if candidate_owner < key:
+            low = mid + 1
+            continue
+        if candidate_owner > key:
+            high = mid - 1
+            continue
+        return int(member_offset), int(member_count)
+    return None
+
+
+def _contiguous_int_runs(values: Iterable[int]) -> tuple[tuple[int, int], ...]:
+    ordered = sorted(set(int(value) for value in values))
+    if not ordered:
+        return ()
+    runs: list[tuple[int, int]] = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        runs.append((start, previous))
+        start = previous = value
+    runs.append((start, previous))
+    return tuple(runs)
+
+
+async def _dense_global_members_from_db(
+    reader: PTG2DbArtifactReader,
+    *,
+    globals_start: int,
+    member_global_count: int,
+    local_ids: Iterable[int],
+) -> dict[int, bytes]:
+    local_id_set = {int(local_id) for local_id in local_ids}
+    if not local_id_set:
+        return {}
+    for local_id in local_id_set:
+        if local_id < 0 or local_id >= int(member_global_count):
+            raise PTG2ManifestArtifactError("dense global membership sidecar member id is out of range")
+    result: dict[int, bytes] = {}
+    for run_start, run_end in _contiguous_int_runs(local_id_set):
+        start = int(globals_start) + run_start * 16
+        length = (run_end - run_start + 1) * 16
+        payload = await reader.read_at(start, length)
+        for offset, local_id in enumerate(range(run_start, run_end + 1)):
+            member_start = offset * 16
+            result[local_id] = payload[member_start : member_start + 16]
+    return result
+
+
 async def lookup_global_sidecar_members_many_from_db(
     session: Any,
     entry: Mapping[str, Any],
@@ -268,13 +333,15 @@ async def lookup_global_sidecar_members_many_from_db(
             raise PTG2ManifestArtifactError("global membership sidecar entry count mismatch")
         index_start = _MEMBERSHIP_HEADER.size
         index_bytes_len = int(entry_count) * _MEMBERSHIP_INDEX_RECORD.size
-        if _INDEX_READ_MAX_BYTES and index_bytes_len > _INDEX_READ_MAX_BYTES:
-            raise PTG2ManifestArtifactError("global membership sidecar owner index is too large for DB lookup")
-        index_bytes = await reader.read_at(index_start, index_bytes_len)
         member_start = index_start + index_bytes_len
         result: dict[bytes, tuple[bytes, ...]] = {}
         for owner_id in owner_ids:
-            match = _index_lookup(index_bytes, owner_id, int(entry_count))
+            match = await _index_lookup_from_db(
+                reader,
+                index_start=index_start,
+                entry_count=int(entry_count),
+                key=owner_id,
+            )
             if match is None:
                 result[owner_id] = ()
                 continue
@@ -301,14 +368,15 @@ async def lookup_global_sidecar_members_many_from_db(
     index_bytes_len = int(entry_count) * _MEMBERSHIP_INDEX_RECORD.size
     globals_start = index_start + index_bytes_len
     globals_bytes_len = int(member_global_count) * 16
-    if _INDEX_READ_MAX_BYTES and max(index_bytes_len, globals_bytes_len) > _INDEX_READ_MAX_BYTES:
-        raise PTG2ManifestArtifactError("dense membership sidecar index/dictionary is too large for DB lookup")
-    index_bytes = await reader.read_at(index_start, index_bytes_len)
-    member_globals = await reader.read_at(globals_start, globals_bytes_len)
     members_start = globals_start + globals_bytes_len
     result: dict[bytes, tuple[bytes, ...]] = {}
     for owner_id in owner_ids:
-        match = _index_lookup(index_bytes, owner_id, int(entry_count))
+        match = await _index_lookup_from_db(
+            reader,
+            index_start=index_start,
+            entry_count=int(entry_count),
+            key=owner_id,
+        )
         if match is None:
             result[owner_id] = ()
             continue
@@ -316,13 +384,17 @@ async def lookup_global_sidecar_members_many_from_db(
         if max_members is not None:
             member_count = min(member_count, max(max_members, 0))
         local_bytes = await reader.read_at(members_start + member_offset * _DENSE_MEMBER_RECORD.size, member_count * _DENSE_MEMBER_RECORD.size)
-        members: list[bytes] = []
+        local_ids: list[int] = []
         for pos in range(0, len(local_bytes), _DENSE_MEMBER_RECORD.size):
             local_id = _DENSE_MEMBER_RECORD.unpack_from(local_bytes, pos)[0]
-            if local_id >= member_global_count:
-                raise PTG2ManifestArtifactError("dense global membership sidecar member id is out of range")
-            global_pos = local_id * 16
-            members.append(member_globals[global_pos : global_pos + 16])
+            local_ids.append(int(local_id))
+        members_by_local_id = await _dense_global_members_from_db(
+            reader,
+            globals_start=globals_start,
+            member_global_count=int(member_global_count),
+            local_ids=local_ids,
+        )
+        members = [members_by_local_id[local_id] for local_id in local_ids]
         result[owner_id] = tuple(members)
     return result
 

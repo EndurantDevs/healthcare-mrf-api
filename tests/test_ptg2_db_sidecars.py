@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import hashlib
+import struct
 import zlib
 
 import pytest
 
+import api.ptg2_db_sidecars as db_sidecars
 from api.ptg2_db_sidecars import (
     lookup_global_sidecar_members_many_from_db,
     lookup_serving_by_code_sidecar_from_db,
@@ -12,6 +14,8 @@ from api.ptg2_db_sidecars import (
 )
 from process.ptg_parts.ptg2_artifact_blobs import ptg2_db_artifact_uri
 from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
     write_global_membership_sidecar,
     write_serving_by_code_sidecar,
     write_serving_by_provider_set_sidecar,
@@ -97,6 +101,47 @@ async def test_db_membership_sidecar_reads_compressed_chunks_without_local_file(
     assert members[owner] == (member_a, member_b)
     assert members[bytes.fromhex("00000000000000000000000000009999")] == ()
     assert session.calls
+
+
+@pytest.mark.asyncio
+async def test_db_dense_membership_sidecar_uses_sparse_range_reads(monkeypatch):
+    owner_a = bytes.fromhex("00000000000000000000000000000011")
+    owner_b = bytes.fromhex("00000000000000000000000000000012")
+    member_a = bytes.fromhex("00000000000000000000000000000021")
+    member_b = bytes.fromhex("00000000000000000000000000000022")
+    member_c = bytes.fromhex("00000000000000000000000000000023")
+    payload = bytearray()
+    payload.extend(struct.pack("<8sIQQ", PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC, 1, 2, 3))
+    payload.extend(struct.pack("<16sQI", owner_a, 0, 2))
+    payload.extend(struct.pack("<16sQI", owner_b, 2, 1))
+    payload.extend(member_a)
+    payload.extend(member_b)
+    payload.extend(member_c)
+    payload.extend(struct.pack("<III", 0, 2, 1))
+    raw_payload = bytes(payload)
+    entry = _db_entry(
+        {
+            "record_format": PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
+            "owner_count": 2,
+            "member_count": 3,
+            "member_global_count": 3,
+        },
+        raw_payload,
+        artifact_id="dense-membership-artifact",
+        chunk_bytes=11,
+    )
+    session = FakeChunkSession(raw_payload, chunk_bytes=11, compression="zlib")
+    monkeypatch.setattr(db_sidecars, "_INDEX_READ_MAX_BYTES", 8)
+
+    members = await lookup_global_sidecar_members_many_from_db(
+        session,
+        entry,
+        [owner_a.hex()],
+        schema_name="mrf",
+    )
+
+    assert members[owner_a] == (member_a, member_c)
+    assert any(call.get("chunk_no") is not None for call in session.calls)
 
 
 @pytest.mark.asyncio
