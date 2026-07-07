@@ -529,7 +529,7 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     assert "UNION ALL" not in first_member_query_sql
     assert "UNION ALL" not in second_member_query_sql
     assert "EXISTS (" in first_member_query_sql
-    assert first_member_query_params["limit"] == 40
+    assert first_member_query_params["limit"] == 10
     assert first_member_query_params["location_zips"] == ["60601", "60602"]
 
 

@@ -4265,6 +4265,14 @@ def _ptg2_manifest_location_candidate_floor() -> int:
         return 100
 
 
+def _rate_group_unnest_threshold() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_RATE_GROUP_UNNEST_THRESHOLD", "50000")
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return 50000
+
+
 async def _ptg2_manifest_location_provider_matches(
     session,
     serving_tables: PTG2ServingTables,
@@ -4520,12 +4528,26 @@ async def _ptg2_manifest_location_provider_matches(
         has_checked_rate_provider_group_sidecar = True
         if rate_provider_group_ids:
             params["location_rate_provider_group_ids"] = list(rate_provider_group_ids)
-            rate_group_filter = (
-                "provider_group_global_id_128 = ANY("
-                f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
-            )
-            member_filters.append(f"pgm_scope.{rate_group_filter}")
-            final_member_filters.append(f"pgm.{rate_group_filter}")
+            if len(rate_provider_group_ids) >= _rate_group_unnest_threshold():
+                member_scope_cte = f"""
+            rate_provider_groups AS MATERIALIZED (
+                SELECT unnest(
+                    CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)})
+                ) AS provider_group_global_id_128
+            ),"""
+                member_scope_join = """
+                JOIN rate_provider_groups rpg_scope
+                  ON rpg_scope.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
+                final_member_scope_join = """
+            JOIN rate_provider_groups rpg
+              ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
+            else:
+                rate_group_filter = (
+                    "provider_group_global_id_128 = ANY("
+                    f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
+                )
+                member_filters.append(f"pgm_scope.{rate_group_filter}")
+                final_member_filters.append(f"pgm.{rate_group_filter}")
     if (
         provider_group_location_table
         and not rate_provider_group_ids

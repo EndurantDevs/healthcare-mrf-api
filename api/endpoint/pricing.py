@@ -4966,7 +4966,10 @@ async def group_plan_providers(request):
         # UNION ALL subquery across all member tables makes PostgreSQL sort and
         # filter the combined stream, which is much slower for ZIP-radius
         # lookups on plans with a few very uneven source snapshots.
-        split_limit = min(max(limit * max(len(member_tables), 1) * 2, limit), 5000)
+        # The first N rows from the sorted union must be within the first N
+        # rows of at least one source, so per-source overfetch just makes dense
+        # member scans do extra location probes.
+        split_limit = limit
         split_query_params_by_name = {**params, "limit": split_limit}
         provider_npi_set: set[int] = set()
         for member_table in member_tables:

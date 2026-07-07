@@ -5308,6 +5308,49 @@ async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exist
     assert "scoped_member_npis" not in sql
 
 
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_large_sidecar_scope_uses_unnest_cte(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_RATE_GROUP_UNNEST_THRESHOLD", "2")
+    group_a = "00000000-0000-0000-0000-000000000011"
+    group_b = "00000000-0000-0000-0000-000000000012"
+    session = FakeSession([FakeResult(rows=[])])
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(return_value=(group_a, group_b)),
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_token",
+        provider_group_member_table="mrf.ptg2_provider_group_member_token",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+        id_storage="uuid",
+    )
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "plan_id": "010854205",
+            "code": "99203",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "npi": 1234567890,
+        },
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    sql = str(session.calls[-1][0][0])
+    assert "rate_provider_groups AS MATERIALIZED" in sql
+    assert "SELECT unnest(" in sql
+    assert "JOIN rate_provider_groups rpg_scope" in sql
+    assert "JOIN rate_provider_groups rpg" in sql
+    assert "pgm_scope.provider_group_global_id_128 = ANY" not in sql
+    assert "pgm.provider_group_global_id_128 = ANY" not in sql
+
+
 async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
     """Run the group-plan 010854205 / CPT 90837 reproducer; return (sql, params).
 
@@ -5998,7 +6041,10 @@ def _fake_manifest_provider_location_row(group_id: str) -> dict[str, object]:
 @pytest.mark.asyncio
 async def test_manifest_location_provider_matches_prefers_provider_group_location_table(monkeypatch):
     group_id = "00000000-0000-0000-0000-000000000001"
-    session = FakeSession([FakeResult(rows=[_fake_manifest_provider_location_row(group_id)])])
+    session = FakeSession([
+        FakeResult(rows=[]),
+        FakeResult(rows=[_fake_manifest_provider_location_row(group_id)]),
+    ])
     monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -6040,7 +6086,11 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
 
     assert provider_set_ids == {"provider-set-1"}
     assert providers_by_set["provider-set-1"][0]["npi"] == 1234567890
-    sql = str(session.calls[0][0][0])
+    sql = next(
+        str(call[0][0])
+        for call in session.calls
+        if "FROM mrf.ptg2_provider_group_location_token loc" in str(call[0][0])
+    )
     assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
     assert "loc.taxonomy_array && (" in sql
     assert "FROM mrf.ptg2_provider_group_member_token pgm_scope" not in sql
