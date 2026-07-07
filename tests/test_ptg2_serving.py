@@ -75,6 +75,13 @@ def _fake_call_sql(session: FakeSession, pattern: str) -> str:
     raise AssertionError(f"SQL call containing {pattern!r} not found")
 
 
+def _async_sidecar_members_many(mapping):
+    async def fake(_session, _serving_tables, _name, _owner_ids, **_kwargs):
+        return mapping
+
+    return fake
+
+
 @pytest.mark.asyncio
 async def test_overlay_provider_directory_corroboration_marks_address_and_prefers_directory_phone():
     session = FakeSession(
@@ -475,12 +482,12 @@ async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_diction
         id_storage="uuid",
     )
 
-    def fake_sidecar_members_many(_serving_tables, sidecar_name, owner_ids):
+    async def fake_sidecar_members_many(_session, _serving_tables, sidecar_name, owner_ids, **_kwargs):
         assert sidecar_name == "price_forward"
         assert owner_ids == (price_set_id,)
         return {price_set_id: (price_atom_id,)}
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_members_many)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
 
     prices_by_set = await ptg2_serving._ptg2_manifest_prices_for_price_sets(session, tables, [price_set_id])
 
@@ -823,7 +830,7 @@ async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_mi
         id_storage="uuid",
     )
 
-    def fake_sidecar_members_many(_serving_tables, sidecar_name, owner_ids, **_kwargs):
+    async def fake_sidecar_members_many(_session, _serving_tables, sidecar_name, owner_ids, **_kwargs):
         if sidecar_name == "provider_npi":
             return {owner_id: () for owner_id in owner_ids}
         if sidecar_name == "provider_forward":
@@ -835,7 +842,7 @@ async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_mi
         assert limit == 1
         return [{"npi": 1234567890, "provider_name": "Example Provider"}]
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_members_many)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
     monkeypatch.setattr(
         ptg2_serving,
         "_ptg2_manifest_enriched_provider_rows_for_npis",
@@ -3196,12 +3203,12 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
         artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
     )
 
-    def fake_members_many(_serving_tables, name, group_ids, **_kwargs):
+    async def fake_members_many(_session, _serving_tables, name, group_ids, **_kwargs):
         assert name == "provider_inverted"
         assert group_ids == (group_id,)
         return {group_id: (provider_set_id,)}
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_members_many)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_members_many)
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -3246,12 +3253,16 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert "AS telephone_number" in sql
     assert "AS fax_number" in sql
     assert "addr.address_key" in sql
-    assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
-    assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
+    assert "addr.lat IS NOT NULL" in sql
+    assert "addr.long IS NOT NULL" in sql
+    assert "addr.type IN ('primary', 'secondary', 'practice', 'site')" in sql
+    assert "ST_DWithin(" in sql
+    assert "Geography(ST_MakePoint((addr.long)::double precision, (addr.lat)::double precision))" in sql
+    assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" not in sql
+    assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" not in sql
     assert "ll_to_earth" not in sql
     assert "2 * 3958.7613 * asin" in sql
     assert "radians(CAST(:geo_lat AS double precision))" in sql
-    assert ") <= CAST(:geo_radius_miles AS double precision)" in sql
     assert "COALESCE(addr.address_precision, '') <> 'city_zip'" in sql
     assert "fallback_addresses AS MATERIALIZED" in sql
     assert "JOIN location_npis loc ON loc.npi = na.npi" in sql
@@ -3307,7 +3318,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
         id_storage="uuid",
     )
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -3367,7 +3378,7 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
         artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
     monkeypatch.setattr(
         ptg2_serving,
         "_manifest_rate_provider_groups_from_sidecar",
@@ -3427,7 +3438,7 @@ async def test_manifest_location_classification_filter_scopes_via_semijoin_and_a
         artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
 
     await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -3488,7 +3499,7 @@ async def test_manifest_location_uses_provider_group_rate_scope_table_when_decla
         artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
     monkeypatch.setattr(
         ptg2_serving,
         "_manifest_rate_provider_groups_from_sidecar",
@@ -3546,7 +3557,7 @@ async def test_manifest_location_uses_rate_scope_table_without_provider_group_lo
         artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
     monkeypatch.setattr(
         ptg2_serving,
         "_manifest_rate_provider_groups_from_sidecar",
@@ -3591,12 +3602,12 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
         id_storage="uuid",
     )
 
-    def fake_sidecar_many(_serving_tables, sidecar_name, owner_ids):
+    async def fake_sidecar_many(_session, _serving_tables, sidecar_name, owner_ids, **_kwargs):
         assert sidecar_name == "provider_forward"
         assert owner_ids == (provider_set_id,)
         return {provider_set_id: (group_id,)}
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_sidecar_many)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_many)
 
     result = await ptg2_serving._manifest_rate_provider_groups_from_sidecar(
         session,
@@ -3666,7 +3677,7 @@ async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatc
         artifacts={"provider_forward": {"path": "provider-forward.bin"}},
         id_storage="uuid",
     )
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", _fail_manifest_sidecar_usage)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", _fail_manifest_sidecar_usage)
     monkeypatch.setattr(
         ptg2_serving,
         "_manifest_rate_provider_groups_from_sidecar",
@@ -3865,7 +3876,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
         id_storage="uuid",
     )
 
-    def fake_members_many(_serving_tables, name, owner_ids, **_kwargs):
+    async def fake_members_many(_session, _serving_tables, name, owner_ids, **_kwargs):
         if name == "provider_forward":
             assert owner_ids == (provider_set_id,)
             return {provider_set_id: (group_id,)}
@@ -3874,7 +3885,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
             return {group_id: (provider_set_id,)}
         raise AssertionError(name)
 
-    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_members_many)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_members_many)
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -3915,8 +3926,8 @@ async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monke
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_args, **_kwargs: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
 
     sets_by_group = await ptg2_serving._manifest_sets_by_group(session, tables, (group_id,))
@@ -3989,8 +4000,8 @@ async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_in
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_a, **_k: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
@@ -5167,8 +5178,8 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_a, **_k: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
 
     await ptg2_serving._ptg2_manifest_location_provider_matches(
@@ -5222,8 +5233,8 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_a, **_k: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
 
     await ptg2_serving._ptg2_manifest_location_provider_matches(
@@ -5281,8 +5292,8 @@ async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exist
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_a, **_k: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
 
     await ptg2_serving._ptg2_manifest_location_provider_matches(
@@ -5323,8 +5334,8 @@ async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
     )
     monkeypatch.setattr(
         ptg2_serving,
-        "_ptg2_manifest_sidecar_members_many",
-        lambda *_a, **_k: {group_id: (provider_set_id,)},
+        "_ptg2_manifest_sidecar_members_many_async",
+        _async_sidecar_members_many({group_id: (provider_set_id,)}),
     )
     await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
@@ -5489,6 +5500,13 @@ async def test_compact_serving_geo_filter_uses_unified_address_table_when_compat
     assert "JOIN mrf.npi_address addr_filter" not in sql
     assert "addr_filter.address_precision" in sql
     assert "COALESCE(addr_filter.address_precision, '') <> 'city_zip'" in sql
+    assert "addr_filter.type IN ('primary', 'secondary', 'practice', 'site')" in sql
+    assert "ST_DWithin(" in sql
+    assert (
+        "Geography(ST_MakePoint((addr_filter.long)::double precision, "
+        "(addr_filter.lat)::double precision))"
+    ) in sql
+    assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" not in sql
 
 
 @pytest.mark.asyncio
@@ -5898,7 +5916,10 @@ async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_lega
 
     assert match_result == (set(), {})
     sidecar_probe.assert_awaited_once()
-    assert session.calls == []
+    executed_sql = "\n".join(str(call[0][0]) for call in session.calls)
+    assert "raw_location_npis AS" not in executed_sql
+    assert "ptg2_provider_group_location_token" not in executed_sql
+    assert "ptg2_provider_group_member_token" not in executed_sql
 
 
 def _fake_manifest_provider_location_row(group_id: str) -> dict[str, object]:

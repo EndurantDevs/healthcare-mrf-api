@@ -148,12 +148,13 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
                 "post_publish_index_profile": "serving",
                 "post_publish_index_concurrently": True,
                 "post_publish_index_pending": False,
-                "post_publish_index_total": 1,
-                "post_publish_index_completed": 1,
+                "post_publish_index_total": 2,
+                "post_publish_index_completed": 2,
                 "post_publish_index_timings": [
                     {"index": "geo_bbox", "seconds": 13.4},
+                    {"index": "geo_idx", "seconds": 28.1},
                 ],
-                "post_publish_skipped_indexes": ["entity_address_unified.geo_idx"],
+                "post_publish_skipped_indexes": [],
                 "published_elapsed_seconds": 233.2,
                 "phase_timings": {
                     "entity-address-unified indexing stage": {"wall_seconds": 24.1}
@@ -197,10 +198,11 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     assert terminal["metrics"]["post_publish_index_profile"] == "serving"
     assert terminal["metrics"]["post_publish_index_concurrently"] is True
     assert terminal["metrics"]["post_publish_index_pending"] is False
-    assert terminal["metrics"]["post_publish_index_total"] == 1
-    assert terminal["metrics"]["post_publish_index_completed"] == 1
+    assert terminal["metrics"]["post_publish_index_total"] == 2
+    assert terminal["metrics"]["post_publish_index_completed"] == 2
     assert terminal["metrics"]["post_publish_index_timings"][0]["index"] == "geo_bbox"
-    assert terminal["metrics"]["post_publish_skipped_indexes"] == ["entity_address_unified.geo_idx"]
+    assert terminal["metrics"]["post_publish_index_timings"][1]["index"] == "geo_idx"
+    assert terminal["metrics"]["post_publish_skipped_indexes"] == []
     assert terminal["metrics"]["published_elapsed_seconds"] == 233.2
     assert terminal["metrics"]["phase_timings"]["entity-address-unified indexing stage"]["wall_seconds"] == 24.1
     assert terminal["metrics"]["stage_index_timings"][0]["index"] == "primary_npi"

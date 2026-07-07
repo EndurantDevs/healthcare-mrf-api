@@ -109,6 +109,14 @@ from api.ptg2_tables import (
 )
 from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
 from api.ptg2_manifest_artifacts import search_ptg2_manifest_serving_snapshot
+from api.ptg2_db_sidecars import (
+    db_artifact_entry_available,
+    lookup_global_sidecar_members_from_db,
+    lookup_global_sidecar_members_many_from_db,
+    lookup_serving_by_code_sidecar_from_db,
+    lookup_serving_by_provider_set_patterns_from_db,
+    lookup_serving_by_provider_set_sidecar_from_db,
+)
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import (
     lookup_global_sidecar_members,
@@ -755,6 +763,19 @@ def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
         f"cos(radians({request_lat})) * cos(radians({lat_sql})) * "
         f"power(sin(radians(({long_sql}) - {request_long}) / 2), 2)"
         "))))"
+    )
+
+
+def _ptg2_geo_dwithin_sql(lat_sql: str, long_sql: str) -> str:
+    """Return an indexable PostGIS radius predicate for address-table geo scans."""
+    request_lat = "CAST(:geo_lat AS double precision)"
+    request_long = "CAST(:geo_long AS double precision)"
+    return (
+        "ST_DWithin("
+        f"Geography(ST_MakePoint(({long_sql})::double precision, ({lat_sql})::double precision)), "
+        f"Geography(ST_MakePoint({request_long}, {request_lat})), "
+        "CAST(:geo_radius_miles AS double precision) * 1609.34"
+        ")"
     )
 
 
@@ -2127,7 +2148,8 @@ async def _ptg2_manifest_provider_set_keys_for_ids(
     }
 
 
-def _ptg2_manifest_lookup_serving_by_code_sidecar(
+async def _ptg2_manifest_lookup_serving_by_code_sidecar(
+    session,
     serving_tables: PTG2ServingTables,
     code_key: int,
     *,
@@ -2136,6 +2158,14 @@ def _ptg2_manifest_lookup_serving_by_code_sidecar(
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
     if not entry:
         return ()
+    if db_artifact_entry_available(entry):
+        return await lookup_serving_by_code_sidecar_from_db(
+            session,
+            entry,
+            int(code_key),
+            schema_name=PTG2_SCHEMA,
+            provider_set_keys=provider_set_keys,
+        )
     raw_path = str(entry.get("path") or "").strip()
     if not raw_path:
         return ()
@@ -2148,7 +2178,8 @@ def _ptg2_manifest_lookup_serving_by_code_sidecar(
     )
 
 
-def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+async def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+    session,
     serving_tables: PTG2ServingTables,
     provider_set_key: int,
     *,
@@ -2157,6 +2188,14 @@ def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
     if not entry:
         return ()
+    if db_artifact_entry_available(entry):
+        return await lookup_serving_by_provider_set_sidecar_from_db(
+            session,
+            entry,
+            int(provider_set_key),
+            schema_name=PTG2_SCHEMA,
+            code_keys=code_keys,
+        )
     raw_path = str(entry.get("path") or "").strip()
     if not raw_path:
         return ()
@@ -2169,7 +2208,8 @@ def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
     )
 
 
-def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+async def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+    session,
     serving_tables: PTG2ServingTables,
     provider_set_key: int,
     *,
@@ -2178,6 +2218,14 @@ def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
     if not entry:
         return ()
+    if db_artifact_entry_available(entry):
+        return await lookup_serving_by_provider_set_patterns_from_db(
+            session,
+            entry,
+            int(provider_set_key),
+            schema_name=PTG2_SCHEMA,
+            code_keys=code_keys,
+        )
     raw_path = str(entry.get("path") or "").strip()
     if not raw_path:
         return ()
@@ -2202,7 +2250,8 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     code_key = code_data.get("code_key")
     if code_key is None:
         return None
-    sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+    sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
+        session,
         serving_tables,
         int(code_key),
         provider_set_keys=provider_set_keys,
@@ -2385,7 +2434,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
             rows: list[dict[str, Any]] = []
             skipped = 0
             for code_key in code_by_key:
-                sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+                sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
+                    session,
                     serving_tables,
                     int(code_key),
                     provider_set_keys=requested_provider_set_keys,
@@ -2433,7 +2483,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         page_offset = max(int(offset or 0), 0)
         entries_by_provider_code: list[tuple[str, int, dict[int, list[tuple[int, str]]]]] = []
         for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-            patterns = _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+            patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+                session,
                 serving_tables,
                 provider_set_key,
                 code_keys=code_by_key.keys(),
@@ -2484,7 +2535,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
 
     rows: list[dict[str, Any]] = []
     for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-        sidecar_rows = _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+        sidecar_rows = await _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
+            session,
             serving_tables,
             provider_set_key,
             code_keys=code_by_key.keys(),
@@ -2718,6 +2770,104 @@ def _ptg2_manifest_sidecar_members_many(
     return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
 
 
+async def _ptg2_manifest_sidecar_members_many_async(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str] | tuple[str, ...],
+    *,
+    max_members: int | None = None,
+) -> dict[str, tuple[str, ...]]:
+    owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
+    result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
+    if not owner_id_list:
+        return {}
+    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
+        sha = str(entry.get("sha256") or "")
+        if db_artifact_entry_available(entry):
+            storage_uri = str(entry.get("storage_uri") or "")
+            missing: list[str] = []
+            for owner_id in owner_id_list:
+                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+                cache_key = (storage_uri, sha, cache_owner_id)
+                cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
+                if cached is None:
+                    missing.append(owner_id)
+                else:
+                    result_sets[owner_id].update(cached)
+            if missing:
+                members_by_owner = await lookup_global_sidecar_members_many_from_db(
+                    session,
+                    entry,
+                    missing,
+                    schema_name=PTG2_SCHEMA,
+                    max_members=max_members,
+                )
+                for owner_id in missing:
+                    try:
+                        owner_bytes = bytes.fromhex(owner_id)
+                    except ValueError:
+                        owner_bytes = b""
+                    members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
+                    cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+                    _PTG2_MANIFEST_SIDECAR_CACHE[(storage_uri, sha, cache_owner_id)] = members
+                    result_sets[owner_id].update(members)
+            continue
+
+        path = str(entry.get("path") or "").strip()
+        if not path:
+            continue
+        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
+        sidecar_metadata = entry if sidecar_path == Path(path) else None
+        missing = []
+        for owner_id in owner_id_list:
+            cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+            cache_key = (str(sidecar_path), sha, cache_owner_id)
+            cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
+            if cached is None:
+                missing.append(owner_id)
+            else:
+                result_sets[owner_id].update(cached)
+        if missing:
+            members_by_owner = lookup_global_sidecar_members_many(
+                sidecar_path,
+                missing,
+                metadata=sidecar_metadata,
+                max_members=max_members,
+            )
+            for owner_id in missing:
+                try:
+                    owner_bytes = bytes.fromhex(owner_id)
+                except ValueError:
+                    owner_bytes = b""
+                members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
+                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+                _PTG2_MANIFEST_SIDECAR_CACHE[(str(sidecar_path), sha, cache_owner_id)] = members
+                result_sets[owner_id].update(members)
+    return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
+
+
+async def _ptg2_manifest_sidecar_members_async(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_id: str,
+    *,
+    max_members: int | None = None,
+) -> tuple[str, ...]:
+    owner_id = _ptg2_manifest_id(owner_id)
+    if not owner_id:
+        return ()
+    members_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        name,
+        (owner_id,),
+        max_members=max_members,
+    )
+    return members_by_owner.get(owner_id, ())
+
+
 async def _manifest_sets_by_group(
     session,
     serving_tables: PTG2ServingTables,
@@ -2758,7 +2908,8 @@ async def _manifest_sets_by_group(
                 group_id for group_id, provider_set_ids in sets_by_group.items() if not provider_set_ids
             )
             if missing_group_ids and sidecar_available:
-                fallback_sets = _ptg2_manifest_sidecar_members_many(
+                fallback_sets = await _ptg2_manifest_sidecar_members_many_async(
+                    session,
                     serving_tables,
                     "provider_inverted",
                     missing_group_ids,
@@ -2769,7 +2920,12 @@ async def _manifest_sets_by_group(
 
     if not sidecar_available:
         return None
-    return _ptg2_manifest_sidecar_members_many(serving_tables, "provider_inverted", normalized_group_ids)
+    return await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_inverted",
+        normalized_group_ids,
+    )
 
 
 async def _is_manifest_component_table_populated(session, table_name: str | None) -> bool:
@@ -2833,7 +2989,8 @@ async def _manifest_rate_provider_groups_from_sidecar(
                 code_key = _row_mapping(code_row).get("code_key")
                 break
             if code_key is not None:
-                sidecar_rows = _ptg2_manifest_lookup_serving_by_code_sidecar(
+                sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
+                    session,
                     serving_tables,
                     int(code_key),
                 )
@@ -2845,7 +3002,8 @@ async def _manifest_rate_provider_groups_from_sidecar(
                 provider_set_ids = tuple(sorted(provider_set_ids_by_key.values()))
                 if not provider_set_ids:
                     return ()
-                groups_by_set = _ptg2_manifest_sidecar_members_many(
+                groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+                    session,
                     serving_tables,
                     "provider_forward",
                     provider_set_ids,
@@ -2895,15 +3053,26 @@ async def _manifest_rate_provider_groups_from_sidecar(
     provider_set_ids = tuple(provider_set_ids_list)
     if not provider_set_ids:
         return ()
-    groups_by_set = _ptg2_manifest_sidecar_members_many(serving_tables, "provider_forward", provider_set_ids)
+    groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_forward",
+        provider_set_ids,
+    )
     return tuple(sorted({group_id for group_ids in groups_by_set.values() for group_id in group_ids}))
 
 
-def _ptg2_manifest_provider_npis_for_provider_set(
+async def _ptg2_manifest_provider_npis_for_provider_set(
+    session,
     serving_tables: PTG2ServingTables,
     provider_set_global_id: str,
 ) -> tuple[int, ...]:
-    members = _ptg2_manifest_sidecar_members(serving_tables, "provider_npi", provider_set_global_id)
+    members = await _ptg2_manifest_sidecar_members_async(
+        session,
+        serving_tables,
+        "provider_npi",
+        provider_set_global_id,
+    )
     npis: list[int] = []
     for member in members:
         try:
@@ -2918,14 +3087,16 @@ def _ptg2_manifest_provider_npis_for_provider_set(
     return tuple(sorted(set(npis)))
 
 
-def _ptg2_manifest_provider_npis_for_provider_sets(
+async def _ptg2_manifest_provider_npis_for_provider_sets(
+    session,
     serving_tables: PTG2ServingTables,
     provider_set_global_ids: list[str] | tuple[str, ...],
     *,
     limit_per_set: int | None = None,
 ) -> dict[str, tuple[int, ...]]:
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
-    members_by_set = _ptg2_manifest_sidecar_members_many(
+    members_by_set = await _ptg2_manifest_sidecar_members_many_async(
+        session,
         serving_tables,
         "provider_npi",
         provider_set_ids,
@@ -3063,7 +3234,12 @@ async def _ptg2_manifest_prices_for_price_set(
     price_set_global_id = _ptg2_manifest_id(price_set_global_id)
     if not price_atom_table or not price_set_global_id:
         return []
-    price_members = _ptg2_manifest_sidecar_members(serving_tables, "price_forward", price_set_global_id)
+    price_members = await _ptg2_manifest_sidecar_members_async(
+        session,
+        serving_tables,
+        "price_forward",
+        price_set_global_id,
+    )
     if not price_members:
         return []
     atom_ids = list(price_members)
@@ -3106,7 +3282,12 @@ async def _ptg2_manifest_prices_for_price_sets(
     price_set_ids = _ptg2_manifest_ids(tuple(price_set_global_ids))
     if not price_atom_table or not price_set_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
-    members_by_price_set = _ptg2_manifest_sidecar_members_many(serving_tables, "price_forward", price_set_ids)
+    members_by_price_set = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "price_forward",
+        price_set_ids,
+    )
     atom_ids = tuple(dict.fromkeys(atom_id for atoms in members_by_price_set.values() for atom_id in atoms))
     if not atom_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
@@ -4094,13 +4275,18 @@ async def _ptg2_manifest_location_provider_matches(
             geo_min_long=geo_long - geo_radius_miles / 69.0,
             geo_max_long=geo_long + geo_radius_miles / 69.0,
         )
-        geo_filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-        geo_filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-        geo_filters.append(
-            f"{_ptg2_geo_distance_miles_sql('addr.lat::float8', 'addr.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-        )
         if using_unified_address_table:
+            geo_filters.append("addr.lat IS NOT NULL")
+            geo_filters.append("addr.long IS NOT NULL")
+            geo_filters.append("addr.type IN ('primary', 'secondary', 'practice', 'site')")
             geo_filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
+            geo_filters.append(_ptg2_geo_dwithin_sql("addr.lat", "addr.long"))
+        else:
+            geo_filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+            geo_filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            geo_filters.append(
+                f"{_ptg2_geo_distance_miles_sql('addr.lat::float8', 'addr.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+            )
     if zip_value and geo_filters:
         filters.append(f"({address_zip5_sql} = :zip5 OR ({' AND '.join(geo_filters)}))")
     elif zip_value:
@@ -4879,14 +5065,23 @@ async def _ptg2_manifest_provider_rows_for_provider_set(
     provider_set_global_id = _ptg2_manifest_id(provider_set_global_id)
     if not provider_set_global_id:
         return None
-    provider_npis = _ptg2_manifest_provider_npis_for_provider_set(serving_tables, provider_set_global_id)
+    provider_npis = await _ptg2_manifest_provider_npis_for_provider_set(
+        session,
+        serving_tables,
+        provider_set_global_id,
+    )
     if provider_npis:
         return await _ptg2_manifest_enriched_provider_rows_for_npis(session, npis=provider_npis, limit=limit)
 
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if not provider_group_member_table:
         return None
-    provider_groups = _ptg2_manifest_sidecar_members(serving_tables, "provider_forward", provider_set_global_id)
+    provider_groups = await _ptg2_manifest_sidecar_members_async(
+        session,
+        serving_tables,
+        "provider_forward",
+        provider_set_global_id,
+    )
     if not provider_groups:
         return None
     group_ids = list(provider_groups)
@@ -4923,7 +5118,8 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     if provider_taxonomy_filter_requested:
         candidate_limit_per_set = max(candidate_limit_per_set * 200, 1000)
 
-    npis_by_set = _ptg2_manifest_provider_npis_for_provider_sets(
+    npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
+        session,
         serving_tables,
         provider_set_ids,
         limit_per_set=candidate_limit_per_set,
@@ -4934,7 +5130,12 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         if not provider_group_member_table:
             return None
         has_provider_forward_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_forward"))
-        groups_by_set = _ptg2_manifest_sidecar_members_many(serving_tables, "provider_forward", missing_provider_set_ids)
+        groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+            session,
+            serving_tables,
+            "provider_forward",
+            missing_provider_set_ids,
+        )
         group_ids = tuple(dict.fromkeys(group_id for group_ids in groups_by_set.values() for group_id in group_ids))
         if not group_ids:
             if has_provider_forward_sidecar:
@@ -5840,13 +6041,18 @@ def _compact_provider_filter_sql(
         joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
         geo_clauses = []
         if params.get("geo_lat") is not None:
-            geo_clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            geo_clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            geo_clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-            )
             if _is_unified_address_table(address_table):
+                geo_clauses.append("addr_filter.lat IS NOT NULL")
+                geo_clauses.append("addr_filter.long IS NOT NULL")
+                geo_clauses.append("addr_filter.type IN ('primary', 'secondary', 'practice', 'site')")
                 geo_clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
+                geo_clauses.append(_ptg2_geo_dwithin_sql("addr_filter.lat", "addr_filter.long"))
+            else:
+                geo_clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+                geo_clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+                geo_clauses.append(
+                    f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+                )
         if params.get("zip5") and geo_clauses:
             clauses.append(f"(LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
         elif params.get("zip5"):

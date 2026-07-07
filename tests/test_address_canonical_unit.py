@@ -3114,6 +3114,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_npi" in joined
     assert "idx_procedures_array" in joined
     assert "idx_geo_bbox" in joined
+    assert "idx_geo_idx" in joined
     assert "idx_primary_phone_npi" in joined
     assert "idx_service_phone_digits_npi" in joined
     assert "idx_service_phone_number_npi" in joined
@@ -3121,7 +3122,6 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_service_premise_key_npi" in joined
     assert "idx_address_sources" in joined
     assert "idx_primary_phone_digits_npi" not in joined
-    assert "idx_geo_idx" not in joined
     assert "idx_inferred_npi" not in joined
     assert "idx_entity_type_coalesced_npi" not in joined
     assert "idx_row_origin" not in joined
@@ -3130,7 +3130,6 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "entity_address_unified_20260614.inferred_npi" in context["skipped_stage_indexes"]
     assert "entity_address_unified_20260614.entity_type_coalesced_npi" in context["skipped_stage_indexes"]
     assert "entity_address_unified_20260614.primary_phone_digits_npi" in context["skipped_stage_indexes"]
-    assert "entity_address_unified_20260614.geo_idx" in context["skipped_stage_indexes"]
     assert "entity_address_unified_20260614.row_origin" in context["skipped_stage_indexes"]
     assert "entity_address_unified_20260614.zip5" in context["skipped_stage_indexes"]
     assert "entity_address_unified_20260614.ptg_plan_array" in context["skipped_stage_indexes"]
@@ -3192,18 +3191,23 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "ON mrf.entity_address_unified (npi)" in joined
     assert "entity_address_unified_idx_geo_bbox" in joined
+    assert "entity_address_unified_idx_geo_idx" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "ON mrf.entity_address_unified (premise_key, npi)" in joined
-    assert "entity_address_unified_idx_geo_idx" not in joined
-    assert "entity_address_unified.geo_idx" in context["post_publish_skipped_indexes"]
     assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
     assert context["post_publish_index_concurrency"] in {1}
-    index_statements = [s for s in statements if "CREATE EXTENSION" not in s]
+    index_statements = [
+        s
+        for s in statements
+        if "CREATE EXTENSION" not in s and not s.startswith("ANALYZE ")
+    ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
+    assert "ANALYZE mrf.entity_address_unified;" in statements
     assert context["post_publish_index_total"] == len(index_statements)
     assert context["post_publish_index_completed"] == len(index_statements)
     assert context["post_publish_index_pending"] is False
+    assert context["post_publish_analyzed"] is True
     assert len(context["post_publish_index_timings"]) == len(index_statements)
 
 
@@ -3237,11 +3241,17 @@ async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fa
     assert "CREATE INDEX IF NOT EXISTS entity_address_unified_idx_npi" in joined
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "CREATE INDEX CONCURRENTLY" not in joined
-    index_statements = [s for s in statements if "CREATE EXTENSION" not in s]
+    index_statements = [
+        s
+        for s in statements
+        if "CREATE EXTENSION" not in s and not s.startswith("ANALYZE ")
+    ]
     assert "CREATE EXTENSION IF NOT EXISTS btree_gin" in statements
+    assert "ANALYZE mrf.entity_address_unified;" in statements
     assert context["post_publish_index_total"] == len(index_statements)
     assert context["post_publish_index_completed"] == len(index_statements)
     assert context["post_publish_index_pending"] is False
+    assert context["post_publish_analyzed"] is True
 
 
 @pytest.mark.asyncio

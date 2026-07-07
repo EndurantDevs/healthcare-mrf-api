@@ -18,6 +18,7 @@ from api.ptg2_types import PTG2ServingTables
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
+PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ_ENV = "HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ"
 _PTG2_TABLE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_TABLE_CACHE_TTL_SECONDS", "300")), 0.0)
 _PTG2_TABLE_AVAILABLE_CACHE: dict[str, tuple[float, bool]] = {}
 _PTG2_SNAPSHOT_TABLES_CACHE: dict[str, tuple[float, PTG2ServingTables]] = {}
@@ -134,9 +135,16 @@ def _is_compact_serving_table(table_name: str | None) -> bool:
     return "compact" in str(table_name or "").lower()
 
 
+def _materialize_db_artifacts_on_read() -> bool:
+    raw = os.getenv(PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 async def _hydrate_snapshot_artifacts(session, artifacts: Any) -> dict[str, Any] | None:
     if not isinstance(artifacts, dict):
         return None
+    if not _materialize_db_artifacts_on_read():
+        return dict(artifacts)
 
     async def hydrate_entry(value: Any) -> Any:
         if not isinstance(value, dict):

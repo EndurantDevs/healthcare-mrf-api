@@ -148,6 +148,41 @@ async def test_snapshot_serving_tables_accepts_json_string_manifest():
     assert tables.is_manifest_backed_snapshot is True
 
 
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_keeps_db_artifacts_as_metadata_by_default(monkeypatch):
+    async def fail_hydrate(*_args, **_kwargs):
+        raise AssertionError("db artifacts should not be materialized during snapshot table discovery")
+
+    monkeypatch.delenv("HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ", raising=False)
+    monkeypatch.setattr(ptg2_tables, "hydrate_ptg2_artifact_entry_from_db", fail_hydrate)
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "artifacts": {
+                        "provider_forward": {
+                            "name": "provider_forward",
+                            "path": "/work/old/provider_forward.ptg2sc",
+                            "storage_uri": "db://ptg2_artifact/provider-forward",
+                            "byte_count": 123,
+                        }
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-db-artifact")
+
+    assert tables.artifacts["provider_forward"] == {
+        "name": "provider_forward",
+        "path": "/work/old/provider_forward.ptg2sc",
+        "storage_uri": "db://ptg2_artifact/provider-forward",
+        "byte_count": 123,
+    }
+
+
 def test_manifest_backed_snapshot_type_defaults_to_false_for_empty_metadata():
     tables = PTG2ServingTables()
 

@@ -122,6 +122,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "taxonomy_plans_network",
     "procedures_array",
     "medications_array",
+    "geo_idx",
     "geo_bbox",
     "address_key",
 }
@@ -1127,10 +1128,25 @@ async def _create_post_publish_indexes(
     )
     phase_context["post_publish_skipped_indexes"] = skipped_indexes
 
+    async def _analyze_live_table() -> None:
+        statement = f"ANALYZE {db_schema}.{table_name};"
+        started_at = time.time()
+        if build_concurrently and hasattr(db, "execute_ddl"):
+            await db.execute_ddl(statement)
+        else:
+            await _run_sql_phase(
+                statement,
+                context=phase_context,
+                phase="entity-address-unified post-publish analyze",
+            )
+        phase_context["post_publish_analyze_seconds"] = round(time.time() - started_at, 3)
+        phase_context["post_publish_analyzed"] = True
+
     if not statements:
         phase_context["post_publish_index_pending"] = False
         phase_context["post_publish_index_total"] = 0
         phase_context["post_publish_index_completed"] = 0
+        await _analyze_live_table()
         return
 
     phase_context["post_publish_index_pending"] = True
@@ -1250,6 +1266,7 @@ async def _create_post_publish_indexes(
     if index_concurrency <= 1 or len(statements) == 1:
         for index_name, stmt in statements:
             await _build_index(index_name, stmt)
+        await _analyze_live_table()
         return
 
     semaphore = asyncio.Semaphore(index_concurrency)
@@ -1265,6 +1282,7 @@ async def _create_post_publish_indexes(
     for result in results:
         if isinstance(result, BaseException):
             raise result
+    await _analyze_live_table()
 
 
 async def _prepare_inference_stage_indexes(
