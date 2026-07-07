@@ -105,4 +105,31 @@ mod tests {
             ));
         });
     }
+
+    #[test]
+    fn scanner_chunk_experiment_env_values_are_accepted() {
+        scoped_env(
+            "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
+            Some("8192"),
+            || {
+                assert_eq!(
+                    split_interval(
+                        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
+                        DEFAULT_SPLIT_NEGOTIATED_RATES,
+                    ),
+                    8192
+                );
+            },
+        );
+        scoped_env(
+            "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES",
+            Some("33554432"),
+            || {
+                assert_eq!(
+                    env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES),
+                    33_554_432
+                );
+            },
+        );
+    }
 }

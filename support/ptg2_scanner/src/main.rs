@@ -51,6 +51,7 @@ use struson::writer::{JsonStreamWriter, JsonWriter};
 use xxhash_rust::xxh3::Xxh3;
 
 const DEFAULT_PROVIDER_REF_CHUNK_ITEMS: usize = 1024;
+const MAX_RETAINED_CAPTURE_BYTES: usize = READ_BUF_SIZE;
 
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -3008,6 +3009,28 @@ impl RawChunkStats {
     }
 }
 
+fn take_vec_replacing_with_capacity<T>(values: &mut Vec<T>, capacity: usize) -> Vec<T> {
+    let mut replacement = Vec::with_capacity(capacity);
+    std::mem::swap(values, &mut replacement);
+    replacement
+}
+
+fn take_vec_replacing_with_bounded_capacity<T>(
+    values: &mut Vec<T>,
+    max_retain_capacity: usize,
+) -> Vec<T> {
+    let retained_capacity = values.capacity().min(max_retain_capacity);
+    take_vec_replacing_with_capacity(values, retained_capacity)
+}
+
+fn clear_vec_retain_bounded_capacity<T>(values: &mut Vec<T>, max_retain_capacity: usize) {
+    if values.capacity() > max_retain_capacity {
+        *values = Vec::with_capacity(max_retain_capacity);
+    } else {
+        values.clear();
+    }
+}
+
 struct ProviderRefWorkerOutput {
     provider_map: HashMap<String, ProviderEntry>,
     events: Vec<CopyFileEvent>,
@@ -3215,6 +3238,13 @@ impl<R: Read> BufferedJsonByteReader<R> {
     }
 
     fn capture_value_bytes(&mut self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.capture_value_bytes_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn capture_value_bytes_into(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
+        bytes.clear();
         self.skip_whitespace()?;
         let Some(first) = self.next_byte()? else {
             return Err(io::Error::new(
@@ -3222,13 +3252,13 @@ impl<R: Read> BufferedJsonByteReader<R> {
                 "expected JSON value",
             ));
         };
-        let mut bytes = vec![first];
+        bytes.push(first);
         match first {
             b'"' => {
-                self.capture_string_tail(&mut bytes)?;
+                self.capture_string_tail(bytes)?;
             }
             b'{' | b'[' => {
-                self.capture_nested_tail(&mut bytes, first)?;
+                self.capture_nested_tail(bytes, first)?;
             }
             _ => {
                 while let Some(byte) = self.peek_byte()? {
@@ -3240,7 +3270,7 @@ impl<R: Read> BufferedJsonByteReader<R> {
                 }
             }
         }
-        Ok(bytes)
+        Ok(())
     }
 
     fn capture_string_tail(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
@@ -4240,6 +4270,7 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
     let mut procedure = Map::new();
     let mut raw_rate_chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
     let mut raw_rate_chunk_bytes = 0usize;
+    let mut scratch_value = Vec::new();
     let mut rate_count = 0u64;
     reader.expect_byte(b'{')?;
     let mut first_field = true;
@@ -4261,9 +4292,10 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
             | "billing_code"
             | "name"
             | "description" => {
-                let raw_value = reader.capture_value_bytes()?;
-                let value = parse_json_value_from_raw_bytes(&raw_value)?;
+                reader.capture_value_bytes_into(&mut scratch_value)?;
+                let value = parse_json_value_from_raw_bytes(&scratch_value)?;
                 procedure.insert(name, value);
+                clear_vec_retain_bounded_capacity(&mut scratch_value, MAX_RETAINED_CAPTURE_BYTES);
             }
             "negotiated_rates" => {
                 reader.expect_byte(b'[')?;
@@ -4277,8 +4309,9 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                         || raw_rate_chunk_bytes >= raw_chunk_byte_limit
                     {
                         let raw_rates =
-                            std::mem::replace(&mut raw_rate_chunk, Vec::with_capacity(chunk_size));
-                        let raw_bytes = std::mem::take(&mut raw_rate_chunk_bytes);
+                            take_vec_replacing_with_capacity(&mut raw_rate_chunk, chunk_size);
+                        let raw_bytes = raw_rate_chunk_bytes;
+                        raw_rate_chunk_bytes = 0;
                         io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                         send_worker_job(
                             io_state.tx,
@@ -4295,7 +4328,8 @@ fn enqueue_in_network_raw_byte_scan<R: Read, W: Write>(
                 }
             }
             _ => {
-                let _ = reader.capture_value_bytes()?;
+                reader.capture_value_bytes_into(&mut scratch_value)?;
+                clear_vec_retain_bounded_capacity(&mut scratch_value, MAX_RETAINED_CAPTURE_BYTES);
             }
         }
     }
@@ -4354,11 +4388,10 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                         if raw_rate_chunk.len() >= chunk_size
                             || raw_rate_chunk_bytes >= raw_chunk_byte_limit
                         {
-                            let raw_rates = std::mem::replace(
-                                &mut raw_rate_chunk,
-                                Vec::with_capacity(chunk_size),
-                            );
-                            let raw_bytes = std::mem::take(&mut raw_rate_chunk_bytes);
+                            let raw_rates =
+                                take_vec_replacing_with_capacity(&mut raw_rate_chunk, chunk_size);
+                            let raw_bytes = raw_rate_chunk_bytes;
+                            raw_rate_chunk_bytes = 0;
                             io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                             send_worker_job(
                                 io_state.tx,
@@ -4376,7 +4409,7 @@ fn enqueue_in_network_struson<R: Read, W: Write>(
                         rate_chunk.push(rate);
                         if rate_chunk.len() >= chunk_size {
                             let rates =
-                                std::mem::replace(&mut rate_chunk, Vec::with_capacity(chunk_size));
+                                take_vec_replacing_with_capacity(&mut rate_chunk, chunk_size);
                             send_worker_job(
                                 io_state.tx,
                                 io_state.event_rx,
@@ -4764,7 +4797,10 @@ fn scan_compact_byte_top_level_parallel(
                             &event_rx,
                             &mut writer,
                             &mut provider_ref_producer_blocked_micros,
-                            std::mem::take(&mut raw_refs),
+                            take_vec_replacing_with_capacity(
+                                &mut raw_refs,
+                                provider_ref_chunk_items,
+                            ),
                         )?;
                     }
                     drop(provider_tx);
@@ -5056,19 +5092,24 @@ fn scan_compact_byte_top_level_parallel(
                     if capture_depth > 0 {
                         capture_depth -= 1;
                         if capture_depth == 0 {
-                            raw_ref_bytes = raw_ref_bytes.saturating_add(capture.len());
-                            raw_refs.push(std::mem::take(&mut capture));
+                            let raw_ref = take_vec_replacing_with_bounded_capacity(
+                                &mut capture,
+                                MAX_RETAINED_CAPTURE_BYTES,
+                            );
+                            raw_ref_bytes = raw_ref_bytes.saturating_add(raw_ref.len());
+                            raw_refs.push(raw_ref);
                             *object_counts
                                 .entry("provider_references".to_string())
                                 .or_insert(0) += 1;
                             if raw_refs.len() >= provider_ref_chunk_items
                                 || raw_ref_bytes >= provider_ref_raw_chunk_byte_limit
                             {
-                                let batch = std::mem::replace(
+                                let batch = take_vec_replacing_with_capacity(
                                     &mut raw_refs,
-                                    Vec::with_capacity(provider_ref_chunk_items),
+                                    provider_ref_chunk_items,
                                 );
-                                let batch_bytes = std::mem::take(&mut raw_ref_bytes);
+                                let batch_bytes = raw_ref_bytes;
+                                raw_ref_bytes = 0;
                                 provider_ref_raw_chunk_stats.record(batch.len(), batch_bytes);
                                 send_provider_ref_batch(
                                     &provider_tx,
@@ -5308,11 +5349,12 @@ fn scan_compact_struson_parallel(
                         if raw_refs.len() >= provider_ref_chunk_items
                             || raw_ref_bytes >= provider_ref_raw_chunk_byte_limit
                         {
-                            let batch = std::mem::replace(
+                            let batch = take_vec_replacing_with_capacity(
                                 &mut raw_refs,
-                                Vec::with_capacity(provider_ref_chunk_items),
+                                provider_ref_chunk_items,
                             );
-                            let batch_bytes = std::mem::take(&mut raw_ref_bytes);
+                            let batch_bytes = raw_ref_bytes;
+                            raw_ref_bytes = 0;
                             provider_ref_raw_chunk_stats.record(batch.len(), batch_bytes);
                             send_provider_ref_batch(
                                 &provider_tx,
@@ -6990,6 +7032,35 @@ mod tests {
 
         assert_eq!(processed, 1);
         assert!(provider_map.contains_key("9"));
+    }
+
+    #[test]
+    fn bounded_vec_take_keeps_payload_and_caps_replacement_capacity() {
+        let mut capture = Vec::with_capacity(MAX_RETAINED_CAPTURE_BYTES + 1024);
+        capture.extend_from_slice(b"{\"provider_group_id\":\"1\"}");
+
+        let taken =
+            take_vec_replacing_with_bounded_capacity(&mut capture, MAX_RETAINED_CAPTURE_BYTES);
+
+        assert_eq!(taken, br#"{"provider_group_id":"1"}"#);
+        assert!(capture.is_empty());
+        assert_eq!(capture.capacity(), MAX_RETAINED_CAPTURE_BYTES);
+    }
+
+    #[test]
+    fn capture_value_bytes_into_reuses_scratch_buffer() {
+        let input = br#" {"a":[1,{"b":"c"}]} "tail" "#;
+        let mut reader = BufferedJsonByteReader::new(&input[..]);
+        let mut scratch = Vec::with_capacity(64);
+
+        reader.capture_value_bytes_into(&mut scratch).unwrap();
+        let retained_capacity = scratch.capacity();
+        assert_eq!(scratch, br#"{"a":[1,{"b":"c"}]}"#);
+
+        reader.capture_value_bytes_into(&mut scratch).unwrap();
+
+        assert_eq!(scratch, br#""tail""#);
+        assert_eq!(scratch.capacity(), retained_capacity);
     }
 
     #[test]

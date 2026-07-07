@@ -30,7 +30,9 @@ from process.ptg_parts.config import (
     PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV,
     PTG2_RUST_PROVIDER_REF_WORKERS_ENV,
     PTG2_RUST_PROVIDER_REFS_IN_WORKERS_ENV,
+    PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
     PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV,
+    PTG2_RUST_RAW_CHUNK_BYTES_ENV,
     PTG2_RUST_WORK_QUEUE_ENV,
     PTG2_RUST_WORKERS_ENV,
 )
@@ -236,6 +238,10 @@ def _ptg_lane_environment(params: dict[str, Any]):
         PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV: _bool_env_value(params.get("_scanner_top_level_byte_scan")),
         PTG2_RUST_WORK_QUEUE_ENV: _optional_env_value(params.get("_scanner_work_queue")),
         PTG2_RUST_EVENT_QUEUE_ENV: _optional_env_value(params.get("_scanner_event_queue")),
+        PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV: _optional_env_value(
+            params.get("_scanner_split_negotiated_rates")
+        ),
+        PTG2_RUST_RAW_CHUNK_BYTES_ENV: _optional_env_value(params.get("_scanner_raw_chunk_bytes")),
         PTG2_RUST_PROVIDER_REFS_IN_WORKERS_ENV: _bool_env_value(
             params.get("_scanner_provider_refs_in_workers")
         ),

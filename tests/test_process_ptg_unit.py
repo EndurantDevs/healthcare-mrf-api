@@ -5564,6 +5564,8 @@ def test_ptg2_manifest_snapshot_publish_direct_lean_sidecars_skip_final_serving_
     ]
     assert stage_to_final_renames == []
     assert any('DROP TABLE "mrf"."ptg2_manifest_stage_serving_abc"' in statement for statement in status_calls)
+    assert "lean_code_lookup_idx" not in "\n".join(status_calls)
+    assert "lean_code_idx" in "\n".join(status_calls)
     assert publish_manifest["serving_row_strategy"] == "sidecar"
     assert publish_manifest["serving_table_retained"] is False
     assert publish_manifest["table"].startswith("mrf.ptg2_serving_")

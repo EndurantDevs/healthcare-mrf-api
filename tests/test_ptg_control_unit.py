@@ -269,6 +269,10 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         )
         observed["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
         observed["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
+        observed["split_negotiated_rates"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"
+        )
+        observed["raw_chunk_bytes"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES")
         observed["provider_refs_in_workers"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS"
         )
@@ -309,6 +313,8 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
                 "_scanner_top_level_byte_scan": True,
                 "_scanner_work_queue": 5,
                 "_scanner_event_queue": 9,
+                "_scanner_split_negotiated_rates": 8192,
+                "_scanner_raw_chunk_bytes": 33554432,
                 "_scanner_provider_refs_in_workers": False,
                 "_scanner_provider_ref_workers": 3,
                 "_scanner_provider_ref_queue": 4,
@@ -327,6 +333,8 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         "top_level_byte_scan": "true",
         "work_queue": "5",
         "event_queue": "9",
+        "split_negotiated_rates": "8192",
+        "raw_chunk_bytes": "33554432",
         "provider_refs_in_workers": "false",
         "provider_ref_workers": "3",
         "provider_ref_queue": "4",

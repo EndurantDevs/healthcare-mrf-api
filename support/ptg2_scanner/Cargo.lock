@@ -201,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "flate2",
+ "itoa",
  "pyo3",
  "rayon",
  "serde_json",

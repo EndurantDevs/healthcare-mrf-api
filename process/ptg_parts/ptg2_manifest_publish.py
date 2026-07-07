@@ -2049,6 +2049,7 @@ async def _index_direct_lean_tables(
     final_table: str,
     code_count_table: str,
     provider_set_dictionary_table: str,
+    create_serving_lookup_index: bool = True,
 ) -> None:
     lookup_index = _ptg2_snapshot_index_name(final_table, "lean_code_lookup_idx")
     code_lookup_index = _ptg2_snapshot_index_name(code_count_table, "lean_code_idx")
@@ -2061,13 +2062,14 @@ async def _index_direct_lean_tables(
         INCLUDE (code_key, plan_id, rate_count);
         """
     )
-    await db.status(
-        f"""
-        CREATE INDEX {_quote_ident(lookup_index)}
-        ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-        (code_key);
-        """
-    )
+    if create_serving_lookup_index:
+        await db.status(
+            f"""
+            CREATE INDEX {_quote_ident(lookup_index)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            (code_key);
+            """
+        )
     await db.status(
         f"""
         CREATE UNIQUE INDEX {_quote_ident(provider_set_key_index)}
@@ -2086,6 +2088,7 @@ async def _rewrite_direct_lean_manifest_stage(
     code_count_table: str,
     provider_set_dictionary_table: str,
     constants: Mapping[str, Any] | None,
+    create_serving_lookup_index: bool = True,
 ) -> dict[str, Any]:
     """Rewrite the narrow direct-copy stage into lean provider-key serving tables."""
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
@@ -2115,6 +2118,7 @@ async def _rewrite_direct_lean_manifest_stage(
         final_table=final_table,
         code_count_table=code_count_table,
         provider_set_dictionary_table=provider_set_dictionary_table,
+        create_serving_lookup_index=create_serving_lookup_index,
     )
     return {
         "serving_table_layout": PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
@@ -2300,6 +2304,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 code_count_table=code_count_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
                 constants=_manifest_constants_from_artifacts(artifacts),
+                create_serving_lookup_index=not skip_final_serving_table,
             )
         else:
             lean_serving_manifest = await _rewrite_ptg2_manifest_serving_table_lean_provider_key(
