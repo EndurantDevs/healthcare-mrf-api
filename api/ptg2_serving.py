@@ -4270,12 +4270,20 @@ def _ptg2_manifest_location_candidate_floor() -> int:
         return 100
 
 
-def _rate_group_unnest_threshold() -> int:
-    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_RATE_GROUP_UNNEST_THRESHOLD", "50000")
+def _ptg2_manifest_sql_rate_scope_threshold() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_SQL_RATE_SCOPE_MAX_IDS", "10000")
+    try:
+        return max(int(raw_value), 0)
+    except ValueError:
+        return 10000
+
+
+def _ptg2_manifest_location_first_max_npis() -> int:
+    raw_value = os.getenv("HLTHPRT_PTG2_MANIFEST_LOCATION_FIRST_MAX_NPIS", "5000")
     try:
         return max(int(raw_value), 1)
     except ValueError:
-        return 50000
+        return 5000
 
 
 async def _ptg2_manifest_location_provider_matches(
@@ -4417,17 +4425,10 @@ async def _ptg2_manifest_location_provider_matches(
     if inferred_taxonomy_rule is not None:
         location_array_taxonomy_codes.extend(inferred_taxonomy_rule.taxonomy_codes)
     location_array_taxonomy_int_codes: tuple[int, ...] = ()
-    if (
-        zip_value
-        and geo_lat is not None
-        and geo_long is not None
-        and geo_radius_miles is not None
-        and inferred_taxonomy_rule is not None
-        and not location_specialty_filter.active
-    ):
+    if zip_value and location_array_taxonomy_codes:
         location_array_taxonomy_int_codes = await _taxonomy_int_codes_for_codes(
             session,
-            inferred_taxonomy_rule.taxonomy_codes,
+            location_array_taxonomy_codes,
         )
     member_entity_filter_sql = ""
     if location_inferred_taxonomy_sql:
@@ -4453,6 +4454,8 @@ async def _ptg2_manifest_location_provider_matches(
     active_provider_group_rate_scope_table = ""
     has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
     rate_provider_group_ids: tuple[str, ...] = ()
+    rate_provider_group_id_set: frozenset[str] = frozenset()
+    sql_rate_provider_group_ids: tuple[str, ...] = ()
     has_component_rate_scope = False
     has_checked_rate_provider_group_sidecar = False
     has_rate_provider_group_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_forward"))
@@ -4531,22 +4534,11 @@ async def _ptg2_manifest_location_provider_matches(
             code_system=requested_system,
         )
         has_checked_rate_provider_group_sidecar = True
+        rate_provider_group_id_set = frozenset(_ptg2_manifest_ids(rate_provider_group_ids))
         if rate_provider_group_ids:
-            params["location_rate_provider_group_ids"] = list(rate_provider_group_ids)
-            if len(rate_provider_group_ids) >= _rate_group_unnest_threshold():
-                member_scope_cte = f"""
-            rate_provider_groups AS MATERIALIZED (
-                SELECT unnest(
-                    CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)})
-                ) AS provider_group_global_id_128
-            ),"""
-                member_scope_join = """
-                JOIN rate_provider_groups rpg_scope
-                  ON rpg_scope.provider_group_global_id_128 = pgm_scope.provider_group_global_id_128"""
-                final_member_scope_join = """
-            JOIN rate_provider_groups rpg
-              ON rpg.provider_group_global_id_128 = pgm.provider_group_global_id_128"""
-            else:
+            if len(rate_provider_group_ids) <= _ptg2_manifest_sql_rate_scope_threshold():
+                sql_rate_provider_group_ids = rate_provider_group_ids
+                params["location_rate_provider_group_ids"] = list(sql_rate_provider_group_ids)
                 rate_group_filter = (
                     "provider_group_global_id_128 = ANY("
                     f"CAST(:location_rate_provider_group_ids AS {_ptg2_manifest_id_array_cast(serving_tables)}))"
@@ -4571,8 +4563,11 @@ async def _ptg2_manifest_location_provider_matches(
             code_system=requested_system,
         )
         has_checked_rate_provider_group_sidecar = True
-    if provider_group_location_table and rate_provider_group_ids:
-        params.setdefault("location_rate_provider_group_ids", list(rate_provider_group_ids))
+        rate_provider_group_id_set = frozenset(_ptg2_manifest_ids(rate_provider_group_ids))
+        if rate_provider_group_ids and len(rate_provider_group_ids) <= _ptg2_manifest_sql_rate_scope_threshold():
+            sql_rate_provider_group_ids = rate_provider_group_ids
+    if provider_group_location_table and sql_rate_provider_group_ids:
+        params.setdefault("location_rate_provider_group_ids", list(sql_rate_provider_group_ids))
     is_provider_group_location_scope_empty = (
         bool(provider_group_location_table)
         and not has_component_rate_scope
@@ -4767,7 +4762,7 @@ async def _ptg2_manifest_location_provider_matches(
             location_inferred_taxonomy_sql=location_inferred_taxonomy_sql,
             location_array_taxonomy_codes=tuple(location_array_taxonomy_codes),
             location_array_taxonomy_int_codes=location_array_taxonomy_int_codes,
-            rate_provider_group_ids=rate_provider_group_ids,
+            rate_provider_group_ids=sql_rate_provider_group_ids,
             has_component_rate_scope=has_component_rate_scope,
             member_scope_cte=member_scope_cte,
             is_provider_group_location_scope_empty=is_provider_group_location_scope_empty,
@@ -4793,6 +4788,287 @@ async def _ptg2_manifest_location_provider_matches(
             {**params, "address_types": list(address_types)},
         )
         return [_row_mapping(location_row) for location_row in query_result]
+
+    def _location_first_zip_scope_cte() -> str:
+        if not (
+            zip_value
+            and geo_lat is not None
+            and geo_long is not None
+            and geo_radius_miles is not None
+        ):
+            return ""
+        return f"""
+            location_first_zip_scope AS MATERIALIZED (
+                SELECT g.zip_code::text AS zip5
+                  FROM {PTG2_SCHEMA}.geo_zip_lookup anchor
+                  JOIN {PTG2_SCHEMA}.geo_zip_lookup g
+                    ON g.latitude IS NOT NULL
+                   AND g.longitude IS NOT NULL
+                 WHERE anchor.zip_code = :zip5
+                   AND 69.0 * sqrt(
+                        power(g.latitude - anchor.latitude, 2)
+                        + power(
+                            (g.longitude - anchor.longitude)
+                            * cos(radians((g.latitude + anchor.latitude) / 2.0)),
+                            2
+                        )
+                   ) <= CAST(:geo_radius_miles AS double precision)
+            ),"""
+
+    def _location_first_from_sql() -> str:
+        if not (
+            zip_value
+            and geo_lat is not None
+            and geo_long is not None
+            and geo_radius_miles is not None
+        ):
+            return f"FROM {npi_address_table} addr"
+        scoped_zip_sql = _ptg2_address_zip5_sql("addr_probe", unified=using_unified_address_table)
+        return f"""
+                FROM location_first_zip_scope zip_scope
+                JOIN LATERAL (
+                    SELECT addr_probe.*
+                      FROM {npi_address_table} addr_probe
+                     WHERE {scoped_zip_sql} = zip_scope.zip5
+                       AND addr_probe.npi IS NOT NULL
+                       AND addr_probe.type = ANY(CAST(:address_types AS varchar[]))
+                       {f"AND addr_probe.taxonomy_array && CAST(:location_first_taxonomy_int_codes AS integer[])" if location_array_taxonomy_int_codes else ""}
+                     OFFSET 0
+                ) addr ON TRUE"""
+
+    def _location_first_filters(local_params: dict[str, Any]) -> list[str]:
+        clauses = [*filters]
+        clauses.append("addr.type = ANY(CAST(:address_types AS varchar[]))")
+        if location_array_taxonomy_int_codes:
+            clauses.append("addr.taxonomy_array && CAST(:location_first_taxonomy_int_codes AS integer[])")
+        if location_specialty_filter.active:
+            clauses.append(
+                "addr.npi IN ("
+                + provider_specialty_taxonomy_semijoin_sql(
+                    local_params,
+                    "manifest_location_first_specialty",
+                    location_specialty_filter,
+                    schema=PTG2_SCHEMA,
+                )
+                + ")"
+            )
+        if location_inferred_taxonomy_sql:
+            clauses.append(
+                f"addr.npi IN (SELECT nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy nt "
+                f"WHERE {location_inferred_taxonomy_sql})"
+            )
+            clauses.append(_ptg2_individual_npi_scalar_sql("addr.npi"))
+        return clauses
+
+    async def _query_location_first_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]] | None:
+        if not (
+            using_unified_address_table
+            and rate_provider_group_id_set
+            and not sql_rate_provider_group_ids
+            and (member_taxonomy_scoped or provider_npi is not None)
+            and not has_component_rate_scope
+        ):
+            return None
+        location_first_max_npis = _ptg2_manifest_location_first_max_npis()
+        location_first_params = {
+            key: value for key, value in params.items() if key != "location_rate_provider_group_ids"
+        }
+        location_first_params.update(
+            {
+                "address_types": list(address_types),
+                "location_first_taxonomy_int_codes": list(location_array_taxonomy_int_codes),
+                "location_first_probe_limit": location_first_max_npis + 1,
+                "location_first_max_npis": location_first_max_npis,
+            }
+        )
+        location_first_filters = _location_first_filters(location_first_params)
+        location_first_zip_scope = _location_first_zip_scope_cte()
+        location_first_from_sql = _location_first_from_sql()
+        try:
+            await _set_local_jit_off_for_manifest_location(session)
+            probe_result = await session.execute(
+                text(
+                    f"""
+            WITH
+            {location_first_zip_scope}
+            located_probe AS MATERIALIZED (
+                SELECT DISTINCT addr.npi
+                {location_first_from_sql}
+                WHERE {" AND ".join(location_first_filters)}
+                ORDER BY addr.npi
+                LIMIT :location_first_probe_limit
+            )
+            SELECT npi
+            FROM located_probe
+            """
+                ),
+                location_first_params,
+            )
+        except Exception:
+            await _rollback_optional_ptg2_query(session)
+            return None
+
+        probe_npis = [
+            data.get("npi")
+            for data in (_row_mapping(row) for row in probe_result)
+            if data.get("npi") is not None
+        ]
+        if not probe_npis:
+            return []
+
+        try:
+            result = await session.execute(
+                text(
+                    f"""
+            WITH
+            {location_first_zip_scope}
+            located AS MATERIALIZED (
+                SELECT DISTINCT ON (addr.npi)
+                    addr.npi,
+                    addr.type,
+                    addr.checksum,
+                    addr.state_name,
+                    addr.city_name,
+                    addr.postal_code,
+                    addr.country_code,
+                    addr.address_key,
+                    {premise_key_select_sql}
+                    to_jsonb(addr.*) AS base_address_payload,
+                    addr.lat,
+                    addr.long,
+                    addr.first_line,
+                    addr.second_line,
+                    addr.telephone_number,
+                    addr.fax_number,
+                    addr.phone_number,
+                    addr.phone_extension,
+                    addr.fax_number_digits,
+                    addr.fax_extension,
+                    {location_select_sql}
+                {location_first_from_sql}
+                WHERE {" AND ".join(location_first_filters)}
+                ORDER BY {location_order_sql},
+                    CASE addr.type
+                        WHEN 'practice' THEN 0
+                        WHEN 'primary' THEN 1
+                        WHEN 'secondary' THEN 2
+                        ELSE 3
+                    END,
+                    addr.checksum
+                LIMIT :location_first_max_npis
+            ),
+            location_npis AS MATERIALIZED (
+                SELECT *
+                FROM located
+                ORDER BY {limited_location_order_sql}
+            )
+            {address_fallback_cte}
+            , located_with_tax AS MATERIALIZED (
+                SELECT
+                    loc.*,
+                    tax.taxonomy_codes,
+                    tax.specialties,
+                    tax.classifications,
+                    tax.specializations,
+                    tax.primary_specialty,
+                    tax.primary_specialization
+                FROM location_npis loc
+                {_provider_taxonomy_summary_lateral_sql("loc.npi")}
+            )
+            SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
+                pgm.provider_group_global_id_128,
+                addr.npi,
+                addr.address_key::text AS address_key,
+                addr.premise_key::text AS premise_key,
+                {address_location_hash_sql} AS location_hash,
+                {_eff('state_name')} AS state,
+                {_eff('city_name')} AS city,
+                LEFT(COALESCE({_eff('postal_code')}, ''), 5) AS zip5,
+                addr.distance_miles,
+                addr.zip_match_type,
+                addr.anchor_zip5,
+                addr.zip_radius_miles,
+                '{address_location_source}' AS location_source,
+                '{address_location_source}' AS location_confidence_code,
+                (
+                    COALESCE(addr.base_address_payload, '{{}}'::jsonb)
+                    - 'premise_key'
+                    || jsonb_build_object(
+                        'first_line', {_eff('first_line')},
+                        'second_line', {_eff('second_line')},
+                        'city', {_eff('city_name')},
+                        'state', {_eff('state_name')},
+                        'postal_code', {_eff('postal_code')},
+                        'country_code', {_eff('country_code')},
+                        'telephone_number', {_eff('telephone_number')},
+                        'fax_number', {_eff('fax_number')},
+                        'phone_number', {_eff('phone_number')},
+                        'phone_extension', {_eff('phone_extension')},
+                        'fax_number_digits', {_eff('fax_number_digits')},
+                        'fax_extension', {_eff('fax_extension')},
+                        'address_key', addr.address_key::text,
+                        'address_site_key', addr.premise_key::text,
+                        'lat', {_eff('lat')},
+                        'long', {_eff('long')}
+                    )
+                )::text AS address_payload,
+                {_eff('telephone_number')} AS telephone_number,
+                {_eff('fax_number')} AS fax_number,
+                {_eff('phone_number')} AS phone_number,
+                {_eff('phone_extension')} AS phone_extension,
+                {_eff('fax_number_digits')} AS fax_number_digits,
+                {_eff('fax_extension')} AS fax_extension,
+                COALESCE(addr.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+                COALESCE(addr.specialties, ARRAY[]::varchar[]) AS specialties,
+                COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications,
+                COALESCE(addr.specializations, ARRAY[]::varchar[]) AS specializations,
+                addr.primary_specialty,
+                addr.primary_specialization,
+                {provider_name_sql} AS provider_name
+            FROM located_with_tax addr
+            JOIN LATERAL (
+                SELECT pgm_inner.provider_group_global_id_128
+                  FROM {provider_group_member_table} pgm_inner
+                 WHERE pgm_inner.npi = addr.npi
+                 OFFSET 0
+            ) pgm ON TRUE
+            {provider_join}
+            {address_fallback_join}
+            ORDER BY pgm.provider_group_global_id_128,
+                addr.npi,
+                CASE addr.type
+                    WHEN 'practice' THEN 0
+                    WHEN 'primary' THEN 1
+                    WHEN 'secondary' THEN 2
+                    ELSE 3
+                END,
+                addr.checksum
+            """
+                ),
+                location_first_params,
+            )
+        except Exception:
+            await _rollback_optional_ptg2_query(session)
+            return None
+
+        scoped_rows: list[dict[str, Any]] = []
+        seen_rows: set[tuple[str, int]] = set()
+        for row in (_row_mapping(result_row) for result_row in result):
+            group_id = _ptg2_manifest_id(row.get("provider_group_global_id_128"))
+            if not group_id or group_id not in rate_provider_group_id_set:
+                continue
+            try:
+                npi = int(row.get("npi"))
+            except (TypeError, ValueError):
+                continue
+            row_key = (group_id, npi)
+            if row_key in seen_rows:
+                continue
+            seen_rows.add(row_key)
+            scoped_rows.append(dict(row))
+            if len(scoped_rows) >= configured_limit:
+                break
+        return scoped_rows
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
         address_filters = [*filters]
@@ -5078,9 +5354,13 @@ async def _ptg2_manifest_location_provider_matches(
         fallback_address_types = ("secondary",)
     rows = await _query_provider_group_location_rows(primary_address_types)
     if rows is None:
+        rows = await _query_location_first_provider_rows(primary_address_types)
+    if rows is None:
         rows = await _query_location_provider_rows(primary_address_types)
     if not rows and provider_npi is None:
         fallback_rows = await _query_provider_group_location_rows(fallback_address_types)
+        if fallback_rows is None:
+            fallback_rows = await _query_location_first_provider_rows(fallback_address_types)
         rows = fallback_rows if fallback_rows is not None else await _query_location_provider_rows(fallback_address_types)
     if not rows:
         return set(), {}

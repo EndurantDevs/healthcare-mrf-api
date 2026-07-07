@@ -5352,8 +5352,7 @@ async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exist
 
 
 @pytest.mark.asyncio
-async def test_manifest_location_provider_matches_large_sidecar_scope_uses_unnest_cte(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_RATE_GROUP_UNNEST_THRESHOLD", "2")
+async def test_manifest_location_provider_matches_small_sidecar_scope_uses_plain_any(monkeypatch):
     group_a = "00000000-0000-0000-0000-000000000011"
     group_b = "00000000-0000-0000-0000-000000000012"
     session = FakeSession([FakeResult(rows=[])])
@@ -5386,12 +5385,86 @@ async def test_manifest_location_provider_matches_large_sidecar_scope_uses_unnes
     )
 
     sql = str(session.calls[-1][0][0])
-    assert "rate_provider_groups AS MATERIALIZED" in sql
-    assert "SELECT unnest(" in sql
-    assert "JOIN rate_provider_groups rpg_scope" in sql
-    assert "JOIN rate_provider_groups rpg" in sql
-    assert "pgm_scope.provider_group_global_id_128 = ANY" not in sql
-    assert "pgm.provider_group_global_id_128 = ANY" not in sql
+    assert "rate_provider_groups AS MATERIALIZED" not in sql
+    assert "SELECT unnest(" not in sql
+    assert "JOIN rate_provider_groups rpg_scope" not in sql
+    assert "JOIN rate_provider_groups rpg" not in sql
+    assert "pgm_scope.provider_group_global_id_128 = ANY" in sql
+    assert "pgm.provider_group_global_id_128 = ANY" in sql
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_sidecar_scope_uses_location_first_python_intersection(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SQL_RATE_SCOPE_MAX_IDS", "0")
+    group_id = "00000000-0000-0000-0000-000000000011"
+    other_group_id = "00000000-0000-0000-0000-000000000099"
+    provider_set_id = "00000000000000000000000000000012"
+    row = _fake_manifest_provider_location_row(group_id)
+    other_row = _fake_manifest_provider_location_row(other_group_id)
+    session = FakeSession(
+        [
+            FakeResult(rows=[{"npi": 1234567890}]),
+            FakeResult(rows=[row, other_row]),
+        ]
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.entity_address_unified"))
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg2_serving, "_taxonomy_int_codes_for_codes", AsyncMock(return_value=(101, 202)))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_provider_groups_from_sidecar",
+        AsyncMock(return_value=(group_id,)),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_sets_by_group",
+        AsyncMock(return_value={group_id.replace("-", ""): (provider_set_id,)}),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_overlay_provider_directory_corroboration",
+        AsyncMock(side_effect=lambda _session, rows, **_kwargs: rows),
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_token",
+        provider_group_member_table="mrf.ptg2_provider_group_member_token",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+        id_storage="uuid",
+    )
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "plan_id": "010854205",
+            "code": "99203",
+            "code_system": "CPT",
+            "zip5": "60601",
+            "specialty": "orthopedic surgery",
+        },
+        candidate_limit=5,
+        plan_id="010854205",
+    )
+
+    probe_sql = _fake_call_sql(session, "located_probe AS MATERIALIZED")
+    location_sql = _fake_call_sql(session, "located AS MATERIALIZED")
+    location_params = next(
+        call[0][1]
+        for call in session.calls
+        if "located AS MATERIALIZED" in str(call[0][0])
+    )
+    assert "addr.taxonomy_array && CAST(:location_first_taxonomy_int_codes AS integer[])" in probe_sql
+    assert "JOIN LATERAL" in location_sql
+    assert "FROM mrf.ptg2_provider_group_member_token pgm_inner" in location_sql
+    assert "pgm_inner.npi = addr.npi" in location_sql
+    assert "scoped_member_npis AS MATERIALIZED" not in location_sql
+    assert "rate_provider_groups AS MATERIALIZED" not in location_sql
+    assert "location_rate_provider_group_ids" not in location_sql
+    assert "location_rate_provider_group_ids" not in location_params
+    assert location_params["location_first_taxonomy_int_codes"] == [101, 202]
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
 
 
 async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
