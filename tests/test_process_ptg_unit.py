@@ -844,7 +844,40 @@ def test_rust_publish_skips_optional_provider_geo_index_when_postgis_is_missing(
     assert any("geo_gist_idx" in statement for statement in status_calls)
 
 
-def test_manifest_provider_group_location_indexes_include_zip_covering_index(monkeypatch):
+def test_manifest_provider_group_location_indexes_default_to_lean_profile(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_all(statement, **_params):
+        raise AssertionError("lean provider-location indexes should not query taxonomy rules")
+
+    monkeypatch.delenv(
+        ptg_manifest_publish.PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
+        raising=False,
+    )
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+
+    asyncio.run(
+        ptg_manifest_publish._index_provider_group_locations(
+            schema_name="mrf",
+            provider_group_location_table="ptg2_provider_group_location_snap",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert "zip_group_idx" in joined
+    assert "(state_name, city_name, npi, provider_group_global_id_128)" in joined
+    assert "(npi, provider_group_global_id_128)" in joined
+    assert "USING gin (taxonomy_array gin__int_ops)" in joined
+    assert "zip_type_cover_idx" not in joined
+    assert "geo_gist_idx" not in joined
+    assert "zip_taxonomy_rule_" not in joined
+
+
+def test_manifest_provider_group_location_indexes_full_profile_includes_zip_covering_index(monkeypatch):
     status_calls = []
 
     async def fake_status(statement, **_params):
@@ -854,6 +887,10 @@ def test_manifest_provider_group_location_indexes_include_zip_covering_index(mon
         assert "nucc_taxonomy" in statement
         return [{"int_code": 101}, {"int_code": 202}]
 
+    monkeypatch.setenv(
+        ptg_manifest_publish.PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
+        "full",
+    )
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
 

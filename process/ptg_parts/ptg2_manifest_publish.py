@@ -42,12 +42,17 @@ PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY = "lean_provider_key_v1"
 PTG2_MANIFEST_PRICE_ATOM_LAYOUT_ENV = "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT"
 PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT = "lean_dict_v1"
 PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE"
+PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV = (
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE"
+)
 PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE"
 PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE"
 PTG2_MANIFEST_SERVING_SIDECARS_ENABLED_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED"
 PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS_ENV = "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS"
 logger = logging.getLogger(__name__)
 _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
+_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL = "full"
+_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN = "lean"
 
 
 def _row_value(row: Any, key: str, position: int = 0) -> Any:
@@ -223,6 +228,25 @@ def _ptg2_manifest_provider_group_location_enabled() -> bool:
     if os.getenv(PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE_ENV, True)
     return _ptg2_manifest_serving_layout() != PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY
+
+
+def _ptg2_manifest_provider_group_location_index_profile() -> str:
+    raw_value = os.getenv(
+        PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
+        _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
+    )
+    value = str(raw_value or "").strip().lower()
+    if value in {"", _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN, "minimal"}:
+        return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN
+    if value in {_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL, "legacy"}:
+        return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL
+    logger.warning(
+        "Unknown %s=%r; using %s provider-group location indexes",
+        PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
+        raw_value,
+        _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
+    )
+    return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN
 
 
 def _ptg2_manifest_snapshot_arch() -> str:
@@ -693,37 +717,53 @@ async def _index_provider_group_locations(
     schema_name: str,
     provider_group_location_table: str,
 ) -> None:
-    location_indexes = [
-        ("group_zip_idx", "(provider_group_global_id_128, zip5, npi)"),
-        ("zip_group_idx", "(zip5, provider_group_global_id_128, npi)"),
-        (
-            "zip_type_cover_idx",
-            "(zip5, address_type, provider_group_global_id_128, npi, address_checksum) "
-            "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL",
-        ),
-        ("state_city_group_idx", "(state_name, city_name, provider_group_global_id_128, npi)"),
-        ("state_city_npi_group_idx", "(state_name, city_name, npi, provider_group_global_id_128)"),
-        ("group_state_city_npi_addr_idx", "(provider_group_global_id_128, state_name, city_name, npi, address_checksum)"),
-        ("npi_group_idx", "(npi, provider_group_global_id_128)"),
-        ("group_npi_idx", "(provider_group_global_id_128, npi)"),
-        ("lat_long_group_idx", "(lat, long, provider_group_global_id_128, npi) WHERE lat IS NOT NULL AND long IS NOT NULL"),
-        ("address_key_idx", "(address_key, provider_group_global_id_128, npi) WHERE address_key IS NOT NULL"),
-        ("taxonomy_array_gin_idx", "USING gin (taxonomy_array gin__int_ops)"),
-    ]
+    profile = _ptg2_manifest_provider_group_location_index_profile()
+    if profile == _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL:
+        location_indexes = [
+            ("group_zip_idx", "(provider_group_global_id_128, zip5, npi)"),
+            ("zip_group_idx", "(zip5, provider_group_global_id_128, npi)"),
+            (
+                "zip_type_cover_idx",
+                "(zip5, address_type, provider_group_global_id_128, npi, address_checksum) "
+                "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL",
+            ),
+            ("state_city_group_idx", "(state_name, city_name, provider_group_global_id_128, npi)"),
+            ("state_city_npi_group_idx", "(state_name, city_name, npi, provider_group_global_id_128)"),
+            (
+                "group_state_city_npi_addr_idx",
+                "(provider_group_global_id_128, state_name, city_name, npi, address_checksum)",
+            ),
+            ("npi_group_idx", "(npi, provider_group_global_id_128)"),
+            ("group_npi_idx", "(provider_group_global_id_128, npi)"),
+            (
+                "lat_long_group_idx",
+                "(lat, long, provider_group_global_id_128, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
+            ),
+            ("address_key_idx", "(address_key, provider_group_global_id_128, npi) WHERE address_key IS NOT NULL"),
+            ("taxonomy_array_gin_idx", "USING gin (taxonomy_array gin__int_ops)"),
+        ]
+    else:
+        location_indexes = [
+            ("zip_group_idx", "(zip5, provider_group_global_id_128, npi)"),
+            ("state_city_npi_group_idx", "(state_name, city_name, npi, provider_group_global_id_128)"),
+            ("npi_group_idx", "(npi, provider_group_global_id_128)"),
+            ("taxonomy_array_gin_idx", "USING gin (taxonomy_array gin__int_ops)"),
+        ]
     for index_role, columns_sql in location_indexes:
         await db.status(
             f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, index_role))} "
             f"ON {_qualified_table(schema_name, provider_group_location_table)} {columns_sql};"
         )
-    await _create_optional_manifest_provider_geo_index(
-        schema_name=schema_name,
-        provider_group_location_table=provider_group_location_table,
-    )
-    await _create_inferred_taxonomy_zip_indexes(
-        schema_name=schema_name,
-        provider_group_location_table=provider_group_location_table,
-        group_column="provider_group_global_id_128",
-    )
+    if profile == _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL:
+        await _create_optional_manifest_provider_geo_index(
+            schema_name=schema_name,
+            provider_group_location_table=provider_group_location_table,
+        )
+        await _create_inferred_taxonomy_zip_indexes(
+            schema_name=schema_name,
+            provider_group_location_table=provider_group_location_table,
+            group_column="provider_group_global_id_128",
+        )
     await db.status(f"ANALYZE {_qualified_table(schema_name, provider_group_location_table)};")
 
 

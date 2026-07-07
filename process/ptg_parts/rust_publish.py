@@ -32,6 +32,9 @@ from process.ptg_parts.snapshot_tables import (
 
 logger = logging.getLogger(__name__)
 _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
+PTG2_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV = "HLTHPRT_PTG2_PROVIDER_GROUP_LOCATION_INDEX_PROFILE"
+_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL = "full"
+_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN = "lean"
 
 
 def _row_value(row: Any, key: str, position: int = 0) -> Any:
@@ -48,6 +51,27 @@ def _row_value(row: Any, key: str, position: int = 0) -> Any:
 
 def _ptg2_publish_timestamp() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _provider_group_location_index_profile() -> str:
+    raw_value = os.getenv(
+        PTG2_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
+        os.getenv(
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE",
+            _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
+        ),
+    )
+    value = str(raw_value or "").strip().lower()
+    if value in {"", _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN, "minimal"}:
+        return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN
+    if value in {_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL, "legacy"}:
+        return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL
+    logger.warning(
+        "Unknown provider-group location index profile %r; using %s indexes",
+        raw_value,
+        _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
+    )
+    return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN
 
 
 async def _create_optional_provider_geo_index(
@@ -333,57 +357,78 @@ async def _publish_rust_compact_snapshot_tables(
                );
             """
         )
-        location_indexes = [
-            (
-                "group_zip_idx",
-                "(provider_group_hash, zip5, npi)",
-            ),
-            (
-                "zip_group_idx",
-                "(zip5, provider_group_hash, npi)",
-            ),
-            (
-                "state_city_group_idx",
-                "(state_name, city_name, provider_group_hash, npi)",
-            ),
-            (
-                "state_city_npi_group_idx",
-                "(state_name, city_name, npi, provider_group_hash)",
-            ),
-            (
-                "group_state_city_npi_addr_idx",
-                "(provider_group_hash, state_name, city_name, npi, address_checksum)",
-            ),
-            (
-                "npi_group_idx",
-                "(npi, provider_group_hash)",
-            ),
-            (
-                "group_npi_idx",
-                "(provider_group_hash, npi)",
-            ),
-            (
-                "lat_long_group_idx",
-                "(lat, long, provider_group_hash, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
-            ),
-            (
-                "taxonomy_array_gin_idx",
-                "USING gin (taxonomy_array gin__int_ops)",
-            ),
-        ]
+        if _provider_group_location_index_profile() == _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL:
+            location_indexes = [
+                (
+                    "group_zip_idx",
+                    "(provider_group_hash, zip5, npi)",
+                ),
+                (
+                    "zip_group_idx",
+                    "(zip5, provider_group_hash, npi)",
+                ),
+                (
+                    "state_city_group_idx",
+                    "(state_name, city_name, provider_group_hash, npi)",
+                ),
+                (
+                    "state_city_npi_group_idx",
+                    "(state_name, city_name, npi, provider_group_hash)",
+                ),
+                (
+                    "group_state_city_npi_addr_idx",
+                    "(provider_group_hash, state_name, city_name, npi, address_checksum)",
+                ),
+                (
+                    "npi_group_idx",
+                    "(npi, provider_group_hash)",
+                ),
+                (
+                    "group_npi_idx",
+                    "(provider_group_hash, npi)",
+                ),
+                (
+                    "lat_long_group_idx",
+                    "(lat, long, provider_group_hash, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
+                ),
+                (
+                    "taxonomy_array_gin_idx",
+                    "USING gin (taxonomy_array gin__int_ops)",
+                ),
+            ]
+        else:
+            location_indexes = [
+                (
+                    "zip_group_idx",
+                    "(zip5, provider_group_hash, npi)",
+                ),
+                (
+                    "state_city_npi_group_idx",
+                    "(state_name, city_name, npi, provider_group_hash)",
+                ),
+                (
+                    "npi_group_idx",
+                    "(npi, provider_group_hash)",
+                ),
+                (
+                    "taxonomy_array_gin_idx",
+                    "USING gin (taxonomy_array gin__int_ops)",
+                ),
+            ]
         for role, columns_sql in location_indexes:
             await db.status(
                 f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, role))} "
                 f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} {columns_sql};"
             )
-        await _create_optional_provider_geo_index(
-            schema_name=schema_name,
-            provider_group_location_table=provider_group_location_table,
-        )
-        await _create_inferred_taxonomy_zip_indexes(
-            schema_name=schema_name,
-            provider_group_location_table=provider_group_location_table,
-        )
+        if _provider_group_location_index_profile() == _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL:
+            await _create_optional_provider_geo_index(
+                schema_name=schema_name,
+                provider_group_location_table=provider_group_location_table,
+            )
+            await _create_inferred_taxonomy_zip_indexes(
+                schema_name=schema_name,
+                provider_group_location_table=provider_group_location_table,
+            )
     analyze_started = time.monotonic()
     for table_name in table_names.values():
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(table_name)};")
