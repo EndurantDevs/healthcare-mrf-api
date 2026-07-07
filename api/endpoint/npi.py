@@ -3393,7 +3393,7 @@ async def get_all(request):
         include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
     include_total_raw = request.args.get("include_total")
-    include_total = _parse_bool_arg(request.args.get("include_total"), default=True)
+    include_total = _parse_bool_arg(include_total_raw, default=_should_include_npi_all_total(request.args, count_only))
     view_mode = str(request.args.get("view") or "").strip().lower()
     classification = request.args.get("classification")
     sitemap_limit_mode = (
@@ -3561,10 +3561,6 @@ async def get_all(request):
     address_key = _normalize_address_key(address_key_raw)
     address_site_key = _normalize_uuid_key(address_site_key_raw, PUBLIC_ADDRESS_SITE_KEY)
     exact_npi = _normalize_exact_npi(npi_raw)
-    if include_total_raw is None and not count_only and (
-        phone_digits or address_key or address_site_key or exact_npi is not None
-    ):
-        include_total = False
     entity_type_code: Optional[int] = None
     if entity_type_code_raw not in (None, ""):
         try:
@@ -6172,3 +6168,15 @@ async def _fetch_provider_directory_address_overlay(
         overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
         overlay_addresses.append(dict(overlay_mapping))
     return overlay_addresses
+
+
+def _should_include_npi_all_total(args: object, count_only: bool) -> bool:
+    if count_only:
+        return True
+    getter = getattr(args, "get", None)
+    if not callable(getter) or getter("include_total") is not None:
+        return True
+    return not any(
+        str(getter(key) or "").strip()
+        for key in ("phone", "address_key", PUBLIC_ADDRESS_SITE_KEY, "npi")
+    )
