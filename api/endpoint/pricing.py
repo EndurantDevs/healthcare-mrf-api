@@ -7826,6 +7826,7 @@ async def list_providers_by_procedure(request):
     code = str(args.get("code", "")).strip()
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
+    ptg_code_system = args.get("code_system") or (_reported_procedure_code_system(code) if code else None)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     include_sources = _parse_bool(args.get("include_sources"), "include_sources", default=False)
     include_evidence = _parse_bool(args.get("include_evidence"), "include_evidence", default=False)
@@ -7863,7 +7864,7 @@ async def list_providers_by_procedure(request):
         args,
         {
             "code": code,
-            "code_system": args.get("code_system"),
+            "code_system": ptg_code_system,
             "plan_id": plan_id,
             "plan_external_id": plan_external_id,
             "plan_market_type": plan_market_type,
@@ -7907,7 +7908,7 @@ async def list_providers_by_procedure(request):
                 "snapshot_id": snapshot_id or None,
                 "mode": mode or None,
                 "code": code or None,
-                "code_system": args.get("code_system") or None,
+                "code_system": ptg_code_system or None,
                 "q": q or None,
                 "specialty": specialty or None,
                 "classification": args.get("classification") or None,

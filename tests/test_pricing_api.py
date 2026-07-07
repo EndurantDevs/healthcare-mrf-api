@@ -2145,6 +2145,36 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
+    observed_search_args_by_name = {}
+
+    async def fake_search(_session, args, pagination):
+        observed_search_args_by_name.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2"},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [],
+        args={"plan_id": "010854205", "market_type": "group", "code": "70551"},
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["query"]["source"] == "ptg2"
+    assert observed_search_args_by_name["code_system"] == "CPT"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit(monkeypatch):
     async def fail_search(*_args, **_kwargs):
         raise AssertionError("broad provider-directory request should fail before PTG search")
