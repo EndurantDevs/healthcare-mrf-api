@@ -3875,7 +3875,7 @@ async def _search_ptg2_manifest_route_item_table(
                     )
                     {npi_filter_sql}
             )
-            SELECT item_payload, distance_miles, zip_rank
+            SELECT item_payload, distance_miles, zip_rank, COUNT(*) OVER () AS total_matches
               FROM raw
              ORDER BY {order_sql}
              LIMIT :limit OFFSET :offset
@@ -3887,9 +3887,12 @@ async def _search_ptg2_manifest_route_item_table(
         await _rollback_optional_ptg2_query(session)
         return None
     items: list[dict[str, Any]] = []
+    total_matches: int | None = None
     with _suspend_gc_for_route_item_payload():
         for row in result:
             data = _row_mapping(row)
+            if total_matches is None:
+                total_matches = _coerce_int_payload(data.get("total_matches"))
             payload = _coerce_json_payload(data.get("item_payload"), {})
             if not isinstance(payload, dict):
                 continue
@@ -3902,14 +3905,16 @@ async def _search_ptg2_manifest_route_item_table(
         if not items:
             return None
 
+        returned_through = int(pagination.offset) + len(items)
         return _shape_ptg2_manifest_response(
             {
                 "items": items,
                 "pagination": {
-                    "total": int(pagination.offset) + len(items),
+                    "total": total_matches if total_matches is not None else returned_through,
                     "limit": pagination.limit,
                     "offset": pagination.offset,
                     "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                    "has_more": bool(total_matches is not None and returned_through < total_matches),
                 },
                 "query": {
                     "plan_id": args.get("plan_id"),
@@ -5842,10 +5847,14 @@ async def _search_ptg2_manifest_db_serving_table(
         location_filter_requested=location_filter_requested and expand_providers,
     )
     total_items = len(items)
+    has_more_page_rows = False
     if expand_providers:
         start = max(int(pagination.offset), 0)
         end = start + max(int(pagination.limit), 0)
         items = items[start:end]
+        has_more_page_rows = end < total_items
+    elif total is not None:
+        has_more_page_rows = (int(pagination.offset) + len(items)) < int(total)
     return _shape_ptg2_manifest_response(
         {
             "items": items,
@@ -5860,6 +5869,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                "has_more": has_more_page_rows,
             },
             "query": {
                 "plan_id": args.get("plan_id"),
