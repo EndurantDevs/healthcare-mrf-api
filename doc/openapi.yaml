@@ -1933,7 +1933,7 @@ paths:
   /npi/match-candidates:
     get:
       operationId: getNpiMatchCandidates
-      summary: Find provider candidates from a location or contact locator
+      summary: Find provider candidates from site key, address key, geo, or phone locators
       description: |
         Locator-first provider candidate matcher. At least one locator is required:
         `address_site_key`, `address_key`, `lat` + `long`, or `phone`.

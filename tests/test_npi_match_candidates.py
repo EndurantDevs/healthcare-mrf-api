@@ -28,14 +28,18 @@ async def test_match_candidate_params_reject_removed_raw_address_locators():
                 {
                     "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
                     "first_line": "326 Nichols Rd",
+                    "line1_norm": "326nicholsrd",
                     "zip_code": "01420",
+                    "zip5": "01420",
                 }
             )
         )
 
     message = str(excinfo.value)
     assert "first_line" in message
+    assert "line1_norm" in message
     assert "zip_code" in message
+    assert "zip5" in message
 
 
 @pytest.mark.asyncio
