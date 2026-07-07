@@ -4925,6 +4925,7 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
     sidecar_path = tmp_path / "provider_forward.ptg2sc"
     sidecar_path.write_bytes(b"PTG2MNDS" + b"\0" * 32)
     calls = []
+    progress_events = []
 
     async def fake_store(path, **kwargs):
         calls.append((Path(path), kwargs))
@@ -4934,6 +4935,7 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
 
     monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
+    monkeypatch.setattr(ptg_manifest_publish, "write_live_progress", lambda **payload: progress_events.append(payload))
 
     artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
         schema_name="mrf",
@@ -4956,6 +4958,8 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
     assert calls[0][0] == sidecar_path
     assert calls[0][1]["snapshot_id"] == "ptg2:test"
     assert calls[0][1]["artifact_kind"] == "provider_forward"
+    assert progress_events[-1]["publish_step"] == "artifact upload complete"
+    assert progress_events[-1]["artifact_name"] == "provider_forward"
 
 
 @pytest.mark.asyncio
@@ -4965,6 +4969,7 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
     price_path = tmp_path / "price_forward.ptg2sc"
     price_path.write_bytes(b"PTG2MNSC" + b"\0" * 32)
     calls = []
+    progress_events = []
 
     async def fake_store(path, **kwargs):
         calls.append((Path(path), kwargs))
@@ -4979,6 +4984,7 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
 
     monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
     monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
+    monkeypatch.setattr(ptg_manifest_publish, "write_live_progress", lambda **payload: progress_events.append(payload))
 
     base_artifacts, base_sidecars = ptg_manifest_publish._split_ptg2_manifest_base_artifacts(
         {
@@ -5008,6 +5014,65 @@ async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkey
     assert sidecars["provider_forward"]["storage_uri"] == "db://ptg2_artifact/provider_forward"
     assert sidecars["price_forward"]["storage_uri"] == "db://ptg2_artifact/price_forward"
     assert [call[0] for call in calls] == [provider_path, price_path]
+    assert [event["artifact_name"] for event in progress_events if event["publish_step"] == "artifact upload complete"] == [
+        "provider_forward",
+        "price_forward",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ptg2_manifest_serving_sidecars_use_rust_copy_fast_path(monkeypatch, tmp_path):
+    artifact_helpers = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
+    copied_sql = []
+    runner_calls = []
+    progress_events = []
+
+    async def fake_copy_query_to_file(sql, output_path):
+        copied_sql.append(sql)
+        if "ORDER BY code_key" in sql:
+            output_path.write_text(
+                "1\t2\t5\t11111111111111111111111111111111\n"
+                "1\t3\t7\t22222222222222222222222222222222\n"
+                "2\t2\t5\t11111111111111111111111111111111\n"
+            )
+        else:
+            output_path.write_text(
+                "2\t1\t5\t11111111111111111111111111111111\n"
+                "2\t2\t5\t11111111111111111111111111111111\n"
+                "3\t1\t7\t22222222222222222222222222222222\n"
+            )
+
+    def fake_runner(kind, copy_path, output_path):
+        runner_calls.append((kind, Path(copy_path), Path(output_path)))
+        rows = [line.split("\t") for line in Path(copy_path).read_text().splitlines()]
+        if kind == "by_code":
+            artifact_helpers.write_serving_by_code_sidecar(output_path, rows)
+        else:
+            artifact_helpers.write_serving_by_provider_set_sidecar(output_path, rows)
+
+    monkeypatch.setattr(ptg_manifest_publish, "_ptg2_manifest_serving_sidecar_rust_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_manifest_publish, "_copy_ptg2_query_to_file", fake_copy_query_to_file)
+    monkeypatch.setattr(ptg_manifest_publish, "_run_ptg2_serving_sidecar_from_key_copy", fake_runner)
+    monkeypatch.setattr(ptg_manifest_publish, "write_live_progress", lambda **payload: progress_events.append(payload))
+
+    sidecars = await ptg_manifest_publish._write_ptg2_manifest_serving_sidecars_rust(
+        schema_name="mrf",
+        final_table="ptg2_serving_test",
+        artifact_dir=tmp_path,
+        expected_row_count=3,
+    )
+
+    assert sidecars is not None
+    assert set(sidecars) == {"serving_by_code", "serving_by_provider_set"}
+    assert sidecars["serving_by_code"]["row_count"] == 3
+    assert sidecars["serving_by_provider_set"]["row_count"] == 3
+    assert [call[0] for call in runner_calls] == ["by_code", "by_provider_set"]
+    assert len(copied_sql) == 2
+    assert not any(path.name.startswith("serving_by_code_") and path.suffix == ".copy" for path in tmp_path.iterdir())
+    assert "serving sidecars export by code" in [event["publish_step"] for event in progress_events]
+    assert "serving sidecars encode reverse" in [event["publish_step"] for event in progress_events]
+    assert progress_events[-1]["publish_step"] == "serving sidecars complete"
 
 
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):

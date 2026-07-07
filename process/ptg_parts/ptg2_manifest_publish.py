@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -29,11 +31,20 @@ from process.ptg_parts.ptg2_artifact_blobs import (
 )
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
+from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
+    PTG2_SERVING_BY_CODE_FORMAT,
+    PTG2_SERVING_BY_CODE_MAGIC,
+    PTG2_SERVING_BY_PROVIDER_SET_ARTIFACT_KIND,
+    PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+    PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+    _existing_serving_sidecar_path_entry,
     read_global_sidecar_entries,
     write_serving_by_code_sidecar_async,
     write_serving_by_provider_set_sidecar_async,
 )
+from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
                                                _ptg2_snapshot_table_name,
                                                _ptg2_snapshot_table_token)
@@ -53,10 +64,13 @@ PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER
 PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE"
 PTG2_MANIFEST_SERVING_SIDECARS_ENABLED_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED"
 PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS_ENV = "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS"
+PTG2_MANIFEST_SERVING_SIDECAR_RUST_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECAR_RUST"
 logger = logging.getLogger(__name__)
 _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
 _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL = "full"
 _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN = "lean"
+_MANIFEST_PUBLISH_DETAIL_START_PCT = 96.38
+_MANIFEST_PUBLISH_DETAIL_END_PCT = 97.24
 
 
 def _row_value(row: Any, key: str, position: int = 0) -> Any:
@@ -69,6 +83,81 @@ def _row_value(row: Any, key: str, position: int = 0) -> Any:
         return row[position]
     except Exception:
         return None
+
+
+def _emit_ptg2_manifest_publish_progress(
+    publish_step: str,
+    *,
+    done: int,
+    total: int,
+    message: str | None = None,
+    pct: float | None = None,
+    **progress_details: Any,
+) -> None:
+    total_steps = max(int(total or 1), 1)
+    completed_steps = max(0, min(int(done), total_steps))
+    if pct is None:
+        pct = _MANIFEST_PUBLISH_DETAIL_START_PCT + (
+            (completed_steps / total_steps)
+            * (_MANIFEST_PUBLISH_DETAIL_END_PCT - _MANIFEST_PUBLISH_DETAIL_START_PCT)
+        )
+    progress_message = message or f"publishing {publish_step}"
+    payload = {
+        "phase": f"publishing: {publish_step}"[:128],
+        "unit": "manifest_publish_steps",
+        "done": completed_steps,
+        "total": total_steps,
+        "pct": pct,
+        "phase_pct": (completed_steps / total_steps) * 100.0,
+        "message": progress_message,
+        "detail": progress_message,
+        "source": "ptg2-manifest-publish-progress",
+        "confidence": "live",
+        "publish_step": publish_step,
+        **{key: value for key, value in progress_details.items() if value is not None},
+    }
+    try:
+        write_live_progress(**payload)
+    except Exception:
+        logger.debug("Failed to write PTG2 manifest publish live progress", exc_info=True)
+
+
+def _path_byte_count(path: Path | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return path.stat().st_size if path.exists() else None
+    except OSError:
+        return None
+
+
+def _ptg2_manifest_sidecar_upload_count(sidecar_artifacts: Mapping[str, Any] | None) -> int:
+    if not sidecar_artifacts:
+        return 0
+    count = 0
+    for name, value in sidecar_artifacts.items():
+        candidates = value if name == "sidecars" and isinstance(value, list) else [value]
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            storage_uri = str(candidate.get("storage_uri") or "").strip()
+            raw_path = str(candidate.get("path") or "").strip()
+            if raw_path and not storage_uri.startswith("db://ptg2_artifact/"):
+                count += 1
+    return count
+
+
+def _artifact_chunk_count(entry: Mapping[str, Any]) -> int | None:
+    try:
+        byte_count = int(entry.get("byte_count") or 0)
+        chunk_bytes = int(entry.get("chunk_bytes") or 0)
+    except (TypeError, ValueError):
+        return None
+    if byte_count <= 0 or chunk_bytes <= 0:
+        return None
+    return (byte_count + chunk_bytes - 1) // chunk_bytes
+
+
 PTG2_MANIFEST_SERVING_COLUMNS = [
     "serving_content_hash_128",
     "plan_id",
@@ -529,6 +618,223 @@ async def _iter_ptg2_serving_sidecar_rows(sql: str):
             yield row
 
 
+def _ptg2_manifest_serving_sidecar_rust_enabled() -> bool:
+    return _env_bool(PTG2_MANIFEST_SERVING_SIDECAR_RUST_ENV, True)
+
+
+def _new_ptg2_temp_path(directory: Path, *, prefix: str, suffix: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+    os.close(fd)
+    path = Path(name)
+    path.unlink(missing_ok=True)
+    return path
+
+
+async def _copy_ptg2_query_to_file(sql: str, output_path: Path) -> None:
+    async with db.acquire() as conn:
+        raw_conn = conn.raw_connection
+        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        copy_from_query = getattr(driver_conn, "copy_from_query", None)
+        if copy_from_query is None:
+            raise NotImplementedError("Active database driver does not expose copy_from_query")
+        with output_path.open("wb") as output:
+            await copy_from_query(
+                sql,
+                output=output,
+                format="text",
+                delimiter="\t",
+                null="\\N",
+            )
+
+
+def _run_ptg2_serving_sidecar_from_key_copy(kind: str, copy_path: Path, output_path: Path) -> None:
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
+        raise RuntimeError("PTG2 Rust serving sidecar encoder is enabled but no scanner binary was found")
+    completed = subprocess.run(
+        [
+            str(binary),
+            "--serving-sidecar-from-key-copy",
+            kind,
+            str(copy_path),
+            str(output_path),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        stderr_text = completed.stderr.decode("utf-8", errors="replace")
+        stdout_text = completed.stdout.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            "PTG2 Rust serving sidecar encoder failed "
+            f"for {kind}: stdout={stdout_text[-500:]} stderr={stderr_text[-1000:]}"
+        )
+
+
+async def _write_ptg2_manifest_serving_sidecars_rust(
+    *,
+    schema_name: str,
+    final_table: str,
+    artifact_dir: Path,
+    expected_row_count: int | None,
+) -> dict[str, Any] | None:
+    if not _ptg2_manifest_serving_sidecar_rust_enabled() or _ptg2_rust_scanner_binary() is None:
+        return None
+
+    qualified_table = f"{_quote_ident(schema_name)}.{_quote_ident(final_table)}"
+    by_code_path = artifact_dir / "serving_by_code_v1.ptg2sbc"
+    by_provider_set_path = artifact_dir / "serving_by_provider_set_v1.ptg2sbp"
+    existing_by_code = _existing_serving_sidecar_path_entry(
+        name="serving_by_code",
+        path=by_code_path,
+        magic=PTG2_SERVING_BY_CODE_MAGIC,
+        expected_format=PTG2_SERVING_BY_CODE_FORMAT,
+        kind=PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    existing_by_provider_set = _existing_serving_sidecar_path_entry(
+        name="serving_by_provider_set",
+        path=by_provider_set_path,
+        magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+        expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        kind=PTG2_SERVING_BY_PROVIDER_SET_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if existing_by_code is not None and existing_by_provider_set is not None:
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars reused",
+            done=8,
+            total=8,
+            message="serving sidecars already exist",
+            serving_by_code_bytes=existing_by_code.get("byte_count"),
+            serving_by_provider_set_bytes=existing_by_provider_set.get("byte_count"),
+        )
+        return {
+            "serving_by_code": existing_by_code,
+            "serving_by_provider_set": existing_by_provider_set,
+        }
+
+    by_code_copy = _new_ptg2_temp_path(artifact_dir, prefix="serving_by_code_", suffix=".copy")
+    by_provider_set_copy = _new_ptg2_temp_path(artifact_dir, prefix="serving_by_provider_set_", suffix=".copy")
+    try:
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars export by code",
+            done=1,
+            total=8,
+            message="exporting serving rows ordered by code",
+            expected_row_count=expected_row_count,
+        )
+        await _copy_ptg2_query_to_file(
+            f"""
+            SELECT code_key, provider_set_key, provider_count, price_set_global_id_128
+            FROM {qualified_table}
+            ORDER BY code_key, provider_set_key, price_set_global_id_128
+            """,
+            by_code_copy,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars export by code complete",
+            done=2,
+            total=8,
+            message="serving rows ordered by code exported",
+            copy_bytes=_path_byte_count(by_code_copy),
+            expected_row_count=expected_row_count,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars encode by code",
+            done=3,
+            total=8,
+            message="encoding serving_by_code sidecar",
+            copy_bytes=_path_byte_count(by_code_copy),
+        )
+        await asyncio.to_thread(
+            _run_ptg2_serving_sidecar_from_key_copy,
+            "by_code",
+            by_code_copy,
+            by_code_path,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars encode by code complete",
+            done=4,
+            total=8,
+            message="serving_by_code sidecar encoded",
+            sidecar_bytes=_path_byte_count(by_code_path),
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars export reverse",
+            done=5,
+            total=8,
+            message="exporting serving rows ordered by provider set",
+            expected_row_count=expected_row_count,
+        )
+        await _copy_ptg2_query_to_file(
+            f"""
+            SELECT provider_set_key, code_key, provider_count, price_set_global_id_128
+            FROM {qualified_table}
+            ORDER BY provider_set_key, code_key, price_set_global_id_128
+            """,
+            by_provider_set_copy,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars export reverse complete",
+            done=6,
+            total=8,
+            message="serving rows ordered by provider set exported",
+            copy_bytes=_path_byte_count(by_provider_set_copy),
+            expected_row_count=expected_row_count,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars encode reverse",
+            done=7,
+            total=8,
+            message="encoding serving_by_provider_set sidecar",
+            copy_bytes=_path_byte_count(by_provider_set_copy),
+        )
+        await asyncio.to_thread(
+            _run_ptg2_serving_sidecar_from_key_copy,
+            "by_provider_set",
+            by_provider_set_copy,
+            by_provider_set_path,
+        )
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars complete",
+            done=8,
+            total=8,
+            message="serving sidecars encoded",
+            serving_by_code_bytes=_path_byte_count(by_code_path),
+            serving_by_provider_set_bytes=_path_byte_count(by_provider_set_path),
+            expected_row_count=expected_row_count,
+        )
+    finally:
+        by_code_copy.unlink(missing_ok=True)
+        by_provider_set_copy.unlink(missing_ok=True)
+
+    by_code = _existing_serving_sidecar_path_entry(
+        name="serving_by_code",
+        path=by_code_path,
+        magic=PTG2_SERVING_BY_CODE_MAGIC,
+        expected_format=PTG2_SERVING_BY_CODE_FORMAT,
+        kind=PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    by_provider_set = _existing_serving_sidecar_path_entry(
+        name="serving_by_provider_set",
+        path=by_provider_set_path,
+        magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+        expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        kind=PTG2_SERVING_BY_PROVIDER_SET_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if by_code is None or by_provider_set is None:
+        raise RuntimeError("PTG2 Rust serving sidecar encoder did not produce valid sidecar files")
+    return {
+        "serving_by_code": by_code,
+        "serving_by_provider_set": by_provider_set,
+    }
+
+
 async def _write_ptg2_manifest_serving_sidecars(
     *,
     schema_name: str,
@@ -547,6 +853,17 @@ async def _write_ptg2_manifest_serving_sidecars(
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
     qualified_table = f"{_quote_ident(schema_name)}.{_quote_ident(final_table)}"
+    try:
+        rust_sidecars = await _write_ptg2_manifest_serving_sidecars_rust(
+            schema_name=schema_name,
+            final_table=final_table,
+            artifact_dir=artifact_dir,
+            expected_row_count=expected_row_count,
+        )
+        if rust_sidecars:
+            return rust_sidecars
+    except Exception:
+        logger.warning("PTG2 Rust serving sidecar generation failed; falling back to Python row streaming", exc_info=True)
     by_code_sql = f"""
         SELECT code_key, provider_set_key, provider_count, price_set_global_id_128
         FROM {qualified_table}
@@ -557,10 +874,31 @@ async def _write_ptg2_manifest_serving_sidecars(
         FROM {qualified_table}
         ORDER BY provider_set_key, code_key, price_set_global_id_128
     """
+    _emit_ptg2_manifest_publish_progress(
+        "serving sidecars python by code",
+        done=1,
+        total=4,
+        message="streaming serving_by_code sidecar in Python",
+        expected_row_count=expected_row_count,
+    )
     by_code = await write_serving_by_code_sidecar_async(
         artifact_dir / "serving_by_code_v1.ptg2sbc",
         _iter_ptg2_serving_sidecar_rows(by_code_sql),
         name="serving_by_code",
+        expected_row_count=expected_row_count,
+    )
+    _emit_ptg2_manifest_publish_progress(
+        "serving sidecars python by code complete",
+        done=2,
+        total=4,
+        message="serving_by_code sidecar streamed in Python",
+        sidecar_bytes=by_code.get("byte_count") if isinstance(by_code, Mapping) else None,
+    )
+    _emit_ptg2_manifest_publish_progress(
+        "serving sidecars python reverse",
+        done=3,
+        total=4,
+        message="streaming serving_by_provider_set sidecar in Python",
         expected_row_count=expected_row_count,
     )
     by_provider_set = await write_serving_by_provider_set_sidecar_async(
@@ -568,6 +906,16 @@ async def _write_ptg2_manifest_serving_sidecars(
         _iter_ptg2_serving_sidecar_rows(by_provider_set_sql),
         name="serving_by_provider_set",
         expected_row_count=expected_row_count,
+    )
+    _emit_ptg2_manifest_publish_progress(
+        "serving sidecars python complete",
+        done=4,
+        total=4,
+        message="serving sidecars streamed in Python",
+        serving_by_code_bytes=by_code.get("byte_count") if isinstance(by_code, Mapping) else None,
+        serving_by_provider_set_bytes=(
+            by_provider_set.get("byte_count") if isinstance(by_provider_set, Mapping) else None
+        ),
     )
     return {
         "serving_by_code": by_code,
@@ -585,8 +933,11 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
         return dict(sidecar_artifacts or {})
 
     uploaded_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    upload_total = _ptg2_manifest_sidecar_upload_count(sidecar_artifacts)
+    upload_done = 0
 
     async def upload_entry(default_name: str, value: Any) -> dict[str, Any] | None:
+        nonlocal upload_done
         if not isinstance(value, Mapping):
             return None
         entry = dict(value)
@@ -598,13 +949,45 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             return entry
         path = Path(raw_path)
         artifact_name = str(entry.get("name") or default_name).strip() or default_name
+        if upload_total:
+            _emit_ptg2_manifest_publish_progress(
+                "artifact upload",
+                done=upload_done,
+                total=upload_total,
+                message=f"uploading {artifact_name} sidecar to PostgreSQL",
+                pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
+                artifact_name=artifact_name,
+                artifact_bytes=_path_byte_count(path),
+            )
         cache_key = (str(path), str(entry.get("sha256") or ""), artifact_name)
         cached = uploaded_by_key.get(cache_key)
         if cached is not None:
             merged = dict(cached)
             merged["name"] = artifact_name
+            if upload_total:
+                upload_done += 1
+                _emit_ptg2_manifest_publish_progress(
+                    "artifact upload reused",
+                    done=upload_done,
+                    total=upload_total,
+                    message=f"reused uploaded {artifact_name} sidecar",
+                    pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
+                    artifact_name=artifact_name,
+                    artifact_bytes=merged.get("byte_count"),
+                    artifact_chunks=_artifact_chunk_count(merged),
+                )
             return merged
         if not path.exists() or path.stat().st_size <= 0:
+            if upload_total:
+                upload_done += 1
+                _emit_ptg2_manifest_publish_progress(
+                    "artifact upload skipped",
+                    done=upload_done,
+                    total=upload_total,
+                    message=f"skipped missing {artifact_name} sidecar upload",
+                    pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
+                    artifact_name=artifact_name,
+                )
             return entry
         uploaded = await store_ptg2_artifact_file_in_db(
             path,
@@ -615,6 +998,19 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             metadata=entry,
         )
         uploaded_by_key[cache_key] = uploaded
+        if upload_total:
+            upload_done += 1
+            _emit_ptg2_manifest_publish_progress(
+                "artifact upload complete",
+                done=upload_done,
+                total=upload_total,
+                message=f"uploaded {artifact_name} sidecar to PostgreSQL",
+                pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
+                artifact_name=artifact_name,
+                artifact_bytes=uploaded.get("byte_count"),
+                artifact_chunks=_artifact_chunk_count(uploaded),
+                storage_uri=uploaded.get("storage_uri"),
+            )
         return dict(uploaded)
 
     stored: dict[str, Any] = {}
@@ -2056,9 +2452,23 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(
             f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_group_location_table)};"
         )
+    _emit_ptg2_manifest_publish_progress(
+        "counting serving rows",
+        done=0,
+        total=8,
+        message="counting published serving rows",
+        serving_table=serving_work_table,
+    )
     row_count = await _exact_table_rows(schema_name, serving_work_table)
     serving_sidecar_artifacts: dict[str, Any] = {}
     if lean_serving_manifest is not None:
+        _emit_ptg2_manifest_publish_progress(
+            "serving sidecars start",
+            done=0,
+            total=8,
+            message="starting serving sidecar generation",
+            serving_rows=row_count,
+        )
         serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
             schema_name=schema_name,
             final_table=serving_work_table,
@@ -2073,6 +2483,14 @@ async def _publish_ptg2_manifest_serving_snapshot(
         and serving_sidecar_artifacts
         and _ptg2_manifest_drop_serving_table_after_sidecars()
     ):
+        _emit_ptg2_manifest_publish_progress(
+            "drop transient serving table",
+            done=1,
+            total=1,
+            message="dropping transient serving table after sidecars",
+            serving_table=serving_work_table,
+            serving_rows=row_count,
+        )
         await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
         serving_table_retained = False
     elapsed_seconds = time.monotonic() - started_at
@@ -2082,6 +2500,14 @@ async def _publish_ptg2_manifest_serving_snapshot(
         sidecar_artifacts,
         serving_sidecar_artifacts,
     )
+    if combined_sidecar_artifacts and ptg2_artifact_db_store_enabled():
+        _emit_ptg2_manifest_publish_progress(
+            "artifact upload start",
+            done=0,
+            total=max(_ptg2_manifest_sidecar_upload_count(combined_sidecar_artifacts), 1),
+            message="uploading sidecar artifacts to PostgreSQL",
+            pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
+        )
     combined_sidecar_artifacts = await _store_ptg2_manifest_sidecar_artifacts_in_db(
         schema_name=schema_name,
         snapshot_id=snapshot_id,

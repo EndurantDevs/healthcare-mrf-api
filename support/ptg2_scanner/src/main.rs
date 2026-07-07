@@ -6075,6 +6075,508 @@ fn manifest_merge_read_next(
     Ok(())
 }
 
+const PTG2_SERVING_BY_CODE_MAGIC: &[u8; 8] = b"PTG2SBC1";
+const PTG2_SERVING_BY_PROVIDER_SET_MAGIC: &[u8; 8] = b"PTG2SBP1";
+const PTG2_SERVING_BY_CODE_FORMAT: &str = "ptg2_serving_by_code_v1";
+const PTG2_SERVING_BY_PROVIDER_SET_FORMAT: &str = "ptg2_serving_by_provider_set_v1";
+
+#[derive(Clone, Copy)]
+struct ServingBlock {
+    key: i32,
+    offset: u64,
+    count: u32,
+}
+
+fn serving_copy_fields(line: &[u8]) -> Vec<&[u8]> {
+    let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+    trimmed.split(|byte| *byte == b'\t').collect()
+}
+
+fn serving_parse_i32(field: &[u8], name: &str) -> io::Result<i32> {
+    let text = std::str::from_utf8(field).map_err(to_io_error)?;
+    text.parse::<i32>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {name} integer in serving copy row: {error}"),
+        )
+    })
+}
+
+fn serving_parse_u64(field: &[u8], name: &str) -> io::Result<u64> {
+    let text = std::str::from_utf8(field).map_err(to_io_error)?;
+    text.parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {name} integer in serving copy row: {error}"),
+        )
+    })
+}
+
+fn serving_parse_global_id(field: &[u8]) -> io::Result<[u8; GLOBAL_ID_BYTES]> {
+    let text = std::str::from_utf8(field).map_err(to_io_error)?;
+    let mut compact = String::with_capacity(GLOBAL_ID_BYTES * 2);
+    for ch in text.trim().chars() {
+        if ch != '-' {
+            compact.push(ch);
+        }
+    }
+    if compact.len() != GLOBAL_ID_BYTES * 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serving copy 128-bit id must have 32 hex chars, got {text:?}"),
+        ));
+    }
+    let mut out = [0u8; GLOBAL_ID_BYTES];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        *slot = u8::from_str_radix(&compact[start..start + 2], 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("serving copy 128-bit id is not hex: {error}"),
+            )
+        })?;
+    }
+    Ok(out)
+}
+
+fn serving_price_key(
+    price_set_id: [u8; GLOBAL_ID_BYTES],
+    price_set_to_key: &mut HashMap<[u8; GLOBAL_ID_BYTES], u32>,
+    price_set_values: &mut Vec<[u8; GLOBAL_ID_BYTES]>,
+) -> io::Result<u32> {
+    if let Some(value) = price_set_to_key.get(&price_set_id) {
+        return Ok(*value);
+    }
+    let key = u32::try_from(price_set_values.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving sidecar has more than u32::MAX price-set ids",
+        )
+    })?;
+    price_set_to_key.insert(price_set_id, key);
+    price_set_values.push(price_set_id);
+    Ok(key)
+}
+
+fn write_uvarint_to_vec(out: &mut Vec<u8>, value: u64) {
+    let mut encoded = value;
+    loop {
+        let byte = (encoded & 0x7f) as u8;
+        encoded >>= 7;
+        if encoded == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn copy_file_into_writer<W: Write>(path: &Path, writer: &mut W) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open {} for sidecar copy: {error}",
+                path.display()
+            ),
+        )
+    })?);
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+    }
+    Ok(())
+}
+
+fn write_serving_sidecar_final(
+    output_path: &Path,
+    body_path: &Path,
+    magic: &[u8; 8],
+    metadata: &Value,
+    price_set_values: &[[u8; GLOBAL_ID_BYTES]],
+    blocks: &[ServingBlock],
+) -> io::Result<u64> {
+    let tmp_path = output_path.with_extension(format!(
+        "{}.tmp",
+        output_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("sidecar")
+    ));
+    let mut writer = BufWriter::new(File::create(&tmp_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to create serving sidecar temp file {}: {error}",
+                tmp_path.display()
+            ),
+        )
+    })?);
+    let header = serde_json::to_vec(metadata).map_err(to_io_error)?;
+    writer.write_all(magic)?;
+    writer.write_all(&(header.len() as u32).to_le_bytes())?;
+    writer.write_all(&header)?;
+    for price_set_id in price_set_values {
+        writer.write_all(price_set_id)?;
+    }
+    for block in blocks {
+        writer.write_all(&block.key.to_le_bytes())?;
+        writer.write_all(&block.offset.to_le_bytes())?;
+        writer.write_all(&block.count.to_le_bytes())?;
+    }
+    copy_file_into_writer(body_path, &mut writer)?;
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&tmp_path, output_path)?;
+    let bytes = output_path.metadata()?.len();
+    Ok(bytes)
+}
+
+fn write_serving_by_code_from_copy(input_path: &Path, output_path: &Path) -> io::Result<Value> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body_path = output_path.with_extension("body.tmp");
+    let mut body = BufWriter::new(File::create(&body_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to create serving-by-code body file {}: {error}",
+                body_path.display()
+            ),
+        )
+    })?);
+    let mut price_set_to_key: HashMap<[u8; GLOBAL_ID_BYTES], u32> = HashMap::new();
+    let mut price_set_values: Vec<[u8; GLOBAL_ID_BYTES]> = Vec::new();
+    let mut blocks: Vec<ServingBlock> = Vec::new();
+    let mut row_count = 0u64;
+    let mut body_offset = 0u64;
+    let mut current_code: Option<i32> = None;
+    let mut current_block_count = 0u32;
+    let mut previous_provider_set_key = 0i32;
+
+    let mut reader = BufReader::new(File::open(input_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open serving-by-code COPY file {}: {error}",
+                input_path.display()
+            ),
+        )
+    })?);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let fields = serving_copy_fields(&line);
+        if fields.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving-by-code COPY rows must have at least 4 fields",
+            ));
+        }
+        let code_key = serving_parse_i32(fields[0], "code_key")?;
+        let provider_set_key = serving_parse_i32(fields[1], "provider_set_key")?;
+        let provider_count = serving_parse_u64(fields[2], "provider_count")?;
+        let price_set_id = serving_parse_global_id(fields[3])?;
+        if current_code != Some(code_key) {
+            if let Some(block) = blocks.last_mut() {
+                block.count = current_block_count;
+            }
+            blocks.push(ServingBlock {
+                key: code_key,
+                offset: body_offset,
+                count: 0,
+            });
+            current_code = Some(code_key);
+            current_block_count = 0;
+            previous_provider_set_key = 0;
+        }
+        if provider_set_key < previous_provider_set_key {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving-by-code rows must be ordered by provider_set_key within code_key",
+            ));
+        }
+        let price_set_key =
+            serving_price_key(price_set_id, &mut price_set_to_key, &mut price_set_values)?;
+        let mut encoded = Vec::with_capacity(16);
+        write_uvarint_to_vec(
+            &mut encoded,
+            (provider_set_key - previous_provider_set_key) as u64,
+        );
+        write_uvarint_to_vec(&mut encoded, provider_count);
+        write_uvarint_to_vec(&mut encoded, u64::from(price_set_key));
+        body.write_all(&encoded)?;
+        body_offset = body_offset.saturating_add(encoded.len() as u64);
+        previous_provider_set_key = provider_set_key;
+        current_block_count = current_block_count.saturating_add(1);
+        row_count = row_count.saturating_add(1);
+    }
+    if let Some(block) = blocks.last_mut() {
+        block.count = current_block_count;
+    }
+    body.flush()?;
+    drop(body);
+
+    let metadata = json!({
+        "format": PTG2_SERVING_BY_CODE_FORMAT,
+        "row_count": row_count,
+        "code_count": blocks.len(),
+        "price_set_count": price_set_values.len(),
+        "body_bytes": body_offset,
+        "price_dictionary_bytes": price_set_values.len() * GLOBAL_ID_BYTES,
+        "block_index_bytes": blocks.len() * 16,
+    });
+    let byte_count = write_serving_sidecar_final(
+        output_path,
+        &body_path,
+        PTG2_SERVING_BY_CODE_MAGIC,
+        &metadata,
+        &price_set_values,
+        &blocks,
+    )?;
+    let _ = std::fs::remove_file(&body_path);
+    Ok(json!({
+        "name": "serving_by_code",
+        "path": output_path.display().to_string(),
+        "format": PTG2_SERVING_BY_CODE_FORMAT,
+        "row_count": row_count,
+        "byte_count": byte_count,
+        "metadata": metadata,
+    }))
+}
+
+fn flush_serving_provider_code(
+    current_code: Option<i32>,
+    current_code_entries: &mut Vec<(u64, u32)>,
+    current_patterns: &mut HashMap<Vec<(u64, u32)>, Vec<i32>>,
+) {
+    if let Some(code_key) = current_code {
+        let entries = std::mem::take(current_code_entries);
+        current_patterns.entry(entries).or_default().push(code_key);
+    }
+}
+
+fn write_serving_provider_block<W: Write>(
+    body: &mut W,
+    provider_set_key: i32,
+    blocks: &mut Vec<ServingBlock>,
+    body_offset: &mut u64,
+    pattern_count: &mut u64,
+    current_patterns: &mut HashMap<Vec<(u64, u32)>, Vec<i32>>,
+) -> io::Result<()> {
+    let mut ordered_patterns: Vec<(Vec<(u64, u32)>, Vec<i32>)> = current_patterns.drain().collect();
+    ordered_patterns.sort_unstable_by(|left, right| {
+        let left_first = left.1.iter().min().copied().unwrap_or(-1);
+        let right_first = right.1.iter().min().copied().unwrap_or(-1);
+        left_first
+            .cmp(&right_first)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    blocks.push(ServingBlock {
+        key: provider_set_key,
+        offset: *body_offset,
+        count: 0,
+    });
+    let mut block_count = 0u32;
+    for (entries, mut code_keys) in ordered_patterns {
+        code_keys.sort_unstable();
+        code_keys.dedup();
+        let mut encoded = Vec::with_capacity(32 + code_keys.len() * 3 + entries.len() * 6);
+        write_uvarint_to_vec(&mut encoded, code_keys.len() as u64);
+        let mut previous_code_key = 0i32;
+        for (index, code_key) in code_keys.iter().copied().enumerate() {
+            let delta = if index == 0 {
+                code_key
+            } else {
+                code_key - previous_code_key
+            };
+            if delta < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "serving-by-provider-set code keys must be nondecreasing",
+                ));
+            }
+            write_uvarint_to_vec(&mut encoded, delta as u64);
+            previous_code_key = code_key;
+        }
+        write_uvarint_to_vec(&mut encoded, entries.len() as u64);
+        for (provider_count, price_set_key) in entries {
+            write_uvarint_to_vec(&mut encoded, provider_count);
+            write_uvarint_to_vec(&mut encoded, u64::from(price_set_key));
+        }
+        body.write_all(&encoded)?;
+        *body_offset = body_offset.saturating_add(encoded.len() as u64);
+        block_count = block_count.saturating_add(1);
+        *pattern_count = pattern_count.saturating_add(1);
+    }
+    if let Some(block) = blocks.last_mut() {
+        block.count = block_count;
+    }
+    Ok(())
+}
+
+fn write_serving_by_provider_set_from_copy(
+    input_path: &Path,
+    output_path: &Path,
+) -> io::Result<Value> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body_path = output_path.with_extension("body.tmp");
+    let mut body = BufWriter::new(File::create(&body_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to create serving-by-provider-set body file {}: {error}",
+                body_path.display()
+            ),
+        )
+    })?);
+    let mut price_set_to_key: HashMap<[u8; GLOBAL_ID_BYTES], u32> = HashMap::new();
+    let mut price_set_values: Vec<[u8; GLOBAL_ID_BYTES]> = Vec::new();
+    let mut code_keys_seen: HashSet<i32> = HashSet::new();
+    let mut blocks: Vec<ServingBlock> = Vec::new();
+    let mut row_count = 0u64;
+    let mut body_offset = 0u64;
+    let mut pattern_count = 0u64;
+    let mut current_provider_set: Option<i32> = None;
+    let mut current_code: Option<i32> = None;
+    let mut current_code_entries: Vec<(u64, u32)> = Vec::new();
+    let mut current_patterns: HashMap<Vec<(u64, u32)>, Vec<i32>> = HashMap::new();
+
+    let mut reader = BufReader::new(File::open(input_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open serving-by-provider-set COPY file {}: {error}",
+                input_path.display()
+            ),
+        )
+    })?);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let fields = serving_copy_fields(&line);
+        if fields.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serving-by-provider-set COPY rows must have at least 4 fields",
+            ));
+        }
+        let provider_set_key = serving_parse_i32(fields[0], "provider_set_key")?;
+        let code_key = serving_parse_i32(fields[1], "code_key")?;
+        let provider_count = serving_parse_u64(fields[2], "provider_count")?;
+        let price_set_id = serving_parse_global_id(fields[3])?;
+        let price_set_key =
+            serving_price_key(price_set_id, &mut price_set_to_key, &mut price_set_values)?;
+        if current_provider_set != Some(provider_set_key) {
+            if let Some(previous_provider_set) = current_provider_set {
+                flush_serving_provider_code(
+                    current_code,
+                    &mut current_code_entries,
+                    &mut current_patterns,
+                );
+                write_serving_provider_block(
+                    &mut body,
+                    previous_provider_set,
+                    &mut blocks,
+                    &mut body_offset,
+                    &mut pattern_count,
+                    &mut current_patterns,
+                )?;
+            }
+            current_provider_set = Some(provider_set_key);
+            current_code = None;
+        }
+        if current_code != Some(code_key) {
+            flush_serving_provider_code(
+                current_code,
+                &mut current_code_entries,
+                &mut current_patterns,
+            );
+            current_code = Some(code_key);
+        }
+        current_code_entries.push((provider_count, price_set_key));
+        code_keys_seen.insert(code_key);
+        row_count = row_count.saturating_add(1);
+    }
+    if let Some(provider_set_key) = current_provider_set {
+        flush_serving_provider_code(
+            current_code,
+            &mut current_code_entries,
+            &mut current_patterns,
+        );
+        write_serving_provider_block(
+            &mut body,
+            provider_set_key,
+            &mut blocks,
+            &mut body_offset,
+            &mut pattern_count,
+            &mut current_patterns,
+        )?;
+    }
+    body.flush()?;
+    drop(body);
+
+    let metadata = json!({
+        "format": PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        "row_count": row_count,
+        "provider_set_count": blocks.len(),
+        "code_count": code_keys_seen.len(),
+        "price_set_count": price_set_values.len(),
+        "pattern_count": pattern_count,
+        "body_bytes": body_offset,
+        "price_dictionary_bytes": price_set_values.len() * GLOBAL_ID_BYTES,
+        "block_index_bytes": blocks.len() * 16,
+    });
+    let byte_count = write_serving_sidecar_final(
+        output_path,
+        &body_path,
+        PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+        &metadata,
+        &price_set_values,
+        &blocks,
+    )?;
+    let _ = std::fs::remove_file(&body_path);
+    Ok(json!({
+        "name": "serving_by_provider_set",
+        "path": output_path.display().to_string(),
+        "format": PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        "row_count": row_count,
+        "byte_count": byte_count,
+        "metadata": metadata,
+    }))
+}
+
+fn write_serving_sidecar_from_key_copy(
+    kind: &str,
+    input_path: &Path,
+    output_path: &Path,
+) -> io::Result<()> {
+    let payload = match kind {
+        "by_code" => write_serving_by_code_from_copy(input_path, output_path)?,
+        "by_provider_set" => write_serving_by_provider_set_from_copy(input_path, output_path)?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serving sidecar kind must be by_code or by_provider_set",
+            ));
+        }
+    };
+    emit_json_record(&mut io::stdout().lock(), "serving_sidecar_file", &payload)
+}
+
 fn merge_manifest_copy_files(
     kind: &str,
     output_path: &Path,
@@ -6837,6 +7339,37 @@ fn main() -> io::Result<()> {
         })?;
         let input_paths: Vec<String> = args.collect();
         return merge_manifest_copy_files(&kind, Path::new(&output_path), &input_paths);
+    }
+    if first_arg == "--serving-sidecar-from-key-copy" {
+        let kind = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --serving-sidecar-from-key-copy <by_code|by_provider_set> <input_copy_path> <output_path>",
+            )
+        })?;
+        let input_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --serving-sidecar-from-key-copy <by_code|by_provider_set> <input_copy_path> <output_path>",
+            )
+        })?;
+        let output_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --serving-sidecar-from-key-copy <by_code|by_provider_set> <input_copy_path> <output_path>",
+            )
+        })?;
+        if args.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --serving-sidecar-from-key-copy <by_code|by_provider_set> <input_copy_path> <output_path>",
+            ));
+        }
+        return write_serving_sidecar_from_key_copy(
+            &kind,
+            Path::new(&input_path),
+            Path::new(&output_path),
+        );
     }
     if first_arg == "--address-canonicalize-copy" {
         let input_path = args.next().ok_or_else(|| {
