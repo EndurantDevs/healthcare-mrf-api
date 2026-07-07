@@ -281,6 +281,58 @@ class PTG2DbArtifactReader:
             raise PTG2ManifestArtifactError("artifact chunk range ended before requested bytes")
         return b"".join(pieces)
 
+    async def read_fixed_records(
+        self,
+        *,
+        base_offset: int,
+        record_size: int,
+        record_numbers: Iterable[int],
+    ) -> dict[int, bytes]:
+        """Read fixed-size records by ordinal while batching artifact chunk fetches."""
+        unique_record_numbers = tuple(dict.fromkeys(int(record_number) for record_number in record_numbers))
+        if not unique_record_numbers:
+            return {}
+        if int(record_size) <= 0:
+            raise PTG2ManifestArtifactError("artifact fixed record size must be positive")
+        total_size = await self.byte_count()
+        chunk_range_by_record_number: dict[int, tuple[int, int]] = {}
+        chunk_numbers_to_fetch_set: set[int] = set()
+        for record_number in unique_record_numbers:
+            if record_number < 0:
+                raise PTG2ManifestArtifactError("artifact fixed record numbers must be non-negative")
+            offset = int(base_offset) + record_number * int(record_size)
+            length = int(record_size)
+            if offset < 0 or offset + length > total_size:
+                raise PTG2ManifestArtifactError(
+                    f"artifact fixed record exceeds byte_count: offset={offset} length={length} size={total_size}"
+            )
+            start_chunk = offset // self.chunk_bytes
+            end_chunk = (offset + length - 1) // self.chunk_bytes
+            chunk_range_by_record_number[record_number] = (offset, end_chunk)
+            chunk_numbers_to_fetch_set.update(range(start_chunk, end_chunk + 1))
+
+        raw_chunks_by_number = await self._read_artifact_chunks(sorted(chunk_numbers_to_fetch_set))
+        fixed_records_by_number: dict[int, bytes] = {}
+        for record_number in unique_record_numbers:
+            offset, end_chunk = chunk_range_by_record_number[record_number]
+            remaining = int(record_size)
+            cursor = offset
+            pieces: list[bytes] = []
+            while remaining > 0:
+                chunk_no = cursor // self.chunk_bytes
+                if chunk_no > end_chunk:
+                    raise PTG2ManifestArtifactError("artifact fixed record ended before requested bytes")
+                chunk = raw_chunks_by_number[chunk_no]
+                start = cursor % self.chunk_bytes
+                take = min(remaining, len(chunk) - start)
+                if take <= 0:
+                    raise PTG2ManifestArtifactError("artifact fixed record chunk range is invalid")
+                pieces.append(chunk[start : start + take])
+                cursor += take
+                remaining -= take
+            fixed_records_by_number[record_number] = b"".join(pieces)
+        return fixed_records_by_number
+
 
 def db_artifact_entry_available(entry: Mapping[str, Any] | None) -> bool:
     return bool(entry and ptg2_artifact_id_from_db_uri(str(entry.get("storage_uri") or "")))
@@ -326,6 +378,55 @@ async def _index_lookup_from_db(
             continue
         return int(member_offset), int(member_count)
     return None
+
+
+async def _index_lookup_many_from_db(
+    reader: PTG2DbArtifactReader,
+    *,
+    index_start: int,
+    entry_count: int,
+    keys: Iterable[bytes],
+) -> dict[bytes, tuple[int, int] | None]:
+    search_range_by_key: dict[bytes, tuple[int, int]] = {bytes(key): (0, int(entry_count) - 1) for key in keys}
+    index_match_by_key: dict[bytes, tuple[int, int] | None] = {}
+    while search_range_by_key:
+        record_numbers_by_key: dict[bytes, int] = {}
+        next_search_range_by_key: dict[bytes, tuple[int, int]] = {}
+        for key, (low, high) in search_range_by_key.items():
+            if low > high:
+                index_match_by_key[key] = None
+                continue
+            record_numbers_by_key[key] = (low + high) // 2
+        if not record_numbers_by_key:
+            break
+        fixed_records_by_number = await reader.read_fixed_records(
+            base_offset=index_start,
+            record_size=_MEMBERSHIP_INDEX_RECORD.size,
+            record_numbers=record_numbers_by_key.values(),
+        )
+        for key, mid in record_numbers_by_key.items():
+            candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack(fixed_records_by_number[mid])
+            low, high = search_range_by_key[key]
+            if candidate_owner < key:
+                next_search_range_by_key[key] = (mid + 1, high)
+                continue
+            if candidate_owner > key:
+                next_search_range_by_key[key] = (low, mid - 1)
+                continue
+            index_match_by_key[key] = int(member_offset), int(member_count)
+        search_range_by_key = next_search_range_by_key
+    return index_match_by_key
+
+
+async def _maybe_read_membership_index(
+    reader: PTG2DbArtifactReader,
+    *,
+    index_start: int,
+    index_bytes_len: int,
+) -> bytes | None:
+    if _INDEX_READ_MAX_BYTES and int(index_bytes_len) > _INDEX_READ_MAX_BYTES:
+        return None
+    return await reader.read_at(index_start, int(index_bytes_len))
 
 
 def _contiguous_int_runs(values: Iterable[int]) -> tuple[tuple[int, int], ...]:
@@ -393,14 +494,25 @@ async def lookup_global_sidecar_members_many_from_db(
         index_start = _MEMBERSHIP_HEADER.size
         index_bytes_len = int(entry_count) * _MEMBERSHIP_INDEX_RECORD.size
         member_start = index_start + index_bytes_len
-        result: dict[bytes, tuple[bytes, ...]] = {}
-        for owner_id in owner_ids:
-            match = await _index_lookup_from_db(
+        index_bytes = await _maybe_read_membership_index(
+            reader,
+            index_start=index_start,
+            index_bytes_len=index_bytes_len,
+        )
+        db_matches = None
+        if index_bytes is None:
+            db_matches = await _index_lookup_many_from_db(
                 reader,
                 index_start=index_start,
                 entry_count=int(entry_count),
-                key=owner_id,
+                keys=owner_ids,
             )
+        result: dict[bytes, tuple[bytes, ...]] = {}
+        for owner_id in owner_ids:
+            if index_bytes is not None:
+                match = _index_lookup(index_bytes, owner_id, int(entry_count))
+            else:
+                match = db_matches.get(owner_id) if db_matches is not None else None
             if match is None:
                 result[owner_id] = ()
                 continue
@@ -428,14 +540,25 @@ async def lookup_global_sidecar_members_many_from_db(
     globals_start = index_start + index_bytes_len
     globals_bytes_len = int(member_global_count) * 16
     members_start = globals_start + globals_bytes_len
-    result: dict[bytes, tuple[bytes, ...]] = {}
-    for owner_id in owner_ids:
-        match = await _index_lookup_from_db(
+    index_bytes = await _maybe_read_membership_index(
+        reader,
+        index_start=index_start,
+        index_bytes_len=index_bytes_len,
+    )
+    db_matches = None
+    if index_bytes is None:
+        db_matches = await _index_lookup_many_from_db(
             reader,
             index_start=index_start,
             entry_count=int(entry_count),
-            key=owner_id,
+            keys=owner_ids,
         )
+    result: dict[bytes, tuple[bytes, ...]] = {}
+    for owner_id in owner_ids:
+        if index_bytes is not None:
+            match = _index_lookup(index_bytes, owner_id, int(entry_count))
+        else:
+            match = db_matches.get(owner_id) if db_matches is not None else None
         if match is None:
             result[owner_id] = ()
             continue

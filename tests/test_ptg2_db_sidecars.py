@@ -136,6 +136,88 @@ async def test_db_membership_sidecar_reads_compressed_chunks_without_local_file(
 
 
 @pytest.mark.asyncio
+async def test_db_membership_sidecar_prefetches_small_index_for_many_owners(tmp_path, monkeypatch):
+    owner_a = bytes.fromhex("00000000000000000000000000000011")
+    owner_b = bytes.fromhex("00000000000000000000000000000012")
+    missing_owner = bytes.fromhex("00000000000000000000000000009999")
+    member_a = bytes.fromhex("00000000000000000000000000000021")
+    member_b = bytes.fromhex("00000000000000000000000000000022")
+    manifest = write_global_membership_sidecar(
+        tmp_path,
+        "provider_forward",
+        {
+            owner_a: [member_a],
+            owner_b: [member_b],
+        },
+    )
+    sidecar = manifest["sidecars"][0]
+    raw_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, raw_payload, artifact_id="membership-index-prefetch-artifact", chunk_bytes=31)
+    session = FakeChunkSession(raw_payload, chunk_bytes=31, compression="zlib")
+
+    async def fail_sparse_lookup(*_args, **_kwargs):
+        raise AssertionError("small DB membership indexes should be prefetched once")
+
+    monkeypatch.setattr(db_sidecars, "_INDEX_READ_MAX_BYTES", 1024 * 1024)
+    monkeypatch.setattr(db_sidecars, "_index_lookup_from_db", fail_sparse_lookup)
+
+    members = await lookup_global_sidecar_members_many_from_db(
+        session,
+        entry,
+        [owner_a.hex(), owner_b.hex(), missing_owner.hex()],
+        schema_name="mrf",
+    )
+
+    assert members[owner_a] == (member_a,)
+    assert members[owner_b] == (member_b,)
+    assert members[missing_owner] == ()
+    assert any(call.get("chunk_nos") for call in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_db_membership_sidecar_batches_sparse_index_lookup_for_many_owners(tmp_path, monkeypatch):
+    owner_a = bytes.fromhex("00000000000000000000000000000011")
+    owner_b = bytes.fromhex("00000000000000000000000000000012")
+    owner_c = bytes.fromhex("00000000000000000000000000000013")
+    missing_owner = bytes.fromhex("00000000000000000000000000009999")
+    member_a = bytes.fromhex("00000000000000000000000000000021")
+    member_b = bytes.fromhex("00000000000000000000000000000022")
+    member_c = bytes.fromhex("00000000000000000000000000000023")
+    manifest = write_global_membership_sidecar(
+        tmp_path,
+        "provider_forward",
+        {
+            owner_a: [member_a],
+            owner_b: [member_b],
+            owner_c: [member_c],
+        },
+    )
+    sidecar = manifest["sidecars"][0]
+    raw_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, raw_payload, artifact_id="membership-sparse-batch-artifact", chunk_bytes=31)
+    session = FakeChunkSession(raw_payload, chunk_bytes=31, compression="zlib")
+
+    async def fail_single_owner_sparse_lookup(*_args, **_kwargs):
+        raise AssertionError("many-owner sparse index lookup should be batched")
+
+    monkeypatch.setattr(db_sidecars, "_INDEX_READ_MAX_BYTES", 8)
+    monkeypatch.setattr(db_sidecars, "_index_lookup_from_db", fail_single_owner_sparse_lookup)
+
+    members = await lookup_global_sidecar_members_many_from_db(
+        session,
+        entry,
+        [owner_a.hex(), owner_b.hex(), owner_c.hex(), missing_owner.hex()],
+        schema_name="mrf",
+    )
+
+    assert members[owner_a] == (member_a,)
+    assert members[owner_b] == (member_b,)
+    assert members[owner_c] == (member_c,)
+    assert members[missing_owner] == ()
+    assert any(call.get("chunk_nos") for call in session.calls)
+
+
+@pytest.mark.asyncio
 async def test_db_dense_membership_sidecar_uses_sparse_range_reads(monkeypatch):
     owner_a = bytes.fromhex("00000000000000000000000000000011")
     owner_b = bytes.fromhex("00000000000000000000000000000012")
