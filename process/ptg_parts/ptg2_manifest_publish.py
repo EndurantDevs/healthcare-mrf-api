@@ -630,6 +630,41 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
     return stored
 
 
+def _merge_ptg2_manifest_sidecar_artifacts(
+    *sidecar_artifacts: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    combined: dict[str, Any] = {}
+    for artifacts in sidecar_artifacts:
+        if not artifacts:
+            continue
+        for name, value in artifacts.items():
+            if name == "sidecars" and isinstance(value, list):
+                existing = combined.get("sidecars")
+                if isinstance(existing, list):
+                    existing.extend(value)
+                elif existing is None:
+                    combined["sidecars"] = list(value)
+                else:
+                    combined["sidecars"] = [existing, *value]
+                continue
+            combined[name] = value
+    return combined
+
+
+def _split_ptg2_manifest_base_artifacts(
+    artifacts: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    base_artifacts = dict(artifacts or {})
+    raw_sidecars = base_artifacts.pop("sidecars", None)
+    if isinstance(raw_sidecars, list):
+        return base_artifacts, {"sidecars": list(raw_sidecars)}
+    if isinstance(raw_sidecars, Mapping):
+        return base_artifacts, dict(raw_sidecars)
+    if raw_sidecars:
+        return base_artifacts, {"sidecars": [raw_sidecars]}
+    return base_artifacts, {}
+
+
 def _manifest_sql_id(value: bytes) -> str:
     if _ptg2_id_storage() == "uuid":
         return str(uuid.UUID(bytes=value))
@@ -2041,15 +2076,19 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
         serving_table_retained = False
     elapsed_seconds = time.monotonic() - started_at
-    combined_sidecar_artifacts = dict(sidecar_artifacts or {})
-    combined_sidecar_artifacts.update(serving_sidecar_artifacts)
+    base_artifacts, base_sidecar_artifacts = _split_ptg2_manifest_base_artifacts(artifacts)
+    combined_sidecar_artifacts = _merge_ptg2_manifest_sidecar_artifacts(
+        base_sidecar_artifacts,
+        sidecar_artifacts,
+        serving_sidecar_artifacts,
+    )
     combined_sidecar_artifacts = await _store_ptg2_manifest_sidecar_artifacts_in_db(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
         sidecar_artifacts=combined_sidecar_artifacts,
     )
     artifact_manifest = _ptg2_manifest_artifacts_manifest(
-        artifacts=artifacts,
+        artifacts=base_artifacts,
         sidecar_artifacts=combined_sidecar_artifacts,
     )
     arch_version = _ptg2_manifest_snapshot_arch()
@@ -2137,6 +2176,13 @@ def _ptg2_manifest_artifacts_manifest(
     sidecars: list[Any] = list(existing_sidecars) if isinstance(existing_sidecars, list) else []
     for name, value in sidecar_artifacts.items():
         if value is None:
+            continue
+        if name == "sidecars" and isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, Mapping):
+                    sidecars.append(dict(item))
+                else:
+                    sidecars.append({"name": f"sidecar_{index}", "path": str(item)})
             continue
         if isinstance(value, Mapping):
             entry = dict(value)

@@ -4958,6 +4958,58 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
     assert calls[0][1]["artifact_kind"] == "provider_forward"
 
 
+@pytest.mark.asyncio
+async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkeypatch, tmp_path):
+    provider_path = tmp_path / "provider_forward.ptg2sc"
+    provider_path.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+    price_path = tmp_path / "price_forward.ptg2sc"
+    price_path.write_bytes(b"PTG2MNSC" + b"\0" * 32)
+    calls = []
+
+    async def fake_store(path, **kwargs):
+        calls.append((Path(path), kwargs))
+        metadata = dict(kwargs["metadata"])
+        metadata.update(
+            {
+                "storage_uri": f"db://ptg2_artifact/{kwargs['name']}",
+                "artifact_id": kwargs["name"],
+            }
+        )
+        return metadata
+
+    monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
+
+    base_artifacts, base_sidecars = ptg_manifest_publish._split_ptg2_manifest_base_artifacts(
+        {
+            "source_trace_set_hash": "trace-set",
+            "sidecars": [
+                {"name": "provider_forward", "path": str(provider_path), "sha256": "provider-sha"},
+            ],
+        }
+    )
+    combined = ptg_manifest_publish._merge_ptg2_manifest_sidecar_artifacts(
+        base_sidecars,
+        {"price_forward": {"name": "price_forward", "path": str(price_path), "sha256": "price-sha"}},
+    )
+    stored = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+        schema_name="mrf",
+        snapshot_id="ptg2:test",
+        sidecar_artifacts=combined,
+    )
+    manifest = ptg_manifest_publish._ptg2_manifest_artifacts_manifest(
+        artifacts=base_artifacts,
+        sidecar_artifacts=stored,
+    )
+
+    sidecars = {sidecar["name"]: sidecar for sidecar in manifest["sidecars"]}
+    assert manifest["source_trace_set_hash"] == "trace-set"
+    assert set(sidecars) == {"provider_forward", "price_forward"}
+    assert sidecars["provider_forward"]["storage_uri"] == "db://ptg2_artifact/provider_forward"
+    assert sidecars["price_forward"]["storage_uri"] == "db://ptg2_artifact/price_forward"
+    assert [call[0] for call in calls] == [provider_path, price_path]
+
+
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
     status_calls = []
     scalar_values = iter([3, 1, 2])
