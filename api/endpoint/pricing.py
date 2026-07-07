@@ -4910,14 +4910,14 @@ async def group_plan_providers(request):
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
 
-    # ZIP-radius filters make the member-table walk pathological on large
-    # multi-network plans: it scans millions of member NPIs probing per-row
-    # address EXISTS before it collects LIMIT matches. Compute the local
-    # candidate set first from the address indexes, then drive the member
-    # lookup from it. When a specialty filter is present, apply the same
-    # taxonomy predicates inside that candidate set.
-    use_local_candidates = bool(location_zips)
+    # Sparse filters (specialty AND a ZIP set) make the member-table walk
+    # pathological: it scans millions of member NPIs probing per-row EXISTS
+    # before it collects LIMIT matches. Compute the small local-specialty
+    # candidate set first (zip-index + taxonomy-index hash join) and drive
+    # the member lookup from it instead.
+    use_local_candidates = bool(specialty_filter.active and location_zips)
     candidate_cte = ""
+    provider_npis: list[int] | None = None
     if use_local_candidates:
         candidate_taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
             "addr.npi",
@@ -4945,7 +4945,7 @@ async def group_plan_providers(request):
         if candidate_taxonomy_predicate:
             candidate_clauses.append(candidate_taxonomy_predicate)
         candidate_where = "\n                      AND ".join(candidate_clauses)
-        candidate_cte = f"""WITH local_candidate_npis AS MATERIALIZED (
+        candidate_cte = f"""WITH local_specialty_npis AS MATERIALIZED (
                 SELECT DISTINCT addr.npi
                   FROM {address_table} addr
                  WHERE {candidate_where}
@@ -4955,12 +4955,32 @@ async def group_plan_providers(request):
         provider_sql = f"""
             {candidate_cte}SELECT DISTINCT gm.npi
               FROM {group_member_table} gm
-              JOIN local_candidate_npis lcn ON lcn.npi = gm.npi
+              JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
              WHERE gm.npi BETWEEN :npi_min AND :npi_max
                AND gm.npi > :cursor_npi
              ORDER BY gm.npi
              LIMIT :limit
             """
+    elif has_location_filter and len(member_tables) > 1:
+        # Keep the fast single-source EXISTS plan for each network. A single
+        # UNION ALL subquery across all member tables makes PostgreSQL sort and
+        # filter the combined stream, which is much slower for ZIP-radius
+        # lookups on plans with a few very uneven source snapshots.
+        split_limit = min(max(limit * max(len(member_tables), 1) * 2, limit), 5000)
+        split_query_params_by_name = {**params, "limit": split_limit}
+        provider_npi_set: set[int] = set()
+        for member_table in member_tables:
+            provider_sql = f"""
+                SELECT DISTINCT gm.npi
+                  FROM {member_table} gm
+                 WHERE gm.npi BETWEEN :npi_min AND :npi_max
+                   AND gm.npi > :cursor_npi{taxonomy_where}{location_where}
+                 ORDER BY gm.npi
+                 LIMIT :limit
+                """
+            split_rows = (await session.execute(text(provider_sql), split_query_params_by_name)).fetchall()
+            provider_npi_set.update(int(row.npi) for row in split_rows if row.npi is not None)
+        provider_npis = sorted(provider_npi_set)[:limit]
     else:
         provider_sql = f"""
             SELECT DISTINCT gm.npi
@@ -4970,8 +4990,9 @@ async def group_plan_providers(request):
              ORDER BY gm.npi
              LIMIT :limit
             """
-    provider_rows = (await session.execute(text(provider_sql), params)).fetchall()
-    provider_npis = [int(row.npi) for row in provider_rows if row.npi is not None]
+    if provider_npis is None:
+        provider_rows = (await session.execute(text(provider_sql), params)).fetchall()
+        provider_npis = [int(row.npi) for row in provider_rows if row.npi is not None]
 
     total_distinct = None
     is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
@@ -4983,7 +5004,7 @@ async def group_plan_providers(request):
             count_sql = f"""
                 {candidate_cte}SELECT COUNT(DISTINCT gm.npi)
                   FROM {group_member_table} gm
-                  JOIN local_candidate_npis lcn ON lcn.npi = gm.npi
+                  JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max
                 """
         else:

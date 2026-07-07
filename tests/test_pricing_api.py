@@ -339,13 +339,10 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     count_sql = str(request.ctx.sa_session.executions[1][0][0])
     address_sql = str(request.ctx.sa_session.executions[2][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
-    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
-    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
     assert "mrf.npi_address addr" in provider_sql
     assert "addr.type IN ('primary', 'secondary')" in provider_sql
     assert "LEFT(COALESCE(addr.postal_code, ''), 5) = ANY(:location_zips)" in provider_sql
-    assert "WITH local_candidate_npis AS MATERIALIZED" in count_sql
-    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in count_sql
+    assert "mrf.npi_address addr" in count_sql
     assert "type IN ('primary', 'secondary')" in address_sql
     assert params["location_city"] == "chicago"
     assert params["location_state"] == "IL"
@@ -392,8 +389,6 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
     assert response_payload["location_filter"]["zips_considered"] == 3
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
-    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
-    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
     assert "= ANY(:location_zips)" in provider_sql
     assert params["location_zips"] == ["60601", "60602", "60611"]
 
@@ -433,8 +428,8 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     assert response_payload["ok"] is True
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
-    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
-    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
+    assert "WITH local_specialty_npis AS MATERIALIZED" in provider_sql
+    assert "JOIN local_specialty_npis lsn ON lsn.npi = gm.npi" in provider_sql
     assert "= ANY(:location_zips)" in provider_sql
     # index-compatible taxonomy predicate: raw column, uppercased params
     assert "UPPER(COALESCE(cand_provider_specialty_nt.healthcare_provider_taxonomy_code" not in provider_sql
@@ -446,7 +441,7 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
 async def test_group_plan_providers_unions_all_published_network_snapshots(monkeypatch):
     """A multi-network plan must enumerate every published snapshot, not just the first."""
 
-    async def fake_pairs(_session, _plan_fields):
+    async def fake_network_snapshot_pairs(_session, _plan_fields):
         return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
 
     member_table_by_snapshot = {
@@ -457,7 +452,7 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     async def fake_snapshot_serving_tables(_session, snapshot_id):
         return types.SimpleNamespace(provider_group_member_table=member_table_by_snapshot[snapshot_id])
 
-    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_pairs)
+    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_network_snapshot_pairs)
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1073913877)])],
@@ -480,6 +475,62 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "SELECT npi FROM mrf.ptg2_provider_group_member_ndc UNION ALL SELECT npi FROM mrf.ptg2_provider_group_member_c2" in provider_sql
     assert "(SELECT npi FROM" in provider_sql
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatch):
+    """ZIP-filtered multi-network lookups should keep per-network member scans indexable."""
+
+    async def fake_network_snapshot_pairs(_session, _plan_fields):
+        return [("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]
+
+    member_table_by_snapshot = {
+        "ptg2:test:ndc": "mrf.ptg2_provider_group_member_ndc",
+        "ptg2:test:c2": "mrf.ptg2_provider_group_member_c2",
+    }
+
+    async def fake_snapshot_serving_tables(_session, snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table=member_table_by_snapshot[snapshot_id])
+
+    async def fake_postal_radius_rows(_session, **keyword_args):
+        return [{"zip5": keyword_args["zip5"]}, {"zip5": "60602"}]
+
+    monkeypatch.setattr(pricing_module, "current_source_snapshot_ids_for_plan", fake_network_snapshot_pairs)
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    monkeypatch.setattr(pricing_module, "_zip_radius_rows", fake_postal_radius_rows)
+    request = make_request(
+        [
+            FakeResult(rows=[types.SimpleNamespace(npi=1073913877), types.SimpleNamespace(npi=1234567890)]),
+            FakeResult(rows=[types.SimpleNamespace(npi=1073913877), types.SimpleNamespace(npi=1003000126)]),
+            FakeResult(rows=[]),
+        ],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "zip5": "60601",
+            "enrich": "0",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    response_payload = json.loads(response.body)
+
+    assert [provider_item["npi"] for provider_item in response_payload["providers"]["items"]] == [
+        1003000126,
+        1073913877,
+        1234567890,
+    ]
+    first_member_query_sql = str(request.ctx.sa_session.executions[0][0][0])
+    second_member_query_sql = str(request.ctx.sa_session.executions[1][0][0])
+    first_member_query_params = request.ctx.sa_session.executions[0][0][1]
+    assert "FROM mrf.ptg2_provider_group_member_ndc gm" in first_member_query_sql
+    assert "FROM mrf.ptg2_provider_group_member_c2 gm" in second_member_query_sql
+    assert "UNION ALL" not in first_member_query_sql
+    assert "UNION ALL" not in second_member_query_sql
+    assert "EXISTS (" in first_member_query_sql
+    assert first_member_query_params["limit"] == 40
+    assert first_member_query_params["location_zips"] == ["60601", "60602"]
 
 
 @pytest.mark.asyncio
