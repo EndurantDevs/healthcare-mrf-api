@@ -1732,149 +1732,6 @@ def _is_statement_timeout_error(exc: BaseException) -> bool:
     return "statement timeout" in message or "querycancelederror" in message
 
 
-def _zip_alias_sql(
-    *,
-    keyed_table: str,
-    archive: str,
-) -> str:
-    return f"""
-        CREATE TEMP TABLE address_zip_aliases ON COMMIT DROP AS
-        WITH source_rows AS (
-            SELECT
-                rn,
-                source_ctid,
-                address_key AS source_address_key,
-                line1_norm,
-                COALESCE(unit_norm, '') AS unit_norm,
-                city_norm,
-                state_code,
-                COALESCE(country_code, 'US') AS country_code
-            FROM {keyed_table}
-            WHERE address_key IS NULL
-              AND line1_norm IS NOT NULL
-              AND city_norm IS NOT NULL
-              AND state_code IS NOT NULL
-              AND zip5 IS NULL
-              AND COALESCE(country_code, 'US') = 'US'
-        ),
-        source_keys AS (
-            SELECT DISTINCT line1_norm, unit_norm, city_norm, state_code, country_code
-            FROM source_rows
-        ),
-        target_rows AS (
-            SELECT
-                0 AS target_source_rank,
-                address_key AS target_address_key,
-                identity_key AS target_identity_key,
-                premise_key AS target_premise_key,
-                line1_norm AS target_line1_norm,
-                COALESCE(unit_norm, '') AS target_unit_norm,
-                city_norm AS target_city_norm,
-                state_code AS target_state_code,
-                zip5 AS target_zip5,
-                zip4 AS target_zip4,
-                COALESCE(country_code, 'US') AS target_country_code,
-                first_line AS target_first_line,
-                second_line AS target_second_line,
-                city_name AS target_city_name,
-                state_name AS target_state_name,
-                postal_code AS target_postal_code,
-                line1_norm,
-                COALESCE(unit_norm, '') AS unit_norm,
-                city_norm,
-                state_code,
-                COALESCE(country_code, 'US') AS country_code
-            FROM {keyed_table}
-            WHERE address_key IS NOT NULL
-              AND identity_key IS NOT NULL
-              AND split_part(identity_key, '|', 8) = 'street'
-              AND line1_norm IS NOT NULL
-              AND city_norm IS NOT NULL
-              AND state_code IS NOT NULL
-              AND zip5 IS NOT NULL
-            UNION ALL
-            SELECT
-                1 AS target_source_rank,
-                archived.address_key AS target_address_key,
-                archived.identity_key AS target_identity_key,
-                archived.premise_key AS target_premise_key,
-                archived.line1_norm AS target_line1_norm,
-                COALESCE(archived.unit_norm, '') AS target_unit_norm,
-                archived.city_norm AS target_city_norm,
-                archived.state_code AS target_state_code,
-                archived.zip5 AS target_zip5,
-                archived.zip4 AS target_zip4,
-                COALESCE(archived.country_code, 'US') AS target_country_code,
-                archived.first_line AS target_first_line,
-                archived.second_line AS target_second_line,
-                archived.city_name AS target_city_name,
-                archived.state_name AS target_state_name,
-                archived.postal_code AS target_postal_code,
-                archived.line1_norm,
-                COALESCE(archived.unit_norm, '') AS unit_norm,
-                archived.city_norm,
-                archived.state_code,
-                COALESCE(archived.country_code, 'US') AS country_code
-            FROM {archive} AS archived
-            JOIN source_keys
-              ON archived.line1_norm = source_keys.line1_norm
-             AND COALESCE(archived.unit_norm, '') = source_keys.unit_norm
-             AND archived.city_norm = source_keys.city_norm
-             AND archived.state_code = source_keys.state_code
-             AND COALESCE(archived.country_code, 'US') = source_keys.country_code
-            WHERE archived.address_key IS NOT NULL
-              AND archived.identity_key IS NOT NULL
-              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
-              AND archived.merged_into IS NULL
-              AND archived.line1_norm IS NOT NULL
-              AND archived.city_norm IS NOT NULL
-              AND archived.state_code IS NOT NULL
-              AND archived.zip5 IS NOT NULL
-        ),
-        candidates AS (
-            SELECT
-                s.rn,
-                s.source_ctid,
-                s.source_address_key,
-                t.target_address_key,
-                t.target_identity_key,
-                t.target_premise_key,
-                t.target_line1_norm,
-                t.target_unit_norm,
-                t.target_city_norm,
-                t.target_state_code,
-                t.target_zip5,
-                t.target_zip4,
-                t.target_country_code,
-                t.target_first_line,
-                t.target_second_line,
-                t.target_city_name,
-                t.target_state_name,
-                t.target_postal_code,
-                t.target_source_rank
-            FROM source_rows AS s
-            JOIN target_rows AS t
-              ON t.line1_norm = s.line1_norm
-             AND t.unit_norm = s.unit_norm
-             AND t.city_norm = s.city_norm
-             AND t.state_code = s.state_code
-             AND t.country_code = s.country_code
-        ),
-        unique_candidates AS (
-            SELECT rn
-            FROM candidates
-            GROUP BY rn
-            HAVING count(DISTINCT target_address_key) = 1
-               AND count(DISTINCT target_zip5) = 1
-        )
-        SELECT DISTINCT ON (c.rn)
-            c.*
-        FROM candidates AS c
-        JOIN unique_candidates AS u USING (rn)
-        ORDER BY c.rn, c.target_source_rank, c.target_address_key;
-    """
-
-
 async def resolve_into_archive(
     staging_table: str,
     field_map: Mapping[str, str],
@@ -2172,51 +2029,6 @@ async def resolve_into_archive(
                 f"stamped={mismatch.staged_address_key} expected={mismatch.computed_address_key} "
                 f"identity={mismatch.identity_key!r}"
             )
-        await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_zip_aliases;"))
-        await session.execute(text(_zip_alias_sql(keyed_table=keyed_table, archive=archive)))
-        zip_alias_stats_raw = (
-            await session.execute(text("""
-                SELECT jsonb_build_object(
-                    'zip_aliases', count(*),
-                    'missing_zip_recovered', count(*)
-                )
-                FROM address_zip_aliases;
-            """))
-        ).scalar() or {}
-        if isinstance(zip_alias_stats_raw, str):
-            zip_alias_stats = json.loads(zip_alias_stats_raw)
-        else:
-            zip_alias_stats = dict(zip_alias_stats_raw)
-        zip_alias_rows = int(zip_alias_stats.get("zip_aliases") or 0)
-        if zip_alias_rows:
-            await session.execute(text(f"""
-                UPDATE {keyed_table} AS keyed
-                   SET address_key = aliases.target_address_key,
-                       computed_address_key = aliases.target_address_key,
-                       identity_key = aliases.target_identity_key,
-                       premise_key = aliases.target_premise_key,
-                       line1_norm = aliases.target_line1_norm,
-                       unit_norm = aliases.target_unit_norm,
-                       city_norm = aliases.target_city_norm,
-                       state_code = aliases.target_state_code,
-                       zip5 = aliases.target_zip5,
-                       zip4 = aliases.target_zip4,
-                       country_code = aliases.target_country_code,
-                       first_line = aliases.target_first_line,
-                       second_line = aliases.target_second_line,
-                       city_name = aliases.target_city_name,
-                       state_name = aliases.target_state_name,
-                       postal_code = aliases.target_postal_code
-                  FROM address_zip_aliases AS aliases
-                 WHERE keyed.rn = aliases.rn;
-            """))
-            await session.execute(text(f"""
-                UPDATE {staging} AS target
-                   SET address_key = aliases.target_address_key
-                  FROM address_zip_aliases AS aliases
-                 WHERE target.ctid::text = aliases.source_ctid
-                   AND target.address_key IS DISTINCT FROM aliases.target_address_key;
-            """))
         alias_stats: dict[str, int] = {}
         completion_alias_rows = 0
         await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
@@ -2307,7 +2119,6 @@ async def resolve_into_archive(
             pct=20,
             message="materialized deduplicated canonical address keys",
             keyed_rows=keyed_rows,
-            zip_aliases=zip_alias_rows,
             completion_aliases=completion_alias_rows,
         )
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (address_key) WHERE address_key IS NOT NULL;"))
@@ -2341,10 +2152,6 @@ async def resolve_into_archive(
         reason_buckets.update({
             str(key): int(value or 0)
             for key, value in alias_stats.items()
-        })
-        reason_buckets.update({
-            str(key): int(value or 0)
-            for key, value in zip_alias_stats.items()
         })
         distinct_keys = int((
             await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))

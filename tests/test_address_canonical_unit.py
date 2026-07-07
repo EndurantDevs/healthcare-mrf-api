@@ -101,7 +101,7 @@ def test_sql_street_alias_helpers_keep_original_next_token_context():
     assert "SELECT token, ord, next_token\n          FROM marked" in completion_sql
 
 
-def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
+def test_resolve_materialization_carries_source_ctid_for_completion_aliases():
     ddl = address_canon._keyed_temp_table_ddl("address_archive_resolve_keyed")
     raw_copy_sql = address_canon._keyed_raw_copy_sql(
         staging="mrf.test_stage",
@@ -117,10 +117,6 @@ def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
         keyed_table="address_archive_resolve_keyed",
         archive="mrf.address_archive_v2",
     )
-    zip_alias_sql = address_canon._zip_alias_sql(
-        keyed_table="address_archive_resolve_keyed",
-        archive="mrf.address_archive_v2",
-    )
 
     assert "source_ctid" in address_canon.KEYED_COPY_COLUMNS
     assert "source_ctid text" in ddl
@@ -133,12 +129,6 @@ def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
     assert "AND (suffix_token IS NULL OR direction_token IS NULL)" in alias_sql
     assert "HAVING count(DISTINCT target_address_key) = 1" in alias_sql
     assert "source_ctid" in alias_sql
-    assert "address_zip_aliases" in zip_alias_sql
-    assert "zip5 IS NULL" in zip_alias_sql
-    assert "city_norm IS NOT NULL" in zip_alias_sql
-    assert "JOIN source_keys" in zip_alias_sql
-    assert "HAVING count(DISTINCT target_address_key) = 1" in zip_alias_sql
-    assert "AND count(DISTINCT target_zip5) = 1" in zip_alias_sql
 
 
 def test_completion_alias_timeout_detector_matches_asyncpg_message():
@@ -1407,7 +1397,7 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
     assert "a.address_key::uuid AS address_key" in mrf_source
 
 
-def test_entity_address_unified_nppes_source_restores_missing_zip_from_archive():
+def test_entity_address_unified_nppes_source_does_not_restore_missing_zip_from_archive():
     selects = entity_address_unified._source_selects(
         "mrf",
         {
@@ -1418,31 +1408,9 @@ def test_entity_address_unified_nppes_source_restores_missing_zip_from_archive()
     )
 
     nppes_source = next(s for s in selects if "'nppes'::varchar AS address_source" in s)
-    assert "LEFT JOIN LATERAL" in nppes_source
-    assert "AS nppes_zip_restore ON TRUE" in nppes_source
-    assert "mrf.addr_zip5_norm_v1(a.postal_code) IS NULL" in nppes_source
-    assert "aa.line1_norm = mrf.addr_street_norm_v1(a.first_line, a.second_line)" in nppes_source
-    assert "bit_count(bit_or(COALESCE(aa.source_bits, 0))::bit(64))::int AS source_ref_count" in nppes_source
-    assert "candidate_count = 1" in nppes_source
-    assert "source_ref_count > COALESCE(next_source_ref_count, -1)" in nppes_source
-    assert "LEFT(zip5, 3) = LEFT(next_zip5, 3)" in nppes_source
-    assert "OR ABS(zip5::int - next_zip5::int) <= 10" in nppes_source
-    assert "THEN nppes_zip_restore.restored_zip5 ELSE a.postal_code END::varchar AS postal_code" in nppes_source
-
-
-def test_entity_address_unified_nppes_source_skips_zip_restore_without_archive():
-    selects = entity_address_unified._source_selects(
-        "mrf",
-        {
-            "npi": True,
-            "npi_address": True,
-            "address_archive_v2": False,
-        },
-    )
-
-    nppes_source = next(s for s in selects if "'nppes'::varchar AS address_source" in s)
     assert "a.postal_code::varchar AS postal_code" in nppes_source
     assert "nppes_zip_restore" not in nppes_source
+    assert "addr_street_norm_v1(a.first_line, a.second_line)" not in nppes_source
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():

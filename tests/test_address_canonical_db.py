@@ -1110,7 +1110,7 @@ async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(mon
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_resolve_recovers_missing_zip_from_unique_exact_sibling(monkeypatch):
+async def test_resolve_leaves_missing_zip_unkeyed_without_coordinate_restore(monkeypatch):
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_missing_zip_repair_test"
@@ -1161,14 +1161,7 @@ async def test_resolve_recovers_missing_zip_from_unique_exact_sibling(monkeypatc
         schema=schema,
     )
 
-    target_key = await db.scalar(
-        f"""
-        SELECT {schema}.addr_key_v1(
-            '10 Zip Repair Road', NULL, 'Austin', 'TX', '78701', 'US'
-        );
-        """
-    )
-    recovered_key = await db.scalar(
+    missing_unique_key = await db.scalar(
         f"""
         SELECT address_key
           FROM {schema}.{stage_table}
@@ -1185,11 +1178,11 @@ async def test_resolve_recovers_missing_zip_from_unique_exact_sibling(monkeypatc
         """
     )
 
-    assert recovered_key == target_key
+    assert missing_unique_key is None
     assert ambiguous_key is None
-    assert stats.reason_buckets["zip_aliases"] == 1
-    assert stats.reason_buckets["missing_zip_recovered"] == 1
-    assert stats.reason_buckets["missing_zip"] == 1
+    assert "zip_aliases" not in stats.reason_buckets
+    assert "missing_zip_recovered" not in stats.reason_buckets
+    assert stats.reason_buckets["missing_zip"] == 2
 
 
 @pytest.mark.asyncio(loop_scope="module")

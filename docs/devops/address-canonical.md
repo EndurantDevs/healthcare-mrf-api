@@ -128,11 +128,12 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
   emits a live warning event; `gate_sample_rows` carries bounded multi-source
   rows for the manual eyeball review.
 - Resolve performs conservative sibling repairs before archive writes:
-  missing ZIP rows are keyed only when street+unit+city+state+country match
-  exactly one observed keyed sibling ZIP, and missing suffix/directional rows
-  are keyed only when the completion-normalized cluster has one higher-
-  specificity sibling. Ambiguous clusters remain split or null-keyed and are
-  reported in `ResolveStats.reason_buckets`.
+  missing suffix/directional rows are keyed only when the completion-normalized
+  cluster has one higher-specificity sibling. Missing ZIP rows are not inferred
+  from street/line normalization or archive sibling matches; they remain
+  null-keyed unless an explicit coordinate-based ZIP restore step resolves them.
+  Ambiguous clusters remain split or null-keyed and are reported in
+  `ResolveStats.reason_buckets`.
 - Do not point `HLTHPRT_ADDRESS_ARCHIVE_TABLE` at the live legacy
   `address_archive` until the Phase 3 migration and verification steps are done.
 - `HLTHPRT_ADDRESS_ARCHIVE_CUTOVER` (default **off**) gates the Phase 4 reader
