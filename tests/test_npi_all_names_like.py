@@ -65,6 +65,26 @@ async def test_get_all_include_total_false_skips_count_query(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_all_locator_defaults_to_no_total_query(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "phone": "(312) 555-1212",
+            "limit": "5",
+            "start": "10",
+        }
+    )
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert conn.calls == 1
+    assert data["total"] == 10
+    assert data["total_source"] == "estimated_page_floor"
+
+
+@pytest.mark.asyncio
 async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
     class SitemapConnection:
         def __init__(self):

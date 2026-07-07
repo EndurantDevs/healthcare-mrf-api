@@ -323,7 +323,7 @@ async def test_match_candidates_route_shapes_payload(monkeypatch):
     assert payload["total"] == 1
     assert payload["candidates"][0]["npi"] == 1013995133
     assert payload["candidates"][0]["address_key"] == "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"
-    assert payload["meta"]["timeout_ms"] == 2000
+    assert payload["meta"]["timeout_ms"] == 8000
 
 
 @pytest.mark.asyncio

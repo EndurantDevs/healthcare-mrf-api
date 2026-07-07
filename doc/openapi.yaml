@@ -3849,6 +3849,12 @@ paths:
     get:
       operationId: searchPricingProvidersByProcedure
       summary: Find providers by procedure/service text or code
+      description: |
+        Finds provider rows by procedure/service text or code. For plan-scoped
+        PTG/TiC requests, claims year filters are ignored by the pricing join;
+        inspect `result_state`, `pricing_scope`, `resolved_snapshot_id`, and
+        `query.ignored_params` to distinguish matched rows from no snapshot,
+        no local match in the requested radius, or no matching rates.
       parameters:
         - name: year
           in: query
@@ -6316,6 +6322,20 @@ components:
     PricingProcedureProviderListResponse:
       type: object
       properties:
+        result_state:
+          type: string
+          nullable: true
+          description: Machine-readable outcome for plan-scoped PTG/TiC pricing lookups.
+          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan]
+        pricing_scope:
+          type: string
+          nullable: true
+          description: Indicates the pricing backend scope when the response came from plan-scoped PTG/TiC data.
+          enum: [plan_scoped_ptg]
+        resolved_snapshot_id:
+          type: string
+          nullable: true
+          description: PTG/TiC serving snapshot used for the lookup when known.
         items:
           type: array
           items:
@@ -6331,6 +6351,22 @@ components:
               type: integer
             year_source:
               type: string
+            ignored_params:
+              type: array
+              description: Query parameters accepted for compatibility but ignored by the resolved backend path.
+              items:
+                type: string
+            year_semantics:
+              type: string
+              nullable: true
+              description: Explains how a supplied year was interpreted for the selected pricing backend.
+              enum: [ignored_for_plan_scoped_ptg_rates]
+            snapshot_id:
+              type: string
+              nullable: true
+            status:
+              type: string
+              nullable: true
             state:
               type: string
               nullable: true

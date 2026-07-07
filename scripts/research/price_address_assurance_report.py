@@ -4,13 +4,13 @@
 
 Examples:
 
-  rtk venv/bin/python scripts/research/price_address_assurance_report.py \
+  venv/bin/python scripts/research/price_address_assurance_report.py \
     --api-payload /tmp/ptg-response.json \
     --raw-artifact /work/ptg2-artifacts/raw/source.json.gz
 
-  curl -sS "$PTG_URL" | rtk venv/bin/python scripts/research/price_address_assurance_report.py --api-payload -
+  curl -sS "$PTG_URL" | venv/bin/python scripts/research/price_address_assurance_report.py --api-payload -
 
-  rtk venv/bin/python scripts/research/price_address_assurance_report.py \
+  venv/bin/python scripts/research/price_address_assurance_report.py \
     --api-url "$PTG_URL" \
     --api-key "$HEALTHPORTA_API_KEY" \
     --require-network-bound-address \

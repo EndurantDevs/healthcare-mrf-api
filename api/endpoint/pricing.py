@@ -4506,6 +4506,60 @@ def _annotate_ptg2_query_payload(
     ignored_params = query_payload.setdefault("ignored_params", [])
     if isinstance(ignored_params, list) and "year" not in ignored_params:
         ignored_params.append("year")
+    query_payload.setdefault(
+        "year_semantics",
+        "ignored_for_plan_scoped_ptg_rates",
+    )
+
+
+def _ptg2_location_filter_requested(args: object) -> bool:
+    getter = getattr(args, "get", None)
+    if not callable(getter):
+        return False
+    return bool(
+        getter("state")
+        or getter("city")
+        or getter("zip5")
+        or getter("zip")
+        or getter("lat") is not None
+        or getter("long") is not None
+        or getter("radius") is not None
+        or getter("radius_miles") is not None
+        or getter("npi") is not None
+    )
+
+
+def _ptg2_empty_result_state(status: str, *, location_filter_requested: bool) -> str:
+    if status == "no_route":
+        return "no_snapshot_for_plan"
+    if location_filter_requested:
+        return "no_match_in_radius"
+    return "no_matching_rates"
+
+
+def _annotate_ptg2_result_state(
+    ptg2_payload: object,
+    *,
+    has_plan_scope: bool,
+    location_filter_requested: bool,
+) -> None:
+    if not isinstance(ptg2_payload, dict) or not has_plan_scope:
+        return
+    query_payload = ptg2_payload.get("query")
+    if not isinstance(query_payload, dict):
+        query_payload = {}
+    items = ptg2_payload.get("items")
+    has_items = isinstance(items, list) and bool(items)
+    status = str(query_payload.get("status") or ("matched" if has_items else "no_match")).strip()
+    result_state = (
+        "matched"
+        if has_items
+        else _ptg2_empty_result_state(status, location_filter_requested=location_filter_requested)
+    )
+    ptg2_payload.setdefault("result_state", result_state)
+    ptg2_payload.setdefault("pricing_scope", "plan_scoped_ptg")
+    if query_payload.get("snapshot_id"):
+        ptg2_payload.setdefault("resolved_snapshot_id", query_payload.get("snapshot_id"))
 
 
 @blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
@@ -5614,6 +5668,7 @@ async def list_provider_procedures(request, npi: str):
         )
         if ptg2_payload is None:
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
+            location_filter_requested = _ptg2_location_filter_requested(args)
             query_payload = {
                 "npi": provider_npi,
                 "plan_id": plan_id or None,
@@ -5630,8 +5685,14 @@ async def list_provider_procedures(request, npi: str):
             }
             if year is not None:
                 query_payload["ignored_params"] = ["year"]
+                query_payload["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
             return response.json(
                 {
+                    "result_state": _ptg2_empty_result_state(
+                        ptg_empty_status,
+                        location_filter_requested=location_filter_requested,
+                    ),
+                    "pricing_scope": "plan_scoped_ptg",
                     "resolved": ptg_empty_status == "no_match",
                     **(
                         {"reason": "no published serving snapshot for this plan_id + market_type"}
@@ -5653,6 +5714,11 @@ async def list_provider_procedures(request, npi: str):
             plan_id_type=plan_id_type,
             year=year,
             has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+        )
+        _annotate_ptg2_result_state(
+            ptg2_payload,
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            location_filter_requested=_ptg2_location_filter_requested(args),
         )
         return _json_response(ptg2_payload)
 
@@ -7720,6 +7786,7 @@ async def list_providers_by_procedure(request):
         )
         if ptg2_payload is None:
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
+            location_filter_requested = _ptg2_location_filter_requested(args)
             query_payload = {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
@@ -7745,8 +7812,14 @@ async def list_providers_by_procedure(request):
             }
             if year is not None:
                 query_payload["ignored_params"] = ["year"]
+                query_payload["year_semantics"] = "ignored_for_plan_scoped_ptg_rates"
             return response.json(
                 {
+                    "result_state": _ptg2_empty_result_state(
+                        ptg_empty_status,
+                        location_filter_requested=location_filter_requested,
+                    ),
+                    "pricing_scope": "plan_scoped_ptg",
                     "resolved": ptg_empty_status == "no_match",
                     **(
                         {"reason": "no published serving snapshot for this plan_id + market_type"}
@@ -7768,6 +7841,11 @@ async def list_providers_by_procedure(request):
             plan_id_type=plan_id_type,
             year=year,
             has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+        )
+        _annotate_ptg2_result_state(
+            ptg2_payload,
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+            location_filter_requested=_ptg2_location_filter_requested(args),
         )
         return _json_response(ptg2_payload)
     if order_by == "cost_index":

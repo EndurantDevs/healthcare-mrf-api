@@ -2286,6 +2286,8 @@ async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_ma
 
     assert payload["items"] == []
     assert payload["pagination"]["total"] == 0
+    assert payload["result_state"] == "no_matching_rates"
+    assert payload["pricing_scope"] == "plan_scoped_ptg"
     assert payload["query"]["source"] == "ptg2"
     assert payload["query"]["status"] == "no_match"
 
@@ -2311,11 +2313,14 @@ async def test_list_providers_by_procedure_no_ptg_route_reports_reason(monkeypat
     payload = json.loads(response.body)
 
     assert payload["resolved"] is False
+    assert payload["result_state"] == "no_snapshot_for_plan"
+    assert payload["pricing_scope"] == "plan_scoped_ptg"
     assert payload["reason"] == "no published serving snapshot for this plan_id + market_type"
     assert payload["pagination"]["total"] == 0
     assert payload["query"]["status"] == "no_route"
     assert payload["query"]["plan_id_type"] == "ein"
     assert payload["query"]["ignored_params"] == ["year"]
+    assert payload["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
 
 
 @pytest.mark.asyncio

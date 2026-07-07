@@ -329,7 +329,7 @@ _NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = N
 _NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
-_MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "2.0"))
+_MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "8.0"))
 _MATCH_CANDIDATES_DEFAULT_LIMIT = 5
 _MATCH_CANDIDATES_MAX_LIMIT = 50
 _MATCH_CANDIDATES_DEFAULT_RADIUS_MILES = 1.0
@@ -3331,7 +3331,7 @@ async def match_candidates(request):
         rows = await _fetch_match_candidate_rows(params, session=request_session)
     except asyncio.TimeoutError as exc:
         raise sanic.exceptions.ServiceUnavailable(
-            "match candidate lookup exceeded the 2 second query budget"
+            f"match candidate lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
         ) from exc
     if params.get("include_sources") or params.get("include_evidence"):
         await _attach_provider_directory_source_details(rows, session=request_session)
@@ -3561,6 +3561,10 @@ async def get_all(request):
     address_key = _normalize_address_key(address_key_raw)
     address_site_key = _normalize_uuid_key(address_site_key_raw, PUBLIC_ADDRESS_SITE_KEY)
     exact_npi = _normalize_exact_npi(npi_raw)
+    if include_total_raw is None and not count_only and (
+        phone_digits or address_key or address_site_key or exact_npi is not None
+    ):
+        include_total = False
     entity_type_code: Optional[int] = None
     if entity_type_code_raw not in (None, ""):
         try:
