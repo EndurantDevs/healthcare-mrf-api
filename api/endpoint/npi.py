@@ -3388,6 +3388,7 @@ async def get_all(request):
         include_sources = True
         include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
+    include_total_raw = request.args.get("include_total")
     include_total = _parse_bool_arg(request.args.get("include_total"), default=True)
     view_mode = str(request.args.get("view") or "").strip().lower()
     classification = request.args.get("classification")
@@ -3629,6 +3630,31 @@ async def get_all(request):
             "procedure_internal_codes",
             "medication_internal_codes",
         )
+    )
+    broad_name_total_deferred = bool(names_like) and not any(
+        [
+            classification,
+            specialization,
+            section,
+            display_name,
+            first_name,
+            last_name,
+            organization_name,
+            exact_npi,
+            phone_digits,
+            address_key,
+            address_site_key,
+            zip_code,
+            entity_type_code,
+            plan_network,
+            codes,
+            has_insurance,
+            city,
+            state,
+            response_format,
+            procedure_internal_codes,
+            medication_internal_codes,
+        ]
     )
 
     def _append_array_filters(address_where: list[str], local_filters: dict[str, Any]) -> dict[str, int]:
@@ -4402,6 +4428,14 @@ async def get_all(request):
 
     async def _count_with_timeout() -> Optional[int]:
         if not include_total:
+            return None
+        if broad_name_total_deferred:
+            logger.info(
+                "Skipping broad NPI /all name-search total count; offset=%s limit=%s explicit_include_total=%s",
+                pagination.offset,
+                pagination.limit,
+                include_total_raw is not None,
+            )
             return None
         if not simple_filter_present and not has_insurance and not city and not state:
             return await _fast_primary_npi_count()

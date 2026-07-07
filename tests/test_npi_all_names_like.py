@@ -182,7 +182,9 @@ async def test_get_all_accepts_name_like_legacy_alias(monkeypatch):
     resp = await get_all(request)
     data = json.loads(resp.body)
 
-    assert data["total"] == 5
+    assert conn.calls == 1
+    assert data["total"] == 0
+    assert data["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert conn.last_params["name_like_0"] == "%clinic%"
 
@@ -213,7 +215,9 @@ async def test_get_all_deduplicates_repeated_name_like_values_from_multidict(mon
     resp = await get_all(request)
     data = json.loads(resp.body)
 
-    assert data["total"] == 5
+    assert conn.calls == 1
+    assert data["total"] == 0
+    assert data["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert "name_like_1" not in conn.last_params
     assert conn.last_params["name_like_0"] == "%cvs%"
@@ -231,10 +235,30 @@ async def test_get_all_deduplicates_q_and_legacy_name_like(monkeypatch):
     resp = await get_all(request)
     data = json.loads(resp.body)
 
-    assert data["total"] == 5
+    assert conn.calls == 1
+    assert data["total"] == 0
+    assert data["total_source"] == "estimated_timeout_floor"
     assert "name_like_0" in conn.last_params
     assert "name_like_1" not in conn.last_params
     assert conn.last_params["name_like_0"] == "%clinic%"
+
+
+@pytest.mark.asyncio
+async def test_get_all_broad_q_explicit_include_total_still_skips_slow_count(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={"q": "silver", "limit": "5", "start": "0", "include_total": "true"}
+    )
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert conn.calls == 1
+    assert data["total"] == 0
+    assert data["total_source"] == "estimated_timeout_floor"
+    assert "name_like_0" in conn.last_params
+    assert conn.last_params["name_like_0"] == "%silver%"
 
 
 @pytest.mark.asyncio
