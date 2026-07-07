@@ -5443,6 +5443,7 @@ async def test_large_sidecar_filters_generic_rows(monkeypatch):
 @pytest.mark.asyncio
 async def test_rate_scope_sidecar_cache(monkeypatch):
     ptg2_serving._PTG2_RATE_SCOPE_CACHE.clear()
+    ptg2_serving._PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = 0
     group_id = "00000000000000000000000000000011"
     session = FakeSession([])
     session.sync_session = object()
@@ -5472,8 +5473,71 @@ async def test_rate_scope_sidecar_cache(monkeypatch):
     )
 
     sidecar_probe.assert_awaited_once()
-    assert first_scope.group_id_set == frozenset({group_id})
+    assert first_scope.group_id_bytes == frozenset({bytes.fromhex(group_id)})
     assert second_scope is first_scope
+
+
+def test_rate_scope_cache_evicts_by_total_ids(monkeypatch):
+    ptg2_serving._PTG2_RATE_SCOPE_CACHE.clear()
+    ptg2_serving._PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = 0
+    monkeypatch.setattr(ptg2_serving, "_PTG2_RATE_SCOPE_CACHE_MAX_KEYS", 10)
+    monkeypatch.setattr(ptg2_serving, "_PTG2_RATE_SCOPE_CACHE_MAX_IDS", 3)
+    first_key = ("first",)
+    second_key = ("second",)
+
+    first_scope = ptg2_serving._ptg2_rate_scope_set(
+        first_key,
+        (
+            "00000000000000000000000000000011",
+            "00000000000000000000000000000012",
+        ),
+    )
+    second_scope = ptg2_serving._ptg2_rate_scope_set(
+        second_key,
+        (
+            "00000000000000000000000000000021",
+            "00000000000000000000000000000022",
+        ),
+    )
+
+    assert first_scope.id_count == 2
+    assert second_scope.id_count == 2
+    assert first_key not in ptg2_serving._PTG2_RATE_SCOPE_CACHE
+    assert ptg2_serving._PTG2_RATE_SCOPE_CACHE[second_key] is second_scope
+    assert ptg2_serving._PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids == 2
+
+
+def test_rate_scope_cache_skips_entries_larger_than_id_budget(monkeypatch):
+    ptg2_serving._PTG2_RATE_SCOPE_CACHE.clear()
+    ptg2_serving._PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = 0
+    monkeypatch.setattr(ptg2_serving, "_PTG2_RATE_SCOPE_CACHE_MAX_KEYS", 10)
+    monkeypatch.setattr(ptg2_serving, "_PTG2_RATE_SCOPE_CACHE_MAX_IDS", 1)
+    cache_key = ("oversized",)
+
+    rate_scope = ptg2_serving._ptg2_rate_scope_set(
+        cache_key,
+        (
+            "00000000000000000000000000000011",
+            "00000000000000000000000000000012",
+        ),
+    )
+
+    assert rate_scope.id_count == 2
+    assert cache_key not in ptg2_serving._PTG2_RATE_SCOPE_CACHE
+    assert ptg2_serving._PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids == 0
+
+
+def test_rate_scope_omits_large_sql_tuple(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SQL_RATE_SCOPE_MAX_IDS", "1")
+    first_group_id = "00000000000000000000000000000011"
+    second_group_id = "00000000000000000000000000000012"
+
+    rate_scope = ptg2_serving._ptg2_build_rate_scope((first_group_id, second_group_id))
+
+    assert rate_scope.group_ids == ()
+    assert rate_scope.id_count == 2
+    assert ptg2_serving._has_rate_scope_group(rate_scope, first_group_id)
+    assert ptg2_serving._has_rate_scope_group(rate_scope, second_group_id)
 
 
 async def _location_first_test_context(monkeypatch):
@@ -5826,8 +5890,9 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     assert "FROM mrf.npi_address addr" not in sql
     assert "'entity_address_unified' AS location_source" in sql
     assert "'entity_address_unified' AS location_confidence_code" in sql
-    assert "to_jsonb(addr.*) - 'premise_key'" in sql
-    assert "jsonb_build_object('address_site_key', addr.premise_key::text)" in sql
+    assert "to_jsonb(addr.*)" not in sql
+    assert "jsonb_build_object('npi', pgm.npi" in sql
+    assert "'address_site_key', addr.premise_key::text" in sql
     assert "AS address_payload" in sql
     assert "addr.npi = pgm.npi" in sql
     assert "addr.npi = sp.npi" not in sql

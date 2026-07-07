@@ -153,6 +153,7 @@ ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
 _PTG2_RATE_SCOPE_CACHE_MAX_KEYS = max(int(os.getenv("HLTHPRT_PTG2_RATE_SCOPE_CACHE_MAX_KEYS", "1024")), 0)
+_PTG2_RATE_SCOPE_CACHE_MAX_IDS = max(int(os.getenv("HLTHPRT_PTG2_RATE_SCOPE_CACHE_MAX_IDS", "3000000")), 0)
 _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_MANIFEST_LOCATION_JIT_DISABLED_ATTR = "_ptg2_manifest_location_jit_disabled"
 _PTG2_TAXONOMY_INT_CODE_CACHE: dict[tuple[str, ...], tuple[int, ...]] = {}
@@ -190,10 +191,17 @@ class _ManifestProviderLocationQuery:
 @dataclass(frozen=True)
 class _ManifestRateScope:
     group_ids: tuple[str, ...]
-    group_id_set: frozenset[str]
+    group_id_bytes: frozenset[bytes]
+    id_count: int
+    fallback_group_ids: frozenset[str] = frozenset()
 
+
+@dataclass
+class _RateScopeCacheBudget:
+    total_ids: int = 0
 
 _PTG2_RATE_SCOPE_CACHE: OrderedDict[tuple[str, ...], _ManifestRateScope] = OrderedDict()
+_PTG2_RATE_SCOPE_CACHE_BUDGET = _RateScopeCacheBudget()
 
 
 @dataclass(frozen=True)
@@ -1865,6 +1873,16 @@ def _ptg2_manifest_id(value: Any) -> str:
     return _uuid_to_hex(value)
 
 
+def _ptg2_manifest_id_bytes(value: Any) -> bytes:
+    manifest_id = _ptg2_manifest_id(value)
+    if len(manifest_id) != 32:
+        return b""
+    try:
+        return bytes.fromhex(manifest_id)
+    except ValueError:
+        return b""
+
+
 def _ptg2_manifest_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_manifest_id(value))))
 
@@ -3035,8 +3053,43 @@ def _ptg2_rate_scope_key(
     )
 
 
+def _ptg2_build_rate_scope(group_ids: tuple[str, ...]) -> _ManifestRateScope:
+    normalized_group_ids = tuple(sorted(set(_ptg2_manifest_ids(group_ids))))
+    sql_group_ids = normalized_group_ids if len(normalized_group_ids) <= _ptg2_sql_scope_limit() else ()
+    binary_group_ids: list[bytes] = []
+    fallback_group_ids: list[str] = []
+    for group_id in normalized_group_ids:
+        binary_group_id = _ptg2_manifest_id_bytes(group_id)
+        if binary_group_id:
+            binary_group_ids.append(binary_group_id)
+        else:
+            fallback_group_ids.append(group_id)
+    return _ManifestRateScope(
+        group_ids=sql_group_ids,
+        group_id_bytes=frozenset(binary_group_ids),
+        id_count=len(normalized_group_ids),
+        fallback_group_ids=frozenset(fallback_group_ids),
+    )
+
+
+def _is_rate_scope_cache_enabled() -> bool:
+    return _PTG2_RATE_SCOPE_CACHE_MAX_KEYS > 0 and _PTG2_RATE_SCOPE_CACHE_MAX_IDS > 0
+
+
+def _ptg2_rate_scope_cache_evict() -> None:
+    while _PTG2_RATE_SCOPE_CACHE and (
+        len(_PTG2_RATE_SCOPE_CACHE) > _PTG2_RATE_SCOPE_CACHE_MAX_KEYS
+        or _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids > _PTG2_RATE_SCOPE_CACHE_MAX_IDS
+    ):
+        _, evicted_scope = _PTG2_RATE_SCOPE_CACHE.popitem(last=False)
+        _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = max(
+            _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids - evicted_scope.id_count,
+            0,
+        )
+
+
 def _ptg2_rate_scope_get(cache_key: tuple[str, ...]) -> _ManifestRateScope | None:
-    if _PTG2_RATE_SCOPE_CACHE_MAX_KEYS <= 0:
+    if not _is_rate_scope_cache_enabled():
         return None
     rate_scope = _PTG2_RATE_SCOPE_CACHE.get(cache_key)
     if rate_scope is not None:
@@ -3045,17 +3098,18 @@ def _ptg2_rate_scope_get(cache_key: tuple[str, ...]) -> _ManifestRateScope | Non
 
 
 def _ptg2_rate_scope_set(cache_key: tuple[str, ...], group_ids: tuple[str, ...]) -> _ManifestRateScope:
-    normalized_group_ids = tuple(sorted(set(_ptg2_manifest_ids(group_ids))))
-    rate_scope = _ManifestRateScope(
-        group_ids=normalized_group_ids,
-        group_id_set=frozenset(normalized_group_ids),
-    )
-    if _PTG2_RATE_SCOPE_CACHE_MAX_KEYS <= 0:
+    rate_scope = _ptg2_build_rate_scope(group_ids)
+    previous_scope = _PTG2_RATE_SCOPE_CACHE.pop(cache_key, None)
+    if previous_scope is not None:
+        _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids = max(
+            _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids - previous_scope.id_count,
+            0,
+        )
+    if not _is_rate_scope_cache_enabled() or rate_scope.id_count > _PTG2_RATE_SCOPE_CACHE_MAX_IDS:
         return rate_scope
     _PTG2_RATE_SCOPE_CACHE[cache_key] = rate_scope
-    _PTG2_RATE_SCOPE_CACHE.move_to_end(cache_key)
-    while len(_PTG2_RATE_SCOPE_CACHE) > _PTG2_RATE_SCOPE_CACHE_MAX_KEYS:
-        _PTG2_RATE_SCOPE_CACHE.popitem(last=False)
+    _PTG2_RATE_SCOPE_CACHE_BUDGET.total_ids += rate_scope.id_count
+    _ptg2_rate_scope_cache_evict()
     return rate_scope
 
 
@@ -3083,10 +3137,7 @@ async def _manifest_rate_scope_from_sidecar(
         code_system=code_system,
     )
     if not is_cache_enabled:
-        return _ManifestRateScope(
-            group_ids=tuple(sorted(set(_ptg2_manifest_ids(group_ids)))),
-            group_id_set=frozenset(_ptg2_manifest_ids(group_ids)),
-        )
+        return _ptg2_build_rate_scope(group_ids)
     return _ptg2_rate_scope_set(cache_key, group_ids)
 
 
@@ -3638,27 +3689,28 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 LEFT(COALESCE({_eff_enrich('postal_code')}, ''), 5) AS zip5,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
-                (
-                    COALESCE(to_jsonb(addr.*), '{{}}'::jsonb)
-                    - 'premise_key'
-                    || jsonb_build_object(
-                        'first_line', {_eff_enrich('first_line')},
-                        'second_line', {_eff_enrich('second_line')},
-                        'city', {_eff_enrich('city_name')},
-                        'state', {_eff_enrich('state_name')},
-                        'postal_code', {_eff_enrich('postal_code')},
-                        'country_code', {_eff_enrich('country_code')},
-                        'telephone_number', {_eff_enrich('telephone_number')},
-                        'fax_number', {_eff_enrich('fax_number')},
-                        'phone_number', {_eff_enrich('phone_number')},
-                        'phone_extension', {_eff_enrich('phone_extension')},
-                        'fax_number_digits', {_eff_enrich('fax_number_digits')},
-                        'fax_extension', {_eff_enrich('fax_extension')},
-                        'address_key', addr.address_key::text,
-                        'address_site_key', addr.premise_key::text,
-                        'lat', {_eff_enrich('lat')},
-                        'long', {_eff_enrich('long')}
-                    )
+                jsonb_build_object(
+                    'npi', source_npis.npi,
+                    'type', addr.type,
+                    'checksum', addr.checksum,
+                    'first_line', {_eff_enrich('first_line')},
+                    'second_line', {_eff_enrich('second_line')},
+                    'city_name', {_eff_enrich('city_name')},
+                    'state_name', {_eff_enrich('state_name')},
+                    'city', {_eff_enrich('city_name')},
+                    'state', {_eff_enrich('state_name')},
+                    'postal_code', {_eff_enrich('postal_code')},
+                    'country_code', {_eff_enrich('country_code')},
+                    'telephone_number', {_eff_enrich('telephone_number')},
+                    'fax_number', {_eff_enrich('fax_number')},
+                    'phone_number', {_eff_enrich('phone_number')},
+                    'phone_extension', {_eff_enrich('phone_extension')},
+                    'fax_number_digits', {_eff_enrich('fax_number_digits')},
+                    'fax_extension', {_eff_enrich('fax_extension')},
+                    'address_key', addr.address_key::text,
+                    'address_site_key', addr.premise_key::text,
+                    'lat', {_eff_enrich('lat')},
+                    'long', {_eff_enrich('long')}
                 )::text AS address_payload,
                 {_eff_enrich('telephone_number')} AS telephone_number,
                 {_eff_enrich('fax_number')} AS fax_number,
@@ -4536,7 +4588,7 @@ _LOCATION_FIRST_MEMBER_SQL_TEMPLATE = Template(
 
 def _ptg2_filter_location_rows(
     candidate_iterable: Iterable[Any],
-    rate_group_ids: frozenset[str],
+    rate_scope: _ManifestRateScope,
     limit: int,
 ) -> list[dict[str, Any]]:
     scoped_location_matches: list[dict[str, Any]] = []
@@ -4544,7 +4596,7 @@ def _ptg2_filter_location_rows(
     for candidate_source in candidate_iterable:
         candidate_mapping = _row_mapping(candidate_source)
         group_id = _ptg2_manifest_id(candidate_mapping.get("provider_group_global_id_128"))
-        if not group_id or group_id not in rate_group_ids:
+        if not _has_rate_scope_group(rate_scope, group_id):
             continue
         try:
             npi = int(candidate_mapping.get("npi"))
@@ -4558,6 +4610,16 @@ def _ptg2_filter_location_rows(
         if len(scoped_location_matches) >= limit:
             break
     return scoped_location_matches
+
+
+def _has_rate_scope_group(rate_scope: _ManifestRateScope, value: Any) -> bool:
+    group_id = _ptg2_manifest_id(value)
+    if not group_id:
+        return False
+    binary_group_id = _ptg2_manifest_id_bytes(group_id)
+    if binary_group_id:
+        return binary_group_id in rate_scope.group_id_bytes
+    return group_id in rate_scope.fallback_group_ids
 
 
 async def _ptg2_manifest_location_provider_matches(
@@ -4728,7 +4790,8 @@ async def _ptg2_manifest_location_provider_matches(
     active_provider_group_rate_scope_table = ""
     has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
     rate_provider_group_ids: tuple[str, ...] = ()
-    rate_provider_group_id_set: frozenset[str] = frozenset()
+    rate_provider_group_count = 0
+    rate_provider_group_scope: _ManifestRateScope | None = None
     sql_rate_provider_group_ids: tuple[str, ...] = ()
     has_component_rate_scope = False
     has_checked_rate_provider_group_sidecar = False
@@ -4809,7 +4872,8 @@ async def _ptg2_manifest_location_provider_matches(
         )
         has_checked_rate_provider_group_sidecar = True
         rate_provider_group_ids = rate_scope.group_ids
-        rate_provider_group_id_set = rate_scope.group_id_set
+        rate_provider_group_count = rate_scope.id_count
+        rate_provider_group_scope = rate_scope
         if rate_provider_group_ids:
             if len(rate_provider_group_ids) <= _ptg2_sql_scope_limit():
                 sql_rate_provider_group_ids = rate_provider_group_ids
@@ -4822,7 +4886,7 @@ async def _ptg2_manifest_location_provider_matches(
                 final_member_filters.append(f"pgm.{rate_group_filter}")
     if (
         provider_group_location_table
-        and not rate_provider_group_ids
+        and rate_provider_group_count == 0
         and not has_checked_rate_provider_group_sidecar
         and not has_component_rate_scope
         and (serving_table or has_serving_by_code_sidecar)
@@ -4839,7 +4903,8 @@ async def _ptg2_manifest_location_provider_matches(
         )
         has_checked_rate_provider_group_sidecar = True
         rate_provider_group_ids = rate_scope.group_ids
-        rate_provider_group_id_set = rate_scope.group_id_set
+        rate_provider_group_count = rate_scope.id_count
+        rate_provider_group_scope = rate_scope
         if rate_provider_group_ids and len(rate_provider_group_ids) <= _ptg2_sql_scope_limit():
             sql_rate_provider_group_ids = rate_provider_group_ids
     if provider_group_location_table and sql_rate_provider_group_ids:
@@ -4849,7 +4914,7 @@ async def _ptg2_manifest_location_provider_matches(
         and not has_component_rate_scope
         and has_rate_provider_group_sidecar
         and has_checked_rate_provider_group_sidecar
-        and not rate_provider_group_ids
+        and rate_provider_group_count == 0
     )
 
     # With a taxonomy filter, resolve the member x taxonomy intersection ONCE in
@@ -5209,7 +5274,7 @@ async def _ptg2_manifest_location_provider_matches(
     async def _query_location_first_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]] | None:
         if not (
             using_unified_address_table
-            and rate_provider_group_id_set
+            and rate_provider_group_scope
             and not sql_rate_provider_group_ids
             and (member_taxonomy_scoped or provider_npi is not None)
             and not has_component_rate_scope
@@ -5257,7 +5322,7 @@ async def _ptg2_manifest_location_provider_matches(
             await _rollback_optional_ptg2_query(session)
             return None
 
-        return _ptg2_filter_location_rows(member_result_set, rate_provider_group_id_set, configured_limit)
+        return _ptg2_filter_location_rows(member_result_set, rate_provider_group_scope, configured_limit)
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
         address_filters = [*filters]
@@ -5407,9 +5472,9 @@ async def _ptg2_manifest_location_provider_matches(
     def _filter_large_scope_rows(location_rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if location_rows is None:
             return None
-        if not (rate_provider_group_id_set and not sql_rate_provider_group_ids and not has_component_rate_scope):
+        if not (rate_provider_group_scope and not sql_rate_provider_group_ids and not has_component_rate_scope):
             return location_rows
-        return _ptg2_filter_location_rows(location_rows, rate_provider_group_id_set, configured_limit)
+        return _ptg2_filter_location_rows(location_rows, rate_provider_group_scope, configured_limit)
 
     async def _fill_location_phone_fallbacks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not using_unified_address_table:
@@ -7055,7 +7120,29 @@ async def _search_compact_serving_table(
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
             f"'{address_location_source}' AS location_source, "
             f"'{address_location_source}' AS location_confidence_code, "
-            "((to_jsonb(addr.*) - 'premise_key') || jsonb_build_object('address_site_key', addr.premise_key::text)) AS address_payload, "
+            "jsonb_build_object("
+            "'npi', pgm.npi, "
+            "'type', addr.type, "
+            "'checksum', addr.checksum, "
+            "'first_line', addr.first_line, "
+            "'second_line', addr.second_line, "
+            "'city_name', addr.city_name, "
+            "'state_name', addr.state_name, "
+            "'city', addr.city, "
+            "'state', addr.state, "
+            "'postal_code', addr.postal_code, "
+            "'country_code', addr.country_code, "
+            "'telephone_number', addr.telephone_number, "
+            "'fax_number', addr.fax_number, "
+            "'phone_number', addr.phone_number, "
+            "'phone_extension', addr.phone_extension, "
+            "'fax_number_digits', addr.fax_number_digits, "
+            "'fax_extension', addr.fax_extension, "
+            "'address_key', addr.address_key::text, "
+            "'address_site_key', addr.premise_key::text, "
+            "'lat', addr.lat, "
+            "'long', addr.long"
+            ") AS address_payload, "
             "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
             "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
             "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
