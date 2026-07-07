@@ -2502,6 +2502,16 @@ paths:
           schema:
             type: boolean
           description: Convenience flag equivalent to include_sources=true and include_evidence=true
+        - name: sync_geocode
+          in: query
+          schema:
+            type: boolean
+          description: When false, skips live geocoding for address rows missing coordinates
+        - name: lookup_stored_geocode
+          in: query
+          schema:
+            type: boolean
+          description: When false, skips stored archive geocode lookup for address rows missing coordinates
         - name: address_limit
           in: query
           schema:
@@ -2513,6 +2523,11 @@ paths:
             type: integer
             minimum: 0
           description: Zero-based address_list offset used with address_limit
+        - name: include_address_total
+          in: query
+          schema:
+            type: boolean
+          description: Include total address count metadata when address_list is paged
       responses:
         '200':
           description: NPI detail payload
