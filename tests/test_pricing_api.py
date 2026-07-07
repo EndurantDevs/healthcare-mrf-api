@@ -339,10 +339,13 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     count_sql = str(request.ctx.sa_session.executions[1][0][0])
     address_sql = str(request.ctx.sa_session.executions[2][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
+    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
+    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
     assert "mrf.npi_address addr" in provider_sql
     assert "addr.type IN ('primary', 'secondary')" in provider_sql
     assert "LEFT(COALESCE(addr.postal_code, ''), 5) = ANY(:location_zips)" in provider_sql
-    assert "mrf.npi_address addr" in count_sql
+    assert "WITH local_candidate_npis AS MATERIALIZED" in count_sql
+    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in count_sql
     assert "type IN ('primary', 'secondary')" in address_sql
     assert params["location_city"] == "chicago"
     assert params["location_state"] == "IL"
@@ -389,6 +392,8 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
     assert response_payload["location_filter"]["zips_considered"] == 3
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
+    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
+    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
     assert "= ANY(:location_zips)" in provider_sql
     assert params["location_zips"] == ["60601", "60602", "60611"]
 
@@ -428,8 +433,8 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     assert response_payload["ok"] is True
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
-    assert "WITH local_specialty_npis AS MATERIALIZED" in provider_sql
-    assert "JOIN local_specialty_npis lsn ON lsn.npi = gm.npi" in provider_sql
+    assert "WITH local_candidate_npis AS MATERIALIZED" in provider_sql
+    assert "JOIN local_candidate_npis lcn ON lcn.npi = gm.npi" in provider_sql
     assert "= ANY(:location_zips)" in provider_sql
     # index-compatible taxonomy predicate: raw column, uppercased params
     assert "UPPER(COALESCE(cand_provider_specialty_nt.healthcare_provider_taxonomy_code" not in provider_sql
