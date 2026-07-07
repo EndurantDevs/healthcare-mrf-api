@@ -20,6 +20,7 @@ from process.ptg_parts.domain import (
     PTG2_DOMAIN_IN_NETWORK,
     PTG2SourceCatalogEntry,
 )
+from process.ptg_parts.healthsparq_source_jobs import healthsparq_catalog_entries
 from process.ptg_parts.row_helpers import _as_list
 
 
@@ -261,6 +262,16 @@ def parse_toc_catalog_entries(
             plan_info=(),
         )
     ]
+    entries.extend(
+        healthsparq_catalog_entries(
+            toc_content,
+            toc_url,
+            toc_meta,
+            plan_ids=plan_ids,
+            plan_name_contains=plan_name_contains,
+            plan_market_types=plan_market_types,
+        )
+    )
     for structure in toc_content.get("reporting_structure", []) or []:
         plans = [
             _normalize_plan_payload(plan)

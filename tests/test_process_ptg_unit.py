@@ -1815,6 +1815,49 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
     assert entries[3].description == "Allowed 2"
 
 
+def test_ptg2_toc_parser_accepts_healthsparq_metadata_files():
+    """HealthSparq metadata entries should become normal PTG catalog entries."""
+    metadata_url = (
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/"
+        "prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
+    )
+    metadata_payload_by_key = {
+        "files": [
+            {
+                "reportingEntityName": "Aetna Signature Administrators",
+                "reportingEntityType": "Third Party Vendor",
+                "reportingPlans": [
+                    {
+                        "planId": "123456789",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "ASA_17_60289",
+                    }
+                ],
+                "fileSchema": "IN_NETWORK_RATES",
+                "fileName": "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz",
+                "filePath": "2026-07-05/inNetworkRates/2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz",
+            }
+        ]
+    }
+
+    catalog_entries = process_ptg.parse_toc_catalog_entries(
+        metadata_payload_by_key,
+        metadata_url,
+        plan_market_types=["group"],
+    )
+    in_network_catalog_entries = [entry for entry in catalog_entries if entry.source_type == "in-network"]
+
+    assert len(in_network_catalog_entries) == 1
+    assert in_network_catalog_entries[0].original_url == (
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/prd/mrf/"
+        "AETNACVS_I/ASA/2026-07-05/inNetworkRates/"
+        "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
+    )
+    assert in_network_catalog_entries[0].description == "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
+    assert in_network_catalog_entries[0].plan_info[0]["plan_id"] == "123456789"
+
+
 def test_ptg2_toc_parser_rejects_non_pricing_payload():
     payload = {
         "provider_urls": [
@@ -2035,6 +2078,84 @@ def test_ptg2_toc_jobs_repair_ucare_json_and_allowed_amount_lists(
         "allowed-amounts",
         "allowed-amounts",
     ]
+
+
+def _write_healthsparq_metadata_fixture(tmp_path, target_file_name: str) -> Path:
+    """Write a minimal HealthSparq metadata document with one selected file."""
+    base_file_metadata_by_key = {
+        "reportingEntityName": "Aetna Signature Administrators",
+        "reportingEntityType": "Third Party Vendor",
+        "reportingPlans": [
+            {
+                "planId": "123456789",
+                "planIdType": "ein",
+                "planMarketType": "group",
+                "planName": "ASA_17_60289",
+            }
+        ],
+        "fileSchema": "IN_NETWORK_RATES",
+    }
+    metadata_document_path = tmp_path / "latest_metadata.json"
+    metadata_document_path.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        **base_file_metadata_by_key,
+                        "fileName": "unrelated.json.gz",
+                        "filePath": "2026-07-05/inNetworkRates/unrelated.json.gz",
+                    },
+                    {
+                        **base_file_metadata_by_key,
+                        "fileName": target_file_name,
+                        "filePath": f"2026-07-05/inNetworkRates/{target_file_name}",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return metadata_document_path
+
+
+def test_ptg2_toc_jobs_accept_healthsparq_metadata_files(monkeypatch, tmp_path):
+    """Targeted HealthSparq metadata imports should emit the matching rate-file job."""
+    metadata_url = (
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/"
+        "prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
+    )
+    target_file_name = "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
+    metadata_document_path = _write_healthsparq_metadata_fixture(tmp_path, target_file_name)
+    pushed_ptg_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=metadata_document_path)
+        return artifact, artifact
+
+    async def fake_push_objects(ptg_rows_to_push, _cls, **_kwargs):
+        pushed_ptg_file_rows.extend(ptg_rows_to_push)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    selected_ptg_jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            metadata_url,
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            file_url_contains=[target_file_name],
+            max_files=1,
+        )
+    )
+
+    assert [job["type"] for job in selected_ptg_jobs] == ["in_network"]
+    assert selected_ptg_jobs[0]["url"] == (
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/prd/mrf/"
+        f"AETNACVS_I/ASA/2026-07-05/inNetworkRates/{target_file_name}"
+    )
+    assert selected_ptg_jobs[0]["plan_info"][0]["plan_name"] == "ASA_17_60289"
+    assert [ptg_file_row["file_type"] for ptg_file_row in pushed_ptg_file_rows] == ["table-of-contents", "in-network"]
 
 
 def _write_targeted_toc_fixture(tmp_path, source_file_locations):

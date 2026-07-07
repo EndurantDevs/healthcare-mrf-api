@@ -2282,16 +2282,19 @@ async def _process_table_of_contents(
 
     file_url_match_tokens = _toc_file_url_match_tokens(file_url_contains)
     targeted_file_import = bool(file_url_match_tokens) and max_files is not None
-
-    if import_run_id and not targeted_file_import:
-        catalog_rows = []
-        for entry in parse_toc_catalog_entries(
+    parsed_catalog_entries: list[PTG2SourceCatalogEntry] = []
+    if not targeted_file_import or not toc_content.get("reporting_structure"):
+        parsed_catalog_entries = parse_toc_catalog_entries(
             toc_content,
             toc_url,
             plan_ids=plan_ids,
             plan_name_contains=plan_name_contains,
             plan_market_types=plan_market_types,
-        ):
+        )
+
+    if import_run_id and not targeted_file_import:
+        catalog_rows = []
+        for entry in parsed_catalog_entries:
             first_plan = entry.plan_info[0] if len(entry.plan_info) == 1 else {}
             catalog_rows.append(
                 {
@@ -2334,6 +2337,50 @@ async def _process_table_of_contents(
             None,
         )
     )
+
+    if not toc_content.get("reporting_structure"):
+        for catalog_entry in parsed_catalog_entries:
+            if _has_reached_toc_file_limit(jobs, max_files):
+                break
+            if catalog_entry.domain == PTG2_DOMAIN_IN_NETWORK:
+                job_type = "in_network"
+                file_type = "in-network"
+            elif catalog_entry.domain == PTG2_DOMAIN_ALLOWED_AMOUNT:
+                job_type = "allowed_amounts"
+                file_type = "allowed-amounts"
+            else:
+                continue
+            location = normalize_tic_source_url(catalog_entry.original_url)
+            if not _is_requested_toc_body_file_url(location, file_url_match_tokens):
+                continue
+            meta = {
+                "reporting_entity_name": catalog_entry.reporting_entity_name,
+                "reporting_entity_type": catalog_entry.reporting_entity_type,
+            }
+            plans = list(catalog_entry.plan_info or ())
+            file_row = _build_file_row(
+                location,
+                file_type,
+                meta,
+                plans,
+                catalog_entry.description,
+                catalog_entry.from_index_url or toc_url,
+            )
+            if file_row["file_id"] not in seen_files:
+                file_rows.append(file_row)
+                seen_files.add(file_row["file_id"])
+            jobs.append(
+                {
+                    "type": job_type,
+                    "url": location,
+                    "description": catalog_entry.description,
+                    "plan_info": plans,
+                    "from_index_url": catalog_entry.from_index_url or toc_url,
+                    "meta": meta,
+                }
+            )
+            if test_mode and len(jobs) >= TEST_TOC_JOBS:
+                break
 
     for structure in toc_content.get("reporting_structure", []):
         if _has_reached_toc_file_limit(jobs, max_files):
