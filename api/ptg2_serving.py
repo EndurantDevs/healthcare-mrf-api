@@ -758,6 +758,13 @@ def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
     )
 
 
+def _ptg2_address_zip5_sql(alias: str, *, unified: bool) -> str:
+    """Return the zip5 expression that matches the hot address-serving index."""
+    if unified:
+        return f"COALESCE({alias}.zip5, LEFT((COALESCE({alias}.postal_code, ''::varchar))::text, 5)::varchar)"
+    return f"LEFT(COALESCE({alias}.postal_code, ''), 5)"
+
+
 def normalize_ptg2_mode(value: str | None) -> str:
     mode = str(value or PTG2_MODE_PRODUCT_SEARCH).strip().lower()
     if mode not in {PTG2_MODE_EXACT_SOURCE, PTG2_MODE_PRODUCT_SEARCH}:
@@ -4061,6 +4068,7 @@ async def _ptg2_manifest_location_provider_matches(
     if not npi_address_table:
         return None
     using_unified_address_table = _is_unified_address_table(npi_address_table)
+    address_zip5_sql = _ptg2_address_zip5_sql("addr", unified=using_unified_address_table)
 
     filters = ["addr.npi IS NOT NULL"]
     configured_limit = _ptg2_manifest_location_match_limit()
@@ -4094,9 +4102,9 @@ async def _ptg2_manifest_location_provider_matches(
         if using_unified_address_table:
             geo_filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
     if zip_value and geo_filters:
-        filters.append(f"(left(coalesce(addr.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_filters)}))")
+        filters.append(f"({address_zip5_sql} = :zip5 OR ({' AND '.join(geo_filters)}))")
     elif zip_value:
-        filters.append("left(coalesce(addr.postal_code, ''), 5) = :zip5")
+        filters.append(f"{address_zip5_sql} = :zip5")
     elif geo_filters:
         filters.extend(geo_filters)
     if provider_npi is not None:
@@ -4369,7 +4377,7 @@ async def _ptg2_manifest_location_provider_matches(
     if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
         distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
         if zip_value:
-            same_zip_sql = "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5"
+            same_zip_sql = f"{address_zip5_sql} = :zip5"
             location_select_sql = (
                 f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {distance_sql} END AS distance_miles, "
                 f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "

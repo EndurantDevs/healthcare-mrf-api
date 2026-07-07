@@ -844,6 +844,17 @@ def test_rust_publish_skips_optional_provider_geo_index_when_postgis_is_missing(
     assert any("geo_gist_idx" in statement for statement in status_calls)
 
 
+def test_rust_publish_provider_group_location_table_flag(monkeypatch):
+    monkeypatch.delenv(ptg_rust_publish.PTG2_PROVIDER_GROUP_LOCATION_TABLE_ENV, raising=False)
+    assert ptg_rust_publish._provider_group_location_enabled() is True
+
+    monkeypatch.setenv(ptg_rust_publish.PTG2_PROVIDER_GROUP_LOCATION_TABLE_ENV, "false")
+    assert ptg_rust_publish._provider_group_location_enabled() is False
+
+    monkeypatch.setenv(ptg_rust_publish.PTG2_PROVIDER_GROUP_LOCATION_TABLE_ENV, "true")
+    assert ptg_rust_publish._provider_group_location_enabled() is True
+
+
 def test_manifest_provider_group_location_indexes_default_to_lean_profile(monkeypatch):
     status_calls = []
 

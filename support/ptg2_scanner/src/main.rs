@@ -1487,7 +1487,7 @@ fn emit_configured_manifest_sidecars<W: Write>(
     }
     if let Some(path) = paths.manifest_price_forward_sidecar.as_deref() {
         if let Some((entry_count, _member_count)) =
-            collector.write_spooled_standard_sidecar("price_forward", path, false)?
+            collector.write_spooled_standard_sidecar("price_forward", path, true)?
         {
             emit_manifest_sidecar_path(
                 writer,
@@ -1501,7 +1501,7 @@ fn emit_configured_manifest_sidecars<W: Write>(
                 "manifest_price_forward_sidecar_file",
                 path,
                 &collector.price_forward_entries()?,
-                false,
+                true,
             )?;
         }
     }

@@ -33,6 +33,7 @@ from process.ptg_parts.snapshot_tables import (
 logger = logging.getLogger(__name__)
 _MAX_PARTIAL_ZIP_TAXONOMY_INDEX_CODES = 12
 PTG2_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV = "HLTHPRT_PTG2_PROVIDER_GROUP_LOCATION_INDEX_PROFILE"
+PTG2_PROVIDER_GROUP_LOCATION_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE"
 _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL = "full"
 _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN = "lean"
 
@@ -72,6 +73,13 @@ def _provider_group_location_index_profile() -> str:
         _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN,
     )
     return _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN
+
+
+def _provider_group_location_enabled() -> bool:
+    raw_value = os.getenv(PTG2_PROVIDER_GROUP_LOCATION_TABLE_ENV)
+    if raw_value is None:
+        return True
+    return str(raw_value).strip().lower() not in {"0", "false", "no", "off"}
 
 
 async def _create_optional_provider_geo_index(
@@ -322,7 +330,7 @@ async def _publish_rust_compact_snapshot_tables(
         index_seconds += await _index_snapshot_compact_tables(schema_name, table_names)
 
     provider_group_location_table = None
-    if table_names.get("provider_group_member"):
+    if table_names.get("provider_group_member") and _provider_group_location_enabled():
         provider_group_location_table = _ptg2_snapshot_table_name("provider_group_location", source_key, snapshot_id)
         await db.status(
             f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)};"
