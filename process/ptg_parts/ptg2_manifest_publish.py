@@ -532,6 +532,7 @@ async def _write_ptg2_manifest_serving_sidecars(
     artifacts: Mapping[str, Any] | None,
     source_key: str,
     snapshot_id: str,
+    expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     if not _ptg2_manifest_serving_sidecars_enabled():
         return {}
@@ -556,11 +557,13 @@ async def _write_ptg2_manifest_serving_sidecars(
         artifact_dir / "serving_by_code_v1.ptg2sbc",
         _iter_ptg2_serving_sidecar_rows(by_code_sql),
         name="serving_by_code",
+        expected_row_count=expected_row_count,
     )
     by_provider_set = await write_serving_by_provider_set_sidecar_async(
         artifact_dir / "serving_by_provider_set_v1.ptg2sbp",
         _iter_ptg2_serving_sidecar_rows(by_provider_set_sql),
         name="serving_by_provider_set",
+        expected_row_count=expected_row_count,
     )
     return {
         "serving_by_code": by_code,
@@ -1959,6 +1962,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         await db.status(
             f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_group_location_table)};"
         )
+    row_count = await _exact_table_rows(schema_name, serving_work_table)
     serving_sidecar_artifacts: dict[str, Any] = {}
     if lean_serving_manifest is not None:
         serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
@@ -1967,8 +1971,8 @@ async def _publish_ptg2_manifest_serving_snapshot(
             artifacts=artifacts,
             source_key=source_key,
             snapshot_id=snapshot_id,
+            expected_row_count=row_count,
         )
-    row_count = await _exact_table_rows(schema_name, serving_work_table)
     serving_table_retained = True
     if (
         lean_serving_manifest is not None

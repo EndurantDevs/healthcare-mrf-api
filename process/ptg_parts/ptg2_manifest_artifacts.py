@@ -296,6 +296,40 @@ def _serving_sidecar_path_entry(
     }
 
 
+def _existing_serving_sidecar_path_entry(
+    *,
+    name: str,
+    path: Path,
+    magic: bytes,
+    expected_format: str,
+    kind: str,
+    expected_row_count: int | None,
+) -> dict[str, Any] | None:
+    if expected_row_count is None or expected_row_count < 0:
+        return None
+    if not path.exists() or path.stat().st_size <= 12:
+        return None
+    try:
+        with path.open("rb") as fp:
+            with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as payload:
+                header, _header_end = _serving_sidecar_header(payload, magic, expected_format, None)
+    except (OSError, PTG2ManifestArtifactError, json.JSONDecodeError, struct.error, ValueError):
+        return None
+    try:
+        row_count = int(header.get("row_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    if row_count != int(expected_row_count):
+        return None
+    return _serving_sidecar_path_entry(
+        name=name,
+        path=path,
+        kind=kind,
+        record_format=expected_format,
+        metadata=header,
+    )
+
+
 def _serving_sidecar_header(
     payload: bytes | bytearray | memoryview | mmap.mmap,
     magic: bytes,
@@ -332,6 +366,7 @@ def write_serving_by_code_sidecar(
     rows: Iterable[Iterable[Any]],
     *,
     name: str = "serving_by_code",
+    expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     """Write compact serving rows grouped by code key.
 
@@ -341,6 +376,16 @@ def write_serving_by_code_sidecar(
 
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_serving_sidecar_path_entry(
+        name=name,
+        path=sidecar_path,
+        magic=PTG2_SERVING_BY_CODE_MAGIC,
+        expected_format=PTG2_SERVING_BY_CODE_FORMAT,
+        kind=PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if existing is not None:
+        return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
     price_set_to_key: dict[bytes, int] = {}
@@ -423,6 +468,7 @@ def write_serving_by_provider_set_sidecar(
     rows: Iterable[Iterable[Any]],
     *,
     name: str = "serving_by_provider_set",
+    expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     """Write compact serving rows grouped by provider-set key.
 
@@ -432,6 +478,16 @@ def write_serving_by_provider_set_sidecar(
 
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_serving_sidecar_path_entry(
+        name=name,
+        path=sidecar_path,
+        magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+        expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        kind=PTG2_SERVING_BY_PROVIDER_SET_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if existing is not None:
+        return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
     price_set_to_key: dict[bytes, int] = {}
@@ -552,9 +608,20 @@ async def write_serving_by_code_sidecar_async(
     rows: AsyncIterable[Iterable[Any]],
     *,
     name: str = "serving_by_code",
+    expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_serving_sidecar_path_entry(
+        name=name,
+        path=sidecar_path,
+        magic=PTG2_SERVING_BY_CODE_MAGIC,
+        expected_format=PTG2_SERVING_BY_CODE_FORMAT,
+        kind=PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if existing is not None:
+        return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
     price_set_to_key: dict[bytes, int] = {}
@@ -637,9 +704,20 @@ async def write_serving_by_provider_set_sidecar_async(
     rows: AsyncIterable[Iterable[Any]],
     *,
     name: str = "serving_by_provider_set",
+    expected_row_count: int | None = None,
 ) -> dict[str, Any]:
     sidecar_path = Path(path)
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _existing_serving_sidecar_path_entry(
+        name=name,
+        path=sidecar_path,
+        magic=PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
+        expected_format=PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
+        kind=PTG2_SERVING_BY_PROVIDER_SET_ARTIFACT_KIND,
+        expected_row_count=expected_row_count,
+    )
+    if existing is not None:
+        return existing
     body_path = sidecar_path.with_name(f"{sidecar_path.name}.body.tmp")
     tmp_path = sidecar_path.with_name(f"{sidecar_path.name}.tmp")
     price_set_to_key: dict[bytes, int] = {}

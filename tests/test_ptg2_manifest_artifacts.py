@@ -102,6 +102,47 @@ def test_serving_by_code_sidecar_lookup_filters_provider_sets(tmp_path):
     assert [(row.provider_set_key, row.price_set_global_id_128) for row in filtered] == [(3, PRICE_B)]
 
 
+def test_serving_by_code_sidecar_reuses_existing_matching_row_count(tmp_path):
+    sidecar = tmp_path / "serving_by_code.ptg2sbc"
+    original = write_serving_by_code_sidecar(
+        sidecar,
+        [
+            (7, 1, 10, PRICE_A),
+            (7, 3, 11, PRICE_B),
+        ],
+    )
+
+    def rows():
+        raise AssertionError("matching sidecar should be reused without consuming rows")
+        yield ()
+
+    reused = write_serving_by_code_sidecar(sidecar, rows(), expected_row_count=2)
+
+    assert reused["sha256"] == original["sha256"]
+    assert reused["byte_count"] == original["byte_count"]
+    assert reused["row_count"] == 2
+
+
+def test_serving_by_code_sidecar_regenerates_existing_mismatched_row_count(tmp_path):
+    sidecar = tmp_path / "serving_by_code.ptg2sbc"
+    original = write_serving_by_code_sidecar(
+        sidecar,
+        [
+            (7, 1, 10, PRICE_A),
+            (7, 3, 11, PRICE_B),
+        ],
+    )
+
+    regenerated = write_serving_by_code_sidecar(
+        sidecar,
+        [(8, 1, 12, PRICE_C)],
+        expected_row_count=1,
+    )
+
+    assert regenerated["row_count"] == 1
+    assert regenerated["sha256"] != original["sha256"]
+
+
 def test_serving_by_provider_set_sidecar_groups_repeated_code_vectors(tmp_path):
     sidecar = tmp_path / "serving_by_provider_set.ptg2sbp"
     metadata = write_serving_by_provider_set_sidecar(
@@ -130,6 +171,27 @@ def test_serving_by_provider_set_sidecar_groups_repeated_code_vectors(tmp_path):
         ((7, 8), ((10, PRICE_A),)),
         ((9,), ((11, PRICE_B),)),
     ]
+
+
+def test_serving_by_provider_set_sidecar_reuses_existing_matching_row_count(tmp_path):
+    sidecar = tmp_path / "serving_by_provider_set.ptg2sbp"
+    original = write_serving_by_provider_set_sidecar(
+        sidecar,
+        [
+            (2, 7, 10, PRICE_A),
+            (2, 8, 10, PRICE_A),
+        ],
+    )
+
+    def rows():
+        raise AssertionError("matching sidecar should be reused without consuming rows")
+        yield ()
+
+    reused = write_serving_by_provider_set_sidecar(sidecar, rows(), expected_row_count=2)
+
+    assert reused["sha256"] == original["sha256"]
+    assert reused["byte_count"] == original["byte_count"]
+    assert reused["row_count"] == 2
 
 
 def test_manifest_artifact_marks_explicit_payer_location_as_payer_confirmed():
