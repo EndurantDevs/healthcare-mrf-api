@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from typing import Any
 
 from sqlalchemy import text
+
+from process.ptg_parts.ptg2_artifact_blobs import hydrate_ptg2_artifact_entry_from_db
 
 from api.ptg2_types import PTG2ServingTables
 
@@ -18,6 +21,7 @@ PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 _PTG2_TABLE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_TABLE_CACHE_TTL_SECONDS", "300")), 0.0)
 _PTG2_TABLE_AVAILABLE_CACHE: dict[str, tuple[float, bool]] = {}
 _PTG2_SNAPSHOT_TABLES_CACHE: dict[str, tuple[float, PTG2ServingTables]] = {}
+logger = logging.getLogger(__name__)
 
 
 def _metadata_cache_enabled(session: Any) -> bool:
@@ -130,6 +134,28 @@ def _is_compact_serving_table(table_name: str | None) -> bool:
     return "compact" in str(table_name or "").lower()
 
 
+async def _hydrate_snapshot_artifacts(session, artifacts: Any) -> dict[str, Any] | None:
+    if not isinstance(artifacts, dict):
+        return None
+
+    async def hydrate_entry(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        try:
+            return await hydrate_ptg2_artifact_entry_from_db(session, value, schema_name=PTG2_SCHEMA)
+        except Exception as exc:
+            logger.warning("Failed to hydrate PTG2 artifact %s from PostgreSQL: %s", value.get("name"), exc)
+            return value
+
+    hydrated: dict[str, Any] = {}
+    for key, value in artifacts.items():
+        if key == "sidecars" and isinstance(value, list):
+            hydrated[key] = [await hydrate_entry(item) for item in value]
+        else:
+            hydrated[key] = await hydrate_entry(value)
+    return hydrated
+
+
 async def snapshot_serving_table(session, snapshot_id: str) -> str | None:
     tables = await snapshot_serving_tables(session, snapshot_id)
     if tables.serving_table:
@@ -191,13 +217,14 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         or manifest.get("storage_uri")
     )
     network_names = serving_index.get("network_names")
+    artifacts = await _hydrate_snapshot_artifacts(session, serving_index.get("artifacts"))
     return _cache(PTG2ServingTables(
         storage=str(serving_index.get("storage") or "").strip() or None,
         type=str(serving_index.get("type") or "").strip() or None,
         snapshot_scoped=bool(serving_index.get("snapshot_scoped")),
         source_key=str(serving_index.get("source_key") or "").strip() or None,
         artifact_uri=str(artifact_uri or "").strip() or None,
-        artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
+        artifacts=artifacts,
         arch_version=str(serving_index.get("arch_version") or "").strip() or None,
         provider_scope_strategy=str(serving_index.get("provider_scope_strategy") or "").strip() or None,
         materialized_tables=(

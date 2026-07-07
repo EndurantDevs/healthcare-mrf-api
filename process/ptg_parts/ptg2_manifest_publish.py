@@ -23,6 +23,10 @@ from process.ptg_parts.config import (
     PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
     PTG2_UNLOGGED_STAGE_ENV, _env_bool, _ptg2_snapshot_arch_from_env)
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
+from process.ptg_parts.ptg2_artifact_blobs import (
+    ptg2_artifact_db_store_enabled,
+    store_ptg2_artifact_file_in_db,
+)
 from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -569,6 +573,61 @@ async def _write_ptg2_manifest_serving_sidecars(
         "serving_by_code": by_code,
         "serving_by_provider_set": by_provider_set,
     }
+
+
+async def _store_ptg2_manifest_sidecar_artifacts_in_db(
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    sidecar_artifacts: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not sidecar_artifacts or not ptg2_artifact_db_store_enabled():
+        return dict(sidecar_artifacts or {})
+
+    uploaded_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    async def upload_entry(default_name: str, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        entry = dict(value)
+        storage_uri = str(entry.get("storage_uri") or "").strip()
+        if storage_uri.startswith("db://ptg2_artifact/"):
+            return entry
+        raw_path = str(entry.get("path") or "").strip()
+        if not raw_path:
+            return entry
+        path = Path(raw_path)
+        artifact_name = str(entry.get("name") or default_name).strip() or default_name
+        cache_key = (str(path), str(entry.get("sha256") or ""), artifact_name)
+        cached = uploaded_by_key.get(cache_key)
+        if cached is not None:
+            merged = dict(cached)
+            merged["name"] = artifact_name
+            return merged
+        if not path.exists() or path.stat().st_size <= 0:
+            return entry
+        uploaded = await store_ptg2_artifact_file_in_db(
+            path,
+            snapshot_id=snapshot_id,
+            artifact_kind=str(entry.get("kind") or artifact_name),
+            name=artifact_name,
+            schema_name=schema_name,
+            metadata=entry,
+        )
+        uploaded_by_key[cache_key] = uploaded
+        return dict(uploaded)
+
+    stored: dict[str, Any] = {}
+    for name, value in sidecar_artifacts.items():
+        if name == "sidecars" and isinstance(value, list):
+            sidecars: list[Any] = []
+            for index, sidecar in enumerate(value):
+                sidecars.append(await upload_entry(f"sidecar_{index}", sidecar) or sidecar)
+            stored[name] = sidecars
+            continue
+        stored_entry = await upload_entry(str(name), value)
+        stored[name] = stored_entry if stored_entry is not None else value
+    return stored
 
 
 def _manifest_sql_id(value: bytes) -> str:
@@ -1984,6 +2043,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
     elapsed_seconds = time.monotonic() - started_at
     combined_sidecar_artifacts = dict(sidecar_artifacts or {})
     combined_sidecar_artifacts.update(serving_sidecar_artifacts)
+    combined_sidecar_artifacts = await _store_ptg2_manifest_sidecar_artifacts_in_db(
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        sidecar_artifacts=combined_sidecar_artifacts,
+    )
     artifact_manifest = _ptg2_manifest_artifacts_manifest(
         artifacts=artifacts,
         sidecar_artifacts=combined_sidecar_artifacts,

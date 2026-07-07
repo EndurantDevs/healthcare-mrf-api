@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import zlib
 from pathlib import Path
 from uuid import UUID
 
@@ -9,6 +10,10 @@ import pytest
 
 from api import ptg2_serving
 from api.ptg2_manifest_artifacts import PTG2ManifestArtifactError, load_ptg2_manifest_snapshot
+from process.ptg_parts.ptg2_artifact_blobs import (
+    hydrate_ptg2_artifact_entry_from_db,
+    ptg2_db_artifact_uri,
+)
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 
 
@@ -42,6 +47,29 @@ class FakePagination:
     offset = 0
 
 
+class FakeAsyncRows:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._rows:
+            raise StopAsyncIteration
+        return self._rows.pop(0)
+
+
+class FakeBlobSession:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.calls = []
+
+    async def stream(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return FakeAsyncRows(self.rows)
+
+
 def _write_sidecar(path, payload, *, jsonl=False):
     if jsonl:
         encoded = "".join(json.dumps(row, sort_keys=True) + "\n" for row in payload).encode("utf-8")
@@ -53,6 +81,39 @@ def _write_sidecar(path, payload, *, jsonl=False):
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "byte_count": len(encoded),
     }
+
+
+@pytest.mark.asyncio
+async def test_ptg2_db_artifact_entry_hydrates_verified_cache(tmp_path, monkeypatch):
+    raw = b"ptg2-sidecar-payload" * 17
+    artifact_id = "artifact1234567890abcdef"
+    entry = {
+        "name": "provider_forward",
+        "path": "/work/ptg2-artifacts/serving/old/provider_forward.ptg2sc",
+        "storage_uri": ptg2_db_artifact_uri(artifact_id),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "byte_count": len(raw),
+    }
+    session = FakeBlobSession(
+        [
+            {
+                "chunk_no": 0,
+                "compression": "zlib",
+                "payload": zlib.compress(raw),
+                "raw_byte_count": len(raw),
+            }
+        ]
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR", str(tmp_path / "cache"))
+
+    hydrated = await hydrate_ptg2_artifact_entry_from_db(session, entry, schema_name="mrf")
+
+    hydrated_path = Path(hydrated["path"])
+    assert hydrated_path.exists()
+    assert hydrated_path.read_bytes() == raw
+    assert hydrated["cache_path"] == str(hydrated_path)
+    assert hydrated["storage_uri"] == entry["storage_uri"]
+    assert session.calls
 
 
 def _write_membership_sidecar(tmp_path, name, kind, mapping):

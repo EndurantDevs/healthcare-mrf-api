@@ -4920,6 +4920,44 @@ def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
     assert sidecar_map["provider_forward"]["path"] == str(provider_forward)
 
 
+@pytest.mark.asyncio
+async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_path):
+    sidecar_path = tmp_path / "provider_forward.ptg2sc"
+    sidecar_path.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+    calls = []
+
+    async def fake_store(path, **kwargs):
+        calls.append((Path(path), kwargs))
+        metadata = dict(kwargs["metadata"])
+        metadata.update({"storage_uri": "db://ptg2_artifact/artifact-1", "artifact_id": "artifact-1"})
+        return metadata
+
+    monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
+
+    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+        schema_name="mrf",
+        snapshot_id="ptg2:test",
+        sidecar_artifacts={
+            "sidecars": [
+                {
+                    "name": "provider_forward",
+                    "path": str(sidecar_path),
+                    "sha256": "sha",
+                    "byte_count": sidecar_path.stat().st_size,
+                }
+            ],
+            "source_trace_set_hash": "trace-set",
+        },
+    )
+
+    assert artifacts["source_trace_set_hash"] == "trace-set"
+    assert artifacts["sidecars"][0]["storage_uri"] == "db://ptg2_artifact/artifact-1"
+    assert calls[0][0] == sidecar_path
+    assert calls[0][1]["snapshot_id"] == "ptg2:test"
+    assert calls[0][1]["artifact_kind"] == "provider_forward"
+
+
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
     status_calls = []
     scalar_values = iter([3, 1, 2])

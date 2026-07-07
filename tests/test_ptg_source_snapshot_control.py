@@ -259,10 +259,12 @@ def test_remove_ptg2_source_snapshot_delegates_table_drop_and_metadata_delete(mo
     assert dropped_tables == [["ptg2_rates_old", "ptg2_providers_old"]]
     assert cleanup_summary["executed"] is True
     assert cleanup_summary["deleted_tables"] == 2
+    assert cleanup_summary["deleted_artifact_chunks"] == 1
     assert cleanup_summary["deleted_artifact_manifests"] == 1
     assert cleanup_summary["deleted_snapshots"] == 1
-    assert len(status_calls) == 2
-    assert all(call[1]["snapshot_id"] == "snap_old" for call in status_calls)
+    assert any("ptg2_artifact_blob_chunk" in call[0] for call in status_calls)
+    assert any("ptg2_artifact_manifest" in call[0] and call[1]["snapshot_id"] == "snap_old" for call in status_calls)
+    assert any("ptg2_snapshot" in call[0] and call[1]["snapshot_id"] == "snap_old" for call in status_calls)
 
 
 def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(monkeypatch):

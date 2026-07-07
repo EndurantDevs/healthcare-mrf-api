@@ -4,7 +4,8 @@ import os
 
 from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
                         BigInteger, Boolean, Column, DateTime, Enum, Float,
-                        Integer, Numeric, PrimaryKeyConstraint, String, text)
+                        Integer, LargeBinary, Numeric, PrimaryKeyConstraint,
+                        String, text)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declared_attr
 
@@ -1993,6 +1994,27 @@ class PTG2ArtifactManifest(Base, JSONOutputMixin):
     sha256 = Column(String(64))
     byte_count = Column(BigInteger)
     payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ArtifactBlobChunk(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_artifact_blob_chunk"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("artifact_id", "chunk_no"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["artifact_id", "chunk_no"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("artifact_id",), "name": "ptg2_artifact_blob_artifact_idx"},
+    ]
+
+    artifact_id = Column(String(96))
+    chunk_no = Column(Integer)
+    compression = Column(String(32))
+    payload = Column(LargeBinary)
+    raw_byte_count = Column(Integer)
+    byte_count = Column(Integer)
     created_at = Column(DateTime)
 
 

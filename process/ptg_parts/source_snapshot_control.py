@@ -10,6 +10,7 @@ from typing import Any
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names, _snapshot_manifest_table_names
 from process.ptg_parts.source_pointers import _source_plan_rows
 
@@ -206,6 +207,14 @@ async def remove_ptg2_source_snapshot(
     schema = _schema_name()
     tables = [str(value) for value in plan.get("tables") or []]
     await _drop_ptg2_snapshot_table_names(tables)
+    artifact_ids = [str(value) for value in plan.get("artifact_manifest_ids") or []]
+    deleted_artifact_chunks = 0
+    if artifact_ids:
+        await ensure_ptg2_artifact_blob_table(schema)
+        deleted_artifact_chunks = await db.status(
+            f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk WHERE artifact_id = ANY(:artifact_ids)",
+            artifact_ids=artifact_ids,
+        )
     deleted_artifacts = await db.status(
         f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_manifest WHERE snapshot_id = :snapshot_id",
         snapshot_id=snapshot_id,
@@ -218,6 +227,7 @@ async def remove_ptg2_source_snapshot(
         **plan,
         "executed": True,
         "deleted_tables": len(tables),
+        "deleted_artifact_chunks": int(deleted_artifact_chunks or 0),
         "deleted_artifact_manifests": int(deleted_artifacts or 0),
         "deleted_snapshots": int(deleted_snapshots or 0),
     }

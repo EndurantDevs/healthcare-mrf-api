@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.snapshot_cleanup import _snapshot_manifest_table_names
 
 
@@ -197,6 +198,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
     """Recompute and execute a bounded cleanup plan in one transaction."""
 
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    await ensure_ptg2_artifact_blob_table(schema_name)
     async with db.acquire() as connection:
         await connection.status("SELECT set_config('lock_timeout', :lock_timeout, true)", lock_timeout=lock_timeout)
         plan = await build_ptg2_source_snapshot_gc_plan(schema_name=schema_name, executor=connection)
@@ -211,6 +213,17 @@ async def execute_ptg2_source_snapshot_gc_plan(
                 f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
             )
         if plan.candidate_snapshot_ids:
+            await connection.status(
+                f"""
+                DELETE FROM {_quote_ident(schema_name)}.ptg2_artifact_blob_chunk
+                 WHERE artifact_id IN (
+                    SELECT artifact_id
+                      FROM {_quote_ident(schema_name)}.ptg2_artifact_manifest
+                     WHERE snapshot_id = ANY(:snapshot_ids)
+                 )
+                """,
+                snapshot_ids=list(plan.candidate_snapshot_ids),
+            )
             await connection.status(
                 f"""
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_artifact_manifest

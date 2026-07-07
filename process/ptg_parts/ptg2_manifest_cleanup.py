@@ -17,6 +17,7 @@ from typing import Any
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 
 PTG2_MANIFEST_STORAGE = "manifest_snapshot"
 PTG2_LEGACY_SNAPSHOT_TABLE_RE = re.compile(
@@ -196,6 +197,11 @@ async def execute_ptg2_manifest_cleanup_plan(plan: PTG2ManifestCleanupPlan, *, s
             keys=list(plan.current_source_rows),
         )
     if plan.artifact_manifest_ids:
+        await ensure_ptg2_artifact_blob_table(schema_name)
+        await db.status(
+            f"DELETE FROM {_quote_ident(schema_name)}.ptg2_artifact_blob_chunk WHERE artifact_id = ANY(:ids)",
+            ids=list(plan.artifact_manifest_ids),
+        )
         await db.status(
             f"DELETE FROM {_quote_ident(schema_name)}.ptg2_artifact_manifest WHERE artifact_id = ANY(:ids)",
             ids=list(plan.artifact_manifest_ids),
