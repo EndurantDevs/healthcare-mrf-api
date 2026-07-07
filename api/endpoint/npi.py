@@ -5331,11 +5331,17 @@ async def get_npi(request, npi):
         include_sources = True
         include_evidence = True
     include_extra_info = _parse_bool_arg(request.args.get("extra_info"), default=False)
-    sync_geocode = _env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True)
-    lookup_stored_geocode = _env_flag(
-        "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
-        "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
-        default=True,
+    sync_geocode = _parse_bool_arg(
+        request.args.get("sync_geocode"),
+        default=_env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True),
+    )
+    lookup_stored_geocode = _parse_bool_arg(
+        request.args.get("lookup_stored_geocode"),
+        default=_env_flag(
+            "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
+            "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
+            default=True,
+        ),
     )
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))

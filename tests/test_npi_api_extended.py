@@ -1240,6 +1240,58 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
 
 
 @pytest.mark.asyncio
+async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
+    async def fake_build(_npi, **_kwargs):
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [
+                {
+                    "checksum": 4,
+                    "first_line": "10 Main",
+                    "second_line": "",
+                    "city_name": "Chicago",
+                    "state_name": "IL",
+                    "postal_code": "60601",
+                    "lat": None,
+                    "long": None,
+                }
+            ],
+        }
+
+    class FakeDB:
+        async def scalar(self, *_args, **_kwargs):
+            raise AssertionError("stored geocode lookup should not execute")
+
+    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "true")
+    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "true")
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_detail",
+        AsyncMock(return_value={"summary": None, "ffs_visibility": {}}),
+    )
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=AssertionError("unexpected geocode call")))
+
+    request = types.SimpleNamespace(
+        args={
+            "view": "summary",
+            "sync_geocode": "0",
+            "lookup_stored_geocode": "0",
+        },
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": True}),
+    )
+    response = await npi_module.get_npi(request, "1518379601")
+    payload = json.loads(response.body)
+
+    assert payload["address_list"][0]["lat"] is None
+
+
+@pytest.mark.asyncio
 async def test_get_npi_uses_response_cache(monkeypatch):
     calls = 0
 
