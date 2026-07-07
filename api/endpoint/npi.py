@@ -94,6 +94,24 @@ PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
     "freshness_score",
     "address_sources",
 }
+MATCH_CANDIDATE_QUERY_PARAMS = {
+    "address_site_key",
+    "address_key",
+    "lat",
+    "long",
+    "radius_miles",
+    "phone",
+    "entity_type_code",
+    "entity_kind",
+    "taxonomy_scope",
+    "provider_type",
+    "specialty",
+    "include_subspecialties",
+    "limit",
+    "include_sources",
+    "include_evidence",
+    "debug",
+}
 PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS = {
     "source_record_ids",
     "base_address_version",
@@ -2624,6 +2642,11 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
 
 async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     args = request.args
+    unknown_params = sorted(set(args.keys()) - MATCH_CANDIDATE_QUERY_PARAMS)
+    if unknown_params:
+        joined = ", ".join(unknown_params)
+        raise sanic.exceptions.InvalidUsage(f"unknown query parameter(s): {joined}")
+
     args.get("address_site_key")
     args.get("address_key")
     args.get("lat")

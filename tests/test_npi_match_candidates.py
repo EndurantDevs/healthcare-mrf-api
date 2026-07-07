@@ -21,6 +21,24 @@ async def test_match_candidate_params_require_locator():
 
 
 @pytest.mark.asyncio
+async def test_match_candidate_params_reject_removed_raw_address_locators():
+    with pytest.raises(sanic.exceptions.InvalidUsage) as excinfo:
+        await npi_module._normalize_match_candidate_params(
+            _request(
+                {
+                    "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
+                    "first_line": "326 Nichols Rd",
+                    "zip_code": "01420",
+                }
+            )
+        )
+
+    message = str(excinfo.value)
+    assert "first_line" in message
+    assert "zip_code" in message
+
+
+@pytest.mark.asyncio
 async def test_match_candidate_params_reject_entity_conflict():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         await npi_module._normalize_match_candidate_params(
