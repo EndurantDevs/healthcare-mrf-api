@@ -2704,6 +2704,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
     )
     session = FakeSession(
         [
+            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
             FakeResult(
                 rows=[
                     {
@@ -2715,7 +2716,6 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
                     }
                 ]
             ),
-            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -2792,6 +2792,12 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
         [
             FakeResult(
                 rows=[
+                    {"provider_set_key": 3, "provider_set_global_id_128": provider_set_a},
+                    {"provider_set_key": 4, "provider_set_global_id_128": provider_set_b},
+                ]
+            ),
+            FakeResult(
+                rows=[
                     {
                         "code_key": 7,
                         "plan_id": "010854205",
@@ -2806,12 +2812,6 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
                         "reported_code": "70552",
                         "rate_count": 1,
                     },
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {"provider_set_key": 3, "provider_set_global_id_128": provider_set_a},
-                    {"provider_set_key": 4, "provider_set_global_id_128": provider_set_b},
                 ]
             ),
         ]
