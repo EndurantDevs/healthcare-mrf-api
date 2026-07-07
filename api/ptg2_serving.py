@@ -7406,7 +7406,7 @@ async def _search_one_ptg2_snapshot(
     if db_payload is not None:
         db_payload = await _enrich_ptg2_code_details(session, db_payload, args)
         return _ptg2_response_cache_set(cache_key, _shape_ptg2_response(db_payload, args))
-    return None
+    return _ptg2_response_cache_set(cache_key, None)
 
 
 async def _search_multi_ptg2_snapshots(

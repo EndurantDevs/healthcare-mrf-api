@@ -10,7 +10,9 @@ import math
 import os
 import re
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import Any, Mapping
 
 import orjson
@@ -277,6 +279,18 @@ ENABLE_PRICING_SCHEMA_CACHE = _env_flag(
 _PRICING_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _PRICING_TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _PRICING_TABLE_COLUMNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS = max(
+    float(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS", "300")),
+    0.0,
+)
+_PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS = max(
+    int(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS", "512")),
+    0,
+)
+_PROCEDURE_TAXONOMY_EVIDENCE_CACHE: OrderedDict[
+    tuple[int, tuple[int, ...], int],
+    tuple[float, list[dict[str, Any]]],
+] = OrderedDict()
 
 
 def _parse_pricing_default_year() -> int | None:
@@ -4037,6 +4051,63 @@ def _taxonomy_evidence_item(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _procedure_taxonomy_evidence_cache_key(
+    year: int,
+    internal_codes: list[int],
+    limit: int,
+) -> tuple[int, tuple[int, ...], int]:
+    return year, tuple(sorted(int(code) for code in internal_codes)), limit
+
+
+def _procedure_taxonomy_evidence_cache_get(
+    cache_key: tuple[int, tuple[int, ...], int],
+) -> list[dict[str, Any]] | None:
+    if (
+        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0
+        or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0
+    ):
+        return None
+    cache_entry = _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.get(cache_key)
+    if cache_entry is None:
+        return None
+    cached_at, evidence_items = cache_entry
+    if (time.monotonic() - cached_at) > _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS:
+        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.pop(cache_key, None)
+        return None
+    _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.move_to_end(cache_key)
+    return deepcopy(evidence_items)
+
+
+def _procedure_taxonomy_evidence_cache_set(
+    cache_key: tuple[int, tuple[int, ...], int],
+    evidence_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if (
+        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0
+        or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0
+    ):
+        return evidence_items
+    _PROCEDURE_TAXONOMY_EVIDENCE_CACHE[cache_key] = (time.monotonic(), deepcopy(evidence_items))
+    _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.move_to_end(cache_key)
+    while len(_PROCEDURE_TAXONOMY_EVIDENCE_CACHE) > _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS:
+        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.popitem(last=False)
+    return evidence_items
+
+
+def _has_representative_procedure_taxonomy_evidence(evidence_items: list[dict[str, Any]]) -> bool:
+    if not evidence_items:
+        return False
+    distinct_npis = sum(item.get("distinct_npis") or 0 for item in evidence_items)
+    total_beneficiaries = sum(
+        _as_float(item.get("total_beneficiaries")) or 0.0
+        for item in evidence_items
+    )
+    return (
+        distinct_npis >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
+        and total_beneficiaries >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
+    )
+
+
 def _classify_procedure_taxonomy_resolution(
     *,
     reported_code: str,
@@ -4166,6 +4237,60 @@ def _classify_procedure_taxonomy_resolution(
     }
 
 
+_QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL = f"""
+            WITH base AS (
+                SELECT
+                    pp.npi,
+                    pp.total_services,
+                    pp.total_beneficiaries,
+                    p.provider_type,
+                    CASE
+                        WHEN UPPER(NULLIF(BTRIM(COALESCE(qf.taxonomy_code, '')), '')) IN ('UNKNOWN', 'NA', 'N/A')
+                        THEN NULL
+                        ELSE UPPER(NULLIF(BTRIM(COALESCE(qf.taxonomy_code, '')), ''))
+                    END AS taxonomy_code,
+                    CASE
+                        WHEN UPPER(NULLIF(BTRIM(COALESCE(qf.taxonomy_classification, '')), '')) IN ('UNKNOWN', 'NA', 'N/A')
+                        THEN NULL
+                        ELSE NULLIF(BTRIM(COALESCE(qf.taxonomy_classification, '')), '')
+                    END AS quality_classification
+                FROM {PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__} pp
+                JOIN {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+                  ON p.npi = pp.npi
+                 AND p.year = pp.year
+                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} qf
+                  ON qf.npi = pp.npi
+                 AND qf.year = pp.year
+                WHERE pp.year = :year
+                  AND pp.procedure_code = ANY(:internal_codes)
+                  AND NULLIF(BTRIM(COALESCE(qf.taxonomy_code, '')), '') IS NOT NULL
+                  AND UPPER(NULLIF(BTRIM(COALESCE(qf.taxonomy_code, '')), '')) NOT IN ('UNKNOWN', 'NA', 'N/A')
+            )
+            SELECT
+                b.taxonomy_code,
+                COALESCE(b.quality_classification, nu.classification)::varchar AS classification,
+                nu.specialization::varchar AS specialization,
+                nu.display_name::varchar AS display_name,
+                COUNT(DISTINCT b.npi)::int AS distinct_npis,
+                COALESCE(SUM(b.total_services), 0)::float AS total_services,
+                COALESCE(SUM(b.total_beneficiaries), 0)::float AS total_beneficiaries,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(BTRIM(COALESCE(b.provider_type, '')), '')), NULL)::varchar[] AS provider_types
+            FROM base b
+            LEFT JOIN {PRICING_SCHEMA}.{NUCCTaxonomy.__tablename__} nu
+              ON UPPER(BTRIM(COALESCE(nu.code, ''))) = b.taxonomy_code
+            GROUP BY
+                b.taxonomy_code,
+                COALESCE(b.quality_classification, nu.classification),
+                nu.specialization,
+                nu.display_name
+            ORDER BY
+                COUNT(DISTINCT b.npi) DESC,
+                COALESCE(SUM(b.total_services), 0) DESC,
+                b.taxonomy_code ASC
+            LIMIT :limit
+            """
+
+
 async def _load_procedure_taxonomy_evidence(
     session,
     *,
@@ -4176,7 +4301,22 @@ async def _load_procedure_taxonomy_evidence(
     if not internal_codes:
         return []
 
+    cache_key = _procedure_taxonomy_evidence_cache_key(year, internal_codes, limit)
+    cached_evidence_items = _procedure_taxonomy_evidence_cache_get(cache_key)
+    if cached_evidence_items is not None:
+        return cached_evidence_items
+
     quality_feature_exists = await _table_exists(session, QUALITY_FEATURE_TABLE_NAME)
+    if quality_feature_exists:
+        quality_evidence_items = await _load_quality_procedure_taxonomy_evidence(
+            session,
+            year=year,
+            internal_codes=internal_codes,
+            limit=limit,
+        )
+        if _has_representative_procedure_taxonomy_evidence(quality_evidence_items):
+            return _procedure_taxonomy_evidence_cache_set(cache_key, quality_evidence_items)
+
     quality_join_sql = (
         f"""
         LEFT JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} qf
@@ -4197,12 +4337,12 @@ async def _load_procedure_taxonomy_evidence(
             NULL::varchar AS quality_classification,
         """
     )
-    params = {
+    query_params_by_name = {
         "year": year,
         "internal_codes": list(internal_codes),
         "limit": limit,
     }
-    result = await session.execute(
+    query_result = await session.execute(
         text(
             f"""
             WITH base AS (
@@ -4283,9 +4423,30 @@ async def _load_procedure_taxonomy_evidence(
             LIMIT :limit
             """
         ),
-        params,
+        query_params_by_name,
     )
-    return [_taxonomy_evidence_item(_row_to_dict(row)) for row in result]
+    evidence_items = [_taxonomy_evidence_item(_row_to_dict(row)) for row in query_result]
+    return _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
+
+
+async def _load_quality_procedure_taxonomy_evidence(
+    session,
+    *,
+    year: int,
+    internal_codes: list[int],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Load procedure taxonomy evidence from precomputed provider quality features."""
+    query_params_by_name = {
+        "year": year,
+        "internal_codes": list(internal_codes),
+        "limit": limit,
+    }
+    query_result = await session.execute(
+        text(_QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL),
+        query_params_by_name,
+    )
+    return [_taxonomy_evidence_item(_row_to_dict(query_row)) for query_row in query_result]
 
 
 async def _resolve_internal_rx_codes_for_request(

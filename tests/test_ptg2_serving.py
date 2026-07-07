@@ -2019,19 +2019,19 @@ async def test_search_current_ptg2_index_ignores_non_manifest_serving_storage(mo
 
 
 @pytest.mark.asyncio
-async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload(monkeypatch):
-    calls = {"snapshot": 0, "search": 0}
+async def test_search_current_ptg2_index_caches_missing_payload(monkeypatch):
+    calls_by_name = {"snapshot": 0, "search": 0}
 
     async def fake_resolve(_session, _args):
         return "snap-cache-miss"
 
     async def fake_snapshot(_session, _snapshot_id):
-        calls["snapshot"] += 1
+        calls_by_name["snapshot"] += 1
         return ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_rate")
 
     async def fake_search(_session, _snapshot_id, _args, _pagination, *, serving_tables):
         del serving_tables
-        calls["search"] += 1
+        calls_by_name["search"] += 1
         return None
 
     ptg2_serving.clear_ptg2_index_cache()
@@ -2042,7 +2042,7 @@ async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload
 
     assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
     assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
-    assert calls == {"snapshot": 2, "search": 2}
+    assert calls_by_name == {"snapshot": 1, "search": 1}
 
 
 @pytest.mark.asyncio

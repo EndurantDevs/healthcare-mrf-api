@@ -2034,6 +2034,54 @@ async def test_resolve_procedure_taxonomy_requires_explicit_hard_filter_opt_in(m
 
 
 @pytest.mark.asyncio
+async def test_load_procedure_taxonomy_evidence_uses_cache(monkeypatch):
+    call_counts_by_name = {"quality": 0}
+    evidence_rows = [
+        {
+            "taxonomy_code": "207Q00000X",
+            "classification": "Family Medicine",
+            "specialization": None,
+            "display_name": "Family Medicine",
+            "distinct_npis": 80,
+            "total_services": 500.0,
+            "total_beneficiaries": 400.0,
+            "provider_types": ["Family Practice"],
+        }
+    ]
+
+    async def has_fake_table(_session, _table_name):
+        return True
+
+    async def fake_load_quality(_session, *, year, internal_codes, limit):
+        assert year == 2023
+        assert internal_codes == [1607056713]
+        assert limit == 10
+        call_counts_by_name["quality"] += 1
+        return [dict(evidence_rows[0])]
+
+    pricing_module._PROCEDURE_TAXONOMY_EVIDENCE_CACHE.clear()
+    monkeypatch.setattr(pricing_module, "_table_exists", has_fake_table)
+    monkeypatch.setattr(pricing_module, "_load_quality_procedure_taxonomy_evidence", fake_load_quality)
+
+    first_items = await pricing_module._load_procedure_taxonomy_evidence(
+        object(),
+        year=2023,
+        internal_codes=[1607056713],
+        limit=10,
+    )
+    first_items[0]["taxonomy_code"] = "MUTATED"
+    second_items = await pricing_module._load_procedure_taxonomy_evidence(
+        object(),
+        year=2023,
+        internal_codes=[1607056713],
+        limit=10,
+    )
+
+    assert call_counts_by_name == {"quality": 1}
+    assert second_items[0]["taxonomy_code"] == "207Q00000X"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatch):
     seen_args = {}
 
