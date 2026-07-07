@@ -192,6 +192,64 @@ class PTG2DbArtifactReader:
         _cache_set(key, raw_chunk)
         return raw_chunk
 
+    async def _read_artifact_chunks(self, chunk_numbers: Iterable[int]) -> dict[int, bytes]:
+        unique_chunk_numbers = tuple(dict.fromkeys(int(chunk_number) for chunk_number in chunk_numbers))
+        if not unique_chunk_numbers:
+            return {}
+        if len(unique_chunk_numbers) == 1:
+            chunk_number = unique_chunk_numbers[0]
+            return {chunk_number: await self._chunk(chunk_number)}
+
+        chunks_by_number: dict[int, bytes] = {}
+        missing_chunk_numbers: list[int] = []
+        for chunk_number in unique_chunk_numbers:
+            cache_lookup_key = _cache_key(self.artifact_id, self.entry, chunk_number)
+            cached_chunk = _cache_get(cache_lookup_key)
+            if cached_chunk is not None:
+                chunks_by_number[chunk_number] = cached_chunk
+            else:
+                missing_chunk_numbers.append(chunk_number)
+
+        if not missing_chunk_numbers:
+            return chunks_by_number
+
+        qualified_chunks = f"{_quote_ident(self.schema_name)}.ptg2_artifact_blob_chunk"
+        chunk_query_result = await self.session.execute(
+            text(
+                f"""
+                SELECT chunk_no, compression, payload, raw_byte_count
+                  FROM {qualified_chunks}
+                 WHERE artifact_id = :artifact_id
+                   AND chunk_no = ANY(CAST(:chunk_nos AS integer[]))
+                 ORDER BY chunk_no
+                """
+            ),
+            {"artifact_id": self.artifact_id, "chunk_nos": missing_chunk_numbers},
+        )
+        for chunk_query_row in chunk_query_result:
+            row_mapping = getattr(chunk_query_row, "_mapping", None)
+            chunk_fields = dict(row_mapping) if row_mapping is not None else dict(chunk_query_row)
+            chunk_number = int(chunk_fields.get("chunk_no"))
+            stored_payload = bytes(chunk_fields.get("payload") or b"")
+            compression = str(chunk_fields.get("compression") or "none")
+            raw_chunk = zlib.decompress(stored_payload) if compression == "zlib" else stored_payload
+            expected_raw = chunk_fields.get("raw_byte_count")
+            if expected_raw is not None and len(raw_chunk) != int(expected_raw):
+                raise PTG2ManifestArtifactError(
+                    f"artifact chunk raw byte_count mismatch for {self.artifact_id}:{chunk_number}"
+                )
+            chunks_by_number[chunk_number] = raw_chunk
+            _cache_set(_cache_key(self.artifact_id, self.entry, chunk_number), raw_chunk)
+
+        missing_chunk_numbers_after_fetch_list = [
+            chunk_number for chunk_number in missing_chunk_numbers if chunk_number not in chunks_by_number
+        ]
+        if missing_chunk_numbers_after_fetch_list:
+            raise FileNotFoundError(
+                f"PTG2 artifact chunk is missing: {self.artifact_id}:{missing_chunk_numbers_after_fetch_list[0]}"
+            )
+        return chunks_by_number
+
     async def read_at(self, offset: int, length: int) -> bytes:
         offset = int(offset)
         length = int(length)
@@ -206,11 +264,12 @@ class PTG2DbArtifactReader:
             )
         start_chunk = offset // self.chunk_bytes
         end_chunk = (offset + length - 1) // self.chunk_bytes
+        chunks = await self._read_artifact_chunks(range(start_chunk, end_chunk + 1))
         pieces: list[bytes] = []
         remaining = length
         cursor = offset
         for chunk_no in range(start_chunk, end_chunk + 1):
-            chunk = await self._chunk(chunk_no)
+            chunk = chunks[chunk_no]
             start = cursor % self.chunk_bytes
             take = min(remaining, len(chunk) - start)
             if take < 0:

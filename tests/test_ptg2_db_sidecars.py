@@ -8,6 +8,7 @@ import pytest
 
 import api.ptg2_db_sidecars as db_sidecars
 from api.ptg2_db_sidecars import (
+    PTG2DbArtifactReader,
     lookup_global_sidecar_members_many_from_db,
     lookup_serving_by_code_sidecar_from_db,
     lookup_serving_by_provider_set_patterns_from_db,
@@ -47,22 +48,38 @@ class FakeChunkSession:
         ]
         self.calls = []
 
-    async def execute(self, _statement, params=None):
-        params = dict(params or {})
-        self.calls.append(params)
-        if "chunk_no" not in params:
+    async def execute_chunk_query(self, _statement, params=None):
+        query_parameters_dict = dict(params or {})
+        self.calls.append(query_parameters_dict)
+        if "chunk_nos" in query_parameters_dict:
+            chunk_rows = []
+            for chunk_no in query_parameters_dict["chunk_nos"]:
+                chunk = self.chunks[int(chunk_no)]
+                stored_payload = zlib.compress(chunk) if self.compression == "zlib" else chunk
+                chunk_rows.append(
+                    {
+                        "chunk_no": int(chunk_no),
+                        "compression": self.compression,
+                        "payload": stored_payload,
+                        "raw_byte_count": len(chunk),
+                    }
+                )
+            return FakeResult(rows=chunk_rows)
+        if "chunk_no" not in query_parameters_dict:
             return FakeResult(scalar=sum(len(chunk) for chunk in self.chunks))
-        chunk = self.chunks[int(params["chunk_no"])]
-        payload = zlib.compress(chunk) if self.compression == "zlib" else chunk
+        chunk = self.chunks[int(query_parameters_dict["chunk_no"])]
+        stored_payload = zlib.compress(chunk) if self.compression == "zlib" else chunk
         return FakeResult(
             rows=[
                 {
                     "compression": self.compression,
-                    "payload": payload,
+                    "payload": stored_payload,
                     "raw_byte_count": len(chunk),
                 }
             ]
         )
+
+    execute = execute_chunk_query
 
 
 def _db_entry(sidecar: dict, raw_payload: bytes, *, artifact_id: str, chunk_bytes: int) -> dict:
@@ -77,6 +94,21 @@ def _db_entry(sidecar: dict, raw_payload: bytes, *, artifact_id: str, chunk_byte
         }
     )
     return entry
+
+
+@pytest.mark.asyncio
+async def test_db_artifact_reader_batches_multi_chunk_range_reads():
+    raw_payload = b"abcdefghijklmnopqrstuvwxyz"
+    entry = _db_entry({}, raw_payload, artifact_id="batched-artifact", chunk_bytes=5)
+    session = FakeChunkSession(raw_payload, chunk_bytes=5, compression="zlib")
+    reader = PTG2DbArtifactReader(session, entry, schema_name="mrf")
+
+    payload = await reader.read_at(3, 17)
+
+    assert payload == raw_payload[3:20]
+    batch_calls = [call for call in session.calls if call.get("chunk_nos")]
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["chunk_nos"] == [0, 1, 2, 3]
 
 
 @pytest.mark.asyncio
