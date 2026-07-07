@@ -650,13 +650,17 @@ def _npi_detail_cache_key(
     include_evidence: bool = False,
     address_limit: int | None = None,
     address_offset: int = 0,
+    include_address_total: bool = True,
 ) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
     archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
-    page_mode = f"alim:{address_limit if address_limit is not None else 'all'}|aoff:{int(address_offset or 0)}"
+    page_mode = (
+        f"alim:{address_limit if address_limit is not None else 'all'}|"
+        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}"
+    )
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
         f"{'chain' if include_chain else 'default'}|"
@@ -5361,6 +5365,7 @@ async def get_npi(request, npi):
         address_offset = max(int(request.args.get("address_offset") or 0), 0)
     except (TypeError, ValueError):
         address_offset = 0
+    include_address_total = _parse_bool_arg(request.args.get("include_address_total"), default=True)
     npi = int(npi)
     cache_key = _npi_detail_cache_key(
         npi,
@@ -5373,6 +5378,7 @@ async def get_npi(request, npi):
         include_evidence=include_evidence,
         address_limit=address_limit,
         address_offset=address_offset,
+        include_address_total=include_address_total,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -5802,6 +5808,7 @@ async def get_npi(request, npi):
     build_kwargs: dict[str, Any] = {
         "address_limit": address_limit,
         "address_offset": address_offset,
+        "include_address_total": include_address_total,
     }
     if request_session is not None:
         build_kwargs["session"] = request_session
@@ -5937,6 +5944,7 @@ async def _build_npi_details(
     include_evidence: bool = False,
     address_limit: int | None = None,
     address_offset: int = 0,
+    include_address_total: bool = True,
     session: Any = None,
 ) -> dict:
     npi_data_table = NPIData.__table__
@@ -6017,7 +6025,7 @@ async def _build_npi_details(
         )
     )
     address_total: int | None = None
-    if address_limit is not None:
+    if address_limit is not None and include_address_total:
         count_stmt = (
             select(func.count())
             .select_from(address_table)
@@ -6031,6 +6039,7 @@ async def _build_npi_details(
                 address_total = int(await db.scalar(count_stmt) or 0)
             except Exception:  # pragma: no cover - gino fallback when no session bound
                 address_total = None
+    if address_limit is not None:
         address_subquery_base = address_subquery_base.limit(address_limit).offset(max(address_offset or 0, 0))
     try:
         address_subquery = address_subquery_base.alias("address_list")

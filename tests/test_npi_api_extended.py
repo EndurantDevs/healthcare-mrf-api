@@ -1241,7 +1241,10 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
 
 @pytest.mark.asyncio
 async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
-    async def fake_build(_npi, **_kwargs):
+    captured_kwargs = {}
+
+    async def fake_build(_npi, **kwargs):
+        captured_kwargs.update(kwargs)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1282,6 +1285,7 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
             "view": "summary",
             "sync_geocode": "0",
             "lookup_stored_geocode": "0",
+            "include_address_total": "0",
         },
         app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": True}),
     )
@@ -1289,6 +1293,7 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
     payload = json.loads(response.body)
 
     assert payload["address_list"][0]["lat"] is None
+    assert captured_kwargs["include_address_total"] is False
 
 
 @pytest.mark.asyncio
