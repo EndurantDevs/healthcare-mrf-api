@@ -7542,6 +7542,7 @@ async def _search_multi_ptg2_snapshots(
             "limit": pagination.limit,
             "offset": pagination.offset,
             "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+            "has_more": (int(pagination.offset) + len(page_items)) < total,
         },
         "query": query,
     }

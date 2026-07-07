@@ -2083,11 +2083,51 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
     # Union of both networks, globally re-sorted by rate asc (cheaper PPO row first).
     assert [item["npi"] for item in payload["items"]] == [222, 111]
     assert payload["pagination"]["total"] == 2
+    assert payload["pagination"]["has_more"] is False
     # Each row stays attributable to the network it came from.
     assert {item["npi"]: item["network"] for item in payload["items"]} == {111: "c2", 222: "ppo_ndc"}
     assert payload["query"]["combined"] is True
     assert payload["query"]["snapshot_id"] is None
     assert {n["source_key"] for n in payload["query"]["networks"]} == {"c2", "ppo_ndc"}
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_combined_pagination_reports_has_more(monkeypatch):
+    async def fake_ids(_session, _args):
+        return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
+
+    async def fake_one(_session, snapshot_id, _args, pagination):
+        # Each network returns one page item but reports a much larger true total,
+        # mirroring the route-item fast path's window count.
+        payload_by_snapshot = {
+            "snap-c2": {
+                "items": [
+                    {"npi": 111, "provider_name": "Ambrose", "prices": [{"negotiated_rate": 1138.57}]}
+                ],
+                "pagination": {"total": 40, "limit": pagination.limit, "offset": pagination.offset},
+                "query": {"snapshot_id": snapshot_id, "code": "29888"},
+            },
+            "snap-ppo": {
+                "items": [
+                    {"npi": 222, "provider_name": "Boswell", "prices": [{"negotiated_rate": 905.0}]}
+                ],
+                "pagination": {"total": 37, "limit": pagination.limit, "offset": pagination.offset},
+                "query": {"snapshot_id": snapshot_id, "code": "29888"},
+            },
+        }
+        return payload_by_snapshot.get(snapshot_id)
+
+    monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+
+    combined_payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "29888", "order_by": "rate", "order": "asc"},
+        FakePagination(),
+    )
+
+    assert combined_payload["pagination"]["total"] == 77
+    assert combined_payload["pagination"]["has_more"] is True
 
 
 @pytest.mark.asyncio
