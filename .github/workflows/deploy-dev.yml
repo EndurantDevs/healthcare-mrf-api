@@ -1,8 +1,10 @@
 name: Queue dev deploy
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +17,7 @@ concurrency:
 jobs:
   queue:
     name: Queue dev-node build
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -37,6 +40,8 @@ jobs:
       - name: Queue build on dev node
         env:
           DEV_DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
+          DEPLOY_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          DEPLOY_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
         run: |
           if [ -z "${DEV_DEPLOY_HOST}" ]; then
             echo "::error::DEV_DEPLOY_HOST is not configured"
@@ -48,7 +53,7 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             "ubuntu@${DEV_DEPLOY_HOST}" \
-            "${GITHUB_SHA} ${GITHUB_REF_NAME} --detach" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
+            "${DEPLOY_SHA} ${DEPLOY_BRANCH} --detach" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
             echo "::error::Failed to queue dev deploy"
             exit 1
           fi
