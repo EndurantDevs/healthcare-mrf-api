@@ -3236,6 +3236,28 @@ def _confidence_band(score: float) -> str:
     return "low"
 
 
+def _match_candidate_source_count(item: Mapping[str, Any]) -> int:
+    """Return the corroborating address source count for ranking ties."""
+
+    sources = item.get("sources")
+    if not isinstance(sources, Mapping):
+        return 0
+    fhir_sources = sources.get("fhir")
+    if not isinstance(fhir_sources, Mapping):
+        return 0
+    return int(fhir_sources.get("source_count") or 0)
+
+
+def _match_candidate_sort_key(item: Mapping[str, Any]) -> tuple[float, int, int]:
+    """Sort strongest, most corroborated candidates first."""
+
+    return (
+        -float(item.get("match_score") or 0),
+        -_match_candidate_source_count(item),
+        int(item.get("npi") or 0),
+    )
+
+
 def _provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
     if not (params.get("taxonomy_exact") or params.get("taxonomy_prefixes") or params.get("provider_type")):
         return False
@@ -3375,7 +3397,7 @@ async def match_candidates(request):
         for row in rows
         if row.get("npi") is not None
     ]
-    candidates.sort(key=lambda item: (-float(item.get("match_score") or 0), int(item.get("npi") or 0)))
+    candidates.sort(key=_match_candidate_sort_key)
     candidates = candidates[: int(params["limit"])]
     return response.json(
         {

@@ -319,6 +319,26 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
     assert candidate["facility"]["classification_confidence"] == "high"
 
 
+def test_match_candidate_sort_key_prefers_source_count_before_npi():
+    ordered = sorted(
+        [
+            {
+                "npi": 1306486022,
+                "match_score": 0.65,
+                "sources": {"fhir": {"source_count": 1}},
+            },
+            {
+                "npi": 1730166224,
+                "match_score": 0.65,
+                "sources": {"fhir": {"source_count": 2}},
+            },
+        ],
+        key=npi_module._match_candidate_sort_key,
+    )
+
+    assert ordered[0]["npi"] == 1730166224
+
+
 @pytest.mark.asyncio
 async def test_match_candidates_route_shapes_payload(monkeypatch):
     async def fake_rows(params, *, session=None):
