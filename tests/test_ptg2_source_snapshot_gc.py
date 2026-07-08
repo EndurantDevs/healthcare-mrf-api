@@ -119,7 +119,20 @@ def test_execute_ptg2_source_snapshot_gc_plan_recomputes_and_deletes_metadata(mo
     connection = _FakeExecutor()
     monkeypatch.setattr(snapshot_gc, "db", _FakeDB(connection))
 
+    # ensure_ptg2_artifact_blob_table resolves `db` inside ptg2_artifact_blobs, so the
+    # snapshot_gc.db patch above does not cover it: unpatched it DDLs the real local
+    # database and fails whenever an earlier test leaves the shared asyncpg pool on a
+    # dead event loop (suite-order flake).
+    ensure_calls: list[str | None] = []
+
+    async def _fake_ensure_blob_table(schema_name=None):
+        ensure_calls.append(schema_name)
+
+    monkeypatch.setattr(snapshot_gc, "ensure_ptg2_artifact_blob_table", _fake_ensure_blob_table)
+
     plan = asyncio.run(snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=1024))
+
+    assert ensure_calls == ["mrf"]
 
     assert plan.table_count == 3
     status_statements = [statement for statement, _params in connection.status_calls]
