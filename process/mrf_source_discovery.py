@@ -13410,8 +13410,12 @@ def _should_sync_private_context_snapshots() -> bool:
 
 
 async def _sync_import_control_seeds(
-    source_rows: list[dict[str, Any]], *, limit: int | None = None
+    source_rows: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    progress_run_id: str | None = None,
 ) -> int:
+    """Sync source seed rows into import-control and optionally emit batch progress."""
     base_url = str(
         os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
         or os.getenv("HP_IMPORT_CONTROL_BASE_URL")
@@ -13434,6 +13438,7 @@ async def _sync_import_control_seeds(
             items.append(item)
     if not items:
         return 0
+    total_items = len(items)
     timeout = _import_control_sync_timeout()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -13456,7 +13461,29 @@ async def _sync_import_control_seeds(
                     )
                 payload = await resp.json()
             synced += int(payload.get("count") or len(payload.get("items") or []))
+            if progress_run_id:
+                _emit_import_control_seed_progress(
+                    progress_run_id,
+                    done=min(synced, total_items),
+                    total=total_items,
+                )
     return synced
+
+
+def _emit_import_control_seed_progress(
+    progress_run_id: str, *, done: int, total: int
+) -> None:
+    """Publish one import-control seed sync progress update for a control run."""
+    enqueue_live_progress(
+        run_id=progress_run_id,
+        importer="mrf-source-discovery",
+        status="running",
+        phase="syncing import-control seeds",
+        unit="sources",
+        done=done,
+        total=total,
+        message=f"synced source seed rows {done}/{total}",
+    )
 
 
 def _env_flag(name: str) -> bool:
@@ -13494,7 +13521,7 @@ def _import_control_sync_timeout() -> aiohttp.ClientTimeout:
 
 
 def _import_control_seed_batch_size() -> int:
-    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 100)
+    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 1000)
 
 
 def _import_control_catalog_concurrency(requested: int | None) -> int:
@@ -15553,7 +15580,9 @@ async def main(
                     message=f"syncing {len(source_rows)} source seed rows",
                 )
             result.import_control_synced = await _sync_import_control_seeds(
-                source_rows, limit=bounded_limit
+                source_rows,
+                limit=bounded_limit,
+                progress_run_id=control_run_id,
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control", "message": str(exc)})

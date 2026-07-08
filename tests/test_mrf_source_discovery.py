@@ -8733,6 +8733,7 @@ async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatc
     """Import-control seed sync chunks broad weekly source batches."""
     calls = []
     captured_timeouts = []
+    progress_events = []
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
@@ -8746,6 +8747,11 @@ async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatc
         "ClientSession",
         _seed_batch_sync_fake_session(calls, captured_timeouts),
     )
+    monkeypatch.setattr(
+        discovery,
+        "enqueue_live_progress",
+        lambda **payload: progress_events.append(payload),
+    )
 
     synced = await discovery._sync_import_control_seeds(
         [
@@ -8756,7 +8762,8 @@ async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatc
                 "seed_provider": "master-list",
             }
             for index in range(3)
-        ]
+        ],
+        progress_run_id="run_seed_sync",
     )
 
     assert synced == 3
@@ -8767,6 +8774,11 @@ async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatc
     )
     assert captured_timeouts[0].total == 321
     assert captured_timeouts[0].sock_read == 123
+    assert [(event["done"], event["total"]) for event in progress_events] == [
+        (2, 3),
+        (3, 3),
+    ]
+    assert {event["run_id"] for event in progress_events} == {"run_seed_sync"}
 
 
 @pytest.mark.asyncio
@@ -14880,7 +14892,11 @@ async def test_sync_import_control_can_skip_catalog_push(monkeypatch):
     assert discovery_summary["import_control_sources_synced"] == 0
     assert discovery_summary["import_control_plans_synced"] == 0
     assert discovery_summary["errors"] == []
-    seed_sync_mock.assert_awaited_once_with([source_record_by_field], limit=None)
+    seed_sync_mock.assert_awaited_once_with(
+        [source_record_by_field],
+        limit=None,
+        progress_run_id=discovery_summary["crawl_run_id"],
+    )
     catalog_sync_mock.assert_not_called()
 
 
