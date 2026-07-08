@@ -3959,26 +3959,40 @@ def _ptg2_route_item_fast_path_allowed(args: dict[str, Any]) -> bool:
         return False
     if args.get("specialty") or args.get("classification"):
         return False
-    explicit_taxonomy_keys = (
-        "taxonomy_codes",
-        "taxonomy_code",
+    unsupported_taxonomy_keys = (
         "taxonomy_classification",
         "taxonomy_specialization",
         "taxonomy_section",
-        "include_subspecialties",
-        "primary_only",
     )
-    if any(args.get(key) not in (None, "", "null") for key in explicit_taxonomy_keys):
+    if any(args.get(key) not in (None, "", "null") for key in unsupported_taxonomy_keys):
         return False
     price_filter_params: dict[str, Any] = {}
     price_filter_clauses, _ = _price_filter_clauses(args, price_filter_params)
     if price_filter_clauses:
         return False
     return bool(
-        args.get("zip5")
-        and args.get("lat") not in (None, "", "null")
+        args.get("lat") not in (None, "", "null")
         and args.get("long") not in (None, "", "null")
         and args.get("radius_miles") not in (None, "", "null")
+    )
+
+
+def _ptg2_route_item_taxonomy_filter_sql(args: dict[str, Any], params: dict[str, Any]) -> str:
+    taxonomy_args = dict(args)
+    if not taxonomy_args.get("taxonomy_codes") and taxonomy_args.get("taxonomy_code"):
+        taxonomy_args["taxonomy_codes"] = taxonomy_args.get("taxonomy_code")
+    specialty_filter = resolve_provider_specialty_filter(taxonomy_args)
+    if not specialty_filter.active:
+        return ""
+    return (
+        "AND r.npi IN ("
+        + provider_specialty_taxonomy_semijoin_sql(
+            params,
+            "route_item_specialty",
+            specialty_filter,
+            schema=PTG2_SCHEMA,
+        )
+        + ")"
     )
 
 
@@ -4003,8 +4017,6 @@ async def _search_ptg2_manifest_route_item_table(
     except (TypeError, ValueError):
         return None
     zip_value = _normalize_zip5(args.get("zip5"))
-    if not zip_value:
-        return None
     table_name = await _ptg2_route_item_table(
         session,
         serving_tables,
@@ -4037,6 +4049,7 @@ async def _search_ptg2_manifest_route_item_table(
         except (TypeError, ValueError):
             return None
         npi_filter_sql = "AND r.npi = :provider_npi"
+    taxonomy_filter_sql = _ptg2_route_item_taxonomy_filter_sql(args, params)
 
     distance_sql = _ptg2_geo_distance_miles_sql("r.lat::float8", "r.long::float8")
     order_by = str(args.get("order_by") or "").strip().lower()
@@ -4096,6 +4109,7 @@ async def _search_ptg2_manifest_route_item_table(
                         )
                     )
                     {npi_filter_sql}
+                    {taxonomy_filter_sql}
             )
             SELECT item_payload, distance_miles, zip_rank, COUNT(*) OVER () AS total_matches
               FROM raw

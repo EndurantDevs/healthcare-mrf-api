@@ -2203,6 +2203,81 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
 
 
 @pytest.mark.asyncio
+async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_filter():
+    columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
+    session = FakeSession(
+        [
+            FakeResult(scalar=True),
+            FakeResult(rows=[(column,) for column in columns]),
+            FakeResult(
+                rows=[
+                    {
+                        "item_payload": {
+                            "npi": 1234567890 + idx,
+                            "provider_name": "Family Medicine Provider",
+                            "reported_code": "99213",
+                            "reported_code_system": "CPT",
+                            "price_summary": [{"rate": 86.48}],
+                        },
+                        "distance_miles": 2.75 + idx,
+                        "zip_rank": 1,
+                        "total_matches": 86,
+                    }
+                    for idx in range(36)
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_7cabb84262c9",
+        storage="manifest_snapshot",
+        id_storage="uuid",
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_route_item_table(
+        session,
+        "ptg2:202607:7cabb84262c9",
+        {
+            "plan_id": "465722012",
+            "code": "99213",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "lat": 40.7128,
+            "long": -74.0060,
+            "radius_miles": 10.0,
+            "taxonomy_codes": "207Q00000X",
+            "primary_only": "true",
+            "order_by": "total_allowed_amount",
+            "order": "asc",
+        },
+        _Pagination(limit=50, offset=50),
+        tables,
+        "product_search",
+        requested_plan="465722012",
+        requested_system="CPT",
+        requested_code="99213",
+    )
+
+    assert response is not None
+    assert response["items"][0]["npi"] == 1234567890
+    assert response["items"][0]["zip_match_type"] == "radius"
+    assert response["items"][0]["anchor_zip5"] is None
+    assert response["pagination"]["total"] == 86
+    assert response["pagination"]["has_more"] is False
+    route_sql = str(session.calls[-1][0][0])
+    route_params = session.calls[-1][0][1]
+    assert "FROM mrf.ptg2_route_item_7cabb84262c9_465722012_cpt_99213 r" in route_sql
+    assert "r.npi IN (SELECT route_item_specialty_nt.npi" in route_sql
+    assert "route_item_specialty_nt.npi = r.npi" not in route_sql
+    assert "UPPER(COALESCE(route_item_specialty_nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'" in route_sql
+    assert "route_item_specialty_nt.healthcare_provider_taxonomy_code IN (:route_item_specialty_taxonomy_code_0)" in route_sql
+    assert route_params["route_item_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert route_params["zip5"] is None
+    assert route_params["limit"] == 50
+    assert route_params["offset"] == 50
+
+
+@pytest.mark.asyncio
 async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_filter():
     session = FakeSession([])
     tables = ptg2_serving.PTG2ServingTables(
