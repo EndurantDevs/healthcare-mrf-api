@@ -9698,6 +9698,63 @@ def _catalog_snapshot_fake_session(captured_calls):
     return fake_session_factory
 
 
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_uses_preview_batch_size(monkeypatch):
+    captured_calls = []
+
+    async def fake_snapshot_items(catalog_source_ids):
+        assert catalog_source_ids == ["source_batch"]
+        return {
+            "source_batch": [
+                {
+                    "canonical_url": f"https://example.com/rates-{index}.json.gz",
+                    "domain": "in_network",
+                    "reporting_entity_name": "Example Importable",
+                    "plan_info": [
+                        {"plan_id": str(index), "plan_market_type": "group"}
+                    ],
+                }
+                for index in range(5)
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "IMPORT_CONTROL_PREVIEW_BATCH_SIZE", 2)
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot_items)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_snapshot_fake_session(captured_calls),
+    )
+
+    sources_synced, plans_synced, sync_errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_batch",
+                "index_url": "https://example.com/index.json",
+                "display_name": "Example Batch",
+                "source_key": "example-batch",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            }
+        ]
+    )
+
+    preview_batch_lengths = [
+        len(call["json"]["items"])
+        for call in captured_calls
+        if call["url"].endswith("/v1/ptg/discover/ingest-preview")
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 3
+    assert sync_errors == []
+    assert preview_batch_lengths == [2, 2, 1]
+
+
 def _catalog_snapshot_source_rows():
     return [
         {

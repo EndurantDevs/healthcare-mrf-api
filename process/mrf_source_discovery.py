@@ -74,6 +74,9 @@ DEFAULT_CONCURRENCY = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_CONCURRENCY", "10
 WRITE_BATCH_SIZE = max(
     int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1
 )
+IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
+    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "1000")), 1
+)
 HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "300")), 1)
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
@@ -14814,7 +14817,10 @@ async def _push_import_control_catalog(
                         continue
                     source_plans = 0
                     if should_ingest_preview:
-                        for batch in _chunked(_split_preview_items(items), 100):
+                        for batch in _chunked(
+                            _split_preview_items(items),
+                            IMPORT_CONTROL_PREVIEW_BATCH_SIZE,
+                        ):
                             source_plans += await _ingest_import_control_preview(
                                 session, base, ic_source_id, batch
                             )
