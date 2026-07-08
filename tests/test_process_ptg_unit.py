@@ -3684,6 +3684,65 @@ def test_allowed_amount_metrics_from_results_sum_evidence_counts():
     assert metrics["allowed_amount_evidence"] is True
 
 
+def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path):
+    allowed_amount_payload_dict = {
+        "out_of_network": [
+            {
+                "name": "Office visit",
+                "billing_code_type": "CPT",
+                "billing_code_type_version": "2026",
+                "billing_code": "99203",
+                "description": "Office visit",
+                "allowed_amounts": [
+                    {
+                        "tin": {"type": "ein", "value": "371382997"},
+                        "service_code": [None, "11"],
+                        "billing_class": "professional",
+                        "payments": [
+                            {
+                                "allowed_amount": 133.0,
+                                "billing_code_modifier": [None, "AA"],
+                                "providers": [{"billed_charge": 200.0, "npi": [1427166008]}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    allowed_path = tmp_path / "allowed.json"
+    allowed_path.write_text(json.dumps(allowed_amount_payload_dict), encoding="utf-8")
+    pushed_rows_by_class = {}
+
+    async def fake_push(rows, cls):
+        pushed_rows_by_class.setdefault(cls, []).extend(rows)
+
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    metrics = asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            {},
+            [{"plan_id": "7862274fdc01bcc0", "plan_market_type": "group"}],
+            {
+                "PTGAllowedItem": "item",
+                "PTGAllowedPayment": "payment",
+                "PTGAllowedProviderPayment": "provider_payment",
+            },
+            False,
+            "import_log",
+            "https://example.test/allowed.json",
+        )
+    )
+
+    assert metrics["allowed_amount_provider_payments"] == 1
+    assert pushed_rows_by_class["payment"][0]["service_code"] == ["11"]
+    assert pushed_rows_by_class["payment"][0]["billing_code_modifier"] == ["AA"]
+    assert pushed_rows_by_class["provider_payment"][0]["npi"] == [1427166008]
+
+
 def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
     pushed = []
     dropped_tables = []

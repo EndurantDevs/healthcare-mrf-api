@@ -22,6 +22,15 @@ from process.ptg_parts.source_jobs import _dedupe_rows_by
 logger = logging.getLogger(__name__)
 
 
+def _as_text_list(value: Any) -> list[str]:
+    items: list[str] = []
+    for item in _as_list(value):
+        text = "" if item is None else str(item).strip()
+        if text:
+            items.append(text)
+    return items
+
+
 def _ptg_facade():
     ptg_module = sys.modules.get("process.ptg")
     if ptg_module is None:
@@ -103,14 +112,16 @@ async def _parse_allowed_amounts(
                     unique_tins.add(tin_value)
                 for payment in allowed_amount.get("payments", []):
                     metrics_by_name["allowed_amount_payments"] += 1
+                    service_codes = _as_text_list(allowed_amount.get("service_code"))
+                    billing_code_modifiers = _as_text_list(payment.get("billing_code_modifier"))
                     payment_hash = _make_checksum(
                         item_hash,
                         tin_info.get("value") or "",
-                        "|".join(_as_list(allowed_amount.get("service_code"))),
+                        "|".join(service_codes),
                         allowed_amount.get("billing_class") or "",
                         allowed_amount.get("setting") or "",
                         payment.get("allowed_amount"),
-                        "|".join(_as_list(payment.get("billing_code_modifier"))),
+                        "|".join(billing_code_modifiers),
                     )
                     payment_rows.append(
                         {
@@ -118,11 +129,11 @@ async def _parse_allowed_amounts(
                             "allowed_item_hash": item_hash,
                             "tin_type": tin_info.get("type"),
                             "tin_value": tin_info.get("value"),
-                            "service_code": _as_list(allowed_amount.get("service_code")),
+                            "service_code": service_codes,
                             "billing_class": allowed_amount.get("billing_class"),
                             "setting": allowed_amount.get("setting"),
                             "allowed_amount": payment.get("allowed_amount"),
-                            "billing_code_modifier": _as_list(payment.get("billing_code_modifier")),
+                            "billing_code_modifier": billing_code_modifiers,
                         }
                     )
                     for provider in payment.get("providers", []):
