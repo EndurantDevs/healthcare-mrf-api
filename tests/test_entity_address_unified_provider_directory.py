@@ -67,8 +67,11 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "loc.address_key ~* '^[0-9a-f]{8}-" in sql
     assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
     assert "loc.telephone_number::varchar AS telephone_number" in sql
-    assert "pd.latitude::numeric BETWEEN -90 AND 90" in sql
-    assert "pd.longitude::numeric BETWEEN -180 AND 180" in sql
+    assert "pd.latitude" in sql
+    assert "pd.longitude" in sql
+    assert "/ 1000000" in sql
+    assert "ABS((pd.latitude)::numeric) < 0.0000001" in sql
+    assert "BETWEEN 24 AND 50" in sql
     assert "practitioner.active IS DISTINCT FROM false" in sql
     assert "organization.active IS DISTINCT FROM false" in sql
     assert "NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line" in sql
@@ -76,6 +79,21 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "pd.address_key AS address_key" in sql
     assert "mrf.addr_key_v1(" in sql
     assert "pd.first_line, pd.second_line, pd.city_name" in sql
+
+
+def test_same_provider_address_backfill_only_uses_same_npi_and_address_key():
+    sql = entity_address_unified._backfill_same_provider_address_fields_sql(
+        "mrf",
+        "entity_address_unified_stage_test",
+    )
+
+    assert "COALESCE(\n                npi,\n                inferred_npi" in sql
+    assert "GROUP BY provider_npi, address_key" in sql
+    assert "target_row.address_key = grouped_fields.address_key" in sql
+    assert "= grouped_fields.provider_npi" in sql
+    assert "telephone_number = COALESCE(target_row.telephone_number, grouped_fields.telephone_number)" in sql
+    assert "phone_number = COALESCE(target_row.phone_number, grouped_fields.phone_number)" in sql
+    assert "ABS(target_row.lat) < 0.0000001" in sql
 
 
 def test_provider_directory_source_selects_precompute_primary_npi_attributes():

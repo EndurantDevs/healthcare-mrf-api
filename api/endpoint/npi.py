@@ -6128,6 +6128,10 @@ async def _fetch_provider_directory_address_overlay(
 ) -> list[dict[str, Any]]:
     if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
         return []
+    overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
+    lat_select = "lat" if "lat" in overlay_columns else "NULL::numeric AS lat"
+    long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
+    coordinate_group_by = ", lat, long" if {"lat", "long"}.issubset(overlay_columns) else ""
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     overlay_query = text(
         f"""
@@ -6145,6 +6149,8 @@ async def _fetch_provider_directory_address_overlay(
             fax_number,
             phone_number,
             fax_number_digits,
+            {lat_select},
+            {long_select},
             address_key,
             address_precision,
             ARRAY['provider_directory_fhir']::varchar[] AS address_sources,
@@ -6158,7 +6164,7 @@ async def _fetch_provider_directory_address_overlay(
       GROUP BY
             npi, first_line, second_line, city_name, state_name, state_code,
             postal_code, country_code, telephone_number, fax_number, phone_number,
-            fax_number_digits, address_key, address_precision
+            fax_number_digits, address_key, address_precision{coordinate_group_by}
       ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key;
         """
     )

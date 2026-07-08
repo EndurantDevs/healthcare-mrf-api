@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -620,6 +621,64 @@ def _normalize_country_code(value: Any) -> str | None:
     if re.fullmatch(r"[A-Z]{2}", token):
         return token
     return text.upper()
+
+
+def _format_coordinate(value: float) -> str:
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def _is_plausible_us_coordinate_pair(latitude: float, longitude: float) -> bool:
+    return (
+        (24 <= latitude <= 50 and -125 <= longitude <= -66)
+        or (51 <= latitude <= 72 and -180 <= longitude <= -129)
+        or (18 <= latitude <= 23 and -161 <= longitude <= -154)
+        or (17 <= latitude <= 19 and -68 <= longitude <= -64)
+        or (13 <= latitude <= 16 and 144 <= longitude <= 146)
+        or (-15 <= latitude <= -10 and -171 <= longitude <= -168)
+    )
+
+
+def _coordinate_pair_is_usable(latitude: float, longitude: float, country_code: str | None) -> bool:
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return False
+    if abs(latitude) < 0.0000001 and abs(longitude) < 0.0000001:
+        return False
+    if not country_code or country_code == "US":
+        return _is_plausible_us_coordinate_pair(latitude, longitude)
+    return True
+
+
+def _parse_coordinate_number(value: Any) -> float | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        parsed = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _normalize_fhir_position(
+    position: dict[str, Any],
+    *,
+    country_code: str | None,
+) -> tuple[str | None, str | None]:
+    latitude = _parse_coordinate_number(position.get("latitude"))
+    longitude = _parse_coordinate_number(position.get("longitude"))
+    if latitude is None or longitude is None:
+        return None, None
+
+    candidates = [(latitude, longitude)]
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        candidates.extend((latitude / divisor, longitude / divisor) for divisor in (1_000_000, 10_000_000))
+
+    for candidate_latitude, candidate_longitude in candidates:
+        if _coordinate_pair_is_usable(candidate_latitude, candidate_longitude, country_code):
+            return _format_coordinate(candidate_latitude), _format_coordinate(candidate_longitude)
+    return None, None
 
 
 def _state_fips_restore_sql(value_sql: str) -> str:
@@ -2328,7 +2387,9 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
     raw_state = _clean_text(first.get("state"))
     state = _normalize_state_name(raw_state)
     state_code = _normalize_state_code(raw_state)
+    country_code = _normalize_country_code(first.get("country"))
     position = resource.get("position") if isinstance(resource.get("position"), dict) else {}
+    latitude, longitude = _normalize_fhir_position(position, country_code=country_code)
     return {
         "first_line": lines[0] if lines else None,
         "second_line": lines[1] if len(lines) > 1 else None,
@@ -2338,9 +2399,9 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
         "postal_code": postal_code,
         "zip5": zip5,
         "city_norm": city.upper() if city else None,
-        "country_code": _normalize_country_code(first.get("country")),
-        "latitude": _clean_text(position.get("latitude")),
-        "longitude": _clean_text(position.get("longitude")),
+        "country_code": country_code,
+        "latitude": latitude,
+        "longitude": longitude,
         "address_json": first if first else None,
     }
 
@@ -9778,6 +9839,67 @@ def _coerce_rowcount(value: Any) -> int:
     return int(matches[-1]) if matches else 0
 
 
+def _coordinate_country_key_sql(country_expr: str) -> str:
+    return f"regexp_replace(upper(COALESCE(({country_expr})::varchar, '')), '[^A-Z0-9]', '', 'g')"
+
+
+def _coordinate_pair_plausible_sql(latitude_expr: str, longitude_expr: str, country_expr: str) -> str:
+    country_key = _coordinate_country_key_sql(country_expr)
+    default_us = f"{country_key} IN ('', 'US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')"
+    return f"""
+        ({latitude_expr}) BETWEEN -90 AND 90
+        AND ({longitude_expr}) BETWEEN -180 AND 180
+        AND NOT (ABS({latitude_expr}) < 0.0000001 AND ABS({longitude_expr}) < 0.0000001)
+        AND (
+            NOT ({default_us})
+            OR (({latitude_expr}) BETWEEN 24 AND 50 AND ({longitude_expr}) BETWEEN -125 AND -66)
+            OR (({latitude_expr}) BETWEEN 51 AND 72 AND ({longitude_expr}) BETWEEN -180 AND -129)
+            OR (({latitude_expr}) BETWEEN 18 AND 23 AND ({longitude_expr}) BETWEEN -161 AND -154)
+            OR (({latitude_expr}) BETWEEN 17 AND 19 AND ({longitude_expr}) BETWEEN -68 AND -64)
+            OR (({latitude_expr}) BETWEEN 13 AND 16 AND ({longitude_expr}) BETWEEN 144 AND 146)
+            OR (({latitude_expr}) BETWEEN -15 AND -10 AND ({longitude_expr}) BETWEEN -171 AND -168)
+        )
+    """
+
+
+def _coordinate_from_location_sql(
+    latitude_expr: str,
+    longitude_expr: str,
+    country_expr: str,
+    *,
+    axis: str,
+) -> str:
+    if axis not in {"lat", "long"}:
+        raise ValueError(f"unsupported coordinate axis: {axis}")
+    numeric_re = r"^-?[0-9]+(\.[0-9]+)?$"
+    raw_lat = f"({latitude_expr})::numeric"
+    raw_long = f"({longitude_expr})::numeric"
+    scaled_1m_lat = f"(({latitude_expr})::numeric / 1000000)"
+    scaled_1m_long = f"(({longitude_expr})::numeric / 1000000)"
+    scaled_10m_lat = f"(({latitude_expr})::numeric / 10000000)"
+    scaled_10m_long = f"(({longitude_expr})::numeric / 10000000)"
+    raw_value = raw_lat if axis == "lat" else raw_long
+    scaled_1m_value = scaled_1m_lat if axis == "lat" else scaled_1m_long
+    scaled_10m_value = scaled_10m_lat if axis == "lat" else scaled_10m_long
+    numeric_guard = (
+        f"({latitude_expr}) ~ '{numeric_re}' AND ({longitude_expr}) ~ '{numeric_re}'"
+    )
+    return f"""
+        CASE
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(raw_lat, raw_long, country_expr)}
+                THEN {raw_value}
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(scaled_1m_lat, scaled_1m_long, country_expr)}
+                THEN {scaled_1m_value}
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(scaled_10m_lat, scaled_10m_long, country_expr)}
+                THEN {scaled_10m_value}
+            ELSE NULL::numeric
+        END
+    """
+
+
 def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
     return (
         "source_record_id",
@@ -9798,6 +9920,8 @@ def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
         "fax_number",
         "phone_number",
         "fax_number_digits",
+        "lat",
+        "long",
         "address_precision",
         "source_updated_at",
         "published_at",
@@ -9828,10 +9952,15 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
         fax_number varchar,
         phone_number varchar(15),
         fax_number_digits varchar(15),
+        lat numeric,
+        long numeric,
         address_precision varchar(32) NOT NULL DEFAULT 'street',
         source_updated_at timestamp,
         published_at timestamp NOT NULL DEFAULT now()
     );
+    ALTER TABLE {table_ref}
+        ADD COLUMN IF NOT EXISTS lat numeric,
+        ADD COLUMN IF NOT EXISTS long numeric;
     """
 
 
@@ -9946,6 +10075,8 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             org_fax.fax_number::varchar AS fax_number,
             NULL::varchar AS phone_number,
             NULL::varchar AS fax_number_digits,
+            NULL::numeric AS lat,
+            NULL::numeric AS long,
             'street'::varchar AS address_precision,
             organization.updated_at AS source_updated_at,
             now() AS published_at
@@ -10000,10 +10131,18 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
             {location_country_expr}::varchar AS country_code,
-            loc.telephone_number::varchar AS telephone_number,
-            loc.fax_number::varchar AS fax_number,
-            loc.phone_number::varchar AS phone_number,
-            loc.fax_number_digits::varchar AS fax_number_digits,
+            COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number,
+            COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number,
+            COALESCE(
+                {role_phone_number_expr},
+                loc.phone_number
+            )::varchar AS phone_number,
+            COALESCE(
+                {role_fax_number_expr},
+                loc.fax_number_digits
+            )::varchar AS fax_number_digits,
+            {location_lat_expr} AS lat,
+            {location_long_expr} AS long,
             'street'::varchar AS address_precision,
             GREATEST(
                 COALESCE(role.updated_at, TIMESTAMP 'epoch'),
@@ -10020,6 +10159,20 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
           JOIN {location_table} AS loc
             ON loc.source_id = role.source_id
            AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS telephone_number
+                FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'phone'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS role_phone ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS fax_number
+                FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'fax'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS role_fax ON TRUE
          WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
            AND practitioner.active IS DISTINCT FROM false
            AND role.active IS DISTINCT FROM false
@@ -10059,6 +10212,8 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.fax_number::varchar AS fax_number,
             loc.phone_number::varchar AS phone_number,
             loc.fax_number_digits::varchar AS fax_number_digits,
+            {location_lat_expr} AS lat,
+            {location_long_expr} AS long,
             'street'::varchar AS address_precision,
             GREATEST(
                 COALESCE(affiliation.updated_at, TIMESTAMP 'epoch'),
@@ -10112,6 +10267,8 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
         fax_number,
         phone_number,
         fax_number_digits,
+        lat,
+        long,
         address_precision,
         source_updated_at,
         published_at
@@ -10137,12 +10294,33 @@ def provider_directory_address_overlay_insert_sql(
     """Build the scoped insert for the compact Provider Directory address overlay."""
     schema = db_schema if db_schema is not None else _schema()
     stage_ref = _qt(schema, stage_table or _address_overlay_stage_table_name(run_id))
+    location_country_expr = _country_restore_default_us_sql("loc.country_code")
     return ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE.format(
         stage_ref=stage_ref,
         columns=", ".join(_provider_directory_address_overlay_columns()),
         qschema=_q(schema),
         org_address_country_expr=_country_restore_default_us_sql("addr.value->>'country'"),
-        location_country_expr=_country_restore_default_us_sql("loc.country_code"),
+        location_country_expr=location_country_expr,
+        role_phone_number_expr=_canonical_contact_number_expr(
+            "role_phone.telephone_number",
+            location_country_expr,
+        ),
+        role_fax_number_expr=_canonical_contact_number_expr(
+            "role_fax.fax_number",
+            location_country_expr,
+        ),
+        location_lat_expr=_coordinate_from_location_sql(
+            "loc.latitude",
+            "loc.longitude",
+            location_country_expr,
+            axis="lat",
+        ),
+        location_long_expr=_coordinate_from_location_sql(
+            "loc.latitude",
+            "loc.longitude",
+            location_country_expr,
+            axis="long",
+        ),
         uuid_re=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         org_scope=_provider_directory_overlay_scope_filter("organization", run_id=run_id, source_ids=source_ids),
         role_scope=_provider_directory_overlay_scope_filter("role", run_id=run_id, source_ids=source_ids),
@@ -10277,6 +10455,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
             raw.fax_number,
             NULL::varchar AS phone_number,
             NULL::varchar AS fax_number_digits,
+            NULL::numeric AS lat,
+            NULL::numeric AS long,
             'street'::varchar AS address_precision,
             raw.source_updated_at,
             now() AS published_at
@@ -10315,10 +10495,12 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
                 {location_country_expr}::varchar AS country_code,
-                loc.telephone_number::varchar AS telephone_number,
-                loc.fax_number::varchar AS fax_number,
-                loc.phone_number::varchar AS phone_number,
-                loc.fax_number_digits::varchar AS fax_number_digits,
+                COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number,
+                COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number,
+                COALESCE({role_phone_number_expr}, loc.phone_number)::varchar AS phone_number,
+                COALESCE({role_fax_number_expr}, loc.fax_number_digits)::varchar AS fax_number_digits,
+                {location_lat_expr} AS lat,
+                {location_long_expr} AS long,
                 'street'::varchar AS address_precision,
                 GREATEST(
                     COALESCE(role.updated_at, TIMESTAMP 'epoch'),
@@ -10335,6 +10517,20 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               JOIN {location_table} AS loc
                 ON loc.source_id = role.source_id
                AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS telephone_number
+                    FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'phone'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS role_phone ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS fax_number
+                    FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'fax'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS role_fax ON TRUE
              WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
                AND practitioner.active IS DISTINCT FROM false
                AND role.active IS DISTINCT FROM false
@@ -10380,6 +10576,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.fax_number::varchar AS fax_number,
                 loc.phone_number::varchar AS phone_number,
                 loc.fax_number_digits::varchar AS fax_number_digits,
+                {location_lat_expr} AS lat,
+                {location_long_expr} AS long,
                 'street'::varchar AS address_precision,
                 GREATEST(
                     COALESCE(affiliation.updated_at, TIMESTAMP 'epoch'),
@@ -10421,12 +10619,33 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
 
 def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: str | None) -> dict[str, str]:
     """Return shared SQL template parameters for Provider Directory overlay inserts."""
+    location_country_expr = _country_restore_default_us_sql("loc.country_code")
     return {
         "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
         "columns": ", ".join(_provider_directory_address_overlay_columns()),
         "qschema": _q(schema),
         "org_address_country_expr": _country_restore_default_us_sql("addr.value->>'country'"),
-        "location_country_expr": _country_restore_default_us_sql("loc.country_code"),
+        "location_country_expr": location_country_expr,
+        "role_phone_number_expr": _canonical_contact_number_expr(
+            "role_phone.telephone_number",
+            location_country_expr,
+        ),
+        "role_fax_number_expr": _canonical_contact_number_expr(
+            "role_fax.fax_number",
+            location_country_expr,
+        ),
+        "location_lat_expr": _coordinate_from_location_sql(
+            "loc.latitude",
+            "loc.longitude",
+            location_country_expr,
+            axis="lat",
+        ),
+        "location_long_expr": _coordinate_from_location_sql(
+            "loc.latitude",
+            "loc.longitude",
+            location_country_expr,
+            axis="long",
+        ),
         "uuid_re": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "organization_table": _qt(schema, "provider_directory_organization"),
         "practitioner_table": _qt(schema, "provider_directory_practitioner"),
@@ -10536,6 +10755,7 @@ async def _populate_address_overlay_stage(
         )
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
+    archive_coordinate_backfill_rows = await _backfill_address_overlay_stage_coordinates(schema, stage_ref)
     duplicates_removed = await _dedupe_address_overlay_stage(stage_ref)
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
     await _create_provider_directory_address_overlay_indexes(schema, stage_table)
@@ -10545,6 +10765,7 @@ async def _populate_address_overlay_stage(
         "inserted": inserted,
         "inserted_by_component": inserted_by_component,
         "countries_normalized": countries_normalized,
+        "archive_coordinate_backfill_rows": archive_coordinate_backfill_rows,
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
@@ -10559,6 +10780,28 @@ async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
                SET country_code = {normalized_country_expr}
              WHERE NULLIF({normalized_country_expr}, '') IS NOT NULL
                AND stage_row.country_code IS DISTINCT FROM {normalized_country_expr};
+            """
+        )
+    )
+
+
+async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: str) -> int:
+    if not await _table_exists(schema, "address_archive_v2"):
+        return 0
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {stage_ref} AS stage_row
+               SET lat = COALESCE(stage_row.lat, archive.lat),
+                   long = COALESCE(stage_row.long, archive.long)
+              FROM {_qt(schema, "address_archive_v2")} AS archive
+             WHERE stage_row.address_key IS NOT NULL
+               AND archive.address_key = stage_row.address_key
+               AND archive.merged_into IS NULL
+               AND archive.lat IS NOT NULL
+               AND archive.long IS NOT NULL
+               AND NOT (ABS(archive.lat) < 0.0000001 AND ABS(archive.long) < 0.0000001)
+               AND (stage_row.lat IS NULL OR stage_row.long IS NULL);
             """
         )
     )
@@ -10610,6 +10853,7 @@ def _address_overlay_publish_result(
         "inserted": stage_metric_dict["inserted"],
         "inserted_by_component": stage_metric_dict["inserted_by_component"],
         "countries_normalized": stage_metric_dict.get("countries_normalized", 0),
+        "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),
         "duplicates_removed": stage_metric_dict["duplicates_removed"],
         "copied_existing": stage_metric_dict["copied_existing"],
         "source_ids": source_ids,

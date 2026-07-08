@@ -160,6 +160,53 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
+async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch):
+    captured_sql: list[str] = []
+
+    class FakeResult:
+        def all(self):
+            return []
+
+    async def fake_execute(stmt, **_kwargs):
+        captured_sql.append(str(stmt))
+        return FakeResult()
+
+    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value={"lat", "long"}))
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+
+    rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
+
+    assert rows == []
+    assert "lat,\n            long," in captured_sql[0]
+    assert "address_precision, lat, long" in captured_sql[0]
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_overlay_fetch_tolerates_old_overlay_schema(monkeypatch):
+    captured_sql: list[str] = []
+
+    class FakeResult:
+        def all(self):
+            return []
+
+    async def fake_execute(stmt, **_kwargs):
+        captured_sql.append(str(stmt))
+        return FakeResult()
+
+    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value=set()))
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+
+    rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
+
+    assert rows == []
+    assert "NULL::numeric AS lat" in captured_sql[0]
+    assert "NULL::numeric AS long" in captured_sql[0]
+    assert "address_precision, lat, long" not in captured_sql[0]
+
+
 def test_validate_section_filters_requires_classification_or_codes():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         npi_module._validate_section_filters("Individual", None, None)

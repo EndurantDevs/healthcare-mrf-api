@@ -1883,6 +1883,67 @@ def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code"
     )
 
 
+def _coordinate_country_key_expr(expr: str) -> str:
+    return f"regexp_replace(upper(COALESCE(({expr})::varchar, '')), '[^A-Z0-9]', '', 'g')"
+
+
+def _coordinate_pair_plausible_sql(latitude_expr: str, longitude_expr: str, country_expr: str) -> str:
+    country_key = _coordinate_country_key_expr(country_expr)
+    default_us = f"{country_key} IN ('', 'US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')"
+    return f"""
+        ({latitude_expr}) BETWEEN -90 AND 90
+        AND ({longitude_expr}) BETWEEN -180 AND 180
+        AND NOT (ABS({latitude_expr}) < 0.0000001 AND ABS({longitude_expr}) < 0.0000001)
+        AND (
+            NOT ({default_us})
+            OR (({latitude_expr}) BETWEEN 24 AND 50 AND ({longitude_expr}) BETWEEN -125 AND -66)
+            OR (({latitude_expr}) BETWEEN 51 AND 72 AND ({longitude_expr}) BETWEEN -180 AND -129)
+            OR (({latitude_expr}) BETWEEN 18 AND 23 AND ({longitude_expr}) BETWEEN -161 AND -154)
+            OR (({latitude_expr}) BETWEEN 17 AND 19 AND ({longitude_expr}) BETWEEN -68 AND -64)
+            OR (({latitude_expr}) BETWEEN 13 AND 16 AND ({longitude_expr}) BETWEEN 144 AND 146)
+            OR (({latitude_expr}) BETWEEN -15 AND -10 AND ({longitude_expr}) BETWEEN -171 AND -168)
+        )
+    """
+
+
+def _coordinate_from_text_pair_sql(
+    latitude_expr: str,
+    longitude_expr: str,
+    country_expr: str,
+    *,
+    axis: str,
+) -> str:
+    if axis not in {"lat", "long"}:
+        raise ValueError(f"unsupported coordinate axis: {axis}")
+    numeric_re = r"^-?[0-9]+(\.[0-9]+)?$"
+    raw_lat = f"({latitude_expr})::numeric"
+    raw_long = f"({longitude_expr})::numeric"
+    scaled_1m_lat = f"(({latitude_expr})::numeric / 1000000)"
+    scaled_1m_long = f"(({longitude_expr})::numeric / 1000000)"
+    scaled_10m_lat = f"(({latitude_expr})::numeric / 10000000)"
+    scaled_10m_long = f"(({longitude_expr})::numeric / 10000000)"
+    raw_value = raw_lat if axis == "lat" else raw_long
+    scaled_1m_value = scaled_1m_lat if axis == "lat" else scaled_1m_long
+    scaled_10m_value = scaled_10m_lat if axis == "lat" else scaled_10m_long
+    numeric_guard = (
+        f"({latitude_expr}) ~ '{numeric_re}' AND ({longitude_expr}) ~ '{numeric_re}'"
+    )
+    return f"""
+        CASE
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(raw_lat, raw_long, country_expr)}
+                THEN {raw_value}
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(scaled_1m_lat, scaled_1m_long, country_expr)}
+                THEN {scaled_1m_value}
+            WHEN {numeric_guard}
+             AND {_coordinate_pair_plausible_sql(scaled_10m_lat, scaled_10m_long, country_expr)}
+                THEN {scaled_10m_value}
+            ELSE NULL::numeric
+        END
+    """
+
+
 def _contact_extension_expr(expr: str) -> str:
     extension_pattern = (
         "'(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
@@ -2997,18 +3058,8 @@ def _source_selects(
                 pd.telephone_number::varchar AS telephone_number,
                 pd.fax_number::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                CASE
-                    WHEN pd.latitude ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                     AND pd.latitude::numeric BETWEEN -90 AND 90
-                        THEN pd.latitude::numeric
-                    ELSE NULL::numeric
-                END AS lat,
-                CASE
-                    WHEN pd.longitude ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                     AND pd.longitude::numeric BETWEEN -180 AND 180
-                        THEN pd.longitude::numeric
-                    ELSE NULL::numeric
-                END AS long,
+                {_coordinate_from_text_pair_sql("pd.latitude", "pd.longitude", "pd.country_code", axis="lat")} AS lat,
+                {_coordinate_from_text_pair_sql("pd.latitude", "pd.longitude", "pd.country_code", axis="long")} AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
                 pd.address_key AS address_key,
@@ -3116,18 +3167,8 @@ def _source_selects(
                 pd.telephone_number::varchar AS telephone_number,
                 pd.fax_number::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                CASE
-                    WHEN pd.latitude ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                     AND pd.latitude::numeric BETWEEN -90 AND 90
-                        THEN pd.latitude::numeric
-                    ELSE NULL::numeric
-                END AS lat,
-                CASE
-                    WHEN pd.longitude ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                     AND pd.longitude::numeric BETWEEN -180 AND 180
-                        THEN pd.longitude::numeric
-                    ELSE NULL::numeric
-                END AS long,
+                {_coordinate_from_text_pair_sql("pd.latitude", "pd.longitude", "pd.country_code", axis="lat")} AS lat,
+                {_coordinate_from_text_pair_sql("pd.latitude", "pd.longitude", "pd.country_code", axis="long")} AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
                 pd.address_key AS address_key,
@@ -4148,25 +4189,121 @@ async def _invalid_coordinate_count(db_schema: str, table_name: str, *, db_clien
             SELECT COUNT(*)
               FROM {db_schema}.{table_name}
              WHERE (lat IS NOT NULL AND (lat < -90 OR lat > 90))
-                OR (long IS NOT NULL AND (long < -180 OR long > 180));
+                OR (long IS NOT NULL AND (long < -180 OR long > 180))
+                OR (lat IS NOT NULL AND long IS NOT NULL AND ABS(lat) < 0.0000001 AND ABS(long) < 0.0000001);
             """
         )
         or 0
     )
 
 
+def _coordinate_missing_or_invalid_sql(alias: str) -> str:
+    return (
+        f"{alias}.lat IS NULL OR {alias}.long IS NULL "
+        f"OR {alias}.lat < -90 OR {alias}.lat > 90 "
+        f"OR {alias}.long < -180 OR {alias}.long > 180 "
+        f"OR (ABS({alias}.lat) < 0.0000001 AND ABS({alias}.long) < 0.0000001)"
+    )
+
+
 def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
+    target_coordinate_missing = _coordinate_missing_or_invalid_sql("t")
     return f"""
     UPDATE {db_schema}.{table_name} AS t
-       SET lat = COALESCE(t.lat, a.lat),
-           long = COALESCE(t.long, a.long)
+       SET lat = CASE WHEN {target_coordinate_missing} THEN a.lat ELSE t.lat END,
+           long = CASE WHEN {target_coordinate_missing} THEN a.long ELSE t.long END
       FROM {db_schema}.address_archive_v2 AS a
      WHERE t.address_key IS NOT NULL
        AND a.address_key = t.address_key
        AND a.merged_into IS NULL
        AND a.lat IS NOT NULL
        AND a.long IS NOT NULL
-       AND (t.lat IS NULL OR t.long IS NULL);
+       AND NOT (ABS(a.lat) < 0.0000001 AND ABS(a.long) < 0.0000001)
+       AND ({target_coordinate_missing});
+    """
+
+
+def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) -> str:
+    target_coordinate_missing = _coordinate_missing_or_invalid_sql("target_row")
+    return f"""
+    WITH source_rows AS MATERIALIZED (
+        SELECT
+            location_key,
+            COALESCE(
+                npi,
+                inferred_npi,
+                CASE
+                    WHEN entity_type = 'npi' AND entity_id ~ '^[0-9]+$' THEN entity_id::bigint
+                    ELSE NULL::bigint
+                END
+            ) AS provider_npi,
+            address_key,
+            telephone_number,
+            phone_number,
+            phone_extension,
+            fax_number,
+            fax_number_digits,
+            fax_extension,
+            lat,
+            long,
+            source_count,
+            updated_at
+          FROM {db_schema}.{table_name}
+         WHERE address_key IS NOT NULL
+    ),
+    grouped_fields AS MATERIALIZED (
+        SELECT
+            provider_npi,
+            address_key,
+            (ARRAY_AGG(telephone_number ORDER BY (telephone_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS telephone_number,
+            (ARRAY_AGG(phone_number ORDER BY (phone_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS phone_number,
+            (ARRAY_AGG(phone_extension ORDER BY (phone_extension IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS phone_extension,
+            (ARRAY_AGG(fax_number ORDER BY (fax_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_number,
+            (ARRAY_AGG(fax_number_digits ORDER BY (fax_number_digits IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_number_digits,
+            (ARRAY_AGG(fax_extension ORDER BY (fax_extension IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_extension,
+            (ARRAY_AGG(lat ORDER BY ((lat IS NULL) OR (long IS NULL)), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::numeric AS lat,
+            (ARRAY_AGG(long ORDER BY ((lat IS NULL) OR (long IS NULL)), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::numeric AS long
+          FROM source_rows
+         WHERE provider_npi IS NOT NULL
+           AND (
+                telephone_number IS NOT NULL
+             OR phone_number IS NOT NULL
+             OR fax_number IS NOT NULL
+             OR fax_number_digits IS NOT NULL
+             OR (lat IS NOT NULL AND long IS NOT NULL)
+           )
+      GROUP BY provider_npi, address_key
+    )
+    UPDATE {db_schema}.{table_name} AS target_row
+       SET telephone_number = COALESCE(target_row.telephone_number, grouped_fields.telephone_number),
+           phone_number = COALESCE(target_row.phone_number, grouped_fields.phone_number),
+           phone_extension = COALESCE(target_row.phone_extension, grouped_fields.phone_extension),
+           fax_number = COALESCE(target_row.fax_number, grouped_fields.fax_number),
+           fax_number_digits = COALESCE(target_row.fax_number_digits, grouped_fields.fax_number_digits),
+           fax_extension = COALESCE(target_row.fax_extension, grouped_fields.fax_extension),
+           lat = CASE WHEN {target_coordinate_missing} THEN grouped_fields.lat ELSE target_row.lat END,
+           long = CASE WHEN {target_coordinate_missing} THEN grouped_fields.long ELSE target_row.long END
+      FROM grouped_fields
+     WHERE target_row.address_key IS NOT NULL
+       AND target_row.address_key = grouped_fields.address_key
+       AND COALESCE(
+            target_row.npi,
+            target_row.inferred_npi,
+            CASE
+                WHEN target_row.entity_type = 'npi' AND target_row.entity_id ~ '^[0-9]+$'
+                    THEN target_row.entity_id::bigint
+                ELSE NULL::bigint
+            END
+       ) = grouped_fields.provider_npi
+       AND (
+            (target_row.telephone_number IS NULL AND grouped_fields.telephone_number IS NOT NULL)
+         OR (target_row.phone_number IS NULL AND grouped_fields.phone_number IS NOT NULL)
+         OR (target_row.phone_extension IS NULL AND grouped_fields.phone_extension IS NOT NULL)
+         OR (target_row.fax_number IS NULL AND grouped_fields.fax_number IS NOT NULL)
+         OR (target_row.fax_number_digits IS NULL AND grouped_fields.fax_number_digits IS NOT NULL)
+         OR (target_row.fax_extension IS NULL AND grouped_fields.fax_extension IS NOT NULL)
+         OR (({target_coordinate_missing}) AND grouped_fields.lat IS NOT NULL AND grouped_fields.long IS NOT NULL)
+       );
     """
 
 
@@ -10820,6 +10957,20 @@ async def shutdown(ctx):
         context["archive_coordinate_backfill_rows"] = int(archive_coordinate_backfill_rows or 0)
     else:
         context["archive_coordinate_backfill_rows"] = 0
+    same_provider_address_backfill_rows = await _run_sql_phase(
+        _backfill_same_provider_address_fields_sql(db_schema, stage_cls.__tablename__),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified backfilling same-provider address fields",
+        unit="rows",
+        done=0,
+        total=1,
+        pct=96,
+        message="backfilling missing contact and coordinates across same-provider addresses",
+        emit_start=True,
+        emit_done=True,
+    )
+    context["same_provider_address_backfill_rows"] = int(same_provider_address_backfill_rows or 0)
     context["publish_validation_deferred"] = defer_publish_validation
     if defer_publish_validation:
         context["publish_validation"] = {
@@ -10968,6 +11119,9 @@ async def shutdown(ctx):
             "support_stage_skipped": bool(context.get("support_stage_skipped")),
             "archive_coordinate_backfill_rows": int(
                 context.get("archive_coordinate_backfill_rows") or 0
+            ),
+            "same_provider_address_backfill_rows": int(
+                context.get("same_provider_address_backfill_rows") or 0
             ),
             **_runtime_config_metrics(context),
             "publish_validation": context.get("publish_validation") or {},

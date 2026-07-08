@@ -1419,6 +1419,88 @@ def test_provider_directory_location_preserves_raw_contact_and_adds_canonical_di
     assert row["fax_extension"] == "22"
 
 
+def test_provider_directory_location_normalizes_valid_coordinates():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-geo",
+            "position": {"latitude": "40.292922", "longitude": "-74.806333"},
+            "address": {
+                "line": ["1 Capital Way"],
+                "city": "Pennington",
+                "state": "NJ",
+                "postalCode": "08534",
+                "country": "US",
+            },
+        },
+    )
+
+    assert model is ProviderDirectoryLocation
+    assert row["latitude"] == "40.292922"
+    assert row["longitude"] == "-74.806333"
+
+
+def test_provider_directory_location_restores_scaled_us_coordinates():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-scaled-geo",
+            "position": {"latitude": "39104200", "longitude": "-84536000"},
+            "address": {
+                "line": ["100 Main St"],
+                "city": "Cincinnati",
+                "state": "OH",
+                "postalCode": "45202",
+                "country": "US",
+            },
+        },
+    )
+
+    assert model is ProviderDirectoryLocation
+    assert row["latitude"] == "39.1042"
+    assert row["longitude"] == "-84.536"
+
+
+def test_provider_directory_location_drops_placeholder_or_implausible_coordinates():
+    _, zero_row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-zero-geo",
+            "position": {"latitude": "0", "longitude": "0"},
+            "address": {
+                "line": ["100 Main St"],
+                "city": "Chicago",
+                "state": "IL",
+                "postalCode": "60601",
+                "country": "US",
+            },
+        },
+    )
+    _, implausible_row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-implausible-geo",
+            "position": {"latitude": "20022053", "longitude": "-100790700"},
+            "address": {
+                "line": ["100 Main St"],
+                "city": "Chicago",
+                "state": "IL",
+                "postalCode": "60601",
+                "country": "US",
+            },
+        },
+    )
+
+    assert zero_row["latitude"] is None
+    assert zero_row["longitude"] is None
+    assert implausible_row["latitude"] is None
+    assert implausible_row["longitude"] is None
+
+
 def test_provider_directory_location_can_skip_contact_derivation_for_streaming_batches():
     model, row = importer.parse_fhir_resource(
         "source_a",
@@ -6879,6 +6961,21 @@ def test_address_overlay_sql_scope():
     assert "addr_key_v1" in sql
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
+    assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
+    assert "AS role_phone ON TRUE" in sql
+    assert "loc.latitude" in sql
+    assert "/ 1000000" in sql
+    assert "ABS(" in sql
+    assert "lat,\n        long," in sql
+
+
+def test_address_overlay_table_sql_includes_coordinates():
+    sql = importer.provider_directory_address_overlay_table_sql("mrf")
+
+    assert "lat numeric" in sql
+    assert "long numeric" in sql
+    assert "ADD COLUMN IF NOT EXISTS lat numeric" in sql
+    assert "ADD COLUMN IF NOT EXISTS long numeric" in sql
 
 
 def test_address_overlay_component_sql_is_bounded_to_one_component():
@@ -6907,6 +7004,25 @@ def test_address_overlay_component_sql_is_bounded_to_one_component():
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
     assert sql.count("addr_key_v1(") == 1
+
+
+def test_address_overlay_practitioner_component_uses_role_phone_and_coordinates():
+    sql = importer._address_overlay_component_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        component="practitioner_role",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+
+    assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
+    assert "COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number" in sql
+    assert "AS role_phone ON TRUE" in sql
+    assert "AS role_fax ON TRUE" in sql
+    assert "loc.latitude" in sql
+    assert "loc.longitude" in sql
+    assert "/ 1000000" in sql
+    assert "ABS(" in sql
 
 
 def test_address_overlay_stage_index_names_are_hash_safe():
@@ -7092,6 +7208,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     }
     assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
+    assert metrics["archive_coordinate_backfill_rows"] == 0
     assert metrics["source_ids"] == ["source_a"]
     assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
     stage_source_record_idx = importer._address_overlay_index_name(stage_table, "source_record_idx")
@@ -7102,6 +7219,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
     assert "PARTITION BY source_record_id" in joined_sql
     assert "duplicate_rank > 1" in joined_sql
+    assert 'FROM "mrf"."address_archive_v2" AS archive' in joined_sql
     assert f'ALTER TABLE "mrf"."{stage_table}" RENAME TO "provider_directory_address_overlay"' in joined_sql
     assert 'ALTER TABLE "mrf"."provider_directory_address_overlay" RENAME TO "provider_directory_address_overlay_old"' in joined_sql
     assert (
