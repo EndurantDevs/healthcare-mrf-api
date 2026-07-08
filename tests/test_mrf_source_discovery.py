@@ -9700,6 +9700,43 @@ def _assert_catalog_progress_events(progress_events):
     assert {event["run_id"] for event in progress_events} == {"run_catalog"}
 
 
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_uses_requested_catalog_concurrency(
+    monkeypatch,
+):
+    http_calls = []
+    snapshot_state_dict = {"active": 0, "max_active": 0}
+
+    async def fake_snapshot(source_ids):
+        assert len(source_ids) == 1
+        snapshot_state_dict["active"] += 1
+        snapshot_state_dict["max_active"] = max(
+            snapshot_state_dict["max_active"], snapshot_state_dict["active"]
+        )
+        await asyncio.sleep(0.01)
+        snapshot_state_dict["active"] -= 1
+        return {}
+
+    monkeypatch.delenv("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY", raising=False)
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        _metadata_only_catalog_source_rows(),
+        limit=2,
+        concurrency=2,
+    )
+
+    assert sources_synced == 2
+    assert plans_synced == 0
+    assert errors == []
+    assert snapshot_state_dict["max_active"] == 2
+
+
 def _metadata_only_catalog_source_rows():
     return [
         {

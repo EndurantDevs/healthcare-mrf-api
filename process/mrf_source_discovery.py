@@ -13497,6 +13497,13 @@ def _import_control_seed_batch_size() -> int:
     return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 100)
 
 
+def _import_control_catalog_concurrency(requested: int | None) -> int:
+    configured = os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY")
+    if configured:
+        return min(_positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY", 1), 32)
+    return min(max(1, int(requested or 1)), 32)
+
+
 def _coerce_metadata(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -14717,6 +14724,7 @@ async def _push_import_control_catalog(
     *,
     limit: int | None = None,
     progress_run_id: str | None = None,
+    concurrency: int | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """Promote eligible discovered sources into import-control and push their discovered
     plans (built from the stored MRF file snapshot). Returns
@@ -14764,9 +14772,58 @@ async def _push_import_control_catalog(
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
+    catalog_concurrency = _import_control_catalog_concurrency(concurrency)
     sources_synced = 0
     plans_synced = 0
     errors: list[dict[str, Any]] = []
+    if catalog_concurrency > 1 and len(eligible_rows_by_identity) > 1:
+        progress_total = len(eligible)
+        progress_state_dict = {"done": 0}
+        progress_lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(catalog_concurrency)
+
+        async def sync_catalog_identity_group(
+            group_rows: list[dict[str, Any]],
+        ) -> tuple[int, int, list[dict[str, Any]]]:
+            """Sync one source identity group while sharing global run progress."""
+            async with semaphore:
+                result = await _push_import_control_catalog(
+                    group_rows,
+                    limit=len(group_rows),
+                    progress_run_id=None,
+                    concurrency=1,
+                )
+            async with progress_lock:
+                progress_state_dict["done"] += len(group_rows)
+                current_done = progress_state_dict["done"]
+            if progress_run_id:
+                enqueue_live_progress(
+                    run_id=progress_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="syncing import-control catalog",
+                    unit="sources",
+                    done=current_done,
+                    total=progress_total,
+                    message=f"synced catalog source {current_done}/{progress_total}",
+                )
+            return result
+
+        sync_results = await asyncio.gather(
+            *(
+                sync_catalog_identity_group(group_rows)
+                for group_rows in eligible_rows_by_identity.values()
+            )
+        )
+        sources_synced = sum(item[0] for item in sync_results)
+        plans_synced = sum(item[1] for item in sync_results)
+        errors = [error for item in sync_results for error in item[2]]
+        if errors and not sources_synced:
+            raise RuntimeError(
+                f"import-control catalog sync failed for all {len(errors)} source(s): "
+                + "; ".join(str(item.get("message") or "") for item in errors)[:500]
+            )
+        return (sources_synced, plans_synced, errors)
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
@@ -15518,6 +15575,7 @@ async def main(
                         source_rows,
                         limit=bounded_limit,
                         progress_run_id=control_run_id,
+                        concurrency=concurrency,
                     )
                 )
                 result.import_control_sources_synced = sources_synced
