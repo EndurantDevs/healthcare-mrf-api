@@ -319,6 +319,47 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
     assert candidate["facility"]["classification_confidence"] == "high"
 
 
+def test_match_candidate_output_boosts_provider_type_taxonomy_match():
+    candidate = npi_module._match_candidate_output(
+        {
+            "npi": 1730166224,
+            "entity_type_code": 2,
+            "provider_organization_name": "INSIGHT CHICAGO, INC.",
+            "address_key": "d8c8e7f0-d765-4786-9349-3663085a23b3",
+            "address_key_matched": True,
+            "address_site_key_matched": False,
+            "phone_matched": False,
+            "geo_distance_miles": None,
+            "address_sources": ["nppes"],
+            "source_count": 1,
+            "taxonomy_list": [
+                {
+                    "taxonomy_code": "282N00000X",
+                    "primary": True,
+                    "display_name": "General Acute Care Hospital",
+                }
+            ],
+        },
+        {
+            "radius_miles": 1.0,
+            "taxonomy_exact": ("282N00000X",),
+            "taxonomy_prefixes": ("261Q",),
+            "provider_type": "hospital",
+            "specialty_filter": types.SimpleNamespace(
+                taxonomy_codes=("282N00000X",),
+                classification=None,
+            ),
+            "include_sources": False,
+            "include_evidence": True,
+        },
+        None,
+    )
+
+    assert candidate["match_score"] == 0.64
+    assert candidate["match_signals"]["taxonomy"]["contribution"] == 0.14
+    assert candidate["match_signals"]["taxonomy"]["provider_type_matched"] is True
+
+
 def test_match_candidate_sort_key_prefers_source_count_before_npi():
     ordered = sorted(
         [

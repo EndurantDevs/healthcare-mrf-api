@@ -3182,6 +3182,7 @@ def _match_signal_payload(
     row: Mapping[str, Any],
     params: Mapping[str, Any],
     taxonomy_matched: bool,
+    is_provider_type_matched: bool,
     fhir_matched: bool,
     ffs_matched: bool,
 ) -> tuple[dict[str, Any], float]:
@@ -3217,8 +3218,12 @@ def _match_signal_payload(
     else:
         signals["geo_distance"] = {"matched": False}
     if taxonomy_matched:
-        score += 0.10
-        signals["taxonomy"]["contribution"] = 0.10
+        taxonomy_contribution = 0.10
+        if is_provider_type_matched:
+            taxonomy_contribution += 0.04
+            signals["taxonomy"]["provider_type_matched"] = True
+        score += taxonomy_contribution
+        signals["taxonomy"]["contribution"] = round(taxonomy_contribution, 4)
     if fhir_matched:
         score += 0.05
         signals["fhir"]["contribution"] = 0.05
@@ -3279,6 +3284,23 @@ def _provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, A
     return False
 
 
+def _is_provider_type_taxonomy_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
+    specialty_filter = params.get("specialty_filter")
+    if specialty_filter is None:
+        return False
+    taxonomy_list = _json_array_value(row.get("taxonomy_list"))
+    specialty_codes = {str(code).upper() for code in specialty_filter.taxonomy_codes}
+    for item in taxonomy_list:
+        if not isinstance(item, Mapping):
+            continue
+        code = str(item.get("taxonomy_code") or "").upper()
+        if code in specialty_codes:
+            return True
+        if specialty_filter.classification and item.get("classification") == specialty_filter.classification:
+            return True
+    return False
+
+
 def _match_candidate_output(
     row: Mapping[str, Any],
     params: Mapping[str, Any],
@@ -3296,10 +3318,12 @@ def _match_candidate_output(
         or enrichment.get("has_medicare_claims")
     ))
     taxonomy_matched = _provider_type_filter_matched(row, params)
+    is_provider_type_matched = _is_provider_type_taxonomy_matched(row, params)
     match_signals, match_score = _match_signal_payload(
         row,
         params,
         taxonomy_matched,
+        is_provider_type_matched,
         fhir_matched,
         ffs_matched,
     )
