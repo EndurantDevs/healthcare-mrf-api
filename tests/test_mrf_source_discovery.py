@@ -14759,3 +14759,84 @@ async def test_push_import_control_catalog_skips_private_context_snapshot_by_def
         "http://import-control.test/v1/catalog/sources",
         "http://import-control.test/v1/catalog/sources/ic_source_1",
     ]
+
+
+def test_import_control_private_preview_item_filters_and_stamps_target():
+    item = {
+        "canonical_url": "https://example.com/ziprecruiter-oap.json.gz",
+        "description": "ZipRecruiter OAP in-network rates",
+        "plan_info": [{"plan_id": "123", "plan_name": "ZipRecruiter OAP"}],
+    }
+
+    stamped = discovery._import_control_preview_item_with_private_context(
+        item, "ZipRecruiter"
+    )
+
+    assert stamped is not None
+    assert stamped["company_name"] == "ZipRecruiter"
+    assert stamped["plan_info"][0]["plan_name"] == "OAP"
+    assert stamped["plan_info"][0]["plan_sponsor_name"] == "ZipRecruiter"
+    assert (
+        discovery._import_control_preview_item_with_private_context(
+            {
+                "canonical_url": "https://example.com/unrelated.json.gz",
+                "description": "Other Employer OAP",
+                "plan_info": [{"plan_id": "456", "plan_name": "OAP"}],
+            },
+            "ZipRecruiter",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_context_snapshot_source_ids_use_non_private_same_url(
+    monkeypatch,
+):
+    async def fake_all(_stmt):
+        return [
+            {
+                "source_id": "source_private_sibling",
+                "source_key": "private",
+                "display_name": "Private",
+                "source_type": "community_index",
+                "access_model": "free",
+                "index_url": "https://example.com/index.json",
+                "canonical_url": "https://example.com/index.json",
+                "status": "active",
+                "metadata_json": {
+                    "source_tier": "mrf_importable",
+                    "raw": {"private_query_context": True},
+                },
+            },
+            {
+                "source_id": "source_public_sibling",
+                "source_key": "public",
+                "display_name": "Public",
+                "source_type": "community_index",
+                "access_model": "free",
+                "index_url": "https://example.com/index.json",
+                "canonical_url": "https://example.com/index.json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+        ]
+
+    monkeypatch.setattr(discovery.db, "all", fake_all)
+
+    source_ids = await discovery._private_context_snapshot_source_ids(
+        {
+            "source_id": "source_private",
+            "index_url": "https://example.com/index.json",
+            "canonical_url": "https://example.com/index.json",
+            "metadata_json": {
+                "source_tier": "mrf_importable",
+                "raw": {
+                    "private_query_context": True,
+                    "target_payer_query": "ZipRecruiter",
+                },
+            },
+        }
+    )
+
+    assert source_ids == ["source_public_sibling"]

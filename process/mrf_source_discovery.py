@@ -14114,6 +14114,188 @@ async def _import_control_snapshot_items(
     return grouped
 
 
+def _import_control_preview_item_matches_query(
+    item: dict[str, Any], target_query: str | None
+) -> bool:
+    values: list[Any] = [
+        item.get("original_url"),
+        item.get("canonical_url"),
+        item.get("domain"),
+        item.get("source_type"),
+        item.get("network_name"),
+        item.get("description"),
+        item.get("from_index_url"),
+        item.get("company_name"),
+        item.get("reporting_entity_name"),
+        item.get("group_id"),
+        item.get("group_number"),
+        item.get("client_id"),
+        item.get("client_name"),
+        item.get("employer_id"),
+        item.get("employer_name"),
+        item.get("employer_slug"),
+        item.get("entity_slug"),
+        item.get("target_label"),
+    ]
+    for plan in item.get("plan_info") or []:
+        if not isinstance(plan, dict):
+            continue
+        values.extend(
+            [
+                plan.get("plan_id"),
+                plan.get("plan_name"),
+                plan.get("planName"),
+                plan.get("plan_sponsor_name"),
+                plan.get("plan_sponser_name"),
+                plan.get("sponsor_name"),
+                plan.get("company_name"),
+            ]
+        )
+    return _search_values_match_query(values, target_query)
+
+
+def _import_control_preview_item_with_private_context(
+    item: dict[str, Any], target_query: str
+) -> dict[str, Any] | None:
+    if not _import_control_preview_item_matches_query(item, target_query):
+        return None
+    next_item = dict(item)
+    plan_info = _query_expanded_plan_info(next_item.get("plan_info") or [], target_query)
+    next_item["plan_info"] = _apply_company_fallback(plan_info, target_query)
+    next_item.setdefault("company_name", target_query)
+    return next_item
+
+
+def _source_row_url_match_values(row: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for value in (
+        row.get("canonical_url"),
+        row.get("index_url"),
+        row.get("human_url"),
+        *_import_control_source_urls(row),
+    ):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        values.append(text)
+        canonical = _canonical_or_none(text)
+        if canonical:
+            values.append(canonical)
+    return list(dict.fromkeys(values))
+
+
+async def _private_context_snapshot_source_ids(
+    row: dict[str, Any], *, limit: int = 8
+) -> list[str]:
+    source_id = str(row.get("source_id") or "")
+    url_values = _source_row_url_match_values(row)
+    if not source_id or not url_values:
+        return []
+    stmt = (
+        select(
+            MRFSource.source_id,
+            MRFSource.payer_id,
+            MRFSource.source_key,
+            MRFSource.display_name,
+            MRFSource.source_type,
+            MRFSource.hosting_platform,
+            MRFSource.access_model,
+            MRFSource.index_url,
+            MRFSource.human_url,
+            MRFSource.canonical_url,
+            MRFSource.domain,
+            MRFSource.status,
+            MRFSource.schema_version,
+            MRFSource.latest_index_date,
+            MRFSource.num_plans,
+            MRFSource.num_files,
+            MRFSource.num_indices,
+            MRFSource.total_compressed_size,
+            MRFSource.provenance_url,
+            MRFSource.seed_provider,
+            MRFSource.confidence,
+            MRFSource.license_status,
+            MRFSource.review_status,
+            MRFSource.metadata_json,
+            MRFSource.created_at,
+            MRFSource.updated_at,
+        )
+        .where(MRFSource.source_id != source_id)
+        .where(
+            or_(
+                MRFSource.canonical_url.in_(url_values),
+                MRFSource.index_url.in_(url_values),
+                MRFSource.human_url.in_(url_values),
+            )
+        )
+        .order_by(
+            MRFSource.num_files.desc().nullslast(),
+            MRFSource.num_plans.desc().nullslast(),
+            MRFSource.source_id,
+        )
+        .limit(limit * 3)
+    )
+    rows = await db.all(stmt)
+    source_ids: list[str] = []
+    for candidate_row in rows:
+        candidate = _stored_source_row_from_db_row(candidate_row)
+        candidate_id = str(candidate.get("source_id") or "")
+        if not candidate_id or candidate_id == source_id:
+            continue
+        if _has_private_query_context_source_row(candidate):
+            continue
+        if not _source_row_is_importable(candidate):
+            continue
+        source_ids.append(candidate_id)
+        if len(source_ids) >= limit:
+            break
+    return source_ids
+
+
+async def _private_context_snapshot_items(
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not _has_private_query_context_source_row(row):
+        return []
+    if not _should_sync_private_context_snapshots():
+        return []
+    target_query = _source_target_payer_query(row) or _clean_text(
+        _import_control_source_context_metadata(row).get("target_payer_query")
+    )
+    if not target_query:
+        return []
+    try:
+        sibling_source_ids = await _private_context_snapshot_source_ids(row)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logging.getLogger(__name__).warning(
+            "private-context sibling snapshot lookup failed: %s", exc
+        )
+        return []
+    if not sibling_source_ids:
+        return []
+    sibling_snapshots = await _import_control_snapshot_items(sibling_source_ids)
+    items: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for sibling_id in sibling_source_ids:
+        for item in sibling_snapshots.get(sibling_id) or []:
+            private_item = _import_control_preview_item_with_private_context(
+                item, target_query
+            )
+            if private_item is None:
+                continue
+            item_key = str(
+                private_item.get("canonical_url")
+                or private_item.get("original_url")
+                or ""
+            )
+            if item_key and item_key in seen_urls:
+                continue
+            if item_key:
+                seen_urls.add(item_key)
+            items.append(private_item)
+    return items
+
+
 _IMPORT_CONTROL_STAGED_VISIBILITY = "internal"
 _IMPORT_CONTROL_STAGED_STATUS = "needs_review"
 
@@ -14534,6 +14716,17 @@ async def _push_import_control_catalog(
                 if group_snapshot_source_ids
                 else {}
             )
+            for row in group_rows:
+                source_id = str(row.get("source_id") or "")
+                if (
+                    source_id
+                    and not snapshots_by_source_id.get(source_id)
+                    and _has_private_query_context_source_row(row)
+                    and _should_sync_private_context_snapshots()
+                ):
+                    private_items = await _private_context_snapshot_items(row)
+                    if private_items:
+                        snapshots_by_source_id[source_id] = private_items
             rows_to_sync = _dedupe_import_control_source_rows(
                 group_rows, snapshots_by_source_id
             )
