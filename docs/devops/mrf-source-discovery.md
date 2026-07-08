@@ -44,10 +44,10 @@ Configure these in `import-control`, not hard-coded cron:
 | Cadence | Params | Purpose |
 | --- | --- | --- |
 | Daily | `--provider master-list --check-urls --concurrency 10` | catch broken/stale curated sources |
-| Weekly | `--provider master-list --crawl --concurrency 10 --sync-import-control --sync-import-control-catalog` | refresh the full searchable source, plan, and file catalog |
+| Weekly | `--provider master-list --check-urls --concurrency 10 --sync-import-control --sync-import-control-catalog` | refresh source health and publish the full stored searchable source, plan, and file catalog |
 | Weekly TPA | `--provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10` | keep TPA-hosted metadata and file references current |
 | Weekly TPA probe | `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10` | sample TPA body-file freshness without full PTG import |
-| Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control` | full metadata refresh within bounded source universe |
+| Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control --sync-import-control-catalog` | full metadata refresh within bounded source universe |
 
 Use `--crawl-target-limit` for production smoke/canary runs before unbounded monthly crawls.
 
