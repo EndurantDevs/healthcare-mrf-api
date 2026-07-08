@@ -3253,11 +3253,22 @@ def _match_candidate_source_count(item: Mapping[str, Any]) -> int:
     return int(fhir_sources.get("source_count") or 0)
 
 
-def _match_candidate_sort_key(item: Mapping[str, Any]) -> tuple[float, int, int]:
+def _is_match_candidate_provider_type_matched(item: Mapping[str, Any]) -> bool:
+    match_signals = item.get("match_signals")
+    if not isinstance(match_signals, Mapping):
+        return False
+    taxonomy_signal = match_signals.get("taxonomy")
+    if not isinstance(taxonomy_signal, Mapping):
+        return False
+    return bool(taxonomy_signal.get("provider_type_matched"))
+
+
+def _match_candidate_sort_key(item: Mapping[str, Any]) -> tuple[float, int, int, int]:
     """Sort strongest, most corroborated candidates first."""
 
     return (
         -float(item.get("match_score") or 0),
+        -int(_is_match_candidate_provider_type_matched(item)),
         -_match_candidate_source_count(item),
         int(item.get("npi") or 0),
     )

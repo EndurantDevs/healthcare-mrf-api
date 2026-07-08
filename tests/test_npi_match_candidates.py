@@ -360,24 +360,32 @@ def test_match_candidate_output_boosts_provider_type_taxonomy_match():
     assert candidate["match_signals"]["taxonomy"]["provider_type_matched"] is True
 
 
-def test_match_candidate_sort_key_prefers_source_count_before_npi():
-    ordered = sorted(
+def test_match_candidate_sort_key_orders_ties():
+    def top_npi(candidates):
+        return sorted(candidates, key=npi_module._match_candidate_sort_key)[0]["npi"]
+
+    assert top_npi(
+        [
+            {"npi": 1306486022, "match_score": 0.65, "sources": {"fhir": {"source_count": 1}}},
+            {"npi": 1730166224, "match_score": 0.65, "sources": {"fhir": {"source_count": 2}}},
+        ]
+    ) == 1730166224
+    assert top_npi(
         [
             {
                 "npi": 1306486022,
-                "match_score": 0.65,
-                "sources": {"fhir": {"source_count": 1}},
+                "match_score": 1.0,
+                "match_signals": {"taxonomy": {"matched": True}},
+                "sources": {"fhir": {"source_count": 3}},
             },
             {
                 "npi": 1730166224,
-                "match_score": 0.65,
-                "sources": {"fhir": {"source_count": 2}},
+                "match_score": 1.0,
+                "match_signals": {"taxonomy": {"provider_type_matched": True}},
+                "sources": {"fhir": {"source_count": 1}},
             },
-        ],
-        key=npi_module._match_candidate_sort_key,
-    )
-
-    assert ordered[0]["npi"] == 1730166224
+        ]
+    ) == 1730166224
 
 
 @pytest.mark.asyncio
