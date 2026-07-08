@@ -544,6 +544,9 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     import_id = str(payload.get("import_id") or "").strip()
     if import_id:
         env.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
+    run_id = str(payload.get("run_id") or "").strip()
+    if spec.role == "start" and spec.worker_class.startswith("process.PTG") and run_id:
+        env.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": f"ptg_start_{run_id}"})
 
     container: dict[str, Any] = {
         "name": "worker",
@@ -587,7 +590,6 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
         "healthporta.com/worker-class-hash": _label_hash(spec.worker_class),
         "healthporta.com/role": spec.role,
     }
-    run_id = str(payload.get("run_id") or "").strip()
     if run_id:
         labels["healthporta.com/run-id-hash"] = _label_hash(run_id)
     job_spec: dict[str, Any] = {

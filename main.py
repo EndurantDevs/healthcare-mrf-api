@@ -132,7 +132,10 @@ def worker_once(worker_settings: str, verbose: bool, custom_log_dict: str | None
 
 
 def _create_single_job_worker(settings):
+    target_job_id = _worker_once_target_job_id()
     scan_limit = _worker_once_scan_limit(settings)
+    if target_job_id:
+        scan_limit = max(scan_limit, _worker_once_target_scan_limit())
     worker = create_worker(
         settings,
         burst=True,
@@ -144,10 +147,19 @@ def _create_single_job_worker(settings):
 
     async def start_jobs_once(job_ids):
         """Clamp burst accounting once this worker claims one real job."""
+        selected_job_ids = list(job_ids)
+        if target_job_id:
+            selected_job_ids = [job_id for job_id in selected_job_ids if _job_id_text(job_id) == target_job_id]
+            if not selected_job_ids:
+                worker.max_burst_jobs = 0
+                return None
         jobs_started_before = worker._jobs_started()
-        await original_start_jobs(job_ids)
-        if worker._jobs_started() > jobs_started_before:
-            worker.max_burst_jobs = worker._jobs_started()
+        await original_start_jobs(selected_job_ids)
+        jobs_started_after = worker._jobs_started()
+        if jobs_started_after > jobs_started_before:
+            worker.max_burst_jobs = jobs_started_after
+        elif target_job_id:
+            worker.max_burst_jobs = 0
 
     worker.start_jobs = start_jobs_once
     return worker
@@ -158,6 +170,21 @@ def _worker_once_scan_limit(settings) -> int:
     if configured:
         return configured
     return max(_positive_int(getattr(settings, "queue_read_limit", None)) or 16, 16)
+
+
+def _worker_once_target_job_id() -> str | None:
+    value = os.environ.get("HLTHPRT_WORKER_ONCE_TARGET_JOB_ID")
+    return value.strip() if value and value.strip() else None
+
+
+def _worker_once_target_scan_limit() -> int:
+    return _positive_int(os.environ.get("HLTHPRT_WORKER_ONCE_TARGET_SCAN_LIMIT")) or 10000
+
+
+def _job_id_text(job_id) -> str:
+    if isinstance(job_id, bytes):
+        return job_id.decode()
+    return str(job_id)
 
 
 def _positive_int(value) -> int | None:

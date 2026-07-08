@@ -265,6 +265,7 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
     env = {item["name"]: item["value"] for item in container["env"]}
     assert env["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert env["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
+    assert env["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
 def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
