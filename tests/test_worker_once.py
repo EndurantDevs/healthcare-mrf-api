@@ -107,10 +107,10 @@ def test_worker_once_scan_limit_can_be_overridden(monkeypatch):
 
 
 def test_worker_once_target_job_uses_large_scan_window(monkeypatch):
-    captured_kwargs = {}
+    captured_kwargs_map = {}
 
     def fake_create_worker(_settings, **kwargs):
-        captured_kwargs.update(kwargs)
+        captured_kwargs_map.update(kwargs)
         worker = SimpleNamespace(**kwargs)
         worker._jobs_started = lambda: 0
 
@@ -125,5 +125,5 @@ def test_worker_once_target_job_uses_large_scan_window(monkeypatch):
 
     main._create_single_job_worker(WorkerSettings)
 
-    assert captured_kwargs["queue_read_limit"] == 10000
-    assert captured_kwargs["max_burst_jobs"] == 10000
+    assert captured_kwargs_map["queue_read_limit"] == 10000
+    assert captured_kwargs_map["max_burst_jobs"] == 10000

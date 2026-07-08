@@ -274,7 +274,7 @@ def _source_config() -> dict[str, Any]:
 
 
 IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
-    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "500")), 1
+    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "5000")), 1
 )
 TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "mymedicalshopper_talon",
