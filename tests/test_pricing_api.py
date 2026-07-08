@@ -79,6 +79,29 @@ def make_request(results, args=None):
     )
 
 
+SMILE_ALLOWED_TABLE_NAMES = (
+    "mrf.ptg_allowed_item_smile_import",
+    "mrf.ptg_allowed_payment_smile_import",
+    "mrf.ptg_allowed_provider_payment_smile_import",
+)
+SMILE_ALLOWED_ROW_BY_FIELD = {
+    "npi": 1427166008,
+    "plan_id": "911643507",
+    "billing_code_type": "CPT",
+    "billing_code": "99214",
+    "allowed_amount": 133.0,
+    "billed_charge": 155.0,
+    "tin_type": "ein",
+    "tin_value": "123456789",
+}
+SMILE_IMPORT_ROW_BY_FIELD = {
+    "source_file_import_id": "smile_import",
+    "source_key": "ptg_smile",
+    "snapshot_id": "ptg2:202607:smile",
+    "metrics": {"plan_count": 1},
+}
+
+
 async def fake_plan_snapshot_pairs(_session, _plan_fields):
     return [("ptg_test", "ptg2:test")]
 
@@ -2319,6 +2342,83 @@ async def test_allowed_amount_empty_ptg_fallback(monkeypatch):
     assert payload["result_state"] == "allowed_amounts_found"
     assert payload["items"][0]["allowed_amount_min"] == 133.0
     assert payload["query"]["source"] == "ptg_allowed_amounts"
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_search_checks_tables_and_allows_single_plan_alias(monkeypatch):
+    """Allowed-amount fallback tolerates catalog-plan aliases for single-plan files."""
+    checked_tables = []
+
+    async def has_test_table(_session, table_name):
+        checked_tables.append(table_name)
+        return True
+
+    async def fake_import_rows(_session, _args, *, plan_id):
+        assert plan_id == "7862274fdc01bcc0"
+        return [SMILE_IMPORT_ROW_BY_FIELD]
+
+    plan_id_filters = []
+
+    async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
+        assert table_names == SMILE_ALLOWED_TABLE_NAMES
+        assert code == "99214"
+        assert code_system == "CPT"
+        assert npi is None
+        assert limit > 0
+        plan_id_filters.append(plan_id)
+        return [] if plan_id else [SMILE_ALLOWED_ROW_BY_FIELD]
+
+    async def fake_provider_rows(_session, *, npis, **_kwargs):
+        assert npis == (1427166008,)
+        return []
+
+    monkeypatch.setattr(pricing_module, "_table_exists", has_test_table)
+    monkeypatch.setattr(pricing_module, "_allowed_amount_import_rows_for_plan", fake_import_rows)
+    monkeypatch.setattr(pricing_module, "_allowed_amount_rows_from_tables", fake_allowed_rows)
+    monkeypatch.setattr(pricing_module, "_ptg2_manifest_enriched_provider_rows_for_npis", fake_provider_rows)
+
+    fallback_payload = await pricing_module._search_ptg_allowed_amount_evidence(
+        FakeSession(),
+        {"plan_id": "7862274fdc01bcc0", "market_type": "group", "code": "99214", "code_system": "CPT"},
+        types.SimpleNamespace(limit=3, offset=0, page=1),
+    )
+
+    assert fallback_payload["result_state"] == "allowed_amounts_found"
+    assert fallback_payload["pricing_scope"] == "plan_scoped_allowed_amounts"
+    assert fallback_payload["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
+    assert fallback_payload["items"][0]["prices"][0]["allowed_amount"] == 133.0
+    assert plan_id_filters == ["7862274fdc01bcc0", ""]
+    assert checked_tables == ["hp_import_control.source_file_import", *SMILE_ALLOWED_TABLE_NAMES]
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_import_rows_include_file_plan_candidates():
+    session = FakeSession(
+        [
+            FakeResult([]),
+            FakeResult(
+                [
+                    {
+                        "source_file_import_id": "candidate_import",
+                        "snapshot_id": "ptg2:202607:candidate",
+                        "source_key": "ptg_candidate",
+                        "import_month": "2026-07-01",
+                        "attempt_no": 1,
+                        "metrics": {"plan_count": 1},
+                    }
+                ]
+            ),
+        ]
+    )
+
+    rows = await pricing_module._allowed_amount_import_rows_for_plan(
+        session,
+        {"market_type": "group"},
+        plan_id="911643507",
+    )
+
+    assert [row["source_file_import_id"] for row in rows] == ["candidate_import"]
+    assert len(session.executions) == 2
 
 
 @pytest.mark.asyncio

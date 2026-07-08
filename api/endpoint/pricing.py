@@ -4813,8 +4813,7 @@ async def _search_ptg_allowed_amount_evidence(
         table_names = _allowed_amount_table_names(suffix)
         if table_names is None:
             continue
-        item_table, payment_table, provider_payment_table = table_names
-        if not all(await _table_exists(session, table) for table in table_names):
+        if not await _has_all_allowed_amount_tables(session, table_names):
             continue
         rows = await _allowed_amount_rows_from_tables(
             session,
@@ -4825,6 +4824,16 @@ async def _search_ptg_allowed_amount_evidence(
             npi=npi_filter,
             limit=_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT,
         )
+        if not rows and _can_use_allowed_amount_table_plan(import_row, args):
+            rows = await _allowed_amount_rows_from_tables(
+                session,
+                table_names=table_names,
+                plan_id="",
+                code=code,
+                code_system=code_system,
+                npi=npi_filter,
+                limit=_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT,
+            )
         if rows:
             evidence_rows = rows
             import_context = import_row
@@ -4943,8 +4952,79 @@ async def _search_ptg_allowed_amount_evidence(
     }
 
 
+async def _has_all_allowed_amount_tables(session, table_names: tuple[str, str, str]) -> bool:
+    for table_name in table_names:
+        if not await _table_exists(session, table_name):
+            return False
+    return True
+
+
+def _can_use_allowed_amount_table_plan(import_row: Mapping[str, Any], args: Mapping[str, Any]) -> bool:
+    """Allow catalog-plan aliases for single-plan allowed-amount files.
+
+    Some source indexes identify the group plan with a catalog-local plan id,
+    while the allowed-amount file itself carries the payer's plan id. If the
+    import is scoped to one discovered plan, the table's plan id is still safe
+    evidence for that requested catalog plan. Multi-plan files keep the exact
+    table plan-id filter.
+    """
+    if args.get("source_key") or args.get("snapshot_id"):
+        return True
+    metrics = _dict_from_jsonish(import_row.get("metrics"))
+    try:
+        return int(metrics.get("plan_count") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _dict_from_jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 async def _allowed_amount_import_rows_for_plan(session, args: Mapping[str, Any], *, plan_id: str) -> list[dict[str, Any]]:
     market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
+    source_key = str(args.get("source_key") or "").strip()
+    snapshot_id = str(args.get("snapshot_id") or "").strip()
+    catalog_rows = await _allowed_amount_catalog_import_rows(
+        session,
+        plan_id=plan_id,
+        market_type=market_type,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+    )
+    candidate_rows = await _allowed_amount_candidate_import_rows(
+        session,
+        market_type=market_type,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+    )
+    import_rows: list[dict[str, Any]] = []
+    seen_source_file_import_ids: set[str] = set()
+    for row in [*catalog_rows, *candidate_rows]:
+        source_file_import_id = str(row.get("source_file_import_id") or "").strip()
+        if not source_file_import_id or source_file_import_id in seen_source_file_import_ids:
+            continue
+        seen_source_file_import_ids.add(source_file_import_id)
+        import_rows.append(row)
+    return import_rows
+
+
+async def _allowed_amount_catalog_import_rows(
+    session,
+    *,
+    plan_id: str,
+    market_type: str,
+    source_key: str,
+    snapshot_id: str,
+) -> list[dict[str, Any]]:
     query_result = await session.execute(
         text(
             """
@@ -4967,11 +5047,61 @@ async def _allowed_amount_import_rows_for_plan(session, args: Mapping[str, Any],
                AND dp.status = 'active'
                AND dp.plan_id = :plan_id
                AND (:market_type = '' OR lower(COALESCE(dp.market_type, '')) = :market_type)
+               AND (:source_key = '' OR sfi.source_key = :source_key)
+               AND (:snapshot_id = '' OR sfi.snapshot_id = :snapshot_id)
              ORDER BY sfi.import_month DESC, sfi.attempt_no DESC, sfi.source_file_import_id DESC
              LIMIT 5
             """
         ),
-        {"plan_id": plan_id, "market_type": market_type},
+        {
+            "plan_id": plan_id,
+            "market_type": market_type,
+            "source_key": source_key,
+            "snapshot_id": snapshot_id,
+        },
+    )
+    return [_row_to_dict(import_row) for import_row in query_result]
+
+
+async def _allowed_amount_candidate_import_rows(
+    session,
+    *,
+    market_type: str,
+    source_key: str,
+    snapshot_id: str,
+) -> list[dict[str, Any]]:
+    query_result = await session.execute(
+        text(
+            """
+            SELECT DISTINCT
+                   sfi.source_file_import_id,
+                   sfi.snapshot_id,
+                   sfi.source_key,
+                   sfi.import_month,
+                   sfi.attempt_no,
+                   sfi.metrics
+              FROM hp_import_control.source_file_import sfi
+              JOIN hp_import_control.discovered_plan_file dpf
+                ON dpf.source_file_id = sfi.source_file_id
+               AND dpf.content_version = sfi.content_version
+              JOIN hp_import_control.discovered_plan dp
+                ON dp.discovered_plan_id = dpf.discovered_plan_id
+             WHERE sfi.status = 'succeeded'
+               AND sfi.removed_at IS NULL
+               AND lower(replace(COALESCE(dpf.file_domain, ''), '-', '_')) IN ('allowed_amounts', 'allowed_amount')
+               AND dp.status = 'active'
+               AND (:market_type = '' OR lower(COALESCE(dp.market_type, '')) = :market_type)
+               AND (:source_key = '' OR sfi.source_key = :source_key)
+               AND (:snapshot_id = '' OR sfi.snapshot_id = :snapshot_id)
+             ORDER BY sfi.import_month DESC, sfi.attempt_no DESC, sfi.source_file_import_id DESC
+             LIMIT 25
+            """
+        ),
+        {
+            "market_type": market_type,
+            "source_key": source_key,
+            "snapshot_id": snapshot_id,
+        },
     )
     return [_row_to_dict(import_row) for import_row in query_result]
 
