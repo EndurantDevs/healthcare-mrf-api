@@ -2326,6 +2326,25 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     return rows
 
 
+_PTG2_PROVIDER_REVERSE_TEXT_FILTER_SQL = """
+            (
+                LOWER(COALESCE(reported_code, '')) LIKE :q_like
+             OR LOWER(COALESCE(reported_code_system, '')) LIKE :q_like
+            )
+            """
+
+
+def _append_provider_reverse_text_filter(
+    filters: list[str],
+    params: dict[str, Any],
+    q_text: str,
+) -> None:
+    if not q_text:
+        return
+    filters.append(_PTG2_PROVIDER_REVERSE_TEXT_FILTER_SQL)
+    params["q_like"] = f"%{q_text}%"
+
+
 async def _ptg2_manifest_code_rows_for_provider_reverse(
     session,
     serving_tables: PTG2ServingTables,
@@ -2335,6 +2354,7 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
     code_system: Any,
     q_text: str,
     code_context: dict[str, Any] | None,
+    code_keys: Iterable[int] | None = None,
     limit_rows: int | None = None,
     offset_rows: int = 0,
 ) -> list[dict[str, Any]] | None:
@@ -2343,6 +2363,12 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
         return None
     params: dict[str, Any] = {}
     filters: list[str] = []
+    normalized_code_keys = sorted(
+        {int(code_key_value) for code_key_value in code_keys or () if code_key_value is not None}
+    )
+    if normalized_code_keys:
+        filters.append("code_key = ANY(CAST(:code_keys AS integer[]))")
+        params["code_keys"] = normalized_code_keys
     if requested_plan:
         plan_filter, plan_order = _code_plan_scope_sql(requested_plan, column="plan_id")
         filters.append(plan_filter)
@@ -2356,23 +2382,14 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
         code_system=code_system,
         code_context=code_context,
     )
-    if q_text:
-        filters.append(
-            """
-            (
-                LOWER(COALESCE(reported_code, '')) LIKE :q_like
-             OR LOWER(COALESCE(reported_code_system, '')) LIKE :q_like
-            )
-            """
-        )
-        params["q_like"] = f"%{q_text}%"
+    _append_provider_reverse_text_filter(filters, params, q_text)
     where_sql = "WHERE " + " AND ".join(filters) if filters else ""
     window_sql = ""
     if limit_rows is not None:
         window_sql = "LIMIT :code_row_limit OFFSET :code_row_offset"
         params["code_row_limit"] = max(int(limit_rows), 0)
         params["code_row_offset"] = max(int(offset_rows or 0), 0)
-    result = await session.execute(
+    code_row_result = await session.execute(
         text(
             f"""
             SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
@@ -2384,7 +2401,7 @@ async def _ptg2_manifest_code_rows_for_provider_reverse(
         ),
         params,
     )
-    return [_row_mapping(row) for row in result]
+    return [_row_mapping(code_row) for code_row in code_row_result]
 
 
 async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
@@ -2540,39 +2557,87 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
                 data.pop("_code_key", None)
             return rows
 
-        code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-            session,
-            serving_tables,
-            requested_plan=requested_plan,
-            code_value=code_value,
-            code_system=code_system,
-            q_text=q_text,
-            code_context=code_context,
-        )
-        if code_rows is None:
-            return None
-        if not code_rows:
-            return []
-        code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
         page_limit = max(int(limit or 0), 0)
         if page_limit <= 0:
             return []
         page_offset = max(int(offset or 0), 0)
         entries_by_provider_code: list[tuple[str, int, dict[int, list[tuple[int, str]]]]] = []
-        for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-            patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+        code_by_key: dict[int, Mapping[str, Any]]
+        if broad_code_scan:
+            matched_code_keys: set[int] = set()
+            for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
+                patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+                    session,
+                    serving_tables,
+                    provider_set_key,
+                    code_keys=None,
+                )
+                entries_by_code: dict[int, list[tuple[int, str]]] = {}
+                for pattern in patterns:
+                    for code_key in pattern.code_keys:
+                        normalized_code_key = int(code_key)
+                        matched_code_keys.add(normalized_code_key)
+                        entries_by_code.setdefault(normalized_code_key, []).extend(pattern.entries)
+                if entries_by_code:
+                    entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
+            if not matched_code_keys:
+                return []
+            code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
                 session,
                 serving_tables,
-                provider_set_key,
-                code_keys=code_by_key.keys(),
+                requested_plan=requested_plan,
+                code_value=code_value,
+                code_system=code_system,
+                q_text=q_text,
+                code_context=code_context,
+                code_keys=matched_code_keys,
             )
-            entries_by_code: dict[int, list[tuple[int, str]]] = {}
-            for pattern in patterns:
-                for code_key in pattern.code_keys:
-                    if int(code_key) in code_by_key:
-                        entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
-            if entries_by_code:
-                entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
+            if code_rows is None:
+                return None
+            if not code_rows:
+                return []
+            code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
+            entries_by_provider_code = [
+                (
+                    provider_set_id,
+                    provider_set_key,
+                    {
+                        int(code_key): entries
+                        for code_key, entries in entries_by_code.items()
+                        if int(code_key) in code_by_key
+                    },
+                )
+                for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code
+            ]
+        else:
+            code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+                session,
+                serving_tables,
+                requested_plan=requested_plan,
+                code_value=code_value,
+                code_system=code_system,
+                q_text=q_text,
+                code_context=code_context,
+            )
+            if code_rows is None:
+                return None
+            if not code_rows:
+                return []
+            code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
+            for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
+                patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+                    session,
+                    serving_tables,
+                    provider_set_key,
+                    code_keys=code_by_key.keys(),
+                )
+                entries_by_code: dict[int, list[tuple[int, str]]] = {}
+                for pattern in patterns:
+                    for code_key in pattern.code_keys:
+                        if int(code_key) in code_by_key:
+                            entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
+                if entries_by_code:
+                    entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
 
         rows: list[dict[str, Any]] = []
         skipped = 0

@@ -2928,6 +2928,13 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
         source_trace_set_hash="trace-set", network_names=["network"], limit=2, offset=0, apply_window=True,
     )
 
+    code_count_call = next(
+        call for call in session.calls if "FROM mrf.ptg2_code_count_manifest_snap" in str(call[0][0])
+    )
+    code_count_sql = str(code_count_call[0][0])
+    code_count_params = code_count_call[0][1]
+    assert "code_key = ANY(CAST(:code_keys AS integer[]))" in code_count_sql
+    assert code_count_params["code_keys"] == [7, 8]
     assert [
         (
             procedure_match["reported_code"],
