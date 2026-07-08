@@ -4791,7 +4791,7 @@ def test_import_control_snapshot_company_fallback_from_index_url():
 
 
 @pytest.mark.asyncio
-async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch):
+async def test_import_control_snapshot_items_keep_medical_rate_files(monkeypatch):
     call_count_map = {"all": 0}
 
     async def fake_all(_stmt):
@@ -4848,18 +4848,23 @@ async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch
 
     items = await discovery._import_control_snapshot_items(["source_1"])
 
-    assert len(items["source_1"]) == 2
+    assert len(items["source_1"]) == 3
     assert (
         items["source_1"][0]["canonical_url"]
-        == "https://example.com/in-network-rates.json.gz"
+        == "https://example.com/allowed-amounts.json.gz"
     )
-    assert items["source_1"][0]["domain"] == "in-network"
+    assert items["source_1"][0]["domain"] == "allowed-amounts"
     assert (
         items["source_1"][1]["canonical_url"]
-        == "https://example.com/direct-in-network-rates.json.gz"
+        == "https://example.com/in-network-rates.json.gz"
     )
     assert items["source_1"][1]["domain"] == "in-network"
-    assert items["source_1"][1]["from_index_url"] is None
+    assert (
+        items["source_1"][2]["canonical_url"]
+        == "https://example.com/direct-in-network-rates.json.gz"
+    )
+    assert items["source_1"][2]["domain"] == "in-network"
+    assert items["source_1"][2]["from_index_url"] is None
 
 
 @pytest.mark.asyncio
@@ -4921,12 +4926,86 @@ def test_import_control_snapshot_file_support_excludes_csv_catalog_references():
     )
     assert (
         discovery._import_control_snapshot_file_is_supported(
+            "allowed-amounts",
+            {"domain": "allowed_amounts"},
+            "https://example.com/index.json",
+        )
+        is True
+    )
+    assert (
+        discovery._import_control_snapshot_file_is_supported(
             "in-network",
             {"domain": "in-network"},
             None,
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_import_control_catalog_source_rows_supplements_stored_snapshot_sources(
+    monkeypatch,
+):
+    calls = {"all": 0}
+
+    async def fake_all(_stmt):
+        calls["all"] += 1
+        return [
+            {
+                "source_id": "source_existing",
+                "source_key": "existing",
+                "display_name": "Existing",
+                "source_type": "community_index",
+                "access_model": "free",
+                "index_url": "https://existing.example/index.json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+            {
+                "source_id": "source_supplemental",
+                "source_key": "supplemental",
+                "display_name": "Supplemental",
+                "source_type": "community_index",
+                "access_model": "free",
+                "index_url": "https://supplemental.example/index.json",
+                "status": "active",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            },
+        ]
+
+    monkeypatch.setattr(discovery.db, "all", fake_all)
+
+    rows = await discovery._import_control_catalog_source_rows(
+        [
+            {
+                "source_id": "source_existing",
+                "source_key": "existing",
+                "display_name": "Existing",
+            }
+        ]
+    )
+
+    assert calls["all"] == 1
+    assert [row["source_id"] for row in rows] == [
+        "source_existing",
+        "source_supplemental",
+    ]
+    assert rows[1]["metadata_json"]["source_tier"] == "mrf_importable"
+
+
+@pytest.mark.asyncio
+async def test_import_control_catalog_source_rows_keeps_bounded_sync_scoped(
+    monkeypatch,
+):
+    async def fake_all(_stmt):  # pragma: no cover - should not be called
+        raise AssertionError("bounded catalog sync should not load stored sources")
+
+    monkeypatch.setattr(discovery.db, "all", fake_all)
+    source_rows = [{"source_id": "source_a"}]
+
+    rows = await discovery._import_control_catalog_source_rows(source_rows, limit=1)
+
+    assert rows == source_rows
 
 
 def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():

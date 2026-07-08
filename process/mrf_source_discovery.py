@@ -13817,9 +13817,149 @@ def _apply_company_fallback(
     return next_info
 
 
+_IMPORT_CONTROL_CATALOG_RATE_DOMAINS = frozenset(
+    {
+        "in_network",
+        "in_network_rates",
+        "allowed_amount",
+        "allowed_amounts",
+    }
+)
+
+
 def _import_control_supported_rate_domain(value: Any) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return normalized in {"in_network", "in_network_rates"}
+    return normalized in _IMPORT_CONTROL_CATALOG_RATE_DOMAINS
+
+
+def _mrf_schema_name() -> str:
+    schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip() or "mrf"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+        return "mrf"
+    return schema
+
+
+def _mapping_value(row: Any, key: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key)
+    return getattr(row, key, None)
+
+
+def _stored_source_row_from_db_row(row: Any) -> dict[str, Any]:
+    return {
+        "source_id": _mapping_value(row, "source_id"),
+        "payer_id": _mapping_value(row, "payer_id"),
+        "source_key": _mapping_value(row, "source_key"),
+        "display_name": _mapping_value(row, "display_name"),
+        "source_type": _mapping_value(row, "source_type"),
+        "hosting_platform": _mapping_value(row, "hosting_platform"),
+        "access_model": _mapping_value(row, "access_model"),
+        "index_url": _mapping_value(row, "index_url"),
+        "human_url": _mapping_value(row, "human_url"),
+        "canonical_url": _mapping_value(row, "canonical_url"),
+        "domain": _mapping_value(row, "domain"),
+        "status": _mapping_value(row, "status"),
+        "schema_version": _mapping_value(row, "schema_version"),
+        "latest_index_date": _mapping_value(row, "latest_index_date"),
+        "num_plans": _mapping_value(row, "num_plans"),
+        "num_files": _mapping_value(row, "num_files"),
+        "num_indices": _mapping_value(row, "num_indices"),
+        "total_compressed_size": _mapping_value(row, "total_compressed_size"),
+        "provenance_url": _mapping_value(row, "provenance_url"),
+        "seed_provider": _mapping_value(row, "seed_provider"),
+        "confidence": _mapping_value(row, "confidence"),
+        "license_status": _mapping_value(row, "license_status"),
+        "review_status": _mapping_value(row, "review_status"),
+        "metadata_json": _coerce_metadata(_mapping_value(row, "metadata_json")),
+        "created_at": _mapping_value(row, "created_at"),
+        "updated_at": _mapping_value(row, "updated_at"),
+    }
+
+
+async def _stored_import_control_catalog_source_rows() -> list[dict[str, Any]]:
+    schema = _mrf_schema_name()
+    skipped_statuses = ", ".join(
+        f"'{status}'" for status in sorted(NON_IMPORTABLE_SOURCE_STATUSES)
+    )
+    supported_domains = ", ".join(
+        f"'{domain}'" for domain in sorted(_IMPORT_CONTROL_CATALOG_RATE_DOMAINS)
+    )
+    rows = await db.all(
+        f"""
+        select
+            s.source_id,
+            s.payer_id,
+            s.source_key,
+            s.display_name,
+            s.source_type,
+            s.hosting_platform,
+            s.access_model,
+            s.index_url,
+            s.human_url,
+            s.canonical_url,
+            s.domain,
+            s.status,
+            s.schema_version,
+            s.latest_index_date,
+            s.num_plans,
+            s.num_files,
+            s.num_indices,
+            s.total_compressed_size,
+            s.provenance_url,
+            s.seed_provider,
+            s.confidence,
+            s.license_status,
+            s.review_status,
+            s.metadata_json,
+            s.created_at,
+            s.updated_at
+        from {schema}.mrf_source s
+        where coalesce(s.status, 'active') not in ({skipped_statuses})
+          and (s.index_url is not null or s.human_url is not null)
+          and exists (
+            select 1
+            from {schema}.mrf_file f
+            where f.source_id = s.source_id
+              and f.url is not null
+              and json_typeof(f.metadata_json->'plan_info') = 'array'
+              and json_array_length(f.metadata_json->'plan_info') > 0
+              and regexp_replace(
+                    lower(coalesce(f.metadata_json->>'domain', f.file_type, '')),
+                    '[^a-z0-9]+',
+                    '_',
+                    'g'
+                  ) in ({supported_domains})
+          )
+        order by s.display_name, s.source_id
+        """
+    )
+    return [_stored_source_row_from_db_row(row) for row in rows]
+
+
+async def _import_control_catalog_source_rows(
+    source_rows: list[dict[str, Any]], *, limit: int | None = None
+) -> list[dict[str, Any]]:
+    if limit is not None:
+        return source_rows
+    merged = list(source_rows)
+    seen_source_ids = {str(row.get("source_id") or "") for row in source_rows}
+    try:
+        stored_rows = await _stored_import_control_catalog_source_rows()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logging.getLogger(__name__).warning(
+            "stored import-control catalog source supplement failed: %s", exc
+        )
+        return merged
+    for row in stored_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id or source_id in seen_source_ids:
+            continue
+        merged.append(row)
+        seen_source_ids.add(source_id)
+    return merged
 
 
 def _import_control_snapshot_file_is_supported(
@@ -14331,6 +14471,7 @@ async def _push_import_control_catalog(
     ).strip()
     if not base_url or not token:
         return (0, 0, [])
+    source_rows = await _import_control_catalog_source_rows(source_rows, limit=limit)
     eligible = [
         row
         for row in source_rows
