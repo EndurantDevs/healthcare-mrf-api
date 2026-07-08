@@ -4223,20 +4223,49 @@ def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
     """
 
 
-def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) -> str:
-    target_coordinate_missing = _coordinate_missing_or_invalid_sql("target_row")
+def _entity_address_provider_npi_expr(row_alias: str | None = None) -> str:
+    prefix = f"{row_alias}." if row_alias else ""
+    return (
+        f"COALESCE({prefix}npi, {prefix}inferred_npi, CASE\n"
+        f"            WHEN {prefix}entity_type = 'npi' AND {prefix}entity_id ~ '^[0-9]+$'\n"
+        f"                THEN {prefix}entity_id::bigint\n"
+        f"            ELSE NULL::bigint\n"
+        f"        END)"
+    )
+
+
+def _same_provider_field_aggregate(column_name: str, sql_type: str = "varchar") -> str:
+    return (
+        f"(ARRAY_AGG({column_name} ORDER BY ({column_name} IS NULL), "
+        f"source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::{sql_type} AS {column_name}"
+    )
+
+
+def _same_provider_coordinate_aggregate(column_name: str) -> str:
+    return (
+        f"(ARRAY_AGG({column_name} ORDER BY ((lat IS NULL) OR (long IS NULL)), "
+        f"source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::numeric AS {column_name}"
+    )
+
+
+def _same_provider_update_needed_sql(target_coordinate_missing: str) -> str:
     return f"""
-    WITH source_rows AS MATERIALIZED (
+            (target_row.telephone_number IS NULL AND grouped_fields.telephone_number IS NOT NULL)
+         OR (target_row.phone_number IS NULL AND grouped_fields.phone_number IS NOT NULL)
+         OR (target_row.phone_extension IS NULL AND grouped_fields.phone_extension IS NOT NULL)
+         OR (target_row.fax_number IS NULL AND grouped_fields.fax_number IS NOT NULL)
+         OR (target_row.fax_number_digits IS NULL AND grouped_fields.fax_number_digits IS NOT NULL)
+         OR (target_row.fax_extension IS NULL AND grouped_fields.fax_extension IS NOT NULL)
+         OR (({target_coordinate_missing}) AND grouped_fields.lat IS NOT NULL AND grouped_fields.long IS NOT NULL)
+    """
+
+
+def _same_provider_source_rows_sql(db_schema: str, table_name: str) -> str:
+    return f"""
+    source_rows AS MATERIALIZED (
         SELECT
             location_key,
-            COALESCE(
-                npi,
-                inferred_npi,
-                CASE
-                    WHEN entity_type = 'npi' AND entity_id ~ '^[0-9]+$' THEN entity_id::bigint
-                    ELSE NULL::bigint
-                END
-            ) AS provider_npi,
+            {_entity_address_provider_npi_expr()} AS provider_npi,
             address_key,
             telephone_number,
             phone_number,
@@ -4250,19 +4279,24 @@ def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) 
             updated_at
           FROM {db_schema}.{table_name}
          WHERE address_key IS NOT NULL
-    ),
+    )
+    """
+
+
+def _same_provider_grouped_fields_sql() -> str:
+    return f"""
     grouped_fields AS MATERIALIZED (
         SELECT
             provider_npi,
             address_key,
-            (ARRAY_AGG(telephone_number ORDER BY (telephone_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS telephone_number,
-            (ARRAY_AGG(phone_number ORDER BY (phone_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS phone_number,
-            (ARRAY_AGG(phone_extension ORDER BY (phone_extension IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS phone_extension,
-            (ARRAY_AGG(fax_number ORDER BY (fax_number IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_number,
-            (ARRAY_AGG(fax_number_digits ORDER BY (fax_number_digits IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_number_digits,
-            (ARRAY_AGG(fax_extension ORDER BY (fax_extension IS NULL), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::varchar AS fax_extension,
-            (ARRAY_AGG(lat ORDER BY ((lat IS NULL) OR (long IS NULL)), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::numeric AS lat,
-            (ARRAY_AGG(long ORDER BY ((lat IS NULL) OR (long IS NULL)), source_count DESC, updated_at DESC NULLS LAST, location_key))[1]::numeric AS long
+            {_same_provider_field_aggregate("telephone_number")},
+            {_same_provider_field_aggregate("phone_number")},
+            {_same_provider_field_aggregate("phone_extension")},
+            {_same_provider_field_aggregate("fax_number")},
+            {_same_provider_field_aggregate("fax_number_digits")},
+            {_same_provider_field_aggregate("fax_extension")},
+            {_same_provider_coordinate_aggregate("lat")},
+            {_same_provider_coordinate_aggregate("long")}
           FROM source_rows
          WHERE provider_npi IS NOT NULL
            AND (
@@ -4274,8 +4308,12 @@ def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) 
            )
       GROUP BY provider_npi, address_key
     )
-    UPDATE {db_schema}.{table_name} AS target_row
-       SET telephone_number = COALESCE(target_row.telephone_number, grouped_fields.telephone_number),
+    """
+
+
+def _same_provider_set_clause_sql(target_coordinate_missing: str) -> str:
+    return f"""
+           telephone_number = COALESCE(target_row.telephone_number, grouped_fields.telephone_number),
            phone_number = COALESCE(target_row.phone_number, grouped_fields.phone_number),
            phone_extension = COALESCE(target_row.phone_extension, grouped_fields.phone_extension),
            fax_number = COALESCE(target_row.fax_number, grouped_fields.fax_number),
@@ -4283,26 +4321,22 @@ def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) 
            fax_extension = COALESCE(target_row.fax_extension, grouped_fields.fax_extension),
            lat = CASE WHEN {target_coordinate_missing} THEN grouped_fields.lat ELSE target_row.lat END,
            long = CASE WHEN {target_coordinate_missing} THEN grouped_fields.long ELSE target_row.long END
+    """
+
+
+def _backfill_same_provider_address_fields_sql(db_schema: str, table_name: str) -> str:
+    """Fill missing contacts and coordinates from same-provider rows at the same address key."""
+    target_coordinate_missing = _coordinate_missing_or_invalid_sql("target_row")
+    return f"""
+    WITH {_same_provider_source_rows_sql(db_schema, table_name)},
+    {_same_provider_grouped_fields_sql()}
+    UPDATE {db_schema}.{table_name} AS target_row
+       SET {_same_provider_set_clause_sql(target_coordinate_missing)}
       FROM grouped_fields
      WHERE target_row.address_key IS NOT NULL
        AND target_row.address_key = grouped_fields.address_key
-       AND COALESCE(
-            target_row.npi,
-            target_row.inferred_npi,
-            CASE
-                WHEN target_row.entity_type = 'npi' AND target_row.entity_id ~ '^[0-9]+$'
-                    THEN target_row.entity_id::bigint
-                ELSE NULL::bigint
-            END
-       ) = grouped_fields.provider_npi
-       AND (
-            (target_row.telephone_number IS NULL AND grouped_fields.telephone_number IS NOT NULL)
-         OR (target_row.phone_number IS NULL AND grouped_fields.phone_number IS NOT NULL)
-         OR (target_row.phone_extension IS NULL AND grouped_fields.phone_extension IS NOT NULL)
-         OR (target_row.fax_number IS NULL AND grouped_fields.fax_number IS NOT NULL)
-         OR (target_row.fax_number_digits IS NULL AND grouped_fields.fax_number_digits IS NOT NULL)
-         OR (target_row.fax_extension IS NULL AND grouped_fields.fax_extension IS NOT NULL)
-         OR (({target_coordinate_missing}) AND grouped_fields.lat IS NOT NULL AND grouped_fields.long IS NOT NULL)
+       AND {_entity_address_provider_npi_expr("target_row")} = grouped_fields.provider_npi
+       AND ({_same_provider_update_needed_sql(target_coordinate_missing)}
        );
     """
 

@@ -162,14 +162,14 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch):
-    captured_sql: list[str] = []
+    captured_sql_statements: list[str] = []
 
     class FakeResult:
         def all(self):
             return []
 
     async def fake_execute(stmt, **_kwargs):
-        captured_sql.append(str(stmt))
+        captured_sql_statements.append(str(stmt))
         return FakeResult()
 
     monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
@@ -179,20 +179,20 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
     rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
 
     assert rows == []
-    assert "lat,\n            long," in captured_sql[0]
-    assert "address_precision, lat, long" in captured_sql[0]
+    assert "lat,\n            long," in captured_sql_statements[0]
+    assert "address_precision, lat, long" in captured_sql_statements[0]
 
 
 @pytest.mark.asyncio
 async def test_provider_directory_overlay_fetch_tolerates_old_overlay_schema(monkeypatch):
-    captured_sql: list[str] = []
+    captured_sql_statements: list[str] = []
 
     class FakeResult:
         def all(self):
             return []
 
     async def fake_execute(stmt, **_kwargs):
-        captured_sql.append(str(stmt))
+        captured_sql_statements.append(str(stmt))
         return FakeResult()
 
     monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
@@ -202,9 +202,9 @@ async def test_provider_directory_overlay_fetch_tolerates_old_overlay_schema(mon
     rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
 
     assert rows == []
-    assert "NULL::numeric AS lat" in captured_sql[0]
-    assert "NULL::numeric AS long" in captured_sql[0]
-    assert "address_precision, lat, long" not in captured_sql[0]
+    assert "NULL::numeric AS lat" in captured_sql_statements[0]
+    assert "NULL::numeric AS long" in captured_sql_statements[0]
+    assert "address_precision, lat, long" not in captured_sql_statements[0]
 
 
 def test_validate_section_filters_requires_classification_or_codes():

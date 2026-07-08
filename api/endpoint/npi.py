@@ -5382,14 +5382,6 @@ async def get_plans_by_npi(_request, npi):
     issuer_data = []
     npi = int(npi)
 
-    # async def get_plans_list(plan_arr):
-    #     t = {}
-    #     q = Plan.query.where(Plan.plan_id == db.func.any(plan_arr)).where(Plan.year == int(2023))
-    #     async with db.acquire() as conn:
-    #         for x in await q.all():
-    #             t[x.plan_id] = x.to_json_dict()
-    #     return t
-
     query = (
         db.select(PlanNPIRaw, Issuer)
         .where(Issuer.issuer_id == PlanNPIRaw.issuer_id)
@@ -5464,8 +5456,7 @@ async def get_npi(request, npi):
     request_session = _request_session(request)
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_archive_cutover = _env_flag("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
-    v2_archive_table_resolved = False
-    v2_archive_table_cache: str | None = None
+    v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
     v2_archive_table_lock = asyncio.Lock()
 
     async def _table_exists(table_name: str) -> bool:
@@ -5496,12 +5487,11 @@ async def get_npi(request, npi):
         return isinstance(value, str) and bool(value)
 
     async def _v2_archive_table() -> str | None:
-        nonlocal v2_archive_table_resolved, v2_archive_table_cache
-        if v2_archive_table_resolved:
-            return v2_archive_table_cache
+        if v2_archive_table_cache.resolved:
+            return v2_archive_table_cache.table_name
         async with v2_archive_table_lock:
-            if v2_archive_table_resolved:
-                return v2_archive_table_cache
+            if v2_archive_table_cache.resolved:
+                return v2_archive_table_cache.table_name
             if address_archive_cutover and hasattr(db, "first"):
                 preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
                 for table_name in (preferred,):
@@ -5511,10 +5501,10 @@ async def get_npi(request, npi):
                         and await _table_has_column(table_name, "geo_source")
                         and await _has_address_key_functions()
                     ):
-                        v2_archive_table_cache = table_name
+                        v2_archive_table_cache.table_name = table_name
                         break
-            v2_archive_table_resolved = True
-            return v2_archive_table_cache
+            v2_archive_table_cache.resolved = True
+            return v2_archive_table_cache.table_name
 
     async def _archive_coordinates_for(address):
         archive_table = await _v2_archive_table()
@@ -6077,7 +6067,7 @@ async def _build_npi_details(
             continue
         address_columns.append(address_table.c[column.key])
 
-    # Return EVERY known service location, not just the NPPES primary/secondary.
+    # Expose every known service location, not just the NPPES primary/secondary.
     # The unified builder stores TiC/PTG and ACA practice locations as type
     # 'practice'/'site', so the legacy primary/secondary-only filter silently
     # dropped all TiC addresses. Widen the filter for the unified model only;

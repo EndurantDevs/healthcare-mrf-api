@@ -638,7 +638,7 @@ def _is_plausible_us_coordinate_pair(latitude: float, longitude: float) -> bool:
     )
 
 
-def _coordinate_pair_is_usable(latitude: float, longitude: float, country_code: str | None) -> bool:
+def _is_usable_coordinate_pair(latitude: float, longitude: float, country_code: str | None) -> bool:
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return False
     if abs(latitude) < 0.0000001 and abs(longitude) < 0.0000001:
@@ -676,7 +676,7 @@ def _normalize_fhir_position(
         candidates.extend((latitude / divisor, longitude / divisor) for divisor in (1_000_000, 10_000_000))
 
     for candidate_latitude, candidate_longitude in candidates:
-        if _coordinate_pair_is_usable(candidate_latitude, candidate_longitude, country_code):
+        if _is_usable_coordinate_pair(candidate_latitude, candidate_longitude, country_code):
             return _format_coordinate(candidate_latitude), _format_coordinate(candidate_longitude)
     return None, None
 
@@ -9961,7 +9961,7 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
     """
 
 
-def provider_directory_address_overlay_coordinate_columns_sql(
+def address_overlay_coordinate_columns_sql(
     db_schema: str | None = None,
     table_name: str | None = None,
 ) -> str:
@@ -9977,7 +9977,7 @@ def provider_directory_address_overlay_coordinate_columns_sql(
 
 async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await db.status(provider_directory_address_overlay_table_sql(schema))
-    await db.status(provider_directory_address_overlay_coordinate_columns_sql(schema))
+    await db.status(address_overlay_coordinate_columns_sql(schema))
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 
@@ -10748,9 +10748,9 @@ async def _copy_existing_address_overlay(
 ) -> int:
     if not source_ids:
         return 0
-    params: dict[str, Any] = {"source_ids": source_ids}
+    query_param_dict: dict[str, Any] = {"source_ids": source_ids}
     if refresh_resource_types:
-        params["refresh_resource_types"] = list(refresh_resource_types)
+        query_param_dict["refresh_resource_types"] = list(refresh_resource_types)
         refresh_filter = (
             "source_id = ANY(CAST(:source_ids AS varchar[])) "
             "AND resource_type = ANY(CAST(:refresh_resource_types AS varchar[]))"
@@ -10765,7 +10765,7 @@ async def _copy_existing_address_overlay(
               FROM {target_ref}
              WHERE NOT ({refresh_filter});
             """,
-            **params,
+            **query_param_dict,
         )
     )
 

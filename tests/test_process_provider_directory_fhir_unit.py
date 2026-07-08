@@ -6971,7 +6971,7 @@ def test_address_overlay_sql_scope():
 
 def test_address_overlay_table_sql_includes_coordinates():
     sql = importer.provider_directory_address_overlay_table_sql("mrf")
-    alter_sql = importer.provider_directory_address_overlay_coordinate_columns_sql("mrf")
+    alter_sql = importer.address_overlay_coordinate_columns_sql("mrf")
 
     assert "lat numeric" in sql
     assert "long numeric" in sql

@@ -87,7 +87,8 @@ def test_same_provider_address_backfill_only_uses_same_npi_and_address_key():
         "entity_address_unified_stage_test",
     )
 
-    assert "COALESCE(\n                npi,\n                inferred_npi" in sql
+    assert "COALESCE(npi, inferred_npi" in sql
+    assert "COALESCE(target_row.npi, target_row.inferred_npi" in sql
     assert "GROUP BY provider_npi, address_key" in sql
     assert "target_row.address_key = grouped_fields.address_key" in sql
     assert "= grouped_fields.provider_npi" in sql
