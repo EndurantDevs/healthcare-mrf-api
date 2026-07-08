@@ -9958,6 +9958,17 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
         source_updated_at timestamp,
         published_at timestamp NOT NULL DEFAULT now()
     );
+    """
+
+
+def provider_directory_address_overlay_coordinate_columns_sql(
+    db_schema: str | None = None,
+    table_name: str | None = None,
+) -> str:
+    """Add optional coordinate columns to older Provider Directory overlay tables."""
+    schema = db_schema if db_schema is not None else _schema()
+    table_ref = _qt(schema, table_name or PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    return f"""
     ALTER TABLE {table_ref}
         ADD COLUMN IF NOT EXISTS lat numeric,
         ADD COLUMN IF NOT EXISTS long numeric;
@@ -9966,6 +9977,7 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
 
 async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await db.status(provider_directory_address_overlay_table_sql(schema))
+    await db.status(provider_directory_address_overlay_coordinate_columns_sql(schema))
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 

@@ -6971,11 +6971,13 @@ def test_address_overlay_sql_scope():
 
 def test_address_overlay_table_sql_includes_coordinates():
     sql = importer.provider_directory_address_overlay_table_sql("mrf")
+    alter_sql = importer.provider_directory_address_overlay_coordinate_columns_sql("mrf")
 
     assert "lat numeric" in sql
     assert "long numeric" in sql
-    assert "ADD COLUMN IF NOT EXISTS lat numeric" in sql
-    assert "ADD COLUMN IF NOT EXISTS long numeric" in sql
+    assert "ADD COLUMN IF NOT EXISTS lat numeric" not in sql
+    assert "ADD COLUMN IF NOT EXISTS lat numeric" in alter_sql
+    assert "ADD COLUMN IF NOT EXISTS long numeric" in alter_sql
 
 
 def test_address_overlay_component_sql_is_bounded_to_one_component():
