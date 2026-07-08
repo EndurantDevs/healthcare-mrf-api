@@ -3977,11 +3977,11 @@ def _ptg2_route_item_fast_path_allowed(args: dict[str, Any]) -> bool:
     )
 
 
-def _ptg2_route_item_taxonomy_filter_sql(args: dict[str, Any], params: dict[str, Any]) -> str:
-    taxonomy_args = dict(args)
-    if not taxonomy_args.get("taxonomy_codes") and taxonomy_args.get("taxonomy_code"):
-        taxonomy_args["taxonomy_codes"] = taxonomy_args.get("taxonomy_code")
-    specialty_filter = resolve_provider_specialty_filter(taxonomy_args)
+def _route_item_taxonomy_sql(args: dict[str, Any], params: dict[str, Any]) -> str:
+    taxonomy_args_dict = dict(args)
+    if not taxonomy_args_dict.get("taxonomy_codes") and taxonomy_args_dict.get("taxonomy_code"):
+        taxonomy_args_dict["taxonomy_codes"] = taxonomy_args_dict.get("taxonomy_code")
+    specialty_filter = resolve_provider_specialty_filter(taxonomy_args_dict)
     if not specialty_filter.active:
         return ""
     return (
@@ -4049,7 +4049,7 @@ async def _search_ptg2_manifest_route_item_table(
         except (TypeError, ValueError):
             return None
         npi_filter_sql = "AND r.npi = :provider_npi"
-    taxonomy_filter_sql = _ptg2_route_item_taxonomy_filter_sql(args, params)
+    taxonomy_filter_sql = _route_item_taxonomy_sql(args, params)
 
     distance_sql = _ptg2_geo_distance_miles_sql("r.lat::float8", "r.long::float8")
     order_by = str(args.get("order_by") or "").strip().lower()

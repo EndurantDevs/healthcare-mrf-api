@@ -2203,9 +2203,10 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
 
 
 @pytest.mark.asyncio
-async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_filter():
+def _build_route_item_taxonomy_fake_session() -> FakeSession:
+    """Build route-item rows for the lat/long taxonomy pagination regression."""
     columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
-    session = FakeSession(
+    return FakeSession(
         [
             FakeResult(scalar=True),
             FakeResult(rows=[(column,) for column in columns]),
@@ -2228,6 +2229,12 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
             ),
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_filter():
+    """Route-item fast path handles HealthJoy-style page-two taxonomy searches."""
+    session = _build_route_item_taxonomy_fake_session()
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_7cabb84262c9",
         storage="manifest_snapshot",
