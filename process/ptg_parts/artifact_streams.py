@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+import struct
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +18,11 @@ try:
 except ImportError:  # pragma: no cover - optional acceleration
     igzip = None
 
+try:
+    import inflate64
+except ImportError:  # pragma: no cover - dependency is installed in deployed images
+    inflate64 = None
+
 from process.ptg_parts.artifacts import sha256_file
 from process.ptg_parts.config import (
     PTG2_DEFER_LOGICAL_HASH_BYTES_ENV,
@@ -26,6 +32,8 @@ from process.ptg_parts.config import (
     _stream_buffer_bytes,
 )
 from process.ptg_parts.domain import PTG2LogicalArtifact
+
+ZIP_DEFLATE64_METHOD = 9
 
 
 def _stream_copy_with_hash(src, dst, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
@@ -49,12 +57,94 @@ def _raw_file_is_gzip(path: str | Path) -> bool:
         return False
 
 
+def _first_zip_member_info(zip_ref: zipfile.ZipFile) -> zipfile.ZipInfo | None:
+    for info in zip_ref.infolist():
+        if not info.is_dir():
+            return info
+    return None
+
+
 def _first_zip_member(path: str | Path) -> str | None:
     with zipfile.ZipFile(path, "r") as zip_ref:
-        for name in zip_ref.namelist():
-            if not name.endswith("/"):
-                return name
-    return None
+        info = _first_zip_member_info(zip_ref)
+        return info.filename if info is not None else None
+
+
+def _zip_member_payload_offset(raw_fp, info: zipfile.ZipInfo) -> int:
+    raw_fp.seek(info.header_offset)
+    header = raw_fp.read(30)
+    if len(header) != 30:
+        raise RuntimeError(f"Invalid zip local header for {info.filename}")
+    signature, *_fields, filename_len, extra_len = struct.unpack("<IHHHHHIIIHH", header)
+    if signature != 0x04034B50:
+        raise RuntimeError(f"Invalid zip local header signature for {info.filename}")
+    return info.header_offset + 30 + filename_len + extra_len
+
+
+class _Deflate64ZipMemberReader:
+    def __init__(self, raw_fp, info: zipfile.ZipInfo, *, compressed_chunk_size: int = 256 * 1024):
+        if inflate64 is None:
+            raise RuntimeError("Deflate64 zip members require the inflate64 package")
+        if info.flag_bits & 0x1:
+            raise RuntimeError(f"Encrypted zip member is not supported: {info.filename}")
+        self._raw_fp = raw_fp
+        self._remaining = info.compress_size
+        self._chunk_size = compressed_chunk_size
+        self._inflater = inflate64.Inflater()
+        self._buffer = bytearray()
+        self._flushed = False
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if size is None or size < 0:
+            chunks = [bytes(self._buffer)]
+            self._buffer.clear()
+            while self._remaining > 0:
+                chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
+                if not chunk:
+                    break
+                self._remaining -= len(chunk)
+                inflated = self._inflater.inflate(chunk)
+                if inflated:
+                    chunks.append(inflated)
+            if not self._flushed:
+                tail = self._inflater.inflate(b"")
+                self._flushed = True
+                if tail:
+                    chunks.append(tail)
+            return b"".join(chunks)
+
+        while len(self._buffer) < size and self._remaining > 0:
+            chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
+            if not chunk:
+                break
+            self._remaining -= len(chunk)
+            inflated = self._inflater.inflate(chunk)
+            if inflated:
+                self._buffer.extend(inflated)
+        if self._remaining == 0 and not self._flushed:
+            tail = self._inflater.inflate(b"")
+            self._flushed = True
+            if tail:
+                self._buffer.extend(tail)
+        result = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return result
+
+
+@contextmanager
+def _open_zip_member_stream(path: Path, info: zipfile.ZipInfo, zip_ref: zipfile.ZipFile):
+    if info.compress_type == ZIP_DEFLATE64_METHOD:
+        with open(path, "rb") as raw_fp:
+            raw_fp.seek(_zip_member_payload_offset(raw_fp, info))
+            yield _Deflate64ZipMemberReader(raw_fp, info)
+        return
+    with zip_ref.open(info, "r") as fp:
+        yield fp
 
 
 @contextmanager
@@ -68,15 +158,21 @@ def open_json_artifact_stream(path: str | Path):
                     yield buffered_fp
         return
     if zipfile.is_zipfile(path_obj):
-        member_name = _first_zip_member(path_obj)
-        if not member_name:
-            raise RuntimeError(f"No file members found in zip artifact {path_obj}")
         with zipfile.ZipFile(path_obj, "r") as zip_ref:
-            with zip_ref.open(member_name, "r") as fp:
+            member_info = _first_zip_member_info(zip_ref)
+            if member_info is None:
+                raise RuntimeError(f"No file members found in zip artifact {path_obj}")
+            with _open_zip_member_stream(path_obj, member_info, zip_ref) as fp:
                 yield fp
         return
     with open(path_obj, "rb") as fp:
         yield fp
+
+
+def _zip_member_name(path: str | Path) -> str | None:
+    with zipfile.ZipFile(path, "r") as zip_ref:
+        info = _first_zip_member_info(zip_ref)
+        return info.filename if info is not None else None
 
 
 def _compression_for_path(raw_path: str | Path) -> tuple[str | None, str | None]:
@@ -85,7 +181,7 @@ def _compression_for_path(raw_path: str | Path) -> tuple[str | None, str | None]
     member_name = None
     if compression is None and zipfile.is_zipfile(raw_path_obj):
         compression = "zip"
-        member_name = _first_zip_member(raw_path_obj)
+        member_name = _zip_member_name(raw_path_obj)
     return compression, member_name
 
 
@@ -132,13 +228,18 @@ def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None 
         return PTG2LogicalArtifact(str(target), digest, total, compression="gzip")
     if zipfile.is_zipfile(raw_path_obj):
         with zipfile.ZipFile(raw_path_obj, "r") as zip_ref:
-            for name in zip_ref.namelist():
-                if name.endswith("/"):
-                    continue
-                target = output_root / Path(name).name
-                with zip_ref.open(name, "r") as src, open(target, "wb") as dst:
-                    digest, total = _stream_copy_with_hash(src, dst)
-                return PTG2LogicalArtifact(str(target), digest, total, compression="zip", member_name=name)
-        raise RuntimeError(f"No file members found in zip artifact {raw_path_obj}")
+            member_info = _first_zip_member_info(zip_ref)
+            if member_info is None:
+                raise RuntimeError(f"No file members found in zip artifact {raw_path_obj}")
+            target = output_root / Path(member_info.filename).name
+            with _open_zip_member_stream(raw_path_obj, member_info, zip_ref) as src, open(target, "wb") as dst:
+                digest, total = _stream_copy_with_hash(src, dst)
+            return PTG2LogicalArtifact(
+                str(target),
+                digest,
+                total,
+                compression="zip",
+                member_name=member_info.filename,
+            )
     digest, total = sha256_file(raw_path_obj)
     return PTG2LogicalArtifact(str(raw_path_obj), digest, total)

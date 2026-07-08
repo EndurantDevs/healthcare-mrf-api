@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import binascii
 import gzip
 import importlib
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -38,6 +40,62 @@ ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
+
+
+def _write_deflate64_zip(path: Path, member_name: str, payload: bytes) -> None:
+    inflate64 = pytest.importorskip("inflate64")
+    name_bytes = member_name.encode("utf-8")
+    deflater = inflate64.Deflater()
+    compressed = deflater.deflate(payload) + deflater.flush()
+    crc = binascii.crc32(payload) & 0xFFFFFFFF
+    local_header = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50,
+        45,
+        0,
+        9,
+        0,
+        0,
+        crc,
+        len(compressed),
+        len(payload),
+        len(name_bytes),
+        0,
+    )
+    central_header = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,
+        45,
+        45,
+        0,
+        9,
+        0,
+        0,
+        crc,
+        len(compressed),
+        len(payload),
+        len(name_bytes),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    central_offset = len(local_header) + len(name_bytes) + len(compressed)
+    central_size = len(central_header) + len(name_bytes)
+    end_record = struct.pack(
+        "<IHHHHIIH",
+        0x06054B50,
+        0,
+        0,
+        1,
+        1,
+        central_size,
+        central_offset,
+        0,
+    )
+    path.write_bytes(local_header + name_bytes + compressed + central_header + name_bytes + end_record)
 ptg_provider_references = importlib.import_module("process.ptg_parts.provider_references")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
@@ -3173,6 +3231,29 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
     assert not list(tmp_path.glob("*_logical.json"))
     with process_ptg.open_json_artifact_stream(raw_path) as fp:
         assert fp.read() == expected
+
+
+def test_ptg2_open_json_artifact_stream_reads_deflate64_zip(tmp_path):
+    raw_path = tmp_path / "rates.zip"
+    expected = b'{"in_network":[{"negotiated_rates":[]}]}'
+    _write_deflate64_zip(raw_path, "nested/rates.json", expected)
+
+    with process_ptg.open_json_artifact_stream(raw_path) as fp:
+        assert fp.read(5) == expected[:5]
+        assert fp.read() == expected[5:]
+
+
+def test_ptg2_stream_logical_artifact_extracts_deflate64_zip(tmp_path):
+    raw_path = tmp_path / "rates.zip"
+    expected = b'{"in_network":[]}'
+    _write_deflate64_zip(raw_path, "nested/rates.json", expected)
+
+    logical = process_ptg.stream_logical_artifact(raw_path, output_dir=tmp_path / "logical")
+
+    assert logical.compression == "zip"
+    assert logical.member_name == "nested/rates.json"
+    assert Path(logical.logical_path).read_bytes() == expected
+    assert logical.logical_sha256 == process_ptg.sha256_bytes(expected)
 
 
 def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_requested(tmp_path, monkeypatch):
