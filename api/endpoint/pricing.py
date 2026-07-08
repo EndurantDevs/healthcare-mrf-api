@@ -24,7 +24,12 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.endpoint.pagination import parse_pagination
-from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
+from api.ptg2_serving import (
+    _ptg2_manifest_enriched_provider_rows_for_npis,
+    normalize_ptg2_mode,
+    search_current_ptg2_index,
+    search_ptg2_provider_procedures,
+)
 from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_source_snapshot_ids_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
@@ -4768,6 +4773,431 @@ def _ptg2_empty_result_state(status: str, *, has_location_filter: bool) -> str:
     return "no_matching_rates"
 
 
+_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT = max(int(os.getenv("HLTHPRT_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT", "10000")), 100)
+
+
+def _has_no_ptg2_priced_items(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        return False
+    pagination = payload.get("pagination")
+    if isinstance(pagination, dict):
+        total = _as_int(pagination.get("total"))
+        if total is not None:
+            return total == 0
+    return isinstance(items, list) and not items
+
+
+async def _search_ptg_allowed_amount_evidence(
+    session,
+    args: Mapping[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    plan_id = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+    code = str(args.get("code") or "").strip()
+    if not plan_id or not code:
+        return None
+    if not await _table_exists(session, "hp_import_control.source_file_import"):
+        return None
+    import_rows = await _allowed_amount_import_rows_for_plan(session, args, plan_id=plan_id)
+    if not import_rows:
+        return None
+    code_system = str(args.get("code_system") or _reported_procedure_code_system(code) or "").strip().upper()
+    npi_filter = _parse_int(args.get("npi") or None, "npi", minimum=1)
+    evidence_rows: list[dict[str, Any]] = []
+    import_context: dict[str, Any] | None = None
+    for import_row in import_rows:
+        suffix = str(import_row.get("source_file_import_id") or "").strip()
+        table_names = _allowed_amount_table_names(suffix)
+        if table_names is None:
+            continue
+        item_table, payment_table, provider_payment_table = table_names
+        if not all(await _table_exists(session, table) for table in table_names):
+            continue
+        rows = await _allowed_amount_rows_from_tables(
+            session,
+            table_names=table_names,
+            plan_id=plan_id,
+            code=code,
+            code_system=code_system,
+            npi=npi_filter,
+            limit=_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT,
+        )
+        if rows:
+            evidence_rows = rows
+            import_context = import_row
+            break
+    if not evidence_rows or import_context is None:
+        return None
+    grouped_rows: dict[int, list[dict[str, Any]]] = {}
+    for row in evidence_rows:
+        npi = _as_int(row.get("npi"))
+        if npi is None or npi <= 0:
+            continue
+        grouped_rows.setdefault(npi, []).append(row)
+    if not grouped_rows:
+        return None
+    provider_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=tuple(grouped_rows),
+        limit=max(len(grouped_rows), 1),
+        plan_id=plan_id,
+        snapshot_id=str(import_context.get("snapshot_id") or "") or None,
+        source_key=str(import_context.get("source_key") or "") or None,
+    )
+    providers_by_npi = {
+        int(row.get("npi")): row
+        for row in (provider_rows or [])
+        if row.get("npi") is not None
+    }
+    zip_distance_map = await _allowed_amount_zip_distance_map(session, args)
+    specialty_filter = resolve_provider_specialty_filter(args)
+    items = []
+    for npi, rows_for_npi in grouped_rows.items():
+        provider = providers_by_npi.get(npi, {"npi": npi, "provider_name": "TiC provider"})
+        if zip_distance_map is not None:
+            provider_zip = _normalize_zip5(provider.get("zip5"))
+            if provider_zip not in zip_distance_map:
+                continue
+        if not _has_allowed_amount_provider_taxonomy_match(provider, specialty_filter):
+            continue
+        item = _allowed_amount_item_from_rows(
+            npi=npi,
+            rows=rows_for_npi,
+            provider=provider,
+            import_context=import_context,
+            code=code,
+            code_system=code_system,
+        )
+        if zip_distance_map is not None:
+            provider_zip = _normalize_zip5(provider.get("zip5"))
+            distance_payload = zip_distance_map.get(provider_zip or "")
+            if distance_payload:
+                item["distance_miles"] = _as_float(distance_payload.get("distance_miles"))
+                item["distance_bucket"] = distance_payload.get("distance_bucket")
+                item["anchor_zip5"] = _normalize_zip5(args.get("zip5"))
+                item["zip_radius_miles"] = _as_float(args.get("zip_radius_miles")) or PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES
+        items.append(item)
+    if not items:
+        return None
+    items.sort(
+        key=lambda item: (
+            item.get("distance_miles") is None,
+            item.get("distance_miles") or 0.0,
+            item.get("allowed_amount_min") is None,
+            item.get("allowed_amount_min") or 0.0,
+            str(item.get("provider_name") or ""),
+            int(item.get("npi") or 0),
+        )
+    )
+    total = len(items)
+    offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
+    page_items = items[offset : offset + limit]
+    return {
+        "result_state": "allowed_amounts_found",
+        "pricing_scope": "plan_scoped_allowed_amounts",
+        "resolved": True,
+        "items": page_items,
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "page": (offset // limit) + 1,
+            "has_more": offset + len(page_items) < total,
+        },
+        "query": {
+            "plan_id": plan_id,
+            "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
+            "code": code,
+            "code_system": code_system or None,
+            "specialty": args.get("specialty") or None,
+            "taxonomy_codes": args.get("taxonomy_codes") or args.get("taxonomy_code") or None,
+            "zip5": args.get("zip5") or None,
+            "zip_radius_miles": args.get("zip_radius_miles") if args.get("zip5") else None,
+            "npi": args.get("npi") or None,
+            "source": "ptg_allowed_amounts",
+            "source_file_import_id": import_context.get("source_file_import_id"),
+            "source_key": import_context.get("source_key"),
+            "snapshot_id": import_context.get("snapshot_id"),
+            "network_semantics": "out_of_network_historical_allowed_amounts",
+        },
+        "sources": [
+            {
+                "source_key": import_context.get("source_key"),
+                "snapshot_id": import_context.get("snapshot_id"),
+                "source_file_import_id": import_context.get("source_file_import_id"),
+                "source_system": "transparency_in_coverage_allowed_amounts",
+                "grain": "plan/code/tin/payment/provider_npi historical allowed amount",
+                "network_status": "out_of_network_or_not_confirmed_in_network",
+            }
+        ],
+        "warnings": [
+            {
+                "code": "allowed_amounts_not_in_network_rates",
+                "message": "Allowed amounts are historical out-of-network payment evidence, not negotiated in-network rates.",
+            }
+        ],
+    }
+
+
+async def _allowed_amount_import_rows_for_plan(session, args: Mapping[str, Any], *, plan_id: str) -> list[dict[str, Any]]:
+    market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
+    query_result = await session.execute(
+        text(
+            """
+            SELECT DISTINCT
+                   sfi.source_file_import_id,
+                   sfi.snapshot_id,
+                   sfi.source_key,
+                   sfi.import_month,
+                   sfi.attempt_no,
+                   sfi.metrics
+              FROM hp_import_control.source_file_import sfi
+              JOIN hp_import_control.discovered_plan_file dpf
+                ON dpf.source_file_id = sfi.source_file_id
+               AND dpf.content_version = sfi.content_version
+              JOIN hp_import_control.discovered_plan dp
+                ON dp.discovered_plan_id = dpf.discovered_plan_id
+             WHERE sfi.status = 'succeeded'
+               AND sfi.removed_at IS NULL
+               AND lower(replace(COALESCE(dpf.file_domain, ''), '-', '_')) IN ('allowed_amounts', 'allowed_amount')
+               AND dp.status = 'active'
+               AND dp.plan_id = :plan_id
+               AND (:market_type = '' OR lower(COALESCE(dp.market_type, '')) = :market_type)
+             ORDER BY sfi.import_month DESC, sfi.attempt_no DESC, sfi.source_file_import_id DESC
+             LIMIT 5
+            """
+        ),
+        {"plan_id": plan_id, "market_type": market_type},
+    )
+    return [_row_to_dict(import_row) for import_row in query_result]
+
+
+def _allowed_amount_table_names(source_file_import_id: str) -> tuple[str, str, str] | None:
+    suffix = re.sub(r"[^A-Za-z0-9_]", "_", source_file_import_id).strip("_")
+    if not suffix:
+        return None
+    item_table = _safe_table_name(f"ptg_allowed_item_{suffix}")
+    payment_table = _safe_table_name(f"ptg_allowed_payment_{suffix}")
+    provider_payment_table = _safe_table_name(f"ptg_allowed_provider_payment_{suffix}")
+    if not item_table or not payment_table or not provider_payment_table:
+        return None
+    return item_table, payment_table, provider_payment_table
+
+
+async def _allowed_amount_rows_from_tables(
+    session,
+    *,
+    table_names: tuple[str, str, str],
+    plan_id: str,
+    code: str,
+    code_system: str,
+    npi: int | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    item_table, payment_table, provider_payment_table = table_names
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                expanded.npi::bigint AS npi,
+                ai.plan_id,
+                ai.plan_market_type,
+                ai.billing_code_type,
+                ai.billing_code,
+                ai.name,
+                ai.description,
+                ap.tin_type,
+                ap.tin_value,
+                ap.service_code,
+                ap.billing_class,
+                ap.setting,
+                ap.allowed_amount::double precision AS allowed_amount,
+                ap.billing_code_modifier,
+                app.billed_charge::double precision AS billed_charge
+              FROM {item_table} ai
+              JOIN {payment_table} ap
+                ON ap.allowed_item_hash = ai.allowed_item_hash
+              JOIN {provider_payment_table} app
+                ON app.payment_hash = ap.payment_hash
+              CROSS JOIN LATERAL unnest(app.npi) AS expanded(npi)
+             WHERE ai.billing_code = :code
+               AND (:code_system = '' OR upper(COALESCE(ai.billing_code_type, '')) = :code_system)
+               AND (:plan_id = '' OR ai.plan_id = :plan_id)
+               AND (:npi IS NULL OR expanded.npi = :npi)
+             ORDER BY ap.allowed_amount NULLS LAST, app.billed_charge NULLS LAST, expanded.npi
+             LIMIT :limit
+            """
+        ),
+        {
+            "plan_id": plan_id,
+            "code": code,
+            "code_system": code_system,
+            "npi": npi,
+            "limit": max(1, min(int(limit or _ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT), _ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT)),
+        },
+    )
+    return [_row_to_dict(payment_row) for payment_row in query_result]
+
+
+async def _allowed_amount_zip_distance_map(session, args: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
+    zip5 = _normalize_zip5(args.get("zip5"))
+    if not zip5:
+        return None
+    radius_miles = _as_float(args.get("zip_radius_miles"))
+    if radius_miles is None:
+        radius_miles = PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES
+    zip_rows = await _zip_radius_rows(
+        session,
+        zip5=zip5,
+        radius_miles=radius_miles,
+        state_hint=str(args.get("state") or "").strip().upper() or None,
+    )
+    zip_distance_map: dict[str, dict[str, Any]] = {}
+    for row in zip_rows:
+        candidate_zip = _normalize_zip5(row.get("zip5"))
+        if candidate_zip is None or candidate_zip in zip_distance_map:
+            continue
+        distance_value = _as_float(row.get("distance_miles"))
+        zip_distance_map[candidate_zip] = {
+            "distance_miles": distance_value,
+            "distance_bucket": _distance_bucket(distance_value),
+        }
+    zip_distance_map.setdefault(zip5, {"distance_miles": 0.0, "distance_bucket": "zip_exact"})
+    return zip_distance_map
+
+
+def _has_allowed_amount_provider_taxonomy_match(
+    provider: dict[str, Any],
+    specialty_filter: ProviderSpecialtyFilter,
+) -> bool:
+    if not specialty_filter.active:
+        return True
+    requested_codes = set(specialty_filter.taxonomy_codes)
+    provider_codes = {str(code or "").strip().upper() for code in (provider.get("taxonomy_codes") or [])}
+    if requested_codes and provider_codes.intersection(requested_codes):
+        return True
+    if specialty_filter.classification:
+        classifications = {
+            str(value or "").strip().lower()
+            for value in (provider.get("classifications") or [])
+        }
+        return specialty_filter.classification.strip().lower() in classifications
+    return False
+
+
+def _allowed_amount_item_from_rows(
+    *,
+    npi: int,
+    rows: list[dict[str, Any]],
+    provider: dict[str, Any],
+    import_context: dict[str, Any],
+    code: str,
+    code_system: str,
+) -> dict[str, Any]:
+    """Build one provider row from historical allowed-amount payment evidence."""
+    price_entries = [_allowed_amount_price_payload(row) for row in rows[:25]]
+    allowed_values = [
+        value for value in (_as_float(row.get("allowed_amount")) for row in rows)
+        if value is not None
+    ]
+    billed_values = [
+        value for value in (_as_float(row.get("billed_charge")) for row in rows)
+        if value is not None
+    ]
+    address_payload_dict = provider.get("address_payload")
+    if isinstance(address_payload_dict, str):
+        try:
+            address_payload_dict = json.loads(address_payload_dict)
+        except (TypeError, ValueError):
+            address_payload_dict = {}
+    if not isinstance(address_payload_dict, dict):
+        address_payload_dict = {}
+    return {
+        "npi": npi,
+        "provider_ordinal": npi,
+        "provider_name": provider.get("provider_name") or "TiC provider",
+        "state": provider.get("state"),
+        "city": provider.get("city"),
+        "zip5": provider.get("zip5"),
+        "address": address_payload_dict,
+        "taxonomy_codes": provider.get("taxonomy_codes") or [],
+        "specialties": provider.get("specialties") or [],
+        "primary_specialty": provider.get("primary_specialty"),
+        "classifications": provider.get("classifications") or [],
+        "specialization": provider.get("primary_specialization"),
+        "source_key": import_context.get("source_key"),
+        "snapshot_id": import_context.get("snapshot_id"),
+        "source_file_import_id": import_context.get("source_file_import_id"),
+        "network_status": "out_of_network_or_not_confirmed_in_network",
+        "network_bound_address": False,
+        "requires_location_confirmation": True,
+        "address_network_binding": "not_applicable_allowed_amounts",
+        "procedure_code": code,
+        "hp_procedure_code": code,
+        "service_code": code,
+        "service_code_system": code_system or None,
+        "reported_code": code,
+        "reported_code_system": code_system or None,
+        "billing_code": code,
+        "billing_code_type": code_system or None,
+        "prices": price_entries,
+        "allowed_amount_prices": price_entries,
+        "allowed_amount_min": min(allowed_values) if allowed_values else None,
+        "allowed_amount_max": max(allowed_values) if allowed_values else None,
+        "allowed_amount_avg": round(sum(allowed_values) / len(allowed_values), 2) if allowed_values else None,
+        "billed_charge_min": min(billed_values) if billed_values else None,
+        "billed_charge_max": max(billed_values) if billed_values else None,
+        "evidence_count": len(rows),
+        "price_summary": [
+            {
+                "source": "allowed_amounts",
+                "price_type": "historical_allowed_amount",
+                "network_status": "out_of_network_or_not_confirmed_in_network",
+                "min": min(allowed_values) if allowed_values else None,
+                "max": max(allowed_values) if allowed_values else None,
+                "avg": round(sum(allowed_values) / len(allowed_values), 2) if allowed_values else None,
+                "evidence_count": len(rows),
+            }
+        ],
+        "confidence": {"network": "allowed_amounts_not_in_network", "location": "nppes_practice_location"},
+    }
+
+
+def _allowed_amount_price_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": "allowed_amounts",
+        "price_type": "historical_allowed_amount",
+        "network_status": "out_of_network_or_not_confirmed_in_network",
+        "allowed_amount": _as_float(row.get("allowed_amount")),
+        "billed_charge": _as_float(row.get("billed_charge")),
+        "tin_type": row.get("tin_type"),
+        "tin_value": row.get("tin_value"),
+        "service_code": _normalize_string_sequence(row.get("service_code")),
+        "billing_class": row.get("billing_class"),
+        "setting": row.get("setting"),
+        "billing_code_modifier": _normalize_string_sequence(row.get("billing_code_modifier")),
+        "match_basis": "npi",
+        "confidence": "medium",
+        "disclaimer": "Historical out-of-network allowed amount; not an in-network negotiated rate.",
+    }
+
+
+def _normalize_string_sequence(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    return [str(item).strip() for item in values if str(item or "").strip()]
+
+
 def _annotate_ptg2_result_state(
     ptg2_payload: object,
     *,
@@ -7928,6 +8358,11 @@ async def list_providers_by_procedure(request):
     include_debug = _parse_bool(args.get("include_debug"), "include_debug", default=False) or _parse_bool(
         args.get("include_details"), "include_details", default=False
     )
+    include_allowed_amounts = _parse_bool(
+        args.get("include_allowed_amounts"),
+        "include_allowed_amounts",
+        default=True,
+    )
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
@@ -8042,6 +8477,16 @@ async def list_providers_by_procedure(request):
             pagination,
         )
         if ptg2_payload is None:
+            if include_allowed_amounts:
+                allowed_amount_payload = await _search_ptg_allowed_amount_evidence(session, args, pagination)
+                if allowed_amount_payload is not None:
+                    _annotate_ptg2_query_payload(
+                        allowed_amount_payload,
+                        plan_id_type=plan_id_type,
+                        year=year,
+                        has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+                    )
+                    return _json_response(allowed_amount_payload)
             ptg_empty_status = "no_match" if (source_key or snapshot_id) else "no_route"
             has_location_filter = _has_ptg2_location_filter(args)
             query_payload = {
@@ -8093,6 +8538,16 @@ async def list_providers_by_procedure(request):
                     "query": query_payload,
                 }
             )
+        if include_allowed_amounts and _has_no_ptg2_priced_items(ptg2_payload):
+            allowed_amount_payload = await _search_ptg_allowed_amount_evidence(session, args, pagination)
+            if allowed_amount_payload is not None:
+                _annotate_ptg2_query_payload(
+                    allowed_amount_payload,
+                    plan_id_type=plan_id_type,
+                    year=year,
+                    has_plan_scope=bool(plan_id or plan_external_id or snapshot_id),
+                )
+                return _json_response(allowed_amount_payload)
         _annotate_ptg2_query_payload(
             ptg2_payload,
             plan_id_type=plan_id_type,

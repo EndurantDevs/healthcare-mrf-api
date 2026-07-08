@@ -1670,7 +1670,10 @@ class PTGAllowedItem(Base, JSONOutputMixin):
         {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['allowed_item_hash']
-    __my_additional_indexes__ = [{'index_elements': ('billing_code',), 'name': 'ptg_allowed_code_idx'}]
+    __my_additional_indexes__ = [
+        {'index_elements': ('billing_code',), 'name': 'ptg_allowed_code_idx'},
+        {'index_elements': ('plan_id', 'plan_market_type', 'billing_code'), 'name': 'ptg_allowed_plan_code_idx'},
+    ]
 
     allowed_item_hash = Column(BigInteger)
     file_id = Column(BigInteger)
@@ -1698,6 +1701,7 @@ class PTGAllowedPayment(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {'index_elements': ('allowed_item_hash',), 'name': 'ptg_allowed_payment_item_idx'},
         {'index_elements': ('tin_value',), 'name': 'ptg_allowed_payment_tin_idx'},
+        {'index_elements': ('allowed_item_hash', 'tin_value'), 'name': 'ptg_allowed_payment_item_tin_idx'},
     ]
 
     payment_hash = Column(BigInteger)
@@ -1719,7 +1723,10 @@ class PTGAllowedProviderPayment(Base, JSONOutputMixin):
         {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['provider_payment_hash']
-    __my_additional_indexes__ = [{'index_elements': ('payment_hash',), 'name': 'ptg_allowed_provider_payment_idx'}]
+    __my_additional_indexes__ = [
+        {'index_elements': ('payment_hash',), 'name': 'ptg_allowed_provider_payment_idx'},
+        {'index_elements': ('npi',), 'name': 'ptg_allowed_provider_payment_npi_gin_idx', 'using': 'gin'},
+    ]
 
     provider_payment_hash = Column(BigInteger)
     payment_hash = Column(BigInteger)

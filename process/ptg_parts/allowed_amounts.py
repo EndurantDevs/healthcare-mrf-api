@@ -47,7 +47,7 @@ async def _parse_allowed_amounts(
     import_log_cls,
     source_url: str,
     max_items: int | None = None,
-) -> None:
+) -> dict[str, Any]:
     item_cls = classes["PTGAllowedItem"]
     payment_cls = classes["PTGAllowedPayment"]
     provider_payment_cls = classes["PTGAllowedProviderPayment"]
@@ -57,11 +57,21 @@ async def _parse_allowed_amounts(
     item_rows: list[dict[str, Any]] = []
     payment_rows: list[dict[str, Any]] = []
     provider_payment_rows: list[dict[str, Any]] = []
+    metrics_by_name: dict[str, Any] = {
+        "allowed_amount_items": 0,
+        "allowed_amount_blocks": 0,
+        "allowed_amount_payments": 0,
+        "allowed_amount_provider_payments": 0,
+        "allowed_amount_npi_references": 0,
+        "allowed_amount_unique_tins": 0,
+    }
+    unique_tins: set[str] = set()
 
     with open_json_artifact_stream(file_path) as afp:
         count = 0
         for out_item in ijson.items(afp, "out_of_network.item", use_float=True):
             count += 1
+            metrics_by_name["allowed_amount_items"] += 1
             item_hash = _make_checksum(
                 file_id,
                 out_item.get("billing_code_type"),
@@ -86,8 +96,13 @@ async def _parse_allowed_amounts(
                 }
             )
             for allowed_amount in out_item.get("allowed_amounts", []):
+                metrics_by_name["allowed_amount_blocks"] += 1
                 tin_info = allowed_amount.get("tin") or {}
+                tin_value = str(tin_info.get("value") or "").strip()
+                if tin_value:
+                    unique_tins.add(tin_value)
                 for payment in allowed_amount.get("payments", []):
+                    metrics_by_name["allowed_amount_payments"] += 1
                     payment_hash = _make_checksum(
                         item_hash,
                         tin_info.get("value") or "",
@@ -111,16 +126,19 @@ async def _parse_allowed_amounts(
                         }
                     )
                     for provider in payment.get("providers", []):
+                        provider_npis = _as_int_list(provider.get("npi"))
+                        metrics_by_name["allowed_amount_provider_payments"] += 1
+                        metrics_by_name["allowed_amount_npi_references"] += len(provider_npis)
                         provider_payment_rows.append(
                             {
                                 "provider_payment_hash": _make_checksum(
                                     payment_hash,
                                     provider.get("billed_charge"),
-                                    "|".join(str(n) for n in _as_int_list(provider.get("npi"))),
+                                    "|".join(str(n) for n in provider_npis),
                                 ),
                                 "payment_hash": payment_hash,
                                 "billed_charge": provider.get("billed_charge"),
-                                "npi": _as_int_list(provider.get("npi")),
+                                "npi": provider_npis,
                             }
                         )
             if len(item_rows) >= 100:
@@ -144,6 +162,8 @@ async def _parse_allowed_amounts(
     if provider_payment_rows:
         await _push_objects_from_facade(provider_payment_rows, provider_payment_cls)
     await _ptg_facade().flush_error_log(import_log_cls)
+    metrics_by_name["allowed_amount_unique_tins"] = len(unique_tins)
+    return metrics_by_name
 
 
 async def _process_allowed_amounts_file(
@@ -192,7 +212,7 @@ async def _process_allowed_amounts_file(
             logical_artifact=logical_artifact,
             import_run_id=import_run_id,
         )
-        await _parse_allowed_amounts(
+        allowed_metrics = await _parse_allowed_amounts(
             extracted, file_row["file_id"], meta, plan_info, classes, test_mode, import_log_cls, url,
             max_items=max_items,
         )
@@ -208,4 +228,9 @@ async def _process_allowed_amounts_file(
             "etag": source_version.etag,
             "last_modified": source_version.last_modified,
         }
+    summary.update(allowed_metrics)
+    summary["allowed_amount_evidence"] = bool(
+        int(allowed_metrics.get("allowed_amount_provider_payments") or 0) > 0
+        or int(allowed_metrics.get("allowed_amount_payments") or 0) > 0
+    )
     return PTG2FileProcessResult("allowed_amounts", url, True, file_id=file_row["file_id"], summary=summary)

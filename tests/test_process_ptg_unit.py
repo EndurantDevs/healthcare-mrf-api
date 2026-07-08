@@ -3650,6 +3650,114 @@ def test_ptg2_main_publishes_allowed_amount_only_metadata_snapshot(monkeypatch):
     assert "manifest_stage" in dropped_tables
 
 
+def test_allowed_amount_metrics_from_results_sum_evidence_counts():
+    metrics = process_ptg._allowed_amount_metrics_from_results(
+        [
+            {
+                "source_type": "allowed_amounts",
+                "summary": {
+                    "allowed_amount_items": 2,
+                    "allowed_amount_blocks": 3,
+                    "allowed_amount_payments": 4,
+                    "allowed_amount_provider_payments": 5,
+                    "allowed_amount_npi_references": 8,
+                    "allowed_amount_unique_tins": 2,
+                },
+            },
+            {"source_type": "in_network", "summary": {"allowed_amount_items": 99}},
+            {
+                "source_type": "allowed_amounts",
+                "summary": {
+                    "allowed_amount_items": 1,
+                    "allowed_amount_provider_payments": 7,
+                },
+            },
+        ]
+    )
+
+    assert metrics["allowed_amount_items"] == 3
+    assert metrics["allowed_amount_blocks"] == 3
+    assert metrics["allowed_amount_payments"] == 4
+    assert metrics["allowed_amount_provider_payments"] == 12
+    assert metrics["allowed_amount_npi_references"] == 8
+    assert metrics["allowed_amount_unique_tins"] == 2
+    assert metrics["allowed_amount_evidence"] is True
+
+
+def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
+    pushed = []
+    dropped_tables = []
+    publish_serving = AsyncMock()
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/allowed.json.gz"),
+            )
+
+    async def fake_allowed(*_args, **_kwargs):
+        return process_ptg.PTG2FileProcessResult(
+            "allowed_amounts",
+            "https://example.test/allowed.json.gz",
+            True,
+            file_id=123,
+            summary={
+                "allowed_amount_items": 2,
+                "allowed_amount_blocks": 3,
+                "allowed_amount_payments": 4,
+                "allowed_amount_provider_payments": 5,
+                "allowed_amount_npi_references": 6,
+                "allowed_amount_unique_tins": 1,
+                "allowed_amount_evidence": True,
+            },
+        )
+
+    async def fake_drop_tables(names):
+        dropped_tables.extend(names)
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", fake_drop_tables)
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_allowed_amounts_file", fake_allowed)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", publish_serving)
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
+
+    result = asyncio.run(
+        process_ptg.main(
+            allowed_url="https://example.test/allowed.json.gz",
+            import_month="2026-04",
+            import_id="allowed_evidence_state_machine_test",
+            source_key="allowed_evidence_state_machine_test",
+        )
+    )
+
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    final_report = import_run_rows[-1]["report"]
+
+    assert result["allowed_amount_provider_payments"] == 5
+    assert final_report["serving_index"]["type"] == "allowed_amounts_evidence"
+    assert final_report["serving_index"]["storage"] == "legacy_dynamic_tables"
+    assert final_report["serving_index"]["allowed_amount_provider_payments"] == 5
+    assert final_report["allowed_amount_evidence"] is True
+    assert final_report["serving_rates"] in {0}
+    assert publish_serving.await_count in {0}
+    assert "manifest_stage" in dropped_tables
+
+
 def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     pushed = []
 

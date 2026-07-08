@@ -2729,6 +2729,34 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
     return versions
 
 
+_ALLOWED_AMOUNT_METRIC_KEYS = (
+    "allowed_amount_items",
+    "allowed_amount_blocks",
+    "allowed_amount_payments",
+    "allowed_amount_provider_payments",
+    "allowed_amount_npi_references",
+    "allowed_amount_unique_tins",
+)
+
+
+def _allowed_amount_metrics_from_results(files: list[dict[str, Any]]) -> dict[str, int | bool]:
+    metrics_by_name: dict[str, int | bool] = {key: 0 for key in _ALLOWED_AMOUNT_METRIC_KEYS}
+    for file_result in files:
+        if file_result.get("source_type") != "allowed_amounts":
+            continue
+        summary = file_result.get("summary") if isinstance(file_result.get("summary"), dict) else {}
+        for key in _ALLOWED_AMOUNT_METRIC_KEYS:
+            try:
+                metrics_by_name[key] = int(metrics_by_name.get(key) or 0) + max(0, int(summary.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+    metrics_by_name["allowed_amount_evidence"] = bool(
+        int(metrics_by_name.get("allowed_amount_provider_payments") or 0) > 0
+        or int(metrics_by_name.get("allowed_amount_payments") or 0) > 0
+    )
+    return metrics_by_name
+
+
 def _normalize_source_network_names(value: Any) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
@@ -3253,6 +3281,7 @@ async def main(
             file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
             for file_summary in successful_files
         )
+        allowed_amount_metrics = _allowed_amount_metrics_from_results(successful_files)
         if has_serving_files and _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
             _emit_ptg2_publish_progress(
                 "pre-copy merge",
@@ -3332,11 +3361,13 @@ async def main(
                 )
                 ptg2_manifest_stage_table = None
             serving_index = {
-                "type": "allowed_amounts_only",
-                "storage": "metadata_only",
+                "type": "allowed_amounts_evidence" if allowed_amount_metrics.get("allowed_amount_evidence") else "allowed_amounts_only",
+                "storage": "legacy_dynamic_tables" if allowed_amount_metrics.get("allowed_amount_evidence") else "metadata_only",
                 "source_key": source_key_val,
                 "serving_rates": 0,
                 "rate_count": 0,
+                "legacy_table_suffix": import_id_val,
+                **allowed_amount_metrics,
             }
         publish_seconds = time.monotonic() - publish_started_monotonic
         finished = _utcnow()
@@ -3373,6 +3404,7 @@ async def main(
             "serving_index": serving_index,
             "timings": timing_payload,
             "manifest_precopy_merge": manifest_merge_metrics,
+            **allowed_amount_metrics,
         }
         if isinstance(serving_index, dict):
             authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
@@ -3517,6 +3549,7 @@ async def main(
             "files_skipped": len(skipped_files),
             "serving_rates": report_payload.get("serving_rates"),
             "rate_count": report_payload.get("rate_count"),
+            **allowed_amount_metrics,
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
             "address_refresh": address_refresh_result,
         }

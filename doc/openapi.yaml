@@ -3855,6 +3855,9 @@ paths:
         inspect `result_state`, `pricing_scope`, `resolved_snapshot_id`, and
         `query.ignored_params` to distinguish matched rows from no snapshot,
         no local match in the requested radius, or no matching rates.
+        If `include_allowed_amounts` is true or omitted, a plan-scoped lookup
+        with no in-network negotiated row may return historical allowed-amount
+        evidence clearly marked as not confirmed in-network.
       parameters:
         - name: year
           in: query
@@ -4000,6 +4003,11 @@ paths:
         - name: include_evidence
           in: query
           schema: { type: boolean }
+        - name: include_allowed_amounts
+          in: query
+          schema: { type: boolean, default: true }
+          description: |
+            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. Returned allowed-amount rows are marked as out-of-network or not confirmed in-network and must not be presented as covered in-network rates.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -4257,6 +4265,13 @@ paths:
           in: query
           schema:
             type: boolean
+        - name: include_allowed_amounts
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: |
+            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. Returned allowed-amount rows are marked as out-of-network or not confirmed in-network and must not be presented as covered in-network rates.
         - name: include_details
           in: query
           schema:
@@ -6326,12 +6341,12 @@ components:
           type: string
           nullable: true
           description: Machine-readable outcome for plan-scoped PTG/TiC pricing lookups.
-          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan]
+          enum: [matched, no_match_in_radius, no_matching_rates, no_snapshot_for_plan, allowed_amounts_found]
         pricing_scope:
           type: string
           nullable: true
           description: Indicates the pricing backend scope when the response came from plan-scoped PTG/TiC data.
-          enum: [plan_scoped_ptg]
+          enum: [plan_scoped_ptg, plan_scoped_allowed_amounts]
         resolved_snapshot_id:
           type: string
           nullable: true

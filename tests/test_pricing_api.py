@@ -2231,6 +2231,125 @@ async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_falls_back_to_allowed_amount_evidence(monkeypatch):
+    async def fake_search(_session, _args, _pagination):
+        return None
+
+    async def fake_allowed(_session, args, pagination):
+        return {
+            "result_state": "allowed_amounts_found",
+            "pricing_scope": "plan_scoped_allowed_amounts",
+            "items": [
+                {
+                    "npi": 1427166008,
+                    "network_status": "out_of_network_or_not_confirmed_in_network",
+                    "prices": [{"source": "allowed_amounts", "allowed_amount": 133.0}],
+                }
+            ],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg_allowed_amounts", "plan_id": args["plan_id"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fake_allowed)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "911643507",
+            "market_type": "group",
+            "code": "99203",
+            "zip5": "60601",
+            "year": "2023",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["result_state"] == "allowed_amounts_found"
+    assert payload["pricing_scope"] == "plan_scoped_allowed_amounts"
+    assert payload["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
+    assert payload["items"][0]["prices"][0]["source"] == "allowed_amounts"
+    assert payload["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_empty_ptg_fallback(monkeypatch):
+    async def fake_search(_session, _args, pagination):
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "status": "no_match"},
+        }
+
+    async def fake_allowed(_session, args, pagination):
+        return {
+            "result_state": "allowed_amounts_found",
+            "pricing_scope": "plan_scoped_allowed_amounts",
+            "items": [{"npi": 1427166008, "allowed_amount_min": 133.0}],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg_allowed_amounts", "plan_id": args["plan_id"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fake_allowed)
+    request = make_request(
+        [],
+        args={"plan_id": "911643507", "market_type": "group", "code": "99203", "zip5": "60601"},
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["result_state"] == "allowed_amounts_found"
+    assert payload["items"][0]["allowed_amount_min"] == 133.0
+    assert payload["query"]["source"] == "ptg_allowed_amounts"
+
+
+@pytest.mark.asyncio
+async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(monkeypatch):
+    async def fake_search(_session, _args, _pagination):
+        return None
+
+    async def fail_allowed(*_args, **_kwargs):
+        raise AssertionError("allowed amount fallback should be disabled")
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fail_allowed)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "911643507",
+            "market_type": "group",
+            "code": "99203",
+            "include_allowed_amounts": "false",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["items"] == []
+    assert payload["result_state"] == "no_snapshot_for_plan"
+    assert payload["query"]["source"] == "ptg2"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit(monkeypatch):
     async def fail_search(*_args, **_kwargs):
         raise AssertionError("broad provider-directory request should fail before PTG search")
