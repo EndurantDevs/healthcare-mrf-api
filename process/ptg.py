@@ -931,7 +931,7 @@ async def _merge_and_copy_ptg2_manifest_files(
 
     price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
     provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
-    if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, True):
+    if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, False):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
         progress_total = 3
 

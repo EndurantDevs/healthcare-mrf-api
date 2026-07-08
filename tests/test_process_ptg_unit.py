@@ -6482,7 +6482,7 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     assert progress_events[-1]["source"] == "ptg2-publish-progress"
 
 
-def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
+def test_ptg2_manifest_precopy_merge_streams_when_enabled(monkeypatch, tmp_path):
     """Streaming pre-copy merge emits progress around each direct COPY stream."""
     stream_calls = []
     progress_events = []
@@ -6498,7 +6498,7 @@ def test_ptg2_manifest_precopy_merge_streams_by_default(monkeypatch, tmp_path):
             "dropped_rows": 1,
         }
 
-    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", raising=False)
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", "true")
     monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fake_stream)
     monkeypatch.setattr(process_ptg, "write_live_progress", lambda **payload: progress_events.append(payload))
 
@@ -6553,7 +6553,7 @@ def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatc
         ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     )
     monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
-    monkeypatch.delenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", raising=False)
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_STREAM_MERGE_COPY", "true")
     monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fake_stream)
 
     metrics = asyncio.run(
