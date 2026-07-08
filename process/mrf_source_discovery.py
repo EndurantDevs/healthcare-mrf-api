@@ -13430,30 +13430,67 @@ async def _sync_import_control_seeds(
             items.append(item)
     if not items:
         return 0
-    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+    timeout = _import_control_sync_timeout()
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
+    synced = 0
     async with aiohttp.ClientSession(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
-        async with session.post(
-            f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
-            json={"seed_provider": "healthcare-mrf-api", "items": items},
-        ) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                raise RuntimeError(
-                    f"import-control seed sync failed: {resp.status} {text[:200]}"
-                )
-            payload = await resp.json()
-    return int(payload.get("count") or len(payload.get("items") or []))
+        for batch in _chunked(items, _import_control_seed_batch_size()):
+            async with session.post(
+                f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
+                json={"seed_provider": "healthcare-mrf-api", "items": batch},
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise RuntimeError(
+                        f"import-control seed sync failed: {resp.status} {text[:200]}"
+                    )
+                payload = await resp.json()
+            synced += int(payload.get("count") or len(payload.get("items") or []))
+    return synced
 
 
 def _env_flag(name: str) -> bool:
     return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _positive_env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _import_control_sync_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=_positive_env_float(
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS", 300.0
+        ),
+        connect=_positive_env_float(
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS", 10.0
+        ),
+        sock_read=_positive_env_float(
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS", 180.0
+        ),
+    )
+
+
+def _import_control_seed_batch_size() -> int:
+    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 500)
 
 
 def _coerce_metadata(value: Any) -> dict[str, Any]:
@@ -14687,7 +14724,7 @@ async def _push_import_control_catalog(
             _import_control_source_identity_key(row), []
         ).append(row)
     base = base_url.rstrip("/")
-    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+    timeout = _import_control_sync_timeout()
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",

@@ -8691,6 +8691,127 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
     assert item["reviewed_at"]
 
 
+def _seed_batch_sync_fake_session(captured_calls, captured_timeouts):
+    """Return a fake aiohttp session that records seed sync batches."""
+
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, timeout=None, **_kwargs):
+            captured_timeouts.append(timeout)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            captured_calls.append({"url": url, "json": json})
+            return FakeResponse({"count": len(json.get("items") or [])})
+
+    return FakeSession
+
+
+@pytest.mark.asyncio
+async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatch):
+    """Import-control seed sync chunks broad weekly source batches."""
+    calls = []
+    captured_timeouts = []
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", "2")
+    monkeypatch.setenv(
+        "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS", "321"
+    )
+    monkeypatch.setenv("HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS", "123")
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _seed_batch_sync_fake_session(calls, captured_timeouts),
+    )
+
+    synced = await discovery._sync_import_control_seeds(
+        [
+            {
+                "source_id": f"source_{index}",
+                "index_url": f"https://example.com/{index}/index.json",
+                "display_name": f"Example Payer {index}",
+                "seed_provider": "master-list",
+            }
+            for index in range(3)
+        ]
+    )
+
+    assert synced == 3
+    assert [len(call["json"]["items"]) for call in calls] == [2, 1]
+    assert all(
+        call["url"] == "http://import-control.test/v1/catalog/seeds/import"
+        for call in calls
+    )
+    assert captured_timeouts[0].total == 321
+    assert captured_timeouts[0].sock_read == 123
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_uses_sync_timeout(monkeypatch):
+    """Catalog sync uses the same long import-control HTTP timeout."""
+    calls = []
+    captured_timeouts = []
+    sentinel_timeout = object()
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_local"]
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_sync_timeout", lambda: sentinel_timeout)
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(
+        discovery.aiohttp,
+        "ClientSession",
+        _catalog_existing_public_snapshot_fake_session(calls, captured_timeouts),
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_local",
+                "index_url": "https://example.com/index.json",
+                "human_url": "https://example.com/transparency",
+                "display_name": "Example Payer",
+                "source_key": "example",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "metadata_json": {"source_tier": "mrf_importable"},
+            }
+        ]
+    )
+
+    assert sources_synced == 1
+    assert plans_synced == 0
+    assert errors == []
+    assert captured_timeouts == [sentinel_timeout]
+
+
 def test_import_control_source_identity_key_keeps_context_scoped_generic_urls():
     shared_url = "https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I"
     first_key = discovery._import_control_source_identity_key(
@@ -9135,7 +9256,7 @@ def _existing_public_catalog_source_row():
     }
 
 
-def _catalog_existing_public_snapshot_fake_session(captured_calls):
+def _catalog_existing_public_snapshot_fake_session(captured_calls, captured_timeouts=None):
     class FakeResponse:
         def __init__(self, payload, status=200):
             self.payload = payload
@@ -9154,8 +9275,9 @@ def _catalog_existing_public_snapshot_fake_session(captured_calls):
             return "error"
 
     class FakeSession:
-        def __init__(self, *_args, **_kwargs):
-            return None
+        def __init__(self, *_args, timeout=None, **_kwargs):
+            if captured_timeouts is not None:
+                captured_timeouts.append(timeout)
 
         async def __aenter__(self):
             return self

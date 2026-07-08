@@ -112,6 +112,13 @@ Useful environment knobs for full crawls:
   defaults to `0`, which lets full-catalog crawls finish slow write batches instead of aborting.
 - `HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE`: split preview items sent per
   import-control catalog ingest request; defaults to 1000.
+- `HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE`: split import-control seed sync
+  rows per request; defaults to 500.
+- `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS`,
+  `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS`, and
+  `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS`: HTTP timeouts for
+  internal import-control seed/catalog publication; default to 300, 10, and
+  180 seconds.
 - `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
   Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
   larger index files without changing the global default.
