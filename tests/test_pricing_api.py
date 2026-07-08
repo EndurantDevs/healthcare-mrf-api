@@ -2589,6 +2589,37 @@ async def test_list_providers_by_procedure_zip_radius_expands_candidates():
 
 
 @pytest.mark.asyncio
+async def test_postal_radius_cache_avoids_repeated_geo_lookup(monkeypatch):
+    """Repeated postal-radius expansion should reuse memory and return copies."""
+
+    pricing_module._ZIP_RADIUS_ROWS_CACHE.clear()
+    monkeypatch.setattr(pricing_module, "_ZIP_RADIUS_ROWS_CACHE_TTL_SECONDS", 300.0)
+    monkeypatch.setattr(pricing_module, "_ZIP_RADIUS_ROWS_CACHE_MAX_KEYS", 16)
+    geo_lookup_session = FakeSession(
+        [
+            FakeResult(rows=[{"zip5": "20814", "state": "MD", "latitude": 39.0, "longitude": -77.1}]),
+            FakeResult(rows=[{"zip5": "20814", "state": "MD", "distance_miles": 0.0}]),
+        ]
+    )
+
+    initial_radius_matches = await pricing_module._zip_radius_rows(
+        geo_lookup_session,
+        zip5="20814",
+        radius_miles=5.0,
+    )
+    initial_radius_matches[0]["zip5"] = "mutated"
+    cached_radius_matches = await pricing_module._zip_radius_rows(
+        geo_lookup_session,
+        zip5="20814",
+        radius_miles=5.0,
+    )
+
+    assert len(geo_lookup_session.executions) == 2
+    assert cached_radius_matches[0]["zip5"] == "20814"
+    pricing_module._ZIP_RADIUS_ROWS_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats():
     request = make_request(
         [

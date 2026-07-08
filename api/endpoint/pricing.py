@@ -279,6 +279,18 @@ ENABLE_PRICING_SCHEMA_CACHE = _env_flag(
 _PRICING_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _PRICING_TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _PRICING_TABLE_COLUMNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_ZIP_RADIUS_ROWS_CACHE_TTL_SECONDS = max(
+    float(os.getenv("HLTHPRT_PRICING_ZIP_RADIUS_CACHE_TTL_SECONDS", "86400")),
+    0.0,
+)
+_ZIP_RADIUS_ROWS_CACHE_MAX_KEYS = max(
+    int(os.getenv("HLTHPRT_PRICING_ZIP_RADIUS_CACHE_MAX_KEYS", "2048")),
+    0,
+)
+_ZIP_RADIUS_ROWS_CACHE: OrderedDict[
+    tuple[str, float, str, int],
+    tuple[float, tuple[dict[str, Any], ...]],
+] = OrderedDict()
 _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS = max(
     float(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS", "300")),
     0.0,
@@ -654,6 +666,44 @@ def _distance_miles_expression(anchor_lat: float, anchor_long: float):
     )
 
 
+def _zip_radius_cache_key(
+    *,
+    zip5: str,
+    radius_miles: float,
+    state_filter: str | None,
+    limit: int,
+) -> tuple[str, float, str, int]:
+    return (
+        zip5,
+        round(max(float(radius_miles), 0.0), 3),
+        str(state_filter or "").strip().upper(),
+        max(int(limit), 1),
+    )
+
+
+def _zip_radius_rows_cache_get(key: tuple[str, float, str, int]) -> list[dict[str, Any]] | None:
+    if _ZIP_RADIUS_ROWS_CACHE_TTL_SECONDS <= 0 or _ZIP_RADIUS_ROWS_CACHE_MAX_KEYS <= 0:
+        return None
+    cached = _ZIP_RADIUS_ROWS_CACHE.get(key)
+    if cached is None:
+        return None
+    cached_at, cached_rows = cached
+    if (time.monotonic() - cached_at) > _ZIP_RADIUS_ROWS_CACHE_TTL_SECONDS:
+        _ZIP_RADIUS_ROWS_CACHE.pop(key, None)
+        return None
+    _ZIP_RADIUS_ROWS_CACHE.move_to_end(key)
+    return [dict(row) for row in cached_rows]
+
+
+def _zip_radius_rows_cache_put(key: tuple[str, float, str, int], rows: list[dict[str, Any]]) -> None:
+    if _ZIP_RADIUS_ROWS_CACHE_TTL_SECONDS <= 0 or _ZIP_RADIUS_ROWS_CACHE_MAX_KEYS <= 0:
+        return
+    _ZIP_RADIUS_ROWS_CACHE[key] = (time.monotonic(), tuple(dict(row) for row in rows))
+    _ZIP_RADIUS_ROWS_CACHE.move_to_end(key)
+    while len(_ZIP_RADIUS_ROWS_CACHE) > _ZIP_RADIUS_ROWS_CACHE_MAX_KEYS:
+        _ZIP_RADIUS_ROWS_CACHE.popitem(last=False)
+
+
 def _distance_bucket(distance_miles: float | None) -> str | None:
     if distance_miles is None:
         return None
@@ -705,6 +755,19 @@ async def _zip_radius_rows(
     if not normalized_zip:
         return []
 
+    state_hint_normalized = str(state_hint or "").strip().upper() or None
+    cache_key: tuple[str, float, str, int] | None = None
+    if anchor_context is None:
+        cache_key = _zip_radius_cache_key(
+            zip5=normalized_zip,
+            radius_miles=radius_miles,
+            state_filter=state_hint_normalized,
+            limit=limit,
+        )
+        cached_rows = _zip_radius_rows_cache_get(cache_key)
+        if cached_rows is not None:
+            return cached_rows
+
     anchor = anchor_context
     if anchor is not None:
         anchor_zip = _normalize_zip5(anchor.get("zip5"))
@@ -712,9 +775,8 @@ async def _zip_radius_rows(
             anchor = None
     if anchor is None:
         anchor = await _lookup_zip_context(session, normalized_zip)
-    state_hint_normalized = str(state_hint or "").strip().upper() or None
     if anchor is None:
-        return [
+        rows = [
             {
                 "zip5": normalized_zip,
                 "state": state_hint_normalized,
@@ -723,13 +785,16 @@ async def _zip_radius_rows(
                 "is_anchor": True,
             }
         ]
+        if cache_key is not None:
+            _zip_radius_rows_cache_put(cache_key, rows)
+        return rows
 
     anchor_lat = _as_float(anchor.get("latitude"))
     anchor_long = _as_float(anchor.get("longitude"))
     anchor_state = str(anchor.get("state") or "").strip().upper() or None
     state_filter = state_hint_normalized or anchor_state
     if anchor_lat is None or anchor_long is None:
-        return [
+        rows = [
             {
                 "zip5": normalized_zip,
                 "state": state_filter,
@@ -738,6 +803,9 @@ async def _zip_radius_rows(
                 "is_anchor": True,
             }
         ]
+        if cache_key is not None:
+            _zip_radius_rows_cache_put(cache_key, rows)
+        return rows
 
     distance_expr = _distance_miles_expression(anchor_lat, anchor_long).label("distance_miles")
     filters = [
@@ -790,6 +858,8 @@ async def _zip_radius_rows(
                 "is_anchor": True,
             },
         )
+    if cache_key is not None:
+        _zip_radius_rows_cache_put(cache_key, rows)
     return rows
 
 
