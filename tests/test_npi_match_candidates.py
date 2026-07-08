@@ -179,6 +179,37 @@ def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
     assert query_params["match_taxonomy_prefix_0"] == "261Q%"
 
 
+def test_match_candidate_query_keeps_explicit_taxonomy_scope_restrictive():
+    query, query_params = npi_module._match_candidate_query(
+        {
+            "address_site_key": None,
+            "address_key": "d8c8e7f0-d765-4786-9349-3663085a23b3",
+            "lat": None,
+            "long": None,
+            "radius_miles": None,
+            "phone_digits": "3125551212",
+            "entity_type_code": 2,
+            "taxonomy_exact": ("282N00000X",),
+            "taxonomy_prefixes": ("261Q",),
+            "provider_type": "hospital",
+            "specialty_filter": types.SimpleNamespace(
+                taxonomy_codes=("273R00000X",),
+                classification=None,
+            ),
+            "limit": 5,
+        },
+        "mrf.entity_address_unified",
+    )
+    sql = str(query)
+    candidate_locations_sql = sql.split("LIMIT :candidate_limit", 1)[0]
+
+    assert query_params["match_taxonomy_codes"] == ["282N00000X"]
+    assert query_params["match_taxonomy_prefix_0"] == "261Q%"
+    assert "273R00000X" not in repr(query_params)
+    assert "nf.npi = COALESCE(a.npi, a.inferred_npi)" in candidate_locations_sql
+    assert "t.npi = COALESCE(a.npi, a.inferred_npi)" in candidate_locations_sql
+
+
 def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator():
     params = {
         "address_site_key": None,

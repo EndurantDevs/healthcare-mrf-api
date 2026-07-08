@@ -2800,10 +2800,16 @@ def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
     }
 
 
-def _match_candidate_taxonomy_filter_sql(params: dict[str, Any], query_params: dict[str, Any]) -> str:
+def _match_candidate_taxonomy_filter_sql(
+    params: dict[str, Any],
+    query_params: dict[str, Any],
+    *,
+    npi_sql: str = "cl.npi",
+) -> str:
     specialty_filter = params.get("specialty_filter")
     taxonomy_codes = list(params.get("taxonomy_exact") or [])
-    if specialty_filter is not None:
+    has_explicit_scope = bool(taxonomy_codes or params.get("taxonomy_prefixes"))
+    if specialty_filter is not None and not has_explicit_scope:
         taxonomy_codes.extend(str(code).upper() for code in specialty_filter.taxonomy_codes)
     taxonomy_codes = list(dict.fromkeys(code for code in taxonomy_codes if code))
     taxonomy_prefixes = list(params.get("taxonomy_prefixes") or [])
@@ -2815,7 +2821,12 @@ def _match_candidate_taxonomy_filter_sql(params: dict[str, Any], query_params: d
         key = f"match_taxonomy_prefix_{idx}"
         query_params[key] = f"{prefix}%"
         taxonomy_conditions.append(f"t.healthcare_provider_taxonomy_code LIKE :{key}")
-    if specialty_filter is not None and specialty_filter.classification and not specialty_filter.taxonomy_codes:
+    if (
+        specialty_filter is not None
+        and not has_explicit_scope
+        and specialty_filter.classification
+        and not specialty_filter.taxonomy_codes
+    ):
         query_params["match_taxonomy_classification"] = specialty_filter.classification
         taxonomy_conditions.append("nu.classification = :match_taxonomy_classification")
     if not taxonomy_conditions:
@@ -2828,7 +2839,7 @@ def _match_candidate_taxonomy_filter_sql(params: dict[str, Any], query_params: d
               FROM {taxonomy_table_sql} AS t
          LEFT JOIN {nucc_table_sql} AS nu
                 ON nu.code = t.healthcare_provider_taxonomy_code
-             WHERE t.npi = cl.npi
+             WHERE t.npi = {npi_sql}
                AND ({' OR '.join(taxonomy_conditions)})
         )
     """
@@ -2907,11 +2918,32 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     locator_where = ([selected_locator] if selected_locator else []) or geo_locator_where
     address_where.append(f"({' OR '.join(locator_where)})")
 
-    npi_where: list[str] = []
+    npi_table_sql = _schema_cache_key(NPIData.__tablename__)
+    taxonomy_filter = _match_candidate_taxonomy_filter_sql(params, query_params)
     if params.get("entity_type_code") is not None:
         query_params["entity_type_code"] = params["entity_type_code"]
+        address_where.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                  FROM {npi_table_sql} AS nf
+                 WHERE nf.npi = {columns['provider_npi']}
+                   AND nf.entity_type_code = :entity_type_code
+            )
+            """
+        )
+    if taxonomy_filter != "1=1":
+        address_where.append(
+            _match_candidate_taxonomy_filter_sql(
+                params,
+                query_params,
+                npi_sql=columns["provider_npi"],
+            )
+        )
+
+    npi_where: list[str] = []
+    if params.get("entity_type_code") is not None:
         npi_where.append("n.entity_type_code = :entity_type_code")
-    taxonomy_filter = _match_candidate_taxonomy_filter_sql(params, query_params)
     if taxonomy_filter != "1=1":
         npi_where.append(taxonomy_filter)
     npi_where_sql = " AND ".join(npi_where) if npi_where else "1=1"
@@ -2923,7 +2955,6 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     )
     address_key_match = "a.address_key = CAST(:address_key AS uuid)" if params.get("address_key") else "false"
     phone_match = _address_phone_digits_filter("a", address_table_sql) if params.get("phone_digits") else "false"
-    npi_table_sql = _schema_cache_key(NPIData.__tablename__)
     taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
