@@ -12509,12 +12509,17 @@ async def _push_crawl_row_batches(
     observation_rows: list[dict[str, Any]],
     *,
     batch_size: int | None = None,
+    row_write_timeout: float | None = None,
 ) -> None:
     async def push_chunked(rows: list[dict[str, Any]], model: type[Any]) -> None:
         size = max(1, int(batch_size or len(rows) or 1))
         while rows:
             chunk = rows[:size]
-            await push_objects(chunk, model, rewrite=True, use_copy=False)
+            write_coro = push_objects(chunk, model, rewrite=True, use_copy=False)
+            if row_write_timeout and row_write_timeout > 0:
+                await asyncio.wait_for(write_coro, timeout=row_write_timeout)
+            else:
+                await write_coro
             del rows[: len(chunk)]
 
     if plan_rows:
@@ -13033,10 +13038,10 @@ async def _crawl_toc_metadata(
         target_crawl_timeout = 180.0
     try:
         row_write_timeout = float(
-            os.getenv("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", "180")
+            os.getenv("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", "0")
         )
     except ValueError:
-        row_write_timeout = 180.0
+        row_write_timeout = 0.0
 
     async def crawl_one(
         target: CrawlTarget, session: aiohttp.ClientSession
@@ -13167,7 +13172,11 @@ async def _crawl_toc_metadata(
         for observation in resolver_observations:
             observation_ids.add(observation["observation_id"])
         await _push_crawl_row_batches(
-            [], target_rows, resolver_observations, batch_size=write_batch_size
+            [],
+            target_rows,
+            resolver_observations,
+            batch_size=write_batch_size,
+            row_write_timeout=row_write_timeout,
         )
         total = len(targets)
         if progress_run_id:
@@ -13253,11 +13262,9 @@ async def _crawl_toc_metadata(
                     pending_file_rows,
                     pending_observation_rows,
                     batch_size=write_batch_size,
+                    row_write_timeout=row_write_timeout,
                 )
-                if row_write_timeout > 0:
-                    await asyncio.wait_for(write_coro, timeout=row_write_timeout)
-                else:
-                    await write_coro
+                await write_coro
             if progress_run_id:
                 enqueue_live_progress(
                     run_id=progress_run_id,
@@ -13286,11 +13293,9 @@ async def _crawl_toc_metadata(
             pending_file_rows,
             pending_observation_rows,
             batch_size=write_batch_size,
+            row_write_timeout=row_write_timeout,
         )
-        if row_write_timeout > 0:
-            await asyncio.wait_for(final_write_coro, timeout=row_write_timeout)
-        else:
-            await final_write_coro
+        await final_write_coro
     return (
         discovery_count_map["plans"],
         discovery_count_map["files"],

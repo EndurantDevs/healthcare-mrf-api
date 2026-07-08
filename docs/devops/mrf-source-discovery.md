@@ -44,7 +44,7 @@ Configure these in `import-control`, not hard-coded cron:
 | Cadence | Params | Purpose |
 | --- | --- | --- |
 | Daily | `--provider master-list --check-urls --concurrency 10` | catch broken/stale curated sources |
-| Weekly | `--provider master-list --limit 500 --check-urls --concurrency 10 --sync-import-control` | refresh curated source universe and central control catalog |
+| Weekly | `--provider master-list --crawl --concurrency 10 --sync-import-control --sync-import-control-catalog` | refresh the full searchable source, plan, and file catalog |
 | Weekly TPA | `--provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10` | keep TPA-hosted metadata and file references current |
 | Weekly TPA probe | `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10` | sample TPA body-file freshness without full PTG import |
 | Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control` | full metadata refresh within bounded source universe |

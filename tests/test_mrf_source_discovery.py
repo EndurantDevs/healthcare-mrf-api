@@ -13848,6 +13848,39 @@ async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crawl_toc_metadata_disables_row_write_timeout_by_default(monkeypatch):
+    row_write_timeouts = []
+
+    async def fake_resolve_crawl_targets(*_args, **_kwargs):
+        return [], []
+
+    async def fake_push_crawl_row_batches(*_args, **kwargs):
+        row_write_timeouts.append(kwargs["row_write_timeout"])
+
+    monkeypatch.delenv("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(
+        discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches
+    )
+
+    await discovery._crawl_toc_metadata(
+        [
+            {
+                "source_id": "source_1",
+                "payer_id": "payer_1",
+                "index_url": "https://example.com/source",
+            }
+        ],
+        test_mode=False,
+        run_id="run_1",
+        max_toc_bytes=1024,
+        concurrency=1,
+    )
+
+    assert row_write_timeouts == [0.0, 0.0]
+
+
+@pytest.mark.asyncio
 async def test_crawl_table_of_contents_metadata_times_out_slow_target(monkeypatch):
     pushed_batches = []
     source_rows = [
@@ -14436,6 +14469,32 @@ async def test_push_crawl_row_batches_chunks_large_model_writes(monkeypatch):
         (discovery.MRFFile, 1, True, False),
         (discovery.MRFUrlObservation, 1, True, False),
     ]
+
+
+@pytest.mark.asyncio
+async def test_push_crawl_row_batches_applies_timeout_per_chunk(monkeypatch):
+    observed_timeouts = []
+
+    async def fake_push_objects(_rows, _model, *, rewrite, use_copy):
+        assert rewrite is True
+        assert use_copy is False
+
+    async def fake_wait_for(awaitable, *, timeout):
+        observed_timeouts.append(timeout)
+        return await awaitable
+
+    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
+    monkeypatch.setattr(discovery.asyncio, "wait_for", fake_wait_for)
+
+    await discovery._push_crawl_row_batches(
+        [{"mrf_plan_id": str(index)} for index in range(5)],
+        [],
+        [],
+        batch_size=2,
+        row_write_timeout=45.0,
+    )
+
+    assert observed_timeouts == [45.0, 45.0, 45.0]
 
 
 @pytest.mark.asyncio

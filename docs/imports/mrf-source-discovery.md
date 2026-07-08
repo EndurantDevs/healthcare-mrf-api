@@ -108,6 +108,8 @@ Useful environment knobs for full crawls:
 - `HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT`: total timeout for provider/TOC listing fetches; defaults to 300 seconds.
 - `HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT`: socket read timeout for provider/TOC listing fetches; defaults to 120 seconds.
 - `HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE`: parsed-row upsert batch size; defaults to 2000 rows.
+- `HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS`: optional per-batch database write timeout;
+  defaults to `0`, which lets full-catalog crawls finish slow write batches instead of aborting.
 - `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
   Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
   larger index files without changing the global default.
