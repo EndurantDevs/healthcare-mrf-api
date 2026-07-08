@@ -3415,13 +3415,16 @@ def test_entity_address_unified_archive_coordinate_backfill_sql_only_fills_missi
     )
 
     assert "UPDATE mrf.entity_address_unified_20260614 AS t" in sql
-    assert "SET lat = COALESCE(t.lat, a.lat)" in sql
-    assert "long = COALESCE(t.long, a.long)" in sql
+    assert "SET lat = CASE WHEN t.lat IS NULL OR t.long IS NULL" in sql
+    assert "THEN a.lat ELSE t.lat END" in sql
+    assert "long = CASE WHEN t.lat IS NULL OR t.long IS NULL" in sql
+    assert "THEN a.long ELSE t.long END" in sql
     assert "FROM mrf.address_archive_v2 AS a" in sql
     assert "a.merged_into IS NULL" in sql
     assert "a.lat IS NOT NULL" in sql
     assert "a.long IS NOT NULL" in sql
-    assert "(t.lat IS NULL OR t.long IS NULL)" in sql
+    assert "t.lat IS NULL OR t.long IS NULL" in sql
+    assert "ABS(t.lat) < 0.0000001" in sql
 
 
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
