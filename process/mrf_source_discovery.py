@@ -13378,7 +13378,17 @@ def _import_control_source_context_metadata(row: dict[str, Any]) -> dict[str, An
 
 
 def _has_private_query_context_source_row(row: dict[str, Any]) -> bool:
-    return bool(_import_control_source_context_metadata(row).get("private_query_context"))
+    context = _import_control_source_context_metadata(row)
+    if context.get("private_query_context"):
+        return True
+    metadata = row.get("metadata_json") or {}
+    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    target_query = (
+        context.get("target_payer_query")
+        or metadata.get("target_payer_query")
+        or raw.get("target_payer_query")
+    )
+    return bool(target_query and raw.get("query_expansion_source"))
 
 
 def _should_sync_private_context_snapshots() -> bool:

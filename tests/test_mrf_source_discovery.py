@@ -14832,8 +14832,8 @@ async def test_private_context_snapshot_source_ids_use_non_private_same_url(
             "metadata_json": {
                 "source_tier": "mrf_importable",
                 "raw": {
-                    "private_query_context": True,
                     "target_payer_query": "ZipRecruiter",
+                    "query_expansion_source": True,
                 },
             },
         }
