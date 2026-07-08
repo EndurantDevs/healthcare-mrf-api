@@ -48,6 +48,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["mrf-source-discovery"]["family"] == "mrf"
     assert items["mrf-source-discovery"]["enqueue_adapter"] == "arq_single_job"
     assert items["mrf-source-discovery"]["schedulable"] is True
+    assert items["mrf-source-discovery"]["cancelable"] is True
     assert items["address-archive-v2-migrate"]["family"] == "provider"
     assert items["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
     assert items["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"

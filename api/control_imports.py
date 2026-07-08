@@ -209,7 +209,7 @@ _CANCELABLE_IMPORTERS = {
     "npi",
     "nucc",
     "places-zcta",
-    "cms-doctors",
+    "cms-doctors", "mrf-source-discovery",
     "provider-directory-fhir",
     "address-archive-v2-migrate",
     "openaddresses",
