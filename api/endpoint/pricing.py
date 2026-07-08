@@ -5157,7 +5157,7 @@ async def _allowed_amount_rows_from_tables(
              WHERE ai.billing_code = :code
                AND (:code_system = '' OR upper(COALESCE(ai.billing_code_type, '')) = :code_system)
                AND (:plan_id = '' OR ai.plan_id = :plan_id)
-               AND (:npi IS NULL OR expanded.npi = :npi)
+               AND (CAST(:npi AS bigint) IS NULL OR expanded.npi = CAST(:npi AS bigint))
              ORDER BY ap.allowed_amount NULLS LAST, app.billed_charge NULLS LAST, expanded.npi
              LIMIT :limit
             """

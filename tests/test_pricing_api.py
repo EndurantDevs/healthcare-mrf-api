@@ -2422,6 +2422,25 @@ async def test_allowed_amount_import_rows_include_file_plan_candidates():
 
 
 @pytest.mark.asyncio
+async def test_allowed_amount_rows_cast_optional_npi_bind():
+    session = FakeSession([FakeResult([])])
+
+    await pricing_module._allowed_amount_rows_from_tables(
+        session,
+        table_names=SMILE_ALLOWED_TABLE_NAMES,
+        plan_id="911643507",
+        code="99214",
+        code_system="CPT",
+        npi=None,
+        limit=1,
+    )
+
+    sql_text = str(session.executions[0][0][0])
+    assert "CAST(:npi AS bigint) IS NULL" in sql_text
+    assert "expanded.npi = CAST(:npi AS bigint)" in sql_text
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(monkeypatch):
     async def fake_search(_session, _args, _pagination):
         return None
