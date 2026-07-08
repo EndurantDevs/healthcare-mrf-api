@@ -13509,26 +13509,26 @@ def _positive_env_int(name: str, default: int) -> int:
 def _import_control_sync_timeout() -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(
         total=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS", 300.0
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS", 1800.0
         ),
         connect=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS", 10.0
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS", 30.0
         ),
         sock_read=_positive_env_float(
-            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS", 180.0
+            "HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS", 600.0
         ),
     )
 
 
 def _import_control_seed_batch_size() -> int:
-    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 1000)
+    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 500)
 
 
 def _import_control_catalog_concurrency(requested: int | None) -> int:
     configured = os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY")
     if configured:
         return min(_positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY", 1), 32)
-    return min(max(1, int(requested or 1)), 32)
+    return min(max(1, int(requested or 1)), 4)
 
 
 def _coerce_metadata(value: Any) -> dict[str, Any]:
@@ -14814,12 +14814,28 @@ async def _push_import_control_catalog(
         ) -> tuple[int, int, list[dict[str, Any]]]:
             """Sync one source identity group while sharing global run progress."""
             async with semaphore:
-                result = await _push_import_control_catalog(
-                    group_rows,
-                    limit=len(group_rows),
-                    progress_run_id=None,
-                    concurrency=1,
-                )
+                try:
+                    result = await _push_import_control_catalog(
+                        group_rows,
+                        limit=len(group_rows),
+                        progress_run_id=None,
+                        concurrency=1,
+                    )
+                except Exception as sync_error:  # pylint: disable=broad-exception-caught
+                    source_id = (
+                        str(group_rows[0].get("source_id") or "") if group_rows else ""
+                    )
+                    result = (
+                        0,
+                        0,
+                        [
+                            {
+                                "source_id": source_id or None,
+                                "import_control_source_id": None,
+                                "message": str(sync_error),
+                            }
+                        ],
+                    )
             async with progress_lock:
                 progress_state_dict["done"] += len(group_rows)
                 current_done = progress_state_dict["done"]
