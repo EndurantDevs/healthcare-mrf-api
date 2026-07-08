@@ -14809,23 +14809,23 @@ async def _push_import_control_catalog(
         progress_lock = asyncio.Lock()
         semaphore = asyncio.Semaphore(catalog_concurrency)
 
-        async def sync_catalog_identity_group(
+        async def sync_catalog_source_identity_group(
             group_rows: list[dict[str, Any]],
         ) -> tuple[int, int, list[dict[str, Any]]]:
             """Sync one source identity group while sharing global run progress."""
             async with semaphore:
                 try:
-                    result = await _push_import_control_catalog(
+                    group_sync_result = await _push_import_control_catalog(
                         group_rows,
                         limit=len(group_rows),
                         progress_run_id=None,
                         concurrency=1,
                     )
-                except Exception as sync_error:  # pylint: disable=broad-exception-caught
+                except Exception as sync_error:
                     source_id = (
                         str(group_rows[0].get("source_id") or "") if group_rows else ""
                     )
-                    result = (
+                    group_sync_result = (
                         0,
                         0,
                         [
@@ -14850,11 +14850,11 @@ async def _push_import_control_catalog(
                     total=progress_total,
                     message=f"synced catalog source {current_done}/{progress_total}",
                 )
-            return result
+            return group_sync_result
 
         sync_results = await asyncio.gather(
             *(
-                sync_catalog_identity_group(group_rows)
+                sync_catalog_source_identity_group(group_rows)
                 for group_rows in eligible_rows_by_identity.values()
             )
         )
