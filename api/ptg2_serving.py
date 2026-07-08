@@ -2454,7 +2454,10 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         }
 
     if apply_window:
-        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
+        prefer_provider_set_reverse = broad_code_scan and bool(
+            _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+        )
+        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code") and not prefer_provider_set_reverse:
             page_limit = max(int(limit or 0), 0)
             if page_limit <= 0:
                 return []

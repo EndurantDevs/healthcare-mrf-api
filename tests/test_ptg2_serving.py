@@ -2893,6 +2893,56 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
+    """Broad NPI paging should use the provider-set reverse artifact."""
+    provider_set = "0000000000000000000000000000000a"
+    price_a = "00000000000000000000000000000101"
+    price_b = "00000000000000000000000000000102"
+    reverse_sidecar = write_serving_by_provider_set_sidecar(
+        tmp_path / "serving_by_provider_set.ptg2sbp",
+        [(3, 7, 5, price_a), (3, 8, 11, price_b)],
+    )
+    code_sidecar = write_serving_by_code_sidecar(tmp_path / "serving_by_code.ptg2sbc", [(7, 3, 5, price_a), (8, 3, 11, price_b)])
+    session = FakeSession(
+        [
+            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set}]),
+            FakeResult(
+                rows=[
+                    {"code_key": 7, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
+                    {"code_key": 8, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(storage="manifest_snapshot", code_count_table="mrf.ptg2_code_count_manifest_snap", provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap", serving_table_layout="lean_provider_key_v1", artifacts={"serving_by_code": code_sidecar, "serving_by_provider_set": reverse_sidecar})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_lookup_serving_by_code_sidecar",
+        AsyncMock(side_effect=AssertionError("broad provider reverse lookup should use provider-set sidecar")),
+    )
+
+    procedure_matches = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+        session, tables,
+        provider_set_ids=(provider_set,),
+        requested_plan="010854205", code_value="", code_system=None, q_text="", code_context=None,
+        source_trace_set_hash="trace-set", network_names=["network"], limit=2, offset=0, apply_window=True,
+    )
+
+    assert [
+        (
+            procedure_match["reported_code"],
+            procedure_match["provider_set_global_id_128"],
+            procedure_match["provider_count"],
+            procedure_match["price_set_global_id_128"],
+        )
+        for procedure_match in procedure_matches
+    ] == [
+        ("70551", provider_set, 5, price_a),
+        ("70552", provider_set, 11, price_b),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
     provider_set_id = "0000000000000000000000000000000a"
     price_set_id = "00000000000000000000000000000101"
