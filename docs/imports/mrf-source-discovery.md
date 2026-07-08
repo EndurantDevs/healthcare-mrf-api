@@ -111,9 +111,9 @@ Useful environment knobs for full crawls:
 - `HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS`: optional per-batch database write timeout;
   defaults to `0`, which lets full-catalog crawls finish slow write batches instead of aborting.
 - `HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE`: split preview items sent per
-  import-control catalog ingest request; defaults to 1000.
+  import-control catalog ingest request; defaults to 100.
 - `HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE`: split import-control seed sync
-  rows per request; defaults to 500.
+  rows per request; defaults to 100.
 - `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_TOTAL_TIMEOUT_SECONDS`,
   `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_CONNECT_TIMEOUT_SECONDS`, and
   `HLTHPRT_MRF_IMPORT_CONTROL_SYNC_READ_TIMEOUT_SECONDS`: HTTP timeouts for

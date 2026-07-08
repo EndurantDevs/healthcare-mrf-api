@@ -274,7 +274,7 @@ def _source_config() -> dict[str, Any]:
 
 
 IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
-    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "1000")), 1
+    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "100")), 1
 )
 TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "mymedicalshopper_talon",
@@ -13490,7 +13490,7 @@ def _import_control_sync_timeout() -> aiohttp.ClientTimeout:
 
 
 def _import_control_seed_batch_size() -> int:
-    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 500)
+    return _positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_SEED_BATCH_SIZE", 100)
 
 
 def _coerce_metadata(value: Any) -> dict[str, Any]:
