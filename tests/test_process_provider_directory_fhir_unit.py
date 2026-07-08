@@ -7232,6 +7232,53 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_overlay_publish_can_refresh_practitioner_component_only(monkeypatch):
+    monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
+    status_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_status(sql, **params):
+        sql_text = str(sql)
+        status_calls.append((sql_text, params))
+        if "WHERE NOT" in sql_text and "refresh_resource_types" in sql_text:
+            return "INSERT 0 11"
+        if "provider_directory_fhir:practitioner_role:" in sql_text:
+            return "INSERT 0 7"
+        if "duplicate_rank > 1" in sql_text:
+            return "DELETE 0"
+        return "OK"
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=18))
+    monkeypatch.setattr(importer.db, "transaction", lambda: FakeTransaction())
+
+    metrics = await importer.publish_provider_directory_address_overlay(
+        "mrf",
+        source_ids=["source_a"],
+        components=["practitioner_role"],
+    )
+
+    joined_sql = "\n".join(sql for sql, _params in status_calls)
+    copy_params = next(params for sql, params in status_calls if "refresh_resource_types" in sql)
+
+    assert metrics["published"] is True
+    assert metrics["components"] == ["practitioner_role"]
+    assert metrics["copied_existing"] == 11
+    assert metrics["inserted"] == 7
+    assert metrics["inserted_by_component"] == {"practitioner_role": 7}
+    assert copy_params["refresh_resource_types"] == ["PractitionerRole"]
+    assert "provider_directory_fhir:organization_address:" not in joined_sql
+    assert "provider_directory_fhir:organization_affiliation:" not in joined_sql
+    assert "resource_type = ANY(CAST(:refresh_resource_types AS varchar[]))" in joined_sql
+
+
+@pytest.mark.asyncio
 async def test_overlay_publish_skips_run_scope_without_sources(monkeypatch):
     monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
     ensure_overlay = AsyncMock()

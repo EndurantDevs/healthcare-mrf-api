@@ -10354,6 +10354,36 @@ ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES = {
     "practitioner_role": "role",
     "organization_affiliation": "affiliation",
 }
+ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES = {
+    "organization_address": "Organization",
+    "practitioner_role": "PractitionerRole",
+    "organization_affiliation": "OrganizationAffiliation",
+}
+ADDRESS_OVERLAY_COMPONENTS = tuple(ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES)
+
+
+def _clean_address_overlay_components(raw_components: Any) -> tuple[str, ...]:
+    if raw_components in (None, "", ()):
+        return ADDRESS_OVERLAY_COMPONENTS
+    if isinstance(raw_components, str):
+        component_values = raw_components.split(",")
+    elif isinstance(raw_components, (bytes, bytearray, dict)) or not hasattr(raw_components, "__iter__"):
+        component_values = (raw_components,)
+    else:
+        component_values = raw_components
+    cleaned_components: list[str] = []
+    seen_components: set[str] = set()
+    for component in component_values:
+        component_text = _clean_text(component)
+        if not component_text:
+            continue
+        if component_text not in ADDRESS_OVERLAY_COMPONENT_SCOPE_TYPES:
+            raise ValueError(f"unknown Provider Directory address overlay component: {component_text}")
+        if component_text in seen_components:
+            continue
+        seen_components.add(component_text)
+        cleaned_components.append(component_text)
+    return tuple(cleaned_components or ADDRESS_OVERLAY_COMPONENTS)
 
 
 ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
@@ -10713,18 +10743,29 @@ async def _copy_existing_address_overlay(
     target_ref: str,
     columns: str,
     source_ids: list[str],
+    *,
+    refresh_resource_types: list[str] | tuple[str, ...] | None = None,
 ) -> int:
     if not source_ids:
         return 0
+    params: dict[str, Any] = {"source_ids": source_ids}
+    if refresh_resource_types:
+        params["refresh_resource_types"] = list(refresh_resource_types)
+        refresh_filter = (
+            "source_id = ANY(CAST(:source_ids AS varchar[])) "
+            "AND resource_type = ANY(CAST(:refresh_resource_types AS varchar[]))"
+        )
+    else:
+        refresh_filter = "source_id = ANY(CAST(:source_ids AS varchar[]))"
     return _coerce_rowcount(
         await db.status(
             f"""
             INSERT INTO {stage_ref} ({columns})
             SELECT {columns}
               FROM {target_ref}
-             WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])));
+             WHERE NOT ({refresh_filter});
             """,
-            source_ids=source_ids,
+            **params,
         )
     )
 
@@ -10747,12 +10788,25 @@ async def _populate_address_overlay_stage(
     run_id: str | None,
     source_ids: list[str],
     query_param_dict: dict[str, Any],
-) -> dict[str, int]:
+    components: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     columns = ", ".join(_provider_directory_address_overlay_columns())
-    copied_existing = await _copy_existing_address_overlay(stage_ref, target_ref, columns, source_ids)
+    selected_components = _clean_address_overlay_components(components)
+    refresh_resource_types = (
+        None
+        if set(selected_components) == set(ADDRESS_OVERLAY_COMPONENTS)
+        else [ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES[component] for component in selected_components]
+    )
+    copied_existing = await _copy_existing_address_overlay(
+        stage_ref,
+        target_ref,
+        columns,
+        source_ids,
+        refresh_resource_types=refresh_resource_types,
+    )
     inserted_by_component: dict[str, int] = {}
-    for component in ("organization_address", "practitioner_role", "organization_affiliation"):
+    for component in selected_components:
         inserted_by_component[component] = _coerce_rowcount(
             await db.status(
                 _address_overlay_component_insert_sql(
@@ -10776,6 +10830,7 @@ async def _populate_address_overlay_stage(
         "copied_existing": copied_existing,
         "inserted": inserted,
         "inserted_by_component": inserted_by_component,
+        "components": selected_components,
         "countries_normalized": countries_normalized,
         "archive_coordinate_backfill_rows": archive_coordinate_backfill_rows,
         "duplicates_removed": duplicates_removed,
@@ -10854,7 +10909,7 @@ def _no_scoped_address_overlay_sources_result(schema: str) -> dict[str, Any]:
 
 
 def _address_overlay_publish_result(
-    stage_metric_dict: dict[str, int],
+    stage_metric_dict: dict[str, Any],
     *,
     source_ids: list[str],
     target_ref: str,
@@ -10864,6 +10919,7 @@ def _address_overlay_publish_result(
         "rows": stage_metric_dict["stage_rows"],
         "inserted": stage_metric_dict["inserted"],
         "inserted_by_component": stage_metric_dict["inserted_by_component"],
+        "components": list(stage_metric_dict.get("components") or ADDRESS_OVERLAY_COMPONENTS),
         "countries_normalized": stage_metric_dict.get("countries_normalized", 0),
         "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),
         "duplicates_removed": stage_metric_dict["duplicates_removed"],
@@ -10889,6 +10945,7 @@ async def publish_provider_directory_address_overlay(
     *,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
+    components: list[str] | tuple[str, ...] | str | None = None,
 ) -> dict[str, Any]:
     """Publish Provider Directory address evidence without rebuilding unified addresses."""
     schema = db_schema if db_schema is not None else _schema()
@@ -10922,6 +10979,7 @@ async def publish_provider_directory_address_overlay(
             run_id,
             effective_source_ids,
             query_param_dict,
+            components=_clean_address_overlay_components(components),
         )
         await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref)
         return _address_overlay_publish_result(
