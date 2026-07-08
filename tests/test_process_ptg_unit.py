@@ -3743,6 +3743,62 @@ def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path)
     assert pushed_rows_by_class["provider_payment"][0]["npi"] == [1427166008]
 
 
+def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_path):
+    allowed_amount_payload_dict = {
+        "out_of_network": [
+            {
+                "name": "Office visit",
+                "billing_code_type": "CPT",
+                "billing_code_type_version": "2026",
+                "billing_code": "99214",
+                "description": "Office visit",
+                "allowed_amounts": [
+                    {
+                        "tin": {"type": "ein", "value": "371382997"},
+                        "service_code": ["11"],
+                        "billing_class": "professional",
+                        "payments": [
+                            {
+                                "allowed_amount": 133.0,
+                                "providers": [{"billed_charge": 200.0, "npi": [1427166008]}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    allowed_path = tmp_path / "allowed.json"
+    allowed_path.write_text(json.dumps(allowed_amount_payload_dict), encoding="utf-8")
+    pushed_rows_by_class = {}
+
+    async def fake_push(rows, cls):
+        pushed_rows_by_class.setdefault(cls, []).extend(rows)
+
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    asyncio.run(
+        ptg_allowed_amounts._parse_allowed_amounts(
+            str(allowed_path),
+            123,
+            {"network_status": "in_network"},
+            [{"plan_id": "7862274fdc01bcc0", "plan_market_type": "group"}],
+            {
+                "PTGAllowedItem": "item",
+                "PTGAllowedPayment": "payment",
+                "PTGAllowedProviderPayment": "provider_payment",
+            },
+            False,
+            "import_log",
+            "https://example.test/allowed.json",
+        )
+    )
+
+    assert pushed_rows_by_class["payment"][0]["network_status"] == "in_network"
+    assert pushed_rows_by_class["payment"][0]["network_semantics"] == "in_network_historical_allowed_amounts"
+
+
 def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
     pushed = []
     dropped_tables = []

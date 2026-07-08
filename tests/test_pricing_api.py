@@ -2423,7 +2423,7 @@ async def test_allowed_amount_import_rows_include_file_plan_candidates():
 
 @pytest.mark.asyncio
 async def test_allowed_amount_rows_cast_optional_npi_bind():
-    session = FakeSession([FakeResult([])])
+    session = FakeSession([FakeResult([]), FakeResult([])])
 
     await pricing_module._allowed_amount_rows_from_tables(
         session,
@@ -2435,9 +2435,80 @@ async def test_allowed_amount_rows_cast_optional_npi_bind():
         limit=1,
     )
 
-    sql_text = str(session.executions[0][0][0])
+    sql_text = str(session.executions[1][0][0])
     assert "CAST(:npi AS bigint) IS NULL" in sql_text
     assert "expanded.npi = CAST(:npi AS bigint)" in sql_text
+    assert "'out_of_network_or_not_confirmed_in_network'::text AS network_status" in sql_text
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_rows_select_network_columns_when_present():
+    session = FakeSession([
+        FakeResult([("network_status",), ("network_semantics",)]),
+        FakeResult([]),
+    ])
+
+    await pricing_module._allowed_amount_rows_from_tables(
+        session,
+        table_names=SMILE_ALLOWED_TABLE_NAMES,
+        plan_id="911643507",
+        code="99214",
+        code_system="CPT",
+        npi=None,
+        limit=1,
+    )
+
+    sql_text = str(session.executions[1][0][0])
+    assert "ap.network_status AS network_status" in sql_text
+    assert "ap.network_semantics AS network_semantics" in sql_text
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_search_returns_in_network_allowed_amounts(monkeypatch):
+    async def has_allowed_amount_table(_session, _table_name):
+        return True
+
+    async def fake_import_rows(_session, _args, *, plan_id):
+        assert plan_id == "7862274fdc01bcc0"
+        return [SMILE_IMPORT_ROW_BY_FIELD]
+
+    async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
+        assert table_names == SMILE_ALLOWED_TABLE_NAMES
+        assert plan_id == "7862274fdc01bcc0"
+        assert code == "99214"
+        assert code_system == "CPT"
+        assert npi is None
+        assert limit > 0
+        return [
+            {
+                **SMILE_ALLOWED_ROW_BY_FIELD,
+                "network_status": "in_network",
+                "network_semantics": "in_network_historical_allowed_amounts",
+            }
+        ]
+
+    async def fake_provider_rows(_session, *, npis, **_kwargs):
+        assert npis == (1427166008,)
+        return [{"npi": 1427166008, "provider_name": "Confirmed Network Clinic"}]
+
+    monkeypatch.setattr(pricing_module, "_table_exists", has_allowed_amount_table)
+    monkeypatch.setattr(pricing_module, "_allowed_amount_import_rows_for_plan", fake_import_rows)
+    monkeypatch.setattr(pricing_module, "_allowed_amount_rows_from_tables", fake_allowed_rows)
+    monkeypatch.setattr(pricing_module, "_ptg2_manifest_enriched_provider_rows_for_npis", fake_provider_rows)
+
+    allowed_search_response = await pricing_module._search_ptg_allowed_amount_evidence(
+        FakeSession(),
+        {"plan_id": "7862274fdc01bcc0", "market_type": "group", "code": "99214", "code_system": "CPT"},
+        types.SimpleNamespace(limit=3, offset=0, page=1),
+    )
+
+    assert allowed_search_response is not None
+    assert allowed_search_response["query"]["network_semantics"] == "in_network_historical_allowed_amounts"
+    assert allowed_search_response["sources"][0]["network_status"] == "in_network"
+    assert allowed_search_response["warnings"][0]["code"] == "allowed_amounts_not_negotiated_rates"
+    assert allowed_search_response["items"][0]["network_status"] == "in_network"
+    assert allowed_search_response["items"][0]["price_summary"][0]["network_status"] == "in_network"
+    assert allowed_search_response["items"][0]["prices"][0]["network_semantics"] == "in_network_historical_allowed_amounts"
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import orjson
 import sanic.exceptions
@@ -4774,6 +4774,12 @@ def _ptg2_empty_result_state(status: str, *, has_location_filter: bool) -> str:
 
 
 _ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT = max(int(os.getenv("HLTHPRT_ALLOWED_AMOUNT_EVIDENCE_ROW_LIMIT", "10000")), 100)
+ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK = "in_network"
+ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = "out_of_network_or_not_confirmed_in_network"
+ALLOWED_AMOUNT_NETWORK_STATUS_MIXED = "mixed_network_status"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = "in_network_historical_allowed_amounts"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = "out_of_network_historical_allowed_amounts"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED = "mixed_historical_allowed_amounts"
 
 
 def _has_no_ptg2_priced_items(payload: Any) -> bool:
@@ -4905,6 +4911,7 @@ async def _search_ptg_allowed_amount_evidence(
     offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
     limit = max(int(getattr(pagination, "limit", 25) or 25), 1)
     page_items = items[offset : offset + limit]
+    response_network_context = _allowed_amount_network_context(items)
     return {
         "result_state": "allowed_amounts_found",
         "pricing_scope": "plan_scoped_allowed_amounts",
@@ -4931,7 +4938,7 @@ async def _search_ptg_allowed_amount_evidence(
             "source_file_import_id": import_context.get("source_file_import_id"),
             "source_key": import_context.get("source_key"),
             "snapshot_id": import_context.get("snapshot_id"),
-            "network_semantics": "out_of_network_historical_allowed_amounts",
+            "network_semantics": response_network_context["network_semantics"],
         },
         "sources": [
             {
@@ -4940,15 +4947,10 @@ async def _search_ptg_allowed_amount_evidence(
                 "source_file_import_id": import_context.get("source_file_import_id"),
                 "source_system": "transparency_in_coverage_allowed_amounts",
                 "grain": "plan/code/tin/payment/provider_npi historical allowed amount",
-                "network_status": "out_of_network_or_not_confirmed_in_network",
+                "network_status": response_network_context["network_status"],
             }
         ],
-        "warnings": [
-            {
-                "code": "allowed_amounts_not_in_network_rates",
-                "message": "Allowed amounts are historical out-of-network payment evidence, not negotiated in-network rates.",
-            }
-        ],
+        "warnings": [_allowed_amount_warning(response_network_context)],
     }
 
 
@@ -5118,6 +5120,22 @@ def _allowed_amount_table_names(source_file_import_id: str) -> tuple[str, str, s
     return item_table, payment_table, provider_payment_table
 
 
+async def _allowed_amount_network_select_expressions(session, payment_table: str) -> tuple[str, str]:
+    """Return backward-compatible network metadata SQL for allowed amount rows."""
+    payment_columns = await _table_columns(session, payment_table)
+    network_status_expr = (
+        "ap.network_status"
+        if "network_status" in payment_columns
+        else f"'{ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED}'::text"
+    )
+    network_semantics_expr = (
+        "ap.network_semantics"
+        if "network_semantics" in payment_columns
+        else f"'{ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK}'::text"
+    )
+    return network_status_expr, network_semantics_expr
+
+
 async def _allowed_amount_rows_from_tables(
     session,
     *,
@@ -5128,7 +5146,12 @@ async def _allowed_amount_rows_from_tables(
     npi: int | None,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """Read allowed-amount evidence while tolerating pre-network-metadata tables."""
     item_table, payment_table, provider_payment_table = table_names
+    network_status_expr, network_semantics_expr = await _allowed_amount_network_select_expressions(
+        session,
+        payment_table,
+    )
     query_result = await session.execute(
         text(
             f"""
@@ -5147,6 +5170,8 @@ async def _allowed_amount_rows_from_tables(
                 ap.setting,
                 ap.allowed_amount::double precision AS allowed_amount,
                 ap.billing_code_modifier,
+                {network_status_expr} AS network_status,
+                {network_semantics_expr} AS network_semantics,
                 app.billed_charge::double precision AS billed_charge
               FROM {item_table} ai
               JOIN {payment_table} ap
@@ -5219,6 +5244,99 @@ def _has_allowed_amount_provider_taxonomy_match(
     return False
 
 
+def _normalize_allowed_amount_network_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {
+        ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK,
+        "innetwork",
+        "confirmed_in_network",
+        "covered_in_network",
+        "network",
+    }:
+        return ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+    if normalized in {ALLOWED_AMOUNT_NETWORK_STATUS_MIXED, "mixed", "mixed_network"}:
+        return ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+    return ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+
+
+def _allowed_amount_network_semantics(network_status: str, raw_semantics: Any = None) -> str:
+    normalized_semantics = str(raw_semantics or "").strip().lower()
+    if normalized_semantics in {
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK,
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK,
+        ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED,
+    }:
+        return normalized_semantics
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED
+    return ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK
+
+
+def _allowed_amount_network_context(rows: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    statuses = {
+        _normalize_allowed_amount_network_status(row.get("network_status"))
+        for row in rows
+    }
+    statuses.discard("")
+    if statuses == {ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK}:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+    elif ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK in statuses and len(statuses) > 1:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+    elif ALLOWED_AMOUNT_NETWORK_STATUS_MIXED in statuses:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
+    else:
+        status = ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+
+    semantics_values = {
+        _allowed_amount_network_semantics(status, row.get("network_semantics"))
+        for row in rows
+    }
+    if semantics_values == {ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK}:
+        semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
+    elif len(semantics_values) > 1 or ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED in semantics_values:
+        semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED
+    else:
+        semantics = _allowed_amount_network_semantics(status)
+    return {"network_status": status, "network_semantics": semantics}
+
+
+def _allowed_amount_warning(network_context: Mapping[str, str]) -> dict[str, str]:
+    status = network_context.get("network_status")
+    if status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return {
+            "code": "allowed_amounts_not_negotiated_rates",
+            "message": (
+                "Allowed amounts are historical payment evidence. The source marks "
+                "the evidence in-network, but it is not a negotiated rate."
+            ),
+        }
+    if status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return {
+            "code": "allowed_amounts_mixed_network_status",
+            "message": (
+                "Allowed amounts include mixed or partially confirmed network status. "
+                "They are historical payment evidence, not negotiated rates."
+            ),
+        }
+    return {
+        "code": "allowed_amounts_not_in_network_rates",
+        "message": (
+            "Allowed amounts are historical out-of-network or not-confirmed-in-network "
+            "payment evidence, not negotiated rates."
+        ),
+    }
+
+
+def _allowed_amount_price_disclaimer(network_status: str) -> str:
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return "Historical in-network allowed amount; not a contracted negotiated rate."
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
+        return "Historical allowed amount with mixed network status; not a contracted negotiated rate."
+    return "Historical out-of-network or not-confirmed-in-network allowed amount; not a negotiated rate."
+
+
 def _allowed_amount_item_from_rows(
     *,
     npi: int,
@@ -5229,6 +5347,9 @@ def _allowed_amount_item_from_rows(
     code_system: str,
 ) -> dict[str, Any]:
     """Build one provider row from historical allowed-amount payment evidence."""
+    network_context = _allowed_amount_network_context(rows)
+    network_status = network_context["network_status"]
+    network_semantics = network_context["network_semantics"]
     price_entries = [_allowed_amount_price_payload(row) for row in rows[:25]]
     allowed_values = [
         value for value in (_as_float(row.get("allowed_amount")) for row in rows)
@@ -5262,7 +5383,8 @@ def _allowed_amount_item_from_rows(
         "source_key": import_context.get("source_key"),
         "snapshot_id": import_context.get("snapshot_id"),
         "source_file_import_id": import_context.get("source_file_import_id"),
-        "network_status": "out_of_network_or_not_confirmed_in_network",
+        "network_status": network_status,
+        "network_semantics": network_semantics,
         "network_bound_address": False,
         "requires_location_confirmation": True,
         "address_network_binding": "not_applicable_allowed_amounts",
@@ -5286,22 +5408,29 @@ def _allowed_amount_item_from_rows(
             {
                 "source": "allowed_amounts",
                 "price_type": "historical_allowed_amount",
-                "network_status": "out_of_network_or_not_confirmed_in_network",
+                "network_status": network_status,
                 "min": min(allowed_values) if allowed_values else None,
                 "max": max(allowed_values) if allowed_values else None,
                 "avg": round(sum(allowed_values) / len(allowed_values), 2) if allowed_values else None,
                 "evidence_count": len(rows),
             }
         ],
-        "confidence": {"network": "allowed_amounts_not_in_network", "location": "nppes_practice_location"},
+        "confidence": {
+            "network": "allowed_amounts_in_network"
+            if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+            else "allowed_amounts_not_confirmed_in_network",
+            "location": "nppes_practice_location",
+        },
     }
 
 
 def _allowed_amount_price_payload(row: dict[str, Any]) -> dict[str, Any]:
+    network_status = _normalize_allowed_amount_network_status(row.get("network_status"))
     return {
         "source": "allowed_amounts",
         "price_type": "historical_allowed_amount",
-        "network_status": "out_of_network_or_not_confirmed_in_network",
+        "network_status": network_status,
+        "network_semantics": _allowed_amount_network_semantics(network_status, row.get("network_semantics")),
         "allowed_amount": _as_float(row.get("allowed_amount")),
         "billed_charge": _as_float(row.get("billed_charge")),
         "tin_type": row.get("tin_type"),
@@ -5312,7 +5441,7 @@ def _allowed_amount_price_payload(row: dict[str, Any]) -> dict[str, Any]:
         "billing_code_modifier": _normalize_string_sequence(row.get("billing_code_modifier")),
         "match_basis": "npi",
         "confidence": "medium",
-        "disclaimer": "Historical out-of-network allowed amount; not an in-network negotiated rate.",
+        "disclaimer": _allowed_amount_price_disclaimer(network_status),
     }
 
 

@@ -1713,6 +1713,8 @@ class PTGAllowedPayment(Base, JSONOutputMixin):
     setting = Column(String(32))
     allowed_amount = Column(Numeric)
     billing_code_modifier = Column(ARRAY(String))
+    network_status = Column(String(64))
+    network_semantics = Column(String(64))
 
 
 class PTGAllowedProviderPayment(Base, JSONOutputMixin):

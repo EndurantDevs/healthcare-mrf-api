@@ -3857,7 +3857,10 @@ paths:
         no local match in the requested radius, or no matching rates.
         If `include_allowed_amounts` is true or omitted, a plan-scoped lookup
         with no in-network negotiated row may return historical allowed-amount
-        evidence clearly marked as not confirmed in-network.
+        evidence. CMS TiC allowed-amounts files are out-of-network by schema;
+        other source metadata may mark the evidence `network_status=in_network`.
+        Allowed amounts are historical payment evidence and must not be
+        presented as negotiated rates.
       parameters:
         - name: year
           in: query
@@ -4007,7 +4010,7 @@ paths:
           in: query
           schema: { type: boolean, default: true }
           description: |
-            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. Returned allowed-amount rows are marked as out-of-network or not confirmed in-network and must not be presented as covered in-network rates.
+            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. CMS TiC allowed-amounts files are out-of-network by schema; other source metadata may mark the evidence `network_status=in_network`. Allowed amounts are historical payment evidence and must not be presented as negotiated rates.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -4271,7 +4274,7 @@ paths:
             type: boolean
             default: true
           description: |
-            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. Returned allowed-amount rows are marked as out-of-network or not confirmed in-network and must not be presented as covered in-network rates.
+            When true or omitted for plan-scoped PTG/TiC requests, may return historical allowed-amount evidence if no in-network negotiated price row is available for the requested code. CMS TiC allowed-amounts files are out-of-network by schema; other source metadata may mark the evidence `network_status=in_network`. Allowed amounts are historical payment evidence and must not be presented as negotiated rates.
         - name: include_details
           in: query
           schema:

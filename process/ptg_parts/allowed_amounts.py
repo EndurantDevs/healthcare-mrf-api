@@ -22,6 +22,12 @@ from process.ptg_parts.source_jobs import _dedupe_rows_by
 logger = logging.getLogger(__name__)
 
 
+ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK = "in_network"
+ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = "out_of_network_or_not_confirmed_in_network"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = "in_network_historical_allowed_amounts"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = "out_of_network_historical_allowed_amounts"
+
+
 def _as_text_list(value: Any) -> list[str]:
     items: list[str] = []
     for item in _as_list(value):
@@ -36,6 +42,37 @@ def _ptg_facade():
     if ptg_module is None:
         raise RuntimeError("process.ptg facade is not loaded")
     return ptg_module
+
+
+def _normalize_allowed_amount_network_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {
+        "in_network",
+        "innetwork",
+        "confirmed_in_network",
+        "covered_in_network",
+        "network",
+    }:
+        return ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
+    return ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+
+
+def _allowed_amount_network_status_from_meta(meta: dict[str, Any]) -> str:
+    for key in (
+        "allowed_amount_network_status",
+        "network_status",
+        "network_scope",
+        "network_type",
+    ):
+        if key in meta:
+            return _normalize_allowed_amount_network_status(meta.get(key))
+    return ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
+
+
+def _allowed_amount_network_semantics(network_status: str) -> str:
+    if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
+        return ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
+    return ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK
 
 
 async def _push_objects_from_facade(rows: list[dict[str, Any]], cls) -> None:
@@ -62,6 +99,8 @@ async def _parse_allowed_amounts(
     provider_payment_cls = classes["PTGAllowedProviderPayment"]
 
     plan_fields = _derive_plan_fields(meta, plan_info)
+    network_status = _allowed_amount_network_status_from_meta(meta)
+    network_semantics = _allowed_amount_network_semantics(network_status)
 
     item_rows: list[dict[str, Any]] = []
     payment_rows: list[dict[str, Any]] = []
@@ -120,6 +159,7 @@ async def _parse_allowed_amounts(
                         "|".join(service_codes),
                         allowed_amount.get("billing_class") or "",
                         allowed_amount.get("setting") or "",
+                        network_status,
                         payment.get("allowed_amount"),
                         "|".join(billing_code_modifiers),
                     )
@@ -134,6 +174,8 @@ async def _parse_allowed_amounts(
                             "setting": allowed_amount.get("setting"),
                             "allowed_amount": payment.get("allowed_amount"),
                             "billing_code_modifier": billing_code_modifiers,
+                            "network_status": network_status,
+                            "network_semantics": network_semantics,
                         }
                     )
                     for provider in payment.get("providers", []):
