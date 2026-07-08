@@ -74,9 +74,6 @@ DEFAULT_CONCURRENCY = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_CONCURRENCY", "10
 WRITE_BATCH_SIZE = max(
     int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1
 )
-IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
-    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "1000")), 1
-)
 HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "300")), 1)
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
@@ -276,6 +273,9 @@ def _source_config() -> dict[str, Any]:
     return _SOURCE_CONFIG_CACHE
 
 
+IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
+    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "1000")), 1
+)
 TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
