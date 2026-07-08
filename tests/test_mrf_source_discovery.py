@@ -9877,6 +9877,33 @@ async def test_push_import_control_catalog_uses_preview_batch_size(monkeypatch):
     assert preview_batch_lengths == [2, 2, 1]
 
 
+def test_chunk_preview_items_for_request_respects_serialized_size():
+    preview_items = [
+        {
+            "canonical_url": f"https://example.com/rates-{index}.json.gz",
+            "domain": "in_network",
+            "plan_info": [
+                {"plan_id": str(index), "plan_name": "Example Plan " + ("x" * 80)}
+            ],
+        }
+        for index in range(3)
+    ]
+    two_item_size = discovery._preview_request_size_bytes(
+        "ic_source", preview_items[:2]
+    )
+
+    batches = list(
+        discovery._chunk_preview_items_for_request(
+            "ic_source",
+            preview_items,
+            max_items=100,
+            max_bytes=two_item_size - 1,
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [1, 1, 1]
+
+
 def _catalog_snapshot_source_rows():
     return [
         {

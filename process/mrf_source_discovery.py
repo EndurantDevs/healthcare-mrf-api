@@ -276,6 +276,10 @@ def _source_config() -> dict[str, Any]:
 IMPORT_CONTROL_PREVIEW_BATCH_SIZE = max(
     int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_BATCH_SIZE", "5000")), 1
 )
+IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES = max(
+    int(os.getenv("HLTHPRT_MRF_IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES", str(8 * 1024 * 1024))),
+    1024,
+)
 TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
@@ -13578,6 +13582,36 @@ def _split_preview_items(
     return split_items
 
 
+def _preview_request_size_bytes(source_id: str, items: list[dict[str, Any]]) -> int:
+    payload = {"source_id": source_id, "items": items}
+    return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def _chunk_preview_items_for_request(
+    source_id: str,
+    preview_item_maps: list[dict[str, Any]],
+    *,
+    max_items: int | None = None,
+    max_bytes: int | None = None,
+):
+    """Yield preview item batches that fit both count and serialized request limits."""
+    resolved_max_items = max_items or IMPORT_CONTROL_PREVIEW_BATCH_SIZE
+    resolved_max_bytes = max_bytes or IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES
+    preview_batch_maps: list[dict[str, Any]] = []
+    for preview_item_map in preview_item_maps:
+        candidate_batch_maps = [*preview_batch_maps, preview_item_map]
+        if preview_batch_maps and (
+            len(candidate_batch_maps) > resolved_max_items
+            or _preview_request_size_bytes(source_id, candidate_batch_maps) > resolved_max_bytes
+        ):
+            yield preview_batch_maps
+            preview_batch_maps = [preview_item_map]
+            continue
+        preview_batch_maps = candidate_batch_maps
+    if preview_batch_maps:
+        yield preview_batch_maps
+
+
 def _as_text_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item or "").strip()]
@@ -14854,9 +14888,8 @@ async def _push_import_control_catalog(
                         continue
                     source_plans = 0
                     if should_ingest_preview:
-                        for batch in _chunked(
-                            _split_preview_items(items),
-                            IMPORT_CONTROL_PREVIEW_BATCH_SIZE,
+                        for batch in _chunk_preview_items_for_request(
+                            ic_source_id, _split_preview_items(items)
                         ):
                             source_plans += await _ingest_import_control_preview(
                                 session, base, ic_source_id, batch

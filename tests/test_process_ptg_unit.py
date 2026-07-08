@@ -42,12 +42,12 @@ ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
 
 
-def _write_deflate64_zip(path: Path, member_name: str, payload: bytes) -> None:
+def _write_deflate64_zip(path: Path, member_name: str, member_payload: bytes) -> None:
     inflate64 = pytest.importorskip("inflate64")
     name_bytes = member_name.encode("utf-8")
     deflater = inflate64.Deflater()
-    compressed = deflater.deflate(payload) + deflater.flush()
-    crc = binascii.crc32(payload) & 0xFFFFFFFF
+    compressed = deflater.deflate(member_payload) + deflater.flush()
+    crc = binascii.crc32(member_payload) & 0xFFFFFFFF
     local_header = struct.pack(
         "<IHHHHHIIIHH",
         0x04034B50,
@@ -58,7 +58,7 @@ def _write_deflate64_zip(path: Path, member_name: str, payload: bytes) -> None:
         0,
         crc,
         len(compressed),
-        len(payload),
+        len(member_payload),
         len(name_bytes),
         0,
     )
@@ -73,7 +73,7 @@ def _write_deflate64_zip(path: Path, member_name: str, payload: bytes) -> None:
         0,
         crc,
         len(compressed),
-        len(payload),
+        len(member_payload),
         len(name_bytes),
         0,
         0,

@@ -94,36 +94,40 @@ class _Deflate64ZipMemberReader:
         self._buffer = bytearray()
         self._flushed = False
 
-    def readable(self) -> bool:
+    def is_readable(self) -> bool:
+        """Return whether this zip member stream supports reads."""
         return True
 
+    readable = is_readable
+
     def read(self, size: int = -1) -> bytes:
+        """Read decompressed bytes from the Deflate64 zip member."""
         if size == 0:
             return b""
         if size is None or size < 0:
-            chunks = [bytes(self._buffer)]
+            decompressed_chunks = [bytes(self._buffer)]
             self._buffer.clear()
             while self._remaining > 0:
-                chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
-                if not chunk:
+                compressed_chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
+                if not compressed_chunk:
                     break
-                self._remaining -= len(chunk)
-                inflated = self._inflater.inflate(chunk)
+                self._remaining -= len(compressed_chunk)
+                inflated = self._inflater.inflate(compressed_chunk)
                 if inflated:
-                    chunks.append(inflated)
+                    decompressed_chunks.append(inflated)
             if not self._flushed:
                 tail = self._inflater.inflate(b"")
                 self._flushed = True
                 if tail:
-                    chunks.append(tail)
-            return b"".join(chunks)
+                    decompressed_chunks.append(tail)
+            return b"".join(decompressed_chunks)
 
         while len(self._buffer) < size and self._remaining > 0:
-            chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
-            if not chunk:
+            compressed_chunk = self._raw_fp.read(min(self._chunk_size, self._remaining))
+            if not compressed_chunk:
                 break
-            self._remaining -= len(chunk)
-            inflated = self._inflater.inflate(chunk)
+            self._remaining -= len(compressed_chunk)
+            inflated = self._inflater.inflate(compressed_chunk)
             if inflated:
                 self._buffer.extend(inflated)
         if self._remaining == 0 and not self._flushed:
@@ -131,9 +135,9 @@ class _Deflate64ZipMemberReader:
             self._flushed = True
             if tail:
                 self._buffer.extend(tail)
-        result = bytes(self._buffer[:size])
+        decompressed_result = bytes(self._buffer[:size])
         del self._buffer[:size]
-        return result
+        return decompressed_result
 
 
 @contextmanager
