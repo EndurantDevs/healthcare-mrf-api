@@ -83,27 +83,37 @@ unless `--publish` or import-control `publish=true` is supplied.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE` (default `false`; fail fast if the optimized inline evidence path is not active, used by the dev serving-only speed profile to avoid silently falling back to the old evidence work-table pass)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES` (default `false`; aggregates plan/source arrays in a separate pass to avoid multiplying grouped rows when raw rows carry many array values)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY` (default `4`; fan-out for independent main-stage index builds)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE` (default `all`; set `serving` to keep provider lookup, plan/network, taxonomy/procedure/medication, address-key, primary ZIP/city, and bounded geo serving indexes while skipping provenance/debug indexes and the broad standalone ZIP/GiST geo indexes)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE` (default `none`; set `serving` with `STAGE_INDEX_PROFILE=none` to publish the row-complete table first, mark the import published, then warm the same serving indexes on the live table outside the critical publish path)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE` (default `all`; use `serving` for deployed serving refreshes so provider lookup, plan/network, taxonomy/procedure/medication, address-key, service-phone, primary ZIP/city, and bounded geo indexes are built on the stage table before the live-table swap while provenance/debug indexes are skipped)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE` (default `none`; use `serving` as a live-table repair/warmup pass after publish. In deployed serving refreshes this should complement `STAGE_INDEX_PROFILE=serving`; `STAGE_INDEX_PROFILE=none` is only for controlled publish-first experiments where slower API reads are acceptable until warmup finishes)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY` (default: `STAGE_INDEX_CONCURRENCY`; fan-out for the optional live-table post-publish index warmup)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENTLY` (default `true`; uses `CREATE INDEX CONCURRENTLY` for live-table warmup. Set `false` for the publish-swap/read-mostly serving table to build normal indexes in parallel; reads stay available, but writes to the published table are blocked while each index builds.)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_PUBLISH_VALIDATION` (default `false`; for full serving-only refreshes, publish after row-count and table constraints, then run the same deep integrity validation on the live table before final warmup success)
 
-When post-publish index warmup is enabled, use `metrics.published_elapsed_seconds`
-as the publish-time measurement. Successful post-publish validation and warmup
-updates preserve the original publish `finished_at`, so import-control duration
-also reflects the row-complete publish time while metrics retain the post-publish
-tail timings. A post-publish validation failure still marks the run failed at the
-failure time. Total worker wall time can still include live index warmup after
-the row-complete table has been published. `CREATE INDEX
-CONCURRENTLY` warmup is forced to run one index at a time because PostgreSQL can
-deadlock multiple concurrent index builds on the same table. For
-entity-address-unified full serving refreshes the published table is read-mostly,
-so dev uses non-concurrent warmup with parallelism to keep reads available while
-finishing the serving indexes much faster. Before each warmup build, the importer
-drops any invalid leftover index with the target name, so a canceled previous
-warmup does not make `IF NOT EXISTS` skip a missing serving index. During the
-publish-first window,
+For deployed reimports, the serving index contract is model-driven:
+`EntityAddressUnified.__my_additional_indexes__` declares the service phone,
+service address, service premise, plan/network, taxonomy, code-array, and geo
+indexes; `STAGE_INDEX_PROFILE=serving` creates the API-critical subset on the
+stage table; the publish swap renames those stage indexes to the live names; and
+`POST_PUBLISH_INDEX_PROFILE=serving` can repair or backfill any missing live
+serving index after publish. Do not rely on migrations alone for these indexes:
+table-swap refreshes must be able to recreate them from the model before the
+swap.
+
+When post-publish index warmup is enabled, use
+`metrics.published_elapsed_seconds` as the publish-time measurement. Successful
+post-publish validation and warmup updates preserve the original publish
+`finished_at`, so import-control duration also reflects the row-complete publish
+time while metrics retain the post-publish tail timings. A post-publish
+validation failure still marks the run failed at the failure time. Total worker
+wall time can still include live index warmup after the row-complete table has
+been published. `CREATE INDEX CONCURRENTLY` warmup is forced to run one index at
+a time because PostgreSQL can deadlock multiple concurrent index builds on the
+same table. For entity-address-unified full serving refreshes the published
+table is read-mostly, so dev uses non-concurrent warmup with parallelism to keep
+reads available while finishing any missing serving indexes much faster. Before
+each warmup build, the importer drops any invalid leftover index with the target
+name, so a canceled previous warmup does not make `IF NOT EXISTS` skip a missing
+serving index. During a controlled publish-first experiment,
 `metrics.post_publish_index_pending=true` means the live row-complete table is
 published while serving indexes are still warming; the same status includes the
 planned `metrics.post_publish_index_total` and current

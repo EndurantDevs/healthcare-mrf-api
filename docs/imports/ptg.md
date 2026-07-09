@@ -81,9 +81,10 @@ python main.py worker process.EntityAddressUnified --burst
 
 ## Main Outputs
 - PTG2 control tables such as `ptg2_import_run`, `ptg2_snapshot`, `ptg2_current_snapshot`, `ptg2_current_source_snapshot`, `ptg2_current_plan_source`, and `ptg2_artifact_manifest`
-- One manifest-backed snapshot serving table for the imported source/month
+- One manifest-backed snapshot serving representation for the imported source/month: either a retained compact serving table or a transient table that is dropped after PostgreSQL binary serving artifacts are published
 - Snapshot support tables for price atoms, provider group members, and precomputed plan/code counts
-- Binary sidecars for provider-set, provider-NPI, provider reverse, and price-set membership
+- PostgreSQL-owned binary serving artifacts for `postgres_binary_v1` snapshots; these replace pod-local forward/reverse serving sidecar files and are rebuildable only through PostgreSQL state
+- Legacy or research snapshots may still reference provider-set, provider-NPI, provider reverse, and price-set sidecars
 
 ## Snapshot Architecture
 
@@ -93,10 +94,17 @@ deployment can serve both old and new snapshots while operators compare them.
 
 Supported import modes:
 
-- Default / `HLTHPRT_PTG2_SNAPSHOT_ARCH=sidecar_scope_v1` omits both
-  provider-scope materialization tables and uses retained sidecars plus the
-  compact serving dictionaries at query time. This is the storage-saving layout
-  for carriers where `provider_group_rate_scope` dominates disk.
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v1` is the deployed storage-saving
+  layout. It omits `provider_set_component` and `provider_group_rate_scope`,
+  writes grouped forward/reverse serving relationships into compressed binary
+  payloads stored in PostgreSQL, and can drop the transient lean serving table
+  after publish. API pods must not materialize those artifacts into local disk
+  caches; the durable source of truth is PostgreSQL so multiple API pods and a
+  separate PostgreSQL host remain safe.
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=sidecar_scope_v1` omits both provider-scope
+  materialization tables and uses retained relationship sidecars plus compact
+  serving dictionaries at query time. Keep this for legacy/research comparison
+  snapshots, not as the default multi-pod serving architecture.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=materialized_v1` materializes
   `provider_set_component` and `provider_group_rate_scope` tables. This is the
   fastest lookup path for very broad provider expansion but can consume large
@@ -110,8 +118,9 @@ need a stable, human-readable A/B label such as `heartland_sidecar_v1`.
 Snapshots without explicit architecture metadata are inferred from their
 manifest tables:
 
+- manifest snapshot with `serving_binary_table` -> `postgres_binary_v1`
 - both scope tables present -> `materialized_v1`
-- manifest snapshot with both scope tables absent -> `sidecar_scope_v1`
+- manifest snapshot with both scope tables absent and no `serving_binary_table` -> `sidecar_scope_v1`
 - any mixed legacy shape -> `legacy_mixed_v1`
 
 ## Notes
@@ -130,7 +139,8 @@ manifest tables:
 - `HLTHPRT_PTG2_MANIFEST_SPILL_DIR` optionally pins those temporary sidecar spill files to a fast local volume. If unset, the system temp directory is used.
 - `HLTHPRT_PTG2_MANIFEST_PRECOPY_MERGE=true` is the default for manifest imports. Python defers scanner COPY shards, then the Rust scanner binary externally sort-merges serving, price atom, and provider group member files before PostgreSQL COPY.
 - `HLTHPRT_PTG2_MANIFEST_MERGE_DIR` and `HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES` control temporary files and chunk size for the Rust pre-COPY merge.
-- `HLTHPRT_PTG2_HOT_ARTIFACT_DIR` should point at node-local scratch for scanner COPY shards, `.ready` files, sidecar spill, and pre-COPY merge work. Shared `/work` remains for retained raw/logical artifacts and final sidecars only.
+- `HLTHPRT_PTG2_HOT_ARTIFACT_DIR` should point at node-local scratch for scanner COPY shards, `.ready` files, spill, and pre-COPY merge work. Shared `/work` remains for retained raw/logical artifacts. In `postgres_binary_v1`, final forward/reverse serving artifacts are copied into PostgreSQL and must not be served from node-local files.
+- `HLTHPRT_PTG2_ARTIFACT_DB_STORE=true` stores retained artifact payloads in PostgreSQL. In deployed `postgres_binary_v1`, keep `HLTHPRT_PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE=false`, `HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ=false`, and leave `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` unset so API pods do not create hidden per-pod disk caches.
 - Import-control resource lanes route PTG runs to `small`, `normal`, `large`, or `huge` worker classes. The selected lane is recorded under `metrics.ptg_resource`; queue/class guards reject mismatched payloads.
 - `HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK=true` is the publish-time safety guard for manifest imports. Normal PTG runs keep the DB `DISTINCT ON` dedupe backstop even after Rust pre-COPY merge because live payer files can still contain duplicate serving identities. If a direct helper path disables the guard and PostgreSQL reports duplicate keys while creating a manifest unique index, publish runs a one-shot DB dedupe rescue and retries the index instead of leaving a half-published snapshot.
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
@@ -189,7 +199,7 @@ Healthy import behavior:
 - `.ready` backlog may fluctuate, but should not grow unbounded for many minutes.
 - Stage table sizes should grow while scanner progress advances.
 
-Full-import validation should include the final `PTG2_IMPORT_DONE` line, API smoke checks for the imported source, and a size report for the snapshot serving table plus sidecars.
+Full-import validation should include the final `PTG2_IMPORT_DONE` line, API smoke checks for the imported source, and a size report for the snapshot serving table plus artifact tables. For `postgres_binary_v1`, confirm `serving_row_strategy=postgres_binary`, `serving_table_exists=false` when dropping the transient serving table, `serving_binary_table_exists=true`, and `serving_sidecar_artifacts=false`.
 
 ## Cleanup After Stopped Runs
 

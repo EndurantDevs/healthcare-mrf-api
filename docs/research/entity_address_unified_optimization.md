@@ -147,17 +147,21 @@ serving-ready by itself. A deployable strict-10x path should publish first and
 warm serving indexes separately, or explicitly accept temporarily slower queries
 until index warmup completes.
 
-The publish-first path is now explicit: use
+The publish-first path remains a controlled benchmark option:
 `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE=none` with
-`HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE=serving`. The import
-publishes and marks the row-complete table successful before warming the serving
-indexes on the live table. This preserves row quality and makes the sub-4-minute
-target a publish-time target; serving index warmup remains a separate
-post-publish performance phase. Use `metrics.published_elapsed_seconds` for the
-publish-time SLA when post-publish index warmup is enabled; total worker wall
-time can still include warmup. Import-control waiters can observe terminal
-status immediately after publish with
-`metrics.post_publish_index_pending=true`, a nonzero
+`HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE=serving` publishes
+the row-complete table first and warms serving indexes on the live table later.
+That is useful for isolating row-build speed, but it creates a window where API
+queries can run without the service phone/address/geo serving indexes. The dev
+serving profile therefore moved to `STAGE_INDEX_PROFILE=serving` plus
+`POST_PUBLISH_INDEX_PROFILE=serving`: the stage table gets the model-defined
+API-critical indexes before swap, and post-publish warmup becomes a repair path
+for missing or invalid live indexes instead of the only place they are created.
+
+Use `metrics.published_elapsed_seconds` for the publish-time SLA when
+post-publish index warmup is enabled; total worker wall time can still include
+warmup. Import-control waiters can observe terminal status immediately after
+publish with `metrics.post_publish_index_pending=true`, a nonzero
 `metrics.post_publish_index_total`, and
 `metrics.post_publish_index_completed=0`; if the proof also needs warmup
 timings, poll the same run again after the worker finishes and confirm
