@@ -153,6 +153,7 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
 PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = (
     "location_contacts",
     "location_coordinates",
+    "resource_id_npis",
     "location_address_keys",
     "location_archive",
     "address_overlay",
@@ -165,6 +166,7 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
     "addresses": (
         "location_contacts",
         "location_coordinates",
+        "resource_id_npis",
         "location_address_keys",
         "location_archive",
         "address_overlay",
@@ -2375,6 +2377,17 @@ def _npi(resource: dict[str, Any]) -> int | None:
     return int(digits)
 
 
+def _npi_from_resource_id(resource_id: str | None) -> int | None:
+    text = _clean_text(resource_id)
+    if not text or not re.fullmatch(r"[0-9]{10}", text):
+        return None
+    return int(text)
+
+
+def _resource_npi(resource: dict[str, Any]) -> int | None:
+    return _npi(resource) or _npi_from_resource_id(_resource_id(resource))
+
+
 def _tin(resource: dict[str, Any]) -> str | None:
     value = _identifier_value(resource, "tax", "tin", "ein")
     if not value:
@@ -2658,7 +2671,7 @@ def parse_fhir_resource(
         family, given, full_name = _name(resource)
         row = {
             **base,
-            "npi": _npi(resource),
+            "npi": _resource_npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
             "family_name": family,
             "given_names": given,
@@ -2671,7 +2684,7 @@ def parse_fhir_resource(
     if resource_type == "Organization":
         row = {
             **base,
-            "npi": _npi(resource),
+            "npi": _resource_npi(resource),
             "tax_id": _tin(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
             "name": _clean_text(resource.get("name")),
@@ -4193,6 +4206,62 @@ async def publish_provider_directory_location_address_keys(
     return total_updated
 
 
+async def backfill_provider_directory_resource_id_npis(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+) -> dict[str, int]:
+    """Backfill payer rows that use the FHIR resource id as the NPI."""
+    schema = db_schema or _schema()
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    query_params_by_name: dict[str, Any] = {}
+    scope_clauses: list[str] = []
+    if cleaned_source_ids:
+        scope_clauses.append("resource.source_id = ANY(CAST(:source_ids AS varchar[]))")
+        query_params_by_name["source_ids"] = cleaned_source_ids
+    if seen_table:
+        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id else ""
+        if run_id:
+            query_params_by_name["run_id"] = run_id
+        seen_ref = _qt(schema, seen_table)
+        scope_clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = :resource_type
+                   {seen_run_filter}
+                   AND seen.source_id = resource.source_id
+                   AND seen.resource_id = resource.resource_id
+            )"""
+        )
+    elif run_id:
+        scope_clauses.append("resource.last_seen_run_id = CAST(:run_id AS varchar)")
+        query_params_by_name["run_id"] = run_id
+    scope_sql = "".join(f"\n               AND {clause}" for clause in scope_clauses)
+    updated_counts_by_resource: dict[str, int] = {}
+    for resource_type, table_name in (
+        ("Practitioner", "provider_directory_practitioner"),
+        ("Organization", "provider_directory_organization"),
+    ):
+        updated_counts_by_resource[resource_type] = _coerce_rowcount(
+            await db.status(
+                f"""
+                UPDATE {_qt(schema, table_name)} AS resource
+                   SET npi = resource.resource_id::bigint,
+                       updated_at = now()
+                 WHERE resource.npi IS NULL
+                   AND resource.resource_id ~ '^[0-9]{{10}}$'
+                   {scope_sql};
+                """,
+                **query_params_by_name,
+                resource_type=resource_type,
+            )
+        )
+    return updated_counts_by_resource
+
+
 async def _publish_provider_directory_artifacts(
     *,
     run_id: str | None,
@@ -4256,6 +4325,19 @@ async def _publish_provider_directory_artifacts(
     )
     if seen_table:
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
+    should_backfill_resource_id_npis = any(
+        is_provider_directory_publish_target_enabled(publish_artifacts_targets, artifact_target_name)
+        for artifact_target_name in ("resource_id_npis", "location_archive", "address_overlay", "corroboration")
+    )
+    if should_backfill_resource_id_npis:
+        resource_id_npi_backfill_run_id = address_key_run_id if address_key_run_id is not None else None
+        metrics["resource_id_npis_backfilled"] = await backfill_provider_directory_resource_id_npis(
+            run_id=resource_id_npi_backfill_run_id,
+            source_ids=source_ids,
+            seen_table=seen_table,
+        )
+    else:
+        metrics["resource_id_npis_backfilled"] = _provider_directory_publish_target_skipped()
     if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_address_keys"):
         metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
             run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,

@@ -1459,6 +1459,38 @@ def test_provider_directory_location_preserves_raw_contact_and_adds_canonical_di
     assert row["fax_extension"] == "22"
 
 
+def test_practitioner_npi_falls_back_to_numeric_resource_id():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Practitioner",
+            "id": "1000488800",
+            "active": True,
+            "name": [{"text": "Molina Shaped Practitioner"}],
+        },
+    )
+
+    assert model is ProviderDirectoryPractitioner
+    assert row["resource_id"] == "1000488800"
+    assert row["npi"] == 1000488800
+
+
+def test_organization_npi_falls_back_to_numeric_resource_id():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Organization",
+            "id": "1000053922",
+            "active": True,
+            "name": "Molina Shaped Organization",
+        },
+    )
+
+    assert model is ProviderDirectoryOrganization
+    assert row["resource_id"] == "1000053922"
+    assert row["npi"] == 1000053922
+
+
 def test_provider_directory_location_normalizes_valid_coordinates():
     model, row = importer.parse_fhir_resource(
         "source_a",
@@ -4422,6 +4454,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
         AsyncMock(return_value={"location_contact_rows_updated": 5}),
     )
     monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=6))
+    monkeypatch.setattr(importer, "backfill_provider_directory_resource_id_npis", AsyncMock(return_value={"Practitioner": 2, "Organization": 1}))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -4452,6 +4485,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     assert metrics["sources_import_attempted"] == 1
     assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert metrics["location_coordinates_backfilled"] == 6
+    assert metrics["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert metrics["network_catalog"] == {"rows": 8}
@@ -4460,6 +4494,8 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.backfill_provider_directory_location_coordinates.assert_awaited_once()
     assert importer.backfill_provider_directory_location_coordinates.await_args.kwargs["run_id"] == "run_full"
+    importer.backfill_provider_directory_resource_id_npis.assert_awaited_once()
+    assert importer.backfill_provider_directory_resource_id_npis.await_args.kwargs["run_id"] == "run_full"
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
     assert importer.publish_provider_directory_location_address_keys.await_args.kwargs["run_id"] == "run_full"
     importer.publish_provider_directory_location_archive.assert_awaited_once()
@@ -4486,6 +4522,7 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
             return_value={"location_contact_rows_updated": 0}
         ),
         "backfill_provider_directory_location_coordinates": AsyncMock(return_value=0),
+        "backfill_provider_directory_resource_id_npis": AsyncMock(return_value={"Practitioner": 0, "Organization": 0}),
         "publish_provider_directory_location_address_keys": AsyncMock(return_value=0),
         "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
         "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 7}),
@@ -4511,6 +4548,7 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     assert metrics["ptg_corroboration_view_published"] is True
     for artifact_name in (
         "backfill_provider_directory_location_coordinates",
+        "backfill_provider_directory_resource_id_npis",
         "publish_provider_directory_location_address_keys",
         "publish_provider_directory_location_archive",
         "publish_provider_directory_address_overlay",
@@ -4536,6 +4574,7 @@ def test_provider_directory_publish_artifact_targets_parse_aliases():
     assert importer._provider_directory_publish_artifact_targets(["addresses"]) == {
         "location_contacts",
         "location_coordinates",
+        "resource_id_npis",
         "location_address_keys",
         "location_archive",
         "address_overlay",
@@ -4545,37 +4584,29 @@ def test_provider_directory_publish_artifact_targets_parse_aliases():
         importer._provider_directory_publish_artifact_targets("bad-stage")
 
 
+def _mock_artifact_only_publishers(monkeypatch) -> dict[str, AsyncMock]:
+    artifact_publish_mocks_by_name = {
+        "backfill_provider_directory_location_contacts": AsyncMock(
+            return_value={"location_contact_rows_updated": 0}
+        ),
+        "backfill_provider_directory_location_coordinates": AsyncMock(return_value=0),
+        "publish_provider_directory_location_address_keys": AsyncMock(return_value=0),
+        "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
+        "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 0}),
+        "publish_provider_directory_network_catalog": AsyncMock(return_value={"rows": 8}),
+        "publish_provider_directory_address_corroboration_if_available": AsyncMock(return_value=True),
+    }
+    for publisher_name, publisher_mock in artifact_publish_mocks_by_name.items():
+        monkeypatch.setattr(importer, publisher_name, publisher_mock)
+    return artifact_publish_mocks_by_name
+
+
 @pytest.mark.asyncio
 async def test_process_data_publish_artifacts_only_can_target_network_catalog(monkeypatch):
+    """Only the requested network catalog artifact should run."""
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
-    monkeypatch.setattr(
-        importer,
-        "backfill_provider_directory_location_contacts",
-        AsyncMock(return_value={"location_contact_rows_updated": 0}),
-    )
-    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=0))
-    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_location_archive",
-        AsyncMock(return_value={"inserted": 0}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_address_overlay",
-        AsyncMock(return_value={"rows": 0}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_network_catalog",
-        AsyncMock(return_value={"rows": 8}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_address_corroboration_if_available",
-        AsyncMock(return_value=True),
-    )
+    artifact_publish_mocks_by_name = _mock_artifact_only_publishers(monkeypatch)
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -4589,22 +4620,31 @@ async def test_process_data_publish_artifacts_only_can_target_network_catalog(mo
     )
 
     assert metrics["publish_artifacts_targets"] == ["network_catalog"]
-    assert metrics["location_contacts_backfilled"] == {"skipped": True, "reason": "target_not_requested"}
-    assert metrics["location_coordinates_backfilled"] == {"skipped": True, "reason": "target_not_requested"}
-    assert metrics["location_address_keys_stamped"] == {"skipped": True, "reason": "target_not_requested"}
-    assert metrics["location_archive"] == {"skipped": True, "reason": "target_not_requested"}
-    assert metrics["address_overlay"] == {"skipped": True, "reason": "target_not_requested"}
+    skipped_metric_names = (
+        "location_contacts_backfilled",
+        "location_coordinates_backfilled",
+        "resource_id_npis_backfilled",
+        "location_address_keys_stamped",
+        "location_archive",
+        "address_overlay",
+    )
+    for skipped_metric_name in skipped_metric_names:
+        assert metrics[skipped_metric_name] == {"skipped": True, "reason": "target_not_requested"}
     assert metrics["network_catalog"] == {"rows": 8}
     assert metrics["ptg_corroboration_view_published"] is False
     assert metrics["ptg_corroboration_view_skipped"] == {"skipped": True, "reason": "target_not_requested"}
-    importer.backfill_provider_directory_location_contacts.assert_not_awaited()
-    importer.backfill_provider_directory_location_coordinates.assert_not_awaited()
-    importer.publish_provider_directory_location_address_keys.assert_not_awaited()
-    importer.publish_provider_directory_location_archive.assert_not_awaited()
-    importer.publish_provider_directory_address_overlay.assert_not_awaited()
-    importer.publish_provider_directory_network_catalog.assert_awaited_once()
-    assert importer.publish_provider_directory_network_catalog.await_args.kwargs["run_id"] is None
-    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
+    skipped_stage_mocks = (
+        artifact_publish_mocks_by_name["backfill_provider_directory_location_contacts"],
+        artifact_publish_mocks_by_name["backfill_provider_directory_location_coordinates"],
+        artifact_publish_mocks_by_name["publish_provider_directory_location_address_keys"],
+        artifact_publish_mocks_by_name["publish_provider_directory_location_archive"],
+        artifact_publish_mocks_by_name["publish_provider_directory_address_overlay"],
+    )
+    for skipped_stage_mock in skipped_stage_mocks:
+        skipped_stage_mock.assert_not_awaited()
+    artifact_publish_mocks_by_name["publish_provider_directory_network_catalog"].assert_awaited_once()
+    assert artifact_publish_mocks_by_name["publish_provider_directory_network_catalog"].await_args.kwargs["run_id"] is None
+    artifact_publish_mocks_by_name["publish_provider_directory_address_corroboration_if_available"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6821,6 +6861,11 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         AsyncMock(return_value={"location_contact_rows_updated": 5}),
     )
     monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=6))
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_resource_id_npis",
+        AsyncMock(return_value={"Practitioner": 2, "Organization": 1}),
+    )
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -6848,6 +6893,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     assert result["publish_artifacts_only"] is True
     assert result["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert result["location_coordinates_backfilled"] == 6
+    assert result["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
     assert result["location_address_keys_stamped"] == 3
     assert result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert result["network_catalog"] == {"rows": 8}
@@ -6858,6 +6904,11 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     }
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.backfill_provider_directory_location_coordinates.assert_awaited_once_with(
+        run_id=None,
+        source_ids=[],
+        seen_table=None,
+    )
+    importer.backfill_provider_directory_resource_id_npis.assert_awaited_once_with(
         run_id=None,
         source_ids=[],
         seen_table=None,
@@ -7319,6 +7370,7 @@ def test_location_archive_source_scope():
 
 @pytest.mark.asyncio
 async def test_artifact_publish_source_scope(monkeypatch):
+    """Artifact publishing should pass run and source scope to each stage."""
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
     monkeypatch.setattr(
         importer,
@@ -7331,6 +7383,7 @@ async def test_artifact_publish_source_scope(monkeypatch):
     overlay_publish = AsyncMock(return_value={"published": True, "rows": 6})
     network_catalog_publish = AsyncMock(return_value={"published": True, "rows": 7})
     monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", coordinate_backfill)
+    monkeypatch.setattr(importer, "backfill_provider_directory_resource_id_npis", AsyncMock(return_value={}))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", key_publish)
     monkeypatch.setattr(importer, "publish_provider_directory_location_archive", archive_publish)
     monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", overlay_publish)
@@ -7370,6 +7423,29 @@ async def test_artifact_publish_source_scope(monkeypatch):
     network_catalog_publish.assert_awaited_once_with(
         run_id="run_1",
         source_ids=["source_a", "source_b"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_id_npi_backfill_receives_publish_scope(monkeypatch):
+    """The resource-id NPI stage should honor artifact run and source scope."""
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    npi_backfill = AsyncMock(return_value={"Practitioner": 2, "Organization": 1})
+    monkeypatch.setattr(importer, "backfill_provider_directory_resource_id_npis", npi_backfill)
+
+    metrics = await importer._publish_provider_directory_artifacts(
+        run_id="run_1",
+        metrics={},
+        address_key_run_id="run_1",
+        source_ids=["source_a", "source_b"],
+        publish_artifacts_targets={"resource_id_npis"},
+    )
+
+    assert metrics["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}
+    npi_backfill.assert_awaited_once_with(
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+        seen_table=None,
     )
 
 
