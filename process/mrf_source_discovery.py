@@ -4501,15 +4501,31 @@ def _magnacare_target_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def _magnacare_search_term_variants(value: Any) -> list[str]:
+    text = _clean_text(value)
+    if not text:
+        return []
+    spaced = re.sub(r"[_-]+", " ", text).strip()
+    variants = [spaced or text]
+    dba_match = re.search(r"\bdba\s+(?P<alias>.+)$", spaced, flags=re.I)
+    if dba_match:
+        variants.append(dba_match.group("alias").strip())
+    if text != spaced:
+        variants.append(text)
+    return variants
+
+
 def _magnacare_search_terms(source: dict[str, Any], resolver: dict[str, Any]) -> list[str]:
     metadata = dict((source or {}).get("metadata_json") or {})
     raw_metadata = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-    candidate_search_terms = [
+    candidate_search_terms: list[str] = []
+    for item in (
         metadata.get("target_payer_query"),
         raw_metadata.get("target_payer_query"),
         *(metadata.get("plan_names") or []),
-        *(resolver.get("search_terms") or ["magna", "employee", "benefit"]),
-    ]
+    ):
+        candidate_search_terms.extend(_magnacare_search_term_variants(item))
+    candidate_search_terms.extend(resolver.get("search_terms") or ["magna", "employee", "benefit"])
     terms: list[str] = []
     seen_search_terms: set[str] = set()
     for item in candidate_search_terms:

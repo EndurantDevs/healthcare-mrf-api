@@ -7637,7 +7637,7 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
 
     async def fake_fetch_text(requested_url, *, max_bytes, session):
         fetched_result_urls.append(requested_url)
-        if "filters=search-by%3AVictra" in requested_url:
+        if "filters=search-by%3Aabc+phones+of+north+carolina+inc+dba+victra" in requested_url:
             return MAGNACARE_RESULTS_HTML
         return ""
 
@@ -7656,7 +7656,9 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
         {
             "source_id": "source_abc",
             "payer_id": "payer_abc",
-            "metadata_json": {"target_payer_query": "Victra"},
+            "metadata_json": {
+                "target_payer_query": "abc_phones_of_north_carolina_inc_dba_victra"
+            },
         },
         "https://clm.magnacare.com/transparency/",
         {
@@ -7668,7 +7670,7 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
         session="session",
     )
 
-    assert "filters=search-by%3AVictra" in fetched_result_urls[0]
+    assert "filters=search-by%3Aabc+phones+of+north+carolina+inc+dba+victra" in fetched_result_urls[0]
     assert len(resolved_targets) == 1
 
 
