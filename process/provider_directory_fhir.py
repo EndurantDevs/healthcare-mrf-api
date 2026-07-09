@@ -981,6 +981,18 @@ def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_coun
 
 
 SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+UHC_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+UHC_ADAPTIVE_PARTITION_TOTAL_CAP = 10000
+UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 4
+
+
+def _letter_prefixes(length: int) -> tuple[str, ...]:
+    if length <= 0:
+        return ("",)
+    prefixes = ("",)
+    for _ in range(length):
+        prefixes = tuple(prefix + letter for prefix in prefixes for letter in UHC_SEARCH_ALPHABET)
+    return prefixes
 
 
 def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
@@ -1007,6 +1019,16 @@ def _aetna_provider_directory_data_partition_values(resource_type: str) -> tuple
     return tuple((state_param, state) for state in US_STATE_ABBRS)
 
 
+def _uhc_provider_directory_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
+    if resource_type == "Practitioner":
+        return tuple(("family", prefix) for prefix in _letter_prefixes(2))
+    if resource_type == "Organization":
+        return tuple(("name", prefix) for prefix in _letter_prefixes(2))
+    if resource_type == "Location":
+        return tuple(("address-state", state) for state in US_STATE_ABBRS)
+    return ()
+
+
 def _url_with_query_item(url: str, key: str, value: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1016,6 +1038,60 @@ def _url_with_query_item(url: str, key: str, value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
 
 
+def _url_with_replaced_query_item(url: str, key: str, value: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query_items = [
+        (item_key, item_value)
+        for item_key, item_value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if item_key != key
+    ]
+    query_items.append((key, value))
+    query = urllib.parse.urlencode(query_items, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _bundle_total(payload: dict[str, Any]) -> int | None:
+    total = payload.get("total")
+    try:
+        return int(total)
+    except (TypeError, ValueError):
+        return None
+
+
+def _uhc_adaptive_partition_max_prefix_length() -> int:
+    return _env_int(
+        "HLTHPRT_PROVIDER_DIRECTORY_UHC_MAX_PREFIX_LENGTH",
+        UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH,
+    )
+
+
+def _uhc_adaptive_partition_child_urls(
+    source: dict[str, Any],
+    resource_type: str,
+    url: str,
+    payload: dict[str, Any],
+) -> list[str]:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base != UHC_PROVIDER_DIRECTORY_BASE:
+        return []
+    query_items = urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+    query_by_name = dict(query_items)
+    if "_getpages" in query_by_name:
+        return []
+    search_param = {"Practitioner": "family", "Organization": "name"}.get(resource_type)
+    if not search_param:
+        return []
+    total = _bundle_total(payload)
+    if total is None or total < UHC_ADAPTIVE_PARTITION_TOTAL_CAP:
+        return []
+    prefix = _clean_text(query_by_name.get(search_param))
+    if not prefix:
+        return []
+    if len(prefix) >= _uhc_adaptive_partition_max_prefix_length():
+        return []
+    return [_url_with_replaced_query_item(url, search_param, prefix + letter) for letter in UHC_SEARCH_ALPHABET]
+
+
 def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
     start_url = _resource_start_url(source, resource_type, page_count=page_count)
     if not start_url:
@@ -1023,6 +1099,11 @@ def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_cou
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
         partitions = _aetna_provider_directory_data_partition_values(resource_type)
+        if not partitions:
+            return [start_url]
+        return [_url_with_query_item(start_url, key, value) for key, value in partitions]
+    if api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        partitions = _uhc_provider_directory_partition_values(resource_type)
         if not partitions:
             return [start_url]
         return [_url_with_query_item(start_url, key, value) for key, value in partitions]
@@ -7934,8 +8015,10 @@ async def _fetch_resource_rows(
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
-    partitioned_fetch = len(start_urls) > 1
+    pending_start_urls = list(start_urls)
+    partitioned_fetch = len(pending_start_urls) > 1
     partition_error_count = 0
+    url: str | None = None
 
     async def flush_pending_rows() -> None:
         if not row_batch_handler or not pending_rows:
@@ -7944,7 +8027,8 @@ async def _fetch_resource_rows(
         pending_rows.clear()
         fetch_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
 
-    for start_url in start_urls:
+    while pending_start_urls:
+        start_url = pending_start_urls.pop(0)
         url = start_url
         while url and _limit_allows_more(rows_fetched, per_resource_limit):
             if cancel_ctx is not None:
@@ -7989,6 +8073,12 @@ async def _fetch_resource_rows(
                 error_message = "non_bundle_payload"
                 break
             pages += 1
+            child_urls = _uhc_adaptive_partition_child_urls(source, resource_type, url, payload)
+            if child_urls:
+                partitioned_fetch = True
+                pending_start_urls = child_urls + pending_start_urls
+                url = None
+                break
             entries = _bundle_entries(payload)
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(
@@ -8040,6 +8130,7 @@ async def _fetch_resource_rows(
         and not hard_page_limit_reached
         and not is_deadline_reached
         and not url
+        and not pending_start_urls
     )
     return ResourceFetchResult(
         model=model,
@@ -8051,7 +8142,7 @@ async def _fetch_resource_rows(
         row_limit_reached=row_limit_reached,
         page_limit_reached=page_limit_reached,
         hard_page_limit_reached=hard_page_limit_reached,
-        next_url_remaining=next_url_remaining or bool(url),
+        next_url_remaining=next_url_remaining or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         deadline_reached=is_deadline_reached,
     )
@@ -10052,13 +10143,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     if resource_type in resources
                 ]
                 resource_fetch_stats_by_resource = metrics.get("resource_fetch_stats") or {}
-                resource_fetch_has_failures = any(
-                    int(resource_stats.get("sources_failed") or 0) > 0
-                    for resource_stats in resource_fetch_stats_by_resource.values()
-                    if isinstance(resource_stats, dict)
+                completion_tracking_available = bool(completed_source_ids_by_resource) or bool(
+                    resource_fetch_stats_by_resource
                 )
-                completion_tracking_available = bool(completed_source_ids_by_resource) or resource_fetch_has_failures
-                if completion_tracking_available:
+                if required_publish_resources and completion_tracking_available:
                     publishable_artifact_source_ids = [
                         source_id
                         for source_id in artifact_source_ids

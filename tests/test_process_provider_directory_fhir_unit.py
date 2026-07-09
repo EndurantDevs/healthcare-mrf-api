@@ -4686,6 +4686,52 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
 
 
 @pytest.mark.asyncio
+async def test_process_data_skips_artifact_publish_when_required_fetches_are_bounded(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
+    publish_artifacts = AsyncMock(return_value={})
+    monkeypatch.setattr(importer, "_publish_provider_directory_artifacts", publish_artifacts)
+
+    async def fake_import_resources(*_args, resource_fetch_stats, **_kwargs):
+        for resource_type in ("Practitioner", "Location", "PractitionerRole"):
+            resource_fetch_stats[resource_type] = {
+                "sources_attempted": 1,
+                "sources_completed": 0,
+                "sources_bounded": 1,
+                "sources_failed": 0,
+                "sources_empty": 0,
+                "bulk_export_sources": 0,
+                "pages_fetched": 1,
+                "rows_fetched": 2,
+            }
+        return {"Practitioner": 2, "Location": 2, "PractitionerRole": 2}
+
+    monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "import_resources": True,
+            "publish_artifacts": True,
+            "resources": "Practitioner,Location,PractitionerRole",
+        },
+    )
+
+    assert metrics["publishable_artifact_source_ids"] == []
+    assert metrics["address_overlay"]["reason"] == "critical_resource_fetch_incomplete"
+    assert metrics["artifact_publish_required_resources"] == [
+        "PractitionerRole",
+        "Practitioner",
+        "Location",
+    ]
+    publish_artifacts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_process_data_uses_live_probe_success_over_seed_auth_required_status(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -5136,6 +5182,66 @@ def test_resource_start_urls_partitions_aetna_providerdirectorydata_state_search
     assert role_urls == [
         "https://apif1.aetna.com/fhir/v1/providerdirectorydata/PractitionerRole?_count=10"
     ]
+
+
+def test_resource_start_urls_partitions_uhc_provider_directory_searches():
+    practitioner_urls = importer._resource_start_urls(
+        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "Practitioner",
+        page_count=100,
+    )
+    organization_urls = importer._resource_start_urls(
+        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "Organization",
+        page_count=100,
+    )
+    location_urls = importer._resource_start_urls(
+        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "Location",
+        page_count=100,
+    )
+    role_urls = importer._resource_start_urls(
+        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "PractitionerRole",
+        page_count=100,
+    )
+
+    assert practitioner_urls[0] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=AA"
+    assert practitioner_urls[-1] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=ZZ"
+    assert len(practitioner_urls) == 26 * 26
+    assert organization_urls[0] == "https://flex.optum.com/fhirpublic/R4/Organization?_count=100&name=AA"
+    assert organization_urls[-1] == "https://flex.optum.com/fhirpublic/R4/Organization?_count=100&name=ZZ"
+    assert len(organization_urls) == 26 * 26
+    assert location_urls[0] == "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-state=AL"
+    assert location_urls[-1].endswith("_count=100&address-state=VI")
+    assert len(location_urls) == len(importer.US_STATE_ABBRS)
+    assert role_urls == ["https://flex.optum.com/fhirpublic/R4/PractitionerRole?_count=100"]
+
+
+def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
+    source_dict = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    children = importer._uhc_adaptive_partition_child_urls(
+        source_dict,
+        "Practitioner",
+        "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SM",
+        {"resourceType": "Bundle", "total": 10000},
+    )
+
+    assert children[0] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SMA"
+    assert children[-1] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SMZ"
+    assert len(children) == 26
+    assert (
+        importer._uhc_adaptive_partition_child_urls(
+            source_dict,
+            "Practitioner",
+            "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=AA",
+            {"resourceType": "Bundle", "total": 9999},
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
