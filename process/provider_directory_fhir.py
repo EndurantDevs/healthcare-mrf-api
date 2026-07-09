@@ -152,6 +152,7 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
 )
 PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = (
     "location_contacts",
+    "location_coordinates",
     "location_address_keys",
     "location_archive",
     "address_overlay",
@@ -163,23 +164,27 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
     "*": PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS,
     "addresses": (
         "location_contacts",
+        "location_coordinates",
         "location_address_keys",
         "location_archive",
         "address_overlay",
     ),
     "address_artifacts": (
         "location_contacts",
+        "location_coordinates",
         "location_address_keys",
         "location_archive",
         "address_overlay",
     ),
     "location": (
         "location_contacts",
+        "location_coordinates",
         "location_address_keys",
         "location_archive",
     ),
     "locations": (
         "location_contacts",
+        "location_coordinates",
         "location_address_keys",
         "location_archive",
     ),
@@ -294,6 +299,7 @@ DEFAULT_STREAM_BATCH_SIZE = 5000
 DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
+DEFAULT_LOCATION_COORDINATE_BATCH_SIZE = 50000
 PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
 PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL = "monthly-full"
 PROVIDER_DIRECTORY_REFRESH_PRESETS = (PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL,)
@@ -3408,6 +3414,232 @@ async def publish_provider_directory_address_corroboration_table(
         raise
 
 
+def _provider_directory_location_coordinate_sql_map(source_alias: str) -> dict[str, str]:
+    location_country_expr = _country_restore_default_us_sql(f"{source_alias}.country_code")
+    raw_lat = f"({source_alias}.latitude)::numeric"
+    raw_long = f"({source_alias}.longitude)::numeric"
+    numeric_re = r"^-?[0-9]+(\.[0-9]+)?$"
+    numeric_guard = (
+        f"{source_alias}.latitude ~ '{numeric_re}' "
+        f"AND {source_alias}.longitude ~ '{numeric_re}'"
+    )
+    normalized_lat_expr = _coordinate_from_location_sql(
+        f"{source_alias}.latitude",
+        f"{source_alias}.longitude",
+        location_country_expr,
+        axis="lat",
+    )
+    normalized_long_expr = _coordinate_from_location_sql(
+        f"{source_alias}.latitude",
+        f"{source_alias}.longitude",
+        location_country_expr,
+        axis="long",
+    )
+    return {
+        "location_country_expr": location_country_expr,
+        "raw_lat": raw_lat,
+        "raw_long": raw_long,
+        "numeric_guard": numeric_guard,
+        "normalized_lat_expr": normalized_lat_expr,
+        "normalized_long_expr": normalized_long_expr,
+    }
+
+
+def _provider_directory_location_coordinate_scopes(
+    source_alias: str,
+    *,
+    db_schema: str,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    seen_table: str | None,
+) -> list[str]:
+    scope_clause_list: list[str] = []
+    if run_id is not None and not seen_table:
+        scope_clause_list.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
+    if source_ids:
+        scope_clause_list.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    if seen_table:
+        seen_ref = _qt(db_schema, seen_table)
+        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
+        scope_clause_list.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Location'
+                   {seen_run_filter}
+                   AND seen.source_id = {source_alias}.source_id
+                   AND seen.resource_id = {source_alias}.resource_id
+            )"""
+        )
+    scope_clause_list.append(
+        f"""(
+            CAST(:after_source_id AS varchar) IS NULL
+            OR ({source_alias}.source_id, {source_alias}.resource_id)
+                > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
+        )"""
+    )
+    return scope_clause_list
+
+
+def _provider_directory_location_coordinate_where_sql(
+    source_alias: str,
+    coordinate_expr_map: dict[str, str],
+    scope_clause_list: list[str],
+) -> str:
+    where_clause_list = [
+        f"NULLIF(BTRIM(COALESCE({source_alias}.latitude, '')), '') IS NOT NULL",
+        f"NULLIF(BTRIM(COALESCE({source_alias}.longitude, '')), '') IS NOT NULL",
+        coordinate_expr_map["numeric_guard"],
+        "NOT ("
+        + _coordinate_pair_plausible_sql(
+            coordinate_expr_map["raw_lat"],
+            coordinate_expr_map["raw_long"],
+            coordinate_expr_map["location_country_expr"],
+        )
+        + ")",
+        f"({coordinate_expr_map['normalized_lat_expr']}) IS NOT NULL",
+        f"({coordinate_expr_map['normalized_long_expr']}) IS NOT NULL",
+        *scope_clause_list,
+    ]
+    return " AND ".join(f"({clause})" for clause in where_clause_list)
+
+
+def _provider_directory_location_coordinate_batch_body(
+    source_alias: str,
+    location_ref: str,
+    coordinate_expr_map: dict[str, str],
+    where_sql: str,
+) -> str:
+    normalized_latitude_sql = _coordinate_text_sql(coordinate_expr_map["normalized_lat_expr"])
+    normalized_longitude_sql = _coordinate_text_sql(coordinate_expr_map["normalized_long_expr"])
+    return f"""
+    WITH candidates AS MATERIALIZED (
+        SELECT
+            {source_alias}.source_id,
+            {source_alias}.resource_id,
+            {normalized_latitude_sql} AS normalized_latitude,
+            {normalized_longitude_sql} AS normalized_longitude
+          FROM {location_ref} AS {source_alias}
+         WHERE {where_sql}
+         ORDER BY {source_alias}.source_id,
+                  {source_alias}.resource_id
+         LIMIT CAST(:batch_size AS integer)
+    ),
+    updated AS (
+        UPDATE {location_ref} AS loc
+           SET latitude = candidates.normalized_latitude,
+               longitude = candidates.normalized_longitude,
+               updated_at = now()
+          FROM candidates
+         WHERE loc.source_id = candidates.source_id
+           AND loc.resource_id = candidates.resource_id
+           AND candidates.normalized_latitude IS NOT NULL
+           AND candidates.normalized_longitude IS NOT NULL
+           AND (
+                loc.latitude IS DISTINCT FROM candidates.normalized_latitude
+             OR loc.longitude IS DISTINCT FROM candidates.normalized_longitude
+           )
+         RETURNING loc.source_id,
+                   loc.resource_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM candidates)::bigint AS candidate_rows,
+        (SELECT COUNT(*) FROM updated)::bigint AS updated_rows,
+        (SELECT source_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_source_id,
+        (SELECT resource_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_resource_id;
+    """
+
+
+def provider_directory_location_coordinate_batch_sql(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+) -> str:
+    """Normalize stored FHIR Location coordinates in bounded keyset batches."""
+
+    schema = db_schema or _schema()
+    source_alias = "loc_src"
+    location_ref = _qt(schema, "provider_directory_location")
+    coordinate_expr_map = _provider_directory_location_coordinate_sql_map(source_alias)
+    scope_clause_list = _provider_directory_location_coordinate_scopes(
+        source_alias,
+        db_schema=schema,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
+    )
+    where_sql = _provider_directory_location_coordinate_where_sql(
+        source_alias,
+        coordinate_expr_map,
+        scope_clause_list,
+    )
+    return _provider_directory_location_coordinate_batch_body(
+        source_alias,
+        location_ref,
+        coordinate_expr_map,
+        where_sql,
+    )
+
+
+async def backfill_provider_directory_location_coordinates(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
+    batch_size: int | None = None,
+) -> int:
+    """Repair stored Provider Directory coordinates that can be normalized safely."""
+
+    schema = db_schema or _schema()
+    if not await _table_exists(schema, "provider_directory_location"):
+        return 0
+    query_param_dict: dict[str, Any] = {}
+    if run_id is not None:
+        query_param_dict["run_id"] = run_id
+    if source_ids:
+        query_param_dict["source_ids"] = list(source_ids)
+    total_updated = 0
+    after_source_id: str | None = None
+    after_resource_id: str | None = None
+    bounded_batch_size = max(int(batch_size or _location_coordinate_batch_size()), 1)
+    coordinate_batch_sql = provider_directory_location_coordinate_batch_sql(
+        schema,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
+    )
+    while True:
+        coordinate_batch_result = await db.first(
+            coordinate_batch_sql,
+            **query_param_dict,
+            after_source_id=after_source_id,
+            after_resource_id=after_resource_id,
+            batch_size=bounded_batch_size,
+        )
+        batch_result_mapping = (
+            coordinate_batch_result._mapping
+            if hasattr(coordinate_batch_result, "_mapping")
+            else dict(coordinate_batch_result or {})
+        )
+        candidate_rows = int(batch_result_mapping.get("candidate_rows") or 0)
+        updated_rows = int(batch_result_mapping.get("updated_rows") or 0)
+        total_updated += updated_rows
+        next_source_id = _clean_text(batch_result_mapping.get("last_source_id"))
+        next_resource_id = _clean_text(batch_result_mapping.get("last_resource_id"))
+        if candidate_rows <= 0 or not next_source_id or not next_resource_id:
+            break
+        if next_source_id == after_source_id and next_resource_id == after_resource_id:
+            break
+        after_source_id = next_source_id
+        after_resource_id = next_resource_id
+    return total_updated
+
+
 def provider_directory_location_address_key_sql(
     db_schema: str | None = None,
     *,
@@ -3828,7 +4060,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=0,
-        total=5,
+        total=6,
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
@@ -3845,8 +4077,27 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=1,
-        total=5,
+        total=6,
         message=location_contacts_message,
+        metrics=metrics,
+    )
+    if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "location_coordinates"):
+        metrics["location_coordinates_backfilled"] = await backfill_provider_directory_location_coordinates(
+            run_id=address_key_run_id, source_ids=source_ids, seen_table=seen_table,
+        )
+        location_coordinates_message = (
+            "backfilled Provider Directory location coordinates; "
+            f"rows={metrics['location_coordinates_backfilled']}"
+        )
+    else:
+        metrics["location_coordinates_backfilled"] = _provider_directory_publish_target_skipped()
+        location_coordinates_message = "skipped Provider Directory location coordinate backfill"
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=2,
+        total=6,
+        message=location_coordinates_message,
         metrics=metrics,
     )
     if seen_table:
@@ -3865,8 +4116,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=2,
-        total=5,
+        done=3,
+        total=6,
         message=location_address_keys_message,
         metrics=metrics,
     )
@@ -3895,8 +4146,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=3,
-        total=5,
+        done=4,
+        total=6,
         message=address_artifact_message,
         metrics=metrics,
     )
@@ -3915,8 +4166,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=4,
-        total=5,
+        done=5,
+        total=6,
         message=network_catalog_message,
         metrics=metrics,
     )
@@ -3944,8 +4195,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=5,
-        total=5,
+        done=6,
+        total=6,
         message=message,
         metrics=metrics,
     )
@@ -4854,6 +5105,21 @@ def _location_address_key_batch_size() -> int:
         )
     except ValueError:
         return DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE
+
+
+def _location_coordinate_batch_size() -> int:
+    try:
+        return max(
+            int(
+                os.getenv(
+                    "HLTHPRT_PROVIDER_DIRECTORY_COORDINATE_BATCH_SIZE",
+                    str(DEFAULT_LOCATION_COORDINATE_BATCH_SIZE),
+                )
+            ),
+            1,
+        )
+    except ValueError:
+        return DEFAULT_LOCATION_COORDINATE_BATCH_SIZE
 
 
 def _short_error(err: BaseException) -> str:
@@ -9669,6 +9935,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     "skipped": True,
                     "reason": "publish_artifacts_disabled",
                 }
+                metrics["location_coordinates_backfilled"] = {
+                    "skipped": True,
+                    "reason": "publish_artifacts_disabled",
+                }
                 metrics["location_address_keys_stamped"] = 0
                 metrics["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
                 metrics["ptg_corroboration_view_published"] = False
@@ -9898,6 +10168,14 @@ def _coordinate_from_location_sql(
             ELSE NULL::numeric
         END
     """
+
+
+def _coordinate_text_sql(numeric_expr: str) -> str:
+    return (
+        "NULLIF(TRIM(TRAILING '.' FROM "
+        f"TRIM(TRAILING '0' FROM ROUND(({numeric_expr})::numeric, 8)::varchar)"
+        "), '')::varchar"
+    )
 
 
 def _provider_directory_address_overlay_columns() -> tuple[str, ...]:

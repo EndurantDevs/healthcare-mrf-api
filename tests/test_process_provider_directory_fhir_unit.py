@@ -1693,6 +1693,65 @@ async def test_publish_provider_directory_location_address_keys_batches_with_see
     status.assert_not_awaited()
 
 
+def test_provider_directory_location_coordinate_batch_sql_scales_bad_coordinates():
+    sql = importer.provider_directory_location_coordinate_batch_sql(
+        "mrf",
+        run_id="run_1",
+        source_ids=["source_a"],
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    assert 'UPDATE "mrf"."provider_directory_location" AS loc' in sql
+    assert "loc_src.latitude" in sql
+    assert "loc_src.longitude" in sql
+    assert "::numeric / 1000000" in sql
+    assert "::numeric / 10000000" in sql
+    assert "NOT (ABS((loc_src.latitude)::numeric) < 0.0000001" in sql
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert "seen.resource_type = 'Location'" in sql
+    assert "AND seen.run_id = CAST(:run_id AS varchar)" in sql
+    assert "AND seen.source_id = loc_src.source_id" in sql
+    assert "AND seen.resource_id = loc_src.resource_id" in sql
+    assert "loc_src.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+    assert "LIMIT CAST(:batch_size AS integer)" in sql
+
+
+@pytest.mark.asyncio
+async def test_backfill_provider_directory_location_coordinates_batches(monkeypatch):
+    class Row:
+        def __init__(self, **values):
+            self._mapping = values
+
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    first = AsyncMock(
+        side_effect=[
+            Row(candidate_rows=2, updated_rows=2, last_source_id="source_a", last_resource_id="loc-2"),
+            Row(candidate_rows=1, updated_rows=1, last_source_id="source_a", last_resource_id="loc-3"),
+            Row(candidate_rows=0, updated_rows=0, last_source_id=None, last_resource_id=None),
+        ]
+    )
+    monkeypatch.setattr(importer.db, "first", first)
+
+    updated = await importer.backfill_provider_directory_location_coordinates(
+        "mrf",
+        run_id="run_1",
+        source_ids=["source_a"],
+        seen_table="provider_directory_import_seen_stage_test",
+        batch_size=2,
+    )
+
+    assert updated == 3
+    assert first.await_count == 3
+    assert first.await_args_list[0].kwargs["run_id"] == "run_1"
+    assert first.await_args_list[0].kwargs["source_ids"] == ["source_a"]
+    assert first.await_args_list[0].kwargs["after_source_id"] is None
+    assert first.await_args_list[1].kwargs["after_source_id"] == "source_a"
+    assert first.await_args_list[1].kwargs["after_resource_id"] == "loc-2"
+    assert first.await_args_list[2].kwargs["after_source_id"] == "source_a"
+    assert first.await_args_list[2].kwargs["after_resource_id"] == "loc-3"
+    assert all(call.kwargs["batch_size"] == 2 for call in first.await_args_list)
+
+
 def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
     table = ProviderDirectoryLocation.__table__
     columns = [column.name for column in table.columns]
@@ -4231,6 +4290,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
         "backfill_provider_directory_location_contacts",
         AsyncMock(return_value={"location_contact_rows_updated": 5}),
     )
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=6))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -4260,12 +4320,15 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     assert metrics["resource_rows"] == {"Location": 2}
     assert metrics["sources_import_attempted"] == 1
     assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
+    assert metrics["location_coordinates_backfilled"] == 6
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert metrics["network_catalog"] == {"rows": 8}
     assert metrics["publish_corroboration"] is True
     assert metrics["ptg_corroboration_view_published"] is True
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
+    importer.backfill_provider_directory_location_coordinates.assert_awaited_once()
+    assert importer.backfill_provider_directory_location_coordinates.await_args.kwargs["run_id"] == "run_full"
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
     assert importer.publish_provider_directory_location_address_keys.await_args.kwargs["run_id"] == "run_full"
     importer.publish_provider_directory_location_archive.assert_awaited_once()
@@ -4287,32 +4350,19 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
 async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
-    monkeypatch.setattr(
-        importer,
-        "backfill_provider_directory_location_contacts",
-        AsyncMock(return_value={"location_contact_rows_updated": 0}),
-    )
-    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_location_archive",
-        AsyncMock(return_value={"inserted": 0}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_address_overlay",
-        AsyncMock(return_value={"rows": 7}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_network_catalog",
-        AsyncMock(return_value={"rows": 8}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "publish_provider_directory_address_corroboration_if_available",
-        AsyncMock(return_value=True),
-    )
+    artifact_mock_map = {
+        "backfill_provider_directory_location_contacts": AsyncMock(
+            return_value={"location_contact_rows_updated": 0}
+        ),
+        "backfill_provider_directory_location_coordinates": AsyncMock(return_value=0),
+        "publish_provider_directory_location_address_keys": AsyncMock(return_value=0),
+        "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
+        "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 7}),
+        "publish_provider_directory_network_catalog": AsyncMock(return_value={"rows": 8}),
+        "publish_provider_directory_address_corroboration_if_available": AsyncMock(return_value=True),
+    }
+    for artifact_name, artifact_mock in artifact_mock_map.items():
+        monkeypatch.setattr(importer, artifact_name, artifact_mock)
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -4328,14 +4378,15 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     assert metrics["address_overlay"] == {"rows": 7}
     assert metrics["network_catalog"] == {"rows": 8}
     assert metrics["ptg_corroboration_view_published"] is True
-    importer.publish_provider_directory_location_address_keys.assert_awaited_once()
-    assert importer.publish_provider_directory_location_address_keys.await_args.kwargs["run_id"] is None
-    importer.publish_provider_directory_location_archive.assert_awaited_once()
-    assert importer.publish_provider_directory_location_archive.await_args.kwargs["run_id"] is None
-    importer.publish_provider_directory_address_overlay.assert_awaited_once()
-    assert importer.publish_provider_directory_address_overlay.await_args.kwargs["run_id"] is None
-    importer.publish_provider_directory_network_catalog.assert_awaited_once()
-    assert importer.publish_provider_directory_network_catalog.await_args.kwargs["run_id"] is None
+    for artifact_name in (
+        "backfill_provider_directory_location_coordinates",
+        "publish_provider_directory_location_address_keys",
+        "publish_provider_directory_location_archive",
+        "publish_provider_directory_address_overlay",
+        "publish_provider_directory_network_catalog",
+    ):
+        artifact_mock_map[artifact_name].assert_awaited_once()
+        assert artifact_mock_map[artifact_name].await_args.kwargs["run_id"] is None
     importer.publish_provider_directory_address_corroboration_if_available.assert_awaited_once()
     assert (
         importer.publish_provider_directory_address_corroboration_if_available.await_args.kwargs[
@@ -4353,6 +4404,7 @@ def test_provider_directory_publish_artifact_targets_parse_aliases():
     }
     assert importer._provider_directory_publish_artifact_targets(["addresses"]) == {
         "location_contacts",
+        "location_coordinates",
         "location_address_keys",
         "location_archive",
         "address_overlay",
@@ -4371,6 +4423,7 @@ async def test_process_data_publish_artifacts_only_can_target_network_catalog(mo
         "backfill_provider_directory_location_contacts",
         AsyncMock(return_value={"location_contact_rows_updated": 0}),
     )
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
     monkeypatch.setattr(
         importer,
@@ -4406,6 +4459,7 @@ async def test_process_data_publish_artifacts_only_can_target_network_catalog(mo
 
     assert metrics["publish_artifacts_targets"] == ["network_catalog"]
     assert metrics["location_contacts_backfilled"] == {"skipped": True, "reason": "target_not_requested"}
+    assert metrics["location_coordinates_backfilled"] == {"skipped": True, "reason": "target_not_requested"}
     assert metrics["location_address_keys_stamped"] == {"skipped": True, "reason": "target_not_requested"}
     assert metrics["location_archive"] == {"skipped": True, "reason": "target_not_requested"}
     assert metrics["address_overlay"] == {"skipped": True, "reason": "target_not_requested"}
@@ -4413,6 +4467,7 @@ async def test_process_data_publish_artifacts_only_can_target_network_catalog(mo
     assert metrics["ptg_corroboration_view_published"] is False
     assert metrics["ptg_corroboration_view_skipped"] == {"skipped": True, "reason": "target_not_requested"}
     importer.backfill_provider_directory_location_contacts.assert_not_awaited()
+    importer.backfill_provider_directory_location_coordinates.assert_not_awaited()
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
     importer.publish_provider_directory_location_archive.assert_not_awaited()
     importer.publish_provider_directory_address_overlay.assert_not_awaited()
@@ -4457,6 +4512,7 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
         "backfill_provider_directory_location_contacts",
         AsyncMock(return_value={"location_contact_rows_updated": 5}),
     )
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -4484,10 +4540,15 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
         "skipped": True,
         "reason": "publish_artifacts_disabled",
     }
+    assert metrics["location_coordinates_backfilled"] == {
+        "skipped": True,
+        "reason": "publish_artifacts_disabled",
+    }
     assert metrics["location_address_keys_stamped"] == 0
     assert metrics["location_archive"] == {"skipped": True, "reason": "publish_artifacts_disabled"}
     assert metrics["ptg_corroboration_view_published"] is False
     importer.backfill_provider_directory_location_contacts.assert_not_awaited()
+    importer.backfill_provider_directory_location_coordinates.assert_not_awaited()
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
     importer.publish_provider_directory_location_archive.assert_not_awaited()
     importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
@@ -6407,6 +6468,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         "backfill_provider_directory_location_contacts",
         AsyncMock(return_value={"location_contact_rows_updated": 5}),
     )
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", AsyncMock(return_value=6))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -6433,6 +6495,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
 
     assert result["publish_artifacts_only"] is True
     assert result["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
+    assert result["location_coordinates_backfilled"] == 6
     assert result["location_address_keys_stamped"] == 3
     assert result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert result["network_catalog"] == {"rows": 8}
@@ -6442,6 +6505,11 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         "reason": "publish_corroboration_disabled",
     }
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
+    importer.backfill_provider_directory_location_coordinates.assert_awaited_once_with(
+        run_id=None,
+        source_ids=[],
+        seen_table=None,
+    )
     importer.publish_provider_directory_location_address_keys.assert_awaited_once_with(
         run_id=None, source_ids=[],
         seen_table=None,
@@ -6905,10 +6973,12 @@ async def test_artifact_publish_source_scope(monkeypatch):
         "backfill_provider_directory_location_contacts",
         AsyncMock(return_value={"location_contact_rows_updated": 2}),
     )
+    coordinate_backfill = AsyncMock(return_value=8)
     key_publish = AsyncMock(return_value=3)
     archive_publish = AsyncMock(return_value={"inserted": 4, "provenance_updates": 5})
     overlay_publish = AsyncMock(return_value={"published": True, "rows": 6})
     network_catalog_publish = AsyncMock(return_value={"published": True, "rows": 7})
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_coordinates", coordinate_backfill)
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", key_publish)
     monkeypatch.setattr(importer, "publish_provider_directory_location_archive", archive_publish)
     monkeypatch.setattr(importer, "publish_provider_directory_address_overlay", overlay_publish)
@@ -6921,10 +6991,16 @@ async def test_artifact_publish_source_scope(monkeypatch):
         source_ids=["source_a", "source_b"],
     )
 
+    assert metrics["location_coordinates_backfilled"] == 8
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"]["inserted"] == 4
     assert metrics["address_overlay"] == {"published": True, "rows": 6}
     assert metrics["network_catalog"] == {"published": True, "rows": 7}
+    coordinate_backfill.assert_awaited_once_with(
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+        seen_table=None,
+    )
     key_publish.assert_awaited_once_with(
         run_id="run_1",
         source_ids=["source_a", "source_b"],
