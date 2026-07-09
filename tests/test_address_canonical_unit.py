@@ -3193,6 +3193,12 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "entity_address_unified_idx_geo_bbox" in joined
     assert "entity_address_unified_idx_geo_idx" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
+    assert "entity_address_unified_idx_service_phone_digits_npi" in joined
+    assert "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'), npi" in joined
+    assert "entity_address_unified_idx_service_phone_number_npi" in joined
+    assert "ON mrf.entity_address_unified (phone_number, npi)" in joined
+    assert "entity_address_unified_idx_service_address_key_npi" in joined
+    assert "ON mrf.entity_address_unified (address_key, npi)" in joined
     assert "entity_address_unified_idx_service_premise_key_npi" in joined
     assert "ON mrf.entity_address_unified (premise_key, npi)" in joined
     assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
@@ -3209,6 +3215,31 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert context["post_publish_index_pending"] is False
     assert context["post_publish_analyzed"] is True
     assert len(context["post_publish_index_timings"]) == len(index_statements)
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_swap_renames_model_serving_indexes(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    stage_cls = entity_address_unified.make_class(EntityAddressUnified, "20260614")
+
+    await entity_address_unified._swap_stage_table("mrf", EntityAddressUnified, stage_cls)
+
+    joined = "\n".join(statements)
+    expected_indexes = {
+        "service_phone_digits_npi",
+        "service_phone_number_npi",
+        "service_address_key_npi",
+        "service_premise_key_npi",
+    }
+    for index_name in expected_indexes:
+        assert f"entity_address_unified_20260614_idx_{index_name}" in joined
+        assert f"RENAME TO entity_address_unified_idx_{index_name};" in joined
 
 
 @pytest.mark.asyncio
