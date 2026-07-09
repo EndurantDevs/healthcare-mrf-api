@@ -2728,6 +2728,47 @@ async def test_source_fetch_does_not_retry_deterministic_http_error(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_source_fetch_reduces_oversized_initial_search_page(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, timeout):
+        calls.append(url)
+        if url.endswith("_count=1000"):
+            return 413, {"resourceType": "OperationOutcome"}, None, 4
+        return 200, {"resourceType": "Bundle", "entry": []}, None, 5
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=1000",
+        timeout=3,
+    )
+
+    assert result == (200, {"resourceType": "Bundle", "entry": []}, None, 9)
+    assert calls == [
+        "https://payer.example/fhir/Practitioner?_count=1000",
+        "https://payer.example/fhir/Practitioner?_count=100",
+    ]
+
+
+@pytest.mark.parametrize(
+    "continuation_query",
+    [
+        "_getpages=opaque",
+        "_offset=100",
+        "_continuationToken=opaque",
+        "cursorMark=opaque",
+        "nextToken=opaque",
+    ],
+)
+def test_source_fetch_does_not_resize_continuation_page(continuation_query):
+    url = f"https://payer.example/fhir/Practitioner?_count=1000&{continuation_query}"
+
+    assert importer._source_fetch_candidate_urls(url) == [url]
+
+
+@pytest.mark.asyncio
 async def test_probe_sources_records_credential_descriptor_without_secret(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_TOKEN", "secret-token")
     monkeypatch.setenv(

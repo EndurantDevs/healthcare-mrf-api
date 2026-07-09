@@ -8013,13 +8013,71 @@ def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
     return min(2.0, 0.25 * (2**max(0, attempt_index)))
 
 
-async def _fetch_source_json(
+def _source_fetch_candidate_urls(url: str) -> list[str]:
+    parsed = urllib.parse.urlsplit(url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query_by_name = dict(query_items)
+    continuation_query_names = {
+        "_continuationtoken",
+        "_getpages",
+        "_getpagesid",
+        "_getpagesoffset",
+        "_offset",
+        "cursor",
+        "cursormark",
+        "nexttoken",
+        "page",
+        "pagetoken",
+    }
+    if continuation_query_names.intersection(name.lower() for name in query_by_name):
+        return [url]
+    try:
+        requested_count = int(query_by_name.get("_count") or 0)
+    except (TypeError, ValueError):
+        return [url]
+    if requested_count <= 1:
+        return [url]
+    candidate_urls = [url]
+    for fallback_count in (100, 25, 10, 1):
+        if fallback_count >= requested_count:
+            continue
+        candidate_urls.append(_url_with_replaced_query_item(url, "_count", str(fallback_count)))
+    return candidate_urls
+
+
+def _should_reduce_source_page_size(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> bool:
+    return bool(
+        _is_transient_source_fetch_failure(status_code, fetch_error)
+        or status_code in {400, 413}
+    )
+
+
+async def _fetch_source_json_once(
     source_record: dict[str, Any],
     url: str,
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     options = _credential_request_options_for_source(source_record, url)
+    if not options["headers"] and not options["query_params"]:
+        return await _fetch_json(url, timeout=timeout)
+    return await _fetch_json_with_options(
+        url,
+        timeout=timeout,
+        extra_headers=options["headers"],
+        query_params=options["query_params"],
+    )
+
+
+async def _fetch_source_json(
+    source_record: dict[str, Any],
+    url: str,
+    *,
+    timeout: int,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     total_elapsed_ms = 0
     fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int] = (
         None,
@@ -8027,22 +8085,26 @@ async def _fetch_source_json(
         "request_not_attempted",
         0,
     )
-    for attempt_index in range(_source_fetch_retry_attempts()):
-        if not options["headers"] and not options["query_params"]:
-            fetch_result = await _fetch_json(url, timeout=timeout)
-        else:
-            fetch_result = await _fetch_json_with_options(
-                url,
+    candidate_urls = _source_fetch_candidate_urls(url)
+    for candidate_index, candidate_url in enumerate(candidate_urls):
+        is_last_candidate = candidate_index == len(candidate_urls) - 1
+        attempt_count = _source_fetch_retry_attempts() if is_last_candidate else 1
+        for attempt_index in range(attempt_count):
+            fetch_result = await _fetch_source_json_once(
+                source_record,
+                candidate_url,
                 timeout=timeout,
-                extra_headers=options["headers"],
-                query_params=options["query_params"],
             )
-        status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
-        total_elapsed_ms += elapsed_ms
-        if not _is_transient_source_fetch_failure(status_code, fetch_error):
-            return status_code, fhir_payload, fetch_error, total_elapsed_ms
-        if attempt_index + 1 < _source_fetch_retry_attempts():
-            await asyncio.sleep(_source_fetch_retry_delay_seconds(attempt_index))
+            status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
+            total_elapsed_ms += elapsed_ms
+            if not _is_transient_source_fetch_failure(status_code, fetch_error):
+                if not _should_reduce_source_page_size(status_code, fetch_error):
+                    return status_code, fhir_payload, fetch_error, total_elapsed_ms
+                break
+            if not is_last_candidate:
+                break
+            if attempt_index + 1 < attempt_count:
+                await asyncio.sleep(_source_fetch_retry_delay_seconds(attempt_index))
     return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
 
 
