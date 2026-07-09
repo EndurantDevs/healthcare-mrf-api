@@ -1596,7 +1596,7 @@ def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
 
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
     if _address_table_is_unified(address_table_sql):
-        return f"({alias}.npi = :npi_filter OR {alias}.inferred_npi = :npi_filter)"
+        return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"
     return f"{alias}.npi = :npi_filter"
 
 

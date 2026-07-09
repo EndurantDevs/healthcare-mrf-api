@@ -735,7 +735,7 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
     assert "source_record_ids" not in row
 
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    assert "(c.npi = :npi_filter OR c.inferred_npi = :npi_filter)" in page_sql
+    assert "COALESCE(c.npi, c.inferred_npi) = :npi_filter" in page_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
     assert any(params.get("npi_filter") == 1033213624 for _sql, params in conn.sql_calls)
 
