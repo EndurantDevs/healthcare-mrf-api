@@ -844,19 +844,30 @@ def _reverse_lookup_checkpoint_exclusion_sql(
 
 async def _clear_reverse_lookup_checkpoints(
     source: dict[str, Any],
+    *,
+    seed_resource_type: str | None = None,
 ) -> int:
     """Start the next completed scan fresh after every seed finished once."""
     canonical_api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if not canonical_api_base:
         return 0
+    seed_type_filter = (
+        "AND seed_resource_type = :seed_resource_type"
+        if seed_resource_type
+        else ""
+    )
+    query_params_by_name = {"canonical_api_base": canonical_api_base}
+    if seed_resource_type:
+        query_params_by_name["seed_resource_type"] = seed_resource_type
     result = await db.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)}
-         WHERE canonical_api_base = :canonical_api_base;
+         WHERE canonical_api_base = :canonical_api_base
+           {seed_type_filter};
         """,
-        canonical_api_base=canonical_api_base,
+        **query_params_by_name,
     )
-    return int(getattr(result, "rowcount", 0) or 0)
+    return int(result or 0)
 
 
 def _reverse_lookup_checkpoint_source_ids(
@@ -986,7 +997,7 @@ async def _mark_postal_checkpointed_roles_seen(
         "run_id": run_id,
         "source_ids": source_ids,
         "canonical_api_base": canonical_api_base,
-        "checkpoint_type": UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+        "checkpoint_type": _uhc_role_postal_checkpoint_type(source_record, source_ids),
     }
     await db.status(
         f"""
@@ -1654,6 +1665,20 @@ def _uhc_partition_residual_error(
     return "uhc_practitionerrole_residual_unverified"
 
 
+def _uhc_role_postal_checkpoint_type(
+    source_record: dict[str, Any],
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    scoped_source_ids = source_ids or source_record.get("_partition_checkpoint_source_ids")
+    if isinstance(scoped_source_ids, str):
+        scoped_source_ids = (scoped_source_ids,)
+    if not scoped_source_ids:
+        scoped_source_ids = (_clean_text(source_record.get("source_id")) or "canonical",)
+    scope_payload = "\x1f".join(sorted(set(scoped_source_ids)))
+    scope_hash = hashlib.sha256(scope_payload.encode("utf-8")).hexdigest()[:16]
+    return f"{UHC_ROLE_POSTAL_CHECKPOINT_TYPE}:{scope_hash}"
+
+
 def _uhc_role_postal_prefix(
     source_record: dict[str, Any],
     resource_type: str,
@@ -1698,7 +1723,7 @@ async def _load_partition_checkpoints(
            AND seed_resource_type = :seed_resource_type;
         """,
         canonical_api_base=canonical_api_base,
-        seed_resource_type=UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+        seed_resource_type=_uhc_role_postal_checkpoint_type(source_record),
     )
     return {
         prefix
@@ -1723,7 +1748,7 @@ async def _record_partition_checkpoint(
         state.pending_partition_checkpoint_rows.append(
             _reverse_lookup_checkpoint_row(
                 source_record,
-                UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+                _uhc_role_postal_checkpoint_type(source_record),
                 prefix,
                 run_id,
             )
@@ -9187,7 +9212,10 @@ async def _fetch_partitioned_resource_rows(
         and resource_type == "PractitionerRole"
         and _is_uhc_role_postal_partition_enabled(source_record)
     ):
-        await _clear_reverse_lookup_checkpoints(source_record)
+        await _clear_reverse_lookup_checkpoints(
+            source_record,
+            seed_resource_type=_uhc_role_postal_checkpoint_type(source_record),
+        )
     is_complete = is_partition_scan_complete and not residual_error
     return ResourceFetchResult(
         model=model,
@@ -9200,9 +9228,7 @@ async def _fetch_partitioned_resource_rows(
         page_limit_reached=False,
         hard_page_limit_reached=state.hard_page_limit_reached,
         next_url_remaining=state.next_url_remaining or not start_url_queue.empty(),
-        error=state.error_message
-        or ("deadline_reached" if state.deadline_reached else None)
-        or residual_error,
+        error=state.error_message or ("deadline_reached" if state.deadline_reached else None) or residual_error,
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
     )
@@ -10536,6 +10562,15 @@ def _group_resource_import_sources(
     return ordered_groups
 
 
+def _scoped_partition_source_record(
+    source_group: list[dict[str, Any]],
+    source_ids: list[str],
+) -> dict[str, Any]:
+    source_by_name = dict(source_group[0])
+    source_by_name["_partition_checkpoint_source_ids"] = tuple(source_ids)
+    return source_by_name
+
+
 def _copy_rows_for_source_ids(rows: list[dict[str, Any]], source_ids: list[str]) -> list[dict[str, Any]]:
     if len(source_ids) <= 1:
         return rows
@@ -10869,8 +10904,8 @@ async def _import_resources(
         if cancel_ctx is not None:
             await raise_if_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
-        source = source_group[0]
         source_ids = [item["source_id"] for item in source_group]
+        source = _scoped_partition_source_record(source_group, source_ids)
         async with progress_lock:
             active_group_details[group_key] = {
                 "source_ids": source_ids[:10],

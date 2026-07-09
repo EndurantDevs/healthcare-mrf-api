@@ -5426,6 +5426,51 @@ def test_provider_directory_partition_concurrency_defaults_to_sixteen(monkeypatc
     assert importer._partition_fetch_concurrency() == 16
 
 
+def test_uhc_postal_checkpoint_type_is_scoped_to_alias_set():
+    source_lookup = {
+        "source_id": "uhc-primary",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    single_alias_type = importer._uhc_role_postal_checkpoint_type(
+        source_lookup,
+        ["uhc-primary"],
+    )
+    grouped_alias_type = importer._uhc_role_postal_checkpoint_type(
+        source_lookup,
+        ["uhc-primary", "uhc-community"],
+    )
+
+    assert single_alias_type != grouped_alias_type
+    assert single_alias_type.startswith(importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE + ":")
+
+
+@pytest.mark.asyncio
+async def test_clear_reverse_checkpoints_can_scope_seed_type(monkeypatch):
+    statements: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_db_status(statement, **query_params):
+        statements.append((statement, query_params))
+        return 4
+
+    monkeypatch.setattr(importer.db, "status", fake_db_status)
+    source_lookup = {
+        "source_id": "uhc-primary",
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    checkpoint_type = importer._uhc_role_postal_checkpoint_type(source_lookup)
+
+    deleted_count = await importer._clear_reverse_lookup_checkpoints(
+        source_lookup,
+        seed_resource_type=checkpoint_type,
+    )
+
+    assert deleted_count == 4
+    assert "seed_resource_type = :seed_resource_type" in statements[0][0]
+    assert statements[0][1]["seed_resource_type"] == checkpoint_type
+
+
 def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
     source_dict = {
         "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
@@ -5632,7 +5677,7 @@ async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch
 @pytest.mark.asyncio
 async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     checkpoint_batches: list[list[dict[str, Any]]] = []
-    cleared_bases: list[str] = []
+    cleared_checkpoints: list[tuple[str, str | None]] = []
 
     async def fake_db_all(_statement, **_query_params):
         return []
@@ -5645,8 +5690,10 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
         checkpoint_batches.append(rows)
         return len(rows)
 
-    async def fake_clear_checkpoints(source_record):
-        cleared_bases.append(source_record["canonical_api_base"])
+    async def fake_clear_checkpoints(source_record, *, seed_resource_type=None):
+        cleared_checkpoints.append(
+            (source_record["canonical_api_base"], seed_resource_type)
+        )
         return 1
 
     monkeypatch.setattr(importer.db, "all", fake_db_all)
@@ -5680,9 +5727,10 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     assert partition_fetch_result.complete is False
     assert partition_fetch_result.error == "uhc_practitionerrole_residual_unverified"
     assert partition_fetch_result.rows_fetched == 1
-    assert checkpoint_batches[0][0]["seed_resource_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
+    checkpoint_type = importer._uhc_role_postal_checkpoint_type(source_lookup)
+    assert checkpoint_batches[0][0]["seed_resource_type"] == checkpoint_type
     assert checkpoint_batches[0][0]["seed_resource_id"] == "1"
-    assert cleared_bases == [importer.UHC_PROVIDER_DIRECTORY_BASE]
+    assert cleared_checkpoints == [(importer.UHC_PROVIDER_DIRECTORY_BASE, checkpoint_type)]
 
 
 @pytest.mark.asyncio
@@ -5691,7 +5739,7 @@ async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatc
         resource_id = request_url.rsplit("=", 1)[-1]
         return 200, _practitioner_partition_bundle(resource_id), None, 5
 
-    async def fail_clear_checkpoints(_source_record):
+    async def fail_clear_checkpoints(_source_record, **_kwargs):
         raise AssertionError("non-role resource cleared PractitionerRole checkpoints")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
@@ -6225,7 +6273,10 @@ async def test_postal_partition_resume_marks_existing_roles_seen(monkeypatch):
     assert "UPDATE" in statements[0][0]
     assert "INSERT INTO" in statements[1][0]
     assert "provider_directory_import_seen_stage_test" in statements[1][0]
-    assert statements[0][1]["checkpoint_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
+    assert statements[0][1]["checkpoint_type"] == importer._uhc_role_postal_checkpoint_type(
+        source_lookup,
+        ["uhc"],
+    )
     assert statements[0][1]["source_ids"] == ["uhc"]
 
 
