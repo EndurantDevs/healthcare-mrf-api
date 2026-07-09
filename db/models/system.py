@@ -45,6 +45,7 @@ __all__ = (
     "ProviderDirectoryLocation",
     "ProviderDirectoryOrganization",
     "ProviderDirectoryOrganizationAffiliation",
+    "ProviderDirectoryPaginationCheckpoint",
     "ProviderDirectoryPractitioner",
     "ProviderDirectoryPractitionerRole",
     "ProviderDirectoryReverseLookupCheckpoint",
@@ -928,6 +929,55 @@ class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
+    """Durable resume state for one source-scoped paginated resource scan."""
+
+    __tablename__ = "provider_directory_pagination_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("canonical_api_base", "resource_type", "source_scope_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["canonical_api_base", "resource_type", "source_scope_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("owner_run_id",),
+            "name": "provider_directory_pagination_checkpoint_owner_idx",
+        },
+        {
+            "index_elements": ("state", "updated_at"),
+            "name": "provider_directory_pagination_checkpoint_state_updated_idx",
+        },
+        {
+            "index_elements": ("dataset_id",),
+            "name": "provider_directory_pagination_checkpoint_dataset_idx",
+        },
+    ]
+
+    canonical_api_base = Column(TEXT, nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    source_scope_hash = Column(String(64), nullable=False)
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="provider_directory_pagination_checkpoint_dataset_id_fkey",
+        ),
+    )
+    source_ids = Column(JSON, nullable=False)
+    owner_run_id = Column(String(64), nullable=False)
+    retry_of_run_id = Column(String(64))
+    start_url_hash = Column(String(64), nullable=False)
+    next_url = Column(TEXT)
+    state = Column(String(32), nullable=False)
+    pages_processed = Column(BigInteger, nullable=False, default=0)
+    rows_processed = Column(BigInteger, nullable=False, default=0)
+    recent_cursor_hashes = Column(JSON, nullable=False, default=list)
+    created_at = Column(TIMESTAMP, nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False)
+    completed_at = Column(TIMESTAMP)
 
 
 class ProviderDirectoryReverseLookupCheckpoint(Base, JSONOutputMixin):
