@@ -3042,7 +3042,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                f.geo_distance_miles ASC NULLS LAST,
                f.source_count DESC NULLS LAST,
                f.npi
-         LIMIT :limit
+         LIMIT :candidate_limit
         """
     )
     return query, query_params
