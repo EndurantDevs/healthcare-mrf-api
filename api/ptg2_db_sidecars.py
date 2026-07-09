@@ -212,11 +212,24 @@ def _price_set_atom_id_bucket(price_set_id: bytes | bytearray | memoryview | str
 
 
 def _read_uvarint(payload: bytes | bytearray | memoryview, offset: int) -> tuple[int, int]:
-    result = 0
-    shift = 0
     cursor = int(offset)
+    payload_length = len(payload)
+    if cursor >= payload_length:
+        raise PTG2ManifestArtifactError("serving sidecar ended inside a uvarint")
+    first = int(payload[cursor])
+    cursor += 1
+    if first < 0x80:
+        return first, cursor
+    if cursor >= payload_length:
+        raise PTG2ManifestArtifactError("serving sidecar ended inside a uvarint")
+    second = int(payload[cursor])
+    cursor += 1
+    result = (first & 0x7F) | ((second & 0x7F) << 7)
+    if second < 0x80:
+        return result, cursor
+    shift = 14
     while True:
-        if cursor >= len(payload):
+        if cursor >= payload_length:
             raise PTG2ManifestArtifactError("serving sidecar ended inside a uvarint")
         byte = int(payload[cursor])
         cursor += 1
@@ -565,6 +578,7 @@ async def _serving_binary_payload_rows(
         text(
             f"""
             SELECT
+                block_key,
                 block_no,
                 entry_count,
                 payload,
@@ -654,28 +668,11 @@ async def _serving_binary_dictionary(
     cached_dictionary = _binary_dictionary_cache_get(cache_key)
     if cached_dictionary is not _CACHE_MISS:
         return cached_dictionary
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                payload,
-                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
-                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
-              FROM {qualified_table} binary_block
-             WHERE artifact_kind = :artifact_kind
-               AND block_key = 0
-               AND block_no = 0
-             LIMIT 1
-            """
-        ),
-        {"artifact_kind": artifact_kind},
+    dictionary_payload = await _serving_binary_dictionary_payload(
+        session,
+        table_name,
+        artifact_kind=artifact_kind,
     )
-    dictionary_records = _result_rows(query_result)
-    if not dictionary_records:
-        raise PTG2ManifestArtifactError(f"PTG2 serving binary dictionary is missing: {artifact_kind}")
-    dictionary_payload = _decode_serving_binary_payload(_row_mapping(dictionary_records[0]))
-    if len(dictionary_payload) % 16:
-        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
     price_set_ids = tuple(
         _id_text(dictionary_payload[payload_offset : payload_offset + 16])
         for payload_offset in range(0, len(dictionary_payload), 16)
@@ -1064,20 +1061,47 @@ async def lookup_serving_binary_by_provider_set_patterns_from_db(
     *,
     code_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingProviderSetPattern, ...]:
-    records = await _serving_binary_payload_rows(
+    patterns_by_provider_set = await lookup_serving_binary_by_provider_sets_patterns_from_db(
+        session,
+        table_name,
+        [int(provider_set_key)],
+        code_keys=code_keys,
+    )
+    return patterns_by_provider_set.get(int(provider_set_key), ())
+
+
+async def lookup_serving_binary_by_provider_sets_patterns_from_db(
+    session: Any,
+    table_name: str,
+    provider_set_keys: Iterable[int],
+    *,
+    code_keys: Iterable[int] | None = None,
+) -> dict[int, tuple[PTG2ServingProviderSetPattern, ...]]:
+    normalized_provider_set_keys = tuple(
+        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
+    )
+    if not normalized_provider_set_keys:
+        return {}
+    records = await _serving_binary_payload_rows_for_keys(
         session,
         table_name,
         artifact_kind=_SERVING_BINARY_BY_PROVIDER_SET_KIND,
-        block_key=int(provider_set_key),
+        block_keys=normalized_provider_set_keys,
     )
     if not records:
-        return ()
+        return {provider_set_key: () for provider_set_key in normalized_provider_set_keys}
     code_filter = {int(value) for value in code_keys} if code_keys is not None else None
-    raw_patterns: list[tuple[tuple[int, ...], tuple[tuple[int, int], ...]]] = []
+    raw_patterns_by_provider_set: dict[
+        int,
+        list[tuple[tuple[int, ...], tuple[tuple[int, int], ...]]],
+    ] = {provider_set_key: [] for provider_set_key in normalized_provider_set_keys}
     needed_price_keys: set[int] = set()
     for record in records:
+        provider_set_key = int(record.get("block_key") or 0)
+        if provider_set_key not in raw_patterns_by_provider_set:
+            continue
         record_patterns, record_price_keys = _decode_provider_binary_record(record, code_filter)
-        raw_patterns.extend(record_patterns)
+        raw_patterns_by_provider_set[provider_set_key].extend(record_patterns)
         needed_price_keys.update(record_price_keys)
     price_ids_by_key = await _serving_binary_dictionary_values_for_keys(
         session,
@@ -1085,21 +1109,24 @@ async def lookup_serving_binary_by_provider_set_patterns_from_db(
         artifact_kind=_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND,
         item_keys=needed_price_keys,
     )
-    patterns: list[PTG2ServingProviderSetPattern] = []
-    for decoded_code_keys, entries in raw_patterns:
-        resolved_entries = tuple(
-            (provider_count, price_ids_by_key[price_key])
-            for provider_count, price_key in entries
-            if price_key in price_ids_by_key
-        )
-        if resolved_entries:
-            patterns.append(
-                PTG2ServingProviderSetPattern(
-                    code_keys=decoded_code_keys,
-                    entries=resolved_entries,
-                )
+    patterns_by_provider_set: dict[int, tuple[PTG2ServingProviderSetPattern, ...]] = {}
+    for provider_set_key in normalized_provider_set_keys:
+        patterns: list[PTG2ServingProviderSetPattern] = []
+        for decoded_code_keys, entries in raw_patterns_by_provider_set[provider_set_key]:
+            resolved_entries = tuple(
+                (provider_count, price_ids_by_key[price_key])
+                for provider_count, price_key in entries
+                if price_key in price_ids_by_key
             )
-    return tuple(patterns)
+            if resolved_entries:
+                patterns.append(
+                    PTG2ServingProviderSetPattern(
+                        code_keys=decoded_code_keys,
+                        entries=resolved_entries,
+                    )
+                )
+        patterns_by_provider_set[provider_set_key] = tuple(patterns)
+    return patterns_by_provider_set
 
 
 async def lookup_serving_binary_by_provider_set_from_db(

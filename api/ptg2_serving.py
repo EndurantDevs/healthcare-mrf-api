@@ -120,6 +120,7 @@ from api.ptg2_db_sidecars import (
     lookup_serving_binary_by_code_from_db,
     lookup_serving_binary_by_provider_set_from_db,
     lookup_serving_binary_by_provider_set_patterns_from_db,
+    lookup_serving_binary_by_provider_sets_patterns_from_db,
     lookup_binary_price_atoms_from_db,
     lookup_serving_by_code_sidecar_from_db,
     lookup_serving_by_provider_set_patterns_from_db,
@@ -2326,6 +2327,36 @@ async def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
     )
 
 
+async def _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int],
+    *,
+    code_keys: Iterable[int] | None = None,
+) -> dict[int, tuple[Any, ...]]:
+    normalized_provider_set_keys = tuple(
+        sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
+    )
+    if not normalized_provider_set_keys:
+        return {}
+    if serving_tables.serving_binary_table:
+        return await lookup_serving_binary_by_provider_sets_patterns_from_db(
+            session,
+            serving_tables.serving_binary_table,
+            normalized_provider_set_keys,
+            code_keys=code_keys,
+        )
+    patterns_by_provider_set: dict[int, tuple[Any, ...]] = {}
+    for provider_set_key in normalized_provider_set_keys:
+        patterns_by_provider_set[provider_set_key] = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+            session,
+            serving_tables,
+            provider_set_key,
+            code_keys=code_keys,
+        )
+    return patterns_by_provider_set
+
+
 def _ptg2_serving_sidecar_window(
     sidecar_rows: Iterable[Any],
     provider_set_ids_by_key: Mapping[int, str],
@@ -2655,7 +2686,7 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
             rows: list[dict[str, Any]] = []
             skipped = 0
             code_row_offset = 0
-            code_row_batch_size = max(page_limit + page_offset, 1)
+            code_row_batch_size = max(page_limit + page_offset, 256)
             while True:
                 code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
                     session,
@@ -2676,13 +2707,14 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
                 if not code_by_key:
                     break
                 entries_by_provider_code = []
+                patterns_by_provider_set = await _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
+                    session,
+                    serving_tables,
+                    provider_set_keys_by_id.values(),
+                    code_keys=code_by_key.keys(),
+                )
                 for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-                    patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
-                        session,
-                        serving_tables,
-                        provider_set_key,
-                        code_keys=code_by_key.keys(),
-                    )
+                    patterns = patterns_by_provider_set.get(int(provider_set_key), ())
                     entries_by_code: dict[int, list[tuple[int, str]]] = {}
                     for pattern in patterns:
                         for code_key in pattern.code_keys:
@@ -2744,13 +2776,14 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
             if not code_rows:
                 return []
             code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
+            patterns_by_provider_set = await _ptg2_manifest_lookup_serving_by_provider_sets_patterns(
+                session,
+                serving_tables,
+                provider_set_keys_by_id.values(),
+                code_keys=code_by_key.keys(),
+            )
             for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-                patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
-                    session,
-                    serving_tables,
-                    provider_set_key,
-                    code_keys=code_by_key.keys(),
-                )
+                patterns = patterns_by_provider_set.get(int(provider_set_key), ())
                 entries_by_code: dict[int, list[tuple[int, str]]] = {}
                 for pattern in patterns:
                     for code_key in pattern.code_keys:

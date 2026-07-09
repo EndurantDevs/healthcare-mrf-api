@@ -11,6 +11,7 @@ from api.ptg2_db_sidecars import (
     lookup_binary_price_atoms_from_db,
     lookup_serving_binary_by_code_from_db,
     lookup_serving_binary_by_provider_set_patterns_from_db,
+    lookup_serving_binary_by_provider_sets_patterns_from_db,
 )
 from process.ptg_parts import ptg2_serving_binary as serving_binary_writer
 
@@ -46,7 +47,10 @@ class FakeServingBinarySession:
         if "block_keys" in query_params_dict:
             records = []
             for block_key in query_params_dict.get("block_keys") or []:
-                records.extend(self.records_by_kind.get((artifact_kind, block_key), []))
+                records.extend(
+                    {**record, "block_key": block_key}
+                    for record in self.records_by_kind.get((artifact_kind, block_key), [])
+                )
             return FakeResult(rows=records)
         block_key = query_params_dict.get("block_key")
         records = self.records_by_kind.get((artifact_kind, block_key), self.records_by_kind.get(artifact_kind, []))
@@ -488,3 +492,46 @@ async def test_db_serving_binary_provider_set_patterns_support_reverse_lookup():
     assert len(patterns) == 1
     assert patterns[0].code_keys == (9,)
     assert patterns[0].entries == ((10, first_price_set_id.hex()), (20, second_price_set_id.hex()))
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_batches_reverse_lookup_for_provider_sets():
+    first_price_set_id = bytes.fromhex("00000000000000000000000000000071")
+    second_price_set_id = bytes.fromhex("00000000000000000000000000000072")
+    first_provider_payload = b"".join(
+        _uvarint(payload_part) for payload_part in (2, 7, 2, 2, 10, 0, 20, 1)
+    )
+    second_provider_payload = b"".join(
+        _uvarint(payload_part) for payload_part in (1, 9, 1, 30, 1)
+    )
+    session = FakeServingBinarySession(
+        {
+            ("by_provider_set", 5): [
+                {"block_no": 0, "entry_count": 1, "payload": first_provider_payload}
+            ],
+            ("by_provider_set", 6): [
+                {"block_no": 0, "entry_count": 1, "payload": second_provider_payload}
+            ],
+            "by_provider_set_price_dictionary": [
+                {"payload": first_price_set_id + second_price_set_id}
+            ],
+        }
+    )
+
+    patterns_by_provider_set = await lookup_serving_binary_by_provider_sets_patterns_from_db(
+        session,
+        "mrf.ptg2_serving_binary_test",
+        [5, 6],
+        code_keys=[9],
+    )
+
+    assert patterns_by_provider_set[5][0].entries == (
+        (10, first_price_set_id.hex()),
+        (20, second_price_set_id.hex()),
+    )
+    assert patterns_by_provider_set[6][0].entries == ((30, second_price_set_id.hex()),)
+    reverse_calls = [
+        call for call in session.calls if call.get("artifact_kind") == "by_provider_set"
+    ]
+    assert len(reverse_calls) == 1
+    assert reverse_calls[0]["block_keys"] == [5, 6]

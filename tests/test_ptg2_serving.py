@@ -3339,7 +3339,7 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
     code_count_params = code_count_call[0][1]
     assert "code_key = ANY(CAST(:code_keys AS integer[]))" not in code_count_sql
     assert "LIMIT :code_row_limit OFFSET :code_row_offset" in code_count_sql
-    assert code_count_params["code_row_limit"] == 2
+    assert code_count_params["code_row_limit"] == 256
     assert code_count_params["code_row_offset"] == 0
     assert [
         (
@@ -3385,16 +3385,22 @@ def _postgres_binary_reverse_fixture():
 
 
 def _patch_binary_reverse_guards(monkeypatch, *, price_a_id: str, price_b_id: str) -> None:
-    async def binary_patterns(_session, table_name, provider_set_key, *, code_keys=None):
+    async def binary_patterns(_session, table_name, provider_set_keys, *, code_keys=None):
         assert table_name == "mrf.ptg2_serving_binary_manifest_snap"
-        assert provider_set_key == 3
+        assert tuple(provider_set_keys) == (3,)
         assert sorted(int(code_key) for code_key in code_keys or ()) == [7, 8]
-        return (
-            SimpleNamespace(code_keys=(7,), entries=((5, price_a_id),)),
-            SimpleNamespace(code_keys=(8,), entries=((11, price_b_id),)),
-        )
+        return {
+            3: (
+                SimpleNamespace(code_keys=(7,), entries=((5, price_a_id),)),
+                SimpleNamespace(code_keys=(8,), entries=((11, price_b_id),)),
+            )
+        }
 
-    monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_provider_set_patterns_from_db", binary_patterns)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_serving_binary_by_provider_sets_patterns_from_db",
+        binary_patterns,
+    )
     monkeypatch.setattr(
         ptg2_serving,
         "lookup_serving_by_provider_set_patterns_from_db",
