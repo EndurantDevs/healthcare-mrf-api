@@ -37,14 +37,18 @@ from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
+    ProviderDirectoryAPIEndpoint,
     ProviderDirectoryCapability,
     ProviderDirectoryCanonicalResource,
+    ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
+    ProviderDirectoryEndpointDataset,
     ProviderDirectoryHealthcareService,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
     ProviderDirectoryOrganization,
     ProviderDirectoryOrganizationAffiliation,
+    ProviderDirectoryPaginationCheckpoint,
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
     ProviderDirectoryReverseLookupCheckpoint,
@@ -211,6 +215,7 @@ RESOURCE_MODELS_BY_TYPE = {
 RESOURCE_MODELS = tuple(RESOURCE_MODELS_BY_TYPE.values())
 RESOURCE_TYPES_BY_MODEL = {model: resource_type for resource_type, model in RESOURCE_MODELS_BY_TYPE.items()}
 SOURCE_MODELS = (
+    ProviderDirectoryAPIEndpoint,
     ProviderDirectorySource,
     ProviderDirectoryCapability,
     ProviderDirectoryInsurancePlan,
@@ -223,8 +228,11 @@ SOURCE_MODELS = (
     ProviderDirectoryEndpoint,
 )
 CANONICAL_RESOURCE_MODELS = (
+    ProviderDirectoryEndpointDataset,
+    ProviderDirectoryDatasetResource,
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
+    ProviderDirectoryPaginationCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
 )
 USER_AGENT = os.getenv(
@@ -473,6 +481,31 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
 }
 PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
+PAGINATION_CHECKPOINT_API_BASES = frozenset(
+    {
+        CIGNA_PROVIDER_DIRECTORY_BASE,
+        HUMANA_PROVIDER_DIRECTORY_BASE,
+        MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+)
+PAGINATION_CHECKPOINT_ACTIVE = "active"
+PAGINATION_CHECKPOINT_COMPLETE = "complete"
+PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
+PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
+FHIR_CONTINUATION_QUERY_NAMES = frozenset(
+    {
+        "_continuationtoken",
+        "_getpages",
+        "_getpagesid",
+        "_getpagesoffset",
+        "_offset",
+        "cursor",
+        "cursormark",
+        "nexttoken",
+        "page",
+        "pagetoken",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -499,6 +532,25 @@ class ResourceFetchResult:
             or self.hard_page_limit_reached
             or self.deadline_reached
         )
+
+
+@dataclass(frozen=True)
+class PaginationCheckpointContext:
+    canonical_api_base: str
+    source_scope_hash: str
+    source_ids: tuple[str, ...]
+    owner_run_id: str
+    retry_of_run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PaginationResumeState:
+    next_url: str | None
+    pages_processed: int
+    rows_processed: int
+    recent_url_hashes: tuple[str, ...]
+    complete: bool = False
+    resumed: bool = False
 
 
 @dataclass
@@ -8062,19 +8114,9 @@ def _source_fetch_candidate_urls(url: str) -> list[str]:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query_by_name = dict(query_items)
-    continuation_query_names = {
-        "_continuationtoken",
-        "_getpages",
-        "_getpagesid",
-        "_getpagesoffset",
-        "_offset",
-        "cursor",
-        "cursormark",
-        "nexttoken",
-        "page",
-        "pagetoken",
-    }
-    if continuation_query_names.intersection(name.lower() for name in query_by_name):
+    if FHIR_CONTINUATION_QUERY_NAMES.intersection(
+        name.lower() for name in query_by_name
+    ):
         return [url]
     try:
         requested_count = int(query_by_name.get("_count") or 0)
@@ -9223,6 +9265,35 @@ def _pagination_url_identity(url: str) -> str:
     )
 
 
+def _has_fhir_continuation_query(url: str) -> bool:
+    query_names = {
+        name.lower()
+        for name, _value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    }
+    return bool(FHIR_CONTINUATION_QUERY_NAMES.intersection(query_names))
+
+
+def _should_restart_expired_pagination_checkpoint(
+    *,
+    status_code: int | None,
+    fetch_error: str | None,
+    request_url: str,
+    resume_state: PaginationResumeState | None,
+    has_restart_attempted: bool,
+) -> bool:
+    return bool(
+        resume_state
+        and resume_state.resumed
+        and not has_restart_attempted
+        and fetch_error is None
+        and status_code in {400, 404, 410}
+        and _has_fhir_continuation_query(request_url)
+    )
+
+
 async def _mark_partition_fetch_error(
     state: PartitionFetchState,
     current_error: str,
@@ -9548,6 +9619,7 @@ async def _fetch_resource_rows(
     cancel_task: dict[str, Any] | None = None,
     bulk_export: bool = False,
     deadline_seconds: int = 0,
+    pagination_checkpoint: PaginationCheckpointContext | None = None,
 ) -> ResourceFetchResult | None:
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
@@ -9584,12 +9656,50 @@ async def _fetch_resource_rows(
     start_urls = _resource_start_urls(source, resource_type, page_count=page_count)
     if not start_urls:
         return None
+    checkpoint_context = (
+        pagination_checkpoint
+        if (
+            pagination_checkpoint is not None
+            and len(start_urls) == 1
+            and row_batch_handler is not None
+            and per_resource_limit <= 0
+            and page_limit <= 0
+        )
+        else None
+    )
+    checkpoint_start_url = start_urls[0] if checkpoint_context else None
+    resume_state = (
+        await _load_or_initialize_pagination_checkpoint(
+            checkpoint_context,
+            resource_type,
+            checkpoint_start_url,
+        )
+        if checkpoint_context and checkpoint_start_url
+        else None
+    )
+    if resume_state and resume_state.complete:
+        return ResourceFetchResult(
+            model=model,
+            rows=[],
+            rows_fetched=resume_state.rows_processed,
+            rows_written=0,
+            pages_fetched=resume_state.pages_processed,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            fetch_mode="checkpoint_complete",
+        )
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
-    rows_fetched = 0
+    rows_fetched = resume_state.rows_processed if resume_state else 0
     fetch_counts_by_name = {"rows_written": 0}
-    pages = 0
+    pages = resume_state.pages_processed if resume_state else 0
     seen_urls: set[str] = set()
+    recent_url_hashes = list(resume_state.recent_url_hashes if resume_state else ())
+    persisted_url_hashes = set(recent_url_hashes)
+    has_restart_attempted = False
     row_limit_reached = False
     page_limit_reached = False
     hard_page_limit_reached = False
@@ -9599,10 +9709,15 @@ async def _fetch_resource_rows(
     is_deadline_reached = False
     max_pages = (
         0
-        if resource_type == "PractitionerRole" and _is_uhc_role_postal_partition_enabled(source)
+        if checkpoint_context
+        or resource_type == "PractitionerRole" and _is_uhc_role_postal_partition_enabled(source)
         else _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     )
-    pending_start_urls = list(start_urls)
+    pending_start_urls = (
+        [resume_state.next_url]
+        if resume_state and resume_state.next_url
+        else list(start_urls)
+    )
     partitioned_fetch = len(pending_start_urls) > 1
     if (
         partitioned_fetch
@@ -9654,17 +9769,50 @@ async def _fetch_resource_rows(
                 hard_page_limit_reached = True
                 next_url_remaining = True
                 break
-            if url in seen_urls:
-                error_message = "pagination loop detected"
+            request_identity = _pagination_url_identity(url)
+            request_url_hash = _pagination_url_hash(url)
+            if request_identity in seen_urls or request_url_hash in persisted_url_hashes:
+                error_message = (
+                    "pagination_cursor_repeated"
+                    if _has_cursor_mark_query_parameter(url)
+                    else "pagination loop detected"
+                )
                 next_url_remaining = True
                 break
-            seen_urls.add(url)
+            seen_urls.add(request_identity)
             status_code, payload, error, _elapsed = await _fetch_source_json(
                 source,
                 url,
                 timeout=resource_timeout,
             )
             if status_code != 200 or error:
+                if (
+                    checkpoint_context
+                    and checkpoint_start_url
+                    and _should_restart_expired_pagination_checkpoint(
+                        status_code=status_code,
+                        fetch_error=error,
+                        request_url=url,
+                        resume_state=resume_state,
+                        has_restart_attempted=has_restart_attempted,
+                    )
+                ):
+                    await _save_pagination_checkpoint(
+                        checkpoint_context,
+                        resource_type,
+                        next_url=checkpoint_start_url,
+                        pages_processed=0,
+                        rows_processed=0,
+                        recent_url_hashes=[],
+                    )
+                    rows_fetched = 0
+                    pages = 0
+                    seen_urls.clear()
+                    recent_url_hashes.clear()
+                    persisted_url_hashes.clear()
+                    has_restart_attempted = True
+                    url = checkpoint_start_url
+                    continue
                 current_error = error or f"http_{status_code}"
                 if partitioned_fetch:
                     partition_error_count += 1
@@ -9714,12 +9862,40 @@ async def _fetch_resource_rows(
                 if not _limit_allows_more(rows_fetched, per_resource_limit):
                     row_limit_reached = entry_index < len(entries) - 1
                     break
-                if deadline_at is not None and time.monotonic() >= deadline_at:
+                if (
+                    not checkpoint_context
+                    and deadline_at is not None
+                    and time.monotonic() >= deadline_at
+                ):
                     is_deadline_reached = True
                     next_url_remaining = True
                     break
             next_url = _next_link(payload)
-            url = _resolved_fhir_next_url(source, url, next_url)
+            resolved_next_url = _resolved_fhir_next_url(source, url, next_url)
+            if (
+                checkpoint_context
+                and not entries
+                and resolved_next_url
+                and checkpoint_context.canonical_api_base
+                == MOLINA_PROVIDER_DIRECTORY_BASE
+                and _pagination_url_identity(resolved_next_url) == request_identity
+            ):
+                resolved_next_url = None
+            if checkpoint_context:
+                await flush_pending_rows()
+                recent_url_hashes.append(request_url_hash)
+                recent_url_hashes = recent_url_hashes[
+                    -PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:
+                ]
+                await _save_pagination_checkpoint(
+                    checkpoint_context,
+                    resource_type,
+                    next_url=resolved_next_url,
+                    pages_processed=pages,
+                    rows_processed=rows_fetched,
+                    recent_url_hashes=recent_url_hashes,
+                )
+            url = resolved_next_url
             if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
                 row_limit_reached = True
                 next_url_remaining = True
@@ -9765,6 +9941,7 @@ async def _fetch_resource_rows(
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
+        fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
         deadline_reached=is_deadline_reached,
     )
 
@@ -10871,6 +11048,378 @@ def _scoped_partition_source_record(
     return source_by_name
 
 
+def _is_pagination_checkpoint_mode_enabled(
+    *,
+    run_id: str | None,
+    full_refresh: bool,
+    resource_limit: int,
+    page_limit: int,
+    stream_batch_size: int,
+    stale_cleanup: bool,
+    publish_artifacts: bool,
+) -> bool:
+    return bool(
+        run_id
+        and full_refresh
+        and resource_limit <= 0
+        and page_limit <= 0
+        and stream_batch_size > 0
+        and not stale_cleanup
+        and not publish_artifacts
+    )
+
+
+def _pagination_checkpoint_context(
+    source: dict[str, Any],
+    source_ids: list[str],
+    *,
+    run_id: str | None,
+    retry_of_run_id: str | None,
+) -> PaginationCheckpointContext | None:
+    canonical_api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if not run_id or not source_ids or canonical_api_base not in PAGINATION_CHECKPOINT_API_BASES:
+        return None
+    scope_payload = json.dumps(
+        {
+            "source_ids": sorted(set(source_ids)),
+            "resource_group": _resource_import_group_key(source),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return PaginationCheckpointContext(
+        canonical_api_base=canonical_api_base,
+        source_scope_hash=hashlib.sha256(scope_payload.encode("utf-8")).hexdigest(),
+        source_ids=tuple(sorted(set(source_ids))),
+        owner_run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+    )
+
+
+def _pagination_url_hash(url: str) -> str:
+    identity = _pagination_url_identity(url)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _json_text_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := _clean_text(item))]
+
+
+def _pagination_checkpoint_row_mapping(row: Any) -> dict[str, Any]:
+    if row is None:
+        return {}
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    return dict(row)
+
+
+def _pagination_checkpoint_table_ref() -> str:
+    return _qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)
+
+
+async def _fetch_pagination_checkpoint(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> dict[str, Any]:
+    checkpoint_row = await db.first(
+        f"""
+        SELECT source_ids, owner_run_id, start_url_hash, next_url, state,
+               pages_processed, rows_processed, recent_cursor_hashes
+          FROM {_pagination_checkpoint_table_ref()}
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash;
+        """,
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+    )
+    return _pagination_checkpoint_row_mapping(checkpoint_row)
+
+
+def _compatible_pagination_resume_state(
+    checkpoint: dict[str, Any],
+    context: PaginationCheckpointContext,
+    start_url_hash: str,
+) -> PaginationResumeState | None:
+    existing_source_ids = tuple(sorted(_json_text_list(checkpoint.get("source_ids"))))
+    existing_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+    has_matching_owner = existing_owner_run_id == context.owner_run_id or (
+        context.retry_of_run_id is not None
+        and existing_owner_run_id == context.retry_of_run_id
+    )
+    if (
+        not checkpoint
+        or existing_source_ids != context.source_ids
+        or _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
+        or not has_matching_owner
+    ):
+        return None
+    is_complete = checkpoint.get("state") == PAGINATION_CHECKPOINT_COMPLETE
+    next_url = _clean_text(checkpoint.get("next_url"))
+    if not is_complete and not next_url:
+        return None
+    return PaginationResumeState(
+        next_url=next_url,
+        pages_processed=int(checkpoint.get("pages_processed") or 0),
+        rows_processed=int(checkpoint.get("rows_processed") or 0),
+        recent_url_hashes=tuple(
+            _json_text_list(checkpoint.get("recent_cursor_hashes"))
+        ),
+        complete=is_complete,
+        resumed=True,
+    )
+
+
+async def _adopt_pagination_checkpoint_owner(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    previous_owner_run_id: str,
+) -> None:
+    updated = await db.status(
+        f"""
+        UPDATE {_pagination_checkpoint_table_ref()}
+           SET owner_run_id = :owner_run_id,
+               retry_of_run_id = :previous_owner_run_id,
+               updated_at = now()
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND owner_run_id = :previous_owner_run_id;
+        """,
+        owner_run_id=context.owner_run_id,
+        previous_owner_run_id=previous_owner_run_id,
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+    )
+    if _coerce_rowcount(updated) <= 0:
+        raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+
+
+def _pagination_checkpoint_reset_sql() -> str:
+    return f"""
+    INSERT INTO {_pagination_checkpoint_table_ref()} (
+        canonical_api_base, resource_type, source_scope_hash, dataset_id,
+        source_ids, owner_run_id, retry_of_run_id, start_url_hash,
+        next_url, state, pages_processed, rows_processed,
+        recent_cursor_hashes, created_at, updated_at, completed_at
+    ) VALUES (
+        :canonical_api_base, :resource_type, :source_scope_hash, NULL,
+        CAST(:source_ids AS jsonb), :owner_run_id, :retry_of_run_id,
+        :start_url_hash, :next_url, :state, 0, 0,
+        '[]'::jsonb, now(), now(), NULL
+    )
+    ON CONFLICT (canonical_api_base, resource_type, source_scope_hash)
+    DO UPDATE SET
+        dataset_id = NULL,
+        source_ids = EXCLUDED.source_ids,
+        owner_run_id = EXCLUDED.owner_run_id,
+        retry_of_run_id = EXCLUDED.retry_of_run_id,
+        start_url_hash = EXCLUDED.start_url_hash,
+        next_url = EXCLUDED.next_url,
+        state = EXCLUDED.state,
+        pages_processed = 0,
+        rows_processed = 0,
+        recent_cursor_hashes = '[]'::jsonb,
+        created_at = now(),
+        updated_at = now(),
+        completed_at = NULL;
+    """
+
+
+async def _reset_pagination_checkpoint(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    start_url: str,
+    start_url_hash: str,
+) -> None:
+    await db.status(
+        _pagination_checkpoint_reset_sql(),
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+        source_ids=json.dumps(context.source_ids),
+        owner_run_id=context.owner_run_id,
+        retry_of_run_id=context.retry_of_run_id,
+        start_url_hash=start_url_hash,
+        next_url=start_url,
+        state=PAGINATION_CHECKPOINT_ACTIVE,
+    )
+
+
+async def _load_or_initialize_pagination_checkpoint(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    start_url: str,
+) -> PaginationResumeState:
+    """Load only same-run or direct-retry state; otherwise reset the scan."""
+    start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
+    checkpoint = await _fetch_pagination_checkpoint(context, resource_type)
+    resume_state = _compatible_pagination_resume_state(
+        checkpoint,
+        context,
+        start_url_hash,
+    )
+    if resume_state:
+        previous_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+        if previous_owner_run_id and previous_owner_run_id != context.owner_run_id:
+            await _adopt_pagination_checkpoint_owner(
+                context,
+                resource_type,
+                previous_owner_run_id,
+            )
+        return resume_state
+    await _reset_pagination_checkpoint(
+        context,
+        resource_type,
+        start_url,
+        start_url_hash,
+    )
+    return PaginationResumeState(
+        next_url=start_url,
+        pages_processed=0,
+        rows_processed=0,
+        recent_url_hashes=(),
+    )
+
+
+async def _save_pagination_checkpoint(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    *,
+    next_url: str | None,
+    pages_processed: int,
+    rows_processed: int,
+    recent_url_hashes: list[str],
+) -> None:
+    bounded_hashes = recent_url_hashes[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
+    is_complete = next_url is None
+    updated = await db.status(
+        f"""
+        UPDATE {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)}
+           SET next_url = :next_url,
+               state = :state,
+               pages_processed = :pages_processed,
+               rows_processed = :rows_processed,
+               recent_cursor_hashes = CAST(:recent_cursor_hashes AS jsonb),
+               updated_at = now(),
+               completed_at = CASE WHEN :is_complete THEN now() ELSE NULL END
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND owner_run_id = :owner_run_id;
+        """,
+        next_url=next_url,
+        state=(
+            PAGINATION_CHECKPOINT_COMPLETE
+            if is_complete
+            else PAGINATION_CHECKPOINT_ACTIVE
+        ),
+        pages_processed=pages_processed,
+        rows_processed=rows_processed,
+        recent_cursor_hashes=json.dumps(bounded_hashes),
+        is_complete=is_complete,
+        canonical_api_base=context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=context.source_scope_hash,
+        owner_run_id=context.owner_run_id,
+    )
+    if _coerce_rowcount(updated) <= 0:
+        raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+
+
+async def _clear_pagination_checkpoints(
+    context: PaginationCheckpointContext,
+    resource_types: list[str],
+) -> int:
+    if not resource_types:
+        return 0
+    deleted = await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)}
+         WHERE canonical_api_base = :canonical_api_base
+           AND source_scope_hash = :source_scope_hash
+           AND owner_run_id = :owner_run_id
+           AND resource_type = ANY(CAST(:resource_types AS varchar[]));
+        """,
+        canonical_api_base=context.canonical_api_base,
+        source_scope_hash=context.source_scope_hash,
+        owner_run_id=context.owner_run_id,
+        resource_types=resource_types,
+    )
+    return _coerce_rowcount(deleted)
+
+
+async def _finalize_source_pagination_checkpoints(
+    source: dict[str, Any],
+    resource_types: list[str],
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    resume_required_entries: set[str] | None,
+) -> None:
+    context = source.get("_pagination_checkpoint_context")
+    if not isinstance(context, PaginationCheckpointContext):
+        return
+    incomplete_resource_types = [
+        resource_type
+        for resource_type in resource_types
+        if resource_type not in diagnostics_by_resource
+        or diagnostics_by_resource[resource_type].get("complete") is not True
+        or diagnostics_by_resource[resource_type].get("error")
+        or diagnostics_by_resource[resource_type].get("bounded")
+    ]
+    if incomplete_resource_types:
+        if resume_required_entries is not None:
+            resume_required_entries.update(
+                f"{source['source_id']}:{resource_type}"
+                for resource_type in incomplete_resource_types
+            )
+        return
+    await _clear_pagination_checkpoints(
+        context,
+        list(diagnostics_by_resource),
+    )
+
+
+async def _reset_unexpected_empty_pagination_checkpoint(
+    source: dict[str, Any],
+    resource_type: str,
+    page_count: int,
+    result: ResourceFetchResult,
+) -> None:
+    context = source.get("_pagination_checkpoint_context")
+    if (
+        not isinstance(context, PaginationCheckpointContext)
+        or result.error != CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
+    ):
+        return
+    start_urls = _resource_start_urls(
+        source,
+        resource_type,
+        page_count=page_count,
+    )
+    if len(start_urls) != 1:
+        return
+    await _save_pagination_checkpoint(
+        context,
+        resource_type,
+        next_url=start_urls[0],
+        pages_processed=0,
+        rows_processed=0,
+        recent_url_hashes=[],
+    )
+
+
 def _copy_rows_for_source_ids(rows: list[dict[str, Any]], source_ids: list[str]) -> list[dict[str, Any]]:
     if len(source_ids) <= 1:
         return rows
@@ -11108,6 +11657,9 @@ async def _import_resources(
     cancel_task: dict[str, Any] | None = None,
     progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
     preserve_seen_stage: bool = False,
+    is_pagination_checkpointing_enabled: bool = False,
+    retry_of_run_id: str | None = None,
+    pagination_resume_required: set[str] | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
@@ -11206,6 +11758,13 @@ async def _import_resources(
         group_key = id(source_group)
         source_ids = [item["source_id"] for item in source_group]
         source = _scoped_partition_source_record(source_group, source_ids)
+        if is_pagination_checkpointing_enabled:
+            source["_pagination_checkpoint_context"] = _pagination_checkpoint_context(
+                source,
+                source_ids,
+                run_id=run_id,
+                retry_of_run_id=retry_of_run_id,
+            )
         async with progress_lock:
             active_group_details[group_key] = {
                 "source_ids": source_ids[:10],
@@ -11337,12 +11896,19 @@ async def _import_resources(
                 cancel_task=cancel_task,
                 bulk_export=bulk_export,
                 deadline_seconds=resource_deadline_seconds,
+                pagination_checkpoint=source.get("_pagination_checkpoint_context"),
             )
             if not result:
                 continue
             result = _fail_closed_on_unexpected_empty_resource(
                 source,
                 resource_type,
+                result,
+            )
+            await _reset_unexpected_empty_pagination_checkpoint(
+                source,
+                resource_type,
+                page_count,
                 result,
             )
             for _source_id in source_ids:
@@ -11578,6 +12144,12 @@ async def _import_resources(
                 progress_callback=linked_progress,
                 deadline_seconds=linked_resource_deadline_seconds,
             )
+        await _finalize_source_pagination_checkpoints(
+            source,
+            resources,
+            source_resource_diagnostics,
+            pagination_resume_required,
+        )
         return (
             source_ids,
             source_resource_diagnostics,
@@ -11683,6 +12255,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     await _ensure_provider_directory_tables()
 
     run_id = _clean_text(task.get("run_id")) or _clean_text(ctx.get("control_run_id"))
+    retry_of_run_id = _clean_text(task.get("retry_of_run_id"))
     requested_source_ids = _clean_source_id_list(
         task.get("source_ids")
         or task.get("source_id")
@@ -11744,6 +12317,15 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     publish_artifacts = _bool_or_default(
         task.get("publish_artifacts"),
         import_resources and set(resources) == set(DEFAULT_RESOURCES),
+    )
+    is_pagination_checkpointing_enabled = _is_pagination_checkpoint_mode_enabled(
+        run_id=run_id,
+        full_refresh=full_refresh,
+        resource_limit=resource_limit,
+        page_limit=page_limit,
+        stream_batch_size=stream_batch_size,
+        stale_cleanup=stale_cleanup,
+        publish_artifacts=publish_artifacts,
     )
     seen_stage_table_for_publish = (
         _provider_directory_import_seen_stage_table_name(run_id)
@@ -11884,6 +12466,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
             "publish_corroboration": publish_corroboration,
+            "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
+            "retry_of_run_id": retry_of_run_id,
             "credential_config_file_configured": bool(credential_config_file),
         }
         await _mark_provider_directory_progress(
@@ -11963,6 +12547,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 metrics=metrics,
             )
             completed_source_ids_by_resource: dict[str, set[str]] = {}
+            pagination_resume_required_entries: set[str] = set()
             metrics["resource_rows"] = await _import_resources(
                 importable,
                 resources=resources,
@@ -11987,7 +12572,18 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 cancel_task={**task, "run_id": run_id},
                 progress_callback=resource_progress,
                 preserve_seen_stage=bool(seen_stage_table_for_publish),
+                is_pagination_checkpointing_enabled=is_pagination_checkpointing_enabled,
+                retry_of_run_id=retry_of_run_id,
+                pagination_resume_required=pagination_resume_required_entries,
             )
+            if pagination_resume_required_entries:
+                required_entries = sorted(pagination_resume_required_entries)
+                metrics["pagination_resume_required"] = required_entries
+                ctx["context"]["audit"] = metrics
+                raise RuntimeError(
+                    f"{PAGINATION_RESUME_REQUIRED_ERROR}:"
+                    + ",".join(required_entries)
+                )
             metrics["resource_fetch_completed_source_ids"] = {
                 resource_type: sorted(source_ids)
                 for resource_type, source_ids in sorted(completed_source_ids_by_resource.items())

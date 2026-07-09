@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import importlib
@@ -7471,6 +7472,343 @@ async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkey
     stats: dict[str, dict[str, Any]] = {}
     importer._record_resource_fetch_stats(stats, "Practitioner", result)
     assert stats["Practitioner"]["sources_empty"] == 0
+
+
+def _cigna_checkpoint_source():
+    return {
+        "source_id": "source_a",
+        "api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+    }
+
+
+def _cigna_checkpoint_context(
+    owner_run_id: str,
+    retry_of_run_id: str | None = None,
+):
+    return importer.PaginationCheckpointContext(
+        canonical_api_base=importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="scope_a",
+        source_ids=("source_a",),
+        owner_run_id=owner_run_id,
+        retry_of_run_id=retry_of_run_id,
+    )
+
+
+def _practitioner_search_bundle(resource_id: str, next_url: str | None = None):
+    payload = {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": resource_id,
+                    "name": [{"family": "Checkpoint"}],
+                }
+            }
+        ],
+    }
+    if next_url:
+        payload["link"] = [{"relation": "next", "url": next_url}]
+    return payload
+
+
+def _checkpoint_page_callbacks(
+    start_url: str,
+    next_url: str,
+    calls: list[str],
+):
+    async def load_checkpoint(_context, resource_type, request_url):
+        assert resource_type == "Practitioner"
+        assert request_url == start_url
+        return importer.PaginationResumeState(
+            next_url=start_url,
+            pages_processed=0,
+            rows_processed=0,
+            recent_url_hashes=(),
+        )
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        calls.append(request_url)
+        return (
+            200,
+            _practitioner_search_bundle(
+                f"prac-{len(calls)}",
+                next_url if len(calls) == 1 else None,
+            ),
+            None,
+            5,
+        )
+
+    return load_checkpoint, fetch_source_json
+
+
+def test_pagination_checkpoint_mode_requires_acquisition_only():
+    enabled_options_by_name = {
+        "run_id": "run_1",
+        "full_refresh": True,
+        "resource_limit": 0,
+        "page_limit": 0,
+        "stream_batch_size": 1000,
+        "stale_cleanup": False,
+        "publish_artifacts": False,
+    }
+
+    assert (
+        importer._is_pagination_checkpoint_mode_enabled(**enabled_options_by_name)
+        is True
+    )
+    for option_name, disabled_value in (
+        ("run_id", None),
+        ("full_refresh", False),
+        ("resource_limit", 1),
+        ("page_limit", 1),
+        ("stream_batch_size", 0),
+        ("stale_cleanup", True),
+        ("publish_artifacts", True),
+    ):
+        options_by_name = {**enabled_options_by_name, option_name: disabled_value}
+        assert importer._is_pagination_checkpoint_mode_enabled(**options_by_name) is False
+
+
+@pytest.mark.asyncio
+async def test_pagination_checkpoint_retry_adopts_direct_predecessor(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
+    checkpoint_by_name = {
+        "source_ids": ["source_a"],
+        "owner_run_id": "run_original",
+        "start_url_hash": start_url_hash,
+        "next_url": start_url + "&_getpages=resume",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 5,
+        "rows_processed": 500,
+        "recent_cursor_hashes": ["prior_hash"],
+    }
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    resume_state = await importer._load_or_initialize_pagination_checkpoint(
+        _cigna_checkpoint_context("run_retry", "run_original"),
+        "Practitioner",
+        start_url,
+    )
+
+    assert resume_state.resumed is True
+    assert resume_state.pages_processed == 5
+    assert resume_state.rows_processed == 500
+    assert "UPDATE" in status_mock.await_args.args[0]
+    assert status_mock.await_args.kwargs["previous_owner_run_id"] == "run_original"
+
+
+@pytest.mark.asyncio
+async def test_pagination_checkpoint_new_schedule_resets_stale_owner(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    checkpoint_by_name = {
+        "source_ids": ["source_a"],
+        "owner_run_id": "run_unrelated",
+        "start_url_hash": hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+        "next_url": start_url + "&_getpages=stale",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 5,
+        "rows_processed": 500,
+        "recent_cursor_hashes": ["stale_hash"],
+    }
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    resume_state = await importer._load_or_initialize_pagination_checkpoint(
+        _cigna_checkpoint_context("run_new_schedule"),
+        "Practitioner",
+        start_url,
+    )
+
+    assert resume_state.resumed is False
+    assert resume_state.next_url == start_url
+    assert "INSERT INTO" in status_mock.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_checkpoints_only_after_page_write(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    next_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=opaque&_count=100"
+    )
+    calls: list[str] = []
+    events: list[tuple[str, Any]] = []
+    load_checkpoint, fetch_source_json = _checkpoint_page_callbacks(
+        start_url,
+        next_url,
+        calls,
+    )
+
+    async def row_batch_handler(_model, rows):
+        events.append(("write", [row["resource_id"] for row in rows]))
+        return len(rows)
+
+    async def fake_save_checkpoint(_context, _resource_type, **checkpoint):
+        events.append(("checkpoint", checkpoint["next_url"]))
+
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save_checkpoint)
+
+    fetch_result = await importer._fetch_resource_rows(
+        _cigna_checkpoint_source(),
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        row_batch_handler=row_batch_handler,
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_cigna_checkpoint_context("run_1"),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.fetch_mode == "checkpointed_paged"
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.rows_written == 2
+    assert calls == [start_url, next_url]
+    assert events == [
+        ("write", ["prac-1"]),
+        ("checkpoint", next_url),
+        ("write", ["prac-2"]),
+        ("checkpoint", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_resumes_exact_checkpoint_url(monkeypatch):
+    resume_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=resume-token&_count=100"
+    )
+    saved_checkpoints: list[dict[str, Any]] = []
+
+    async def fake_load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=7,
+            rows_processed=700,
+            recent_url_hashes=("prior_hash",),
+            resumed=True,
+        )
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        assert request_url == resume_url
+        return 200, _practitioner_search_bundle("prac-701"), None, 5
+
+    async def row_batch_handler(_model, rows):
+        return len(rows)
+
+    async def fake_save_checkpoint(_context, _resource_type, **checkpoint):
+        saved_checkpoints.append(checkpoint)
+
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        fake_load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save_checkpoint)
+
+    fetch_result = await importer._fetch_resource_rows(
+        _cigna_checkpoint_source(),
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=row_batch_handler,
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_cigna_checkpoint_context(
+            "run_retry",
+            "run_original",
+        ),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.pages_fetched == 8
+    assert fetch_result.rows_fetched == 701
+    assert saved_checkpoints[0]["next_url"] is None
+    assert saved_checkpoints[0]["pages_processed"] == 8
+    assert saved_checkpoints[0]["rows_processed"] == 701
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    resume_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=expired&_count=100"
+    )
+    calls: list[str] = []
+    saved_next_urls: list[str | None] = []
+
+    async def fake_load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=5,
+            rows_processed=500,
+            recent_url_hashes=(),
+            resumed=True,
+        )
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        calls.append(request_url)
+        if request_url == resume_url:
+            return 410, {"resourceType": "OperationOutcome"}, None, 5
+        return 200, {"resourceType": "Bundle", "entry": []}, None, 5
+
+    async def fake_save_checkpoint(_context, _resource_type, **checkpoint):
+        saved_next_urls.append(checkpoint["next_url"])
+
+    async def row_batch_handler(_model, rows):
+        return len(rows)
+
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        fake_load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save_checkpoint)
+
+    fetch_result = await importer._fetch_resource_rows(
+        _cigna_checkpoint_source(),
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=row_batch_handler,
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_cigna_checkpoint_context(
+            "run_retry",
+            "run_original",
+        ),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert calls == [resume_url, start_url]
+    assert saved_next_urls == [start_url, None]
 
 
 @pytest.mark.asyncio
