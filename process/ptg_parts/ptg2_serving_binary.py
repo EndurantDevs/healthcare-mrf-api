@@ -44,8 +44,7 @@ PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND = "by_code_price_dictionary"
 PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND = "provider_set_count_dictionary"
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_KIND = "by_provider_set"
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_dictionary"
-PTG2_SERVING_BINARY_PRICE_SET_ATOMS_KIND = "price_set_atoms"
-PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND = "price_set_atoms_by_id"
+PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND = "price_set_atoms_by_id_v2"
 PTG2_SERVING_BINARY_BLOCK_BYTES_ENV = "HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES"
 PTG2_SERVING_BINARY_COPY_RECORDS_ENV = "HLTHPRT_PTG2_SERVING_BINARY_COPY_RECORDS"
 PTG2_SERVING_BINARY_RUST_ENV = "HLTHPRT_PTG2_SERVING_BINARY_RUST"
@@ -74,8 +73,8 @@ _DEFAULT_COPY_RECORDS = 2048
 _DEFAULT_STREAM_TASKS = 2
 _DEFAULT_COMPRESSION_MIN_BYTES = 128
 _DEFAULT_COPY_WORK_MEM = "128MB"
-_PRICE_SET_ATOM_BLOCK_SIZE = 1024
-_PRICE_SET_ATOM_ID_BUCKETS = 256
+_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
+_PRICE_SET_ATOM_ID_V2_BUCKETS = 1 << (_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES * 8)
 _MEMBERSHIP_HEADER = struct.Struct("<8sIQ")
 _DENSE_MEMBERSHIP_HEADER = struct.Struct("<8sIQQ")
 _MEMBERSHIP_INDEX_RECORD = struct.Struct("<16sQI")
@@ -254,17 +253,11 @@ def _price_dictionary_payload(price_set_values: list[bytes]) -> bytes:
     return b"".join(price_set_values)
 
 
-def _price_set_atom_payload(price_key: int, atom_ids: tuple[bytes, ...]) -> bytes:
-    payload = bytearray()
-    _append_uvarint(payload, int(price_key))
-    _append_uvarint(payload, len(atom_ids))
-    for atom_id in atom_ids:
-        payload.extend(_normalize_128_id(atom_id))
-    return bytes(payload)
-
-
-def _price_set_atom_id_bucket(price_set_id: bytes) -> int:
-    return int.from_bytes(_normalize_128_id(price_set_id)[:4], "big") % _PRICE_SET_ATOM_ID_BUCKETS
+def _price_set_atom_prefix_bucket(price_set_id: bytes) -> int:
+    return int.from_bytes(
+        _normalize_128_id(price_set_id)[:_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES],
+        "big",
+    )
 
 
 def _price_set_atom_by_id_payload(price_set_id: bytes, atom_ids: tuple[bytes, ...]) -> bytes:
@@ -750,50 +743,6 @@ async def _copy_serving_binary_record_batches(
     return copied
 
 
-def _decode_stored_payload(record: Mapping[str, Any]) -> bytes:
-    payload = bytes(record.get("payload") or b"")
-    compression = str(record.get("payload_compression") or "none").strip().lower()
-    if compression in {"", "none"}:
-        return payload
-    if compression != "zlib":
-        raise PTG2ManifestArtifactError(f"unsupported PTG2 serving binary payload compression: {compression}")
-    raw_payload = zlib.decompress(payload)
-    expected_raw_bytes = record.get("raw_payload_bytes")
-    if expected_raw_bytes is not None and int(expected_raw_bytes or 0) > 0 and len(raw_payload) != int(expected_raw_bytes):
-        raise PTG2ManifestArtifactError("PTG2 serving binary raw payload byte count mismatch")
-    return raw_payload
-
-
-async def _load_price_key_map(*, schema_name: str, table_name: str) -> dict[bytes, int]:
-    """Load ``price_set_id -> price_key`` from the by-code binary dictionary."""
-
-    qualified_target = f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
-    dictionary_row = await db.first(
-        f"""
-        SELECT
-            payload,
-            COALESCE(payload_compression, 'none') AS payload_compression,
-            raw_payload_bytes
-        FROM {qualified_target} binary_block
-        WHERE artifact_kind = :artifact_kind
-          AND block_key = 0
-          AND block_no = 0
-        LIMIT 1
-        """,
-        artifact_kind=PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
-    )
-    if dictionary_row is None:
-        return {}
-    row_mapping = getattr(dictionary_row, "_mapping", None)
-    dictionary_payload = _decode_stored_payload(dict(row_mapping) if row_mapping is not None else dict(dictionary_row))
-    if len(dictionary_payload) % 16:
-        raise PTG2ManifestArtifactError("PTG2 serving binary price dictionary payload has invalid length")
-    return {
-        dictionary_payload[offset : offset + 16]: index
-        for index, offset in enumerate(range(0, len(dictionary_payload), 16))
-    }
-
-
 def _iter_artifact_entries(artifacts: Mapping[str, Any] | None) -> Iterable[dict[str, Any]]:
     """Yield normalized artifact entries from a named or list-based manifest payload."""
 
@@ -913,8 +862,8 @@ def _iter_price_forward_members(
 
 
 @dataclass
-class _PriceSetAtomBlockWriter:
-    """Buffers price-set atom mappings into block-keyed serving-binary rows."""
+class _PriceSetAtomPrefixBlockWriter:
+    """Write prefix-bucketed price-set memberships in source-id order."""
 
     schema_name: str
     table_name: str
@@ -923,20 +872,15 @@ class _PriceSetAtomBlockWriter:
     batch_records: list[tuple[Any, ...]] = field(default_factory=list)
     copied_records: int = 0
     block_count: int = 0
-    id_block_count: int = 0
     price_set_count: int = 0
     atom_ref_count: int = 0
-    current_block_key: int | None = None
+    current_bucket_key: int | None = None
     current_block_no: int = 0
     current_payload: bytearray = field(default_factory=bytearray)
     current_entry_count: int = 0
-    block_no_by_key: dict[int, int] = field(default_factory=dict)
-    id_payload_by_bucket: dict[int, bytearray] = field(default_factory=dict)
-    id_entry_count_by_bucket: dict[int, int] = field(default_factory=dict)
-    id_block_no_by_bucket: dict[int, int] = field(default_factory=dict)
 
     async def flush_batch(self) -> None:
-        """COPY any buffered serving-binary rows into PostgreSQL."""
+        """COPY buffered v2 membership rows into PostgreSQL."""
 
         if not self.batch_records:
             return
@@ -949,100 +893,64 @@ class _PriceSetAtomBlockWriter:
         self.batch_records = []
 
     async def append_record(self, record: tuple[Any, ...]) -> None:
-        """Append one table row and flush when the COPY batch is full."""
+        """Append one encoded block and flush a complete COPY batch."""
 
         self.batch_records.append(record)
         if len(self.batch_records) >= self.batch_size:
             await self.flush_batch()
 
     async def flush_block(self) -> None:
-        """Flush the current price-key block into the pending COPY batch."""
+        """Flush the current prefix bucket block."""
 
-        if self.current_block_key is None or self.current_entry_count <= 0:
+        if self.current_bucket_key is None or self.current_entry_count <= 0:
             return
         await self.append_record(
             _serving_binary_record(
-                PTG2_SERVING_BINARY_PRICE_SET_ATOMS_KIND,
-                self.current_block_key,
+                PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND,
+                self.current_bucket_key,
                 self.current_block_no,
                 self.current_entry_count,
                 self.current_payload,
             )
         )
         self.block_count += 1
-        self.block_no_by_key[self.current_block_key] = self.current_block_no + 1
         self.current_block_no += 1
         self.current_entry_count = 0
         self.current_payload = bytearray()
 
-    async def flush_id_bucket(self, bucket_key: int) -> None:
-        """Flush one price-set-id hash bucket into the pending COPY batch."""
+    async def add_price_set(self, price_set_id: bytes, atom_ids: tuple[bytes, ...]) -> None:
+        """Append one membership entry to its monotonic ID-prefix bucket."""
 
-        entry_count = int(self.id_entry_count_by_bucket.get(bucket_key) or 0)
-        if entry_count <= 0:
-            return
-        await self.append_record(
-            _serving_binary_record(
-                PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND,
-                bucket_key,
-                int(self.id_block_no_by_bucket.get(bucket_key) or 0),
-                entry_count,
-                self.id_payload_by_bucket.get(bucket_key, bytearray()),
-            )
-        )
-        self.id_block_count += 1
-        self.id_block_no_by_bucket[bucket_key] = int(self.id_block_no_by_bucket.get(bucket_key) or 0) + 1
-        self.id_entry_count_by_bucket[bucket_key] = 0
-        self.id_payload_by_bucket[bucket_key] = bytearray()
-
-    async def flush_id_buckets(self) -> None:
-        """Flush all pending price-set-id hash buckets."""
-
-        for bucket_key in sorted(self.id_entry_count_by_bucket):
-            await self.flush_id_bucket(bucket_key)
-
-    async def add_price_set(self, price_key: int, price_set_id: bytes, atom_ids: tuple[bytes, ...]) -> None:
-        """Append one price-set membership entry to the active block."""
-
-        entry_payload = _price_set_atom_payload(price_key, atom_ids)
-        block_key = int(price_key) // _PRICE_SET_ATOM_BLOCK_SIZE
-        if self.current_block_key != block_key:
+        bucket_key = _price_set_atom_prefix_bucket(price_set_id)
+        if self.current_bucket_key is not None and bucket_key < self.current_bucket_key:
+            raise RuntimeError("price-set atom rows must be ordered by price_set_global_id_128")
+        entry_payload = _price_set_atom_by_id_payload(price_set_id, atom_ids)
+        if self.current_bucket_key != bucket_key:
             await self.flush_block()
-            self.current_block_key = block_key
-            self.current_block_no = int(self.block_no_by_key.get(block_key) or 0)
+            self.current_bucket_key = bucket_key
+            self.current_block_no = 0
         elif self.current_entry_count > 0 and len(self.current_payload) + len(entry_payload) > self.max_payload_bytes:
             await self.flush_block()
         self.current_payload.extend(entry_payload)
         self.current_entry_count += 1
-        id_bucket_key = _price_set_atom_id_bucket(price_set_id)
-        id_entry_payload = _price_set_atom_by_id_payload(price_set_id, atom_ids)
-        id_payload = self.id_payload_by_bucket.setdefault(id_bucket_key, bytearray())
-        if (
-            int(self.id_entry_count_by_bucket.get(id_bucket_key) or 0) > 0
-            and len(id_payload) + len(id_entry_payload) > self.max_payload_bytes
-        ):
-            await self.flush_id_bucket(id_bucket_key)
-            id_payload = self.id_payload_by_bucket.setdefault(id_bucket_key, bytearray())
-        id_payload.extend(id_entry_payload)
-        self.id_entry_count_by_bucket[id_bucket_key] = int(self.id_entry_count_by_bucket.get(id_bucket_key) or 0) + 1
         self.price_set_count += 1
         self.atom_ref_count += len(atom_ids)
 
     async def finish(self) -> None:
-        """Flush the active block and pending COPY batch."""
+        """Flush the final prefix block and COPY batch."""
 
         await self.flush_block()
-        await self.flush_id_buckets()
         await self.flush_batch()
 
     def summary(self) -> dict[str, Any]:
-        """Return import metrics for the generated price-set atom blocks."""
+        """Return counts and format metadata for the generated blocks."""
 
         return {
-            "block_size": _PRICE_SET_ATOM_BLOCK_SIZE,
-            "block_count": self.block_count,
-            "id_bucket_count": _PRICE_SET_ATOM_ID_BUCKETS,
-            "id_block_count": self.id_block_count,
+            "format": "price_set_atoms_by_id_v2",
+            "artifact_kind": PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND,
+            "id_prefix_bytes": _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES,
+            "id_bucket_count": _PRICE_SET_ATOM_ID_V2_BUCKETS,
+            "id_block_count": self.block_count,
             "price_set_count": self.price_set_count,
             "atom_ref_count": self.atom_ref_count,
             "copied_records": self.copied_records,
@@ -1059,15 +967,11 @@ async def _write_price_set_atom_blocks(
 ) -> dict[str, Any]:
     """Encode the price_forward sidecar as PostgreSQL serving-binary blocks."""
 
-    price_key_by_id = await _load_price_key_map(schema_name=schema_name, table_name=table_name)
-    if not price_key_by_id:
-        return {"skipped": "missing_price_dictionary"}
     if price_set_atom_table:
         table_summary = await _write_atom_map_blocks_from_table(
             schema_name=schema_name,
             table_name=table_name,
             price_set_atom_table=price_set_atom_table,
-            price_key_by_id=price_key_by_id,
             max_payload_bytes=max_payload_bytes,
         )
         if int(table_summary.get("price_set_count") or 0) > 0 or not _price_forward_artifact_path(price_forward_artifact):
@@ -1076,17 +980,14 @@ async def _write_price_set_atom_blocks(
     sidecar_path = _price_forward_artifact_path(price_forward_artifact)
     if sidecar_path is None:
         return {"skipped": "missing_price_forward_sidecar"}
-    block_writer = _PriceSetAtomBlockWriter(
+    block_writer = _PriceSetAtomPrefixBlockWriter(
         schema_name=schema_name,
         table_name=table_name,
         max_payload_bytes=max_payload_bytes,
         batch_size=_serving_binary_copy_records(),
     )
     for owner_id, atom_ids in _iter_price_forward_members(sidecar_path, metadata=price_forward_artifact):
-        price_key = price_key_by_id.get(owner_id)
-        if price_key is None:
-            continue
-        await block_writer.add_price_set(price_key, owner_id, atom_ids)
+        await block_writer.add_price_set(owner_id, atom_ids)
     await block_writer.finish()
     summary = block_writer.summary()
     summary["source"] = "price_forward_sidecar"
@@ -1098,13 +999,12 @@ async def _write_atom_map_blocks_from_table(
     schema_name: str,
     table_name: str,
     price_set_atom_table: str,
-    price_key_by_id: Mapping[bytes, int],
     max_payload_bytes: int,
 ) -> dict[str, Any]:
     """Encode staged price-set atom rows as PostgreSQL serving-binary blocks."""
 
     qualified_source = f"{_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)}"
-    block_writer = _PriceSetAtomBlockWriter(
+    block_writer = _PriceSetAtomPrefixBlockWriter(
         schema_name=schema_name,
         table_name=table_name,
         max_payload_bytes=max_payload_bytes,
@@ -1117,9 +1017,7 @@ async def _write_atom_map_blocks_from_table(
         """Write the pending price-set group after the ordered stream advances."""
         if current_price_set_id is None:
             return
-        price_key = price_key_by_id.get(current_price_set_id)
-        if price_key is not None:
-            await block_writer.add_price_set(price_key, current_price_set_id, tuple(current_atom_ids))
+        await block_writer.add_price_set(current_price_set_id, tuple(current_atom_ids))
 
     async with db.session() as session:
         atom_pair_result = await session.stream(

@@ -39,11 +39,51 @@ class FakeServingBinarySession:
     def __init__(self, records_by_kind):
         self.records_by_kind = records_by_kind
         self.calls = []
+        self.statements = []
+
+    def _dictionary_metadata_result(self, artifact_kind):
+        dictionary_records = self.records_by_kind.get(artifact_kind, [])
+        if not dictionary_records:
+            return FakeResult()
+        dictionary_record = dictionary_records[0]
+        return FakeResult(
+            rows=[
+                {
+                    "payload_compression": dictionary_record.get("payload_compression", "none"),
+                    "raw_payload_bytes": dictionary_record.get("raw_payload_bytes", 0),
+                    "payload_bytes": len(dictionary_record.get("payload") or b""),
+                }
+            ]
+        )
+
+    def _dictionary_slice_result(self, artifact_kind, item_keys):
+        dictionary_records = self.records_by_kind.get(artifact_kind, [])
+        if not dictionary_records:
+            return FakeResult()
+        dictionary_payload = dictionary_records[0].get("payload") or b""
+        return FakeResult(
+            rows=[
+                {
+                    "item_key": item_key,
+                    "item_value": dictionary_payload[item_key * 16 : item_key * 16 + 16],
+                }
+                for item_key in item_keys
+            ]
+        )
 
     async def execute(self, _statement, params=None):
         query_params_dict = dict(params or {})
         self.calls.append(query_params_dict)
+        statement_text = str(_statement)
+        self.statements.append(statement_text)
         artifact_kind = query_params_dict.get("artifact_kind")
+        if "octet_length(binary_block.payload) AS payload_bytes" in statement_text:
+            return self._dictionary_metadata_result(artifact_kind)
+        if "substring(" in statement_text and "requested.item_key" in statement_text:
+            return self._dictionary_slice_result(
+                artifact_kind,
+                query_params_dict.get("item_keys") or [],
+            )
         if "block_keys" in query_params_dict:
             records = []
             for block_key in query_params_dict.get("block_keys") or []:
@@ -117,6 +157,33 @@ def _uvarint(value: int) -> bytes:
     return bytes(payload)
 
 
+@pytest.mark.asyncio
+async def test_db_serving_binary_dictionary_reads_metadata_without_json_encoding_row():
+    price_set_id = bytes.fromhex("00000000000000000000000000000041")
+    fake_session = FakeServingBinarySession(
+        {
+            "by_code_price_dictionary": [
+                {
+                    "payload": price_set_id,
+                    "payload_compression": "none",
+                    "raw_payload_bytes": 0,
+                }
+            ]
+        }
+    )
+
+    payload = await db_sidecars._serving_binary_dictionary_payload(
+        fake_session,
+        "mrf.ptg2_serving_binary_large_dictionary",
+        artifact_kind="by_code_price_dictionary",
+    )
+
+    assert payload == price_set_id
+    assert all("to_jsonb(binary_block)" not in statement for statement in fake_session.statements)
+    assert "binary_block.payload_compression" in fake_session.statements[-1]
+    assert "binary_block.raw_payload_bytes" in fake_session.statements[-1]
+
+
 def test_serving_binary_copy_work_mem_default_and_rollback(monkeypatch):
     monkeypatch.delenv(serving_binary_writer.PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, raising=False)
     assert serving_binary_writer._serving_binary_copy_work_mem() == "128MB"
@@ -172,6 +239,8 @@ async def test_db_serving_binary_by_code_reads_matching_provider_sets():
         (serving_row.code_key, serving_row.provider_set_key, serving_row.provider_count, serving_row.price_set_global_id_128)
         for serving_row in matched_serving_rows
     ] == [(7, 5, 20, second_price_set_id.hex())]
+    assert any(call.get("item_keys") == [1] for call in session.calls)
+    assert any("substring(" in statement for statement in session.statements)
 
 
 @pytest.mark.asyncio
@@ -429,6 +498,29 @@ async def test_db_serving_binary_reads_price_set_atom_blocks_by_price_id():
 
 
 @pytest.mark.asyncio
+async def test_db_serving_binary_reads_v2_price_set_atom_prefix_bucket():
+    price_set_id = bytes.fromhex("123400000000000000000000000000b1")
+    price_atom_id = bytes.fromhex("000000000000000000000000000000c1")
+    atom_payload = b"".join((price_set_id, _uvarint(1), price_atom_id))
+    fake_session = FakeServingBinarySession(
+        {
+            ("price_set_atoms_by_id_v2", 0x1234): [
+                {"block_key": 0x1234, "block_no": 0, "entry_count": 1, "payload": atom_payload}
+            ],
+        }
+    )
+
+    members_by_price_set = await lookup_atoms_by_price_id(
+        fake_session,
+        "mrf.ptg2_serving_binary_price_atoms_v2_test",
+        [price_set_id.hex()],
+    )
+
+    assert members_by_price_set == {price_set_id.hex(): (price_atom_id.hex(),)}
+    assert "price_set_atoms_by_id" not in [call.get("artifact_kind") for call in fake_session.calls]
+
+
+@pytest.mark.asyncio
 async def test_db_serving_binary_reuses_cached_dictionaries_for_same_table():
     price_set_id = bytes.fromhex("00000000000000000000000000000081")
     first_payload = b"".join(_uvarint(payload_part) for payload_part in (1, 10, 0))
@@ -442,11 +534,19 @@ async def test_db_serving_binary_reuses_cached_dictionaries_for_same_table():
     )
 
     first_rows = await lookup_serving_binary_by_code_from_db(fake_session, "mrf.ptg2_serving_binary_cache_test", 7)
+    dictionary_calls_after_first_lookup = sum(
+        call.get("artifact_kind") == "by_code_price_dictionary"
+        for call in fake_session.calls
+    )
     second_rows = await lookup_serving_binary_by_code_from_db(fake_session, "mrf.ptg2_serving_binary_cache_test", 8)
 
     assert [serving_row.provider_count for serving_row in first_rows] == [10]
     assert [serving_row.provider_count for serving_row in second_rows] == [20]
-    assert sum(call.get("artifact_kind") == "by_code_price_dictionary" for call in fake_session.calls) == 1
+    assert dictionary_calls_after_first_lookup == 2
+    assert sum(
+        call.get("artifact_kind") == "by_code_price_dictionary"
+        for call in fake_session.calls
+    ) == dictionary_calls_after_first_lookup
     assert sum(call.get("artifact_kind") == "provider_set_count_dictionary" for call in fake_session.calls) == 1
 
 
