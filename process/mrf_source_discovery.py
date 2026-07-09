@@ -13409,6 +13409,35 @@ def _should_sync_private_context_snapshots() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+async def _post_import_control_seed_batch(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    batch: list[dict[str, Any]],
+) -> dict[str, Any]:
+    retry_attempts = _import_control_catalog_retry_attempts()
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            async with session.post(
+                f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
+                json={"seed_provider": "healthcare-mrf-api", "items": batch},
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise RuntimeError(
+                        f"import-control seed sync failed: {resp.status} {text[:200]}"
+                    )
+                return await resp.json()
+        except Exception as exc:
+            should_retry = (
+                attempt < retry_attempts
+                and _should_retry_import_control_catalog_error({"message": str(exc)})
+            )
+            if not should_retry:
+                raise
+            await asyncio.sleep(_import_control_catalog_retry_delay(attempt))
+    return {}
+
+
 async def _sync_import_control_seeds(
     source_rows: list[dict[str, Any]],
     *,
@@ -13450,16 +13479,7 @@ async def _sync_import_control_seeds(
         headers=headers, timeout=timeout, trust_env=False
     ) as session:
         for batch in _chunked(items, _import_control_seed_batch_size()):
-            async with session.post(
-                f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
-                json={"seed_provider": "healthcare-mrf-api", "items": batch},
-            ) as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise RuntimeError(
-                        f"import-control seed sync failed: {resp.status} {text[:200]}"
-                    )
-                payload = await resp.json()
+            payload = await _post_import_control_seed_batch(session, base_url, batch)
             synced += int(payload.get("count") or len(payload.get("items") or []))
             if progress_run_id:
                 _emit_import_control_seed_progress(

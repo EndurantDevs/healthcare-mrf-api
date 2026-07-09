@@ -8781,6 +8781,62 @@ async def test_sync_import_control_seeds_batches_requests_and_timeout(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_sync_import_control_seeds_retries_transient_disconnect(monkeypatch):
+    """Seed sync retries transient import-control transport failures."""
+    calls = []
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return {"count": 1}
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            self.ready = True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if len(calls) == 1:
+                raise ConnectionError("Server disconnected")
+            return FakeResponse()
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_catalog_retry_delay", lambda _attempt: 0)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
+
+    synced = await discovery._sync_import_control_seeds(
+        [
+            {
+                "source_id": "source_retry",
+                "index_url": "https://example.com/retry/index.json",
+                "display_name": "Example Retry",
+                "seed_provider": "master-list",
+            }
+        ]
+    )
+
+    assert synced == 1
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_push_import_control_catalog_uses_sync_timeout(monkeypatch):
     """Catalog sync uses the same long import-control HTTP timeout."""
     calls = []
