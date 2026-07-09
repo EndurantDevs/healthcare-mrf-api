@@ -7127,6 +7127,28 @@ def test_address_overlay_stage_index_names_are_hash_safe():
     assert index_name.endswith("_idx") or "_" in index_name
 
 
+@pytest.mark.asyncio
+async def test_address_overlay_stage_dedupe_is_scoped_to_refreshed_sources(monkeypatch):
+    status_mock = AsyncMock(return_value="DELETE 2")
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    removed = await importer._dedupe_address_overlay_stage(
+        '"mrf"."provider_directory_address_overlay_stage_test"',
+        source_ids=["source_b", "source_a", "source_a", ""],
+        resource_types=["PractitionerRole", "OrganizationAffiliation"],
+    )
+
+    assert removed == 2
+    sql = status_mock.await_args.args[0]
+    assert "FROM \"mrf\".\"provider_directory_address_overlay_stage_test\"" in sql
+    assert "WHERE source_id = ANY(CAST(:dedupe_source_ids AS varchar[]))" in sql
+    assert "resource_type = ANY(CAST(:dedupe_resource_types AS varchar[]))" in sql
+    assert status_mock.await_args.kwargs == {
+        "dedupe_source_ids": ["source_b", "source_a"],
+        "dedupe_resource_types": ["PractitionerRole", "OrganizationAffiliation"],
+    }
+
+
 def test_network_catalog_table_sql_shape():
     sql = importer.provider_directory_network_catalog_table_sql("mrf")
 

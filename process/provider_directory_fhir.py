@@ -11121,7 +11121,11 @@ async def _populate_address_overlay_stage(
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     archive_coordinate_backfill_rows = await _backfill_address_overlay_stage_coordinates(schema, stage_ref)
-    duplicates_removed = await _dedupe_address_overlay_stage(stage_ref)
+    duplicates_removed = await _dedupe_address_overlay_stage(
+        stage_ref,
+        source_ids=source_ids,
+        resource_types=refresh_resource_types,
+    )
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
     await _create_provider_directory_address_overlay_indexes(schema, stage_table)
     await db.status(f"ANALYZE {stage_ref};")
@@ -11173,7 +11177,27 @@ async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: st
     )
 
 
-async def _dedupe_address_overlay_stage(stage_ref: str) -> int:
+async def _dedupe_address_overlay_stage(
+    stage_ref: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    resource_types: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    where_clauses: list[str] = []
+    query_param_dict: dict[str, Any] = {}
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    if cleaned_source_ids:
+        where_clauses.append("source_id = ANY(CAST(:dedupe_source_ids AS varchar[]))")
+        query_param_dict["dedupe_source_ids"] = cleaned_source_ids
+    cleaned_resource_types = [
+        resource_type
+        for resource_type in (_clean_text(resource_type) for resource_type in (resource_types or ()))
+        if resource_type
+    ]
+    if cleaned_resource_types:
+        where_clauses.append("resource_type = ANY(CAST(:dedupe_resource_types AS varchar[]))")
+        query_param_dict["dedupe_resource_types"] = cleaned_resource_types
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     return _coerce_rowcount(
         await db.status(
             f"""
@@ -11190,10 +11214,12 @@ async def _dedupe_address_overlay_stage(stage_ref: str) -> int:
                                 address_key
                         ) AS duplicate_rank
                       FROM {stage_ref}
+                     {where_sql}
                   ) AS ranked
              WHERE stage_row.ctid = ranked.ctid
                AND ranked.duplicate_rank > 1;
-            """
+            """,
+            **query_param_dict,
         )
     )
 
