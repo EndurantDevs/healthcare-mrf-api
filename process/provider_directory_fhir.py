@@ -47,6 +47,7 @@ from db.models import (
     ProviderDirectoryOrganizationAffiliation,
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
+    ProviderDirectoryReverseLookupCheckpoint,
     ProviderDirectorySource,
     ProviderDirectorySourceResource,
     db,
@@ -224,6 +225,7 @@ SOURCE_MODELS = (
 CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
+    ProviderDirectoryReverseLookupCheckpoint,
 )
 USER_AGENT = os.getenv(
     "HLTHPRT_PROVIDER_DIRECTORY_USER_AGENT",
@@ -544,6 +546,7 @@ class ScanPractitionerRoleFetchOptions:
     seed_source_ids: tuple[str, ...] = ()
     existing_seed_source_ids: tuple[str, ...] = ()
     seed_page_size: int = 5000
+    resume_completed_seeds: bool = False
 
 
 @dataclass
@@ -602,8 +605,10 @@ class _PractitionerRoleReverseLookupState:
     is_hard_page_limit_reached: bool = False
     is_deadline_reached: bool = False
     has_next_url_remaining: bool = False
+    completed_seed_rows: list[dict[str, Any]] = field(default_factory=list)
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def add_seed(self) -> None:
         """Count a queued reverse lookup seed."""
@@ -623,6 +628,39 @@ class _PractitionerRoleReverseLookupState:
             self.error_message = (
                 f"reverse_lookup_errors_{self.reverse_error_count}_last_{current_error}"
             )
+
+    async def add_completed_seed(
+        self,
+        request: _PractitionerRoleReverseLookupRequest,
+        seed_resource_type: str,
+        seed_resource_id: str,
+    ) -> None:
+        """Persist finished reverse lookup seeds in bounded batches for resumption."""
+        if not request.options.resume_completed_seeds:
+            return
+        checkpoint_rows: list[dict[str, Any]] = []
+        async with self.checkpoint_lock:
+            self.completed_seed_rows.append(
+                _reverse_lookup_checkpoint_row(
+                    request.source,
+                    seed_resource_type,
+                    seed_resource_id,
+                    request.options.run_id,
+                )
+            )
+            if len(self.completed_seed_rows) >= _reverse_lookup_checkpoint_flush_rows():
+                checkpoint_rows = list(self.completed_seed_rows)
+                self.completed_seed_rows.clear()
+        if checkpoint_rows:
+            await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_rows)
+
+    async def flush_completed_seed_rows(self) -> None:
+        """Write checkpoints that did not fill a full streaming batch."""
+        async with self.checkpoint_lock:
+            checkpoint_rows = list(self.completed_seed_rows)
+            self.completed_seed_rows.clear()
+        if checkpoint_rows:
+            await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_rows)
 
     async def has_reached_page_limit(self) -> bool:
         """Return whether the shared reverse lookup page limit has been reached."""
@@ -741,10 +779,74 @@ class _PractitionerRoleReverseLookupState:
             )
             if await self.has_reached_page_limit():
                 return
+        await self.add_completed_seed(request, seed_resource_type, seed_resource_id)
 
 
 def _schema() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+
+
+def _reverse_lookup_checkpoint_flush_rows() -> int:
+    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_REVERSE_LOOKUP_CHECKPOINT_FLUSH_ROWS", 250))
+
+
+def _reverse_lookup_checkpoint_row(
+    source: dict[str, Any],
+    seed_resource_type: str,
+    seed_resource_id: str,
+    run_id: str | None,
+) -> dict[str, Any]:
+    canonical_api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if not canonical_api_base:
+        raise ValueError("reverse lookup checkpoint requires a canonical API base")
+    now = _now()
+    return {
+        "canonical_api_base": canonical_api_base,
+        "seed_resource_type": seed_resource_type,
+        "seed_resource_id": seed_resource_id,
+        "last_completed_run_id": run_id,
+        "completed_at": now,
+        "updated_at": now,
+    }
+
+
+def _reverse_lookup_checkpoint_exclusion_sql(
+    options: ScanPractitionerRoleFetchOptions,
+    resource_id_expr: str,
+) -> str:
+    """Exclude seeds already completed for the same canonical public endpoint."""
+    canonical_api_base = _canonical_base(
+        (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
+    )
+    if not options.resume_completed_seeds or not canonical_api_base:
+        return ""
+    checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
+    return f"""
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {checkpoint_ref} AS checkpoint
+                        WHERE checkpoint.canonical_api_base = :checkpoint_canonical_api_base
+                          AND checkpoint.seed_resource_type = :resource_type
+                          AND checkpoint.seed_resource_id = {resource_id_expr}
+                   )
+            """
+
+
+async def _clear_reverse_lookup_checkpoints(
+    source: dict[str, Any],
+) -> int:
+    """Start the next completed scan fresh after every seed finished once."""
+    canonical_api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if not canonical_api_base:
+        return 0
+    result = await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)}
+         WHERE canonical_api_base = :canonical_api_base;
+        """,
+        canonical_api_base=canonical_api_base,
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 def _q(identifier: str) -> str:
@@ -1404,6 +1506,10 @@ async def _scan_role_stage_seeds(
     source_ids = list(options.seed_source_ids or ())
     page_size = max(1, options.seed_page_size)
     search_params = _practitioner_role_reverse_lookup_params(options.source)
+    checkpoint_exclusion_sql = _reverse_lookup_checkpoint_exclusion_sql(options, "seed.resource_id")
+    checkpoint_canonical_api_base = _canonical_base(
+        (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
+    )
     for resource_type in _practitioner_role_reverse_lookup_resources(options.source):
         search_param = search_params.get(resource_type)
         if not search_param:
@@ -1412,18 +1518,20 @@ async def _scan_role_stage_seeds(
         while True:
             resource_rows = await db.all(
                 f"""
-                SELECT DISTINCT resource_id
-                  FROM {stage_ref}
-                 WHERE resource_type = :resource_type
-                   AND source_id = ANY(CAST(:source_ids AS varchar[]))
-                   AND resource_id > :last_resource_id
-                 ORDER BY resource_id
+                SELECT DISTINCT seed.resource_id
+                  FROM {stage_ref} AS seed
+                 WHERE seed.resource_type = :resource_type
+                   AND seed.source_id = ANY(CAST(:source_ids AS varchar[]))
+                   AND seed.resource_id > :last_resource_id
+                   {checkpoint_exclusion_sql}
+                 ORDER BY seed.resource_id
                  LIMIT :limit;
                 """,
                 resource_type=resource_type,
                 source_ids=source_ids,
                 last_resource_id=last_resource_id,
                 limit=page_size,
+                checkpoint_canonical_api_base=checkpoint_canonical_api_base,
             )
             if not resource_rows:
                 break
@@ -1446,6 +1554,10 @@ async def _scan_role_db_seed_rows(
         return
     page_size = max(1, options.seed_page_size)
     search_params = _practitioner_role_reverse_lookup_params(options.source)
+    checkpoint_exclusion_sql = _reverse_lookup_checkpoint_exclusion_sql(options, "seed.resource_id")
+    checkpoint_canonical_api_base = _canonical_base(
+        (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
+    )
     seed_table_by_resource_type = {
         "Practitioner": "provider_directory_practitioner",
         "Organization": "provider_directory_organization",
@@ -1460,16 +1572,18 @@ async def _scan_role_db_seed_rows(
         while True:
             resource_rows = await db.all(
                 f"""
-                SELECT DISTINCT resource_id
-                  FROM {_qt(_schema(), table_name)}
-                 WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
-                   AND resource_id > :last_resource_id
-                 ORDER BY resource_id
+                SELECT DISTINCT seed.resource_id
+                  FROM {_qt(_schema(), table_name)} AS seed
+                 WHERE seed.source_id = ANY(CAST(:source_ids AS varchar[]))
+                   AND seed.resource_id > :last_resource_id
+                   {checkpoint_exclusion_sql}
+                 ORDER BY seed.resource_id
                  LIMIT :limit;
                 """,
                 source_ids=source_ids,
                 last_resource_id=last_resource_id,
                 limit=page_size,
+                checkpoint_canonical_api_base=checkpoint_canonical_api_base,
             )
             if not resource_rows:
                 break
@@ -8283,11 +8397,9 @@ async def _fetch_bulk_export_resource_rows(
             page_limit_reached=False,
             hard_page_limit_reached=False,
             next_url_remaining=row_limit_reached,
-            error=output_error,
+        error=output_error,
         fetch_mode="bulk_export",
     )
-
-
 async def _flush_partition_resource_rows(
     state: PartitionFetchState,
     row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
@@ -8494,8 +8606,6 @@ async def _fetch_partitioned_resource_rows(
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
     )
-
-
 async def _fetch_resource_rows(
     source: dict[str, Any],
     resource_type: str,
@@ -8875,7 +8985,7 @@ async def _fetch_scan_practitioner_role_rows(
         and not is_deadline_reached
         and not next_url_remaining
     )
-    return ResourceFetchResult(
+    reverse_lookup_result = ResourceFetchResult(
         model=model,
         rows=rows,
         rows_fetched=rows_fetched,
@@ -8889,6 +8999,9 @@ async def _fetch_scan_practitioner_role_rows(
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="source_specific_reverse_lookup",
     )
+    if reverse_lookup_result.complete and options.resume_completed_seeds:
+        await _clear_reverse_lookup_checkpoints(options.source or source)
+    return reverse_lookup_result
 
 
 def _scan_practitioner_role_reverse_lookup_concurrency() -> int:
@@ -8990,6 +9103,7 @@ async def _run_role_lookup_tasks(
                 lookup_task.cancel()
         if not producer_task.done():
             producer_task.cancel()
+        await fetch_state.flush_completed_seed_rows()
 
 
 def _build_role_lookup_result(
@@ -9063,12 +9177,15 @@ async def _fetch_scan_practitioner_role_rows_concurrent(
     request = _new_role_lookup_request(source_config, resource_rows_by_type, options)
     await _run_role_lookup_tasks(fetch_state, request, concurrency)
     await streamed_rows.flush()
-    return _build_role_lookup_result(
+    reverse_lookup_result = _build_role_lookup_result(
         result_model,
         retained_resource_rows,
         streamed_rows,
         fetch_state,
     )
+    if reverse_lookup_result.complete and options.resume_completed_seeds:
+        await _clear_reverse_lookup_checkpoints(options.source or source_config)
+    return reverse_lookup_result
 
 
 def _reference_resource_key(reference: str | None, expected_type: str) -> tuple[str, str] | None:
@@ -10442,6 +10559,7 @@ async def _import_resources(
                     seed_stage_table=scan_seed_stage_table,
                     seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
                     existing_seed_source_ids=tuple(source_ids) if not scan_seed_stage_table else (),
+                    resume_completed_seeds=per_resource_limit <= 0 and page_limit <= 0,
                 ),
             )
             for _source_id in source_ids:

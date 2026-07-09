@@ -30,6 +30,7 @@ __all__ = (
     "ProviderDirectoryOrganizationAffiliation",
     "ProviderDirectoryPractitioner",
     "ProviderDirectoryPractitionerRole",
+    "ProviderDirectoryReverseLookupCheckpoint",
     "ProviderDirectorySource",
     "ProviderDirectorySourceResource",
 )
@@ -797,6 +798,31 @@ class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     resource_id = Column(String(256), nullable=False)
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryReverseLookupCheckpoint(Base, JSONOutputMixin):
+    """Completed source-specific reverse lookup seeds awaiting scan completion."""
+
+    __tablename__ = "provider_directory_reverse_lookup_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("canonical_api_base", "seed_resource_type", "seed_resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["canonical_api_base", "seed_resource_type", "seed_resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("last_completed_run_id",),
+            "name": "provider_directory_reverse_lookup_checkpoint_run_idx",
+        },
+    ]
+
+    canonical_api_base = Column(TEXT, nullable=False)
+    seed_resource_type = Column(String(64), nullable=False)
+    seed_resource_id = Column(String(256), nullable=False)
+    last_completed_run_id = Column(String(64))
+    completed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
 
 

@@ -5814,6 +5814,88 @@ async def test_scan_practitioner_role_reverse_lookup_pages_seed_rows_from_stage(
 
 
 @pytest.mark.asyncio
+async def test_reverse_lookup_db_seeds_exclude_completed_checkpoint(monkeypatch):
+    """An interrupted UHC scan resumes after already completed practitioner seeds."""
+    seed_queries: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_db_all(statement, **query_params):
+        seed_queries.append((statement, query_params))
+        if query_params["last_resource_id"] == "":
+            return [("prac-2",)]
+        return []
+
+    monkeypatch.setattr(importer.db, "all", fake_db_all)
+    options = importer.ScanPractitionerRoleFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=60,
+        run_id="run_resume",
+        source={
+            "source_id": "uhc",
+            "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        },
+        existing_seed_source_ids=("uhc",),
+        resume_completed_seeds=True,
+    )
+
+    seeds = [seed async for seed in importer._scan_role_db_seed_rows(options)]
+
+    assert seeds == [("practitioner", "Practitioner", "prac-2")]
+    assert "provider_directory_reverse_lookup_checkpoint" in seed_queries[0][0]
+    assert seed_queries[0][1]["checkpoint_canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+
+
+@pytest.mark.asyncio
+async def test_reverse_lookup_checkpoint_flushes_completed_seed(monkeypatch):
+    """Completed reverse lookup seeds are persisted before a later resume run."""
+    persisted_rows: list[dict[str, Any]] = []
+
+    async def fake_upsert_rows(model, rows, **_kwargs):
+        assert model is importer.ProviderDirectoryReverseLookupCheckpoint
+        persisted_rows.extend(rows)
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert_rows)
+    uhc_source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    options = importer.ScanPractitionerRoleFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=60,
+        run_id="run_resume",
+        source=uhc_source_lookup,
+        resume_completed_seeds=True,
+    )
+    request = importer._new_role_lookup_request(uhc_source_lookup, {}, options)
+    state = importer._PractitionerRoleReverseLookupState(
+        result_model=ProviderDirectoryPractitionerRole,
+        retained_resource_rows=[],
+        streamed_rows=importer._StreamedResourceRowBuffer(
+            model=ProviderDirectoryPractitionerRole,
+            row_batch_handler=None,
+            row_batch_size=1,
+            pending_row_items=[],
+        ),
+        retain_rows=False,
+        page_limit=0,
+    )
+
+    await state.add_completed_seed(request, "Practitioner", "prac-2")
+    await state.flush_completed_seed_rows()
+
+    assert persisted_rows[0]["canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+    assert persisted_rows[0]["seed_resource_type"] == "Practitioner"
+    assert persisted_rows[0]["seed_resource_id"] == "prac-2"
+    assert persisted_rows[0]["last_completed_run_id"] == "run_resume"
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
