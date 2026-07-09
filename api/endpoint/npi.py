@@ -6235,20 +6235,32 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
-async def _fetch_provider_directory_address_overlay(
-    npi: int,
-    *,
-    session: Any = None,
-) -> list[dict[str, Any]]:
-    if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
-        return []
-    overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
+def _provider_directory_overlay_source_join_sql(
+    source_table_exists: bool,
+) -> tuple[str, str]:
+    if not source_table_exists:
+        return "", "overlay.source_id"
+    source_table_sql = _schema_cache_key(ProviderDirectorySource.__tablename__)
+    source_table_join = (
+        f"LEFT JOIN {source_table_sql} AS directory_source "
+        "ON directory_source.source_id = overlay.source_id"
+    )
+    independent_source_expression = (
+        "COALESCE(NULLIF(directory_source.canonical_api_base, ''), overlay.source_id)"
+    )
+    return source_table_join, independent_source_expression
+
+
+def _provider_directory_overlay_query_sql(
+    overlay_columns: set[str],
+    source_table_join: str,
+    independent_source_expression: str,
+) -> str:
     lat_select = "lat" if "lat" in overlay_columns else "NULL::numeric AS lat"
     long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
     coordinate_group_by = ", lat, long" if {"lat", "long"}.issubset(overlay_columns) else ""
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    overlay_query = text(
-        f"""
+    return f"""
         SELECT
             npi,
             'practice'::varchar AS type,
@@ -6268,19 +6280,44 @@ async def _fetch_provider_directory_address_overlay(
             address_key,
             address_precision,
             ARRAY['provider_directory_fhir']::varchar[] AS address_sources,
-            ARRAY_AGG(source_record_id ORDER BY source_record_id)::varchar[] AS source_record_ids,
-            COUNT(DISTINCT source_id)::integer AS source_count,
-            COUNT(DISTINCT source_id)::integer AS independent_source_count,
-            (COUNT(DISTINCT source_id) > 1)::boolean AS multi_source_confirmed,
+            ARRAY_AGG(overlay.source_record_id ORDER BY overlay.source_record_id)::varchar[] AS source_record_ids,
+            COUNT(DISTINCT overlay.source_id)::integer AS source_count,
+            COUNT(DISTINCT {independent_source_expression})::integer AS independent_source_count,
+            (COUNT(DISTINCT {independent_source_expression}) > 1)::boolean AS multi_source_confirmed,
             MAX(source_updated_at) AS updated_at
-          FROM {overlay_table_sql}
-         WHERE npi = :npi
+          FROM {overlay_table_sql} AS overlay
+          {source_table_join}
+         WHERE overlay.npi = :npi
       GROUP BY
             npi, first_line, second_line, city_name, state_name, state_code,
             postal_code, country_code, telephone_number, fax_number, phone_number,
             fax_number_digits, address_key, address_precision{coordinate_group_by}
       ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key;
-        """
+    """
+
+
+async def _fetch_provider_directory_address_overlay(
+    npi: int,
+    *,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
+    if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
+        return []
+    overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
+    source_table_exists = await _table_exists(
+        ProviderDirectorySource.__tablename__,
+        session=session,
+    )
+    source_table_join, independent_source_expression = (
+        _provider_directory_overlay_source_join_sql(source_table_exists)
+    )
+    overlay_query = text(
+        _provider_directory_overlay_query_sql(
+            overlay_columns,
+            source_table_join,
+            independent_source_expression,
+        )
     )
     overlay_result = await _execute_stmt(overlay_query, session=session, params={"npi": int(npi)})
     overlay_addresses: list[dict[str, Any]] = []

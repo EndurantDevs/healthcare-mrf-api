@@ -181,6 +181,39 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
     assert rows == []
     assert "lat,\n            long," in captured_sql_statements[0]
     assert "address_precision, lat, long" in captured_sql_statements[0]
+    assert "LEFT JOIN mrf.provider_directory_source AS directory_source" in captured_sql_statements[0]
+    assert "directory_source.canonical_api_base" in captured_sql_statements[0]
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_overlay_falls_back_to_alias_count_without_source_table(
+    monkeypatch,
+):
+    captured_sql_statements: list[str] = []
+
+    class FakeResult:
+        def all(self):
+            return []
+
+    async def is_fake_table_present(table_name, **_kwargs):
+        return table_name == npi_module.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+
+    async def fake_execute(stmt, **_kwargs):
+        captured_sql_statements.append(str(stmt))
+        return FakeResult()
+
+    monkeypatch.setattr(npi_module, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(npi_module, "_table_columns", AsyncMock(return_value=set()))
+    monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+
+    rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
+
+    assert rows == []
+    assert "LEFT JOIN mrf.provider_directory_source" not in captured_sql_statements[0]
+    assert (
+        "COUNT(DISTINCT overlay.source_id)::integer AS independent_source_count"
+        in captured_sql_statements[0]
+    )
 
 
 @pytest.mark.asyncio
