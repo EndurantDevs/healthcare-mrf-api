@@ -8049,10 +8049,7 @@ def _should_reduce_source_page_size(
     status_code: int | None,
     fetch_error: str | None,
 ) -> bool:
-    return bool(
-        _is_transient_source_fetch_failure(status_code, fetch_error)
-        or status_code in {400, 413}
-    )
+    return fetch_error is None and status_code in {400, 413}
 
 
 async def _fetch_source_json_once(
@@ -8088,7 +8085,8 @@ async def _fetch_source_json(
     candidate_urls = _source_fetch_candidate_urls(url)
     for candidate_index, candidate_url in enumerate(candidate_urls):
         is_last_candidate = candidate_index == len(candidate_urls) - 1
-        attempt_count = _source_fetch_retry_attempts() if is_last_candidate else 1
+        should_try_smaller_page = False
+        attempt_count = _source_fetch_retry_attempts()
         for attempt_index in range(attempt_count):
             fetch_result = await _fetch_source_json_once(
                 source_record,
@@ -8097,14 +8095,18 @@ async def _fetch_source_json(
             )
             status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
             total_elapsed_ms += elapsed_ms
+            should_try_smaller_page = _should_reduce_source_page_size(
+                status_code,
+                fetch_error,
+            )
+            if should_try_smaller_page and not is_last_candidate:
+                break
             if not _is_transient_source_fetch_failure(status_code, fetch_error):
-                if not _should_reduce_source_page_size(status_code, fetch_error):
-                    return status_code, fhir_payload, fetch_error, total_elapsed_ms
-                break
-            if not is_last_candidate:
-                break
+                return status_code, fhir_payload, fetch_error, total_elapsed_ms
             if attempt_index + 1 < attempt_count:
                 await asyncio.sleep(_source_fetch_retry_delay_seconds(attempt_index))
+        if not should_try_smaller_page:
+            return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
     return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
 
 

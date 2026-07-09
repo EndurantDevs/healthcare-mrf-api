@@ -2752,6 +2752,32 @@ async def test_source_fetch_reduces_oversized_initial_search_page(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
+async def test_source_fetch_retries_transient_failure_without_resizing(monkeypatch):
+    calls: list[str] = []
+    responses = [
+        (None, None, "TimeoutError: timed out", 7),
+        (503, {"resourceType": "OperationOutcome"}, None, 11),
+        (200, {"resourceType": "Bundle", "entry": []}, None, 5),
+    ]
+
+    async def fake_fetch_json(url, *, timeout):
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_source_fetch_retry_delay_seconds", lambda _attempt: 0)
+
+    result = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=1000",
+        timeout=3,
+    )
+
+    assert result == (200, {"resourceType": "Bundle", "entry": []}, None, 23)
+    assert calls == ["https://payer.example/fhir/Practitioner?_count=1000"] * 3
+
+
 @pytest.mark.parametrize(
     "continuation_query",
     [
