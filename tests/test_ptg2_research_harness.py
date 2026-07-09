@@ -108,6 +108,23 @@ def test_suite_validation_and_env_expansion(tmp_path):
     assert env["HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"] == "2"
 
 
+def test_postgres_binary_final_suite_uses_fast_tableless_config():
+    suite = harness.load_suite("docs/research/ptg2_postgres_binary_local_suite.json")
+    variants = harness.variant_map(suite)
+    final_env = variants["postgres_binary_final"]["env"]
+
+    assert final_env["HLTHPRT_PTG2_SNAPSHOT_ARCH"] == "postgres_binary_v1"
+    assert final_env["HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"] == "true"
+    assert final_env["HLTHPRT_PTG2_RUST_WORKERS"] == "16"
+    assert final_env["HLTHPRT_PTG2_RUST_WORK_QUEUE"] == "32"
+    assert final_env["HLTHPRT_PTG2_RUST_EVENT_QUEUE"] == "128"
+    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION"] == "zlib"
+    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT"] == "binary"
+    assert final_env["HLTHPRT_PTG2_SERVING_BINARY_TARGET_COPY_FORMAT"] == "binary"
+    assert final_env["HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_TASKS"] == "16"
+    assert final_env["HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS"] == "true"
+
+
 def test_copy_output_gate_detects_digest_mismatch():
     baseline = {
         "serving": {"rows": 1, "sha256": "a"},

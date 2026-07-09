@@ -39,6 +39,7 @@
         "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "64",
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "8192",
         "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "33554432",
+        "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": "true",
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v1",
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
         "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v2",
@@ -75,11 +76,12 @@
       "api_probe_warmup": 4,
       "env": {
         "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
-        "HLTHPRT_PTG2_RUST_WORKERS": "8",
-        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "16",
-        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "64",
+        "HLTHPRT_PTG2_RUST_WORKERS": "16",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "32",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "128",
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "8192",
         "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "33554432",
+        "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": "true",
         "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v1",
         "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
         "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v2",
@@ -90,7 +92,10 @@
         "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION": "zlib",
         "HLTHPRT_PTG2_DB_BINARY_BLOCK_CACHE_BYTES": "0",
         "HLTHPRT_PTG2_DB_BINARY_DICTIONARY_CACHE_BYTES": "0",
-        "HLTHPRT_PTG2_DB_SIDECAR_CHUNK_CACHE_BYTES": "0"
+        "HLTHPRT_PTG2_DB_SIDECAR_CHUNK_CACHE_BYTES": "0",
+        "HLTHPRT_PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT": "binary",
+        "HLTHPRT_PTG2_SERVING_BINARY_TARGET_COPY_FORMAT": "binary",
+        "HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_TASKS": "16"
       }
     }
   ],
@@ -144,28 +149,28 @@
       "variants": ["table_serving_current", "postgres_binary_final"]
     },
     {
-      "id": "local-postgres-binary-vs-current-table-1m",
+      "id": "local-postgres-binary-vs-current-table-2m",
       "kind": "local_ptg_cli",
       "fixture": "large_in_network",
-      "negotiated_rates": 1048576,
-      "billing_codes": 256,
-      "provider_sets": 16,
-      "price_reuse_mod": 4096,
-      "source_key": "local-postgres-binary-ab-current-large",
+      "negotiated_rates": 2097152,
+      "billing_codes": 512,
+      "provider_sets": 32,
+      "price_reuse_mod": 8192,
+      "source_key": "local-postgres-binary-ab-current-2m",
       "import_month": "2026-07",
       "max_files": 1,
       "full_file": true,
       "verify_original": true,
       "analyze_serving_sidecar": false,
-      "serving_sidecar_max_rows": 2000000,
-      "max_bytes": 2147483648,
+      "serving_sidecar_max_rows": 3000000,
+      "max_bytes": 4294967296,
       "gates": {
         "baseline_variant": "table_serving_current",
         "performance": false,
         "memory": false,
         "min_storage_ratio": 15.0,
-        "min_snapshot_total_ratio": 20.0,
-        "min_import_total_improvement_pct": 0.0
+        "min_snapshot_total_ratio": 19.0,
+        "min_import_total_improvement_pct": 66.67
       },
       "variants": ["table_serving_current", "postgres_binary_final"]
     },
