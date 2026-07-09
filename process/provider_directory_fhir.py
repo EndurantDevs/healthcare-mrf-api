@@ -7996,21 +7996,54 @@ async def _fetch_json_with_options(
     )
 
 
+def _source_fetch_retry_attempts() -> int:
+    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_FETCH_ATTEMPTS", 3))
+
+
+def _is_transient_source_fetch_failure(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> bool:
+    if fetch_error:
+        return True
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
+    return min(2.0, 0.25 * (2**max(0, attempt_index)))
+
+
 async def _fetch_source_json(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    options = _credential_request_options_for_source(source, url)
-    if not options["headers"] and not options["query_params"]:
-        return await _fetch_json(url, timeout=timeout)
-    return await _fetch_json_with_options(
-        url,
-        timeout=timeout,
-        extra_headers=options["headers"],
-        query_params=options["query_params"],
+    options = _credential_request_options_for_source(source_record, url)
+    total_elapsed_ms = 0
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int] = (
+        None,
+        None,
+        "request_not_attempted",
+        0,
     )
+    for attempt_index in range(_source_fetch_retry_attempts()):
+        if not options["headers"] and not options["query_params"]:
+            fetch_result = await _fetch_json(url, timeout=timeout)
+        else:
+            fetch_result = await _fetch_json_with_options(
+                url,
+                timeout=timeout,
+                extra_headers=options["headers"],
+                query_params=options["query_params"],
+            )
+        status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
+        total_elapsed_ms += elapsed_ms
+        if not _is_transient_source_fetch_failure(status_code, fetch_error):
+            return status_code, fhir_payload, fetch_error, total_elapsed_ms
+        if attempt_index + 1 < _source_fetch_retry_attempts():
+            await asyncio.sleep(_source_fetch_retry_delay_seconds(attempt_index))
+    return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
 
 
 RESOURCE_ACCESS_PROBE_ORDER = (

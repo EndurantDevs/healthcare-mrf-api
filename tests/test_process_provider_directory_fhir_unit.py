@@ -2681,6 +2681,53 @@ def test_provider_directory_credentials_do_not_apply_to_cross_host_reference(mon
 
 
 @pytest.mark.asyncio
+async def test_source_fetch_retries_transient_get_failures(monkeypatch):
+    responses = [
+        (None, None, "TimeoutError: timed out", 7),
+        (503, {"resourceType": "OperationOutcome"}, None, 11),
+        (200, {"resourceType": "Bundle", "entry": []}, None, 5),
+    ]
+
+    async def fake_fetch_json(_url, *, timeout):
+        return responses.pop(0)
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_source_fetch_retry_delay_seconds", lambda _attempt: 0)
+
+    status_code, payload, fetch_error, elapsed_ms = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=1",
+        timeout=3,
+    )
+
+    assert status_code == 200
+    assert payload == {"resourceType": "Bundle", "entry": []}
+    assert fetch_error is None
+    assert elapsed_ms == 23
+    assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_source_fetch_does_not_retry_deterministic_http_error(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, timeout):
+        calls.append(url)
+        return 404, None, None, 4
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Endpoint?_count=1",
+        timeout=3,
+    )
+
+    assert result == (404, None, None, 4)
+    assert calls == ["https://payer.example/fhir/Endpoint?_count=1"]
+
+
+@pytest.mark.asyncio
 async def test_probe_sources_records_credential_descriptor_without_secret(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_TOKEN", "secret-token")
     monkeypatch.setenv(
