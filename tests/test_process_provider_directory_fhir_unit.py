@@ -5896,6 +5896,43 @@ async def test_reverse_lookup_checkpoint_flushes_completed_seed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reverse_lookup_resume_marks_checkpointed_roles_seen(monkeypatch):
+    """Stale cleanup retains roles completed by an earlier checkpointed segment."""
+    statements: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_db_status(statement, **query_params):
+        statements.append((statement, query_params))
+        return 2
+
+    monkeypatch.setattr(importer.db, "status", fake_db_status)
+    options = importer.ScanPractitionerRoleFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=60,
+        run_id="run_resume",
+        source={
+            "source_id": "uhc",
+            "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        },
+        seed_source_ids=("uhc",),
+        resume_completed_seeds=True,
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    marked_rows = await importer._mark_checkpointed_reverse_lookup_roles_seen(options)
+
+    assert marked_rows == 2
+    assert len(statements) == 2
+    assert "UPDATE" in statements[0][0]
+    assert "INSERT INTO" in statements[1][0]
+    assert "provider_directory_import_seen_stage_test" in statements[1][0]
+    assert "ON CONFLICT" not in statements[1][0]
+    assert statements[0][1]["source_ids"] == ["uhc"]
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 

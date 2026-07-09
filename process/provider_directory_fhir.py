@@ -547,6 +547,7 @@ class ScanPractitionerRoleFetchOptions:
     existing_seed_source_ids: tuple[str, ...] = ()
     seed_page_size: int = 5000
     resume_completed_seeds: bool = False
+    seen_table: str | None = None
 
 
 @dataclass
@@ -847,6 +848,103 @@ async def _clear_reverse_lookup_checkpoints(
         canonical_api_base=canonical_api_base,
     )
     return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _reverse_lookup_checkpoint_source_ids(
+    options: ScanPractitionerRoleFetchOptions,
+) -> list[str]:
+    return list(options.seed_source_ids or options.existing_seed_source_ids or ())
+
+
+def _reverse_lookup_checkpoint_role_match_sql(
+    role_alias: str,
+    checkpoint_alias: str,
+) -> str:
+    practitioner_match = _sql_ref_matches_resource(
+        f"{role_alias}.practitioner_ref",
+        "Practitioner",
+        f"{checkpoint_alias}.seed_resource_id",
+    )
+    organization_match = _sql_ref_matches_resource(
+        f"{role_alias}.organization_ref",
+        "Organization",
+        f"{checkpoint_alias}.seed_resource_id",
+    )
+    location_match = _sql_ref_matches_resource(
+        "location_ref.value",
+        "Location",
+        f"{checkpoint_alias}.seed_resource_id",
+    )
+    return f"""
+        (
+            ({checkpoint_alias}.seed_resource_type = 'Practitioner' AND {practitioner_match})
+         OR ({checkpoint_alias}.seed_resource_type = 'Organization' AND {organization_match})
+         OR (
+                {checkpoint_alias}.seed_resource_type = 'Location'
+            AND EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements_text(
+                           COALESCE({role_alias}.location_refs::jsonb, '[]'::jsonb)
+                       ) AS location_ref(value)
+                 WHERE {location_match}
+            )
+         )
+        )
+    """
+
+
+async def _mark_checkpointed_reverse_lookup_roles_seen(
+    options: ScanPractitionerRoleFetchOptions,
+) -> int:
+    """Keep earlier reverse-lookup rows visible to stale cleanup during resumption."""
+    if not options.resume_completed_seeds or not options.run_id:
+        return 0
+    source_ids = _reverse_lookup_checkpoint_source_ids(options)
+    canonical_api_base = _canonical_base(
+        (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
+    )
+    if not source_ids or not canonical_api_base:
+        return 0
+    role_ref = _qt(_schema(), ProviderDirectoryPractitionerRole.__tablename__)
+    checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
+    seen_ref = _qt(_schema(), options.seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    role_match_sql = _reverse_lookup_checkpoint_role_match_sql("role", "checkpoint")
+    run_filter = "" if options.seen_table else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
+    await db.status(
+        f"""
+        UPDATE {role_ref} AS role
+           SET last_seen_run_id = :run_id,
+               updated_at = now()
+          FROM {checkpoint_ref} AS checkpoint
+         WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
+           AND checkpoint.canonical_api_base = :canonical_api_base
+           AND {role_match_sql};
+        """,
+        run_id=options.run_id,
+        source_ids=source_ids,
+        canonical_api_base=canonical_api_base,
+    )
+    return int(
+        await db.status(
+            f"""
+            INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
+            SELECT DISTINCT :run_id,
+                            'PractitionerRole',
+                            role.source_id,
+                            role.resource_id
+              FROM {role_ref} AS role
+              JOIN {checkpoint_ref} AS checkpoint
+                ON checkpoint.canonical_api_base = :canonical_api_base
+               AND {role_match_sql}
+             WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
+            {run_filter};
+            """,
+            run_id=options.run_id,
+            source_ids=source_ids,
+            canonical_api_base=canonical_api_base,
+        )
+        or 0
+    )
 
 
 def _q(identifier: str) -> str:
@@ -8834,6 +8932,7 @@ async def _fetch_scan_practitioner_role_rows(
 ) -> ResourceFetchResult:
     if options.source is None:
         options = replace(options, source=source)
+    await _mark_checkpointed_reverse_lookup_roles_seen(options)
     reverse_lookup_concurrency = _scan_practitioner_role_reverse_lookup_concurrency()
     if reverse_lookup_concurrency > 1 and options.per_resource_limit <= 0 and options.page_limit <= 0:
         return await _fetch_scan_practitioner_role_rows_concurrent(
@@ -10561,6 +10660,7 @@ async def _import_resources(
                     seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
                     existing_seed_source_ids=tuple(source_ids) if not scan_seed_stage_table else (),
                     resume_completed_seeds=per_resource_limit <= 0 and page_limit <= 0,
+                    seen_table=seen_stage_table,
                 ),
             )
             for _source_id in source_ids:
