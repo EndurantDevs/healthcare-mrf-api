@@ -2564,6 +2564,11 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert stats["Location"]["sources_completed"] == 1
 
 
+def test_alohr_organization_query_uses_supported_nested_contacts_field():
+    assert "contacts { contacts { system value use } }" in importer.ALOHR_ORGANIZATION_QUERY
+    assert "organizationContact" not in importer.ALOHR_ORGANIZATION_QUERY
+
+
 @pytest.mark.asyncio
 async def test_update_source_resource_import_metadata_casts_json_to_jsonb(monkeypatch):
     calls: list[tuple[str, dict[str, Any]]] = []

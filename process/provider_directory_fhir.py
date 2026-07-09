@@ -379,7 +379,6 @@ query ALOHR_ORG_FIND($criteria: ProviderOrgSearchCriteria, $nextToken: String) {
       npi
       specialty
       specialtyDescription
-      organizationContact { system value use }
       addresses { type street1 street2 city state zip county }
       contacts { contacts { system value use } }
     }
