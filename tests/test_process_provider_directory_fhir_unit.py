@@ -238,6 +238,9 @@ def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
     assert set(row["metadata_json"]["provider_directory_expected_nonempty_resources"]) == (
         importer.CIGNA_EXPECTED_NONEMPTY_RESOURCES
     )
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.DEFAULT_RESOURCES
+    )
     assert (
         row["metadata_json"]["provider_directory_previous_api_base"]
         == "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4"
@@ -654,6 +657,11 @@ def test_source_row_from_seed_overrides_molina_developer_portal_base():
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == (
         importer.MOLINA_PROVIDER_DIRECTORY_METADATA_URL
     )
+    assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    )
+    assert importer._resource_start_url(row, "InsurancePlan", page_count=100) is None
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
 def test_source_row_from_seed_overrides_molina_dead_fhir_host():
@@ -773,6 +781,11 @@ def test_source_row_from_seed_overrides_humana_stale_oauth_label():
     assert row["last_validated_status"] == "valid"
     assert row["metadata_json"]["provider_directory_override"] == "humana_public_fhir_api"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.HUMANA_PROVIDER_DIRECTORY_METADATA_URL
+    assert importer._resource_start_url(row, "InsurancePlan", page_count=100) == (
+        f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?_count=100"
+    )
+    assert importer._resource_start_url(row, "OrganizationAffiliation", page_count=100) is None
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
 def test_source_row_from_seed_overrides_tmhp_stale_oauth_label():

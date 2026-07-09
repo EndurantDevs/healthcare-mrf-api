@@ -1523,6 +1523,19 @@ def _source_resource_timeout(source: dict[str, Any], resource_type: str, timeout
     return max(base_timeout, min_timeout)
 
 
+def _source_supported_resource_types(source: dict[str, Any]) -> set[str] | None:
+    configured_resources = _source_metadata(source).get(
+        "provider_directory_supported_resources"
+    )
+    if not isinstance(configured_resources, list):
+        return None
+    return {
+        resource_type
+        for resource_type in (_clean_text(value) for value in configured_resources)
+        if resource_type in DEFAULT_RESOURCES
+    }
+
+
 def _url_with_count(url: str, page_count: int) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1533,6 +1546,12 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 
 def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
+    supported_resource_types = _source_supported_resource_types(source)
+    if (
+        supported_resource_types is not None
+        and resource_type not in supported_resource_types
+    ):
+        return None
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     resource_page_count = _source_resource_page_count(source, resource_type, page_count)
     endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
@@ -2691,6 +2710,7 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
             "provider_directory_expected_nonempty_resources": sorted(
                 CIGNA_EXPECTED_NONEMPTY_RESOURCES
             ),
+            "provider_directory_supported_resources": list(DEFAULT_RESOURCES),
         },
     }
 
@@ -2834,9 +2854,16 @@ def _molina_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
             "provider_directory_confirmed_base": MOLINA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": MOLINA_DEVELOPER_PORTAL_URL,
             "provider_directory_confirmed_metadata_url": MOLINA_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_supported_resources": [
+                "Location",
+                "Organization",
+                "OrganizationAffiliation",
+                "Practitioner",
+                "PractitionerRole",
+            ],
             "provider_directory_resource_probe_caveat": (
-                "Metadata is open, but broad resource searches returned HTTP 500 from the live API "
-                "during discovery; resource import diagnostics remain authoritative."
+                "Live declared resources are public; generated searches for undeclared resource "
+                "types return HTTP 500 and are intentionally skipped."
             ),
         },
     }
@@ -3003,6 +3030,13 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
             "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
             "provider_directory_confirmed_base": HUMANA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": HUMANA_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_supported_resources": [
+                "InsurancePlan",
+                "Location",
+                "Organization",
+                "Practitioner",
+                "PractitionerRole",
+            ],
         },
     }
 
@@ -11363,7 +11397,6 @@ async def _clear_pagination_checkpoints(
 
 async def _finalize_source_pagination_checkpoints(
     source: dict[str, Any],
-    resource_types: list[str],
     diagnostics_by_resource: dict[str, dict[str, Any]],
     resume_required_entries: set[str] | None,
 ) -> None:
@@ -11372,11 +11405,10 @@ async def _finalize_source_pagination_checkpoints(
         return
     incomplete_resource_types = [
         resource_type
-        for resource_type in resource_types
-        if resource_type not in diagnostics_by_resource
-        or diagnostics_by_resource[resource_type].get("complete") is not True
-        or diagnostics_by_resource[resource_type].get("error")
-        or diagnostics_by_resource[resource_type].get("bounded")
+        for resource_type, diagnostic in diagnostics_by_resource.items()
+        if diagnostic.get("complete") is not True
+        or diagnostic.get("error")
+        or diagnostic.get("bounded")
     ]
     if incomplete_resource_types:
         if resume_required_entries is not None:
@@ -12146,7 +12178,6 @@ async def _import_resources(
             )
         await _finalize_source_pagination_checkpoints(
             source,
-            resources,
             source_resource_diagnostics,
             pagination_resume_required,
         )
