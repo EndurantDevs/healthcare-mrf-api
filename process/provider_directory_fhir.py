@@ -8885,9 +8885,17 @@ def _source_catalog_stale_cleanup_enabled(
     full_refresh: bool,
     source_query: str | None,
     limit: int | None,
+    requested_source_ids: list[str] | tuple[str, ...] | None = None,
     retest_results_configured: bool = True,
 ) -> bool:
-    return bool(stale_cleanup and full_refresh and not source_query and not limit and retest_results_configured)
+    return bool(
+        stale_cleanup
+        and full_refresh
+        and not source_query
+        and not limit
+        and not requested_source_ids
+        and retest_results_configured
+    )
 
 
 async def _delete_stale_provider_directory_source_catalog(
@@ -10065,6 +10073,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
 
     try:
         source_rows = _dedupe_source_rows([_source_row_from_seed(row) for row in seed_rows])
+        source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
         await _upsert_rows(ProviderDirectorySource, source_rows)
@@ -10074,6 +10083,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             full_refresh=full_refresh,
             source_query=source_query,
             limit=limit,
+            requested_source_ids=requested_source_ids,
             retest_results_configured=retest_path is not None,
         ):
             stale_source_rows_deleted = await _delete_stale_provider_directory_source_catalog(
@@ -10422,6 +10432,26 @@ def _clean_source_id_list(raw_source_ids: Any) -> list[str]:
         seen_source_ids.add(source_id_text)
         cleaned_source_ids.append(source_id_text)
     return cleaned_source_ids
+
+
+def _scope_source_rows(
+    source_rows: list[dict[str, Any]],
+    requested_source_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not requested_source_ids:
+        return source_rows
+    rows_by_source_id = {
+        source_id: row
+        for row in source_rows
+        if (source_id := _clean_text(row.get("source_id")))
+    }
+    missing_source_ids = [source_id for source_id in requested_source_ids if source_id not in rows_by_source_id]
+    if missing_source_ids:
+        raise ValueError(
+            "Provider Directory source_id not found in resolved source catalog: "
+            + ", ".join(missing_source_ids)
+        )
+    return [rows_by_source_id[source_id] for source_id in requested_source_ids]
 
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"

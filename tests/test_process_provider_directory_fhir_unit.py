@@ -2004,6 +2004,13 @@ def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
         full_refresh=True,
         source_query=None,
         limit=None,
+        requested_source_ids=["source_a"],
+    )
+    assert not importer._source_catalog_stale_cleanup_enabled(
+        stale_cleanup=True,
+        full_refresh=True,
+        source_query=None,
+        limit=None,
         retest_results_configured=False,
     )
 
@@ -4769,6 +4776,103 @@ async def test_process_data_skips_artifact_publish_when_required_fetches_are_bou
         "Location",
     ]
     publish_artifacts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_data_source_id_scopes_seed_probe_and_resource_import(monkeypatch):
+    upserted_source_rows: list[dict[str, Any]] = []
+
+    async def fake_upsert(_model, source_rows_to_upsert, **_kwargs):
+        upserted_source_rows.extend(source_rows_to_upsert)
+        return len(source_rows_to_upsert)
+
+    def fake_source_row(seed_row):
+        source_id = seed_row["id"]
+        return {
+            "source_id": source_id,
+            "org_name": f"Source {source_id}",
+            "api_base": f"https://{source_id}.example.test/fhir",
+            "canonical_api_base": f"https://{source_id}.example.test/fhir",
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "metadata_json": {},
+        }
+
+    probe_sources = AsyncMock(return_value=(1, 1, {"source_b"}))
+    import_resources = AsyncMock(return_value={"Practitioner": 1})
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_resolve_seed_db", lambda *_args, **_kwargs: ("/tmp/provider-directory.db", None))
+    monkeypatch.setattr(
+        importer,
+        "_seed_rows_from_sqlite",
+        lambda *_args, **_kwargs: [{"id": "source_a"}, {"id": "source_b"}],
+    )
+    monkeypatch.setattr(importer, "_source_row_from_seed", fake_source_row)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_probe_sources", probe_sources)
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "seed_db_path": "/tmp/provider-directory.db",
+            "source_id": ["source_b"],
+            "probe": True,
+            "import_resources": True,
+            "resources": "Practitioner",
+            "publish_artifacts": False,
+        },
+    )
+
+    assert metrics["sources_seeded"] == 1
+    assert [source_row["source_id"] for source_row in upserted_source_rows] == ["source_b"]
+    probe_sources.assert_awaited_once()
+    assert [source_row["source_id"] for source_row in probe_sources.await_args.args[0]] == ["source_b"]
+    import_resources.assert_awaited_once()
+    assert [source_row["source_id"] for source_row in import_resources.await_args.args[0]] == ["source_b"]
+    assert metrics["sources_import_attempted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_process_data_source_id_missing_from_catalog_fails_fast(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_resolve_seed_db", lambda *_args, **_kwargs: ("/tmp/provider-directory.db", None))
+    monkeypatch.setattr(importer, "_seed_rows_from_sqlite", lambda *_args, **_kwargs: [{"id": "source_a"}])
+    monkeypatch.setattr(
+        importer,
+        "_source_row_from_seed",
+        lambda _row: {
+            "source_id": "source_a",
+            "org_name": "Source A",
+            "api_base": "https://source-a.example.test/fhir",
+            "canonical_api_base": "https://source-a.example.test/fhir",
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "metadata_json": {},
+        },
+    )
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock())
+    monkeypatch.setattr(importer, "_probe_sources", AsyncMock())
+    monkeypatch.setattr(importer, "_import_resources", AsyncMock())
+
+    with pytest.raises(ValueError, match="source_id not found"):
+        await importer.process_data(
+            {"context": {}},
+            {
+                "seed_db_path": "/tmp/provider-directory.db",
+                "source_id": ["source_missing"],
+                "probe": True,
+                "import_resources": True,
+            },
+        )
+
+    importer._upsert_rows.assert_not_awaited()
+    importer._probe_sources.assert_not_awaited()
+    importer._import_resources.assert_not_awaited()
 
 
 @pytest.mark.asyncio
