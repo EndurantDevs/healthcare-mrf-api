@@ -5844,6 +5844,7 @@ async def test_reverse_lookup_db_seeds_exclude_completed_checkpoint(monkeypatch)
 
     assert seeds == [("practitioner", "Practitioner", "prac-2")]
     assert "provider_directory_reverse_lookup_checkpoint" in seed_queries[0][0]
+    assert seed_queries[0][1]["resource_type"] == "Practitioner"
     assert seed_queries[0][1]["checkpoint_canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
 
 

@@ -1678,6 +1678,7 @@ async def _scan_role_db_seed_rows(
                  ORDER BY seed.resource_id
                  LIMIT :limit;
                 """,
+                resource_type=resource_type,
                 source_ids=source_ids,
                 last_resource_id=last_resource_id,
                 limit=page_size,
