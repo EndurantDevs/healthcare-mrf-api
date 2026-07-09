@@ -862,6 +862,68 @@ def test_hap_rewrites_blocked_pagination_sibling_host():
     )
 
 
+def test_molina_rewrites_exact_sapphire_next_link():
+    source_lookup = {
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+    raw_query = "_count=100&cursorMark=abc%2Bdef&family=Smith%20Jones"
+
+    next_url = importer._resolved_fhir_next_url(
+        source_lookup,
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100",
+        f"https://{importer.MOLINA_PAGINATION_HOST}/fhir/Practitioner?{raw_query}",
+    )
+
+    assert next_url == (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?{raw_query}"
+    )
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        "https://evil.example/fhir/Practitioner?cursorMark=abc",
+        "https://molina.sapphirethreesixtyfive.com:8443/fhir/Practitioner?cursorMark=abc",
+        "https://molina.sapphirethreesixtyfive.com/fhir/Location?cursorMark=abc",
+        "https://molina.sapphirethreesixtyfive.com/fhir/Practitioner/extra?cursorMark=abc",
+        "https://molina.sapphirethreesixtyfive.com/fhir/Practitioner?_count=100",
+    ],
+)
+def test_molina_rejects_unallowlisted_cross_origin_next_link(next_url):
+    source_lookup = {
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+
+    with pytest.raises(ValueError, match="untrusted_molina_pagination_link"):
+        importer._resolved_fhir_next_url(
+            source_lookup,
+            f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100",
+            next_url,
+        )
+
+
+@pytest.mark.asyncio
+async def test_partition_fetch_detects_reordered_molina_cursor_cycle():
+    state = importer.PartitionFetchState(
+        result_model=object,
+        retained_resource_rows=[],
+    )
+    first_url = (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=100&cursorMark=abc%2Bdef&family=Smith"
+    )
+    reordered_url = (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "family=Smith&cursorMark=abc%2bdef&_count=100"
+    )
+
+    assert await importer._can_fetch_partition_url(state, first_url, max_pages=0) is True
+    assert await importer._can_fetch_partition_url(state, reordered_url, max_pages=0) is False
+    assert state.error_message == "pagination_cursor_repeated"
+
+
 def test_source_row_from_seed_overrides_hap_name_only_seed_row():
     row = importer._source_row_from_seed(
         {

@@ -437,6 +437,7 @@ HUMANA_PROVIDER_DIRECTORY_METADATA_URL = f"{HUMANA_PROVIDER_DIRECTORY_BASE}/meta
 MOLINA_DEVELOPER_PORTAL_URL = "https://developer.interop.molinahealthcare.com"
 MOLINA_PROVIDER_DIRECTORY_BASE = "https://api.interop.molinahealthcare.com/providerdirectory"
 MOLINA_PROVIDER_DIRECTORY_METADATA_URL = f"{MOLINA_PROVIDER_DIRECTORY_BASE}/metadata"
+MOLINA_PAGINATION_HOST = "molina.sapphirethreesixtyfive.com"
 TMHP_PROVIDER_DIRECTORY_BASE = "https://cmsinterop.tmhp.com/tmhp/fhir/pd/R4"
 TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
@@ -8540,6 +8541,8 @@ def _resolved_fhir_next_url(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
     parsed_next = urllib.parse.urlsplit(next_url)
+    if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
+        return _resolved_molina_next_url(current_url, next_url)
     if api_base != HAP_PROVIDER_DIRECTORY_BASE:
         return next_url
     if parsed_next.netloc.lower() != HAP_BLOCKED_PAGINATION_HOST:
@@ -8552,6 +8555,51 @@ def _resolved_fhir_next_url(
             parsed_next.path,
             parsed_next.query,
             parsed_next.fragment,
+        )
+    )
+
+
+def _resolved_molina_next_url(current_url: str, next_url: str) -> str:
+    canonical_base = urllib.parse.urlsplit(MOLINA_PROVIDER_DIRECTORY_BASE)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    if (
+        parsed_next.scheme.lower() == canonical_base.scheme
+        and parsed_next.netloc.lower() == canonical_base.netloc
+    ):
+        return next_url
+
+    parsed_current = urllib.parse.urlsplit(current_url)
+    resource_prefix = f"{canonical_base.path.rstrip('/')}/"
+    resource_type = (
+        parsed_current.path[len(resource_prefix) :]
+        if parsed_current.path.startswith(resource_prefix)
+        else ""
+    )
+    cursor_values = [
+        cursor_value
+        for key, cursor_value in urllib.parse.parse_qsl(
+            parsed_next.query,
+            keep_blank_values=True,
+        )
+        if key == "cursorMark"
+    ]
+    is_allowlisted = (
+        parsed_next.scheme.lower() == "https"
+        and parsed_next.netloc.lower() == MOLINA_PAGINATION_HOST
+        and not parsed_next.fragment
+        and resource_type in DEFAULT_RESOURCES
+        and parsed_next.path == f"/fhir/{resource_type}"
+        and len(cursor_values) == 1
+    )
+    if not is_allowlisted:
+        raise ValueError("untrusted_molina_pagination_link")
+    return urllib.parse.urlunsplit(
+        (
+            canonical_base.scheme,
+            canonical_base.netloc,
+            f"{canonical_base.path.rstrip('/')}/{resource_type}",
+            parsed_next.query,
+            "",
         )
     )
 
@@ -9133,12 +9181,46 @@ async def _can_fetch_partition_url(
             state.next_url_remaining = True
             state.stop_event.set()
             return False
-        if request_url in state.seen_urls:
-            state.error_message = "pagination loop detected"
+        request_identity = _pagination_url_identity(request_url)
+        if request_identity in state.seen_urls:
+            state.error_message = (
+                "pagination_cursor_repeated"
+                if _has_cursor_mark_query_parameter(request_url)
+                else "pagination loop detected"
+            )
             state.next_url_remaining = True
             return False
-        state.seen_urls.add(request_url)
+        state.seen_urls.add(request_identity)
         return True
+
+
+def _has_cursor_mark_query_parameter(url: str) -> bool:
+    return any(
+        key == "cursorMark"
+        for key, _value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    )
+
+
+def _pagination_url_identity(url: str) -> str:
+    if not _has_cursor_mark_query_parameter(url):
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    normalized_query = urllib.parse.urlencode(
+        sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)),
+        doseq=True,
+    )
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            normalized_query,
+            "",
+        )
+    )
 
 
 async def _mark_partition_fetch_error(
