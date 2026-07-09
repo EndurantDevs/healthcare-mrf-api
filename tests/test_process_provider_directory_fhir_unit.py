@@ -705,6 +705,28 @@ def test_source_row_from_seed_overrides_uhc_dead_fhir_host():
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.UHC_PROVIDER_DIRECTORY_METADATA_URL
 
 
+def test_source_resource_timeout_uses_uhc_floor():
+    assert (
+        importer._source_resource_timeout(
+            {
+                "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+                "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+            },
+            "InsurancePlan",
+            10,
+        )
+        == 60
+    )
+    assert (
+        importer._source_resource_timeout(
+            {"api_base": "https://example.test/fhir"},
+            "InsurancePlan",
+            10,
+        )
+        == 10
+    )
+
+
 def test_source_row_from_seed_overrides_humana_stale_oauth_label():
     row = importer._source_row_from_seed(
         {
@@ -5458,6 +5480,111 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
     ]
     assert resource_fetch_stats["PractitionerRole"]["sources_attempted"] == 1
     assert resource_fetch_stats["PractitionerRole"]["rows_fetched"] == 1
+
+
+def _uhc_reverse_lookup_source() -> dict[str, str]:
+    return {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+
+def _uhc_practitioner_fetch_result() -> importer.ResourceFetchResult:
+    return importer.ResourceFetchResult(
+        model=ProviderDirectoryPractitioner,
+        rows=[],
+        rows_fetched=1,
+        rows_written=1,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+
+def _uhc_practitioner_role_bundle() -> dict[str, Any]:
+    return {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "fullUrl": "https://flex.optum.com/fhirpublic/R4/PractitionerRole/role-1",
+                "resource": {
+                    "resourceType": "PractitionerRole",
+                    "id": "role-1",
+                    "practitioner": {"reference": "Practitioner/prac-1"},
+                },
+            }
+        ],
+    }
+
+
+def _install_uhc_reverse_lookup_import_fakes(monkeypatch):
+    role_call_rows: list[tuple[str, int]] = []
+    upsert_call_rows: list[tuple[type, list[dict[str, Any]]]] = []
+
+    async def fake_fetch_resource_rows(source, resource_type, **kwargs):
+        if resource_type == "PractitionerRole":
+            raise AssertionError("UHC PractitionerRole should be reverse-looked-up after practitioners")
+        if resource_type != "Practitioner":
+            return None
+        row_batch_handler = kwargs.get("row_batch_handler")
+        rows = [{"source_id": source["source_id"], "resource_id": "prac-1", "npi": "1234567890"}]
+        assert row_batch_handler is not None
+        await row_batch_handler(ProviderDirectoryPractitioner, rows)
+        return _uhc_practitioner_fetch_result()
+
+    async def fake_fetch_source_json(_source, url, *, timeout):
+        role_call_rows.append((url, timeout))
+        return (200, _uhc_practitioner_role_bundle(), None, 5)
+
+    async def fake_upsert_resource_rows(model, rows, **_kwargs):
+        upsert_call_rows.append((model, rows))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
+    return role_call_rows, upsert_call_rows
+
+
+@pytest.mark.asyncio
+async def test_import_resources_fetches_uhc_practitioner_roles_after_practitioners(monkeypatch):
+    """UHC roles are recovered through practitioner reverse lookup with the UHC timeout floor."""
+
+    _stub_resource_import_metadata(monkeypatch)
+    role_call_rows, upsert_call_rows = _install_uhc_reverse_lookup_import_fakes(monkeypatch)
+
+    resource_fetch_stats_by_resource: dict[str, dict[str, Any]] = {}
+    completed_source_ids_by_resource: dict[str, set[str]] = {}
+    counts = await importer._import_resources(
+        [_uhc_reverse_lookup_source()],
+        resources=["PractitionerRole", "Practitioner"],
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        stream_batch_size=5,
+        resource_fetch_stats=resource_fetch_stats_by_resource,
+        resource_completion=completed_source_ids_by_resource,
+    )
+
+    assert counts == {"PractitionerRole": 1, "Practitioner": 1}
+    assert [model for model, _rows in upsert_call_rows] == [
+        ProviderDirectoryPractitioner,
+        ProviderDirectoryPractitionerRole,
+    ]
+    assert role_call_rows == [
+        (
+            "https://flex.optum.com/fhirpublic/R4/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25",
+            60,
+        )
+    ]
+    assert resource_fetch_stats_by_resource["PractitionerRole"]["rows_fetched"] == 1
+    assert completed_source_ids_by_resource["PractitionerRole"] == {"uhc"}
 
 
 def _practitioner_stream_fetch_result(rows_written: int):

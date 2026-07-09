@@ -445,6 +445,14 @@ SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
     "Organization": "organization",
     "Location": "location",
 }
+UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES = ("Practitioner",)
+UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
+    "Practitioner": "practitioner",
+}
+SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
+    (UHC_PROVIDER_DIRECTORY_BASE, resource_type): 60
+    for resource_type in DEFAULT_RESOURCES
+}
 PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     # This HAPI proxy returns an empty PractitionerRole Bundle for _count >= 50,
     # even though _count=25 returns rows and a next link.
@@ -495,6 +503,7 @@ class ScanPractitionerRoleFetchOptions:
     cancel_ctx: dict[str, Any] | None = None
     cancel_task: dict[str, Any] | None = None
     deadline_seconds: int = 0
+    source: dict[str, Any] | None = None
     seed_stage_table: str | None = None
     seed_source_ids: tuple[str, ...] = ()
     seed_page_size: int = 5000
@@ -931,6 +940,15 @@ def _source_resource_page_count(source: dict[str, Any], resource_type: str, page
     return max(1, min(bounded_count, min(caps)))
 
 
+def _source_resource_timeout(source: dict[str, Any], resource_type: str, timeout: int) -> int:
+    base_timeout = max(int(timeout or 0), 1)
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    min_timeout = SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS.get((api_base or "", resource_type))
+    if min_timeout is None:
+        return base_timeout
+    return max(base_timeout, min_timeout)
+
+
 def _url_with_count(url: str, page_count: int) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1016,24 +1034,49 @@ def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_cou
 def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
     return (
         resource_type == "PractitionerRole"
-        and _canonical_base(source.get("canonical_api_base") or source.get("api_base")) == SCAN_PROVIDER_DIRECTORY_BASE
+        and bool(_practitioner_role_reverse_lookup_resources(source))
     )
 
 
 def _scan_practitioner_role_reverse_lookup_planned(source: dict[str, Any], resources: list[str]) -> bool:
+    reverse_lookup_resources = _practitioner_role_reverse_lookup_resources(source)
     return (
         _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
         and "PractitionerRole" in resources
-        and any(resource in resources for resource in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES)
+        and any(resource in resources for resource in reverse_lookup_resources)
     )
 
 
+def _practitioner_role_reverse_lookup_resources(source: dict[str, Any] | None) -> tuple[str, ...]:
+    source = source or {}
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == SCAN_PROVIDER_DIRECTORY_BASE:
+        return SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES
+    if api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        return UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES
+    return ()
+
+
+def _practitioner_role_reverse_lookup_params(source: dict[str, Any] | None) -> dict[str, str]:
+    source = source or {}
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == SCAN_PROVIDER_DIRECTORY_BASE:
+        return SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS
+    if api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        return UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS
+    return {}
+
+
 def _scan_practitioner_role_seed_rows(
+    source: dict[str, Any] | None,
     rows_by_resource: dict[str, list[dict[str, Any]]]
 ) -> Iterator[tuple[str, str, str]]:
     seen: set[tuple[str, str]] = set()
-    for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
-        search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
+    search_params = _practitioner_role_reverse_lookup_params(source)
+    for resource_type in _practitioner_role_reverse_lookup_resources(source):
+        search_param = search_params.get(resource_type)
+        if not search_param:
+            continue
         for row in rows_by_resource.get(resource_type, []):
             resource_id = _clean_text(row.get("resource_id"))
             if not resource_id:
@@ -1053,7 +1096,7 @@ async def _iter_scan_practitioner_role_seed_rows(
         async for seed in _scan_role_stage_seeds(options):
             yield seed
         return
-    for seed in _scan_practitioner_role_seed_rows(rows_by_resource):
+    for seed in _scan_practitioner_role_seed_rows(options.source, rows_by_resource):
         yield seed
 
 
@@ -1064,8 +1107,11 @@ async def _scan_role_stage_seeds(
     stage_ref = _qt(_schema(), options.seed_stage_table or "")
     source_ids = list(options.seed_source_ids or ())
     page_size = max(1, options.seed_page_size)
-    for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
-        search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
+    search_params = _practitioner_role_reverse_lookup_params(options.source)
+    for resource_type in _practitioner_role_reverse_lookup_resources(options.source):
+        search_param = search_params.get(resource_type)
+        if not search_param:
+            continue
         last_resource_id = ""
         while True:
             resource_rows = await db.all(
@@ -7836,12 +7882,13 @@ async def _fetch_resource_rows(
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
+    resource_timeout = _source_resource_timeout(source, resource_type, timeout)
     if bulk_export:
         result = await _fetch_bulk_export_resource_rows(
             source,
             resource_type,
             per_resource_limit=per_resource_limit,
-            timeout=timeout,
+            timeout=resource_timeout,
             run_id=run_id,
             row_batch_handler=row_batch_handler,
             row_batch_size=row_batch_size,
@@ -7913,7 +7960,11 @@ async def _fetch_resource_rows(
                 next_url_remaining = True
                 break
             seen_urls.add(url)
-            status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
+            status_code, payload, error, _elapsed = await _fetch_source_json(
+                source,
+                url,
+                timeout=resource_timeout,
+            )
             if status_code != 200 or error:
                 current_error = error or f"http_{status_code}"
                 if partitioned_fetch:
@@ -8005,6 +8056,8 @@ async def _fetch_scan_practitioner_role_rows(
     rows_by_resource: dict[str, list[dict[str, Any]]],
     options: ScanPractitionerRoleFetchOptions,
 ) -> ResourceFetchResult:
+    if options.source is None:
+        options = replace(options, source=source)
     model = ProviderDirectoryPractitionerRole
     rows: list[dict[str, Any]] = []
     seen_role_ids: set[str] | None = set() if options.retain_rows else None
@@ -8022,6 +8075,11 @@ async def _fetch_scan_practitioner_role_rows(
         row_batch_handler=options.row_batch_handler,
         row_batch_size=options.row_batch_size,
         pending_row_items=[],
+    )
+    resource_timeout = _source_resource_timeout(
+        options.source or source,
+        "PractitionerRole",
+        options.timeout,
     )
     is_deadline_reached = False
     deadline_at = (
@@ -8069,7 +8127,7 @@ async def _fetch_scan_practitioner_role_rows(
             status_code, payload, error, _elapsed = await _fetch_source_json(
                 source,
                 url,
-                timeout=options.timeout,
+                timeout=resource_timeout,
             )
             if status_code != 200 or error:
                 current_error = error or f"http_{status_code}"
@@ -8448,6 +8506,21 @@ def _record_resource_fetch_stats(stats: dict[str, dict[str, Any]], resource_type
         entry["sources_empty"] += 1
     if result.fetch_mode == "bulk_export":
         entry["bulk_export_sources"] += 1
+
+
+def _is_resource_fetch_complete_for_publish(result: ResourceFetchResult) -> bool:
+    return result.complete and not result.error and not result.bounded and not result.next_url_remaining
+
+
+def _record_resource_completion(
+    completion: dict[str, set[str]] | None,
+    resource_type: str,
+    source_ids: list[str],
+    result: ResourceFetchResult,
+) -> None:
+    if completion is None or not _is_resource_fetch_complete_for_publish(result):
+        return
+    completion.setdefault(resource_type, set()).update(source_ids)
 
 
 def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_source: int) -> dict[str, Any]:
@@ -9079,6 +9152,7 @@ async def _import_resources(
     resource_deadline_seconds: int = 0,
     linked_counts: dict[str, int] | None = None,
     resource_fetch_stats: dict[str, dict[str, Any]] | None = None,
+    resource_completion: dict[str, set[str]] | None = None,
     stale_counts: dict[str, int] | None = None,
     stale_cleanup: bool = False,
     stream_batch_size: int = 0,
@@ -9274,7 +9348,7 @@ async def _import_resources(
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
                 if linked_resource_limit > 0 or (
                     scan_role_reverse_lookup_planned
-                    and resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES
+                    and resource_type in _practitioner_role_reverse_lookup_resources(source)
                 ):
                     rows_by_resource.setdefault(resource_type, []).extend(
                         _compact_linked_reference_rows(resource_type, rows)
@@ -9311,6 +9385,7 @@ async def _import_resources(
                 continue
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, resource_type, result)
+            _record_resource_completion(resource_completion, resource_type, source_ids, result)
             if result.rows or resource_type not in rows_by_resource:
                 rows_by_resource[resource_type] = result.rows
             written_total = (
@@ -9392,6 +9467,12 @@ async def _import_resources(
                 retry_result = replace(retry_result, fetch_mode=f"{retry_result.fetch_mode}_retry")
                 for _source_id in source_ids:
                     _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", retry_result)
+                _record_resource_completion(
+                    resource_completion,
+                    "PractitionerRole",
+                    source_ids,
+                    retry_result,
+                )
                 if retry_result.rows or "PractitionerRole" not in rows_by_resource:
                     rows_by_resource["PractitionerRole"] = retry_result.rows
                 retry_written_total = (
@@ -9445,7 +9526,7 @@ async def _import_resources(
             scan_seed_stage_table = seen_stage_table if use_streaming and seen_stage_table else None
             if scan_seed_stage_table:
                 await _prepare_provider_directory_import_seen_stage_lookup(scan_seed_stage_table)
-                for seed_resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+                for seed_resource_type in _practitioner_role_reverse_lookup_resources(source):
                     rows_by_resource.pop(seed_resource_type, None)
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
@@ -9477,12 +9558,14 @@ async def _import_resources(
                     cancel_ctx=cancel_ctx,
                     cancel_task=cancel_task,
                     deadline_seconds=linked_resource_deadline_seconds,
+                    source=source,
                     seed_stage_table=scan_seed_stage_table,
                     seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
                 ),
             )
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", result)
+            _record_resource_completion(resource_completion, "PractitionerRole", source_ids, result)
             written_total = (
                 result.rows_written
                 if use_streaming
@@ -9908,6 +9991,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 message=f"importing resources from {len(source_import_groups)} source group(s)",
                 metrics=metrics,
             )
+            completed_source_ids_by_resource: dict[str, set[str]] = {}
             metrics["resource_rows"] = await _import_resources(
                 importable,
                 resources=resources,
@@ -9922,6 +10006,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 resource_deadline_seconds=resource_deadline_seconds,
                 linked_counts=metrics.setdefault("linked_resource_rows", {}),
                 resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
+                resource_completion=completed_source_ids_by_resource,
                 stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
                 stale_cleanup=stale_cleanup,
                 stream_batch_size=stream_batch_size,
@@ -9932,6 +10017,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 progress_callback=resource_progress,
                 preserve_seen_stage=bool(seen_stage_table_for_publish),
             )
+            metrics["resource_fetch_completed_source_ids"] = {
+                resource_type: sorted(source_ids)
+                for resource_type, source_ids in sorted(completed_source_ids_by_resource.items())
+            }
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts:
                 artifact_source_ids = requested_source_ids
@@ -9941,16 +10030,60 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                         for importable_source in importable
                         if _clean_text(importable_source.get("source_id")) is not None
                     ]
-                metrics = await _publish_provider_directory_artifacts(
-                    run_id=run_id,
-                    metrics=metrics,
-                    seen_table=seen_stage_table_for_publish,
-                    address_key_run_id=run_id,
-                    publish_scope_run_id=run_id,
-                    source_ids=artifact_source_ids,
-                    publish_corroboration=publish_corroboration,
-                    publish_artifacts_targets=publish_artifacts_targets,
+                required_publish_resources = [
+                    resource_type
+                    for resource_type in ("PractitionerRole", "Practitioner", "Location")
+                    if resource_type in resources
+                ]
+                resource_fetch_stats_by_resource = metrics.get("resource_fetch_stats") or {}
+                resource_fetch_has_failures = any(
+                    int(resource_stats.get("sources_failed") or 0) > 0
+                    for resource_stats in resource_fetch_stats_by_resource.values()
+                    if isinstance(resource_stats, dict)
                 )
+                completion_tracking_available = bool(completed_source_ids_by_resource) or resource_fetch_has_failures
+                if completion_tracking_available:
+                    publishable_artifact_source_ids = [
+                        source_id
+                        for source_id in artifact_source_ids
+                        if all(
+                            source_id in completed_source_ids_by_resource.get(resource_type, set())
+                            for resource_type in required_publish_resources
+                        )
+                    ]
+                else:
+                    publishable_artifact_source_ids = list(artifact_source_ids)
+                metrics["publishable_artifact_source_ids"] = publishable_artifact_source_ids
+                skipped_artifact_source_ids = sorted(set(artifact_source_ids) - set(publishable_artifact_source_ids))
+                if skipped_artifact_source_ids:
+                    metrics["artifact_publish_skipped_source_ids"] = skipped_artifact_source_ids
+                    metrics["artifact_publish_required_resources"] = required_publish_resources
+                if required_publish_resources and not publishable_artifact_source_ids:
+                    skip_payload_by_metric = {
+                        "skipped": True,
+                        "reason": "critical_resource_fetch_incomplete",
+                        "required_resources": required_publish_resources,
+                        "source_ids": artifact_source_ids,
+                    }
+                    metrics["location_contacts_backfilled"] = skip_payload_by_metric
+                    metrics["location_coordinates_backfilled"] = skip_payload_by_metric
+                    metrics["location_address_keys_stamped"] = skip_payload_by_metric
+                    metrics["location_archive"] = skip_payload_by_metric
+                    metrics["address_overlay"] = skip_payload_by_metric
+                    metrics["network_catalog"] = skip_payload_by_metric
+                    metrics["ptg_corroboration_view_published"] = False
+                    metrics["ptg_corroboration_view_skipped"] = skip_payload_by_metric
+                else:
+                    metrics = await _publish_provider_directory_artifacts(
+                        run_id=run_id,
+                        metrics=metrics,
+                        seen_table=seen_stage_table_for_publish,
+                        address_key_run_id=run_id,
+                        publish_scope_run_id=run_id,
+                        source_ids=publishable_artifact_source_ids,
+                        publish_corroboration=publish_corroboration,
+                        publish_artifacts_targets=publish_artifacts_targets,
+                    )
             else:
                 metrics["location_contacts_backfilled"] = {
                     "skipped": True,
