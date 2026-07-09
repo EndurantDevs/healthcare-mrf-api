@@ -5388,6 +5388,72 @@ def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
     )
 
 
+def _practitioner_partition_bundle(resource_id: str) -> dict[str, Any]:
+    return {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": resource_id,
+                    "name": [{"family": f"Family {resource_id}"}],
+                }
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch):
+    requested_urls: list[str] = []
+    written_resource_batches: list[dict[str, Any]] = []
+    fetch_count_by_name = {"active": 0, "peak": 0}
+
+    async def fake_fetch_json(_source_record, request_url, *, timeout):
+        requested_urls.append(request_url)
+        fetch_count_by_name["active"] += 1
+        fetch_count_by_name["peak"] = max(fetch_count_by_name["peak"], fetch_count_by_name["active"])
+        await asyncio.sleep(0.01)
+        fetch_count_by_name["active"] -= 1
+        resource_id = request_url.rsplit("=", 1)[-1]
+        return 200, _practitioner_partition_bundle(resource_id), None, 5
+
+    async def fake_write(_model, resource_batch):
+        written_resource_batches.extend(resource_batch)
+        return len(resource_batch)
+
+    start_urls = [
+        "https://example.test/fhir/Practitioner?part=1",
+        "https://example.test/fhir/Practitioner?part=2",
+        "https://example.test/fhir/Practitioner?part=3",
+    ]
+    monkeypatch.setattr(importer, "_resource_start_urls", lambda *_args, **_kwargs: start_urls)
+    monkeypatch.setattr(importer, "_partition_fetch_concurrency", lambda: 2)
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    practitioner_fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        row_batch_handler=fake_write,
+        row_batch_size=2,
+        retain_rows=False,
+    )
+
+    assert practitioner_fetch_result is not None
+    assert practitioner_fetch_result.fetch_mode == "partitioned_paged"
+    assert practitioner_fetch_result.complete is True
+    assert practitioner_fetch_result.rows_fetched == 3
+    assert practitioner_fetch_result.rows_written == 3
+    assert fetch_count_by_name["peak"] == 2
+    assert sorted(requested_urls) == start_urls
+    assert [resource_row["resource_id"] for resource_row in written_resource_batches] == ["1", "2", "3"]
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
     calls: list[str] = []

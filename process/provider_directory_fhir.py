@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
@@ -491,6 +491,37 @@ class ResourceFetchResult:
             or self.hard_page_limit_reached
             or self.deadline_reached
         )
+
+
+@dataclass
+class PartitionFetchState:
+    """Shared counters for concurrent partitioned FHIR searches."""
+
+    result_model: type
+    retained_resource_rows: list[dict[str, Any]]
+    fetched_count: int = 0
+    written_count: int = 0
+    page_count: int = 0
+    partition_error_count: int = 0
+    error_message: str | None = None
+    hard_page_limit_reached: bool = False
+    deadline_reached: bool = False
+    next_url_remaining: bool = False
+    seen_urls: set[str] = field(default_factory=set)
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True)
+class PartitionFetchOptions:
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    row_batch_size: int
+    retain_rows: bool
+    deadline_at: float | None
+    max_pages: int
 
 
 @dataclass(frozen=True)
@@ -8015,11 +8046,11 @@ async def _fetch_bulk_export_resource_rows(
         if output_error and rows_fetched == 0 and rows_written == 0:
             return None
         complete = not output_error and not row_limit_reached
-        return ResourceFetchResult(
-            model=model,
-            rows=rows,
-            rows_fetched=rows_fetched,
-            rows_written=rows_written,
+    return ResourceFetchResult(
+        model=model,
+        rows=rows,
+        rows_fetched=rows_fetched,
+        rows_written=rows_written,
             pages_fetched=(output_urls and len(output_urls) or 0) + polls,
             complete=complete,
             row_limit_reached=row_limit_reached,
@@ -8027,8 +8058,216 @@ async def _fetch_bulk_export_resource_rows(
             hard_page_limit_reached=False,
             next_url_remaining=row_limit_reached,
             error=output_error,
-            fetch_mode="bulk_export",
+        fetch_mode="bulk_export",
+    )
+
+
+async def _flush_partition_resource_rows(
+    state: PartitionFetchState,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
+    pending_resource_rows: list[dict[str, Any]],
+) -> None:
+    if not row_batch_handler or not pending_resource_rows:
+        return
+    resource_batch_rows = list(pending_resource_rows)
+    pending_resource_rows.clear()
+    async with state.writer_lock:
+        written_count = await row_batch_handler(state.result_model, resource_batch_rows)
+    async with state.state_lock:
+        state.written_count += written_count
+
+
+async def _can_fetch_partition_url(
+    state: PartitionFetchState,
+    request_url: str,
+    *,
+    max_pages: int,
+) -> bool:
+    async with state.state_lock:
+        if state.stop_event.is_set():
+            return False
+        if max_pages > 0 and state.page_count >= max_pages:
+            state.hard_page_limit_reached = True
+            state.next_url_remaining = True
+            state.stop_event.set()
+            return False
+        if request_url in state.seen_urls:
+            state.error_message = "pagination loop detected"
+            state.next_url_remaining = True
+            return False
+        state.seen_urls.add(request_url)
+        return True
+
+
+async def _mark_partition_fetch_error(
+    state: PartitionFetchState,
+    current_error: str,
+) -> None:
+    async with state.state_lock:
+        state.partition_error_count += 1
+        state.error_message = f"partition_errors_{state.partition_error_count}_last_{current_error}"
+
+
+async def _mark_partition_page_fetched(state: PartitionFetchState) -> None:
+    async with state.state_lock:
+        state.page_count += 1
+
+
+async def _consume_partition_entries(
+    state: PartitionFetchState,
+    source_record: dict[str, Any],
+    resource_type: str,
+    bundle_entries: list[dict[str, Any]],
+    pending_resource_rows: list[dict[str, Any]],
+    fetch_options: PartitionFetchOptions,
+) -> None:
+    for entry_record in bundle_entries:
+        parsed_resource = parse_fhir_resource(
+            source_record["source_id"],
+            entry_record["resource"],
+            resource_url=_clean_text(entry_record.get("fullUrl")),
+            run_id=fetch_options.run_id,
+            normalize_location_contacts=not (resource_type == "Location" and fetch_options.row_batch_handler),
         )
+        if not parsed_resource:
+            continue
+        parsed_model, resource_row = parsed_resource
+        if parsed_model is not state.result_model:
+            continue
+        async with state.state_lock:
+            state.fetched_count += 1
+            if fetch_options.retain_rows:
+                state.retained_resource_rows.append(resource_row)
+        if fetch_options.row_batch_handler:
+            pending_resource_rows.append(resource_row)
+            if len(pending_resource_rows) >= max(1, fetch_options.row_batch_size):
+                await _flush_partition_resource_rows(
+                    state,
+                    fetch_options.row_batch_handler,
+                    pending_resource_rows,
+                )
+
+
+async def _fetch_partition_url_chain(
+    source_record: dict[str, Any],
+    resource_type: str,
+    start_url_queue: asyncio.Queue[str],
+    state: PartitionFetchState,
+    request_url: str,
+    fetch_options: PartitionFetchOptions,
+) -> None:
+    pending_resource_rows: list[dict[str, Any]] = []
+    current_url: str | None = request_url
+    while current_url and not state.stop_event.is_set():
+        if fetch_options.deadline_at is not None and time.monotonic() >= fetch_options.deadline_at:
+            state.deadline_reached = True
+            state.next_url_remaining = True
+            state.stop_event.set()
+            break
+        if not await _can_fetch_partition_url(state, current_url, max_pages=fetch_options.max_pages):
+            break
+        status_code, fhir_payload, fetch_error, _elapsed = await _fetch_source_json(
+            source_record,
+            current_url,
+            timeout=fetch_options.timeout,
+        )
+        if status_code != 200 or fetch_error:
+            await _mark_partition_fetch_error(state, fetch_error or f"http_{status_code}")
+            break
+        if not _is_bundle_payload(fhir_payload):
+            await _mark_partition_fetch_error(state, "non_bundle_payload")
+            break
+        await _mark_partition_page_fetched(state)
+        child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, current_url, fhir_payload)
+        if child_urls:
+            for child_url in child_urls:
+                start_url_queue.put_nowait(child_url)
+            break
+        await _consume_partition_entries(
+            state,
+            source_record,
+            resource_type,
+            _bundle_entries(fhir_payload),
+            pending_resource_rows,
+            fetch_options,
+        )
+        next_url = _next_link(fhir_payload)
+        current_url = urllib.parse.urljoin(current_url, next_url) if next_url else None
+    await _flush_partition_resource_rows(state, fetch_options.row_batch_handler, pending_resource_rows)
+
+
+async def _run_partition_fetch_worker(
+    source_record: dict[str, Any],
+    resource_type: str,
+    start_url_queue: asyncio.Queue[str],
+    state: PartitionFetchState,
+    fetch_options: PartitionFetchOptions,
+) -> None:
+    while not state.stop_event.is_set():
+        try:
+            request_url = start_url_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        try:
+            await _fetch_partition_url_chain(
+                source_record,
+                resource_type,
+                start_url_queue,
+                state,
+                request_url,
+                fetch_options,
+            )
+        finally:
+            start_url_queue.task_done()
+
+
+async def _fetch_partitioned_resource_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    start_urls: list[str],
+    fetch_options: PartitionFetchOptions,
+) -> ResourceFetchResult:
+    """Fetch independent FHIR search partitions concurrently and merge counts."""
+    start_url_queue: asyncio.Queue[str] = asyncio.Queue()
+    for request_url in start_urls:
+        start_url_queue.put_nowait(request_url)
+    state = PartitionFetchState(result_model=model, retained_resource_rows=[])
+    worker_count = min(_partition_fetch_concurrency(), max(1, len(start_urls)))
+    worker_tasks = [
+        asyncio.create_task(
+            _run_partition_fetch_worker(
+                source_record,
+                resource_type,
+                start_url_queue,
+                state,
+                fetch_options,
+            )
+        )
+        for _worker_index in range(worker_count)
+    ]
+    await asyncio.gather(*worker_tasks)
+    is_complete = (
+        not state.error_message
+        and not state.hard_page_limit_reached
+        and not state.deadline_reached
+        and start_url_queue.empty()
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=state.retained_resource_rows,
+        rows_fetched=state.fetched_count,
+        rows_written=state.written_count,
+        pages_fetched=state.page_count,
+        complete=is_complete,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=state.hard_page_limit_reached,
+        next_url_remaining=state.next_url_remaining or not start_url_queue.empty(),
+        error=state.error_message or ("deadline_reached" if state.deadline_reached else None),
+        fetch_mode="partitioned_paged",
+        deadline_reached=state.deadline_reached,
+    )
 
 
 async def _fetch_resource_rows(
@@ -8099,6 +8338,28 @@ async def _fetch_resource_rows(
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     pending_start_urls = list(start_urls)
     partitioned_fetch = len(pending_start_urls) > 1
+    if (
+        partitioned_fetch
+        and _partition_fetch_concurrency() > 1
+        and per_resource_limit <= 0
+        and page_limit <= 0
+    ):
+        partition_fetch_options = PartitionFetchOptions(
+            timeout=resource_timeout,
+            run_id=run_id,
+            row_batch_handler=row_batch_handler,
+            row_batch_size=row_batch_size,
+            retain_rows=retain_rows,
+            deadline_at=deadline_at,
+            max_pages=max_pages,
+        )
+        return await _fetch_partitioned_resource_rows(
+            source,
+            resource_type,
+            model,
+            pending_start_urls,
+            partition_fetch_options,
+        )
     partition_error_count = 0
     url: str | None = None
 
@@ -9044,6 +9305,10 @@ def _env_int(name: str, default: int) -> int:
 
 def _linked_resource_flush_rows() -> int:
     return _env_int("HLTHPRT_PROVIDER_DIRECTORY_LINKED_RESOURCE_FLUSH_ROWS", 1000)
+
+
+def _partition_fetch_concurrency() -> int:
+    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", 8))
 
 
 async def _mark_provider_directory_progress(
