@@ -7,6 +7,39 @@ import pytest
 from process.ptg_parts import ptg2_serving_binary as serving_binary_writer
 
 
+def test_natural_lean_stream_sql_joins_dictionary_tables():
+    by_code_sql = serving_binary_writer._serving_binary_stream_sql(
+        qualified_source='"mrf"."ptg2_manifest_stage_serving_token"',
+        kind="by_code",
+        source_layout=serving_binary_writer.PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN,
+        qualified_code_count_table='"mrf"."ptg2_code_count_token"',
+        qualified_provider_set_dictionary_table='"mrf"."ptg2_provider_set_dict_token"',
+    )
+    reverse_sql = serving_binary_writer._serving_binary_stream_sql(
+        qualified_source='"mrf"."ptg2_manifest_stage_serving_token"',
+        kind="by_provider_set",
+        source_layout=serving_binary_writer.PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN,
+        qualified_code_count_table='"mrf"."ptg2_code_count_token"',
+        qualified_provider_set_dictionary_table='"mrf"."ptg2_provider_set_dict_token"',
+    )
+
+    assert 'FROM "mrf"."ptg2_manifest_stage_serving_token" serving' in by_code_sql
+    assert 'JOIN "mrf"."ptg2_code_count_token" code_count' in by_code_sql
+    assert 'JOIN "mrf"."ptg2_provider_set_dict_token" provider_set_dictionary' in by_code_sql
+    assert "code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system" in by_code_sql
+    assert "ORDER BY code_count.code_key, provider_set_dictionary.provider_set_key" in by_code_sql
+    assert "ORDER BY provider_set_dictionary.provider_set_key, code_count.code_key" in reverse_sql
+
+
+def test_natural_lean_stream_sql_requires_dictionary_tables():
+    with pytest.raises(ValueError, match="dictionary tables"):
+        serving_binary_writer._serving_binary_stream_sql(
+            qualified_source='"mrf"."ptg2_manifest_stage_serving_token"',
+            kind="by_code",
+            source_layout=serving_binary_writer.PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN,
+        )
+
+
 @pytest.mark.asyncio
 async def test_price_set_atom_writer_keeps_block_numbers_when_keys_reappear(monkeypatch):
     copied_records = []

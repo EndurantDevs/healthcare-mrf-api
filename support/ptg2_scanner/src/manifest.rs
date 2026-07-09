@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use xxhash_rust::xxh3::Xxh3;
 
 pub const GLOBAL_ID_BYTES: usize = 16;
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GlobalId128(pub [u8; GLOBAL_ID_BYTES]);
@@ -28,8 +29,9 @@ impl GlobalId128 {
         let mut hasher = Xxh3::new();
         hasher.update(domain.as_bytes());
         for part in parts {
+            let mut length_buffer = itoa::Buffer::new();
             hasher.update(b"\x1f");
-            hasher.update(part.len().to_string().as_bytes());
+            hasher.update(length_buffer.format(part.len()).as_bytes());
             hasher.update(b":");
             hasher.update(part.as_bytes());
         }
@@ -83,7 +85,8 @@ impl GlobalId128 {
     pub fn to_hex(self) -> String {
         let mut out = String::with_capacity(GLOBAL_ID_BYTES * 2);
         for byte in self.0 {
-            out.push_str(&format!("{byte:02x}"));
+            out.push(LOWER_HEX[(byte >> 4) as usize] as char);
+            out.push(LOWER_HEX[(byte & 0x0f) as usize] as char);
         }
         out
     }
@@ -266,6 +269,16 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.to_hex().len(), 32);
+    }
+
+    #[test]
+    fn global_id_hex_uses_lowercase_fixed_width_encoding() {
+        let id = GlobalId128([
+            0x00, 0x01, 0x0f, 0x10, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80, 0x91, 0xa2, 0xb3,
+            0xc4, 0xff,
+        ]);
+
+        assert_eq!(id.to_hex(), "00010f102a3b4c5d6e7f8091a2b3c4ff");
     }
 
     #[test]
