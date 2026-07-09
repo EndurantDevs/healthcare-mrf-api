@@ -1386,8 +1386,10 @@ def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_coun
 
 SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 UHC_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+UHC_POSTAL_SEARCH_ALPHABET = tuple("0123456789")
 UHC_ADAPTIVE_PARTITION_TOTAL_CAP = 10000
 UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 4
+UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH = 5
 
 
 def _letter_prefixes(length: int) -> tuple[str, ...]:
@@ -1430,6 +1432,11 @@ def _uhc_provider_directory_partition_values(resource_type: str) -> tuple[tuple[
         return tuple(("name", prefix) for prefix in _letter_prefixes(2))
     if resource_type == "Location":
         return tuple(("address-state", state) for state in US_STATE_ABBRS)
+    if resource_type == "PractitionerRole":
+        return tuple(
+            ("location.address-postalcode", prefix)
+            for prefix in UHC_POSTAL_SEARCH_ALPHABET
+        )
     return ()
 
 
@@ -1470,30 +1477,82 @@ def _uhc_adaptive_partition_max_prefix_length() -> int:
 
 
 def _uhc_adaptive_partition_child_urls(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     url: str,
-    payload: dict[str, Any],
+    bundle_payload: dict[str, Any],
 ) -> list[str]:
-    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
     if api_base != UHC_PROVIDER_DIRECTORY_BASE:
         return []
     query_items = urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)
     query_by_name = dict(query_items)
     if "_getpages" in query_by_name:
         return []
-    search_param = {"Practitioner": "family", "Organization": "name"}.get(resource_type)
+    search_param = {
+        "Practitioner": "family",
+        "Organization": "name",
+        "PractitionerRole": "location.address-postalcode",
+    }.get(resource_type)
     if not search_param:
         return []
-    total = _bundle_total(payload)
+    total = _bundle_total(bundle_payload)
     if total is None or total < UHC_ADAPTIVE_PARTITION_TOTAL_CAP:
         return []
     prefix = _clean_text(query_by_name.get(search_param))
     if not prefix:
         return []
-    if len(prefix) >= _uhc_adaptive_partition_max_prefix_length():
+    max_prefix_length = (
+        UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH
+        if resource_type == "PractitionerRole"
+        else _uhc_adaptive_partition_max_prefix_length()
+    )
+    if len(prefix) >= max_prefix_length:
         return []
-    return [_url_with_replaced_query_item(url, search_param, prefix + letter) for letter in UHC_SEARCH_ALPHABET]
+    search_alphabet = (
+        UHC_POSTAL_SEARCH_ALPHABET
+        if resource_type == "PractitionerRole"
+        else UHC_SEARCH_ALPHABET
+    )
+    return [
+        _url_with_replaced_query_item(url, search_param, prefix + character)
+        for character in search_alphabet
+    ]
+
+
+def _is_uhc_role_zip_cap_hit(
+    source: dict[str, Any],
+    resource_type: str,
+    url: str,
+    payload: dict[str, Any],
+) -> bool:
+    if resource_type != "PractitionerRole" or not _is_uhc_role_postal_partition_enabled(source):
+        return False
+    query_by_name = dict(
+        urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+    )
+    if "_getpages" in query_by_name:
+        return False
+    prefix = _clean_text(query_by_name.get("location.address-postalcode"))
+    return bool(
+        prefix
+        and len(prefix) >= UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH
+        and (_bundle_total(payload) or 0) >= UHC_ADAPTIVE_PARTITION_TOTAL_CAP
+    )
+
+
+def _is_uhc_role_postal_partition_enabled(source: dict[str, Any]) -> bool:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base != UHC_PROVIDER_DIRECTORY_BASE:
+        return False
+    return os.getenv("HLTHPRT_PROVIDER_DIRECTORY_UHC_ROLE_POSTAL_PARTITIONS", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
@@ -1522,6 +1581,7 @@ def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_cou
 def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
     return (
         resource_type == "PractitionerRole"
+        and not _is_uhc_role_postal_partition_enabled(source)
         and bool(_practitioner_role_reverse_lookup_resources(source))
     )
 
@@ -8620,6 +8680,16 @@ async def _fetch_partition_url_chain(
             for child_url in child_urls:
                 start_url_queue.put_nowait(child_url)
             break
+        if _is_uhc_role_zip_cap_hit(
+            source_record,
+            resource_type,
+            current_url,
+            fhir_payload,
+        ):
+            await _mark_partition_fetch_error(
+                state,
+                "uhc_role_postal_partition_cap_exhausted",
+            )
         await _consume_partition_entries(
             state,
             source_record,
@@ -8770,7 +8840,11 @@ async def _fetch_resource_rows(
     error_message: str | None = None
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
-    max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
+    max_pages = (
+        0
+        if resource_type == "PractitionerRole" and _is_uhc_role_postal_partition_enabled(source)
+        else _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
+    )
     pending_start_urls = list(start_urls)
     partitioned_fetch = len(pending_start_urls) > 1
     if (
@@ -8857,6 +8931,8 @@ async def _fetch_resource_rows(
                 pending_start_urls = child_urls + pending_start_urls
                 url = None
                 break
+            if _is_uhc_role_zip_cap_hit(source, resource_type, url, payload):
+                error_message = "uhc_role_postal_partition_cap_exhausted"
             entries = _bundle_entries(payload)
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(

@@ -5361,7 +5361,12 @@ def test_resource_start_urls_partitions_uhc_provider_directory_searches():
     assert location_urls[0] == "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-state=AL"
     assert location_urls[-1].endswith("_count=100&address-state=VI")
     assert len(location_urls) == len(importer.US_STATE_ABBRS)
-    assert role_urls == ["https://flex.optum.com/fhirpublic/R4/PractitionerRole?_count=100"]
+    assert role_urls[0] == (
+        "https://flex.optum.com/fhirpublic/R4/PractitionerRole?"
+        "_count=100&location.address-postalcode=0"
+    )
+    assert role_urls[-1].endswith("_count=100&location.address-postalcode=9")
+    assert len(role_urls) == 10
 
 
 def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
@@ -5387,6 +5392,43 @@ def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
             {"resourceType": "Bundle", "total": 9999},
         )
         == []
+    )
+
+
+def test_uhc_adaptive_partition_child_urls_split_capped_role_postal_prefix():
+    source_lookup = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    children = importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "PractitionerRole",
+        (
+            "https://flex.optum.com/fhirpublic/R4/PractitionerRole?"
+            "_count=100&location.address-postalcode=606"
+        ),
+        {"resourceType": "Bundle", "total": 10000},
+    )
+
+    assert children[0].endswith("_count=100&location.address-postalcode=6060")
+    assert children[-1].endswith("_count=100&location.address-postalcode=6069")
+    assert len(children) == 10
+
+
+def test_uhc_role_postal_partition_reports_unsplittable_zip_cap():
+    source_lookup = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._is_uhc_role_zip_cap_hit(
+        source_lookup,
+        "PractitionerRole",
+        (
+            "https://flex.optum.com/fhirpublic/R4/PractitionerRole?"
+            "_count=100&location.address-postalcode=60601"
+        ),
+        {"resourceType": "Bundle", "total": 10000},
     )
 
 
@@ -6138,6 +6180,7 @@ def _install_uhc_reverse_lookup_import_fakes(monkeypatch):
 async def test_import_resources_fetches_uhc_practitioner_roles_after_practitioners(monkeypatch):
     """UHC roles are recovered through practitioner reverse lookup with the UHC timeout floor."""
 
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_UHC_ROLE_POSTAL_PARTITIONS", "0")
     _stub_resource_import_metadata(monkeypatch)
     role_call_rows, upsert_call_rows = _install_uhc_reverse_lookup_import_fakes(monkeypatch)
 
