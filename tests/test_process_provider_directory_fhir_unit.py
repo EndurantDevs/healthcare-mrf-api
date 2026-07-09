@@ -2649,9 +2649,11 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
     )
 
     async def fake_fetch_json_with_options(url, *, timeout, extra_headers=None, query_params=None):
-        assert url == "https://payer.example/fhir/metadata?_format=json"
         assert extra_headers == {"Authorization": "Bearer secret-token"}
         assert query_params == {}
+        if url == "https://payer.example/fhir/Practitioner?_count=1":
+            return 200, {"resourceType": "Bundle", "entry": []}, None, 5
+        assert url == "https://payer.example/fhir/metadata?_format=json"
         return (
             200,
             {
@@ -2696,6 +2698,53 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
         "query_param_names": [],
     }
     assert "secret-token" not in json.dumps(metadata)
+
+
+@pytest.mark.asyncio
+async def test_probe_source_marks_resource_access_denied_as_auth_required(monkeypatch):
+    calls: list[str] = []
+    capability_payload_map = {
+        "resourceType": "CapabilityStatement",
+        "fhirVersion": "4.0.1",
+        "rest": [{"resource": [{"type": "Practitioner"}]}],
+    }
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        calls.append(request_url)
+        if "/metadata" in request_url:
+            return 200, capability_payload_map, None, 5
+        return (
+            403,
+            {
+                "resourceType": "OperationOutcome",
+                "issue": [{"diagnostics": "Access denied by rule"}],
+            },
+            None,
+            7,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    probe, returned_capability = await importer._probe_source(
+        {
+            "source_id": "gated_source",
+            "api_base": "https://gated.example/fhir",
+            "canonical_api_base": "https://gated.example/fhir",
+        },
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert probe["status"] == "auth_required"
+    assert probe["http_status"] == 403
+    assert probe["resource_probe"]["resource_type"] == "Practitioner"
+    assert returned_capability == capability_payload_map
+    assert calls == [
+        "https://gated.example/fhir/metadata?_format=json",
+        "https://gated.example/fhir/Practitioner?_count=1",
+        "https://gated.example/fhir/metadata",
+        "https://gated.example/fhir/Practitioner?_count=1",
+    ]
 
 
 @pytest.mark.asyncio

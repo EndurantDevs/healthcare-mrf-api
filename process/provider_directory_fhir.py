@@ -7751,10 +7751,144 @@ async def _fetch_source_json(
     )
 
 
-async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    urls = _candidate_metadata_urls(source)
-    if not urls:
-        probe = {
+RESOURCE_ACCESS_PROBE_ORDER = (
+    "Practitioner",
+    "PractitionerRole",
+    "Location",
+    "Organization",
+    "InsurancePlan",
+)
+
+
+def _capability_resource_types(capability_payload: dict[str, Any]) -> set[str]:
+    resource_types: set[str] = set()
+    for rest_item in capability_payload.get("rest") or []:
+        if not isinstance(rest_item, dict):
+            continue
+        for resource_item in rest_item.get("resource") or []:
+            if not isinstance(resource_item, dict):
+                continue
+            resource_type = _clean_text(resource_item.get("type"))
+            if resource_type:
+                resource_types.add(resource_type)
+    return resource_types
+
+
+def _is_access_denied_outcome(resource_payload: dict[str, Any] | None) -> bool:
+    if not resource_payload or resource_payload.get("resourceType") != "OperationOutcome":
+        return False
+    issue_text = " ".join(
+        str(issue.get("diagnostics") or issue.get("details", {}).get("text") or "")
+        for issue in resource_payload.get("issue") or []
+        if isinstance(issue, dict)
+    ).lower()
+    return any(
+        marker in issue_text
+        for marker in ("access denied", "not authorized", "not authorised", "forbidden")
+    )
+
+
+async def _probe_resource_access(
+    source_record: dict[str, Any],
+    candidate_base: str,
+    capability_payload: dict[str, Any],
+    *,
+    timeout: int,
+) -> dict[str, Any] | None:
+    if _alohr_source_uses_graphql_connector(source_record):
+        return None
+    supported_resource_types = _capability_resource_types(capability_payload)
+    resource_type = next(
+        (
+            candidate_resource_type
+            for candidate_resource_type in RESOURCE_ACCESS_PROBE_ORDER
+            if candidate_resource_type in supported_resource_types
+        ),
+        None,
+    )
+    if not resource_type:
+        return None
+    resource_probe_source_map = {
+        **source_record,
+        "api_base": candidate_base,
+        "canonical_api_base": candidate_base,
+    }
+    resource_url = _resource_start_url(resource_probe_source_map, resource_type, page_count=1)
+    if not resource_url:
+        return None
+    status_code, resource_payload, error, elapsed = await _fetch_source_json(
+        resource_probe_source_map,
+        resource_url,
+        timeout=timeout,
+    )
+    is_access_denied = status_code in {401, 403} or _is_access_denied_outcome(resource_payload)
+    return {
+        "status": "auth_required" if is_access_denied else "reachable",
+        "http_status": status_code,
+        "response_time_ms": elapsed,
+        "url": resource_url,
+        "resource_type": resource_type,
+        "error": error or ("resource access denied" if is_access_denied else None),
+    }
+
+
+async def _probe_metadata_candidate(
+    source_record: dict[str, Any],
+    candidate_base: str,
+    metadata_url: str,
+    *,
+    timeout: int,
+    run_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    status_code, capability_payload, error, elapsed = await _fetch_source_json(
+        source_record,
+        metadata_url,
+        timeout=timeout,
+    )
+    status = _classify_http(status_code, error, capability_payload)
+    credential = _credential_request_options_for_source(source_record, metadata_url)
+    is_credential_missing = not credential["descriptor"] and not _alohr_source_uses_graphql_connector(
+        source_record
+    )
+    if status == "valid" and _source_declares_credentialed_access(source_record) and is_credential_missing:
+        status = "auth_required"
+        error = error or "source requires credentialed Provider Directory resource access but no matching credentials are configured"
+    if status == "valid_non_fhir" and is_credential_missing and (
+        _source_declares_credentialed_access(source_record)
+        or _source_uses_known_onboarding_gateway(source_record)
+    ):
+        status = "auth_required"
+        error = error or "source requires credentialed Provider Directory access but no matching credentials are configured"
+    resource_probe_map = None
+    if status == "valid" and isinstance(capability_payload, dict):
+        resource_probe_map = await _probe_resource_access(
+            source_record,
+            candidate_base,
+            capability_payload,
+            timeout=timeout,
+        )
+        if resource_probe_map and resource_probe_map["status"] == "auth_required":
+            status = "auth_required"
+            status_code = resource_probe_map.get("http_status")
+            error = resource_probe_map.get("error") or "Provider Directory resource access requires authorization"
+    candidate_probe_map = {
+        "status": status,
+        "http_status": status_code,
+        "response_time_ms": elapsed,
+        "url": metadata_url,
+        "api_base": candidate_base,
+        "error": error,
+        "run_id": run_id,
+        "credential": credential["descriptor"],
+        "resource_probe": resource_probe_map,
+    }
+    return candidate_probe_map, capability_payload
+
+
+async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    metadata_urls = _candidate_metadata_urls(source_record)
+    if not metadata_urls:
+        source_probe_map = {
             "status": "no_api",
             "http_status": None,
             "response_time_ms": 0,
@@ -7762,26 +7896,26 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
             "error": "missing api_base",
             "run_id": run_id,
         }
-        return probe, None
+        return source_probe_map, None
     missing_credential_blocks_probe = (
         (
-            _source_declares_credentialed_access(source)
-            or _source_uses_known_onboarding_gateway(source)
+            _source_declares_credentialed_access(source_record)
+            or _source_uses_known_onboarding_gateway(source_record)
         )
-        and not _alohr_source_uses_graphql_connector(source)
+        and not _alohr_source_uses_graphql_connector(source_record)
         and not any(
-            _credential_request_options_for_source(source, url)["descriptor"]
-            for _candidate_base, url in urls
+            _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
+            for _candidate_base, metadata_url in metadata_urls
         )
     )
     if missing_credential_blocks_probe:
-        candidate_base, url = urls[0]
+        candidate_base, metadata_url = metadata_urls[0]
         return (
             {
                 "status": "auth_required",
                 "http_status": None,
                 "response_time_ms": 0,
-                "url": url,
+                "url": metadata_url,
                 "api_base": candidate_base,
                 "error": (
                     "source requires credentialed Provider Directory access "
@@ -7794,40 +7928,19 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
         )
     best_probe: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
-    for candidate_base, url in urls:
-        status_code, payload, error, elapsed = await _fetch_source_json(source, url, timeout=timeout)
-        status = _classify_http(status_code, error, payload)
-        credential = _credential_request_options_for_source(source, url)
-        if (
-            status == "valid"
-            and _source_declares_credentialed_access(source)
-            and not _alohr_source_uses_graphql_connector(source)
-            and not credential["descriptor"]
-        ):
-            status = "auth_required"
-            error = error or "source requires credentialed Provider Directory resource access but no matching credentials are configured"
-        if (
-            status == "valid_non_fhir"
-            and (_source_declares_credentialed_access(source) or _source_uses_known_onboarding_gateway(source))
-            and not credential["descriptor"]
-        ):
-            status = "auth_required"
-            error = error or "source requires credentialed Provider Directory access but no matching credentials are configured"
-        probe = {
-            "status": status,
-            "http_status": status_code,
-            "response_time_ms": elapsed,
-            "url": url,
-            "api_base": candidate_base,
-            "error": error,
-            "run_id": run_id,
-            "credential": credential["descriptor"],
-        }
-        if status == "valid":
-            return probe, payload
-        if best_probe is None or status_code == 200:
-            best_probe = probe
-            best_payload = payload
+    for candidate_base, metadata_url in metadata_urls:
+        candidate_probe_map, capability_payload = await _probe_metadata_candidate(
+            source_record,
+            candidate_base,
+            metadata_url,
+            timeout=timeout,
+            run_id=run_id,
+        )
+        if candidate_probe_map["status"] == "valid":
+            return candidate_probe_map, capability_payload
+        if best_probe is None or candidate_probe_map.get("http_status") == 200:
+            best_probe = candidate_probe_map
+            best_payload = capability_payload
     assert best_probe is not None
     return best_probe, best_payload
 
@@ -7835,13 +7948,14 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
     candidate_count = max(1, len(_candidate_metadata_urls(source)))
+    request_count = candidate_count * 2
     env_value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT")
     if env_value:
         try:
             return max(1, int(env_value))
         except ValueError:
-            return max(timeout + 1, (timeout * candidate_count) + 2)
-    return max(timeout + 1, (timeout * candidate_count) + 2)
+            return max(timeout + 1, (timeout * request_count) + 2)
+    return max(timeout + 1, (timeout * request_count) + 2)
 
 
 def _probe_flush_every() -> int:
