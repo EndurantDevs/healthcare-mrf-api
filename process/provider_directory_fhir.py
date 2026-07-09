@@ -383,6 +383,10 @@ AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirecto
 AETNA_PROVIDER_DIRECTORY_DATA_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectorydata"
 AETNA_PROVIDER_DIRECTORY_TOKEN_URL = "https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token"
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
+CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
+    resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
+)
+CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
 CENTENE_PARTNER_PORTAL_APIS_URL = "https://partners.centene.com/apis"
 CENTENE_PROVIDER_DIRECTORY_BASE = "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory"
 CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE = "https://iopc-provider.api.centene.com/iopc/provider/ca"
@@ -2107,6 +2111,43 @@ def _source_metadata(source: dict[str, Any]) -> dict[str, Any]:
     return _json_object(source.get("metadata_json"))
 
 
+def _expected_nonempty_resource_types(source: dict[str, Any]) -> set[str]:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == CIGNA_PROVIDER_DIRECTORY_BASE:
+        return set(CIGNA_EXPECTED_NONEMPTY_RESOURCES)
+    configured_resources = _source_metadata(source).get(
+        "provider_directory_expected_nonempty_resources"
+    )
+    if not isinstance(configured_resources, list):
+        return set()
+    return {
+        resource_type
+        for resource_type in (_clean_text(value) for value in configured_resources)
+        if resource_type
+    }
+
+
+def _fail_closed_on_unexpected_empty_resource(
+    source: dict[str, Any],
+    resource_type: str,
+    result: ResourceFetchResult,
+) -> ResourceFetchResult:
+    if (
+        resource_type not in _expected_nonempty_resource_types(source)
+        or not result.complete
+        or result.error
+        or result.bounded
+        or result.rows_fetched > 0
+        or result.rows_written > 0
+    ):
+        return result
+    return replace(
+        result,
+        complete=False,
+        error=CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR,
+    )
+
+
 def _normalize_credential_key(value: Any) -> str:
     return str(value or "").strip().lower()
 
@@ -2594,6 +2635,9 @@ def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
             ),
             "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
             "provider_directory_confirmed_base": CIGNA_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_expected_nonempty_resources": sorted(
+                CIGNA_EXPECTED_NONEMPTY_RESOURCES
+            ),
         },
     }
 
@@ -11214,6 +11258,11 @@ async def _import_resources(
             )
             if not result:
                 continue
+            result = _fail_closed_on_unexpected_empty_resource(
+                source,
+                resource_type,
+                result,
+            )
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, resource_type, result)
             _record_resource_completion(resource_completion, resource_type, source_ids, result)

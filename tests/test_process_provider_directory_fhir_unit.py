@@ -234,6 +234,9 @@ def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
     assert row["auth_type"] == "none"
     assert row["last_validated_status"] == "valid_non_fhir"
     assert row["metadata_json"]["provider_directory_override"] == "cigna_public_providerdirectory"
+    assert set(row["metadata_json"]["provider_directory_expected_nonempty_resources"]) == (
+        importer.CIGNA_EXPECTED_NONEMPTY_RESOURCES
+    )
     assert (
         row["metadata_json"]["provider_directory_previous_api_base"]
         == "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4"
@@ -2792,6 +2795,54 @@ def test_source_fetch_does_not_resize_continuation_page(continuation_query):
     url = f"https://payer.example/fhir/Practitioner?_count=1000&{continuation_query}"
 
     assert importer._source_fetch_candidate_urls(url) == [url]
+
+
+@pytest.mark.parametrize("resource_type", sorted(importer.CIGNA_EXPECTED_NONEMPTY_RESOURCES))
+def test_cigna_expected_nonempty_resource_fails_closed(resource_type):
+    result = importer.ResourceFetchResult(
+        model=object,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+    guarded_result = importer._fail_closed_on_unexpected_empty_resource(
+        {"canonical_api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE},
+        resource_type,
+        result,
+    )
+
+    assert guarded_result.complete is False
+    assert guarded_result.error == importer.CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
+
+
+def test_cigna_empty_endpoint_remains_complete():
+    result = importer.ResourceFetchResult(
+        model=object,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+    guarded_result = importer._fail_closed_on_unexpected_empty_resource(
+        {"canonical_api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE},
+        "Endpoint",
+        result,
+    )
+
+    assert guarded_result is result
 
 
 @pytest.mark.asyncio
