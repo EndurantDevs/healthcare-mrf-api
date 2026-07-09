@@ -2,7 +2,21 @@
 
 import os
 
-from sqlalchemy import DATE, JSON, TEXT, TIMESTAMP, BigInteger, Boolean, Column, DateTime, Integer, PrimaryKeyConstraint, String
+from sqlalchemy import (
+    DATE,
+    JSON,
+    TEXT,
+    TIMESTAMP,
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    UniqueConstraint,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -20,9 +34,12 @@ __all__ = (
     "MRFUrlObservation",
     "PartDImportRun",
     "PartDFormularySnapshot",
+    "ProviderDirectoryAPIEndpoint",
     "ProviderDirectoryCapability",
     "ProviderDirectoryCanonicalResource",
+    "ProviderDirectoryDatasetResource",
     "ProviderDirectoryEndpoint",
+    "ProviderDirectoryEndpointDataset",
     "ProviderDirectoryHealthcareService",
     "ProviderDirectoryInsurancePlan",
     "ProviderDirectoryLocation",
@@ -345,6 +362,109 @@ class MRFUrlObservation(Base, JSONOutputMixin):
     metadata_json = Column(JSON)
 
 
+class ProviderDirectoryAPIEndpoint(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_api_endpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("endpoint_id"),
+        UniqueConstraint(
+            "canonical_api_base",
+            "credential_descriptor_hash",
+            "endpoint_signature_hash",
+            name="provider_directory_api_endpoint_identity_key",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["endpoint_id"]
+
+    endpoint_id = Column(String(64), nullable=False)
+    canonical_api_base = Column(TEXT, nullable=False)
+    credential_descriptor_hash = Column(String(64), nullable=False)
+    endpoint_signature_hash = Column(String(64), nullable=False)
+    credential_descriptor_json = Column(JSON)
+    endpoint_signature_json = Column(JSON)
+    first_seen_at = Column(TIMESTAMP)
+    last_seen_at = Column(TIMESTAMP)
+    metadata_json = Column(JSON)
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_endpoint_dataset"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("dataset_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["dataset_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("endpoint_id",),
+            "name": "provider_directory_endpoint_dataset_endpoint_idx",
+        },
+        {"index_elements": ("status",), "name": "provider_directory_endpoint_dataset_status_idx"},
+        {
+            "index_elements": ("endpoint_id",),
+            "name": "provider_directory_endpoint_dataset_current_idx",
+            "unique": True,
+            "where": "is_current = true",
+        },
+        {"index_elements": ("dataset_hash",), "name": "provider_directory_endpoint_dataset_hash_idx"},
+    ]
+
+    dataset_id = Column(String(96), nullable=False)
+    endpoint_id = Column(
+        String(64),
+        ForeignKey(
+            ProviderDirectoryAPIEndpoint.endpoint_id,
+            name="provider_directory_endpoint_dataset_endpoint_id_fkey",
+        ),
+        nullable=False,
+    )
+    import_run_id = Column(String(64))
+    previous_dataset_id = Column(String(96))
+    dataset_hash = Column(String(64))
+    status = Column(String(32), nullable=False)
+    is_current = Column(Boolean, nullable=False, default=False)
+    resource_count = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(TIMESTAMP)
+    validated_at = Column(TIMESTAMP)
+    published_at = Column(TIMESTAMP)
+    superseded_at = Column(TIMESTAMP)
+    publication_metadata_json = Column(JSON)
+
+
+class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_dataset_resource"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("dataset_id", "resource_type", "resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["dataset_id", "resource_type", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("resource_type", "resource_id"),
+            "name": "provider_directory_dataset_resource_type_id_idx",
+        },
+        {"index_elements": ("payload_hash",), "name": "provider_directory_dataset_resource_hash_idx"},
+    ]
+
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="provider_directory_dataset_resource_dataset_id_fkey",
+        ),
+        nullable=False,
+    )
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(String(256), nullable=False)
+    payload_hash = Column(String(64), nullable=False)
+    payload_json = Column(JSON, nullable=False)
+
+
 class ProviderDirectorySource(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_source"
     __main_table__ = __tablename__
@@ -359,6 +479,7 @@ class ProviderDirectorySource(Base, JSONOutputMixin):
         {"index_elements": ("auth_type",), "name": "provider_directory_source_auth_type_idx"},
         {"index_elements": ("last_validated_status",), "name": "provider_directory_source_validation_idx"},
         {"index_elements": ("data_quality_flag",), "name": "provider_directory_source_data_quality_idx"},
+        {"index_elements": ("endpoint_id",), "name": "provider_directory_source_endpoint_id_idx"},
     ]
 
     source_id = Column(String(64), nullable=False)
@@ -368,6 +489,14 @@ class ProviderDirectorySource(Base, JSONOutputMixin):
     portal_url = Column(TEXT)
     api_base = Column(TEXT)
     canonical_api_base = Column(TEXT)
+    endpoint_id = Column(
+        String(64),
+        ForeignKey(
+            ProviderDirectoryAPIEndpoint.endpoint_id,
+            name="provider_directory_source_endpoint_id_fkey",
+            ondelete="SET NULL",
+        ),
+    )
     endpoint_insurance_plan = Column(TEXT)
     endpoint_practitioner = Column(TEXT)
     endpoint_practitioner_role = Column(TEXT)
