@@ -2849,7 +2849,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     columns = _match_candidate_column_sql(address_table_sql)
     query_params: dict[str, Any] = {
         "limit": int(params["limit"]),
-        "candidate_limit": min(max(int(params["limit"]) * 8, 25), 500),
+        "candidate_limit": min(max(int(params["limit"]) * 8, 100), 500),
     }
     address_where = [
         _provider_list_address_type_clause(
