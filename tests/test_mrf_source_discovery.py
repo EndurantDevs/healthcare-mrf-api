@@ -9748,6 +9748,42 @@ async def test_push_import_control_catalog_uses_requested_catalog_concurrency(
     assert snapshot_state_dict["max_active"] == 2
 
 
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_retries_transient_group_errors(
+    monkeypatch,
+):
+    http_calls = []
+    attempts_by_source_id = {}
+
+    async def fake_snapshot(source_ids):
+        assert len(source_ids) == 1
+        source_id = source_ids[0]
+        attempts_by_source_id[source_id] = attempts_by_source_id.get(source_id, 0) + 1
+        if attempts_by_source_id[source_id] == 1:
+            raise TimeoutError()
+        return {}
+
+    monkeypatch.delenv("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_CONCURRENCY", raising=False)
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(discovery, "_import_control_catalog_retry_delay", lambda _attempt: 0)
+    monkeypatch.setattr(
+        discovery.aiohttp, "ClientSession", _catalog_snapshot_fake_session(http_calls)
+    )
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        _metadata_only_catalog_source_rows(),
+        limit=2,
+        concurrency=2,
+    )
+
+    assert sources_synced == 2
+    assert plans_synced == 0
+    assert errors == []
+    assert attempts_by_source_id == {"source_one": 2, "source_two": 2}
+
+
 def _metadata_only_catalog_source_rows():
     return [
         {

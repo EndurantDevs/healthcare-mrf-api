@@ -13531,6 +13531,36 @@ def _import_control_catalog_concurrency(requested: int | None) -> int:
     return min(max(1, int(requested or 1)), 4)
 
 
+def _import_control_catalog_retry_attempts() -> int:
+    return min(_positive_env_int("HLTHPRT_MRF_IMPORT_CONTROL_CATALOG_RETRY_ATTEMPTS", 4), 8)
+
+
+def _import_control_catalog_retry_delay(attempt: int) -> float:
+    return min(60.0, float(5 * (2 ** max(0, attempt - 1))))
+
+
+def _should_retry_import_control_catalog_error(error: dict[str, Any]) -> bool:
+    message = str(error.get("message") or "").strip().lower()
+    if not message:
+        return True
+    return any(
+        token in message
+        for token in (
+            "broken pipe",
+            "connection reset",
+            "connection timeout",
+            "server disconnected",
+            "timeout",
+        )
+    )
+
+
+def _should_retry_import_control_catalog_errors(
+    errors: list[dict[str, Any]],
+) -> bool:
+    return bool(errors) and all(_should_retry_import_control_catalog_error(error) for error in errors)
+
+
 def _coerce_metadata(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -14817,34 +14847,46 @@ async def _push_import_control_catalog(
         progress_state_dict = {"done": 0}
         progress_lock = asyncio.Lock()
         semaphore = asyncio.Semaphore(catalog_concurrency)
+        retry_attempts = _import_control_catalog_retry_attempts()
 
         async def sync_catalog_source_identity_group(
             group_rows: list[dict[str, Any]],
         ) -> tuple[int, int, list[dict[str, Any]]]:
             """Sync one source identity group while sharing global run progress."""
             async with semaphore:
-                try:
-                    group_sync_result = await _push_import_control_catalog(
-                        group_rows,
-                        limit=len(group_rows),
-                        progress_run_id=None,
-                        concurrency=1,
+                group_sync_result = (0, 0, [])
+                for attempt in range(1, retry_attempts + 1):
+                    try:
+                        group_sync_result = await _push_import_control_catalog(
+                            group_rows,
+                            limit=len(group_rows),
+                            progress_run_id=None,
+                            concurrency=1,
+                        )
+                    except Exception as sync_error:
+                        source_id = (
+                            str(group_rows[0].get("source_id") or "") if group_rows else ""
+                        )
+                        group_sync_result = (
+                            0,
+                            0,
+                            [
+                                {
+                                    "source_id": source_id or None,
+                                    "import_control_source_id": None,
+                                    "message": str(sync_error),
+                                }
+                            ],
+                        )
+                    group_sources_synced, _group_plans_synced, group_errors = group_sync_result
+                    should_retry = (
+                        attempt < retry_attempts
+                        and group_sources_synced == 0
+                        and _should_retry_import_control_catalog_errors(group_errors)
                     )
-                except Exception as sync_error:
-                    source_id = (
-                        str(group_rows[0].get("source_id") or "") if group_rows else ""
-                    )
-                    group_sync_result = (
-                        0,
-                        0,
-                        [
-                            {
-                                "source_id": source_id or None,
-                                "import_control_source_id": None,
-                                "message": str(sync_error),
-                            }
-                        ],
-                    )
+                    if not should_retry:
+                        break
+                    await asyncio.sleep(_import_control_catalog_retry_delay(attempt))
             async with progress_lock:
                 progress_state_dict["done"] += len(group_rows)
                 current_done = progress_state_dict["done"]
