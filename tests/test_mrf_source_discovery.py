@@ -9760,6 +9760,8 @@ async def test_push_import_control_catalog_retries_transient_group_errors(
         source_id = source_ids[0]
         attempts_by_source_id[source_id] = attempts_by_source_id.get(source_id, 0) + 1
         if attempts_by_source_id[source_id] == 1:
+            if source_id == "source_one":
+                raise OSError(113, "No route to host")
             raise TimeoutError()
         return {}
 

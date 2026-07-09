@@ -13549,6 +13549,7 @@ def _should_retry_import_control_catalog_error(error: dict[str, Any]) -> bool:
             "broken pipe",
             "connection reset",
             "connection timeout",
+            "no route to host",
             "server disconnected",
             "timeout",
         )
