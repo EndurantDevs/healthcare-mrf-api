@@ -2960,8 +2960,47 @@ async def _ptg_summary(
     skip_corroboration: bool = False,
     skip_network_name_overlap: bool = False,
     force_live_view_scans: bool = False,
+    fast_probe: bool = False,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
+    view = "provider_directory_address_corroboration"
+    view_kind = await _relation_kind(conn, schema, view)
+    if fast_probe:
+        estimate = await _table_row_estimate(conn, schema, view) if view_kind else {}
+        estimated_rows = _int(estimate.get("row_count"))
+        summary["ptg_unified_address"] = {
+            "available": bool(view_kind),
+            "summary_source": "provider_directory_address_corroboration_estimate",
+            "counts_are_estimates": True,
+            "ptg_unified_address_rows": estimated_rows,
+            "ptg_source_count": 0,
+            "ptg_npi_count": 0,
+            "ptg_keyed_address_rows": estimated_rows,
+            "ptg_keyed_address_pct": _pct(estimated_rows, estimated_rows),
+        }
+        if skip_corroboration:
+            summary["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
+        elif not view_kind:
+            summary["ptg_corroboration"] = {"available": False}
+        else:
+            summary["ptg_corroboration"] = {
+                "available": True,
+                "summary_source": "pg_stat_user_tables",
+                "counts_are_estimates": True,
+                "relation_kind": view_kind,
+                "corroboration_rows": estimated_rows,
+                "provider_directory_source_count": 0,
+                "active_match_rows": 0,
+                "plan_context_match_rows": 0,
+                "network_context_rows": 0,
+                "resolved_network_name_rows": 0,
+                "resolved_network_match_rows": 0,
+            }
+        summary["ptg_network_name_overlap"] = _skipped_summary(
+            "disabled by --fast-serving-readiness",
+            samples=[],
+        )
+        return summary
     if await _relation_exists(conn, schema, "entity_address_unified"):
         plan_filter = (
             "WHERE COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 "
@@ -2993,8 +3032,6 @@ async def _ptg_summary(
         summary["ptg_unified_address"] = {"available": True, **row}
     else:
         summary["ptg_unified_address"] = {"available": False}
-    view = "provider_directory_address_corroboration"
-    view_kind = await _relation_kind(conn, schema, view)
     if skip_corroboration:
         summary["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
     elif not view_kind:
@@ -4484,6 +4521,7 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     skip_corroboration=args.skip_ptg_corroboration,
                     skip_network_name_overlap=args.skip_ptg_network_overlap,
                     force_live_view_scans=args.force_ptg_live_view_scans,
+                    fast_probe=bool(args.fast_serving_readiness),
                 )
             ),
             "network_resolution_summary": network_resolution_summary,

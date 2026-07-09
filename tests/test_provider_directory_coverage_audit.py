@@ -1296,6 +1296,35 @@ def test_provider_directory_coverage_audit_skipped_ptg_summary_shape():
     }
 
 
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_ptg_summary_fast_probe_uses_estimate(monkeypatch):
+    async def relation_kind(_conn, _schema, table):
+        assert table == "provider_directory_address_corroboration"
+        return "table"
+
+    async def table_row_estimate(_conn, _schema, table):
+        assert table == "provider_directory_address_corroboration"
+        return {"row_count": 42}
+
+    monkeypatch.setattr(audit, "_relation_kind", relation_kind)
+    monkeypatch.setattr(audit, "_table_row_estimate", table_row_estimate)
+
+    summary = await audit._ptg_summary(AsyncMock(), "mrf", sample_limit=5, fast_probe=True)
+
+    assert summary["ptg_unified_address"]["summary_source"] == (
+        "provider_directory_address_corroboration_estimate"
+    )
+    assert summary["ptg_unified_address"]["ptg_unified_address_rows"] == 42
+    assert summary["ptg_corroboration"]["summary_source"] == "pg_stat_user_tables"
+    assert summary["ptg_corroboration"]["corroboration_rows"] == 42
+    assert summary["ptg_network_name_overlap"] == {
+        "available": False,
+        "skipped": True,
+        "reason": "disabled by --fast-serving-readiness",
+        "samples": [],
+    }
+
+
 def test_provider_directory_coverage_audit_ptg_network_overlap_sql_uses_serving_network_names():
     sql = audit._ptg_network_name_overlap_cte_sql("mrf", ptg_plan_filter="AND plan_ids.plan_id = $1")
 
