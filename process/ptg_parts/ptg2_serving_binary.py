@@ -665,8 +665,8 @@ async def _load_price_key_map(*, schema_name: str, table_name: str) -> dict[byte
         f"""
         SELECT
             payload,
-            COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
-            NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+            COALESCE(payload_compression, 'none') AS payload_compression,
+            raw_payload_bytes
         FROM {qualified_target} binary_block
         WHERE artifact_kind = :artifact_kind
           AND block_key = 0
