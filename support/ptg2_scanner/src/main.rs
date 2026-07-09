@@ -334,6 +334,13 @@ type ServingProviderPattern = (ServingProviderEntries, Vec<i32>);
 type ServingProviderPatternMap = HashMap<ServingProviderEntries, Vec<i32>>;
 
 #[derive(Default)]
+struct ServingProviderBlockStats {
+    record_count: u64,
+    block_count: u64,
+    pattern_count: u64,
+}
+
+#[derive(Default)]
 struct ManifestGlobalIdCache {
     provider_sets: HashMap<String, (GlobalId128, String)>,
     price_sets: HashMap<String, (GlobalId128, String)>,
@@ -3374,14 +3381,6 @@ fn take_vec_replacing_with_capacity<T>(values: &mut Vec<T>, capacity: usize) -> 
     replacement
 }
 
-fn take_vec_replacing_with_bounded_capacity<T>(
-    values: &mut Vec<T>,
-    max_retain_capacity: usize,
-) -> Vec<T> {
-    let retained_capacity = values.capacity().min(max_retain_capacity);
-    take_vec_replacing_with_capacity(values, retained_capacity)
-}
-
 fn take_raw_rate_chunk_replacing_with_bounded_capacity(
     chunk: &mut RawRateChunk,
     rate_capacity: usize,
@@ -4508,14 +4507,6 @@ fn read_rate_lite_struson<R: Read>(
         network_names: canonical_text_list(network_names, false),
         prices,
     }))
-}
-
-fn transfer_next_value_to_bytes<R: Read>(
-    json_reader: &mut JsonStreamReader<R>,
-) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    transfer_next_value_to_bytes_append(json_reader, &mut bytes)?;
-    Ok(bytes)
 }
 
 fn transfer_next_value_to_bytes_append<R: Read>(
@@ -7567,9 +7558,7 @@ fn flush_serving_binary_provider_blocks<W: Write>(
     provider_set_key: i32,
     max_payload_bytes: usize,
     current_patterns: &mut ServingProviderPatternMap,
-    record_count: &mut u64,
-    block_count: &mut u64,
-    pattern_count: &mut u64,
+    block_stats: &mut ServingProviderBlockStats,
 ) -> io::Result<()> {
     let mut ordered_patterns: Vec<ServingProviderPattern> = current_patterns.drain().collect();
     ordered_patterns.sort_unstable_by(|left, right| {
@@ -7596,9 +7585,11 @@ fn flush_serving_binary_provider_blocks<W: Write>(
                 block_pattern_count,
                 &block_payload,
             )?;
-            *record_count = record_count.saturating_add(1);
-            *block_count = block_count.saturating_add(1);
-            *pattern_count = pattern_count.saturating_add(block_pattern_count as u64);
+            block_stats.record_count = block_stats.record_count.saturating_add(1);
+            block_stats.block_count = block_stats.block_count.saturating_add(1);
+            block_stats.pattern_count = block_stats
+                .pattern_count
+                .saturating_add(block_pattern_count as u64);
             block_payload.clear();
             block_pattern_count = 0;
             block_no += 1;
@@ -7616,9 +7607,11 @@ fn flush_serving_binary_provider_blocks<W: Write>(
             block_pattern_count,
             &block_payload,
         )?;
-        *record_count = record_count.saturating_add(1);
-        *block_count = block_count.saturating_add(1);
-        *pattern_count = pattern_count.saturating_add(block_pattern_count as u64);
+        block_stats.record_count = block_stats.record_count.saturating_add(1);
+        block_stats.block_count = block_stats.block_count.saturating_add(1);
+        block_stats.pattern_count = block_stats
+            .pattern_count
+            .saturating_add(block_pattern_count as u64);
     }
     Ok(())
 }
@@ -7634,9 +7627,7 @@ fn write_serving_binary_by_provider_set_copy_from_reader<R: BufRead, W: Write>(
     let mut price_set_values: Vec<[u8; GLOBAL_ID_BYTES]> = Vec::new();
     let mut code_keys_seen: HashSet<i32> = HashSet::new();
     let mut row_count = 0u64;
-    let mut record_count = 0u64;
-    let mut block_count = 0u64;
-    let mut pattern_count = 0u64;
+    let mut block_stats = ServingProviderBlockStats::default();
     let mut provider_set_count = 0u64;
     let mut current_provider_set: Option<i32> = None;
     let mut current_code: Option<i32> = None;
@@ -7671,9 +7662,7 @@ fn write_serving_binary_by_provider_set_copy_from_reader<R: BufRead, W: Write>(
                     previous_provider_set,
                     max_payload_bytes,
                     &mut current_patterns,
-                    &mut record_count,
-                    &mut block_count,
-                    &mut pattern_count,
+                    &mut block_stats,
                 )?;
             }
             current_provider_set = Some(provider_set_key);
@@ -7704,9 +7693,7 @@ fn write_serving_binary_by_provider_set_copy_from_reader<R: BufRead, W: Write>(
             provider_set_key,
             max_payload_bytes,
             &mut current_patterns,
-            &mut record_count,
-            &mut block_count,
-            &mut pattern_count,
+            &mut block_stats,
         )?;
     }
     let dictionary_payload = serving_binary_dictionary_payload(&price_set_values);
@@ -7719,7 +7706,7 @@ fn write_serving_binary_by_provider_set_copy_from_reader<R: BufRead, W: Write>(
         price_set_values.len(),
         &dictionary_payload,
     )?;
-    record_count = record_count.saturating_add(1);
+    block_stats.record_count = block_stats.record_count.saturating_add(1);
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
     let mut payload = json!({
@@ -7729,10 +7716,10 @@ fn write_serving_binary_by_provider_set_copy_from_reader<R: BufRead, W: Write>(
         "row_count": row_count,
         "provider_set_count": provider_set_count,
         "code_count": code_keys_seen.len(),
-        "block_count": block_count,
-        "pattern_count": pattern_count,
+        "block_count": block_stats.block_count,
+        "pattern_count": block_stats.pattern_count,
         "price_set_count": price_set_values.len(),
-        "copy_record_count": record_count,
+        "copy_record_count": block_stats.record_count,
         "byte_count": writer.byte_count(),
         "block_bytes": max_payload_bytes,
         "target_copy_format": if target_format == ServingBinaryTargetCopyFormat::Binary { "postgres_binary" } else { "text" },
@@ -7754,9 +7741,7 @@ fn write_serving_binary_by_provider_set_copy_from_pg_binary_reader<R: Read, W: W
     let mut price_set_values: Vec<[u8; GLOBAL_ID_BYTES]> = Vec::new();
     let mut code_keys_seen: HashSet<i32> = HashSet::new();
     let mut row_count = 0u64;
-    let mut record_count = 0u64;
-    let mut block_count = 0u64;
-    let mut pattern_count = 0u64;
+    let mut block_stats = ServingProviderBlockStats::default();
     let mut provider_set_count = 0u64;
     let mut current_provider_set: Option<i32> = None;
     let mut current_code: Option<i32> = None;
@@ -7785,9 +7770,7 @@ fn write_serving_binary_by_provider_set_copy_from_pg_binary_reader<R: Read, W: W
                     previous_provider_set,
                     max_payload_bytes,
                     &mut current_patterns,
-                    &mut record_count,
-                    &mut block_count,
-                    &mut pattern_count,
+                    &mut block_stats,
                 )?;
             }
             current_provider_set = Some(provider_set_key);
@@ -7818,9 +7801,7 @@ fn write_serving_binary_by_provider_set_copy_from_pg_binary_reader<R: Read, W: W
             provider_set_key,
             max_payload_bytes,
             &mut current_patterns,
-            &mut record_count,
-            &mut block_count,
-            &mut pattern_count,
+            &mut block_stats,
         )?;
     }
     let dictionary_payload = serving_binary_dictionary_payload(&price_set_values);
@@ -7833,7 +7814,7 @@ fn write_serving_binary_by_provider_set_copy_from_pg_binary_reader<R: Read, W: W
         price_set_values.len(),
         &dictionary_payload,
     )?;
-    record_count = record_count.saturating_add(1);
+    block_stats.record_count = block_stats.record_count.saturating_add(1);
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
     let mut payload = json!({
@@ -7843,10 +7824,10 @@ fn write_serving_binary_by_provider_set_copy_from_pg_binary_reader<R: Read, W: W
         "row_count": row_count,
         "provider_set_count": provider_set_count,
         "code_count": code_keys_seen.len(),
-        "block_count": block_count,
-        "pattern_count": pattern_count,
+        "block_count": block_stats.block_count,
+        "pattern_count": block_stats.pattern_count,
         "price_set_count": price_set_values.len(),
-        "copy_record_count": record_count,
+        "copy_record_count": block_stats.record_count,
         "byte_count": writer.byte_count(),
         "block_bytes": max_payload_bytes,
         "source_copy_format": "postgres_binary",
@@ -8050,9 +8031,7 @@ where
         reverse_current_code,
         &mut reverse_current_entries,
     );
-    let mut reverse_record_count = 0u64;
-    let mut reverse_block_count = 0u64;
-    let mut reverse_pattern_count = 0u64;
+    let mut reverse_block_stats = ServingProviderBlockStats::default();
     let reverse_provider_set_count = reverse_patterns_by_provider.len();
     for (provider_set_key, mut patterns) in reverse_patterns_by_provider {
         flush_serving_binary_provider_blocks(
@@ -8061,9 +8040,7 @@ where
             provider_set_key,
             max_payload_bytes,
             &mut patterns,
-            &mut reverse_record_count,
-            &mut reverse_block_count,
-            &mut reverse_pattern_count,
+            &mut reverse_block_stats,
         )?;
     }
     let reverse_dictionary_payload = serving_binary_dictionary_payload(&reverse_price_set_values);
@@ -8076,7 +8053,7 @@ where
         reverse_price_set_values.len(),
         &reverse_dictionary_payload,
     )?;
-    reverse_record_count = reverse_record_count.saturating_add(1);
+    reverse_block_stats.record_count = reverse_block_stats.record_count.saturating_add(1);
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
 
@@ -8100,17 +8077,17 @@ where
         "row_count": row_count,
         "provider_set_count": reverse_provider_set_count,
         "code_count": reverse_code_keys_seen.len(),
-        "block_count": reverse_block_count,
-        "pattern_count": reverse_pattern_count,
+        "block_count": reverse_block_stats.block_count,
+        "pattern_count": reverse_block_stats.pattern_count,
         "price_set_count": reverse_price_set_values.len(),
-        "copy_record_count": reverse_record_count,
+        "copy_record_count": reverse_block_stats.record_count,
         "block_bytes": max_payload_bytes,
     });
     let mut payload = json!({
         "name": "serving_binary_combined",
         "format": PTG2_SERVING_BINARY_TABLE_FORMAT,
         "row_count": row_count,
-        "copy_record_count": by_code_state.record_count.saturating_add(reverse_record_count),
+        "copy_record_count": by_code_state.record_count.saturating_add(reverse_block_stats.record_count),
         "byte_count": writer.byte_count(),
         "block_bytes": max_payload_bytes,
         "target_copy_format": if target_format == ServingBinaryTargetCopyFormat::Binary { "postgres_binary" } else { "text" },
@@ -9156,19 +9133,6 @@ mod tests {
 
         assert_eq!(processed, 1);
         assert!(provider_map.contains_key("9"));
-    }
-
-    #[test]
-    fn bounded_vec_take_keeps_payload_and_caps_replacement_capacity() {
-        let mut capture = Vec::with_capacity(MAX_RETAINED_CAPTURE_BYTES + 1024);
-        capture.extend_from_slice(b"{\"provider_group_id\":\"1\"}");
-
-        let taken =
-            take_vec_replacing_with_bounded_capacity(&mut capture, MAX_RETAINED_CAPTURE_BYTES);
-
-        assert_eq!(taken, br#"{"provider_group_id":"1"}"#);
-        assert!(capture.is_empty());
-        assert_eq!(capture.capacity(), MAX_RETAINED_CAPTURE_BYTES);
     }
 
     #[test]
