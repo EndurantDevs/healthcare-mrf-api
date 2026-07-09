@@ -676,6 +676,9 @@ def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
     assert row["metadata_json"]["provider_directory_override"] == "uhc_flex_optum_fhirpublic_r4"
     assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.UHC_INTEROPERABILITY_APIS_URL
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.UHC_PROVIDER_DIRECTORY_METADATA_URL
+    assert row["metadata_json"]["provider_directory_resource_page_count_caps"] == {
+        "InsurancePlan": 1,
+    }
 
 
 def test_source_row_from_seed_overrides_uhc_dead_fhir_host():
@@ -4897,6 +4900,16 @@ def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_
     assert url == (
         "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?_count=25"
     )
+
+
+def test_resource_start_url_caps_uhc_insurance_plan_page_count():
+    url = importer._resource_start_url(
+        {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "InsurancePlan",
+        page_count=100,
+    )
+
+    assert url == "https://flex.optum.com/fhirpublic/R4/InsurancePlan?_count=1"
 
 
 def test_resource_start_url_does_not_cap_other_michigan_interopstation_resources():

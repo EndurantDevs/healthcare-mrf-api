@@ -457,6 +457,9 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     # This HAPI proxy returns an empty PractitionerRole Bundle for _count >= 50,
     # even though _count=25 returns rows and a next link.
     (INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
+    # UHC/Flex InsurancePlan accepts tiny pages but returns Azure 504s for
+    # _count=10/100, so full imports must walk this resource one row at a time.
+    (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
 }
 PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
@@ -1916,6 +1919,9 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
             "provider_directory_confirmed_base": UHC_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": UHC_INTEROPERABILITY_APIS_URL,
             "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_resource_page_count_caps": {
+                "InsurancePlan": 1,
+            },
         },
     }
 
