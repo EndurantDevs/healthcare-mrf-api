@@ -617,6 +617,7 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     source_id = Column(String(64), nullable=False)
     resource_id = Column(String(256), nullable=False)
     resource_url = Column(TEXT)
+    npi = Column(BigInteger)
     active = Column(Boolean)
     practitioner_ref = Column(TEXT)
     organization_ref = Column(TEXT)

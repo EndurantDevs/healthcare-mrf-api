@@ -3113,6 +3113,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
         {
             "resourceType": "PractitionerRole",
             "id": "role-1",
+            "identifier": [{"system": "https://example.test/fhir/npi", "value": "1234567893"}],
             "practitioner": {"reference": "Practitioner/prac-1"},
             "organization": {"reference": "Organization/org-1"},
             "location": [{"reference": "Location/loc-1"}],
@@ -3156,6 +3157,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert location_row["telephone_number"] == "312-555-0100"
     assert location_row["phone_number"] == "3125550100"
     assert role_model is ProviderDirectoryPractitionerRole
+    assert role_row["npi"] == 1234567893
     assert role_row["location_refs"] == ["Location/loc-1"]
     assert role_row["insurance_plan_refs"] == ["InsurancePlan/plan-1"]
     assert role_row["endpoint_refs"] == ["Endpoint/endpoint-1"]
@@ -3183,7 +3185,7 @@ def test_address_corroboration_sql_links_overlay_roles():
     assert "split_part(overlay.source_record_id, ':', 5)" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
     assert "practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')" in sql
-    assert "practitioner.npi = e.npi" in sql
+    assert "COALESCE(practitioner.npi, role.npi) = e.npi" in sql
     assert 'LEFT JOIN "mrf"."provider_directory_location" loc' in sql
     assert "loc.resource_id = e.location_resource_id" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS provider_directory_network_refs" in sql
@@ -7636,6 +7638,8 @@ def test_address_overlay_sql_scope():
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
     assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
+    assert "COALESCE(practitioner.npi, role.npi)::bigint AS npi" in sql
+    assert "COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999" in sql
     assert "AS role_phone ON TRUE" in sql
     assert "loc.latitude" in sql
     assert "/ 1000000" in sql

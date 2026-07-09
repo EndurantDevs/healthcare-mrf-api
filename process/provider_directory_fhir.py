@@ -2749,6 +2749,7 @@ def parse_fhir_resource(
         period_start, period_end = _period(resource)
         row = {
             **base,
+            "npi": _npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
             "practitioner_ref": _first_reference(resource.get("practitioner")),
             "organization_ref": _first_reference(resource.get("organization")),
@@ -3166,7 +3167,7 @@ def provider_directory_address_corroboration_sql(
           JOIN {_qt(schema, "provider_directory_practitioner")} practitioner
             ON practitioner.source_id = role.source_id
            AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
-           AND practitioner.npi = e.npi
+           AND COALESCE(practitioner.npi, role.npi) = e.npi
           LEFT JOIN {_qt(schema, "provider_directory_location")} loc
             ON loc.source_id = e.source_id
            AND loc.resource_id = e.location_resource_id
@@ -11037,7 +11038,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             role.last_seen_run_id::varchar AS last_seen_run_id,
             'PractitionerRole'::varchar AS resource_type,
             role.resource_id::varchar AS resource_id,
-            practitioner.npi::bigint AS npi,
+            COALESCE(practitioner.npi, role.npi)::bigint AS npi,
             CASE
                 WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
                 ELSE {qschema}.addr_key_v1(
@@ -11098,7 +11099,7 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                  AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                LIMIT 1
           ) AS role_fax ON TRUE
-         WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+         WHERE COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999
            AND practitioner.active IS DISTINCT FROM false
            AND role.active IS DISTINCT FROM false
            AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
@@ -11431,7 +11432,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 role.last_seen_run_id::varchar AS last_seen_run_id,
                 'PractitionerRole'::varchar AS resource_type,
                 role.resource_id::varchar AS resource_id,
-                practitioner.npi::bigint AS npi,
+                COALESCE(practitioner.npi, role.npi)::bigint AS npi,
                 CASE
                     WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
                     ELSE {qschema}.addr_key_v1(
@@ -11486,7 +11487,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                      AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                    LIMIT 1
               ) AS role_fax ON TRUE
-             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+             WHERE COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999
                AND practitioner.active IS DISTINCT FROM false
                AND role.active IS DISTINCT FROM false
                AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
