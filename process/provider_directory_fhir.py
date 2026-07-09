@@ -539,6 +539,27 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _provider_directory_index_elements_sql(model: Any, index: dict[str, Any]) -> str:
+    elements: list[str] = []
+    using = str(index.get("using") or "").strip().lower()
+    table = getattr(model, "__table__", None)
+    columns = getattr(table, "columns", {}) if table is not None else {}
+    for raw_element in index.get("index_elements", ()) or ():
+        element = str(raw_element)
+        column = columns.get(element) if hasattr(columns, "get") else None
+        column_type = getattr(column, "type", None)
+        if (
+            using == "gin"
+            and column is not None
+            and isinstance(column_type, SQLAlchemyJSON)
+            and not isinstance(column_type, JSONB)
+        ):
+            elements.append(f"({_q(element)}::jsonb)")
+        else:
+            elements.append(element)
+    return ", ".join(elements)
+
+
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 
@@ -4934,7 +4955,7 @@ async def _ensure_provider_directory_tables() -> None:
             name = index.get("name") or "_".join(index.get("index_elements", ()))
             using = f"USING {index.get('using')} " if index.get("using") else ""
             where = f" WHERE {index.get('where')}" if index.get("where") else ""
-            elements = ", ".join(index.get("index_elements", ()))
+            elements = _provider_directory_index_elements_sql(model, index)
             unique = "UNIQUE " if index.get("unique") else ""
             await db.status(
                 f"CREATE {unique}INDEX IF NOT EXISTS {name} "

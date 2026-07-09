@@ -38,6 +38,21 @@ def _stub_resource_import_metadata(monkeypatch):
     monkeypatch.setattr(importer, "_update_source_resource_import_metadata", AsyncMock())
 
 
+def test_provider_directory_json_gin_indexes_cast_json_columns_to_jsonb():
+    index = next(
+        spec
+        for spec in ProviderDirectoryPractitionerRole.__my_additional_indexes__
+        if spec["name"] == "provider_directory_role_location_refs_gin_idx"
+    )
+
+    elements_sql = importer._provider_directory_index_elements_sql(
+        ProviderDirectoryPractitionerRole,
+        index,
+    )
+
+    assert elements_sql == '("location_refs"::jsonb)'
+
+
 def test_source_row_from_seed_normalizes_base_and_flags():
     row = importer._source_row_from_seed(
         {
