@@ -40,6 +40,7 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
             "--skip-unified",
             "--skip-ptg",
             "--skip-network-resolution",
+            "--skip-practitioner-role-reimport-gap-summary",
             "--skip-top-source-yield",
             "--skip-advertised-resource-gaps",
             "--skip-valid-zero-row-sources",
@@ -55,6 +56,7 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
     assert args.skip_unified is True
     assert args.skip_ptg is True
     assert args.skip_network_resolution is True
+    assert args.skip_practitioner_role_reimport_gap_summary is True
     assert args.skip_top_source_yield is True
     assert args.skip_advertised_resource_gaps is True
     assert args.skip_valid_zero_row_sources is True
@@ -78,6 +80,7 @@ def test_provider_directory_coverage_audit_pod_safe_sets_expensive_skip_flags():
     assert args.skip_unified is True
     assert args.skip_ptg is True
     assert args.skip_network_resolution is True
+    assert args.skip_practitioner_role_reimport_gap_summary is True
     assert args.skip_top_source_yield is True
     assert args.skip_advertised_resource_gaps is True
     assert args.skip_valid_zero_row_sources is True

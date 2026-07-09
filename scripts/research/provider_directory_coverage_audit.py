@@ -4446,7 +4446,14 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 conn,
                 schema,
                 sample_limit=args.sample_limit,
-            ),
+            )
+            if not args.skip_practitioner_role_reimport_gap_summary
+            else {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-practitioner-role-reimport-gap-summary",
+                "samples": [],
+            },
             "canonical_resource_summary": (
                 {
                     "available": False,
@@ -5127,6 +5134,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the heavier unresolved network-ref scan for quick checks during active imports.",
     )
     parser.add_argument(
+        "--skip-practitioner-role-reimport-gap-summary",
+        action="store_true",
+        help="Skip the heavier per-source PractitionerRole reimport/projection gap scan.",
+    )
+    parser.add_argument(
         "--skip-ptg",
         action="store_true",
         help="Skip PTG pricing/corroboration scans for quick Provider Directory-only gates.",
@@ -5183,6 +5195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.skip_unified = True
         args.fast_serving_readiness = True
         args.skip_network_resolution = True
+        args.skip_practitioner_role_reimport_gap_summary = True
         args.skip_ptg = True
         args.skip_top_source_yield = True
         args.skip_advertised_resource_gaps = True
