@@ -406,6 +406,7 @@ HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_METADATA_URL = f"{HEALTH_PARTNERS_PLANS
 HAP_PROVIDER_DIRECTORY_DOC_URL = "https://api.hap.org/providerdirectoryapi"
 HAP_PROVIDER_DIRECTORY_BASE = "https://provider-directory-r4.api.hap.org"
 HAP_PROVIDER_DIRECTORY_METADATA_URL = f"{HAP_PROVIDER_DIRECTORY_BASE}/metadata"
+HAP_BLOCKED_PAGINATION_HOST = "fhir-prov-dir-r4.api.hap.org"
 CHORUS_PROVIDER_DIRECTORY_DOC_URL = "https://appconnect.chorushealthplans.org/developers/providerapi"
 FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL = "https://devportal.firstmedicalpr.com/ApiLibrary"
 AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS = {
@@ -784,8 +785,10 @@ class _PractitionerRoleReverseLookupState:
             )
             await self.add_practitioner_role_page(resource_rows)
             next_link = _next_link(bundle_payload)
-            next_lookup_url = (
-                urllib.parse.urljoin(next_lookup_url, next_link) if next_link else None
+            next_lookup_url = _resolved_fhir_next_url(
+                request.source,
+                next_lookup_url,
+                next_link,
             )
             if await self.has_reached_page_limit():
                 return
@@ -1287,6 +1290,35 @@ def _resource_or_metadata_parent_base(api_base: str | None) -> str | None:
     ):
         return _parent_base_url(canonical)
     return None
+
+
+def _rebased_derived_endpoint_fields(
+    row: dict[str, Any],
+    endpoint_overrides: dict[str, Any],
+    previous_api_base: str,
+    normalized_api_base: str,
+) -> dict[str, Any]:
+    rebased_fields_by_name = dict(endpoint_overrides)
+    normalized_fields_by_name = _source_override_endpoint_fields(normalized_api_base)
+    previous_base = _canonical_base(previous_api_base)
+    for endpoint_field, normalized_endpoint in normalized_fields_by_name.items():
+        current_endpoint = (
+            rebased_fields_by_name.get(endpoint_field)
+            if endpoint_field in rebased_fields_by_name
+            else row.get(endpoint_field)
+        )
+        canonical_endpoint = _canonical_base(current_endpoint)
+        is_derived_from_previous = bool(
+            previous_base
+            and canonical_endpoint
+            and (
+                canonical_endpoint == previous_base
+                or canonical_endpoint.startswith(previous_base.rstrip("/") + "/")
+            )
+        )
+        if not canonical_endpoint or is_derived_from_previous:
+            rebased_fields_by_name[endpoint_field] = normalized_endpoint
+    return rebased_fields_by_name
 
 
 def _append_unique(values: list[str], value: str | None) -> None:
@@ -2950,9 +2982,16 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
     endpoint_overrides = override.get("endpoints", {}) if override else {}
     parent_api_base = _resource_or_metadata_parent_base(api_base)
     if parent_api_base and _canonical_base(parent_api_base) != canonical_api_base:
+        previous_api_base = api_base
         metadata.setdefault("provider_directory_previous_api_base", api_base)
         metadata["provider_directory_base_normalization"] = "resource_or_metadata_parent_base"
         metadata["provider_directory_confirmed_base"] = parent_api_base
+        endpoint_overrides = _rebased_derived_endpoint_fields(
+            row,
+            endpoint_overrides,
+            previous_api_base,
+            parent_api_base,
+        )
         api_base = parent_api_base
         canonical_api_base = _canonical_base(parent_api_base)
     source_id = _stable_source_id(
@@ -8348,6 +8387,34 @@ def _next_link(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _resolved_fhir_next_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    next_link: str | None,
+) -> str | None:
+    if not next_link:
+        return None
+    next_url = urllib.parse.urljoin(current_url, next_link)
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    parsed_next = urllib.parse.urlsplit(next_url)
+    if api_base != HAP_PROVIDER_DIRECTORY_BASE:
+        return next_url
+    if parsed_next.netloc.lower() != HAP_BLOCKED_PAGINATION_HOST:
+        return next_url
+    public_base = urllib.parse.urlsplit(HAP_PROVIDER_DIRECTORY_BASE)
+    return urllib.parse.urlunsplit(
+        (
+            public_base.scheme,
+            public_base.netloc,
+            parsed_next.path,
+            parsed_next.query,
+            parsed_next.fragment,
+        )
+    )
+
+
 def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | None:
     api_base = _canonical_base(source.get("api_base"))
     if not api_base:
@@ -9053,7 +9120,7 @@ async def _fetch_partition_page(
     )
     next_url = _next_link(fhir_payload)
     return PartitionPageFetchResult(
-        next_url=urllib.parse.urljoin(current_url, next_url) if next_url else None,
+        next_url=_resolved_fhir_next_url(source_record, current_url, next_url),
         outcome="failed" if is_partition_failed_on_page else "fetched",
     )
 
@@ -9429,7 +9496,7 @@ async def _fetch_resource_rows(
                     next_url_remaining = True
                     break
             next_url = _next_link(payload)
-            url = urllib.parse.urljoin(url, next_url) if next_url else None
+            url = _resolved_fhir_next_url(source, url, next_url)
             if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
                 row_limit_reached = True
                 next_url_remaining = True
@@ -9604,7 +9671,7 @@ async def _fetch_scan_practitioner_role_rows(
                     row_limit_reached = entry_index < len(entries) - 1
                     break
             next_url = _next_link(payload)
-            url = urllib.parse.urljoin(url, next_url) if next_url else None
+            url = _resolved_fhir_next_url(source, url, next_url)
             if not _limit_allows_more(rows_fetched, options.per_resource_limit) and url:
                 row_limit_reached = True
                 next_url_remaining = True

@@ -77,6 +77,25 @@ def test_source_row_from_seed_normalizes_base_and_flags():
     assert row["is_medicare_advantage"] is True
 
 
+def test_normalized_resource_base_rebases_derived_endpoint_fields():
+    row = importer._source_row_from_seed(
+        {
+            "id": "resource-base-1",
+            "org_name": "Example Health Plan",
+            "api_base": "https://example.test/fhir/Practitioner",
+            "endpoint_practitioner": "https://example.test/fhir/Practitioner",
+            "endpoint_location": "https://example.test/fhir/Practitioner/Location",
+            "endpoint_organization": "https://example.test/fhir/Organization",
+            "source": "fixture",
+        }
+    )
+
+    assert row["api_base"] == "https://example.test/fhir"
+    assert row["endpoint_practitioner"] == "https://example.test/fhir/Practitioner"
+    assert row["endpoint_location"] == "https://example.test/fhir/Location"
+    assert row["endpoint_organization"] == "https://example.test/fhir/Organization"
+
+
 def test_source_row_from_seed_overrides_aetna_developer_portal_base():
     row = importer._source_row_from_seed(
         {
@@ -817,6 +836,27 @@ def test_source_row_from_seed_overrides_hap_stale_provider_directory_path():
     assert row["last_validated_status"] == "valid"
     assert row["metadata_json"]["provider_directory_override"] == "hap_provider_directory_r4"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.HAP_PROVIDER_DIRECTORY_METADATA_URL
+
+
+def test_hap_rewrites_blocked_pagination_sibling_host():
+    source_lookup = {
+        "api_base": importer.HAP_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.HAP_PROVIDER_DIRECTORY_BASE,
+    }
+
+    next_url = importer._resolved_fhir_next_url(
+        source_lookup,
+        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1",
+        (
+            "https://fhir-prov-dir-r4.api.hap.org/Practitioner?"
+            "_count=1&_getpages=next-token"
+        ),
+    )
+
+    assert next_url == (
+        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=1&_getpages=next-token"
+    )
 
 
 def test_source_row_from_seed_overrides_hap_name_only_seed_row():
