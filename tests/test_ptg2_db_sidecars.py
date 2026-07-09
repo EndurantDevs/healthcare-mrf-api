@@ -120,6 +120,46 @@ async def test_db_artifact_reader_batches_multi_chunk_range_reads():
 
 
 @pytest.mark.asyncio
+async def test_db_artifact_reader_batches_multiple_ranges_in_one_chunk_query():
+    raw_payload = b"abcdefghijklmnopqrstuvwxyz0123456789"
+    entry = _db_entry({}, raw_payload, artifact_id="multi-range-artifact", chunk_bytes=5)
+    session = FakeChunkSession(raw_payload, chunk_bytes=5, compression="zlib")
+    reader = PTG2DbArtifactReader(session, entry, schema_name="mrf")
+
+    payloads = await reader.read_ranges(
+        {
+            "first": (3, 7),
+            "second": (18, 10),
+            "empty": (30, 0),
+        }
+    )
+
+    assert payloads == {
+        "first": raw_payload[3:10],
+        "second": raw_payload[18:28],
+        "empty": b"",
+    }
+    batch_calls = [call for call in session.calls if call.get("chunk_nos")]
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["chunk_nos"] == [0, 1, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_db_artifact_reader_bounds_multi_range_chunk_batches(monkeypatch):
+    raw_payload = b"abcdefghijklmnopqrstuvwxyz0123456789"
+    entry = _db_entry({}, raw_payload, artifact_id="bounded-range-artifact", chunk_bytes=5)
+    session = FakeChunkSession(raw_payload, chunk_bytes=5, compression="zlib")
+    reader = PTG2DbArtifactReader(session, entry, schema_name="mrf")
+    monkeypatch.setattr(db_sidecars, "_CHUNK_CACHE_MAX_BYTES", 10)
+
+    payloads = await reader.read_ranges({"payload": (3, 27)})
+
+    assert payloads == {"payload": raw_payload[3:30]}
+    batch_calls = [call for call in session.calls if call.get("chunk_nos")]
+    assert [call["chunk_nos"] for call in batch_calls] == [[0, 1], [2, 3], [4, 5]]
+
+
+@pytest.mark.asyncio
 async def test_db_membership_sidecar_reads_compressed_chunks_without_local_file(tmp_path):
     owner = bytes.fromhex("00000000000000000000000000000011")
     member_a = bytes.fromhex("00000000000000000000000000000021")

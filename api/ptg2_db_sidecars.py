@@ -480,6 +480,54 @@ class PTG2DbArtifactReader:
             raise PTG2ManifestArtifactError("artifact chunk range ended before requested bytes")
         return b"".join(pieces)
 
+    async def read_ranges(
+        self,
+        ranges_by_key: Mapping[Any, tuple[int, int]],
+    ) -> dict[Any, bytes]:
+        """Read many byte ranges while fetching every required chunk once."""
+
+        if not ranges_by_key:
+            return {}
+        total_size = await self.byte_count()
+        payload_parts_by_key: dict[Any, list[bytes]] = {}
+        slices_by_chunk: dict[int, list[tuple[Any, int, int]]] = {}
+        for range_key, (raw_offset, raw_length) in ranges_by_key.items():
+            offset = int(raw_offset)
+            length = int(raw_length)
+            if offset < 0 or length < 0:
+                raise PTG2ManifestArtifactError("artifact byte ranges must be non-negative")
+            if offset + length > total_size:
+                raise PTG2ManifestArtifactError(
+                    f"artifact byte range exceeds byte_count: offset={offset} length={length} size={total_size}"
+                )
+            payload_parts_by_key[range_key] = []
+            if length == 0:
+                continue
+            cursor = offset
+            remaining = length
+            while remaining > 0:
+                chunk_no = cursor // self.chunk_bytes
+                start = cursor % self.chunk_bytes
+                take = min(remaining, self.chunk_bytes - start)
+                slices_by_chunk.setdefault(chunk_no, []).append((range_key, start, take))
+                cursor += take
+                remaining -= take
+
+        ordered_chunk_numbers = sorted(slices_by_chunk)
+        batch_byte_limit = max(_CHUNK_CACHE_MAX_BYTES, self.chunk_bytes)
+        batch_chunk_count = max(batch_byte_limit // self.chunk_bytes, 1)
+        for batch_start in range(0, len(ordered_chunk_numbers), batch_chunk_count):
+            chunk_batch = ordered_chunk_numbers[batch_start : batch_start + batch_chunk_count]
+            chunks_by_number = await self._read_artifact_chunks(chunk_batch)
+            for chunk_no in chunk_batch:
+                chunk = chunks_by_number[chunk_no]
+                for range_key, start, take in slices_by_chunk[chunk_no]:
+                    part = chunk[start : start + take]
+                    if len(part) != take:
+                        raise PTG2ManifestArtifactError("artifact chunk range is invalid")
+                    payload_parts_by_key[range_key].append(part)
+        return {range_key: b"".join(parts) for range_key, parts in payload_parts_by_key.items()}
+
     async def read_fixed_records(
         self,
         *,
@@ -1414,46 +1462,6 @@ async def _maybe_read_membership_index(
     return await reader.read_at(index_start, int(index_bytes_len))
 
 
-def _contiguous_int_runs(values: Iterable[int]) -> tuple[tuple[int, int], ...]:
-    ordered = sorted(set(int(value) for value in values))
-    if not ordered:
-        return ()
-    runs: list[tuple[int, int]] = []
-    start = previous = ordered[0]
-    for value in ordered[1:]:
-        if value == previous + 1:
-            previous = value
-            continue
-        runs.append((start, previous))
-        start = previous = value
-    runs.append((start, previous))
-    return tuple(runs)
-
-
-async def _dense_global_members_from_db(
-    reader: PTG2DbArtifactReader,
-    *,
-    globals_start: int,
-    member_global_count: int,
-    local_ids: Iterable[int],
-) -> dict[int, bytes]:
-    local_id_set = {int(local_id) for local_id in local_ids}
-    if not local_id_set:
-        return {}
-    for local_id in local_id_set:
-        if local_id < 0 or local_id >= int(member_global_count):
-            raise PTG2ManifestArtifactError("dense global membership sidecar member id is out of range")
-    result: dict[int, bytes] = {}
-    for run_start, run_end in _contiguous_int_runs(local_id_set):
-        start = int(globals_start) + run_start * 16
-        length = (run_end - run_start + 1) * 16
-        payload = await reader.read_at(start, length)
-        for offset, local_id in enumerate(range(run_start, run_end + 1)):
-            member_start = offset * 16
-            result[local_id] = payload[member_start : member_start + 16]
-    return result
-
-
 async def lookup_global_sidecar_members_many_from_db(
     session: Any,
     entry: Mapping[str, Any],
@@ -1493,6 +1501,7 @@ async def lookup_global_sidecar_members_many_from_db(
                 keys=owner_ids,
             )
         result: dict[bytes, tuple[bytes, ...]] = {}
+        member_ranges_by_owner: dict[bytes, tuple[int, int]] = {}
         for owner_id in owner_ids:
             if index_bytes is not None:
                 match = _index_lookup(index_bytes, owner_id, int(entry_count))
@@ -1504,7 +1513,9 @@ async def lookup_global_sidecar_members_many_from_db(
             member_offset, member_count = match
             if max_members is not None:
                 member_count = min(member_count, max(max_members, 0))
-            member_bytes = await reader.read_at(member_start + member_offset * 16, member_count * 16)
+            member_ranges_by_owner[owner_id] = (member_start + member_offset * 16, member_count * 16)
+        member_payloads_by_owner = await reader.read_ranges(member_ranges_by_owner)
+        for owner_id, member_bytes in member_payloads_by_owner.items():
             result[owner_id] = tuple(member_bytes[pos : pos + 16] for pos in range(0, len(member_bytes), 16))
         return result
     if magic not in _DENSE_MEMBERSHIP_MAGICS:
@@ -1539,6 +1550,7 @@ async def lookup_global_sidecar_members_many_from_db(
             keys=owner_ids,
         )
     result: dict[bytes, tuple[bytes, ...]] = {}
+    local_ranges_by_owner: dict[bytes, tuple[int, int]] = {}
     for owner_id in owner_ids:
         if index_bytes is not None:
             match = _index_lookup(index_bytes, owner_id, int(entry_count))
@@ -1550,17 +1562,28 @@ async def lookup_global_sidecar_members_many_from_db(
         member_offset, member_count = match
         if max_members is not None:
             member_count = min(member_count, max(max_members, 0))
-        local_bytes = await reader.read_at(members_start + member_offset * _DENSE_MEMBER_RECORD.size, member_count * _DENSE_MEMBER_RECORD.size)
+        local_ranges_by_owner[owner_id] = (
+            members_start + member_offset * _DENSE_MEMBER_RECORD.size,
+            member_count * _DENSE_MEMBER_RECORD.size,
+        )
+    local_payloads_by_owner = await reader.read_ranges(local_ranges_by_owner)
+    local_ids_by_owner: dict[bytes, list[int]] = {}
+    requested_local_ids: set[int] = set()
+    for owner_id, local_bytes in local_payloads_by_owner.items():
         local_ids: list[int] = []
         for pos in range(0, len(local_bytes), _DENSE_MEMBER_RECORD.size):
             local_id = _DENSE_MEMBER_RECORD.unpack_from(local_bytes, pos)[0]
+            if local_id >= int(member_global_count):
+                raise PTG2ManifestArtifactError("dense global membership sidecar member id is out of range")
             local_ids.append(int(local_id))
-        members_by_local_id = await _dense_global_members_from_db(
-            reader,
-            globals_start=globals_start,
-            member_global_count=int(member_global_count),
-            local_ids=local_ids,
-        )
+            requested_local_ids.add(int(local_id))
+        local_ids_by_owner[owner_id] = local_ids
+    members_by_local_id = await reader.read_fixed_records(
+        base_offset=globals_start,
+        record_size=16,
+        record_numbers=sorted(requested_local_ids),
+    )
+    for owner_id, local_ids in local_ids_by_owner.items():
         members = [members_by_local_id[local_id] for local_id in local_ids]
         result[owner_id] = tuple(members)
     return result
