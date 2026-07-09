@@ -788,6 +788,36 @@ def test_source_row_from_seed_overrides_humana_stale_oauth_label():
     assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
+def test_source_row_from_seed_normalizes_iehp_double_slash_endpoints():
+    row = importer._source_row_from_seed(
+        {
+            "id": "iehp-double-slash",
+            "org_name": "Inland Empire Health Plan",
+            "plan_name": "IEHP Provider Directory",
+            "api_base": "https://fhir.iehp.org/provider-directory/",
+            "endpoint_practitioner": (
+                "https://fhir.iehp.org/provider-directory//Practitioner"
+            ),
+            "auth_type": "none",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.IEHP_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.IEHP_PROVIDER_DIRECTORY_BASE
+    assert row["endpoint_practitioner"] == (
+        f"{importer.IEHP_PROVIDER_DIRECTORY_BASE}/Practitioner"
+    )
+    assert row["metadata_json"]["provider_directory_override"] == (
+        "iehp_public_provider_directory"
+    )
+    assert importer._resource_start_url(row, "HealthcareService", page_count=100) == (
+        f"{importer.IEHP_PROVIDER_DIRECTORY_BASE}/HealthcareService?_count=100"
+    )
+    assert importer._resource_start_url(row, "OrganizationAffiliation", page_count=100) is None
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
+
+
 def test_source_row_from_seed_overrides_tmhp_stale_oauth_label():
     row = importer._source_row_from_seed(
         {

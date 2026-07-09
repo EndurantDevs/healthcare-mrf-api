@@ -442,6 +442,8 @@ UHC_PROVIDER_DIRECTORY_BASE = "https://flex.optum.com/fhirpublic/R4"
 UHC_PROVIDER_DIRECTORY_METADATA_URL = f"{UHC_PROVIDER_DIRECTORY_BASE}/metadata"
 HUMANA_PROVIDER_DIRECTORY_BASE = "https://fhir.humana.com/api"
 HUMANA_PROVIDER_DIRECTORY_METADATA_URL = f"{HUMANA_PROVIDER_DIRECTORY_BASE}/metadata"
+IEHP_PROVIDER_DIRECTORY_BASE = "https://fhir.iehp.org/provider-directory"
+IEHP_PROVIDER_DIRECTORY_METADATA_URL = f"{IEHP_PROVIDER_DIRECTORY_BASE}/metadata"
 MOLINA_DEVELOPER_PORTAL_URL = "https://developer.interop.molinahealthcare.com"
 MOLINA_PROVIDER_DIRECTORY_BASE = "https://api.interop.molinahealthcare.com/providerdirectory"
 MOLINA_PROVIDER_DIRECTORY_METADATA_URL = f"{MOLINA_PROVIDER_DIRECTORY_BASE}/metadata"
@@ -485,6 +487,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
+        IEHP_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
     }
 )
@@ -3041,6 +3044,47 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
     }
 
 
+def _iehp_provider_directory_override(seed_row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row.get("api_base"))
+    org_name = (_clean_text(seed_row.get("org_name")) or "").lower()
+    portal_url = (_clean_text(seed_row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(seed_row.get("source_url")) or "").lower()
+    should_override = (
+        bool(api_base and api_base.startswith(IEHP_PROVIDER_DIRECTORY_BASE))
+        or "fhir.iehp.org/provider-directory" in portal_url
+        or "fhir.iehp.org/provider-directory" in source_url
+        or "inland empire health plan" in org_name
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": IEHP_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": IEHP_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(IEHP_PROVIDER_DIRECTORY_BASE),
+        "metadata": {
+            "provider_directory_override": "iehp_public_provider_directory",
+            "provider_directory_override_reason": (
+                "IEHP publishes one public R4 Provider Directory base; seed aliases can contain "
+                "double-slash resource paths that return HTTP 400."
+            ),
+            "provider_directory_previous_api_base": _clean_text(seed_row.get("api_base")),
+            "provider_directory_confirmed_base": IEHP_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_metadata_url": IEHP_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_supported_resources": [
+                "HealthcareService",
+                "InsurancePlan",
+                "Location",
+                "Organization",
+                "Practitioner",
+                "PractitionerRole",
+            ],
+        },
+    }
+
+
 def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
     portal_url = (_clean_text(row.get("portal_url")) or "").lower()
@@ -3104,6 +3148,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         or _state_public_provider_directory_override(row)
         or _hap_provider_directory_override(row)
         or _humana_provider_directory_override(row)
+        or _iehp_provider_directory_override(row)
         or _scan_provider_directory_override(row)
     )
     if override:
