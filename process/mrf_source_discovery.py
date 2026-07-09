@@ -14141,18 +14141,6 @@ async def _import_control_snapshot_items(
     unique_ids = [sid for sid in dict.fromkeys(source_ids) if sid]
     if not unique_ids:
         return {}
-    plan_rows = await db.all(
-        select(
-            MRFPlan.source_id,
-            MRFPlan.plan_id,
-            MRFPlan.plan_id_type,
-            MRFPlan.market_type,
-            MRFPlan.plan_name,
-            MRFPlan.reporting_entity_name,
-            MRFPlan.metadata_json,
-        ).where(MRFPlan.source_id.in_(unique_ids))
-    )
-    plan_lookup = _plan_lookup_from_rows(plan_rows)
     stmt = (
         select(
             MRFFile.source_id,
@@ -14172,7 +14160,8 @@ async def _import_control_snapshot_items(
         .where(MRFFile.url.is_not(None))
     )
     rows = await db.all(stmt)
-    grouped: dict[str, list[dict[str, Any]]] = {}
+    supported_rows = []
+    plan_lookup_source_id_list = []
     for row in rows:
         metadata = _coerce_metadata(row[5])
         file_domain = metadata.get("domain") or row[3]
@@ -14180,6 +14169,26 @@ async def _import_control_snapshot_items(
             file_domain, metadata, row[11]
         ):
             continue
+        supported_rows.append((row, metadata, file_domain))
+        if not metadata.get("plan_info") and row[0]:
+            plan_lookup_source_id_list.append(row[0])
+    plan_lookup = {}
+    if plan_lookup_source_id_list:
+        plan_source_ids = list(dict.fromkeys(plan_lookup_source_id_list))
+        plan_rows = await db.all(
+            select(
+                MRFPlan.source_id,
+                MRFPlan.plan_id,
+                MRFPlan.plan_id_type,
+                MRFPlan.market_type,
+                MRFPlan.plan_name,
+                MRFPlan.reporting_entity_name,
+                MRFPlan.metadata_json,
+            ).where(MRFPlan.source_id.in_(plan_source_ids))
+        )
+        plan_lookup = _plan_lookup_from_rows(plan_rows)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row, metadata, file_domain in supported_rows:
         plan_info = metadata.get("plan_info") or []
         if not plan_info:
             plan_info = _file_column_plan_info(

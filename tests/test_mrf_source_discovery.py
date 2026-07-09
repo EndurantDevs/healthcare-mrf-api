@@ -4796,8 +4796,6 @@ async def test_import_control_snapshot_items_keep_medical_rate_files(monkeypatch
 
     async def fake_all(_stmt):
         call_count_map["all"] += 1
-        if call_count_map["all"] in {1}:
-            return []
         plan_info = [{"plan_id": "123", "plan_market_type": "group"}]
         return [
             (
@@ -4848,6 +4846,7 @@ async def test_import_control_snapshot_items_keep_medical_rate_files(monkeypatch
 
     items = await discovery._import_control_snapshot_items(["source_1"])
 
+    assert call_count_map["all"] == 1
     assert len(items["source_1"]) == 3
     assert (
         items["source_1"][0]["canonical_url"]
@@ -4875,7 +4874,7 @@ async def test_import_control_snapshot_items_use_metadata_company_before_generic
 
     async def fake_all(_stmt):
         call_count_map["all"] += 1
-        if call_count_map["all"] in {1}:
+        if call_count_map["all"] > 1:
             return []
         return [
             (
