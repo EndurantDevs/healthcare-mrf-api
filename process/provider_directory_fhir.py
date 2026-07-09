@@ -542,6 +542,7 @@ class ScanPractitionerRoleFetchOptions:
     source: dict[str, Any] | None = None
     seed_stage_table: str | None = None
     seed_source_ids: tuple[str, ...] = ()
+    existing_seed_source_ids: tuple[str, ...] = ()
     seed_page_size: int = 5000
 
 
@@ -570,6 +571,176 @@ class _StreamedResourceRowBuffer:
         row_items = list(self.pending_row_items)
         self.pending_row_items.clear()
         self.rows_written += await self.row_batch_handler(self.model, row_items)
+
+
+@dataclass(frozen=True)
+class _PractitionerRoleReverseLookupRequest:
+    """Immutable controls for a concurrent PractitionerRole reverse lookup."""
+
+    source: dict[str, Any]
+    rows_by_resource: dict[str, list[dict[str, Any]]]
+    options: ScanPractitionerRoleFetchOptions
+    resource_timeout: int
+    deadline_at: float | None
+
+
+@dataclass
+class _PractitionerRoleReverseLookupState:
+    """Shared counters and streaming output for concurrent role lookup workers."""
+
+    result_model: type
+    retained_resource_rows: list[dict[str, Any]]
+    streamed_rows: _StreamedResourceRowBuffer
+    retain_rows: bool
+    page_limit: int
+    seen_role_ids: set[str] | None = None
+    seed_count: int = 0
+    fetched_count: int = 0
+    page_count: int = 0
+    reverse_error_count: int = 0
+    error_message: str | None = None
+    is_hard_page_limit_reached: bool = False
+    is_deadline_reached: bool = False
+    has_next_url_remaining: bool = False
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def add_seed(self) -> None:
+        """Count a queued reverse lookup seed."""
+        async with self.state_lock:
+            self.seed_count += 1
+
+    async def mark_deadline_reached(self) -> None:
+        """Record that unfinished reverse lookup work remains after deadline."""
+        async with self.state_lock:
+            self.is_deadline_reached = True
+            self.has_next_url_remaining = True
+
+    async def record_reverse_lookup_error(self, current_error: str) -> None:
+        """Record the latest reverse lookup error with a running count."""
+        async with self.state_lock:
+            self.reverse_error_count += 1
+            self.error_message = (
+                f"reverse_lookup_errors_{self.reverse_error_count}_last_{current_error}"
+            )
+
+    async def has_reached_page_limit(self) -> bool:
+        """Return whether the shared reverse lookup page limit has been reached."""
+        async with self.state_lock:
+            return self.is_hard_page_limit_reached
+
+    async def add_practitioner_role_page(self, resource_rows: list[dict[str, Any]]) -> None:
+        """Add parsed PractitionerRole rows and update shared page counters."""
+        accepted_rows: list[dict[str, Any]] = []
+        async with self.state_lock:
+            self.page_count += 1
+            if self.page_limit > 0 and self.page_count >= self.page_limit:
+                self.is_hard_page_limit_reached = True
+                self.has_next_url_remaining = True
+            for row in resource_rows:
+                role_id = _clean_text(row.get("resource_id"))
+                if not role_id:
+                    continue
+                if self.seen_role_ids is not None and role_id in self.seen_role_ids:
+                    continue
+                if self.seen_role_ids is not None:
+                    self.seen_role_ids.add(role_id)
+                if self.retain_rows:
+                    self.retained_resource_rows.append(row)
+                self.fetched_count += 1
+                accepted_rows.append(row)
+        if not accepted_rows:
+            return
+        async with self.writer_lock:
+            for row in accepted_rows:
+                await self.streamed_rows.add(row)
+
+    async def produce_seed_rows(
+        self,
+        request: _PractitionerRoleReverseLookupRequest,
+        seed_queue: asyncio.Queue[tuple[str, str, str] | None],
+        worker_count: int,
+    ) -> None:
+        """Queue Practitioner/Organization/Location seeds for reverse lookup workers."""
+        try:
+            async for seed in _iter_scan_practitioner_role_seed_rows(
+                request.rows_by_resource,
+                request.options,
+            ):
+                if request.options.cancel_ctx is not None:
+                    await raise_if_cancelled(
+                        request.options.cancel_ctx,
+                        request.options.cancel_task,
+                    )
+                if _is_lookup_deadline_elapsed(request.deadline_at):
+                    await self.mark_deadline_reached()
+                    break
+                await self.add_seed()
+                await seed_queue.put(seed)
+        finally:
+            for _unused_worker_index in range(worker_count):
+                await seed_queue.put(None)
+
+    async def fetch_seed_rows(
+        self,
+        request: _PractitionerRoleReverseLookupRequest,
+        seed_queue: asyncio.Queue[tuple[str, str, str] | None],
+    ) -> None:
+        """Consume queued seeds and fetch matching PractitionerRole pages."""
+        while True:
+            seed = await seed_queue.get()
+            try:
+                if seed is None:
+                    return
+                await self.fetch_seed_pages(request, seed)
+            finally:
+                seed_queue.task_done()
+
+    async def fetch_seed_pages(
+        self,
+        request: _PractitionerRoleReverseLookupRequest,
+        seed: tuple[str, str, str],
+    ) -> None:
+        """Fetch all PractitionerRole pages for one reverse lookup seed."""
+        search_param, seed_resource_type, seed_resource_id = seed
+        next_lookup_url = _scan_practitioner_role_reverse_lookup_url(
+            request.source,
+            search_param,
+            seed_resource_type,
+            seed_resource_id,
+            page_count=request.options.page_count,
+        )
+        while next_lookup_url:
+            if request.options.cancel_ctx is not None:
+                await raise_if_cancelled(request.options.cancel_ctx, request.options.cancel_task)
+            if _is_lookup_deadline_elapsed(request.deadline_at):
+                await self.mark_deadline_reached()
+                return
+            if await self.has_reached_page_limit():
+                return
+            status_code, bundle_payload, error, _elapsed = await _fetch_source_json(
+                request.source,
+                next_lookup_url,
+                timeout=request.resource_timeout,
+            )
+            if status_code != 200 or error:
+                await self.record_reverse_lookup_error(error or f"http_{status_code}")
+                return
+            if not bundle_payload or bundle_payload.get("resourceType") != "Bundle":
+                await self.record_reverse_lookup_error("non_bundle_payload")
+                return
+            resource_rows = _parse_practitioner_role_reverse_lookup_rows(
+                request.source["source_id"],
+                bundle_payload,
+                request.options.run_id,
+            )
+            await self.add_practitioner_role_page(resource_rows)
+            next_link = _next_link(bundle_payload)
+            next_lookup_url = (
+                urllib.parse.urljoin(next_lookup_url, next_link) if next_link else None
+            )
+            if await self.has_reached_page_limit():
+                return
 
 
 def _schema() -> str:
@@ -1213,8 +1384,16 @@ async def _iter_scan_practitioner_role_seed_rows(
         async for seed in _scan_role_stage_seeds(options):
             yield seed
         return
+    in_memory_seed_count = 0
     for seed in _scan_practitioner_role_seed_rows(options.source, rows_by_resource):
+        in_memory_seed_count += 1
         yield seed
+    if in_memory_seed_count:
+        return
+    if options.existing_seed_source_ids:
+        async for seed in _scan_role_db_seed_rows(options):
+            yield seed
+        return
 
 
 async def _scan_role_stage_seeds(
@@ -1242,6 +1421,52 @@ async def _scan_role_stage_seeds(
                  LIMIT :limit;
                 """,
                 resource_type=resource_type,
+                source_ids=source_ids,
+                last_resource_id=last_resource_id,
+                limit=page_size,
+            )
+            if not resource_rows:
+                break
+            for resource_row in resource_rows:
+                resource_id = _clean_text(resource_row[0])
+                if not resource_id:
+                    continue
+                last_resource_id = resource_id
+                yield (search_param, resource_type, resource_id)
+            if len(resource_rows) < page_size:
+                break
+
+
+async def _scan_role_db_seed_rows(
+    options: ScanPractitionerRoleFetchOptions,
+) -> AsyncIterator[tuple[str, str, str]]:
+    """Page reverse lookup seed resource ids from already imported source rows."""
+    source_ids = list(options.existing_seed_source_ids or ())
+    if not source_ids:
+        return
+    page_size = max(1, options.seed_page_size)
+    search_params = _practitioner_role_reverse_lookup_params(options.source)
+    seed_table_by_resource_type = {
+        "Practitioner": "provider_directory_practitioner",
+        "Organization": "provider_directory_organization",
+        "Location": "provider_directory_location",
+    }
+    for resource_type in _practitioner_role_reverse_lookup_resources(options.source):
+        search_param = search_params.get(resource_type)
+        table_name = seed_table_by_resource_type.get(resource_type)
+        if not search_param or not table_name:
+            continue
+        last_resource_id = ""
+        while True:
+            resource_rows = await db.all(
+                f"""
+                SELECT DISTINCT resource_id
+                  FROM {_qt(_schema(), table_name)}
+                 WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+                   AND resource_id > :last_resource_id
+                 ORDER BY resource_id
+                 LIMIT :limit;
+                """,
                 source_ids=source_ids,
                 last_resource_id=last_resource_id,
                 limit=page_size,
@@ -8499,6 +8724,14 @@ async def _fetch_scan_practitioner_role_rows(
 ) -> ResourceFetchResult:
     if options.source is None:
         options = replace(options, source=source)
+    reverse_lookup_concurrency = _scan_practitioner_role_reverse_lookup_concurrency()
+    if reverse_lookup_concurrency > 1 and options.per_resource_limit <= 0 and options.page_limit <= 0:
+        return await _fetch_scan_practitioner_role_rows_concurrent(
+            source,
+            rows_by_resource,
+            options,
+            concurrency=reverse_lookup_concurrency,
+        )
     model = ProviderDirectoryPractitionerRole
     rows: list[dict[str, Any]] = []
     seen_role_ids: set[str] | None = set() if options.retain_rows else None
@@ -8528,7 +8761,7 @@ async def _fetch_scan_practitioner_role_rows(
         if options.deadline_seconds > 0
         else None
     )
-    max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
+    max_pages = _role_lookup_page_limit()
 
     async for search_param, seed_resource_type, seed_resource_id in _iter_scan_practitioner_role_seed_rows(
         rows_by_resource,
@@ -8655,6 +8888,186 @@ async def _fetch_scan_practitioner_role_rows(
         next_url_remaining=next_url_remaining,
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="source_specific_reverse_lookup",
+    )
+
+
+def _scan_practitioner_role_reverse_lookup_concurrency() -> int:
+    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_ROLE_LOOKUP_CONCURRENCY", 16))
+
+
+def _role_lookup_page_limit() -> int:
+    return max(0, _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_REVERSE_LOOKUP_PAGES", 0))
+
+
+def _is_lookup_deadline_elapsed(deadline_at: float | None) -> bool:
+    return deadline_at is not None and time.monotonic() >= deadline_at
+
+
+def _parse_practitioner_role_reverse_lookup_rows(
+    source_id: str,
+    payload: dict[str, Any],
+    run_id: str | None,
+) -> list[dict[str, Any]]:
+    """Parse PractitionerRole rows from a reverse lookup Bundle payload."""
+    resource_rows: list[dict[str, Any]] = []
+    for entry in _bundle_entries(payload):
+        parsed = parse_fhir_resource(
+            source_id,
+            entry["resource"],
+            resource_url=_clean_text(entry.get("fullUrl")),
+            run_id=run_id,
+        )
+        if not parsed:
+            continue
+        parsed_model, row = parsed
+        if parsed_model is ProviderDirectoryPractitionerRole:
+            resource_rows.append(row)
+    return resource_rows
+
+
+def _new_role_lookup_state(
+    result_model: type,
+    retained_resource_rows: list[dict[str, Any]],
+    streamed_rows: _StreamedResourceRowBuffer,
+    options: ScanPractitionerRoleFetchOptions,
+) -> _PractitionerRoleReverseLookupState:
+    """Create shared state for concurrent PractitionerRole reverse lookup."""
+    return _PractitionerRoleReverseLookupState(
+        result_model=result_model,
+        retained_resource_rows=retained_resource_rows,
+        streamed_rows=streamed_rows,
+        retain_rows=options.retain_rows,
+        page_limit=_role_lookup_page_limit(),
+        seen_role_ids=set() if options.retain_rows else None,
+    )
+
+
+def _new_role_lookup_request(
+    source_config: dict[str, Any],
+    resource_rows_by_type: dict[str, list[dict[str, Any]]],
+    options: ScanPractitionerRoleFetchOptions,
+) -> _PractitionerRoleReverseLookupRequest:
+    """Create immutable controls for concurrent PractitionerRole reverse lookup."""
+    deadline_at = (
+        time.monotonic() + options.deadline_seconds
+        if options.deadline_seconds > 0
+        else None
+    )
+    return _PractitionerRoleReverseLookupRequest(
+        source=source_config,
+        rows_by_resource=resource_rows_by_type,
+        options=options,
+        resource_timeout=_source_resource_timeout(
+            options.source or source_config,
+            "PractitionerRole",
+            options.timeout,
+        ),
+        deadline_at=deadline_at,
+    )
+
+
+async def _run_role_lookup_tasks(
+    fetch_state: _PractitionerRoleReverseLookupState,
+    request: _PractitionerRoleReverseLookupRequest,
+    concurrency: int,
+) -> None:
+    """Run the concurrent reverse lookup producer and workers."""
+    seed_queue: asyncio.Queue[tuple[str, str, str] | None] = asyncio.Queue(
+        maxsize=max(concurrency * 4, 1)
+    )
+    lookup_tasks = [
+        asyncio.create_task(fetch_state.fetch_seed_rows(request, seed_queue))
+        for _unused_worker_index in range(concurrency)
+    ]
+    producer_task = asyncio.create_task(
+        fetch_state.produce_seed_rows(request, seed_queue, concurrency)
+    )
+    try:
+        await asyncio.gather(producer_task, *lookup_tasks)
+    finally:
+        for lookup_task in lookup_tasks:
+            if not lookup_task.done():
+                lookup_task.cancel()
+        if not producer_task.done():
+            producer_task.cancel()
+
+
+def _build_role_lookup_result(
+    result_model: type,
+    retained_resource_rows: list[dict[str, Any]],
+    streamed_rows: _StreamedResourceRowBuffer,
+    fetch_state: _PractitionerRoleReverseLookupState,
+) -> ResourceFetchResult:
+    """Build the ResourceFetchResult for concurrent PractitionerRole lookup."""
+    if fetch_state.seed_count == 0:
+        return ResourceFetchResult(
+            model=result_model,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
+            fetch_mode="source_specific_deferred",
+        )
+    is_complete = (
+        not fetch_state.error_message
+        and not fetch_state.is_hard_page_limit_reached
+        and not fetch_state.is_deadline_reached
+        and not fetch_state.has_next_url_remaining
+    )
+    return ResourceFetchResult(
+        model=result_model,
+        rows=retained_resource_rows,
+        rows_fetched=fetch_state.fetched_count,
+        rows_written=streamed_rows.rows_written,
+        pages_fetched=fetch_state.page_count,
+        complete=is_complete,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=fetch_state.is_hard_page_limit_reached,
+        next_url_remaining=fetch_state.has_next_url_remaining,
+        error=fetch_state.error_message
+        or ("deadline_reached" if fetch_state.is_deadline_reached else None),
+        deadline_reached=fetch_state.is_deadline_reached,
+        fetch_mode="source_specific_reverse_lookup_concurrent",
+    )
+
+
+async def _fetch_scan_practitioner_role_rows_concurrent(
+    source_config: dict[str, Any],
+    resource_rows_by_type: dict[str, list[dict[str, Any]]],
+    options: ScanPractitionerRoleFetchOptions,
+    *,
+    concurrency: int,
+) -> ResourceFetchResult:
+    """Fetch reverse PractitionerRole lookups concurrently for large payer scans."""
+    result_model = ProviderDirectoryPractitionerRole
+    retained_resource_rows: list[dict[str, Any]] = []
+    streamed_rows = _StreamedResourceRowBuffer(
+        model=result_model,
+        row_batch_handler=options.row_batch_handler,
+        row_batch_size=options.row_batch_size,
+        pending_row_items=[],
+    )
+    fetch_state = _new_role_lookup_state(
+        result_model,
+        retained_resource_rows,
+        streamed_rows,
+        options,
+    )
+    request = _new_role_lookup_request(source_config, resource_rows_by_type, options)
+    await _run_role_lookup_tasks(fetch_state, request, concurrency)
+    await streamed_rows.flush()
+    return _build_role_lookup_result(
+        result_model,
+        retained_resource_rows,
+        streamed_rows,
+        fetch_state,
     )
 
 
@@ -9798,7 +10211,7 @@ async def _import_resources(
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if (
                 resource_type == "PractitionerRole"
-                and scan_role_reverse_lookup_planned
+                and _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
             ):
                 continue
             async with progress_lock:
@@ -9986,7 +10399,11 @@ async def _import_resources(
                 active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
             use_streaming = stream_batch_size > 0
-            scan_seed_stage_table = seen_stage_table if use_streaming and seen_stage_table else None
+            scan_seed_stage_table = (
+                seen_stage_table
+                if use_streaming and seen_stage_table and scan_role_reverse_lookup_planned
+                else None
+            )
             if scan_seed_stage_table:
                 await _prepare_provider_directory_import_seen_stage_lookup(scan_seed_stage_table)
                 for seed_resource_type in _practitioner_role_reverse_lookup_resources(source):
@@ -10024,6 +10441,7 @@ async def _import_resources(
                     source=source,
                     seed_stage_table=scan_seed_stage_table,
                     seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
+                    existing_seed_source_ids=tuple(source_ids) if not scan_seed_stage_table else (),
                 ),
             )
             for _source_id in source_ids:

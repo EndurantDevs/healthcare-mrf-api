@@ -5912,6 +5912,48 @@ def _uhc_reverse_lookup_source() -> dict[str, str]:
     }
 
 
+@pytest.mark.asyncio
+async def test_uhc_practitioner_role_seeds_can_fall_back_to_existing_practitioners(monkeypatch):
+    db_calls: list[dict[str, Any]] = []
+
+    async def fake_all(_sql, **params):
+        db_calls.append(params)
+        if params["last_resource_id"] == "":
+            return [("prac-1",), ("prac-2",)]
+        if params["last_resource_id"] == "prac-2":
+            return [("prac-3",)]
+        return []
+
+    monkeypatch.setattr(importer.db, "all", fake_all)
+
+    options = importer.ScanPractitionerRoleFetchOptions(
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        source=_uhc_reverse_lookup_source(),
+        existing_seed_source_ids=("uhc",),
+        seed_page_size=2,
+    )
+
+    seeds = [
+        seed
+        async for seed in importer._iter_scan_practitioner_role_seed_rows(
+            rows_by_resource={},
+            options=options,
+        )
+    ]
+
+    assert seeds == [
+        ("practitioner", "Practitioner", "prac-1"),
+        ("practitioner", "Practitioner", "prac-2"),
+        ("practitioner", "Practitioner", "prac-3"),
+    ]
+    assert [call["last_resource_id"] for call in db_calls] == ["", "prac-2"]
+    assert all(call["source_ids"] == ["uhc"] for call in db_calls)
+
+
 def _uhc_practitioner_fetch_result() -> importer.ResourceFetchResult:
     return importer.ResourceFetchResult(
         model=ProviderDirectoryPractitioner,
