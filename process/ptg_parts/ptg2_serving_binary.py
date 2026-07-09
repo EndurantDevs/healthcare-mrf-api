@@ -823,6 +823,7 @@ class _PriceSetAtomBlockWriter:
     current_block_no: int = 0
     current_payload: bytearray = field(default_factory=bytearray)
     current_entry_count: int = 0
+    block_no_by_key: dict[int, int] = field(default_factory=dict)
     id_payload_by_bucket: dict[int, bytearray] = field(default_factory=dict)
     id_entry_count_by_bucket: dict[int, int] = field(default_factory=dict)
     id_block_no_by_bucket: dict[int, int] = field(default_factory=dict)
@@ -862,6 +863,7 @@ class _PriceSetAtomBlockWriter:
             )
         )
         self.block_count += 1
+        self.block_no_by_key[self.current_block_key] = self.current_block_no + 1
         self.current_block_no += 1
         self.current_entry_count = 0
         self.current_payload = bytearray()
@@ -900,7 +902,7 @@ class _PriceSetAtomBlockWriter:
         if self.current_block_key != block_key:
             await self.flush_block()
             self.current_block_key = block_key
-            self.current_block_no = 0
+            self.current_block_no = int(self.block_no_by_key.get(block_key) or 0)
         elif self.current_entry_count > 0 and len(self.current_payload) + len(entry_payload) > self.max_payload_bytes:
             await self.flush_block()
         self.current_payload.extend(entry_payload)
