@@ -477,46 +477,23 @@ def test_delete_kubernetes_worker_jobs_deletes_active_matching_run(monkeypatch):
 
 
 def test_find_running_pid_ignores_other_node_worker(monkeypatch):
-    output = """
-111 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=mrf-local-smoke-b
-222 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=local_mrf
-"""
-
+    output = "111 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=mrf-local-smoke-b\n222 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=local_mrf"
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
-
-    spec = control_workers._BY_QUEUE["arq:PTG"]
-
-    assert control_workers._find_running_pid(spec) == 222
+    assert control_workers._find_running_pid(control_workers._BY_QUEUE["arq:PTG"]) == 222
 
 
 def test_find_running_pid_requires_exact_worker_class(monkeypatch):
-    output = """
-111 /opt/python main.py worker process.ProviderQuality_finish --burst HLTHPRT_IMPORT_NODE_ID=local_mrf
-222 /opt/python main.py worker process.ProviderQuality --burst HLTHPRT_IMPORT_NODE_ID=local_mrf
-"""
-
+    output = "111 /opt/python main.py worker process.ProviderQuality_finish --burst HLTHPRT_IMPORT_NODE_ID=local_mrf\n222 /opt/python main.py worker process.ProviderQuality --burst HLTHPRT_IMPORT_NODE_ID=local_mrf"
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
-
-    start_spec = control_workers._BY_QUEUE["arq:ProviderQuality"]
-    finish_spec = control_workers._BY_QUEUE["arq:ProviderQuality_finish"]
-
-    assert control_workers._find_running_pid(start_spec) == 222
-    assert control_workers._find_running_pid(finish_spec) == 111
+    assert control_workers._find_running_pid(control_workers._BY_QUEUE["arq:ProviderQuality"]) == 222
+    assert control_workers._find_running_pid(control_workers._BY_QUEUE["arq:ProviderQuality_finish"]) == 111
 
 
 def test_find_running_pid_matches_ptg_worker_once(monkeypatch):
-    output = """
-111 /opt/python main.py worker-once process.PTGSmall HLTHPRT_IMPORT_NODE_ID=local_mrf
-222 /opt/python main.py worker process.PTGNormal --burst HLTHPRT_IMPORT_NODE_ID=local_mrf
-"""
-
+    output = "111 /opt/python main.py worker-once process.PTGSmall HLTHPRT_IMPORT_NODE_ID=local_mrf\n222 /opt/python main.py worker process.PTGNormal --burst HLTHPRT_IMPORT_NODE_ID=local_mrf"
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
-
-    small_spec = control_workers._BY_QUEUE["arq:PTGSmall"]
-    normal_spec = control_workers._BY_QUEUE["arq:PTGNormal"]
-
-    assert control_workers._find_running_pid(small_spec) == 111
-    assert control_workers._find_running_pid(normal_spec) == 222
+    assert control_workers._find_running_pid(control_workers._BY_QUEUE["arq:PTGSmall"]) == 111
+    assert control_workers._find_running_pid(control_workers._BY_QUEUE["arq:PTGNormal"]) == 222

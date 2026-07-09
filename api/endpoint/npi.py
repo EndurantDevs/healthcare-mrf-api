@@ -3178,6 +3178,33 @@ def _facility_payload(
     }
 
 
+def _has_match_candidate_taxonomy_context(params: Mapping[str, Any]) -> bool:
+    return bool(
+        params.get("taxonomy_exact")
+        or params.get("taxonomy_prefixes")
+        or params.get("provider_type")
+        or params.get("specialty_filter")
+    )
+
+
+def _should_boost_general_acute_care_candidate(
+    row: Mapping[str, Any],
+    params: Mapping[str, Any],
+    taxonomy_list: Sequence[Any],
+    enrichment: Mapping[str, Any] | None,
+) -> bool:
+    if _has_match_candidate_taxonomy_context(params):
+        return False
+    if _entity_kind_from_code(row.get("entity_type_code")) != "organization":
+        return False
+    requested_kind = str(params.get("entity_kind") or "").strip().lower()
+    if requested_kind and requested_kind != "organization":
+        return False
+    primary = _primary_taxonomy(taxonomy_list)
+    taxonomy_code = str(primary.get("taxonomy_code") or "").upper()
+    return taxonomy_code.startswith("282N") and bool(enrichment and enrichment.get("has_hospital_enrollment"))
+
+
 def _match_signal_payload(
     row: Mapping[str, Any],
     params: Mapping[str, Any],
@@ -3231,6 +3258,11 @@ def _match_signal_payload(
         score += 0.05
         signals["ffs"]["contribution"] = 0.05
     return signals, round(min(score, 1.0), 4)
+
+
+def _boost_general_acute_care_score(signals: dict[str, Any], match_score: float) -> float:
+    signals["facility"] = {"matched": True, "canonical_hospital": True, "contribution": 0.06}
+    return round(min(match_score + 0.06, 1.0), 4)
 
 
 def _confidence_band(score: float) -> str:
@@ -3330,6 +3362,12 @@ def _match_candidate_output(
     ))
     taxonomy_matched = _provider_type_filter_matched(row, params)
     is_provider_type_matched = _is_provider_type_taxonomy_matched(row, params)
+    is_general_acute_care_matched = _should_boost_general_acute_care_candidate(
+        row,
+        params,
+        taxonomy_list,
+        enrichment,
+    )
     match_signals, match_score = _match_signal_payload(
         row,
         params,
@@ -3338,6 +3376,8 @@ def _match_candidate_output(
         fhir_matched,
         ffs_matched,
     )
+    if is_general_acute_care_matched:
+        match_score = _boost_general_acute_care_score(match_signals, match_score)
     address = {
         "type": row.get("address_type"),
         "first_line": row.get("first_line"),
