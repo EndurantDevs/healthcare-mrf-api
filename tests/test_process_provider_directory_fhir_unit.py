@@ -5414,8 +5414,10 @@ def test_resource_start_urls_partitions_uhc_provider_directory_searches():
         "https://flex.optum.com/fhirpublic/R4/PractitionerRole?"
         "_count=100&location.address-postalcode=0"
     )
-    assert role_urls[-1].endswith("_count=100&location.address-postalcode=9")
-    assert len(role_urls) == 10
+    assert role_urls[9].endswith("_count=100&location.address-postalcode=9")
+    assert role_urls[10].endswith("_count=100&location.address-postalcode=A")
+    assert role_urls[-1].endswith("_count=100&location.address-postalcode=Z")
+    assert len(role_urls) == 36
 
 
 def test_provider_directory_partition_concurrency_defaults_to_sixteen(monkeypatch):
@@ -5675,7 +5677,8 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
         ),
     )
 
-    assert partition_fetch_result.complete is True
+    assert partition_fetch_result.complete is False
+    assert partition_fetch_result.error == "uhc_practitionerrole_residual_unverified"
     assert partition_fetch_result.rows_fetched == 1
     assert checkpoint_batches[0][0]["seed_resource_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
     assert checkpoint_batches[0][0]["seed_resource_id"] == "1"

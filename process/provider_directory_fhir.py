@@ -1454,6 +1454,7 @@ def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_coun
 SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 UHC_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 UHC_POSTAL_SEARCH_ALPHABET = tuple("0123456789")
+UHC_POSTAL_ROOT_ALPHABET = tuple("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 UHC_ADAPTIVE_PARTITION_TOTAL_CAP = 10000
 UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 4
 UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH = 5
@@ -1503,7 +1504,7 @@ def _uhc_provider_directory_partition_values(resource_type: str) -> tuple[tuple[
     if resource_type == "PractitionerRole":
         return tuple(
             ("location.address-postalcode", prefix)
-            for prefix in UHC_POSTAL_SEARCH_ALPHABET
+            for prefix in UHC_POSTAL_ROOT_ALPHABET
         )
     return ()
 
@@ -1640,6 +1641,17 @@ def _is_uhc_role_postal_partition_enabled(source: dict[str, Any]) -> bool:
         "no",
         "off",
     }
+
+
+def _uhc_partition_residual_error(
+    source_record: dict[str, Any],
+    resource_type: str,
+) -> str | None:
+    if resource_type != "PractitionerRole":
+        return None
+    if not _is_uhc_role_postal_partition_enabled(source_record):
+        return None
+    return "uhc_practitionerrole_residual_unverified"
 
 
 def _uhc_role_postal_prefix(
@@ -9159,18 +9171,24 @@ async def _fetch_partitioned_resource_rows(
         fetch_options,
         len(start_urls),
     )
-    is_complete = (
+    is_partition_scan_complete = (
         not state.error_message
         and not state.hard_page_limit_reached
         and not state.deadline_reached
         and start_url_queue.empty()
     )
+    residual_error = (
+        _uhc_partition_residual_error(source_record, resource_type)
+        if is_partition_scan_complete
+        else None
+    )
     if (
-        is_complete
+        is_partition_scan_complete
         and resource_type == "PractitionerRole"
         and _is_uhc_role_postal_partition_enabled(source_record)
     ):
         await _clear_reverse_lookup_checkpoints(source_record)
+    is_complete = is_partition_scan_complete and not residual_error
     return ResourceFetchResult(
         model=model,
         rows=state.retained_resource_rows,
@@ -9182,7 +9200,9 @@ async def _fetch_partitioned_resource_rows(
         page_limit_reached=False,
         hard_page_limit_reached=state.hard_page_limit_reached,
         next_url_remaining=state.next_url_remaining or not start_url_queue.empty(),
-        error=state.error_message or ("deadline_reached" if state.deadline_reached else None),
+        error=state.error_message
+        or ("deadline_reached" if state.deadline_reached else None)
+        or residual_error,
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
     )
@@ -9388,6 +9408,16 @@ async def _fetch_resource_rows(
         ):
             break
     await flush_pending_rows()
+    if (
+        not error_message
+        and not row_limit_reached
+        and not page_limit_reached
+        and not hard_page_limit_reached
+        and not is_deadline_reached
+        and not url
+        and not pending_start_urls
+    ):
+        error_message = _uhc_partition_residual_error(source, resource_type)
     complete = (
         not error_message
         and not row_limit_reached
