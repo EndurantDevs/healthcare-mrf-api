@@ -5418,6 +5418,12 @@ def test_resource_start_urls_partitions_uhc_provider_directory_searches():
     assert len(role_urls) == 10
 
 
+def test_provider_directory_partition_concurrency_defaults_to_sixteen(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", raising=False)
+
+    assert importer._partition_fetch_concurrency() == 16
+
+
 def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
     source_dict = {
         "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,

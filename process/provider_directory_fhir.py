@@ -10130,7 +10130,7 @@ def _linked_resource_flush_rows() -> int:
 
 
 def _partition_fetch_concurrency() -> int:
-    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", 8))
+    return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", 16))
 
 
 async def _mark_provider_directory_progress(
