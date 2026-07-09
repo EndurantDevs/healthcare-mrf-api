@@ -537,6 +537,24 @@ gin(ptg_plan_array)
 gin(ptg_source_array)
 ```
 
+Deployed serving refreshes also require model-defined partial indexes for the
+API predicates that cannot rely on generic NPI or geo indexes:
+
+```text
+btree(npi) where type in service-location roles and address_key is not null
+btree(npi) where type in service-location roles and premise_key is not null
+btree(
+  COALESCE(NULLIF(phone_number, ''), normalized_telephone_digits),
+  npi
+) where type in service-location roles and the normalized phone is present
+gist(Geography(ST_MakePoint(long::double precision, lat::double precision)))
+  where type in service-location roles and precise coordinates are present
+```
+
+These indexes must be declared on the model and created on stage tables before
+the publish swap. A reimport must not depend on one-off migrations or manual
+live indexes, because `entity_address_unified` is replaced by table swap.
+
 Minimum bridge indexes:
 
 ```text

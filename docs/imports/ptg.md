@@ -101,6 +101,11 @@ Supported import modes:
   after publish. API pods must not materialize those artifacts into local disk
   caches; the durable source of truth is PostgreSQL so multiple API pods and a
   separate PostgreSQL host remain safe.
+  Price atoms remain the canonical rate payload rows; the binary artifacts store
+  compact relationship maps from plan/code/provider-group searches to price atom
+  ids, and reverse maps from NPI/provider-group searches back to the same price
+  atoms. The architecture saves space by not expanding every provider/rate
+  relationship into PostgreSQL heap rows, not by dropping prices or providers.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=sidecar_scope_v1` omits both provider-scope
   materialization tables and uses retained relationship sidecars plus compact
   serving dictionaries at query time. Keep this for legacy/research comparison
@@ -199,7 +204,14 @@ Healthy import behavior:
 - `.ready` backlog may fluctuate, but should not grow unbounded for many minutes.
 - Stage table sizes should grow while scanner progress advances.
 
-Full-import validation should include the final `PTG2_IMPORT_DONE` line, API smoke checks for the imported source, and a size report for the snapshot serving table plus artifact tables. For `postgres_binary_v1`, confirm `serving_row_strategy=postgres_binary`, `serving_table_exists=false` when dropping the transient serving table, `serving_binary_table_exists=true`, and `serving_sidecar_artifacts=false`.
+Full-import validation should include the final `PTG2_IMPORT_DONE` line, API
+smoke checks for the imported source, and a size report for the snapshot support
+tables plus PostgreSQL artifact tables. For `postgres_binary_v1`, confirm
+`serving_row_strategy=postgres_binary`, `serving_table_exists=false` when
+dropping the transient serving table, `serving_binary_table_exists=true`,
+`serving_sidecar_artifacts=false`, and that API pods did not create
+`HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` or any pod-local materialized artifact
+cache.
 
 ## Cleanup After Stopped Runs
 

@@ -2,12 +2,12 @@
 
 ## PTG Lanes
 
-| Queue | Worker class | Cap goal | Scanner default |
-| --- | --- | ---: | --- |
-| `arq:PTGSmall` | `process.PTGSmall` | 16 per node | 4 workers, parse-in-workers on |
-| `arq:PTGNormal` | `process.PTGNormal` | 8 per node | 2 workers, parse-in-workers on |
-| `arq:PTGLarge` | `process.PTGLarge` | 3 per node | 1 worker, parse-in-workers off |
-| `arq:PTGHuge` | `process.PTGHuge` | 1 per node | 1 worker, parse-in-workers off |
+| Queue | Worker class | Code max-jobs default | Dev cap | Scanner default |
+| --- | --- | ---: | ---: | --- |
+| `arq:PTGSmall` | `process.PTGSmall` | 16 per worker | 1 active job | 4 workers, parse-in-workers on |
+| `arq:PTGNormal` | `process.PTGNormal` | 8 per worker | 1 active job | 4 workers, parse-in-workers on; dev override 8 workers |
+| `arq:PTGLarge` | `process.PTGLarge` | 3 per worker | 1 active job | 4 workers, parse-in-workers on; dev override 16 workers |
+| `arq:PTGHuge` | `process.PTGHuge` | 1 per worker | 1 active job | 4 workers, parse-in-workers on; dev override 8 workers |
 
 The legacy `arq:PTG` and `process.PTG` remain as a compatibility/default lane
 while rollout is in progress.
@@ -27,6 +27,8 @@ the import-control API again.
 
 ## Deployment Defaults
 
-Dev starts with higher small/normal concurrency and conservative large/huge
-isolation. Production should copy the same lane model, but caps must be set from
-observed node memory and PostgreSQL headroom.
+Dev currently isolates all PTG lanes to one active job per launched worker class
+while it validates the PostgreSQL-binary storage path, large-file retry
+escalation, and API latency. Production should copy the same lane model, but
+caps must be set from observed node memory, PostgreSQL headroom, and import
+duration targets.

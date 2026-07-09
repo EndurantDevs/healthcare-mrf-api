@@ -33,6 +33,7 @@ no serving rows point to unresolved merged_into address keys
 city_zip precision is excluded from precise radius candidates
 no invalid latitude/longitude values
 required indexes exist
+service phone lookup uses the expression index and not a broad OR scan
 hot table average row size below configured limit
 bridge table counts within expected ranges
 ANALYZE completed
@@ -131,6 +132,7 @@ Plan checks should include:
 
 - GIST geo index usage for radius searches;
 - GIN index usage for bounded taxonomy/ACA/PTG arrays;
+- expression index usage for service-phone/provider-directory lookups;
 - bridge index usage for procedure and medication searches;
 - no unexpected sequential scan on full table for common searches;
 - acceptable latency on production-like data.

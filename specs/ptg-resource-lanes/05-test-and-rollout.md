@@ -24,4 +24,10 @@
 - Small PTG work is not blocked solely because one large/huge PTG is active.
 - Worker jobs request/limit memory according to their class.
 - No PTG scanner hot files are written to RWX/NFS by default.
+- New storage-saving PTG snapshots publish with
+  `arch_version=postgres_binary_v1`, no durable `provider_set_component`, no
+  durable `provider_group_rate_scope`, PostgreSQL-owned binary serving
+  artifacts, and no pod-local serving artifact cache.
+- API smoke covers forward plan/code pricing, reverse NPI pricing, and
+  geo-filtered provider pricing against a `postgres_binary_v1` snapshot.
 - Rollback env flags are documented and tested on dev.

@@ -4,7 +4,13 @@ This note records the checks used before sharing the repository for external rev
 
 ## PTG2 Serving Storage Evidence
 
-Measured on the local PostgreSQL instance at `127.0.0.1:5440`, database `healthporta`, schema `mrf`.
+This section is historical local evidence for the first manifest-backed storage
+reduction work. Current storage reviews should prefer live snapshot manifests
+and deployment smoke output, because new imports default to
+`postgres_binary_v1`.
+
+Measured on the local PostgreSQL instance at `127.0.0.1:5440`, database
+`healthporta`, schema `mrf`.
 
 Current source snapshots:
 
@@ -13,7 +19,10 @@ Current source snapshots:
 | `asr_1208` | `ptg2:202605:2e95465b2025` | 41 GB | ~4.5 GB |
 | `asr_1236` | `ptg2:202605:79060d12dfcf` | 41 GB | ~4.5 GB |
 
-Support tables are `price_atom`, `provider_group_member`, and `code_count`. This is the hot database footprint used by serving. The older selected-table baseline was 212 GB, so the current serving layout is materially smaller while keeping API responses compatible.
+Support tables are `price_atom`, `provider_group_member`, and `code_count`.
+This was the hot database footprint for the earlier manifest layout. In the
+current `postgres_binary_v1` layout, review the PostgreSQL binary artifact table
+and confirm that pod-local forward/reverse serving sidecar files are absent.
 
 Import timing records available locally:
 
@@ -26,7 +35,8 @@ The `asr_1208` manifest-backed run was validated from salvaged artifacts, so its
 
 ## Artifact Hygiene
 
-The retained sidecar directory can contain stale files from interrupted or superseded imports. Use the manifest-driven dry-run before deleting anything:
+Legacy retained sidecar directories can contain stale files from interrupted or
+superseded imports. Use the manifest-driven dry-run before deleting anything:
 
 ```bash
 HLTHPRT_DB_HOST=127.0.0.1 \
@@ -38,7 +48,7 @@ HLTHPRT_PTG2_ARTIFACT_DIR=/Volumes/Data/data \
   ./venv314/bin/python -m process.ptg_parts.ptg2_artifact_cleanup --schema mrf
 ```
 
-Current dry-run result:
+Historical dry-run result:
 
 - referenced sidecars: 36.2 GB
 - unreferenced sidecars: 61.1 GB

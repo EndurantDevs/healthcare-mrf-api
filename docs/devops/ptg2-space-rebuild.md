@@ -16,7 +16,9 @@ compared, repointed by the importer, and only then removed.
 - Rebuild from stored `mrf.ptg2_import_run.options`; do not hand-copy payer URLs
   into tickets or chat.
 - Compare old and new snapshots before removal.
-- Treat row samples and retained sidecar hashes as required checks.
+- Treat row samples and retained serving artifacts as required checks. For
+  `postgres_binary_v1`, the retained serving artifacts are PostgreSQL rows, not
+  pod-local files.
 - Remove one old source snapshot at a time.
 - Keep the job output JSON and post-cleanup metrics in the incident/report
   folder.
@@ -95,11 +97,16 @@ The compare must pass all of these checks:
 - sampled serving rows have zero misses
 - sampled price atoms have zero misses
 - sampled provider group members have zero misses
-- sidecar byte counts and sha256 hashes match
+- retained serving artifact counts and sha256 hashes match when both snapshots
+  use sidecar-backed layouts
+- PostgreSQL binary serving artifact rows exist and local serving sidecar files
+  are absent when the new snapshot uses `postgres_binary_v1`
 
 The `--benchmark-*` options are non-gating. They add warm-cache,
 snapshot-scoped serving timings for sampled plan/code pairs so storage changes
-can be reviewed next to real query latency.
+can be reviewed next to real query latency. For `postgres_binary_v1`, also
+include one forward lookup, one reverse NPI lookup, and one geo-filtered
+plan/code lookup so both binary relationship directions are exercised.
 
 Do not remove the old snapshot if any check fails.
 
