@@ -3414,6 +3414,37 @@ def test_linked_resource_candidate_urls_use_endpoint_endpoint_for_endpoint_refs(
     ]
 
 
+def test_group_resource_import_sources_collapses_shared_base_with_linked_limit():
+    source_rows = [
+        {
+            "source_id": "source_a",
+            "api_base": "https://shared.example/fhir",
+            "canonical_api_base": "https://shared.example/fhir",
+        },
+        {
+            "source_id": "source_b",
+            "api_base": "https://shared.example/fhir",
+            "canonical_api_base": "https://shared.example/fhir",
+        },
+        {
+            "source_id": "source_c",
+            "api_base": "https://shared.example/fhir",
+            "canonical_api_base": "https://shared.example/fhir",
+            "endpoint_location": "Location?address-state=CA",
+        },
+    ]
+
+    groups = importer._group_resource_import_sources(
+        source_rows,
+        linked_resource_limit=50000,
+    )
+
+    assert [[source["source_id"] for source in group] for group in groups] == [
+        ["source_a", "source_b"],
+        ["source_c"],
+    ]
+
+
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
     async def fake_fetch_json(url, *, timeout):
@@ -3445,7 +3476,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    counts = await importer._import_linked_resource_rows(
+    linked_resource_counts = await importer._import_linked_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         {
             "PractitionerRole": [
@@ -3463,7 +3494,12 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
         run_id="run_1",
     )
 
-    assert counts == {"Practitioner": 1, "Location": 1, "InsurancePlan": 1, "Endpoint": 1}
+    assert linked_resource_counts == {
+        "Practitioner": 1,
+        "Location": 1,
+        "InsurancePlan": 1,
+        "Endpoint": 1,
+    }
     concrete_models = [
         model
         for model, _rows, _kwargs in upserts
@@ -3502,6 +3538,61 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
         "Endpoint",
     }
     assert {row["last_seen_run_id"] for row in source_edge_rows} == {"run_1"}
+
+
+@pytest.mark.asyncio
+async def test_import_linked_resource_rows_mirrors_grouped_source_ids(monkeypatch):
+    async def fake_fetch_json(fetch_url, *, timeout):
+        if "/Practitioner/prac-1" in fetch_url:
+            return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
+        return 404, None, None, 5
+
+    captured_upsert_calls = []
+
+    async def fake_upsert(resource_model, resource_rows, **upsert_kwargs):
+        captured_upsert_calls.append((resource_model, resource_rows, upsert_kwargs))
+        return len(resource_rows)
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    linked_resource_counts = await importer._import_linked_resource_rows(
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        {
+            "PractitionerRole": [
+                {
+                    "resource_id": "role-1",
+                    "practitioner_ref": "Practitioner/prac-1",
+                }
+            ]
+        },
+        per_source_limit=5,
+        timeout=3,
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+    )
+
+    assert linked_resource_counts == {"Practitioner": 2}
+    practitioner_rows = [
+        practitioner_row
+        for resource_model, resource_rows, _upsert_kwargs in captured_upsert_calls
+        if resource_model is ProviderDirectoryPractitioner
+        for practitioner_row in resource_rows
+    ]
+    source_edge_rows = [
+        source_edge_row
+        for resource_model, resource_rows, _upsert_kwargs in captured_upsert_calls
+        if resource_model is ProviderDirectorySourceResource
+        for source_edge_row in resource_rows
+    ]
+    assert {
+        practitioner_row["source_id"]
+        for practitioner_row in practitioner_rows
+    } == {"source_a", "source_b"}
+    assert {
+        source_edge_row["source_id"]
+        for source_edge_row in source_edge_rows
+    } == {"source_a", "source_b"}
 
 
 @pytest.mark.asyncio

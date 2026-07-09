@@ -8435,6 +8435,7 @@ async def _import_linked_resource_rows(
         for model, rows in pending.items():
             if not rows:
                 continue
+            rows = _copy_rows_for_source_ids(rows, edge_source_ids)
             imported = await _upsert_resource_rows(
                 model,
                 rows,
@@ -8905,12 +8906,23 @@ def _limit_allows_more(current: int, limit: int) -> bool:
     return limit <= 0 or current < limit
 
 
-def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str]:
-    api_base = _canonical_base(source.get("api_base"))
+def _resource_endpoint_signature(source: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (field, _clean_text(source.get(field)) or "")
+        for field in sorted(RESOURCE_ENDPOINT_FIELDS.values())
+    )
+
+
+def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if not api_base:
-        return source.get("source_id") or "", ""
+        return source.get("source_id") or "", "", ()
     credential_descriptor = _credential_request_options_for_source(source, f"{api_base}/metadata")["descriptor"]
-    return api_base, json.dumps(credential_descriptor or {}, sort_keys=True, default=str)
+    return (
+        api_base,
+        json.dumps(credential_descriptor or {}, sort_keys=True, default=str),
+        _resource_endpoint_signature(source),
+    )
 
 
 def _group_resource_import_sources(
@@ -8918,9 +8930,7 @@ def _group_resource_import_sources(
     *,
     linked_resource_limit: int,
 ) -> list[list[dict[str, Any]]]:
-    if linked_resource_limit > 0:
-        return [[source] for source in sources]
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, tuple[tuple[str, str], ...]], list[dict[str, Any]]] = {}
     ordered_groups: list[list[dict[str, Any]]] = []
     for source in sources:
         key = _resource_import_group_key(source)
