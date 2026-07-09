@@ -5487,6 +5487,64 @@ def test_uhc_role_postal_partition_reports_unsplittable_zip_cap():
     )
 
 
+@pytest.mark.parametrize(
+    ("resource_type", "request_url"),
+    (
+        (
+            "Location",
+            "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-state=CA",
+        ),
+        (
+            "Practitioner",
+            "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=ABCD",
+        ),
+        (
+            "OrganizationAffiliation",
+            "https://flex.optum.com/fhirpublic/R4/OrganizationAffiliation?_count=100",
+        ),
+    ),
+)
+def test_uhc_unsplittable_resource_total_cap_is_exhausted(resource_type, request_url):
+    del resource_type
+    source_lookup = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._is_uhc_partition_cap_exhausted(
+        source_lookup,
+        request_url,
+        {"resourceType": "Bundle", "total": 10000},
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_unpartitioned_total_cap_is_incomplete(monkeypatch):
+    async def fake_fetch_json(_source_record, _request_url, *, timeout):
+        return 200, {"resourceType": "Bundle", "total": 10000}, None, 5
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "OrganizationAffiliation",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "uhc_organizationaffiliation_partition_cap_exhausted"
+
+
 def _practitioner_partition_bundle(resource_id: str) -> dict[str, Any]:
     return {
         "resourceType": "Bundle",
@@ -5622,6 +5680,42 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     assert checkpoint_batches[0][0]["seed_resource_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
     assert checkpoint_batches[0][0]["seed_resource_id"] == "1"
     assert cleared_bases == [importer.UHC_PROVIDER_DIRECTORY_BASE]
+
+
+@pytest.mark.asyncio
+async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatch):
+    async def fake_fetch_json(_source_record, request_url, *, timeout):
+        resource_id = request_url.rsplit("=", 1)[-1]
+        return 200, _practitioner_partition_bundle(resource_id), None, 5
+
+    async def fail_clear_checkpoints(_source_record):
+        raise AssertionError("non-role resource cleared PractitionerRole checkpoints")
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", fail_clear_checkpoints)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    partition_fetch_result = await importer._fetch_partitioned_resource_rows(
+        source_lookup,
+        "Practitioner",
+        ProviderDirectoryPractitioner,
+        ["https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=AB"],
+        importer.PartitionFetchOptions(
+            timeout=3,
+            run_id="run_1",
+            row_batch_handler=None,
+            row_batch_size=100,
+            retain_rows=True,
+            deadline_at=None,
+            max_pages=0,
+        ),
+    )
+
+    assert partition_fetch_result.complete is True
 
 
 @pytest.mark.asyncio

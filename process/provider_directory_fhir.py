@@ -1611,6 +1611,25 @@ def _is_uhc_role_zip_cap_hit(
     )
 
 
+def _is_uhc_partition_cap_exhausted(
+    source_record: dict[str, Any],
+    url: str,
+    payload: dict[str, Any],
+) -> bool:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base != UHC_PROVIDER_DIRECTORY_BASE:
+        return False
+    query_by_name = dict(
+        urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+    )
+    return (
+        "_getpages" not in query_by_name
+        and (_bundle_total(payload) or 0) >= UHC_ADAPTIVE_PARTITION_TOTAL_CAP
+    )
+
+
 def _is_uhc_role_postal_partition_enabled(source: dict[str, Any]) -> bool:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base != UHC_PROVIDER_DIRECTORY_BASE:
@@ -8967,14 +8986,16 @@ async def _fetch_partition_page(
         fhir_payload,
     ):
         return PartitionPageFetchResult(next_url=None, outcome="split")
-    is_partition_failed_on_page = _is_uhc_role_zip_cap_hit(
+    is_partition_failed_on_page = _is_uhc_partition_cap_exhausted(
         source_record,
-        resource_type,
         current_url,
         fhir_payload,
     )
     if is_partition_failed_on_page:
-        await _mark_partition_fetch_error(state, "uhc_role_postal_partition_cap_exhausted")
+        await _mark_partition_fetch_error(
+            state,
+            f"uhc_{resource_type.lower()}_partition_cap_exhausted",
+        )
     await _consume_partition_entries(
         state,
         source_record,
@@ -9144,7 +9165,11 @@ async def _fetch_partitioned_resource_rows(
         and not state.deadline_reached
         and start_url_queue.empty()
     )
-    if is_complete and _is_uhc_role_postal_partition_enabled(source_record):
+    if (
+        is_complete
+        and resource_type == "PractitionerRole"
+        and _is_uhc_role_postal_partition_enabled(source_record)
+    ):
         await _clear_reverse_lookup_checkpoints(source_record)
     return ResourceFetchResult(
         model=model,
@@ -9317,8 +9342,8 @@ async def _fetch_resource_rows(
                 pending_start_urls = child_urls + pending_start_urls
                 url = None
                 break
-            if _is_uhc_role_zip_cap_hit(source, resource_type, url, payload):
-                error_message = "uhc_role_postal_partition_cap_exhausted"
+            if _is_uhc_partition_cap_exhausted(source, url, payload):
+                error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
             entries = _bundle_entries(payload)
             for entry_index, entry in enumerate(entries):
                 parsed = parse_fhir_resource(
