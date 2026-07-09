@@ -7631,6 +7631,47 @@ async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
     ]
 
 
+@pytest.mark.asyncio
+async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
+    fetched_result_urls = []
+
+    async def fake_fetch_text(requested_url, *, max_bytes, session):
+        fetched_result_urls.append(requested_url)
+        if "filters=search-by%3AVictra" in requested_url:
+            return MAGNACARE_RESULTS_HTML
+        return ""
+
+    async def fake_fetch_json(requested_url, *, max_bytes, session):
+        return {
+            "Data": (
+                "https://transparencymrfprod.blob.core.windows.net/mrf-magnacare/"
+                "MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret"
+            )
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    resolved_targets = await discovery._resolve_magnacare_transparency_mrf(
+        {
+            "source_id": "source_abc",
+            "payer_id": "payer_abc",
+            "metadata_json": {"target_payer_query": "Victra"},
+        },
+        "https://clm.magnacare.com/transparency/",
+        {
+            "type": "magnacare_transparency_mrf",
+            "search_terms": ["magna"],
+            "max_bytes": 1024,
+            "max_targets": 10,
+        },
+        session="session",
+    )
+
+    assert "filters=search-by%3AVictra" in fetched_result_urls[0]
+    assert len(resolved_targets) == 1
+
+
 def test_highmark_hmhs_script_expands_current_month_index_urls():
     script = """
     var fileArr = [

@@ -4501,6 +4501,27 @@ def _magnacare_target_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def _magnacare_search_terms(source: dict[str, Any], resolver: dict[str, Any]) -> list[str]:
+    metadata = dict((source or {}).get("metadata_json") or {})
+    raw_metadata = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    candidate_search_terms = [
+        metadata.get("target_payer_query"),
+        raw_metadata.get("target_payer_query"),
+        *(metadata.get("plan_names") or []),
+        *(resolver.get("search_terms") or ["magna", "employee", "benefit"]),
+    ]
+    terms: list[str] = []
+    seen_search_terms: set[str] = set()
+    for item in candidate_search_terms:
+        text = str(item or "").strip()
+        key = text.lower()
+        if not text or key in seen_search_terms:
+            continue
+        seen_search_terms.add(key)
+        terms.append(text)
+    return terms
+
+
 async def _resolve_magnacare_transparency_mrf(
     source: dict[str, Any],
     url: str,
@@ -4508,11 +4529,7 @@ async def _resolve_magnacare_transparency_mrf(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
-    search_terms = [
-        str(item).strip()
-        for item in (resolver.get("search_terms") or ["magna", "employee", "benefit"])
-        if str(item).strip()
-    ]
+    search_terms = _magnacare_search_terms(source, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
