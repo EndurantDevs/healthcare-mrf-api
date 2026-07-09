@@ -227,6 +227,35 @@ def test_control_wrapped_publish_importers_request_shutdown():
     )
     assert npi_payload["run_shutdown"] is False
 
+
+def test_provider_directory_adapter_scopes_retry_lineage():
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["provider-directory-fhir"]
+    ordinary_row_map = {
+        "run_id": "run_ordinary",
+        "importer": "provider-directory-fhir",
+        "family": "provider",
+    }
+    retry_row_map = {
+        **ordinary_row_map,
+        "run_id": "run_retry",
+        "retry_of_run_id": "run_original",
+        "schedule_id": "schedule_monthly",
+        "subscription_id": "subscription_1",
+        "source_file_import_id": "source_file_1",
+        "import_id": "import_1",
+    }
+
+    ordinary_payload = control_imports._adapter_payload(adapter, ordinary_row_map, {"resource_limit": 100})
+    retry_payload = control_imports._adapter_payload(adapter, retry_row_map, {"resource_limit": 100})
+
+    assert ordinary_payload["task"] == {"test_mode": False, "resource_limit": 100}
+    assert retry_payload["task"] == {
+        "test_mode": False,
+        "resource_limit": 100,
+        "retry_of_run_id": "run_original",
+    }
+
+
 def test_openaddresses_adapter_preserves_parallel_load_params():
     payload = control_imports._adapter_payload(
         control_imports._SINGLE_JOB_ADAPTERS["openaddresses"],

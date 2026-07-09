@@ -1012,6 +1012,11 @@ def _ptg_lane_metrics(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_TASK_LINEAGE_FIELDS_BY_IMPORTER = {
+    "provider-directory-fhir": ("retry_of_run_id",),
+}
+
+
 def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     test_mode = bool(params.get("test_mode", params.get("test", False)))
     if adapter["payload"] == "test_mode":
@@ -1027,6 +1032,14 @@ def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[
                 payload[key] = params[key]
         return payload
     if adapter["payload"] in {"control_wrapped", "control_wrapped_kwargs"}:
+        task_payload_map = {"test_mode": test_mode, **params}
+        task_lineage_fields = _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(
+            str(row.get("importer") or ""),
+            (),
+        )
+        for field in task_lineage_fields:
+            if row.get(field):
+                task_payload_map[field] = row[field]
         return {
             "run_id": row["run_id"],
             "importer": row.get("importer"),
@@ -1035,7 +1048,7 @@ def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[
             "target_function": adapter["target_function"],
             "call_style": "kwargs" if adapter["payload"] == "control_wrapped_kwargs" else "ctx_task",
             "run_shutdown": bool(adapter.get("run_shutdown")),
-            "task": {"test_mode": test_mode, **params},
+            "task": task_payload_map,
         }
     if adapter["payload"] == "run_import":
         payload = {
