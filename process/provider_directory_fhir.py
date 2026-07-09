@@ -452,6 +452,10 @@ TMHP_PROVIDER_DIRECTORY_BASE = "https://cmsinterop.tmhp.com/tmhp/fhir/pd/R4"
 TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL = f"{NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/metadata"
+NEBRASKA_DHHS_PAGINATION_HOST = "dhhs-uat-api.ne.gov"
+FHIR_OFFSET_PAGINATION_BASES = frozenset(
+    {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}
+)
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
@@ -1548,29 +1552,52 @@ def _url_with_count(url: str, page_count: int) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
 
 
-def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
-    supported_resource_types = _source_supported_resource_types(source)
+def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base not in FHIR_OFFSET_PAGINATION_BASES:
+        return url
+    sorted_url = _url_with_replaced_query_item(url, "_sort", "_id")
+    return _url_with_replaced_query_item(sorted_url, "_offset", "0")
+
+
+def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
+    supported_resource_types = _source_supported_resource_types(source_record)
     if (
         supported_resource_types is not None
         and resource_type not in supported_resource_types
     ):
         return None
-    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    resource_page_count = _source_resource_page_count(source, resource_type, page_count)
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    resource_page_count = _source_resource_page_count(
+        source_record,
+        resource_type,
+        page_count,
+    )
     endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
-    endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
+    endpoint = _clean_text(source_record.get(endpoint_field)) if endpoint_field else None
     if endpoint and not _is_placeholder_url(endpoint):
         parsed = urllib.parse.urlsplit(endpoint)
         if parsed.scheme and parsed.netloc:
-            return _url_with_count(endpoint, resource_page_count)
+            return _source_pagination_start_url(
+                source_record,
+                _url_with_count(endpoint, resource_page_count),
+            )
         if api_base:
-            return _url_with_count(
-                urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint),
-                resource_page_count,
+            return _source_pagination_start_url(
+                source_record,
+                _url_with_count(
+                    urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint),
+                    resource_page_count,
+                ),
             )
     if not api_base:
         return None
-    return _url_with_count(f"{api_base}/{resource_type}", resource_page_count)
+    return _source_pagination_start_url(
+        source_record,
+        _url_with_count(f"{api_base}/{resource_type}", resource_page_count),
+    )
 
 
 SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -8662,6 +8689,8 @@ def _resolved_fhir_next_url(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
     parsed_next = urllib.parse.urlsplit(next_url)
+    if api_base in FHIR_OFFSET_PAGINATION_BASES:
+        return _resolved_offset_next_url(api_base, current_url, next_url)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
         return _resolved_molina_next_url(current_url, next_url)
     if api_base != HAP_PROVIDER_DIRECTORY_BASE:
@@ -8676,6 +8705,91 @@ def _resolved_fhir_next_url(
             parsed_next.path,
             parsed_next.query,
             parsed_next.fragment,
+        )
+    )
+
+
+def _validated_offset_pagination_parts(
+    api_base: str,
+    current_url: str,
+    next_url: str,
+) -> tuple[urllib.parse.SplitResult, urllib.parse.SplitResult, str]:
+    canonical_base = urllib.parse.urlsplit(api_base)
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    allowed_hosts = {canonical_base.netloc.lower()}
+    if api_base == NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE:
+        allowed_hosts.add(NEBRASKA_DHHS_PAGINATION_HOST)
+    current_resource_prefix = f"{canonical_base.path.rstrip('/')}/"
+    resource_type = (
+        parsed_current.path[len(current_resource_prefix) :]
+        if parsed_current.path.startswith(current_resource_prefix)
+        else ""
+    )
+    next_query_items = urllib.parse.parse_qsl(
+        parsed_next.query,
+        keep_blank_values=True,
+    )
+    next_offsets = [
+        offset_value
+        for key, offset_value in next_query_items
+        if key in {"_getpagesoffset", "_offset"}
+    ]
+    allowed_paths = {canonical_base.path, parsed_current.path}
+    is_allowlisted = (
+        parsed_next.scheme.lower() == canonical_base.scheme
+        and parsed_next.netloc.lower() in allowed_hosts
+        and parsed_next.path in allowed_paths
+        and not parsed_next.fragment
+        and resource_type in DEFAULT_RESOURCES
+        and len(next_offsets) == 1
+        and next_offsets[0].isdigit()
+    )
+    if not is_allowlisted:
+        raise ValueError("untrusted_offset_pagination_link")
+    return canonical_base, parsed_current, next_offsets[0]
+
+
+def _resolved_offset_next_url(
+    api_base: str,
+    current_url: str,
+    next_url: str,
+) -> str:
+    canonical_base, parsed_current, next_offset = (
+        _validated_offset_pagination_parts(api_base, current_url, next_url)
+    )
+    current_query_items = urllib.parse.parse_qsl(
+        parsed_current.query,
+        keep_blank_values=True,
+    )
+    current_count = next(
+        (
+            count_value
+            for key, count_value in current_query_items
+            if key == "_count"
+        ),
+        str(DEFAULT_MAX_PAGE_COUNT),
+    )
+    preserved_query_items = [
+        (key, query_value)
+        for key, query_value in current_query_items
+        if key.lower() not in FHIR_CONTINUATION_QUERY_NAMES
+        and key not in {"_count", "_offset", "_sort"}
+    ]
+    preserved_query_items.extend(
+        (
+            ("_sort", "_id"),
+            ("_offset", next_offset),
+            ("_count", current_count),
+        )
+    )
+    return urllib.parse.urlunsplit(
+        (
+            canonical_base.scheme,
+            canonical_base.netloc,
+            parsed_current.path,
+            urllib.parse.urlencode(preserved_query_items, doseq=True),
+            "",
         )
     )
 

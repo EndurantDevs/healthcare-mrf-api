@@ -837,6 +837,10 @@ def test_source_row_from_seed_overrides_tmhp_stale_oauth_label():
     assert row["auth_type"] == "none"
     assert row["metadata_json"]["provider_directory_override"] == "tmhp_public_providerdirectory"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.TMHP_PROVIDER_DIRECTORY_METADATA_URL
+    assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
+        f"{importer.TMHP_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=100&_sort=_id&_offset=0"
+    )
 
 
 def test_source_row_from_seed_overrides_nebraska_dhhs_stale_oauth_label():
@@ -860,6 +864,10 @@ def test_source_row_from_seed_overrides_nebraska_dhhs_stale_oauth_label():
     assert (
         row["metadata_json"]["provider_directory_confirmed_metadata_url"]
         == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL
+    )
+    assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
+        f"{importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=100&_sort=_id&_offset=0"
     )
 
 
@@ -904,6 +912,65 @@ def test_hap_rewrites_blocked_pagination_sibling_host():
         f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?"
         "_count=1&_getpages=next-token"
     )
+
+
+@pytest.mark.parametrize(
+    ("api_base", "next_host"),
+    [
+        (
+            importer.TMHP_PROVIDER_DIRECTORY_BASE,
+            "cmsinterop.tmhp.com",
+        ),
+        (
+            importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+            importer.NEBRASKA_DHHS_PAGINATION_HOST,
+        ),
+    ],
+)
+def test_state_directory_rewrites_hapi_next_link_to_sorted_offset(
+    api_base,
+    next_host,
+):
+    source_lookup = {
+        "api_base": api_base,
+        "canonical_api_base": api_base,
+    }
+    base_path = importer.urllib.parse.urlsplit(api_base).path
+    current_url = (
+        f"{api_base}/Practitioner?family=Smith&_count=100&_sort=_id&_offset=0"
+    )
+    advertised_next_url = (
+        f"https://{next_host}{base_path}?"
+        "_getpages=opaque&_getpagesoffset=100&_count=100&_bundletype=searchset"
+    )
+
+    next_url = importer._resolved_fhir_next_url(
+        source_lookup,
+        current_url,
+        advertised_next_url,
+    )
+
+    assert next_url == (
+        f"{api_base}/Practitioner?"
+        "family=Smith&_sort=_id&_offset=100&_count=100"
+    )
+
+
+def test_state_directory_rejects_untrusted_offset_next_link():
+    source_lookup = {
+        "api_base": importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+    }
+
+    with pytest.raises(ValueError, match="untrusted_offset_pagination_link"):
+        importer._resolved_fhir_next_url(
+            source_lookup,
+            (
+                f"{importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+                "_count=100&_sort=_id&_offset=0"
+            ),
+            "https://evil.example/fhir?_getpagesoffset=100&_count=100",
+        )
 
 
 def test_molina_rewrites_exact_sapphire_next_link():
