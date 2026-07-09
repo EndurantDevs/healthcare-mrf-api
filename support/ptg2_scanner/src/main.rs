@@ -6613,53 +6613,76 @@ fn encode_serving_by_code_group(
     Ok(encoded)
 }
 
-fn append_serving_binary_by_code_group<W: Write>(
-    writer: &mut W,
+struct ServingBinaryByCodeGroupState {
     current_code: Option<i32>,
     max_payload_bytes: usize,
-    block_no: &mut usize,
-    current_entry_count: &mut usize,
-    previous_provider_set_key: &mut i32,
-    current_payload: &mut Vec<u8>,
+    block_no: usize,
+    current_entry_count: usize,
+    previous_provider_set_key: i32,
+    current_payload: Vec<u8>,
     current_provider_set_key: Option<i32>,
-    current_price_keys: &mut Vec<u32>,
-    record_count: &mut u64,
-    group_count: &mut u64,
+    current_price_keys: Vec<u32>,
+    record_count: u64,
+    group_count: u64,
+}
+
+impl ServingBinaryByCodeGroupState {
+    fn new(max_payload_bytes: usize) -> Self {
+        Self {
+            current_code: None,
+            max_payload_bytes,
+            block_no: 0,
+            current_entry_count: 0,
+            previous_provider_set_key: 0,
+            current_payload: Vec::with_capacity(max_payload_bytes.min(1024 * 1024)),
+            current_provider_set_key: None,
+            current_price_keys: Vec::new(),
+            record_count: 0,
+            group_count: 0,
+        }
+    }
+}
+
+fn append_serving_binary_by_code_group<W: Write>(
+    writer: &mut W,
+    state: &mut ServingBinaryByCodeGroupState,
 ) -> io::Result<()> {
-    let Some(provider_set_key) = current_provider_set_key else {
-        current_price_keys.clear();
+    let Some(provider_set_key) = state.current_provider_set_key else {
+        state.current_price_keys.clear();
         return Ok(());
     };
-    if current_price_keys.is_empty() {
+    if state.current_price_keys.is_empty() {
         return Ok(());
     }
-    let Some(_code_key) = current_code else {
-        current_price_keys.clear();
+    let Some(_code_key) = state.current_code else {
+        state.current_price_keys.clear();
         return Ok(());
     };
     let mut encoded = encode_serving_by_code_group(
         provider_set_key,
-        *previous_provider_set_key,
-        current_price_keys,
+        state.previous_provider_set_key,
+        &state.current_price_keys,
     )?;
-    if *current_entry_count > 0 && current_payload.len() + encoded.len() > max_payload_bytes {
+    if state.current_entry_count > 0
+        && state.current_payload.len() + encoded.len() > state.max_payload_bytes
+    {
         flush_serving_binary_by_code_block(
             writer,
-            current_code,
-            *block_no,
-            current_entry_count,
-            current_payload,
-            record_count,
+            state.current_code,
+            state.block_no,
+            &mut state.current_entry_count,
+            &mut state.current_payload,
+            &mut state.record_count,
         )?;
-        *block_no += 1;
-        *previous_provider_set_key = 0;
-        encoded = encode_serving_by_code_group(provider_set_key, 0, current_price_keys)?;
+        state.block_no += 1;
+        state.previous_provider_set_key = 0;
+        encoded = encode_serving_by_code_group(provider_set_key, 0, &state.current_price_keys)?;
     }
-    current_payload.extend_from_slice(&encoded);
-    *current_entry_count += 1;
-    *previous_provider_set_key = provider_set_key;
-    *group_count = group_count.saturating_add(1);
-    current_price_keys.clear();
+    state.current_payload.extend_from_slice(&encoded);
+    state.current_entry_count += 1;
+    state.previous_provider_set_key = provider_set_key;
+    state.group_count = state.group_count.saturating_add(1);
+    state.current_price_keys.clear();
     Ok(())
 }
 
@@ -6673,16 +6696,8 @@ fn write_serving_binary_by_code_copy_from_reader<R: BufRead, W: Write>(
     let mut price_set_values: Vec<[u8; GLOBAL_ID_BYTES]> = Vec::new();
     let mut provider_count_by_key: BTreeMap<i32, u64> = BTreeMap::new();
     let mut row_count = 0u64;
-    let mut record_count = 0u64;
     let mut code_count = 0u64;
-    let mut current_code: Option<i32> = None;
-    let mut current_payload = Vec::with_capacity(max_payload_bytes.min(1024 * 1024));
-    let mut current_entry_count = 0usize;
-    let mut group_count = 0u64;
-    let mut block_no = 0usize;
-    let mut previous_provider_set_key = 0i32;
-    let mut current_provider_set_key: Option<i32> = None;
-    let mut current_price_keys: Vec<u32> = Vec::new();
+    let mut group_state = ServingBinaryByCodeGroupState::new(max_payload_bytes);
 
     let mut line = Vec::new();
     loop {
@@ -6713,73 +6728,37 @@ fn write_serving_binary_by_code_copy_from_reader<R: BufRead, W: Write>(
         } else {
             provider_count_by_key.insert(provider_set_key, provider_count);
         }
-        if current_code != Some(code_key) {
-            append_serving_binary_by_code_group(
-                writer,
-                current_code,
-                max_payload_bytes,
-                &mut block_no,
-                &mut current_entry_count,
-                &mut previous_provider_set_key,
-                &mut current_payload,
-                current_provider_set_key,
-                &mut current_price_keys,
-                &mut record_count,
-                &mut group_count,
-            )?;
+        if group_state.current_code != Some(code_key) {
+            append_serving_binary_by_code_group(writer, &mut group_state)?;
             flush_serving_binary_by_code_block(
                 writer,
-                current_code,
-                block_no,
-                &mut current_entry_count,
-                &mut current_payload,
-                &mut record_count,
+                group_state.current_code,
+                group_state.block_no,
+                &mut group_state.current_entry_count,
+                &mut group_state.current_payload,
+                &mut group_state.record_count,
             )?;
-            current_code = Some(code_key);
-            previous_provider_set_key = 0;
-            block_no = 0;
+            group_state.current_code = Some(code_key);
+            group_state.previous_provider_set_key = 0;
+            group_state.block_no = 0;
             code_count = code_count.saturating_add(1);
-        } else if current_provider_set_key != Some(provider_set_key) {
-            append_serving_binary_by_code_group(
-                writer,
-                current_code,
-                max_payload_bytes,
-                &mut block_no,
-                &mut current_entry_count,
-                &mut previous_provider_set_key,
-                &mut current_payload,
-                current_provider_set_key,
-                &mut current_price_keys,
-                &mut record_count,
-                &mut group_count,
-            )?;
+        } else if group_state.current_provider_set_key != Some(provider_set_key) {
+            append_serving_binary_by_code_group(writer, &mut group_state)?;
         }
         let price_set_key =
             serving_price_key(price_set_id, &mut price_set_to_key, &mut price_set_values)?;
-        current_provider_set_key = Some(provider_set_key);
-        current_price_keys.push(price_set_key);
+        group_state.current_provider_set_key = Some(provider_set_key);
+        group_state.current_price_keys.push(price_set_key);
         row_count = row_count.saturating_add(1);
     }
-    append_serving_binary_by_code_group(
-        writer,
-        current_code,
-        max_payload_bytes,
-        &mut block_no,
-        &mut current_entry_count,
-        &mut previous_provider_set_key,
-        &mut current_payload,
-        current_provider_set_key,
-        &mut current_price_keys,
-        &mut record_count,
-        &mut group_count,
-    )?;
+    append_serving_binary_by_code_group(writer, &mut group_state)?;
     flush_serving_binary_by_code_block(
         writer,
-        current_code,
-        block_no,
-        &mut current_entry_count,
-        &mut current_payload,
-        &mut record_count,
+        group_state.current_code,
+        group_state.block_no,
+        &mut group_state.current_entry_count,
+        &mut group_state.current_payload,
+        &mut group_state.record_count,
     )?;
     let dictionary_payload = serving_binary_dictionary_payload(&price_set_values);
     write_serving_binary_copy_record(
@@ -6790,7 +6769,7 @@ fn write_serving_binary_by_code_copy_from_reader<R: BufRead, W: Write>(
         price_set_values.len(),
         &dictionary_payload,
     )?;
-    record_count = record_count.saturating_add(1);
+    group_state.record_count = group_state.record_count.saturating_add(1);
     let provider_count_payload = serving_binary_provider_count_payload(&provider_count_by_key);
     write_serving_binary_copy_record(
         writer,
@@ -6800,19 +6779,19 @@ fn write_serving_binary_by_code_copy_from_reader<R: BufRead, W: Write>(
         provider_count_by_key.len(),
         &provider_count_payload,
     )?;
-    record_count = record_count.saturating_add(1);
+    group_state.record_count = group_state.record_count.saturating_add(1);
     writer.flush()?;
     let mut payload = json!({
         "name": "serving_binary_by_code",
         "format": PTG2_SERVING_BINARY_TABLE_FORMAT,
         "kind": PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
         "row_count": row_count,
-        "group_count": group_count,
+        "group_count": group_state.group_count,
         "code_count": code_count,
-        "block_count": record_count.saturating_sub(2),
+        "block_count": group_state.record_count.saturating_sub(2),
         "price_set_count": price_set_values.len(),
         "provider_set_count": provider_count_by_key.len(),
-        "copy_record_count": record_count,
+        "copy_record_count": group_state.record_count,
         "byte_count": writer.byte_count(),
         "block_bytes": max_payload_bytes,
     });
