@@ -267,9 +267,9 @@ def _ensure_kubernetes_job(
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
     namespace = _kubernetes_namespace()
-    if state.get("job_status") in {"succeeded", "failed"} and state.get("job_name"):
+    if state.get("job_status") in {"succeeded", "failed"}:
         try:
-            _delete_kubernetes_job(namespace, str(state["job_name"]))
+            _delete_terminal_kubernetes_worker_jobs(namespace, spec, payload)
         except _KubernetesApiError as exc:
             if exc.status != 404:
                 return {**state, "status": "failed", "message": str(exc)}
@@ -283,6 +283,28 @@ def _ensure_kubernetes_job(
             return {**refreshed, "status": "already_running" if refreshed.get("running") else "exists"}
         return {**state, "status": "failed", "message": str(exc)}
     return {**_worker_state(spec, payload), "status": "started"}
+
+
+def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, payload: dict[str, Any]) -> None:
+    selector = _kubernetes_label_selector(spec, payload)
+    path = f"/apis/batch/v1/namespaces/{namespace}/jobs?{urllib.parse.urlencode({'labelSelector': selector})}"
+    body = _kubernetes_request("GET", path)
+    for job_record in _kubernetes_job_records(body):
+        metadata = job_record.get("metadata") if isinstance(job_record.get("metadata"), dict) else {}
+        job_name = str(metadata.get("name") or "").strip()
+        if not job_name:
+            continue
+        status = job_record.get("status") if isinstance(job_record.get("status"), dict) else {}
+        active_count = int(status.get("active") or 0)
+        succeeded_count = int(status.get("succeeded") or 0)
+        failed_count = int(status.get("failed") or 0)
+        if active_count or not (succeeded_count or failed_count):
+            continue
+        try:
+            _delete_kubernetes_job(namespace, job_name)
+        except _KubernetesApiError as exc:
+            if exc.status != 404:
+                raise
 
 
 def _delete_kubernetes_job(namespace: str, job_name: str) -> None:

@@ -410,6 +410,36 @@ def test_kubernetes_completed_worker_job_is_recreated(monkeypatch):
     assert any(call[0] == "POST" and call[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs" for call in calls)
 
 
+def test_kubernetes_completed_worker_jobs_are_all_removed_before_recreate(monkeypatch):
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            if any(item[0] == "POST" for item in calls):
+                return {"items": [{"metadata": {"name": "worker-job-new"}, "status": {"active": 1}}]}
+            return {
+                "items": [
+                    {"metadata": {"name": "worker-job-old-a"}, "status": {"succeeded": 1}},
+                    {"metadata": {"name": "worker-job-old-b"}, "status": {"succeeded": 1}},
+                ]
+            }
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    result = control_workers.ensure_worker({"worker_class": "process.PTGNormal"})
+
+    assert result["status"] == "started"
+    assert any(call[0] == "DELETE" and call[1].endswith("/jobs/worker-job-old-a") for call in calls)
+    assert any(call[0] == "DELETE" and call[1].endswith("/jobs/worker-job-old-b") for call in calls)
+    assert any(call[0] == "POST" and call[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs" for call in calls)
+
+
 def test_delete_kubernetes_worker_jobs_deletes_active_matching_run(monkeypatch):
     request_calls: list[tuple[str, str, dict[str, object] | None]] = []
 
