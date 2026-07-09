@@ -348,6 +348,8 @@ ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
 ALOHR_GRAPHQL_URL = "https://api.esante.us/graphql"
 ALOHR_TENANT_ID = "alohr"
+ALOHR_PROVIDER_CHECKPOINT_RESOURCE = "ALOHRGraphQLProvider"
+ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE = "ALOHRGraphQLOrganization"
 ALOHR_PROVIDER_QUERY = """
 query ALOHR_PROVIDER_FIND($criteria: ProviderSearchCriteria, $nextToken: String) {
   providers(criteria: $criteria, nextToken: $nextToken) {
@@ -488,6 +490,8 @@ PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
+        ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
@@ -11657,6 +11661,30 @@ async def _fetch_alohr_graphql_page(
     return items, _clean_text(result.get("nextToken")), None
 
 
+def _alohr_graphql_checkpoint_locator(root_key: str, next_token: str | None) -> str:
+    query_items = [("stream", root_key)]
+    if next_token:
+        query_items.append(("nextToken", next_token))
+    return f"{ALOHR_GRAPHQL_URL}?{urllib.parse.urlencode(query_items)}"
+
+
+def _alohr_graphql_checkpoint_token(locator: str, root_key: str) -> str | None:
+    parsed = urllib.parse.urlsplit(locator)
+    expected = urllib.parse.urlsplit(ALOHR_GRAPHQL_URL)
+    query_items = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if (
+        parsed.scheme.lower() != expected.scheme.lower()
+        or parsed.netloc.lower() != expected.netloc.lower()
+        or parsed.path.rstrip("/") != expected.path.rstrip("/")
+        or parsed.fragment
+        or query_items.get("stream") != [root_key]
+        or set(query_items) - {"stream", "nextToken"}
+        or len(query_items.get("nextToken", [])) > 1
+    ):
+        raise ValueError("invalid ALOHR GraphQL pagination checkpoint")
+    return _clean_text((query_items.get("nextToken") or [None])[0])
+
+
 def _alohr_resource_diagnostic(
     *,
     complete: bool,
@@ -11666,6 +11694,7 @@ def _alohr_resource_diagnostic(
     rows_written: int,
     row_limit_reached: bool,
     page_limit_reached: bool,
+    next_url_remaining: bool = False,
 ) -> dict[str, Any]:
     return {
         "complete": complete,
@@ -11677,20 +11706,421 @@ def _alohr_resource_diagnostic(
         "row_limit_reached": row_limit_reached,
         "page_limit_reached": page_limit_reached,
         "hard_page_limit_reached": False,
-        "next_url_remaining": None,
+        "next_url_remaining": next_url_remaining,
     }
+
+
+def _merge_alohr_resource_diagnostic(
+    existing: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    if not existing:
+        return current
+    errors = [
+        error
+        for error in (existing.get("error"), current.get("error"))
+        if error
+    ]
+    return {
+        "complete": existing.get("complete") is True and current.get("complete") is True,
+        "bounded": bool(existing.get("bounded") or current.get("bounded")),
+        "error": "; ".join(dict.fromkeys(errors)) or None,
+        "pages_fetched": int(existing.get("pages_fetched") or 0)
+        + int(current.get("pages_fetched") or 0),
+        "rows_fetched": int(existing.get("rows_fetched") or 0)
+        + int(current.get("rows_fetched") or 0),
+        "rows_written": int(existing.get("rows_written") or 0)
+        + int(current.get("rows_written") or 0),
+        "row_limit_reached": bool(
+            existing.get("row_limit_reached") or current.get("row_limit_reached")
+        ),
+        "page_limit_reached": bool(
+            existing.get("page_limit_reached") or current.get("page_limit_reached")
+        ),
+        "hard_page_limit_reached": False,
+        "next_url_remaining": bool(
+            existing.get("next_url_remaining") or current.get("next_url_remaining")
+        ),
+    }
+
+
+AlohrAppendCallback = Callable[
+    [dict[type, list[dict[str, Any]]], str, dict[str, Any]],
+    None,
+]
+
+
+@dataclass(frozen=True)
+class AlohrGraphQLImportOptions:
+    per_resource_limit: int
+    page_limit: int
+    timeout: int
+    run_id: str | None
+    stale_cleanup: bool
+    seen_table: str | None
+    checkpoint_context: PaginationCheckpointContext | None
+    resume_required_entries: set[str] | None
+
+
+@dataclass
+class AlohrGraphQLImportState:
+    source_ids: list[str]
+    selected_resource_types: set[str]
+    canonical_api_base: str
+    options: AlohrGraphQLImportOptions
+    source_counts_by_resource: dict[str, int]
+    diagnostics_by_resource: dict[str, dict[str, Any]] = field(default_factory=dict)
+    checkpoint_diagnostics_by_resource: dict[str, dict[str, Any]] = field(default_factory=dict)
+    stats_by_resource: dict[str, dict[str, Any]] = field(default_factory=dict)
+    stale_counts_by_resource: dict[str, int] = field(default_factory=dict)
+    stale_ready_source_ids_by_resource: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AlohrGraphQLStreamSpec:
+    query: str
+    root_key: str
+    item_key: str
+    append_item: AlohrAppendCallback
+    resource_types: tuple[str, ...]
+    checkpoint_resource_type: str
+
+
+@dataclass
+class AlohrGraphQLStreamState:
+    current_locator: str | None
+    pages_fetched: int
+    rows_fetched: int
+    recent_locator_hashes: list[str]
+    visited_locator_hashes: set[str]
+    written_counts_by_resource: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    is_row_limit_reached: bool = False
+    is_page_limit_reached: bool = False
+
+
+def _initialize_alohr_graphql_import_state(
+    source_group: list[dict[str, Any]],
+    resource_types: list[str],
+    options: AlohrGraphQLImportOptions,
+) -> AlohrGraphQLImportState:
+    source_ids = [source_record["source_id"] for source_record in source_group]
+    canonical_api_base = (
+        source_group[0].get("canonical_api_base") or source_group[0].get("api_base")
+    )
+    return AlohrGraphQLImportState(
+        source_ids=source_ids,
+        selected_resource_types=set(resource_types),
+        canonical_api_base=canonical_api_base,
+        options=options,
+        source_counts_by_resource={resource_type: 0 for resource_type in resource_types},
+    )
+
+
+async def _load_alohr_graphql_stream_state(
+    stream_spec: AlohrGraphQLStreamSpec,
+    options: AlohrGraphQLImportOptions,
+) -> AlohrGraphQLStreamState:
+    start_locator = _alohr_graphql_checkpoint_locator(stream_spec.root_key, None)
+    resume_state = None
+    if options.checkpoint_context:
+        resume_state = await _load_or_initialize_pagination_checkpoint(
+            options.checkpoint_context,
+            stream_spec.checkpoint_resource_type,
+            start_locator,
+        )
+    current_locator = start_locator
+    if resume_state:
+        current_locator = None if resume_state.complete else resume_state.next_url
+    recent_locator_hashes = list(resume_state.recent_url_hashes if resume_state else ())
+    return AlohrGraphQLStreamState(
+        current_locator=current_locator,
+        pages_fetched=resume_state.pages_processed if resume_state else 0,
+        rows_fetched=resume_state.rows_processed if resume_state else 0,
+        recent_locator_hashes=recent_locator_hashes,
+        visited_locator_hashes=set(recent_locator_hashes),
+    )
+
+
+def _can_fetch_alohr_graphql_stream(
+    stream_state: AlohrGraphQLStreamState,
+    options: AlohrGraphQLImportOptions,
+) -> bool:
+    if options.page_limit > 0 and stream_state.pages_fetched >= options.page_limit:
+        stream_state.is_page_limit_reached = True
+        return False
+    if (
+        options.per_resource_limit > 0
+        and stream_state.rows_fetched >= options.per_resource_limit
+    ):
+        stream_state.is_row_limit_reached = True
+        return False
+    return True
+
+
+def _bounded_alohr_graphql_items(
+    source_items: list[dict[str, Any]],
+    proposed_next_token: str | None,
+    stream_state: AlohrGraphQLStreamState,
+    options: AlohrGraphQLImportOptions,
+) -> list[dict[str, Any]]:
+    if options.per_resource_limit <= 0:
+        return source_items
+    remaining_count = max(0, options.per_resource_limit - stream_state.rows_fetched)
+    accepted_source_items = source_items[:remaining_count]
+    stream_state.is_row_limit_reached = len(accepted_source_items) < len(source_items) or bool(
+        proposed_next_token and len(accepted_source_items) >= remaining_count
+    )
+    return accepted_source_items
+
+
+async def _write_alohr_graphql_page(
+    import_state: AlohrGraphQLImportState,
+    source_items: list[dict[str, Any]],
+    append_item: AlohrAppendCallback,
+) -> dict[str, int]:
+    resource_rows_by_model: dict[type, list[dict[str, Any]]] = {}
+    for source_item in source_items:
+        for source_id in import_state.source_ids:
+            append_item(resource_rows_by_model, source_id, source_item)
+    written_counts_by_resource: dict[str, int] = {}
+    for model, model_rows in resource_rows_by_model.items():
+        resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+        if resource_type not in import_state.selected_resource_types:
+            continue
+        written_count = await _upsert_resource_rows(
+            model,
+            model_rows,
+            run_id=import_state.options.run_id,
+            track_seen=import_state.options.stale_cleanup,
+            seen_table=import_state.options.seen_table,
+            canonical_api_base=import_state.canonical_api_base,
+            source_ids=import_state.source_ids,
+        )
+        prior_count = import_state.source_counts_by_resource.get(resource_type, 0)
+        import_state.source_counts_by_resource[resource_type] = prior_count + written_count
+        written_counts_by_resource[resource_type] = written_count
+    return written_counts_by_resource
+
+
+async def _save_alohr_graphql_stream_page(
+    stream_spec: AlohrGraphQLStreamSpec,
+    stream_state: AlohrGraphQLStreamState,
+    options: AlohrGraphQLImportOptions,
+    request_locator_hash: str,
+    next_locator: str | None,
+) -> None:
+    if options.checkpoint_context:
+        stream_state.recent_locator_hashes.append(request_locator_hash)
+        del stream_state.recent_locator_hashes[:-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT]
+        await _save_pagination_checkpoint(
+            options.checkpoint_context,
+            stream_spec.checkpoint_resource_type,
+            next_url=next_locator,
+            pages_processed=stream_state.pages_fetched,
+            rows_processed=stream_state.rows_fetched,
+            recent_url_hashes=stream_state.recent_locator_hashes,
+        )
+    stream_state.visited_locator_hashes.add(request_locator_hash)
+    stream_state.current_locator = next_locator
+
+
+def _record_alohr_graphql_stream(
+    import_state: AlohrGraphQLImportState,
+    stream_spec: AlohrGraphQLStreamSpec,
+    stream_state: AlohrGraphQLStreamState,
+) -> None:
+    is_complete = (
+        stream_state.error is None
+        and not stream_state.is_row_limit_reached
+        and not stream_state.is_page_limit_reached
+        and not stream_state.current_locator
+    )
+    stream_diagnostic = _alohr_resource_diagnostic(
+        complete=is_complete,
+        error=stream_state.error,
+        pages_fetched=stream_state.pages_fetched,
+        rows_fetched=stream_state.rows_fetched,
+        rows_written=sum(stream_state.written_counts_by_resource.values())
+        // max(1, len(import_state.source_ids)),
+        row_limit_reached=stream_state.is_row_limit_reached,
+        page_limit_reached=stream_state.is_page_limit_reached,
+        next_url_remaining=bool(stream_state.current_locator),
+    )
+    import_state.checkpoint_diagnostics_by_resource[
+        stream_spec.checkpoint_resource_type
+    ] = stream_diagnostic
+    for resource_type in stream_spec.resource_types:
+        if resource_type not in import_state.selected_resource_types:
+            continue
+        resource_diagnostic_by_field = dict(stream_diagnostic)
+        resource_diagnostic_by_field["rows_written"] = (
+            stream_state.written_counts_by_resource.get(resource_type, 0)
+            // max(1, len(import_state.source_ids))
+        )
+        import_state.diagnostics_by_resource[resource_type] = (
+            _merge_alohr_resource_diagnostic(
+                import_state.diagnostics_by_resource.get(resource_type),
+                resource_diagnostic_by_field,
+            )
+        )
+
+
+async def _can_advance_alohr_graphql_stream_page(
+    import_state: AlohrGraphQLImportState,
+    stream_spec: AlohrGraphQLStreamSpec,
+    stream_state: AlohrGraphQLStreamState,
+) -> bool:
+    try:
+        next_token = _alohr_graphql_checkpoint_token(
+            stream_state.current_locator or "",
+            stream_spec.root_key,
+        )
+    except ValueError as exc:
+        stream_state.error = str(exc)
+        return False
+    request_locator_hash = _pagination_url_hash(stream_state.current_locator or "")
+    if request_locator_hash in stream_state.visited_locator_hashes:
+        stream_state.error = "pagination_cursor_repeated"
+        return False
+    source_items, proposed_next_token, stream_state.error = (
+        await _fetch_alohr_graphql_page(
+            stream_spec.query,
+            stream_spec.root_key,
+            stream_spec.item_key,
+            next_token=next_token,
+            timeout=import_state.options.timeout,
+        )
+    )
+    if stream_state.error:
+        return False
+    accepted_source_items = _bounded_alohr_graphql_items(
+        source_items,
+        proposed_next_token,
+        stream_state,
+        import_state.options,
+    )
+    written_counts_by_resource = await _write_alohr_graphql_page(
+        import_state,
+        accepted_source_items,
+        stream_spec.append_item,
+    )
+    stream_state.pages_fetched += 1
+    stream_state.rows_fetched += len(accepted_source_items)
+    for resource_type, written_count in written_counts_by_resource.items():
+        prior_count = stream_state.written_counts_by_resource.get(resource_type, 0)
+        stream_state.written_counts_by_resource[resource_type] = prior_count + written_count
+    next_locator = (
+        _alohr_graphql_checkpoint_locator(stream_spec.root_key, proposed_next_token)
+        if proposed_next_token
+        else None
+    )
+    await _save_alohr_graphql_stream_page(
+        stream_spec,
+        stream_state,
+        import_state.options,
+        request_locator_hash,
+        next_locator,
+    )
+    return not stream_state.is_row_limit_reached
+
+
+async def _fetch_alohr_graphql_stream(
+    import_state: AlohrGraphQLImportState,
+    stream_spec: AlohrGraphQLStreamSpec,
+) -> None:
+    if not (import_state.selected_resource_types & set(stream_spec.resource_types)):
+        return
+    stream_state = await _load_alohr_graphql_stream_state(
+        stream_spec,
+        import_state.options,
+    )
+    while stream_state.current_locator and _can_fetch_alohr_graphql_stream(
+        stream_state,
+        import_state.options,
+    ):
+        if not await _can_advance_alohr_graphql_stream_page(
+            import_state,
+            stream_spec,
+            stream_state,
+        ):
+            break
+    _record_alohr_graphql_stream(import_state, stream_spec, stream_state)
+
+
+def _finalize_alohr_graphql_stats(import_state: AlohrGraphQLImportState) -> None:
+    source_count = len(import_state.source_ids)
+    for resource_type, diagnostic in import_state.diagnostics_by_resource.items():
+        diagnostic["rows_written"] = (
+            import_state.source_counts_by_resource.get(resource_type, 0)
+            // max(1, source_count)
+        )
+        import_state.stats_by_resource[resource_type] = {
+            "sources_attempted": source_count,
+            "sources_completed": source_count if diagnostic.get("complete") else 0,
+            "sources_bounded": source_count if diagnostic.get("bounded") else 0,
+            "sources_failed": source_count if diagnostic.get("error") else 0,
+            "sources_empty": source_count
+            if diagnostic.get("complete") and not diagnostic.get("rows_fetched")
+            else 0,
+            "pages_fetched": int(diagnostic.get("pages_fetched") or 0) * source_count,
+            "rows_fetched": int(diagnostic.get("rows_fetched") or 0) * source_count,
+        }
+
+
+async def _finalize_alohr_stale_rows(import_state: AlohrGraphQLImportState) -> None:
+    if not import_state.options.stale_cleanup:
+        return
+    for resource_type, diagnostic in import_state.diagnostics_by_resource.items():
+        if not diagnostic.get("complete"):
+            continue
+        if import_state.options.seen_table:
+            import_state.stale_ready_source_ids_by_resource[resource_type] = list(
+                import_state.source_ids
+            )
+            continue
+        model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+        if model is None:
+            continue
+        for source_id in import_state.source_ids:
+            deleted_count = await _delete_stale_resource_rows(
+                model,
+                source_id,
+                import_state.options.run_id,
+                use_seen_table=True,
+            )
+            if deleted_count:
+                prior_count = import_state.stale_counts_by_resource.get(resource_type, 0)
+                import_state.stale_counts_by_resource[resource_type] = prior_count + deleted_count
+
+
+async def _finalize_alohr_checkpoints(import_state: AlohrGraphQLImportState) -> None:
+    context = import_state.options.checkpoint_context
+    diagnostics_by_resource = import_state.checkpoint_diagnostics_by_resource
+    if not context or not diagnostics_by_resource:
+        return
+    incomplete_resource_types = [
+        resource_type
+        for resource_type, diagnostic in diagnostics_by_resource.items()
+        if diagnostic.get("complete") is not True
+        or diagnostic.get("error")
+        or diagnostic.get("bounded")
+    ]
+    if incomplete_resource_types:
+        if import_state.options.resume_required_entries is not None:
+            import_state.options.resume_required_entries.update(
+                f"{source_id}:{resource_type}"
+                for source_id in import_state.source_ids
+                for resource_type in incomplete_resource_types
+            )
+        return
+    await _clear_pagination_checkpoints(context, list(diagnostics_by_resource))
 
 
 async def _import_alohr_graphql_source_group(
     source_group: list[dict[str, Any]],
-    *,
-    resources: list[str],
-    per_resource_limit: int,
-    page_limit: int,
-    timeout: int,
-    run_id: str | None,
-    stale_cleanup: bool,
-    seen_table: str | None = None,
+    resource_types: list[str],
+    options: AlohrGraphQLImportOptions,
 ) -> tuple[
     list[str],
     dict[str, dict[str, Any]],
@@ -11700,126 +12130,68 @@ async def _import_alohr_graphql_source_group(
     dict[str, int],
     dict[str, list[str]],
 ]:
-    source_ids = [source["source_id"] for source in source_group]
-    rows_by_model: dict[type, list[dict[str, Any]]] = {}
-    source_counts: dict[str, int] = {resource: 0 for resource in resources}
-    source_resource_stats: dict[str, dict[str, Any]] = {}
-    diagnostics: dict[str, dict[str, Any]] = {}
-    stale_counts: dict[str, int] = {}
-    stale_ready_source_ids: dict[str, list[str]] = {}
-    selected = set(resources)
+    import_state = _initialize_alohr_graphql_import_state(
+        source_group,
+        resource_types,
+        options,
+    )
 
-    async def fetch_stream(
-        query: str,
-        root_key: str,
-        item_key: str,
-        append_item: Callable[[dict[type, list[dict[str, Any]]], str, dict[str, Any]], None],
-        resource_types: tuple[str, ...],
+    def append_provider(
+        resource_rows_by_model: dict[type, list[dict[str, Any]]],
+        source_id: str,
+        source_item: dict[str, Any],
     ) -> None:
-        if not (selected & set(resource_types)):
-            return
-        next_token: str | None = None
-        pages_fetched = 0
-        rows_fetched = 0
-        error: str | None = None
-        row_limit_reached = False
-        page_limit_reached = False
-        while True:
-            if page_limit > 0 and pages_fetched >= page_limit:
-                page_limit_reached = True
-                break
-            items, next_token, error = await _fetch_alohr_graphql_page(
-                query,
-                root_key,
-                item_key,
-                next_token=next_token,
-                timeout=timeout,
-            )
-            if error:
-                break
-            pages_fetched += 1
-            for item in items:
-                if per_resource_limit > 0 and rows_fetched >= per_resource_limit:
-                    row_limit_reached = True
-                    break
-                rows_fetched += 1
-                for source_id in source_ids:
-                    append_item(rows_by_model, source_id, item)
-            if row_limit_reached or not next_token:
-                break
-        complete = error is None and not row_limit_reached and not page_limit_reached and not next_token
-        for resource_type in resource_types:
-            source_resource_stats[resource_type] = {
-                "sources_attempted": len(source_ids),
-                "sources_completed": len(source_ids) if complete else 0,
-                "sources_bounded": len(source_ids) if (row_limit_reached or page_limit_reached) else 0,
-                "sources_failed": len(source_ids) if error else 0,
-                "sources_empty": len(source_ids) if complete and rows_fetched == 0 else 0,
-                "pages_fetched": pages_fetched * len(source_ids),
-                "rows_fetched": rows_fetched * len(source_ids),
-            }
-            diagnostics[resource_type] = _alohr_resource_diagnostic(
-                complete=complete,
-                error=error,
-                pages_fetched=pages_fetched,
-                rows_fetched=rows_fetched,
-                rows_written=0,
-                row_limit_reached=row_limit_reached,
-                page_limit_reached=page_limit_reached,
-            )
-
-    def append_provider(rows: dict[type, list[dict[str, Any]]], source_id: str, item: dict[str, Any]) -> None:
-        _append_alohr_provider_rows(rows, source_id, item, run_id=run_id)
-
-    def append_organization(rows: dict[type, list[dict[str, Any]]], source_id: str, item: dict[str, Any]) -> None:
-        _append_alohr_organization_rows(rows, source_id, item, run_id=run_id)
-
-    await fetch_stream(
-        ALOHR_PROVIDER_QUERY,
-        "providers",
-        "providers",
-        append_provider,
-        ("Practitioner", "Location", "PractitionerRole"),
-    )
-    await fetch_stream(
-        ALOHR_ORGANIZATION_QUERY,
-        "providerOrgs",
-        "providerOrganizations",
-        append_organization,
-        ("Organization", "Location", "OrganizationAffiliation"),
-    )
-
-    for model, rows in rows_by_model.items():
-        resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
-        if resource_type not in selected:
-            continue
-        written = await _upsert_resource_rows(
-            model,
-            rows,
-            run_id=run_id,
-            track_seen=stale_cleanup,
-            seen_table=seen_table,
-            canonical_api_base=source_group[0].get("canonical_api_base") or source_group[0].get("api_base"),
-            source_ids=source_ids,
+        _append_alohr_provider_rows(
+            resource_rows_by_model,
+            source_id,
+            source_item,
+            run_id=options.run_id,
         )
-        source_counts[resource_type] = source_counts.get(resource_type, 0) + written
-        if resource_type in diagnostics:
-            diagnostics[resource_type]["rows_written"] = written // max(1, len(source_ids))
-        if stale_cleanup and diagnostics.get(resource_type, {}).get("complete"):
-            if seen_table:
-                stale_ready_source_ids[resource_type] = list(source_ids)
-            else:
-                for source_id in source_ids:
-                    stale_deleted = await _delete_stale_resource_rows(
-                        model,
-                        source_id,
-                        run_id,
-                        use_seen_table=True,
-                    )
-                    if stale_deleted:
-                        stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
 
-    return source_ids, diagnostics, source_counts, {}, source_resource_stats, stale_counts, stale_ready_source_ids
+    def append_organization(
+        resource_rows_by_model: dict[type, list[dict[str, Any]]],
+        source_id: str,
+        source_item: dict[str, Any],
+    ) -> None:
+        _append_alohr_organization_rows(
+            resource_rows_by_model,
+            source_id,
+            source_item,
+            run_id=options.run_id,
+        )
+
+    stream_specs = (
+        AlohrGraphQLStreamSpec(
+            ALOHR_PROVIDER_QUERY,
+            "providers",
+            "providers",
+            append_provider,
+            ("Practitioner", "Location", "PractitionerRole"),
+            ALOHR_PROVIDER_CHECKPOINT_RESOURCE,
+        ),
+        AlohrGraphQLStreamSpec(
+            ALOHR_ORGANIZATION_QUERY,
+            "providerOrgs",
+            "providerOrganizations",
+            append_organization,
+            ("Organization", "Location", "OrganizationAffiliation"),
+            ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE,
+        ),
+    )
+    for stream_spec in stream_specs:
+        await _fetch_alohr_graphql_stream(import_state, stream_spec)
+    _finalize_alohr_graphql_stats(import_state)
+    await _finalize_alohr_stale_rows(import_state)
+    await _finalize_alohr_checkpoints(import_state)
+    return (
+        import_state.source_ids,
+        import_state.diagnostics_by_resource,
+        import_state.source_counts_by_resource,
+        {},
+        import_state.stats_by_resource,
+        import_state.stale_counts_by_resource,
+        import_state.stale_ready_source_ids_by_resource,
+    )
 
 
 async def _import_resources(
@@ -12017,13 +12389,17 @@ async def _import_resources(
             await report_progress(force=True)
             return await _import_alohr_graphql_source_group(
                 source_group,
-                resources=resources,
-                per_resource_limit=per_resource_limit,
-                page_limit=page_limit,
-                timeout=timeout,
-                run_id=run_id,
-                stale_cleanup=stale_cleanup,
-                seen_table=seen_stage_table,
+                resources,
+                AlohrGraphQLImportOptions(
+                    per_resource_limit=per_resource_limit,
+                    page_limit=page_limit,
+                    timeout=timeout,
+                    run_id=run_id,
+                    stale_cleanup=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    checkpoint_context=source.get("_pagination_checkpoint_context"),
+                    resume_required_entries=pagination_resume_required,
+                ),
             )
         for resource_type in resources:
             if cancel_ctx is not None:

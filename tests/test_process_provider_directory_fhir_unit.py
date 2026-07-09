@@ -2538,14 +2538,20 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch_page)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(
-        [{"source_id": "source_alohr", "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE}],
-        resources=["Practitioner", "Location", "PractitionerRole", "Organization", "OrganizationAffiliation"],
+    options = importer.AlohrGraphQLImportOptions(
         per_resource_limit=0,
         page_limit=0,
         timeout=3,
         run_id="run_1",
         stale_cleanup=False,
+        seen_table=None,
+        checkpoint_context=None,
+        resume_required_entries=None,
+    )
+    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(
+        [{"source_id": "source_alohr", "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE}],
+        ["Practitioner", "Location", "PractitionerRole", "Organization", "OrganizationAffiliation"],
+        options,
     )
 
     assert source_ids == ["source_alohr"]
@@ -2567,6 +2573,180 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
 def test_alohr_organization_query_uses_supported_nested_contacts_field():
     assert "contacts { contacts { system value use } }" in importer.ALOHR_ORGANIZATION_QUERY
     assert "organizationContact" not in importer.ALOHR_ORGANIZATION_QUERY
+
+
+def test_alohr_graphql_checkpoint_locator_round_trips_opaque_token():
+    locator = importer._alohr_graphql_checkpoint_locator("providerOrgs", "opaque+/=? token")
+
+    assert (
+        importer._alohr_graphql_checkpoint_token(locator, "providerOrgs")
+        == "opaque+/=? token"
+    )
+    with pytest.raises(ValueError, match="invalid ALOHR"):
+        importer._alohr_graphql_checkpoint_token(
+            "https://untrusted.example/graphql?stream=providerOrgs&nextToken=opaque",
+            "providerOrgs",
+        )
+
+
+def _alohr_checkpoint_context(
+    owner_run_id: str,
+    retry_of_run_id: str | None = None,
+):
+    return importer.PaginationCheckpointContext(
+        canonical_api_base=importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="scope",
+        source_ids=("source_alohr",),
+        owner_run_id=owner_run_id,
+        retry_of_run_id=retry_of_run_id,
+    )
+
+
+def _alohr_sources():
+    return [
+        {
+            "source_id": "source_alohr",
+            "api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        }
+    ]
+
+
+def _alohr_checkpoint_options(context, owner_run_id, resume_required_entries):
+    return importer.AlohrGraphQLImportOptions(
+        0,
+        0,
+        3,
+        owner_run_id,
+        False,
+        None,
+        context,
+        resume_required_entries,
+    )
+
+
+def _mock_interrupted_alohr_checkpoint(monkeypatch, events):
+    start_locator = importer._alohr_graphql_checkpoint_locator("providerOrgs", None)
+    next_locator = importer._alohr_graphql_checkpoint_locator("providerOrgs", "next-page")
+
+    async def fake_load(_context, resource_type, locator):
+        assert resource_type == importer.ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE
+        assert locator == start_locator
+        return importer.PaginationResumeState(locator, 0, 0, ())
+
+    async def fake_fetch(_query, root_key, _item_key, *, next_token, timeout):
+        assert root_key == "providerOrgs" and timeout == 3
+        if next_token is None:
+            return [{"orgId": "org-1", "name": "One"}], "next-page", None
+        assert next_token == "next-page"
+        return [], None, "timeout"
+
+    async def fake_upsert(model, model_rows, **_kwargs):
+        assert model is ProviderDirectoryOrganization
+        events.append(("write", [model_row["resource_id"] for model_row in model_rows]))
+        return len(model_rows)
+
+    async def fake_save(_context, resource_type, **checkpoint):
+        assert resource_type == importer.ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE
+        events.append(("checkpoint", checkpoint["next_url"]))
+
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", fake_load)
+    monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save)
+    monkeypatch.setattr(importer, "_clear_pagination_checkpoints", AsyncMock())
+    return next_locator
+
+
+@pytest.mark.asyncio
+async def test_alohr_graphql_checkpoint_advances_only_after_page_write(monkeypatch):
+    events: list[tuple[str, Any]] = []
+    resume_required_entries: set[str] = set()
+    checkpoint_context = _alohr_checkpoint_context("run_1")
+    next_locator = _mock_interrupted_alohr_checkpoint(monkeypatch, events)
+    options = _alohr_checkpoint_options(
+        checkpoint_context,
+        "run_1",
+        resume_required_entries,
+    )
+    _source_ids, diagnostics, counts, *_rest = await importer._import_alohr_graphql_source_group(
+        _alohr_sources(),
+        ["Organization"],
+        options,
+    )
+
+    assert events == [("write", ["org-1"]), ("checkpoint", next_locator)]
+    assert counts["Organization"] == 1
+    assert diagnostics["Organization"]["complete"] is False
+    assert diagnostics["Organization"]["error"] == "timeout"
+    assert resume_required_entries == {
+        f"source_alohr:{importer.ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE}"
+    }
+
+
+def _mock_resumed_alohr_checkpoint(
+    monkeypatch,
+    saved_checkpoints,
+    cleared_resource_types,
+):
+    start_locator = importer._alohr_graphql_checkpoint_locator("providerOrgs", None)
+    resume_locator = importer._alohr_graphql_checkpoint_locator("providerOrgs", "resume-token")
+
+    async def fake_load(_context, _resource_type, locator):
+        assert locator == start_locator
+        return importer.PaginationResumeState(
+            resume_locator,
+            7,
+            700,
+            (importer._pagination_url_hash(start_locator),),
+            resumed=True,
+        )
+
+    async def fake_fetch(_query, _root_key, _item_key, *, next_token, timeout):
+        assert next_token == "resume-token" and timeout == 3
+        return [{"orgId": "org-701", "name": "Last"}], None, None
+
+    async def fake_upsert(model, model_rows, **_kwargs):
+        assert model is ProviderDirectoryOrganization
+        return len(model_rows)
+
+    async def fake_save(_context, _resource_type, **checkpoint):
+        saved_checkpoints.append(checkpoint)
+
+    async def fake_clear(_context, resource_types):
+        cleared_resource_types.extend(resource_types)
+        return len(resource_types)
+
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", fake_load)
+    monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save)
+    monkeypatch.setattr(importer, "_clear_pagination_checkpoints", fake_clear)
+
+
+@pytest.mark.asyncio
+async def test_alohr_graphql_checkpoint_resumes_exact_token_and_clears(monkeypatch):
+    saved_checkpoints: list[dict[str, Any]] = []
+    cleared_resource_types: list[str] = []
+    checkpoint_context = _alohr_checkpoint_context("run_retry", "run_1")
+    _mock_resumed_alohr_checkpoint(
+        monkeypatch,
+        saved_checkpoints,
+        cleared_resource_types,
+    )
+    options = _alohr_checkpoint_options(checkpoint_context, "run_retry", set())
+    _source_ids, diagnostics, counts, *_rest = await importer._import_alohr_graphql_source_group(
+        _alohr_sources(),
+        ["Organization"],
+        options,
+    )
+
+    assert counts["Organization"] == 1
+    assert diagnostics["Organization"]["complete"] is True
+    assert diagnostics["Organization"]["rows_fetched"] == 701
+    assert saved_checkpoints[0]["next_url"] is None
+    assert saved_checkpoints[0]["pages_processed"] == 8
+    assert saved_checkpoints[0]["rows_processed"] == 701
+    assert cleared_resource_types == [importer.ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE]
 
 
 @pytest.mark.asyncio
