@@ -5565,6 +5565,27 @@ def test_uhc_unsplittable_resource_total_cap_is_exhausted(resource_type, request
     )
 
 
+@pytest.mark.parametrize(
+    ("resource_type", "expected_error"),
+    (
+        ("Practitioner", "uhc_practitioner_name_residual_unverified"),
+        ("PractitionerRole", "uhc_practitionerrole_residual_unverified"),
+        ("Organization", "uhc_organization_name_residual_unverified"),
+        ("Location", "uhc_location_state_residual_unverified"),
+    ),
+)
+def test_uhc_partitioned_core_resources_report_unverified_residuals(
+    resource_type,
+    expected_error,
+):
+    source_lookup = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._uhc_partition_residual_error(source_lookup, resource_type) == expected_error
+
+
 @pytest.mark.asyncio
 async def test_uhc_unpartitioned_total_cap_is_incomplete(monkeypatch):
     async def fake_fetch_json(_source_record, _request_url, *, timeout):
@@ -5766,7 +5787,8 @@ async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatc
         ),
     )
 
-    assert partition_fetch_result.complete is True
+    assert partition_fetch_result.complete is False
+    assert partition_fetch_result.error == "uhc_practitioner_name_residual_unverified"
 
 
 @pytest.mark.asyncio

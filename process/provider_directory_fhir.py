@@ -1658,11 +1658,21 @@ def _uhc_partition_residual_error(
     source_record: dict[str, Any],
     resource_type: str,
 ) -> str | None:
-    if resource_type != "PractitionerRole":
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base != UHC_PROVIDER_DIRECTORY_BASE:
         return None
-    if not _is_uhc_role_postal_partition_enabled(source_record):
+    if resource_type == "PractitionerRole" and not _is_uhc_role_postal_partition_enabled(
+        source_record
+    ):
         return None
-    return "uhc_practitionerrole_residual_unverified"
+    return {
+        "Practitioner": "uhc_practitioner_name_residual_unverified",
+        "PractitionerRole": "uhc_practitionerrole_residual_unverified",
+        "Organization": "uhc_organization_name_residual_unverified",
+        "Location": "uhc_location_state_residual_unverified",
+    }.get(resource_type)
 
 
 def _uhc_role_postal_checkpoint_type(
