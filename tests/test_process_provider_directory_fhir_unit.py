@@ -5502,6 +5502,22 @@ def _practitioner_partition_bundle(resource_id: str) -> dict[str, Any]:
     }
 
 
+def _practitioner_role_partition_bundle() -> dict[str, Any]:
+    return {
+        "resourceType": "Bundle",
+        "total": 1,
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "PractitionerRole",
+                    "id": "role-1",
+                    "practitioner": {"reference": "Practitioner/prac-1"},
+                }
+            }
+        ],
+    }
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch):
     requested_urls: list[str] = []
@@ -5551,6 +5567,61 @@ async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch
     assert fetch_count_by_name["peak"] == 2
     assert sorted(requested_urls) == start_urls
     assert [resource_row["resource_id"] for resource_row in written_resource_batches] == ["1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
+    checkpoint_batches: list[list[dict[str, Any]]] = []
+    cleared_bases: list[str] = []
+
+    async def fake_db_all(_statement, **_query_params):
+        return []
+
+    async def fake_fetch_json(_source_record, _request_url, *, timeout):
+        return 200, _practitioner_role_partition_bundle(), None, 5
+
+    async def fake_upsert_rows(model, rows, **_kwargs):
+        assert model is importer.ProviderDirectoryReverseLookupCheckpoint
+        checkpoint_batches.append(rows)
+        return len(rows)
+
+    async def fake_clear_checkpoints(source_record):
+        cleared_bases.append(source_record["canonical_api_base"])
+        return 1
+
+    monkeypatch.setattr(importer.db, "all", fake_db_all)
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert_rows)
+    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", fake_clear_checkpoints)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    partition_fetch_result = await importer._fetch_partitioned_resource_rows(
+        source_lookup,
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+        [
+            "https://flex.optum.com/fhirpublic/R4/PractitionerRole?"
+            "_count=100&location.address-postalcode=1"
+        ],
+        importer.PartitionFetchOptions(
+            timeout=3,
+            run_id="run_1",
+            row_batch_handler=None,
+            row_batch_size=100,
+            retain_rows=True,
+            deadline_at=None,
+            max_pages=0,
+        ),
+    )
+
+    assert partition_fetch_result.complete is True
+    assert partition_fetch_result.rows_fetched == 1
+    assert checkpoint_batches[0][0]["seed_resource_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
+    assert checkpoint_batches[0][0]["seed_resource_id"] == "1"
+    assert cleared_bases == [importer.UHC_PROVIDER_DIRECTORY_BASE]
 
 
 @pytest.mark.asyncio
@@ -6027,6 +6098,37 @@ async def test_reverse_lookup_resume_marks_checkpointed_roles_seen(monkeypatch):
     assert "INSERT INTO" in statements[1][0]
     assert "provider_directory_import_seen_stage_test" in statements[1][0]
     assert "ON CONFLICT" not in statements[1][0]
+    assert statements[0][1]["source_ids"] == ["uhc"]
+
+
+@pytest.mark.asyncio
+async def test_postal_partition_resume_marks_existing_roles_seen(monkeypatch):
+    statements: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_db_status(statement, **query_params):
+        statements.append((statement, query_params))
+        return 3
+
+    monkeypatch.setattr(importer.db, "status", fake_db_status)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+
+    marked_rows = await importer._mark_postal_checkpointed_roles_seen(
+        source_lookup,
+        ["uhc"],
+        "run_resume",
+        "provider_directory_import_seen_stage_test",
+    )
+
+    assert marked_rows == 3
+    assert len(statements) == 2
+    assert "UPDATE" in statements[0][0]
+    assert "INSERT INTO" in statements[1][0]
+    assert "provider_directory_import_seen_stage_test" in statements[1][0]
+    assert statements[0][1]["checkpoint_type"] == importer.UHC_ROLE_POSTAL_CHECKPOINT_TYPE
     assert statements[0][1]["source_ids"] == ["uhc"]
 
 

@@ -510,8 +510,11 @@ class PartitionFetchState:
     deadline_reached: bool = False
     next_url_remaining: bool = False
     seen_urls: set[str] = field(default_factory=set)
+    completed_partition_prefixes: set[str] = field(default_factory=set)
+    pending_partition_checkpoint_rows: list[dict[str, Any]] = field(default_factory=list)
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -524,6 +527,12 @@ class PartitionFetchOptions:
     retain_rows: bool
     deadline_at: float | None
     max_pages: int
+
+
+@dataclass(frozen=True)
+class PartitionPageFetchResult:
+    next_url: str | None
+    outcome: str
 
 
 @dataclass(frozen=True)
@@ -942,6 +951,64 @@ async def _mark_checkpointed_reverse_lookup_roles_seen(
             run_id=options.run_id,
             source_ids=source_ids,
             canonical_api_base=canonical_api_base,
+        )
+        or 0
+    )
+
+
+async def _mark_postal_checkpointed_roles_seen(
+    source_record: dict[str, Any],
+    source_ids: list[str],
+    run_id: str | None,
+    seen_table: str | None,
+) -> int:
+    """Preserve prior ZIP-partition rows during a resumed stale-cleanup run."""
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if not run_id or not source_ids or not canonical_api_base:
+        return 0
+    role_ref = _qt(_schema(), ProviderDirectoryPractitionerRole.__tablename__)
+    checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
+    seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    checkpoint_exists_sql = f"""
+        EXISTS (
+            SELECT 1
+              FROM {checkpoint_ref} AS checkpoint
+             WHERE checkpoint.canonical_api_base = :canonical_api_base
+               AND checkpoint.seed_resource_type = :checkpoint_type
+        )
+    """
+    run_conflict_sql = (
+        "" if seen_table else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
+    )
+    query_params_by_name = {
+        "run_id": run_id,
+        "source_ids": source_ids,
+        "canonical_api_base": canonical_api_base,
+        "checkpoint_type": UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+    }
+    await db.status(
+        f"""
+        UPDATE {role_ref} AS role
+           SET last_seen_run_id = :run_id,
+               updated_at = now()
+         WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
+           AND {checkpoint_exists_sql};
+        """,
+        **query_params_by_name,
+    )
+    return int(
+        await db.status(
+            f"""
+            INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
+            SELECT :run_id, 'PractitionerRole', role.source_id, role.resource_id
+              FROM {role_ref} AS role
+             WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
+               AND {checkpoint_exists_sql}
+            {run_conflict_sql};
+            """,
+            **query_params_by_name,
         )
         or 0
     )
@@ -1390,6 +1457,7 @@ UHC_POSTAL_SEARCH_ALPHABET = tuple("0123456789")
 UHC_ADAPTIVE_PARTITION_TOTAL_CAP = 10000
 UHC_ADAPTIVE_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 4
 UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH = 5
+UHC_ROLE_POSTAL_CHECKPOINT_TYPE = "PractitionerRolePostalPrefix"
 
 
 def _letter_prefixes(length: int) -> tuple[str, ...]:
@@ -1553,6 +1621,95 @@ def _is_uhc_role_postal_partition_enabled(source: dict[str, Any]) -> bool:
         "no",
         "off",
     }
+
+
+def _uhc_role_postal_prefix(
+    source_record: dict[str, Any],
+    resource_type: str,
+    request_url: str,
+) -> str | None:
+    if resource_type != "PractitionerRole" or not _is_uhc_role_postal_partition_enabled(
+        source_record
+    ):
+        return None
+    query_by_name = dict(
+        urllib.parse.parse_qsl(urllib.parse.urlsplit(request_url).query, keep_blank_values=True)
+    )
+    if "_getpages" in query_by_name:
+        return None
+    return _clean_text(query_by_name.get("location.address-postalcode"))
+
+
+def _partition_checkpoint_flush_rows() -> int:
+    return max(
+        1,
+        _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CHECKPOINT_FLUSH_ROWS", 25),
+    )
+
+
+async def _load_partition_checkpoints(
+    source_record: dict[str, Any],
+    resource_type: str,
+    run_id: str | None,
+) -> set[str]:
+    if not run_id or resource_type != "PractitionerRole":
+        return set()
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if not canonical_api_base or not _is_uhc_role_postal_partition_enabled(source_record):
+        return set()
+    checkpoint_rows = await db.all(
+        f"""
+        SELECT seed_resource_id
+          FROM {_qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)}
+         WHERE canonical_api_base = :canonical_api_base
+           AND seed_resource_type = :seed_resource_type;
+        """,
+        canonical_api_base=canonical_api_base,
+        seed_resource_type=UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+    )
+    return {
+        prefix
+        for checkpoint_row in checkpoint_rows
+        if (prefix := _clean_text(checkpoint_row[0]))
+    }
+
+
+async def _record_partition_checkpoint(
+    state: PartitionFetchState,
+    source_record: dict[str, Any],
+    prefix: str | None,
+    run_id: str | None,
+) -> None:
+    if not prefix or not run_id:
+        return
+    checkpoint_batch_rows: list[dict[str, Any]] = []
+    async with state.checkpoint_lock:
+        if prefix in state.completed_partition_prefixes:
+            return
+        state.completed_partition_prefixes.add(prefix)
+        state.pending_partition_checkpoint_rows.append(
+            _reverse_lookup_checkpoint_row(
+                source_record,
+                UHC_ROLE_POSTAL_CHECKPOINT_TYPE,
+                prefix,
+                run_id,
+            )
+        )
+        if len(state.pending_partition_checkpoint_rows) >= _partition_checkpoint_flush_rows():
+            checkpoint_batch_rows = list(state.pending_partition_checkpoint_rows)
+            state.pending_partition_checkpoint_rows.clear()
+    if checkpoint_batch_rows:
+        await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_batch_rows)
+
+
+async def _flush_partition_checkpoints(state: PartitionFetchState) -> None:
+    async with state.checkpoint_lock:
+        checkpoint_batch_rows = list(state.pending_partition_checkpoint_rows)
+        state.pending_partition_checkpoint_rows.clear()
+    if checkpoint_batch_rows:
+        await _upsert_rows(ProviderDirectoryReverseLookupCheckpoint, checkpoint_batch_rows)
 
 
 def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
@@ -8759,6 +8916,80 @@ async def _consume_partition_entries(
                 )
 
 
+def _enqueue_adaptive_partition_children(
+    source_record: dict[str, Any],
+    resource_type: str,
+    start_url_queue: asyncio.Queue[str],
+    state: PartitionFetchState,
+    current_url: str,
+    fhir_payload: Any,
+) -> int:
+    child_urls = _uhc_adaptive_partition_child_urls(
+        source_record,
+        resource_type,
+        current_url,
+        fhir_payload,
+    )
+    for child_url in child_urls:
+        child_prefix = _uhc_role_postal_prefix(source_record, resource_type, child_url)
+        if child_prefix not in state.completed_partition_prefixes:
+            start_url_queue.put_nowait(child_url)
+    return len(child_urls)
+
+
+async def _fetch_partition_page(
+    source_record: dict[str, Any],
+    resource_type: str,
+    start_url_queue: asyncio.Queue[str],
+    state: PartitionFetchState,
+    current_url: str,
+    pending_resource_rows: list[dict[str, Any]],
+    fetch_options: PartitionFetchOptions,
+) -> PartitionPageFetchResult:
+    status_code, fhir_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        current_url,
+        timeout=fetch_options.timeout,
+    )
+    if status_code != 200 or fetch_error:
+        await _mark_partition_fetch_error(state, fetch_error or f"http_{status_code}")
+        return PartitionPageFetchResult(next_url=None, outcome="failed")
+    if not _is_bundle_payload(fhir_payload):
+        await _mark_partition_fetch_error(state, "non_bundle_payload")
+        return PartitionPageFetchResult(next_url=None, outcome="failed")
+    await _mark_partition_page_fetched(state)
+    if _enqueue_adaptive_partition_children(
+        source_record,
+        resource_type,
+        start_url_queue,
+        state,
+        current_url,
+        fhir_payload,
+    ):
+        return PartitionPageFetchResult(next_url=None, outcome="split")
+    is_partition_failed_on_page = _is_uhc_role_zip_cap_hit(
+        source_record,
+        resource_type,
+        current_url,
+        fhir_payload,
+    )
+    if is_partition_failed_on_page:
+        await _mark_partition_fetch_error(state, "uhc_role_postal_partition_cap_exhausted")
+    await _consume_partition_entries(
+        state,
+        source_record,
+        resource_type,
+        _bundle_entries(fhir_payload),
+        pending_resource_rows,
+        fetch_options,
+    )
+    next_url = _next_link(fhir_payload)
+    return PartitionPageFetchResult(
+        next_url=urllib.parse.urljoin(current_url, next_url) if next_url else None,
+        outcome="failed" if is_partition_failed_on_page else "fetched",
+    )
+
+
 async def _fetch_partition_url_chain(
     source_record: dict[str, Any],
     resource_type: str,
@@ -8768,6 +8999,11 @@ async def _fetch_partition_url_chain(
     fetch_options: PartitionFetchOptions,
 ) -> None:
     pending_resource_rows: list[dict[str, Any]] = []
+    partition_prefix = _uhc_role_postal_prefix(source_record, resource_type, request_url)
+    if partition_prefix in state.completed_partition_prefixes:
+        return
+    is_partition_complete = False
+    is_partition_failed = False
     current_url: str | None = request_url
     while current_url and not state.stop_event.is_set():
         if fetch_options.deadline_at is not None and time.monotonic() >= fetch_options.deadline_at:
@@ -8777,44 +9013,29 @@ async def _fetch_partition_url_chain(
             break
         if not await _can_fetch_partition_url(state, current_url, max_pages=fetch_options.max_pages):
             break
-        status_code, fhir_payload, fetch_error, _elapsed = await _fetch_source_json(
-            source_record,
-            current_url,
-            timeout=fetch_options.timeout,
-        )
-        if status_code != 200 or fetch_error:
-            await _mark_partition_fetch_error(state, fetch_error or f"http_{status_code}")
-            break
-        if not _is_bundle_payload(fhir_payload):
-            await _mark_partition_fetch_error(state, "non_bundle_payload")
-            break
-        await _mark_partition_page_fetched(state)
-        child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, current_url, fhir_payload)
-        if child_urls:
-            for child_url in child_urls:
-                start_url_queue.put_nowait(child_url)
-            break
-        if _is_uhc_role_zip_cap_hit(
+        page_fetch_result = await _fetch_partition_page(
             source_record,
             resource_type,
-            current_url,
-            fhir_payload,
-        ):
-            await _mark_partition_fetch_error(
-                state,
-                "uhc_role_postal_partition_cap_exhausted",
-            )
-        await _consume_partition_entries(
+            start_url_queue,
             state,
-            source_record,
-            resource_type,
-            _bundle_entries(fhir_payload),
+            current_url,
             pending_resource_rows,
             fetch_options,
         )
-        next_url = _next_link(fhir_payload)
-        current_url = urllib.parse.urljoin(current_url, next_url) if next_url else None
+        current_url = page_fetch_result.next_url
+        is_partition_failed = is_partition_failed or page_fetch_result.outcome == "failed"
+        if page_fetch_result.outcome == "split":
+            break
+        if not current_url and not is_partition_failed:
+            is_partition_complete = True
     await _flush_partition_resource_rows(state, fetch_options.row_batch_handler, pending_resource_rows)
+    if is_partition_complete:
+        await _record_partition_checkpoint(
+            state,
+            source_record,
+            partition_prefix,
+            fetch_options.run_id,
+        )
 
 
 async def _run_partition_fetch_worker(
@@ -8842,19 +9063,36 @@ async def _run_partition_fetch_worker(
             start_url_queue.task_done()
 
 
-async def _fetch_partitioned_resource_rows(
+async def _prepare_partition_fetch(
     source_record: dict[str, Any],
     resource_type: str,
     model: type,
     start_urls: list[str],
-    fetch_options: PartitionFetchOptions,
-) -> ResourceFetchResult:
-    """Fetch independent FHIR search partitions concurrently and merge counts."""
+    run_id: str | None,
+) -> tuple[asyncio.Queue[str], PartitionFetchState]:
     start_url_queue: asyncio.Queue[str] = asyncio.Queue()
-    for request_url in start_urls:
-        start_url_queue.put_nowait(request_url)
     state = PartitionFetchState(result_model=model, retained_resource_rows=[])
-    worker_count = min(_partition_fetch_concurrency(), max(1, len(start_urls)))
+    state.completed_partition_prefixes = await _load_partition_checkpoints(
+        source_record,
+        resource_type,
+        run_id,
+    )
+    for request_url in start_urls:
+        partition_prefix = _uhc_role_postal_prefix(source_record, resource_type, request_url)
+        if partition_prefix not in state.completed_partition_prefixes:
+            start_url_queue.put_nowait(request_url)
+    return start_url_queue, state
+
+
+async def _execute_partition_fetch_workers(
+    source_record: dict[str, Any],
+    resource_type: str,
+    start_url_queue: asyncio.Queue[str],
+    state: PartitionFetchState,
+    fetch_options: PartitionFetchOptions,
+    requested_worker_count: int,
+) -> None:
+    worker_count = min(_partition_fetch_concurrency(), max(1, requested_worker_count))
     worker_tasks = [
         asyncio.create_task(
             _run_partition_fetch_worker(
@@ -8867,13 +9105,47 @@ async def _fetch_partitioned_resource_rows(
         )
         for _worker_index in range(worker_count)
     ]
-    await asyncio.gather(*worker_tasks)
+    try:
+        await asyncio.gather(*worker_tasks)
+    finally:
+        for worker_task in worker_tasks:
+            if not worker_task.done():
+                worker_task.cancel()
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        await _flush_partition_checkpoints(state)
+
+
+async def _fetch_partitioned_resource_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    start_urls: list[str],
+    fetch_options: PartitionFetchOptions,
+) -> ResourceFetchResult:
+    """Fetch independent FHIR search partitions concurrently and merge counts."""
+    start_url_queue, state = await _prepare_partition_fetch(
+        source_record,
+        resource_type,
+        model,
+        start_urls,
+        fetch_options.run_id,
+    )
+    await _execute_partition_fetch_workers(
+        source_record,
+        resource_type,
+        start_url_queue,
+        state,
+        fetch_options,
+        len(start_urls),
+    )
     is_complete = (
         not state.error_message
         and not state.hard_page_limit_reached
         and not state.deadline_reached
         and start_url_queue.empty()
     )
+    if is_complete and _is_uhc_role_postal_partition_enabled(source_record):
+        await _clear_reverse_lookup_checkpoints(source_record)
     return ResourceFetchResult(
         model=model,
         rows=state.retained_resource_rows,
@@ -10649,6 +10921,17 @@ async def _import_resources(
                 await maybe_report_partial_progress(group_key, resource_type, written)
                 return written
 
+            if (
+                stale_cleanup
+                and resource_type == "PractitionerRole"
+                and _is_uhc_role_postal_partition_enabled(source)
+            ):
+                await _mark_postal_checkpointed_roles_seen(
+                    source,
+                    source_ids,
+                    run_id,
+                    seen_stage_table,
+                )
             result = await _fetch_resource_rows(
                 source,
                 resource_type,
