@@ -3694,6 +3694,7 @@ def test_ptg2_main_publishes_allowed_amount_only_metadata_snapshot(monkeypatch):
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_ensure_ptg_dynamic_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", fake_drop_tables)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
@@ -3926,6 +3927,7 @@ def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", fake_drop_tables)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_allowed_amounts_file", fake_allowed)
+    monkeypatch.setattr(process_ptg, "_ensure_ptg_dynamic_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
     monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", publish_serving)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
@@ -3993,6 +3995,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_in_network)
     monkeypatch.setattr(process_ptg, "_process_allowed_amounts_file", fake_allowed)
+    monkeypatch.setattr(process_ptg, "_ensure_ptg_dynamic_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
     monkeypatch.setattr(process_ptg, "build_ptg2_snapshot_index_artifact", AsyncMock())
     monkeypatch.delenv("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", raising=False)
@@ -6078,12 +6081,26 @@ def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
         status_calls.append(statement)
 
     async def is_fake_table_present(_schema, table):
-        return table == "ptg2_manifest_stage_serving_abc"
+        return table in {
+            "ptg2_manifest_stage_serving_abc",
+            "ptg2_manifest_stage_code_count_abc",
+            "ptg2_manifest_stage_provider_set_dictionary_abc",
+        }
+
+    async def fake_table_has_rows(_schema, table):
+        return table in {
+            "ptg2_manifest_stage_serving_abc",
+            "ptg2_manifest_stage_code_count_abc",
+            "ptg2_manifest_stage_provider_set_dictionary_abc",
+        }
 
     async def fake_binary_write(**kwargs):
         assert kwargs["schema_name"] == "mrf"
         assert kwargs["source_table"] == "ptg2_manifest_stage_serving_abc"
         assert kwargs["target_table"].startswith("ptg2_serving_binary_")
+        assert kwargs["source_layout"] == "natural_lean"
+        assert kwargs["code_count_table"].startswith("ptg2_code_count_")
+        assert kwargs["provider_set_dictionary_table"].startswith("ptg2_provider_set_dict_")
         return {
             "format": "ptg2_serving_binary_blocks_v1",
             "table": f"mrf.{kwargs['target_table']}",
@@ -6106,7 +6123,7 @@ def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish.db, "all", AsyncMock(side_effect=AssertionError("unused")))
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
-    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", fake_table_has_rows)
     monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
     monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", fake_binary_write)
 
@@ -6122,10 +6139,15 @@ def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
     joined = "\n".join(status_calls)
     assert "lean_src_uidx" not in joined
     assert "provider_set_global_id_128,\n                        price_set_global_id_128" not in joined
+    assert 'FROM "mrf"."ptg2_manifest_stage_code_count_abc"' in joined
+    assert 'FROM "mrf"."ptg2_manifest_stage_provider_set_dictionary_abc"' in joined
+    assert "COUNT(*)::bigint AS rate_count" not in joined
+    assert "SELECT DISTINCT provider_set_global_id_128\n            FROM \"mrf\".\"ptg2_manifest_stage_serving_abc\"" not in joined
     assert any('DROP TABLE "mrf"."ptg2_manifest_stage_serving_abc"' in statement for statement in status_calls)
     assert publish_manifest["serving_row_strategy"] == "postgres_binary"
     assert publish_manifest["serving_table_retained"] is False
     assert publish_manifest["dedupe"]["serving"] == {"skipped": "scanner_dedupe_guarded_postgres_binary"}
+    assert publish_manifest["dictionary_source"] == "scanner_support"
 
 
 def test_ptg2_manifest_snapshot_publish_sidecar_arch_overrides_scope_table_env(monkeypatch):
@@ -6725,6 +6747,111 @@ def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatc
     assert stream_calls[0][1] == "ptg2_manifest_stage_serving_abc"
     assert stream_calls[0][3] is process_ptg._copy_lean_manifest_serving_file
     assert all(not path.exists() for path in source_files_by_kind.values())
+
+
+def test_ptg2_manifest_precopy_direct_copies_files_for_binary_arch(monkeypatch, tmp_path):
+    copy_calls = []
+    source_files_by_kind = {}
+    for kind in ("manifest_lean_serving", "price_atom", "price_set_atom", "provider_group_member"):
+        source_path = tmp_path / f"{kind}.copy"
+        source_path.write_text("row\n", encoding="utf-8")
+        source_files_by_kind[kind] = source_path
+
+    async def fail_merge(*_args, **_kwargs):
+        raise AssertionError("binary direct-copy path should not run the merge producer")
+
+    async def fake_copy(copy_path, *, target_table):
+        copy_calls.append((copy_path.name, target_table))
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", ptg_config.PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1)
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
+    monkeypatch.setattr(process_ptg, "_run_ptg2_manifest_copy_merge", fail_merge)
+    monkeypatch.setattr(process_ptg, "_stream_ptg2_manifest_copy_merge", fail_merge)
+    monkeypatch.setattr(process_ptg, "_copy_lean_manifest_serving_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_price_atom_member_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file", fake_copy)
+
+    metrics = asyncio.run(
+        process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=_manifest_copy_successful_files(source_files_by_kind),
+            manifest_stage_table="ptg2_manifest_stage_serving_abc",
+        )
+    )
+
+    assert metrics["enabled"] is True
+    assert metrics["direct_to_copy"] is True
+    assert metrics["serving_rows"] == 1
+    assert metrics["kinds"]["manifest_lean_serving"]["direct_to_copy"] is True
+    assert copy_calls == [
+        ("manifest_lean_serving.copy", "ptg2_manifest_stage_serving_abc"),
+        ("price_atom.copy", "ptg2_manifest_stage_price_atom_abc"),
+        ("price_set_atom.copy", "ptg2_manifest_stage_price_set_atom_abc"),
+        ("provider_group_member.copy", "ptg2_manifest_stage_provider_group_member_abc"),
+    ]
+    assert all(not path.exists() for path in source_files_by_kind.values())
+
+
+def test_ptg2_manifest_precopy_direct_copy_reports_parallel_tasks(monkeypatch, tmp_path):
+    source_files_by_kind = {"manifest_serving": []}
+    copy_calls = []
+    for index in range(3):
+        source_path = tmp_path / f"manifest_serving_{index}.copy"
+        source_path.write_text(f"row-{index}\n", encoding="utf-8")
+        source_files_by_kind["manifest_serving"].append(source_path)
+    price_atom = tmp_path / "price_atom.copy"
+    provider_group_member = tmp_path / "provider_group_member.copy"
+    price_atom.write_text("price\n", encoding="utf-8")
+    provider_group_member.write_text("provider\n", encoding="utf-8")
+
+    async def fake_copy(copy_path, *, target_table):
+        copy_calls.append((copy_path.name, target_table))
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", ptg_config.PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1)
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_DIRECT_COPY_TASKS", "2")
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_serving_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file", fake_copy)
+
+    metrics = asyncio.run(
+        process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=[
+                {
+                    "summary": {
+                        "manifest": {
+                            "copy_files": {
+                                "manifest_serving": [
+                                    {"path": str(path), "row_count": 1}
+                                    for path in source_files_by_kind["manifest_serving"]
+                                ],
+                                "price_atom": [{"path": str(price_atom), "row_count": 1}],
+                                "provider_group_member": [
+                                    {"path": str(provider_group_member), "row_count": 1}
+                                ],
+                            }
+                        }
+                    }
+                }
+            ],
+            manifest_stage_table="ptg2_manifest_stage_serving_abc",
+        )
+    )
+
+    assert metrics["direct_to_copy"] is True
+    assert metrics["kinds"]["manifest_serving"]["copy_tasks"] == 2
+    assert metrics["kinds"]["manifest_serving"]["output_rows"] == 3
+    assert sorted(name for name, _target in copy_calls if name.startswith("manifest_serving_")) == [
+        "manifest_serving_0.copy",
+        "manifest_serving_1.copy",
+        "manifest_serving_2.copy",
+    ]
+    assert not any(path.exists() for path in source_files_by_kind["manifest_serving"])
+    assert not price_atom.exists()
+    assert not provider_group_member.exists()
 
 
 def test_manifest_copy_cleanup_removes_empty_worker_siblings(tmp_path):

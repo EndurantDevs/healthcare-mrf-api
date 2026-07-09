@@ -453,28 +453,52 @@ async def ensure_ptg2_tables() -> None:
         await _ensure_indexes(cls, db_schema)
 
 
-async def _prepare_ptg_tables(import_id: str, test_mode: bool) -> dict[str, type]:
+PTG_DYNAMIC_TABLE_CLASSES = (
+    PTGFile,
+    PTGProviderGroup,
+    PTGInNetworkItem,
+    PTGBillingCode,
+    PTGNegotiatedRate,
+    PTGNegotiatedPrice,
+    PTGAllowedItem,
+    PTGAllowedPayment,
+    PTGAllowedProviderPayment,
+    ImportLog,
+)
+
+PTG_CONTROL_TABLE_CLASS_NAMES = frozenset({"PTGFile", "ImportLog"})
+PTG_PROVIDER_REFERENCE_TABLE_CLASS_NAMES = frozenset({"PTGProviderGroup"})
+PTG_ALLOWED_AMOUNT_TABLE_CLASS_NAMES = frozenset(
+    {"PTGAllowedItem", "PTGAllowedPayment", "PTGAllowedProviderPayment"}
+)
+PTG_IN_NETWORK_DENSE_TABLE_CLASS_NAMES = frozenset(
+    {
+        "PTGProviderGroup",
+        "PTGInNetworkItem",
+        "PTGBillingCode",
+        "PTGNegotiatedRate",
+        "PTGNegotiatedPrice",
+    }
+)
+
+
+async def _ensure_ptg_dynamic_tables(
+    classes: dict[str, type],
+    class_names: set[str] | frozenset[str],
+    *,
+    test_mode: bool,
+) -> None:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     except Exception as exc:
         logger.warning("Failed to ensure schema %s exists (%s); falling back to public schema", db_schema, exc)
         db_schema = "public"
-    dynamic: dict[str, type] = {}
-    for cls in (
-        PTGFile,
-        PTGProviderGroup,
-        PTGInNetworkItem,
-        PTGBillingCode,
-        PTGNegotiatedRate,
-        PTGNegotiatedPrice,
-        PTGAllowedItem,
-        PTGAllowedPayment,
-        PTGAllowedProviderPayment,
-        ImportLog,
-    ):
-        obj = make_class(cls, import_id, schema_override=db_schema)
-        dynamic[cls.__name__] = obj
+    requested = set(class_names)
+    for cls in PTG_DYNAMIC_TABLE_CLASSES:
+        if cls.__name__ not in requested:
+            continue
+        obj = classes[cls.__name__]
         try:
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
         except Exception as exc:
@@ -484,4 +508,26 @@ async def _prepare_ptg_tables(import_id: str, test_mode: bool) -> dict[str, type
         except Exception as exc:
             logger.warning("PTG create table %s failed: %s", obj.__tablename__, exc)
         await _ensure_indexes(obj, db_schema)
+
+
+async def _prepare_ptg_tables(
+    import_id: str,
+    test_mode: bool,
+    *,
+    initial_table_class_names: set[str] | frozenset[str] | None = None,
+) -> dict[str, type]:
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    try:
+        await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
+    except Exception as exc:
+        logger.warning("Failed to ensure schema %s exists (%s); falling back to public schema", db_schema, exc)
+        db_schema = "public"
+    dynamic: dict[str, type] = {}
+    for cls in PTG_DYNAMIC_TABLE_CLASSES:
+        dynamic[cls.__name__] = make_class(cls, import_id, schema_override=db_schema)
+    requested = set(initial_table_class_names) if initial_table_class_names is not None else {
+        cls.__name__ for cls in PTG_DYNAMIC_TABLE_CLASSES
+    }
+    if requested:
+        await _ensure_ptg_dynamic_tables(dynamic, requested, test_mode=test_mode)
     return dynamic

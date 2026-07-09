@@ -101,7 +101,8 @@ from process.ptg_parts.config import (
     PTG2_FILE_PROCESS_CONCURRENCY_ENV, PTG2_HASH_MODE_ENV,
     PTG2_ITEM_BATCH_ROWS_ENV, PTG2_JSON_DECODER_ITERATOR_ENV,
     PTG2_KEEP_PARTIAL_ENV, PTG2_KEEP_PRICE_SET_STAGE_ENV,
-    PTG2_KEEP_SERVING_RATE_STAGE_ENV, PTG2_MANIFEST_PRECOPY_MERGE_ENV,
+    PTG2_KEEP_SERVING_RATE_STAGE_ENV, PTG2_MANIFEST_DIRECT_COPY_FILES_ENV,
+    PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, PTG2_MANIFEST_PRECOPY_MERGE_ENV,
     PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
     PTG2_MANIFEST_STREAM_MERGE_COPY_ENV,
     PTG2_PRICE_BATCH_ROWS_ENV,
@@ -207,8 +208,10 @@ from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_lean_manifest_serving_file,
     _copy_price_atom_member_file,
+    _copy_ptg2_manifest_code_count_file,
     _copy_ptg2_manifest_price_atom_file,
     _copy_ptg2_manifest_provider_group_member_file,
+    _copy_ptg2_manifest_provider_set_dictionary_file,
     _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
     _use_direct_lean_manifest_copy,
@@ -308,7 +311,10 @@ from process.ptg_parts.source_pointers import (_current_source_snapshot_id,
                                                _source_plan_rows)
 from process.ptg_parts.source_versions import _record_source_version
 from process.ptg_parts.table_setup import (
-    PTG2_MODEL_CLASSES, _drop_ptg2_columns, _ensure_indexes,
+    PTG2_MODEL_CLASSES, PTG_ALLOWED_AMOUNT_TABLE_CLASS_NAMES,
+    PTG_CONTROL_TABLE_CLASS_NAMES, PTG_IN_NETWORK_DENSE_TABLE_CLASS_NAMES,
+    PTG_PROVIDER_REFERENCE_TABLE_CLASS_NAMES, _drop_ptg2_columns,
+    _ensure_indexes, _ensure_ptg_dynamic_tables,
     _ensure_ptg2_price_atom_columns, _ensure_ptg2_price_set_columns,
     _ensure_ptg2_price_set_stage_table, _ensure_ptg2_provider_set_columns,
     _ensure_ptg2_serving_rate_columns, _ensure_ptg2_serving_rate_stage_table,
@@ -835,6 +841,71 @@ async def _stream_manifest_copy_kind_with_progress(
     return copy_metrics
 
 
+async def _copy_manifest_files_direct_with_progress(
+    kind: str,
+    *,
+    target_table: str,
+    input_paths: list[Path],
+    copy_func,
+    completed_steps_before_copy: int,
+    total_steps: int,
+    emitted_rows: int | None,
+) -> dict[str, Any]:
+    existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
+    copy_tasks = max(_env_int(PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, 8), 1)
+    _emit_ptg2_publish_progress(
+        f"copying {kind}",
+        completed_steps=completed_steps_before_copy,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"copying {kind} worker files into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+        input_files=len(existing_paths),
+        emitted_rows=emitted_rows,
+        direct_to_copy=True,
+        copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
+    )
+    if copy_tasks <= 1 or len(existing_paths) <= 1:
+        for input_path in existing_paths:
+            await copy_func(input_path, target_table=target_table)
+    else:
+        semaphore = asyncio.Semaphore(copy_tasks)
+
+        async def copy_one(input_path: Path) -> None:
+            async with semaphore:
+                await copy_func(input_path, target_table=target_table)
+
+        await asyncio.gather(*(copy_one(input_path) for input_path in existing_paths))
+    row_count = int(emitted_rows or 0)
+    _emit_ptg2_publish_progress(
+        f"copied {kind}",
+        completed_steps=completed_steps_before_copy + 1,
+        total_steps=total_steps,
+        stage_start_pct=92.0,
+        stage_end_pct=95.0,
+        message_text=f"copied {row_count} {kind} row(s) into {target_table}",
+        copy_kind=kind,
+        target_table=target_table,
+        input_files=len(existing_paths),
+        input_rows=row_count,
+        output_rows=row_count,
+        dropped_rows=0,
+        direct_to_copy=True,
+        copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
+    )
+    return {
+        "kind": kind,
+        "input_files": len(existing_paths),
+        "input_rows": row_count,
+        "output_rows": row_count,
+        "dropped_rows": 0,
+        "direct_to_copy": True,
+        "copy_tasks": min(copy_tasks, max(len(existing_paths), 1)),
+    }
+
+
 async def _merge_manifest_copy_kind_with_progress(
     kind: str,
     output_path: Path,
@@ -939,7 +1010,14 @@ async def _merge_and_copy_ptg2_manifest_files(
     manifest_stage_table: str,
 ) -> dict[str, Any]:
     manifest_serving_copy_kind, manifest_serving_copy_func, use_direct_lean_copy = _manifest_serving_copy_settings()
-    copy_kinds = [manifest_serving_copy_kind, "price_atom", "price_set_atom", "provider_group_member"]
+    copy_kinds = [
+        manifest_serving_copy_kind,
+        "price_atom",
+        "price_set_atom",
+        "provider_group_member",
+        "code_count",
+        "provider_set_dictionary",
+    ]
     copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(successful_files, copy_kinds)
     if not any(copy_files_by_kind.values()):
         return {"enabled": False, "reason": "no_deferred_copy_files"}
@@ -954,8 +1032,92 @@ async def _merge_and_copy_ptg2_manifest_files(
     price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
     price_set_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
     provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
+    code_count_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "code_count")
+    provider_set_dictionary_table = _ptg2_manifest_support_stage_table(
+        manifest_stage_table,
+        "provider_set_dictionary",
+    )
     has_price_set_atom_files = bool(copy_files_by_kind.get("price_set_atom"))
-    if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, False):
+    binary_snapshot_arch = _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+    direct_copy_default = binary_snapshot_arch
+    if _env_bool(PTG2_MANIFEST_DIRECT_COPY_FILES_ENV, direct_copy_default):
+        merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
+        progress_total = 6 if has_price_set_atom_files else 5
+        try:
+            serving_metrics = await _copy_manifest_files_direct_with_progress(
+                manifest_serving_copy_kind,
+                target_table=manifest_stage_table,
+                input_paths=copy_files_by_kind[manifest_serving_copy_kind],
+                copy_func=manifest_serving_copy_func,
+                completed_steps_before_copy=0,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get(manifest_serving_copy_kind),
+            )
+            price_atom_metrics = await _copy_manifest_files_direct_with_progress(
+                "price_atom",
+                target_table=price_atom_table,
+                input_paths=copy_files_by_kind["price_atom"],
+                copy_func=_copy_ptg2_manifest_price_atom_file,
+                completed_steps_before_copy=1,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("price_atom"),
+            )
+            price_set_atom_metrics = None
+            if has_price_set_atom_files:
+                price_set_atom_metrics = await _copy_manifest_files_direct_with_progress(
+                    "price_set_atom",
+                    target_table=price_set_atom_table,
+                    input_paths=copy_files_by_kind["price_set_atom"],
+                    copy_func=_copy_price_atom_member_file,
+                    completed_steps_before_copy=2,
+                    total_steps=progress_total,
+                    emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
+                )
+            provider_group_member_metrics = await _copy_manifest_files_direct_with_progress(
+                "provider_group_member",
+                target_table=provider_group_member_table,
+                input_paths=copy_files_by_kind["provider_group_member"],
+                copy_func=_copy_ptg2_manifest_provider_group_member_file,
+                completed_steps_before_copy=3 if has_price_set_atom_files else 2,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
+            )
+            code_count_metrics = await _copy_manifest_files_direct_with_progress(
+                "code_count",
+                target_table=code_count_table,
+                input_paths=copy_files_by_kind["code_count"],
+                copy_func=_copy_ptg2_manifest_code_count_file,
+                completed_steps_before_copy=4 if has_price_set_atom_files else 3,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("code_count"),
+            )
+            provider_set_dictionary_metrics = await _copy_manifest_files_direct_with_progress(
+                "provider_set_dictionary",
+                target_table=provider_set_dictionary_table,
+                input_paths=copy_files_by_kind["provider_set_dictionary"],
+                copy_func=_copy_ptg2_manifest_provider_set_dictionary_file,
+                completed_steps_before_copy=5 if has_price_set_atom_files else 4,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("provider_set_dictionary"),
+            )
+            merge_metrics["kinds"] = {
+                manifest_serving_copy_kind: serving_metrics,
+                "price_atom": price_atom_metrics,
+                "provider_group_member": provider_group_member_metrics,
+                "code_count": code_count_metrics,
+                "provider_set_dictionary": provider_set_dictionary_metrics,
+            }
+            if price_set_atom_metrics is not None:
+                merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
+            merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
+            merge_metrics["direct_to_copy"] = True
+            _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
+            return merge_metrics
+        finally:
+            _cleanup_manifest_copy_paths(copy_files_by_kind)
+
+    stream_merge_default = binary_snapshot_arch
+    if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, stream_merge_default):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
         progress_total = 4 if has_price_set_atom_files else 3
 
@@ -1170,6 +1332,8 @@ async def _parse_in_network_file_serving_only(
         "price_atom": [],
         "price_set_atom": [],
         "provider_group_member": [],
+        "code_count": [],
+        "provider_set_dictionary": [],
     }
     deferred_copy_file_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in deferred_copy_files}
     compact_copy_tasks: set[asyncio.Task] = set()
@@ -1219,6 +1383,8 @@ async def _parse_in_network_file_serving_only(
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
     manifest_price_set_atom_copy_path = _new_copy_path("ptg2_manifest_price_set_atom_")
     manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
+    manifest_code_count_copy_path = _new_copy_path("ptg2_manifest_code_count_")
+    manifest_provider_set_dictionary_copy_path = _new_copy_path("ptg2_manifest_provider_set_dictionary_")
     manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
         str(plan_fields.get("plan_id") or "plan"),
         snapshot_id,
@@ -1293,6 +1459,12 @@ async def _parse_in_network_file_serving_only(
         elif kind == "provider_group_member":
             target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
             copy_func = _copy_ptg2_manifest_provider_group_member_file
+        elif kind == "code_count":
+            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "code_count")
+            copy_func = _copy_ptg2_manifest_code_count_file
+        elif kind == "provider_set_dictionary":
+            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_set_dictionary")
+            copy_func = _copy_ptg2_manifest_provider_set_dictionary_file
         else:
             return
         if defer_manifest_copy:
@@ -1335,6 +1507,10 @@ async def _parse_in_network_file_serving_only(
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path if use_postgres_binary_arch else None,
             manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
+            manifest_code_count_copy_path=manifest_code_count_copy_path if use_postgres_binary_arch else None,
+            manifest_provider_set_dictionary_copy_path=(
+                manifest_provider_set_dictionary_copy_path if use_postgres_binary_arch else None
+            ),
             source_network_names=source_network_name_values,
             manifest_only=True,
         ):
@@ -1360,6 +1536,14 @@ async def _parse_in_network_file_serving_only(
             elif record_kind == "manifest_provider_group_member_copy_file":
                 compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("provider_group_member", record_row)))
                 await wait_for_some_copy_tasks()
+            elif record_kind == "manifest_code_count_copy_file":
+                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("code_count", record_row)))
+                await wait_for_some_copy_tasks()
+            elif record_kind == "manifest_provider_set_dictionary_copy_file":
+                compact_copy_tasks.add(
+                    asyncio.create_task(copy_ready_manifest_dictionary_file("provider_set_dictionary", record_row))
+                )
+                await wait_for_some_copy_tasks()
             elif record_kind in {"procedure", "serving_rate_compact"} and record_row.get("procedure_hash"):
                 procedure_hashes.add(str(record_row.get("procedure_hash")))
         await wait_for_some_copy_tasks(force=True)
@@ -1371,6 +1555,11 @@ async def _parse_in_network_file_serving_only(
                 lambda row: copy_ready_manifest_dictionary_file("price_set_atom", row),
             ),
             (manifest_provider_group_member_copy_path, lambda row: copy_ready_manifest_dictionary_file("provider_group_member", row)),
+            (manifest_code_count_copy_path, lambda row: copy_ready_manifest_dictionary_file("code_count", row)),
+            (
+                manifest_provider_set_dictionary_copy_path,
+                lambda row: copy_ready_manifest_dictionary_file("provider_set_dictionary", row),
+            ),
         ):
             for candidate_copy_path in _manifest_copy_candidates(copy_path):
                 if candidate_copy_path.exists() and candidate_copy_path.stat().st_size > 0:
@@ -1389,6 +1578,8 @@ async def _parse_in_network_file_serving_only(
             manifest_price_atom_copy_path,
             manifest_price_set_atom_copy_path,
             manifest_provider_group_member_copy_path,
+            manifest_code_count_copy_path,
+            manifest_provider_set_dictionary_copy_path,
         )
         for copy_path in manifest_copy_paths:
             try:
@@ -2904,6 +3095,15 @@ async def main(
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
     )
+    setup_stage_timings: dict[str, float] = {}
+    setup_stage_started_monotonic = import_started_monotonic
+
+    def mark_setup_stage(stage_name: str) -> None:
+        nonlocal setup_stage_started_monotonic
+        now_monotonic = time.monotonic()
+        setup_stage_timings[stage_name] = now_monotonic - setup_stage_started_monotonic
+        setup_stage_started_monotonic = now_monotonic
+
     source_network_name_values = _normalize_source_network_names(source_network_names)
     # Enforce a streaming size cap on every caller-supplied URL (never None for
     # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
@@ -2917,7 +3117,9 @@ async def main(
                 logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
     write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
     await ensure_database(test_mode)
+    mark_setup_stage("ensure_database")
     await ensure_ptg2_tables()
+    mark_setup_stage("ensure_ptg2_tables")
     compact_import = True
     source_scoped_compact = True
     if source_key_val is None:
@@ -2988,6 +3190,7 @@ async def main(
         PTG2Snapshot,
         rewrite=True,
     )
+    mark_setup_stage("initial_status_rows")
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
     current_pointer_published = False
@@ -3031,7 +3234,27 @@ async def main(
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
         ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
-        classes = await _prepare_ptg_tables(import_id_val, test_mode)
+        mark_setup_stage("manifest_stage_table")
+        initial_dynamic_table_names: set[str] | None = None
+        if snapshot_arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 and compact_import:
+            initial_dynamic_table_names = set(PTG_CONTROL_TABLE_CLASS_NAMES)
+        classes = await _prepare_ptg_tables(
+            import_id_val,
+            test_mode,
+            initial_table_class_names=initial_dynamic_table_names,
+        )
+        if initial_dynamic_table_names is None:
+            prepared_dynamic_table_names = set(classes)
+        else:
+            prepared_dynamic_table_names = set(initial_dynamic_table_names)
+        mark_setup_stage("legacy_dynamic_tables")
+
+        async def ensure_dynamic_tables(class_names: set[str] | frozenset[str]) -> None:
+            missing_names = set(class_names) - prepared_dynamic_table_names
+            if not missing_names:
+                return
+            await _ensure_ptg_dynamic_tables(classes, missing_names, test_mode=test_mode)
+            prepared_dynamic_table_names.update(missing_names)
 
         provider_ref_cache: dict[int, list[dict[str, Any]]] = {}
         jobs: list[dict[str, Any]] = []
@@ -3070,6 +3293,7 @@ async def main(
             jobs.extend(toc_jobs)
 
         if provider_ref_url:
+            await ensure_dynamic_tables(PTG_PROVIDER_REFERENCE_TABLE_CLASS_NAMES)
             provider_ref_cache.update(
                 await _process_provider_reference_file(
                     provider_ref_url,
@@ -3146,6 +3370,10 @@ async def main(
                 break
             if job.get("type") in {"in_network", "allowed_amounts"}:
                 selected_jobs.append(job)
+        if any(job.get("type") == "allowed_amounts" for job in selected_jobs):
+            await ensure_dynamic_tables(PTG_ALLOWED_AMOUNT_TABLE_CLASS_NAMES)
+        if any(job.get("type") == "in_network" for job in selected_jobs) and not compact_import:
+            await ensure_dynamic_tables(PTG_IN_NETWORK_DENSE_TABLE_CLASS_NAMES)
         processed_file_count_map = {"done": 0}
         attempted_files = len(selected_jobs)
         for progress_index, job in enumerate(selected_jobs):
@@ -3361,6 +3589,7 @@ async def main(
             message_text="starting PTG snapshot publish",
         )
         manifest_merge_metrics: dict[str, Any] = {"enabled": False}
+        manifest_precopy_merge_seconds = 0.0
         has_serving_files = any(
             file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
             for file_summary in successful_files
@@ -3373,10 +3602,13 @@ async def main(
                 total_steps=publish_progress_total,
                 message_text="merging manifest copy files before publish",
             )
+            manifest_precopy_merge_started_monotonic = time.monotonic()
             manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
             )
+            manifest_precopy_merge_seconds = time.monotonic() - manifest_precopy_merge_started_monotonic
+            manifest_merge_metrics["elapsed_seconds"] = manifest_precopy_merge_seconds
             _emit_ptg2_publish_progress(
                 "pre-copy merge complete",
                 completed_steps=4,
@@ -3399,6 +3631,15 @@ async def main(
                 has_serving_files=has_serving_files,
             )
         manifest_artifacts = _collect_manifest_artifacts(successful_files)
+        serving_successful_files = [
+            file_summary
+            for file_summary in successful_files
+            if file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
+        ]
+        scanner_dedupe_guarded = (
+            len(serving_successful_files) == 1
+            and _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+        )
         assert source_key_val is not None
         if has_serving_files:
             if not ptg2_manifest_stage_table:
@@ -3416,8 +3657,12 @@ async def main(
                 artifacts=manifest_artifacts,
                 # Pre-copy merge removes exact duplicate rows in the artifact stream,
                 # but live payer files can still produce duplicate serving identities.
-                # Keep the DB DISTINCT pass as the final publish-time guard.
-                db_dedupe_fallback=True,
+                # Keep the DB DISTINCT pass as the final publish-time guard unless
+                # one Rust scanner handled the whole source file and already emitted
+                # deduped manifest support rows.
+                db_dedupe_fallback=not scanner_dedupe_guarded,
+                scanner_dedupe_guarded=scanner_dedupe_guarded,
+                known_serving_rows=manifest_merge_metrics.get("serving_rows"),
             )
             ptg2_manifest_stage_table = None
             _emit_ptg2_publish_progress(
@@ -3454,6 +3699,16 @@ async def main(
                 **allowed_amount_metrics,
             }
         publish_seconds = time.monotonic() - publish_started_monotonic
+        post_publish_prepare_started_monotonic = time.monotonic()
+        post_publish_stage_timings: dict[str, float] = {}
+        post_publish_stage_started_monotonic = post_publish_prepare_started_monotonic
+
+        def mark_post_publish_stage(stage_name: str) -> None:
+            nonlocal post_publish_stage_started_monotonic
+            now_monotonic = time.monotonic()
+            post_publish_stage_timings[stage_name] = now_monotonic - post_publish_stage_started_monotonic
+            post_publish_stage_started_monotonic = now_monotonic
+
         finished = _utcnow()
         previous_snapshot_id = None
         global_previous_snapshot_id = None
@@ -3467,20 +3722,32 @@ async def main(
                 global_previous_snapshot_id = row[0]
         except Exception as exc:
             logger.debug("No PTG2 current snapshot found before publish: %s", exc)
+        mark_post_publish_stage("current_snapshot_lookup")
         if source_scoped_compact and source_key_val:
             previous_snapshot_id = await _current_source_snapshot_id(source_key_val)
         else:
             previous_snapshot_id = global_previous_snapshot_id
+        mark_post_publish_stage("source_snapshot_lookup")
         serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
+        setup_seconds = data_started_monotonic - import_started_monotonic
+        post_publish_prepare_seconds = time.monotonic() - post_publish_prepare_started_monotonic
         timing_payload = {
             "total_seconds": time.monotonic() - import_started_monotonic,
+            "setup_seconds": setup_seconds,
             "data_seconds": data_seconds,
             "publish_seconds": publish_seconds,
+            "manifest_precopy_merge_seconds": manifest_precopy_merge_seconds,
+            "post_publish_prepare_seconds": post_publish_prepare_seconds,
         }
+        for key, value in setup_stage_timings.items():
+            timing_payload[f"setup_{key}_seconds"] = value
+        for key, value in post_publish_stage_timings.items():
+            timing_payload[f"post_publish_{key}_seconds"] = value
         if isinstance(serving_timings, dict):
             for key, value in serving_timings.items():
                 try:
-                    timing_payload[key] = float(value)
+                    timing_key = f"serving_{key}" if key in timing_payload else key
+                    timing_payload[timing_key] = float(value)
                 except (TypeError, ValueError):
                     continue
         report_payload = {
@@ -3600,8 +3867,10 @@ async def main(
             f"\tfiles_failed={len(failed_files)}"
             f"\tserving_rates={report_payload.get('serving_rates', 'unknown')}"
             f"\ttotal_seconds={timing_payload['total_seconds']:.2f}"
+            f"\tsetup_seconds={timing_payload['setup_seconds']:.2f}"
             f"\tdata_seconds={timing_payload['data_seconds']:.2f}"
             f"\tpublish_seconds={timing_payload['publish_seconds']:.2f}"
+            f"\tpost_publish_prepare_seconds={timing_payload['post_publish_prepare_seconds']:.2f}"
             f"\tindex_seconds={float(timing_payload.get('index_seconds', 0.0)):.2f}"
             f"\tanalyze_seconds={float(timing_payload.get('analyze_seconds', 0.0)):.2f}"
         )
