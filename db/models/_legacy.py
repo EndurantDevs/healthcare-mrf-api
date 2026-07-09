@@ -4221,6 +4221,17 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         },
         {
             "index_elements": (
+                "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
+                "npi",
+            ),
+            "name": "service_phone_lookup_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
+            ),
+        },
+        {
+            "index_elements": (
                 "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
                 "npi",
             ),

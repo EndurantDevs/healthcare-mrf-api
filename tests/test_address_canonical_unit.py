@@ -3046,6 +3046,17 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
             {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
             {
                 "index_elements": (
+                    "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
+                    "npi",
+                ),
+                "name": "service_phone_lookup_npi",
+                "where": (
+                    "type IN ('primary', 'secondary', 'practice', 'site') "
+                    "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
+                ),
+            },
+            {
+                "index_elements": (
                     "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
                     "npi",
                 ),
@@ -3116,6 +3127,7 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_geo_bbox" in joined
     assert "idx_geo_idx" in joined
     assert "idx_primary_phone_npi" in joined
+    assert "idx_service_phone_lookup_npi" in joined
     assert "idx_service_phone_digits_npi" in joined
     assert "idx_service_phone_number_npi" in joined
     assert "idx_service_address_key_npi" in joined
@@ -3193,6 +3205,10 @@ async def test_entity_address_unified_post_publish_serving_indexes_use_live_tabl
     assert "entity_address_unified_idx_geo_bbox" in joined
     assert "entity_address_unified_idx_geo_idx" in joined
     assert "entity_address_unified_idx_primary_phone_npi" in joined
+    assert "entity_address_unified_idx_service_phone_lookup_npi" in joined
+    assert (
+        "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')), npi"
+    ) in joined
     assert "entity_address_unified_idx_service_phone_digits_npi" in joined
     assert "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'), npi" in joined
     assert "entity_address_unified_idx_service_phone_number_npi" in joined
@@ -3233,6 +3249,7 @@ async def test_entity_address_unified_swap_renames_model_serving_indexes(monkeyp
     joined = "\n".join(statements)
     expected_indexes = {
         "service_phone_digits_npi",
+        "service_phone_lookup_npi",
         "service_phone_number_npi",
         "service_address_key_npi",
         "service_premise_key_npi",
@@ -3513,6 +3530,17 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "index_elements": ("telephone_number", "npi"),
         "name": "primary_phone_npi",
         "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
+    }
+    assert indexes["service_phone_lookup_npi"] == {
+        "index_elements": (
+            "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
+            "npi",
+        ),
+        "name": "service_phone_lookup_npi",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
+        ),
     }
     assert indexes["service_phone_digits_npi"] == {
         "index_elements": (

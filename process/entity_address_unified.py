@@ -110,6 +110,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "serving_zip5_npi",
     "serving_zip5_taxonomy",
     "primary_phone_npi",
+    "service_phone_lookup_npi",
     "service_phone_digits_npi",
     "service_phone_number_npi",
     "service_address_key_npi",

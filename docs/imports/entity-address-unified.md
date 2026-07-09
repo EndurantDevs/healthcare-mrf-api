@@ -97,7 +97,11 @@ stage table; the publish swap renames those stage indexes to the live names; and
 `POST_PUBLISH_INDEX_PROFILE=serving` can repair or backfill any missing live
 serving index after publish. Do not rely on migrations alone for these indexes:
 table-swap refreshes must be able to recreate them from the model before the
-swap.
+swap. Phone lookups use the model expression index
+`service_phone_lookup_npi`, matching
+`COALESCE(NULLIF(phone_number, ''), normalized_telephone_digits)`, so the API
+does not emit a broad `OR` predicate that can degenerate into a full
+NPI-ordered scan.
 
 When post-publish index warmup is enabled, use
 `metrics.published_elapsed_seconds` as the publish-time measurement. Successful
