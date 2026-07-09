@@ -9103,6 +9103,7 @@ async def _run_role_lookup_tasks(
                 lookup_task.cancel()
         if not producer_task.done():
             producer_task.cancel()
+        await asyncio.gather(producer_task, *lookup_tasks, return_exceptions=True)
         await fetch_state.flush_completed_seed_rows()
 
 
