@@ -4188,12 +4188,20 @@ async def _invalid_coordinate_count(db_schema: str, table_name: str, *, db_clien
             f"""
             SELECT COUNT(*)
               FROM {db_schema}.{table_name}
-             WHERE (lat IS NOT NULL AND (lat < -90 OR lat > 90))
-                OR (long IS NOT NULL AND (long < -180 OR long > 180))
-                OR (lat IS NOT NULL AND long IS NOT NULL AND ABS(lat) < 0.0000001 AND ABS(long) < 0.0000001);
+             WHERE {_coordinate_invalid_sql("")};
             """
         )
         or 0
+    )
+
+
+def _coordinate_invalid_sql(alias: str) -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"({prefix}lat IS NOT NULL AND ({prefix}lat < -90 OR {prefix}lat > 90)) "
+        f"OR ({prefix}long IS NOT NULL AND ({prefix}long < -180 OR {prefix}long > 180)) "
+        f"OR ({prefix}lat IS NOT NULL AND {prefix}long IS NOT NULL "
+        f"AND ABS({prefix}lat) < 0.0000001 AND ABS({prefix}long) < 0.0000001)"
     )
 
 
@@ -4220,6 +4228,15 @@ def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
        AND a.long IS NOT NULL
        AND NOT (ABS(a.lat) < 0.0000001 AND ABS(a.long) < 0.0000001)
        AND ({target_coordinate_missing});
+    """
+
+
+def _clear_invalid_coordinates_sql(db_schema: str, table_name: str) -> str:
+    return f"""
+    UPDATE {db_schema}.{table_name} AS t
+       SET lat = NULL,
+           long = NULL
+     WHERE {_coordinate_invalid_sql("t")};
     """
 
 
@@ -11005,6 +11022,20 @@ async def shutdown(ctx):
         emit_done=True,
     )
     context["same_provider_address_backfill_rows"] = int(same_provider_address_backfill_rows or 0)
+    invalid_coordinate_clear_rows = await _run_sql_phase(
+        _clear_invalid_coordinates_sql(db_schema, stage_cls.__tablename__),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified clearing invalid coordinates",
+        unit="rows",
+        done=0,
+        total=1,
+        pct=97,
+        message="clearing invalid staged coordinates",
+        emit_start=True,
+        emit_done=True,
+    )
+    context["invalid_coordinate_clear_rows"] = int(invalid_coordinate_clear_rows or 0)
     context["publish_validation_deferred"] = defer_publish_validation
     if defer_publish_validation:
         context["publish_validation"] = {
@@ -11157,6 +11188,9 @@ async def shutdown(ctx):
             "same_provider_address_backfill_rows": int(
                 context.get("same_provider_address_backfill_rows") or 0
             ),
+            "invalid_coordinate_clear_rows": int(
+                context.get("invalid_coordinate_clear_rows") or 0
+            ),
             **_runtime_config_metrics(context),
             "publish_validation": context.get("publish_validation") or {},
             "phase_timings": context.get("phase_timings") or {},
@@ -11199,6 +11233,23 @@ async def shutdown(ctx):
                     int(context.get("archive_coordinate_backfill_rows") or 0)
                     + int(archive_coordinate_backfill_rows or 0)
                 )
+            invalid_coordinate_clear_rows = await _run_sql_phase(
+                _clear_invalid_coordinates_sql(db_schema, EntityAddressUnified.__main_table__),
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified clearing invalid coordinates",
+                unit="rows",
+                done=0,
+                total=1,
+                pct=99,
+                message="clearing invalid staged coordinates",
+                emit_start=True,
+                emit_done=True,
+            )
+            context["invalid_coordinate_clear_rows"] = (
+                int(context.get("invalid_coordinate_clear_rows") or 0)
+                + int(invalid_coordinate_clear_rows or 0)
+            )
             started = time.monotonic()
             publish_validation = await _validate_publish_integrity(
                 db_schema,

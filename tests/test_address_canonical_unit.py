@@ -3427,6 +3427,28 @@ def test_entity_address_unified_archive_coordinate_backfill_sql_only_fills_missi
     assert "ABS(t.lat) < 0.0000001" in sql
 
 
+def test_entity_address_unified_clear_invalid_coordinates_sql_nulls_bad_pairs():
+    sql = entity_address_unified._clear_invalid_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+
+    assert "UPDATE mrf.entity_address_unified_20260614 AS t" in sql
+    assert "SET lat = NULL" in sql
+    assert "long = NULL" in sql
+    assert "t.lat IS NOT NULL AND (t.lat < -90 OR t.lat > 90)" in sql
+    assert "t.long IS NOT NULL AND (t.long < -180 OR t.long > 180)" in sql
+    assert "ABS(t.lat) < 0.0000001" in sql
+    assert "ABS(t.long) < 0.0000001" in sql
+
+
+def test_entity_address_unified_clears_invalid_coordinates_before_validation():
+    source = inspect.getsource(entity_address_unified.shutdown)
+
+    assert source.index("_clear_invalid_coordinates_sql") < source.index("_validate_publish_integrity")
+    assert "invalid_coordinate_clear_rows" in source
+
+
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", raising=False)
     assert entity_address_unified._keep_raw_stage() is False
