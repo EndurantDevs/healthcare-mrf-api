@@ -22,6 +22,7 @@ from process.ptg_parts.config import (
     PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE,
     PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR,
     PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
+    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
     PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
     PTG2_UNLOGGED_STAGE_ENV, _env_bool, _ptg2_snapshot_arch_from_env)
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
@@ -44,6 +45,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     write_serving_by_code_sidecar_async,
     write_serving_by_provider_set_sidecar_async,
 )
+from process.ptg_parts.ptg2_serving_binary import write_ptg2_serving_binary_table
 from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
                                                _ptg2_snapshot_table_name,
@@ -56,6 +58,7 @@ PTG2_MANIFEST_SERVING_LAYOUT_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT"
 PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY = "lean_provider_key_v1"
 PTG2_MANIFEST_PRICE_ATOM_LAYOUT_ENV = "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT"
 PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT = "lean_dict_v1"
+PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2 = "lean_dict_v2"
 PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE_ENV = "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_TABLE"
 PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV = (
     "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE"
@@ -74,8 +77,17 @@ _MANIFEST_PUBLISH_DETAIL_END_PCT = 97.24
 
 
 def _row_value(row: Any, key: str, position: int = 0) -> Any:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key)
     if isinstance(row, dict):
         return row.get(key)
+    try:
+        keyed_value = row[key]
+    except Exception:
+        keyed_value = None
+    else:
+        return keyed_value
     value = getattr(row, key, None)
     if value is not None:
         return value
@@ -188,6 +200,10 @@ PTG2_MANIFEST_PRICE_ATOM_COLUMNS = [
     "setting",
     "billing_code_modifier",
     "additional_information",
+]
+PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS = [
+    "price_set_global_id_128",
+    "price_atom_global_id_128",
 ]
 PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS = [
     "provider_group_global_id_128",
@@ -350,7 +366,7 @@ def _ptg2_manifest_provider_set_component_enabled() -> bool:
     arch_version = _ptg2_manifest_snapshot_arch()
     if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
         return True
-    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1:
+    if arch_version in {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1, PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1}:
         return False
     if os.getenv(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV, True)
@@ -363,7 +379,7 @@ def _ptg2_manifest_provider_group_rate_scope_enabled() -> bool:
     arch_version = _ptg2_manifest_snapshot_arch()
     if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
         return True
-    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1:
+    if arch_version in {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1, PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1}:
         return False
     return _env_bool(PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV, False)
 
@@ -426,6 +442,7 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     except Exception as exc:
         logger.debug("failed to disable autovacuum on PTG2 manifest stage table %s: %s", stage_table, exc)
     await _create_ptg2_manifest_price_atom_stage_table(stage_table)
+    await _create_price_atom_member_stage_table(stage_table)
     await _create_ptg2_manifest_provider_group_member_stage_table(stage_table)
     return stage_table
 
@@ -448,6 +465,23 @@ async def _create_ptg2_manifest_price_atom_stage_table(serving_stage_table: str)
             setting varchar(64),
             billing_code_modifier text[] NOT NULL DEFAULT '{{}}',
             additional_information text
+        );
+        """
+    )
+    return stage_table
+
+
+async def _create_price_atom_member_stage_table(serving_stage_table: str) -> str:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "price_set_atom")
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+            price_set_global_id_128 {id_type} NOT NULL,
+            price_atom_global_id_128 {id_type} NOT NULL
         );
         """
     )
@@ -485,6 +519,10 @@ async def _copy_lean_manifest_serving_file(copy_path: Path, *, target_table: str
 
 async def _copy_ptg2_manifest_price_atom_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS)
+
+
+async def _copy_price_atom_member_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_SET_ATOM_COLUMNS)
 
 
 async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
@@ -934,10 +972,9 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
 
     uploaded_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     upload_total = _ptg2_manifest_sidecar_upload_count(sidecar_artifacts)
-    upload_done = 0
+    upload_progress_by_name = {"done": 0}
 
     async def upload_entry(default_name: str, value: Any) -> dict[str, Any] | None:
-        nonlocal upload_done
         if not isinstance(value, Mapping):
             return None
         entry = dict(value)
@@ -952,7 +989,7 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
         if upload_total:
             _emit_ptg2_manifest_publish_progress(
                 "artifact upload",
-                done=upload_done,
+                done=upload_progress_by_name["done"],
                 total=upload_total,
                 message=f"uploading {artifact_name} sidecar to PostgreSQL",
                 pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
@@ -965,10 +1002,10 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             merged = dict(cached)
             merged["name"] = artifact_name
             if upload_total:
-                upload_done += 1
+                upload_progress_by_name["done"] += 1
                 _emit_ptg2_manifest_publish_progress(
                     "artifact upload reused",
-                    done=upload_done,
+                    done=upload_progress_by_name["done"],
                     total=upload_total,
                     message=f"reused uploaded {artifact_name} sidecar",
                     pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
@@ -979,10 +1016,10 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             return merged
         if not path.exists() or path.stat().st_size <= 0:
             if upload_total:
-                upload_done += 1
+                upload_progress_by_name["done"] += 1
                 _emit_ptg2_manifest_publish_progress(
                     "artifact upload skipped",
-                    done=upload_done,
+                    done=upload_progress_by_name["done"],
                     total=upload_total,
                     message=f"skipped missing {artifact_name} sidecar upload",
                     pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
@@ -999,10 +1036,10 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
         )
         uploaded_by_key[cache_key] = uploaded
         if upload_total:
-            upload_done += 1
+            upload_progress_by_name["done"] += 1
             _emit_ptg2_manifest_publish_progress(
                 "artifact upload complete",
-                done=upload_done,
+                done=upload_progress_by_name["done"],
                 total=upload_total,
                 message=f"uploaded {artifact_name} sidecar to PostgreSQL",
                 pct=_MANIFEST_PUBLISH_DETAIL_END_PCT,
@@ -1045,6 +1082,48 @@ def _merge_ptg2_manifest_sidecar_artifacts(
                 continue
             combined[name] = value
     return combined
+
+
+def _ptg2_sidecar_entry_name(name: str, value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("name") or value.get("kind") or name).strip()
+    return str(name or "").strip()
+
+
+def _omit_price_forward_artifacts(
+    sidecar_artifacts: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return sidecar artifacts without the duplicate price_forward artifact."""
+
+    artifacts_by_name: dict[str, Any] = {}
+    for name, value in dict(sidecar_artifacts or {}).items():
+        if name == "sidecars" and isinstance(value, list):
+            retained_sidecars = [
+                dict(item)
+                for item in value
+                if not (
+                    isinstance(item, Mapping)
+                    and str(item.get("name") or item.get("kind") or "").strip() == "price_forward"
+                )
+            ]
+            if retained_sidecars:
+                artifacts_by_name[name] = retained_sidecars
+            continue
+        if _ptg2_sidecar_entry_name(str(name), value) == "price_forward":
+            continue
+        artifacts_by_name[str(name)] = value
+    return artifacts_by_name
+
+
+def _has_serving_binary_price_atoms(serving_binary_manifest: Mapping[str, Any] | None) -> bool:
+    """Return true when serving-binary blocks include price-set atom mappings."""
+
+    if not isinstance(serving_binary_manifest, Mapping):
+        return False
+    price_set_atoms = serving_binary_manifest.get("price_set_atoms")
+    if not isinstance(price_set_atoms, Mapping):
+        return False
+    return int(price_set_atoms.get("price_set_count") or 0) > 0
 
 
 def _split_ptg2_manifest_base_artifacts(
@@ -1509,6 +1588,67 @@ async def _dedupe_ptg2_manifest_price_atom_table(schema_name: str, price_atom_ta
     }
 
 
+def _price_atom_dictionary_columns_by_attr() -> dict[str, str]:
+    """Map price-atom dictionary attributes to lean-table key columns."""
+    return {
+        "negotiated_type": "negotiated_type_key",
+        "expiration_date": "expiration_date_key",
+        "service_code": "service_code_key",
+        "billing_class": "billing_class_key",
+        "setting": "setting_key",
+        "billing_code_modifier": "billing_code_modifier_key",
+        "additional_information": "additional_information_key",
+    }
+
+
+async def _ptg2_price_atom_constant_metadata(
+    *,
+    schema_name: str,
+    price_atom_dictionary_table: str,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Return v2 constant dictionary keys and values that can move to metadata."""
+    constant_key_by_column: dict[str, int] = {}
+    constant_value_by_kind: dict[str, Any] = {}
+    columns_by_attr = _price_atom_dictionary_columns_by_attr()
+    constant_rows = await db.all(
+        f"""
+        SELECT
+            dictionary.attr_kind,
+            dictionary.attr_key::integer AS attr_key,
+            dictionary.text_value,
+            dictionary.text_array
+          FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} dictionary
+          JOIN (
+            SELECT attr_kind
+              FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)}
+             WHERE attr_kind IN (
+                'negotiated_type',
+                'expiration_date',
+                'service_code',
+                'billing_class',
+                'setting',
+                'billing_code_modifier',
+                'additional_information'
+             )
+             GROUP BY attr_kind
+            HAVING COUNT(*) = 1
+          ) constant_attr
+            ON constant_attr.attr_kind = dictionary.attr_kind;
+        """
+    )
+    for constant_row in constant_rows:
+        attr_kind = str(_row_value(constant_row, "attr_kind", 0) or "")
+        column_name = columns_by_attr.get(attr_kind)
+        if not column_name:
+            continue
+        constant_key_by_column[column_name] = int(_row_value(constant_row, "attr_key", 1) or 0)
+        if attr_kind in {"service_code", "billing_code_modifier"}:
+            constant_value_by_kind[attr_kind] = list(_row_value(constant_row, "text_array", 3) or [])
+        else:
+            constant_value_by_kind[attr_kind] = _row_value(constant_row, "text_value", 2)
+    return constant_key_by_column, constant_value_by_kind
+
+
 async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     *,
     schema_name: str,
@@ -1591,27 +1731,37 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)};
         """
     )
-    lookup_collisions = await db.scalar(
-        f"""
-        SELECT count(*)
-          FROM (
-            SELECT attr_kind, text_lookup_key AS lookup_key
-              FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
-             WHERE text_lookup_key IS NOT NULL
-             GROUP BY attr_kind, text_lookup_key
-            HAVING count(*) > 1
-            UNION ALL
-            SELECT attr_kind, array_lookup_key
-              FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
-             WHERE array_lookup_key IS NOT NULL
-             GROUP BY attr_kind, array_lookup_key
-            HAVING count(*) > 1
-          ) collisions;
-        """
-    )
-    if int(lookup_collisions or 0) > 0:
+    if int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+              FROM (
+                SELECT attr_kind, text_lookup_key AS lookup_key
+                  FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+                 WHERE text_lookup_key IS NOT NULL
+                 GROUP BY attr_kind, text_lookup_key
+                HAVING count(*) > 1
+                UNION ALL
+                SELECT attr_kind, array_lookup_key
+                  FROM {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)}
+                 WHERE array_lookup_key IS NOT NULL
+                 GROUP BY attr_kind, array_lookup_key
+                HAVING count(*) > 1
+              ) collisions;
+            """
+        )
+        or 0
+    ) > 0:
         raise RuntimeError(
             f"PTG2 price atom dictionary lookup key collision in {schema_name}.{price_atom_dictionary_table}"
+        )
+    price_atom_layout = _ptg2_manifest_price_atom_layout()
+    constant_key_by_column: dict[str, int] = {}
+    constant_value_by_kind: dict[str, Any] = {}
+    if price_atom_layout == PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2:
+        constant_key_by_column, constant_value_by_kind = await _ptg2_price_atom_constant_metadata(
+            schema_name=schema_name,
+            price_atom_dictionary_table=price_atom_dictionary_table,
         )
     keyed_text_index = _ptg2_snapshot_index_name(keyed_dictionary_table, "text_key_idx")
     keyed_array_index = _ptg2_snapshot_index_name(keyed_dictionary_table, "array_key_idx")
@@ -1632,75 +1782,62 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         """
     )
     await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)};")
+    select_columns = [
+        f"price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128",
+        "price_atom.negotiated_rate::varchar(64) AS negotiated_rate",
+    ]
+    join_sql_parts: list[str] = []
+    dictionary_join_specs = [
+        ("negotiated_type", "text_lookup_key", "negotiated_type"),
+        ("expiration_date", "text_lookup_key", "expiration_date"),
+        ("service_code", "array_lookup_key", "service_code"),
+        ("billing_class", "text_lookup_key", "billing_class"),
+        ("setting", "text_lookup_key", "setting"),
+        ("billing_code_modifier", "array_lookup_key", "billing_code_modifier"),
+        ("additional_information", "text_lookup_key", "additional_information"),
+    ]
+    for attr_kind, lookup_column, source_column in dictionary_join_specs:
+        key_column = _price_atom_dictionary_columns_by_attr()[attr_kind]
+        if key_column in constant_key_by_column:
+            continue
+        select_columns.append(f"{attr_kind}.attr_key::integer AS {key_column}")
+        lookup_prefix = "ARRAY" if lookup_column == "array_lookup_key" else "TEXT"
+        source_lookup_expr = (
+            f"to_json(price_atom.{source_column})::text"
+            if lookup_column == "array_lookup_key"
+            else f"price_atom.{source_column}"
+        )
+        join_sql_parts.append(
+            f"""
+            JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} {attr_kind}
+              ON {attr_kind}.attr_kind = '{attr_kind}'
+             AND {attr_kind}.{lookup_column} = CASE
+                    WHEN price_atom.{source_column} IS NULL THEN 'NULL'
+                    ELSE '{lookup_prefix}:' || md5({source_lookup_expr})
+                 END
+            """
+        )
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
-            price_atom.price_atom_global_id_128::{id_type} AS price_atom_global_id_128,
-            negotiated_type.attr_key::integer AS negotiated_type_key,
-            price_atom.negotiated_rate::varchar(64) AS negotiated_rate,
-            expiration_date.attr_key::integer AS expiration_date_key,
-            service_code.attr_key::integer AS service_code_key,
-            billing_class.attr_key::integer AS billing_class_key,
-            setting.attr_key::integer AS setting_key,
-            billing_code_modifier.attr_key::integer AS billing_code_modifier_key,
-            additional_information.attr_key::integer AS additional_information_key
+            {", ".join(select_columns)}
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} price_atom
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} negotiated_type
-          ON negotiated_type.attr_kind = 'negotiated_type'
-         AND negotiated_type.text_lookup_key = CASE
-                WHEN price_atom.negotiated_type IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(price_atom.negotiated_type)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} expiration_date
-          ON expiration_date.attr_kind = 'expiration_date'
-         AND expiration_date.text_lookup_key = CASE
-                WHEN price_atom.expiration_date IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(price_atom.expiration_date)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} service_code
-          ON service_code.attr_kind = 'service_code'
-         AND service_code.array_lookup_key = CASE
-                WHEN price_atom.service_code IS NULL THEN 'NULL'
-                ELSE 'ARRAY:' || md5(to_json(price_atom.service_code)::text)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} billing_class
-          ON billing_class.attr_kind = 'billing_class'
-         AND billing_class.text_lookup_key = CASE
-                WHEN price_atom.billing_class IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(price_atom.billing_class)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} setting
-          ON setting.attr_kind = 'setting'
-         AND setting.text_lookup_key = CASE
-                WHEN price_atom.setting IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(price_atom.setting)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} billing_code_modifier
-          ON billing_code_modifier.attr_kind = 'billing_code_modifier'
-         AND billing_code_modifier.array_lookup_key = CASE
-                WHEN price_atom.billing_code_modifier IS NULL THEN 'NULL'
-                ELSE 'ARRAY:' || md5(to_json(price_atom.billing_code_modifier)::text)
-             END
-        JOIN {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} additional_information
-          ON additional_information.attr_kind = 'additional_information'
-         AND additional_information.text_lookup_key = CASE
-                WHEN price_atom.additional_information IS NULL THEN 'NULL'
-                ELSE 'TEXT:' || md5(price_atom.additional_information)
-             END;
+        {" ".join(join_sql_parts)};
         """
     )
+    not_null_columns = [
+        "price_atom_global_id_128",
+        *[
+            column
+            for column in _price_atom_dictionary_columns_by_attr().values()
+            if column not in constant_key_by_column
+        ],
+    ]
     await db.status(
         f"""
         ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)}
-            ALTER COLUMN price_atom_global_id_128 SET NOT NULL,
-            ALTER COLUMN negotiated_type_key SET NOT NULL,
-            ALTER COLUMN expiration_date_key SET NOT NULL,
-            ALTER COLUMN service_code_key SET NOT NULL,
-            ALTER COLUMN billing_class_key SET NOT NULL,
-            ALTER COLUMN setting_key SET NOT NULL,
-            ALTER COLUMN billing_code_modifier_key SET NOT NULL,
-            ALTER COLUMN additional_information_key SET NOT NULL;
+            {", ".join(f"ALTER COLUMN {column} SET NOT NULL" for column in not_null_columns)};
         """
     )
     await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
@@ -1711,18 +1848,32 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         """
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)};")
-    dictionary_index = _ptg2_snapshot_index_name(price_atom_dictionary_table, "key_idx")
-    await db.status(
-        f"""
-        CREATE UNIQUE INDEX {_quote_ident(dictionary_index)}
-        ON {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)}
-        (attr_kind, attr_key);
-        """
+    should_keep_dictionary_table = (
+        price_atom_layout != PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2
+        or len(constant_key_by_column) < len(_price_atom_dictionary_columns_by_attr())
     )
-    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)};")
+    if should_keep_dictionary_table and price_atom_layout != PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2:
+        dictionary_index = _ptg2_snapshot_index_name(price_atom_dictionary_table, "key_idx")
+        await db.status(
+            f"""
+            CREATE UNIQUE INDEX {_quote_ident(dictionary_index)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)}
+            (attr_kind, attr_key);
+            """
+        )
+    if should_keep_dictionary_table:
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)};")
+    else:
+        await db.status(
+            f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} CASCADE;"
+        )
     return {
-        "price_atom_table_layout": PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT,
-        "price_atom_dictionary_table": f"{schema_name}.{price_atom_dictionary_table}",
+        "price_atom_table_layout": price_atom_layout,
+        "price_atom_dictionary_table": (
+            f"{schema_name}.{price_atom_dictionary_table}" if should_keep_dictionary_table else None
+        ),
+        "price_atom_constant_keys": constant_key_by_column,
+        "price_atom_constant_values": constant_value_by_kind,
     }
 
 
@@ -2146,8 +2297,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
 
     final_table = _ptg2_snapshot_table_name("serving", source_key, snapshot_id)
     price_atom_stage = _ptg2_manifest_support_stage_table(stage_table, "price_atom")
+    price_set_atom_stage = _ptg2_manifest_support_stage_table(stage_table, "price_set_atom")
     provider_group_member_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_group_member")
     price_atom_table = _ptg2_snapshot_table_name("price_atom", source_key, snapshot_id)
+    price_set_atom_table = _ptg2_snapshot_table_name("price_set_atom", source_key, snapshot_id)
     provider_group_member_table = _ptg2_snapshot_table_name("provider_group_member", source_key, snapshot_id)
     provider_group_location_table = _ptg2_snapshot_table_name("provider_group_location", source_key, snapshot_id)
     provider_set_component_table = _ptg2_snapshot_table_name("provider_set_component", source_key, snapshot_id)
@@ -2155,10 +2308,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
     provider_set_dictionary_table = _ptg2_snapshot_table_name("provider_set_dict", source_key, snapshot_id)
     price_atom_dictionary_table = _ptg2_snapshot_table_name("price_atom_dict", source_key, snapshot_id)
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
+    serving_binary_table = _ptg2_snapshot_table_name("serving_binary", source_key, snapshot_id)
+    arch_version = _ptg2_manifest_snapshot_arch()
     started_at = time.monotonic()
     use_lean_source_stage = _use_direct_lean_manifest_copy()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)} CASCADE;")
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} CASCADE;"
     )
@@ -2178,10 +2334,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} CASCADE;"
     )
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(serving_binary_table)} CASCADE;")
     skip_final_serving_table = (
         use_lean_source_stage
         and _ptg2_manifest_serving_layout() == PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY
-        and _ptg2_manifest_serving_sidecars_enabled()
+        and (_ptg2_manifest_serving_sidecars_enabled() or arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1)
         and _ptg2_manifest_drop_serving_table_after_sidecars()
     )
     serving_work_table = stage_table if skip_final_serving_table else final_table
@@ -2197,6 +2354,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
             f"""
             ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_stage)}
             RENAME TO {_quote_ident(price_atom_table)};
+            """
+        )
+    if await _table_exists(schema_name, price_set_atom_stage):
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_stage)}
+            RENAME TO {_quote_ident(price_set_atom_table)};
             """
         )
     if await _table_exists(schema_name, provider_group_member_stage):
@@ -2222,47 +2386,53 @@ async def _publish_ptg2_manifest_serving_snapshot(
     lookup_index = _ptg2_snapshot_index_name(serving_work_table, "plan_code_lookup_idx")
     provider_set_lookup_index = _ptg2_snapshot_index_name(serving_work_table, "plan_code_provider_set_idx")
     if use_lean_source_stage:
-        lean_source_unique_index = _ptg2_snapshot_index_name(serving_work_table, "lean_src_uidx")
-        try:
-            await db.status(
-                f"""
-                CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
-                (
-                    plan_id,
-                    reported_code_system,
-                    reported_code,
-                    provider_set_global_id_128,
-                    price_set_global_id_128
-                );
-                """
-            )
-        except Exception as exc:
-            if serving_deduped or not _looks_like_unique_index_duplicate(exc):
-                raise
-            logger.warning(
-                "PTG2 manifest lean-source unique index found duplicate rows after direct publish; "
-                "running narrow DB dedupe rescue",
-                exc_info=True,
-            )
-            dedupe_metrics["db_dedupe"] = True
-            dedupe_metrics["rescue"] = True
-            dedupe_metrics["serving"] = await _dedupe_lean_manifest_stage(schema_name, serving_work_table)
-            serving_deduped = True
-            await db.status(
-                f"""
-                CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
-                ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
-                (
-                    plan_id,
-                    reported_code_system,
-                    reported_code,
-                    provider_set_global_id_128,
-                    price_set_global_id_128
-                );
-                """
-            )
-        await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(lean_source_unique_index)};")
+        if should_use_lean_source_guard(
+            arch_version=arch_version,
+            skip_final_serving_table=skip_final_serving_table,
+        ):
+            lean_source_unique_index = _ptg2_snapshot_index_name(serving_work_table, "lean_src_uidx")
+            try:
+                await db.status(
+                    f"""
+                    CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
+                    ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
+                    (
+                        plan_id,
+                        reported_code_system,
+                        reported_code,
+                        provider_set_global_id_128,
+                        price_set_global_id_128
+                    );
+                    """
+                )
+            except Exception as exc:
+                if serving_deduped or not _looks_like_unique_index_duplicate(exc):
+                    raise
+                logger.warning(
+                    "PTG2 manifest lean-source unique index found duplicate rows after direct publish; "
+                    "running narrow DB dedupe rescue",
+                    exc_info=True,
+                )
+                dedupe_metrics["db_dedupe"] = True
+                dedupe_metrics["rescue"] = True
+                dedupe_metrics["serving"] = await _dedupe_lean_manifest_stage(schema_name, serving_work_table)
+                serving_deduped = True
+                await db.status(
+                    f"""
+                    CREATE UNIQUE INDEX {_quote_ident(lean_source_unique_index)}
+                    ON {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)}
+                    (
+                        plan_id,
+                        reported_code_system,
+                        reported_code,
+                        provider_set_global_id_128,
+                        price_set_global_id_128
+                    );
+                    """
+                )
+            await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(lean_source_unique_index)};")
+        else:
+            dedupe_metrics["serving"] = {"skipped": "scanner_dedupe_guarded_postgres_binary"}
     else:
         try:
             await db.status(
@@ -2337,7 +2507,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 price_atom_table,
             )
             price_atom_deduped = True
-        if _ptg2_manifest_price_atom_layout() == PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT:
+        if _ptg2_manifest_price_atom_layout() in {
+            PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT,
+            PTG2_MANIFEST_PRICE_ATOM_LAYOUT_LEAN_DICT_V2,
+        }:
             lean_price_atom_manifest = await _rewrite_ptg2_manifest_price_atom_table_lean_dict(
                 schema_name=schema_name,
                 price_atom_table=price_atom_table,
@@ -2443,10 +2616,14 @@ async def _publish_ptg2_manifest_serving_snapshot(
             (plan_id, reported_code_system, reported_code);
             """
         )
-    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
+    if not skip_final_serving_table:
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(serving_work_table)};")
     await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)};")
     if await _table_exists(schema_name, price_atom_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
+    has_price_set_atom_table = await _table_exists(schema_name, price_set_atom_table)
+    if has_price_set_atom_table and arch_version != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1:
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};")
     if await _table_exists(schema_name, provider_group_member_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
     if materialized_provider_set_component_table:
@@ -2466,26 +2643,61 @@ async def _publish_ptg2_manifest_serving_snapshot(
     )
     row_count = await _exact_table_rows(schema_name, serving_work_table)
     serving_sidecar_artifacts: dict[str, Any] = {}
+    serving_binary_manifest: dict[str, Any] | None = None
     if lean_serving_manifest is not None:
-        _emit_ptg2_manifest_publish_progress(
-            "serving sidecars start",
-            done=0,
-            total=8,
-            message="starting serving sidecar generation",
-            serving_rows=row_count,
-        )
-        serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
-            schema_name=schema_name,
-            final_table=serving_work_table,
-            artifacts=artifacts,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            expected_row_count=row_count,
-        )
+        if arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1:
+            _emit_ptg2_manifest_publish_progress(
+                "serving binary start",
+                done=0,
+                total=4,
+                message="starting PostgreSQL binary serving table generation",
+                serving_rows=row_count,
+            )
+            serving_binary_manifest = await write_ptg2_serving_binary_table(
+                schema_name=schema_name,
+                source_table=serving_work_table,
+                target_table=serving_binary_table,
+                expected_row_count=row_count,
+                price_set_atom_table=price_set_atom_table if has_price_set_atom_table else None,
+                artifacts=artifacts,
+                sidecar_artifacts=sidecar_artifacts,
+                progress_callback=_emit_ptg2_manifest_publish_progress,
+            )
+            if has_price_set_atom_table:
+                await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};")
+                has_price_set_atom_table = False
+            _emit_ptg2_manifest_publish_progress(
+                "serving binary complete",
+                done=4,
+                total=4,
+                message="PostgreSQL binary serving table generated",
+                serving_rows=row_count,
+                serving_binary_table=serving_binary_manifest.get("table"),
+                serving_binary_bytes=(serving_binary_manifest.get("storage") or {}).get("total_bytes"),
+            )
+        else:
+            _emit_ptg2_manifest_publish_progress(
+                "serving sidecars start",
+                done=0,
+                total=8,
+                message="starting serving sidecar generation",
+                serving_rows=row_count,
+            )
+            serving_sidecar_artifacts = await _write_ptg2_manifest_serving_sidecars(
+                schema_name=schema_name,
+                final_table=serving_work_table,
+                artifacts=artifacts,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                expected_row_count=row_count,
+            )
+    if has_price_set_atom_table:
+        await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};")
+        has_price_set_atom_table = False
     serving_table_retained = True
     if (
         lean_serving_manifest is not None
-        and serving_sidecar_artifacts
+        and (serving_sidecar_artifacts or serving_binary_manifest)
         and _ptg2_manifest_drop_serving_table_after_sidecars()
     ):
         _emit_ptg2_manifest_publish_progress(
@@ -2505,6 +2717,8 @@ async def _publish_ptg2_manifest_serving_snapshot(
         sidecar_artifacts,
         serving_sidecar_artifacts,
     )
+    if _has_serving_binary_price_atoms(serving_binary_manifest):
+        combined_sidecar_artifacts = _omit_price_forward_artifacts(combined_sidecar_artifacts)
     if combined_sidecar_artifacts and ptg2_artifact_db_store_enabled():
         _emit_ptg2_manifest_publish_progress(
             "artifact upload start",
@@ -2522,13 +2736,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
         artifacts=base_artifacts,
         sidecar_artifacts=combined_sidecar_artifacts,
     )
-    arch_version = _ptg2_manifest_snapshot_arch()
     materialized_table_map = {
-        "serving": f"{schema_name}.{final_table}",
         "price_atom": f"{schema_name}.{price_atom_table}",
         "provider_group_member": f"{schema_name}.{provider_group_member_table}",
         "code_count": f"{schema_name}.{code_count_table}",
     }
+    if serving_table_retained:
+        materialized_table_map["serving"] = f"{schema_name}.{final_table}"
     if (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"):
         materialized_table_map["price_atom_dictionary"] = (lean_price_atom_manifest or {})[
             "price_atom_dictionary_table"
@@ -2537,6 +2751,8 @@ async def _publish_ptg2_manifest_serving_snapshot(
         materialized_table_map["provider_set_dictionary"] = (lean_serving_manifest or {})[
             "provider_set_dictionary_table"
         ]
+    if serving_binary_manifest:
+        materialized_table_map["serving_binary"] = f"{schema_name}.{serving_binary_table}"
     if materialized_provider_group_location_table:
         materialized_table_map["provider_group_location"] = f"{schema_name}.{materialized_provider_group_location_table}"
     if materialized_provider_set_component_table:
@@ -2551,6 +2767,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
         provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE
     else:
         provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR
+    if serving_binary_manifest:
+        serving_row_strategy = "table_and_postgres_binary" if serving_table_retained else "postgres_binary"
+    else:
+        serving_row_strategy = "table_and_sidecar" if serving_table_retained else "sidecar"
     serving_manifest = {
         "storage": "manifest_snapshot",
         "type": "ptg2_serving",
@@ -2559,13 +2779,17 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "source_key": source_key,
         "arch_version": arch_version,
         "provider_scope_strategy": provider_scope_strategy,
-        "serving_row_strategy": "table_and_sidecar" if serving_table_retained else "sidecar",
+        "serving_row_strategy": serving_row_strategy,
         "serving_table_retained": serving_table_retained,
         "materialized_tables": materialized_table_map,
         "table": f"{schema_name}.{final_table}",
+        "serving_binary_table": f"{schema_name}.{serving_binary_table}" if serving_binary_manifest else None,
+        "serving_binary": serving_binary_manifest,
         "price_atom_table": f"{schema_name}.{price_atom_table}",
         "price_atom_table_layout": (lean_price_atom_manifest or {}).get("price_atom_table_layout"),
         "price_atom_dictionary_table": (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"),
+        "price_atom_constant_keys": (lean_price_atom_manifest or {}).get("price_atom_constant_keys"),
+        "price_atom_constant_values": (lean_price_atom_manifest or {}).get("price_atom_constant_values"),
         "provider_group_member_table": f"{schema_name}.{provider_group_member_table}",
         "provider_group_location_table": (
             f"{schema_name}.{materialized_provider_group_location_table}"
@@ -2623,3 +2847,15 @@ def _ptg2_manifest_artifacts_manifest(
             sidecars.append({"name": str(name), "path": str(value)})
     manifest["sidecars"] = sidecars
     return manifest
+
+
+PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV = "HLTHPRT_PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD"
+
+
+def should_use_lean_source_guard(*, arch_version: str, skip_final_serving_table: bool) -> bool:
+    """Return whether publish should build the transient lean-source uniqueness guard."""
+    if os.getenv(PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV) is not None:
+        return _env_bool(PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV, True)
+    if arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 and skip_final_serving_table:
+        return False
+    return True

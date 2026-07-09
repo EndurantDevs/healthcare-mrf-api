@@ -113,14 +113,21 @@ from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
 from api.ptg2_manifest_artifacts import search_ptg2_manifest_serving_snapshot
 from api.ptg2_db_sidecars import (
     db_artifact_entry_available,
+    lookup_atoms_by_price_id,
+    lookup_atoms_by_price_key,
     lookup_global_sidecar_members_from_db,
     lookup_global_sidecar_members_many_from_db,
+    lookup_serving_binary_by_code_from_db,
+    lookup_serving_binary_by_provider_set_from_db,
+    lookup_serving_binary_by_provider_set_patterns_from_db,
+    lookup_binary_price_atoms_from_db,
     lookup_serving_by_code_sidecar_from_db,
     lookup_serving_by_provider_set_patterns_from_db,
     lookup_serving_by_provider_set_sidecar_from_db,
 )
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2ManifestArtifactError,
     lookup_global_sidecar_members,
     lookup_global_sidecar_members_many,
     lookup_serving_by_code_sidecar,
@@ -482,6 +489,19 @@ def _literal_int_array_sql(values: Iterable[Any]) -> str:
     if not int_values:
         return "ARRAY[]::integer[]"
     return "ARRAY[" + ",".join(str(value) for value in int_values) + "]::integer[]"
+
+
+def _literal_text_sql(value: Any) -> str:
+    if value is None:
+        return "NULL::text"
+    return "'" + str(value).replace("'", "''") + "'::text"
+
+
+def _literal_text_array_sql(values: Iterable[Any]) -> str:
+    text_values = [str(value) for value in values if value is not None]
+    if not text_values:
+        return "ARRAY[]::text[]"
+    return "ARRAY[" + ",".join(_literal_text_sql(value).removesuffix("::text") for value in text_values) + "]::text[]"
 
 
 def _manifest_location_geo_filters_for_alias(
@@ -2077,6 +2097,20 @@ def _ptg2_manifest_sidecar_metadata(entry: dict[str, Any], sidecar_path: Path, r
     return entry if sidecar_path == Path(raw_path) else None
 
 
+def _raise_missing_postgres_binary_table(serving_tables: PTG2ServingTables) -> None:
+    if serving_tables.effective_arch_version != "postgres_binary_v1":
+        return
+    raise PTG2ManifestArtifactError("PTG2 postgres_binary_v1 snapshot is missing serving_binary_table")
+
+
+def _raise_local_sidecar_disallowed(serving_tables: PTG2ServingTables, artifact_name: str) -> None:
+    if serving_tables.effective_arch_version != "postgres_binary_v1":
+        return
+    raise PTG2ManifestArtifactError(
+        f"PTG2 postgres_binary_v1 snapshot requires PostgreSQL artifact storage for {artifact_name}"
+    )
+
+
 def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
     path = Path(raw_path)
     if path.exists():
@@ -2185,6 +2219,14 @@ async def _ptg2_manifest_lookup_serving_by_code_sidecar(
     *,
     provider_set_keys: Iterable[int] | None = None,
 ):
+    if serving_tables.serving_binary_table:
+        return await lookup_serving_binary_by_code_from_db(
+            session,
+            serving_tables.serving_binary_table,
+            int(code_key),
+            provider_set_keys=provider_set_keys,
+        )
+    _raise_missing_postgres_binary_table(serving_tables)
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
     if not entry:
         return ()
@@ -2215,6 +2257,14 @@ async def _ptg2_manifest_lookup_serving_by_provider_set_sidecar(
     *,
     code_keys: Iterable[int] | None = None,
 ):
+    if serving_tables.serving_binary_table:
+        return await lookup_serving_binary_by_provider_set_from_db(
+            session,
+            serving_tables.serving_binary_table,
+            int(provider_set_key),
+            code_keys=code_keys,
+        )
+    _raise_missing_postgres_binary_table(serving_tables)
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
     if not entry:
         return ()
@@ -2245,6 +2295,14 @@ async def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
     *,
     code_keys: Iterable[int] | None = None,
 ):
+    if serving_tables.serving_binary_table:
+        return await lookup_serving_binary_by_provider_set_patterns_from_db(
+            session,
+            serving_tables.serving_binary_table,
+            int(provider_set_key),
+            code_keys=code_keys,
+        )
+    _raise_missing_postgres_binary_table(serving_tables)
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
     if not entry:
         return ()
@@ -2268,6 +2326,28 @@ async def _ptg2_manifest_lookup_serving_by_provider_set_patterns(
     )
 
 
+def _ptg2_serving_sidecar_window(
+    sidecar_rows: Iterable[Any],
+    provider_set_ids_by_key: Mapping[int, str],
+    *,
+    limit: int | None,
+    offset: int,
+) -> list[Any]:
+    """Return the requested ordered serving-row window before response materialization."""
+    ordered_sidecar_rows = sorted(
+        (row for row in sidecar_rows if provider_set_ids_by_key.get(row.provider_set_key)),
+        key=lambda row: (
+            -int(row.provider_count or 0),
+            provider_set_ids_by_key.get(row.provider_set_key) or "",
+            _ptg2_manifest_id(row.price_set_global_id_128),
+        ),
+    )
+    if limit is None:
+        return ordered_sidecar_rows
+    start = max(int(offset), 0)
+    return ordered_sidecar_rows[start : start + max(int(limit), 0)]
+
+
 async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     session,
     serving_tables: PTG2ServingTables,
@@ -2276,7 +2356,10 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     provider_set_keys: Iterable[int] | None,
     source_trace_set_hash: str | None,
     network_names: list[str],
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]] | None:
+    """Read code serving rows from binary/sidecar storage and materialize only one page."""
     code_key = code_data.get("code_key")
     if code_key is None:
         return None
@@ -2293,8 +2376,14 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
         serving_tables,
         [row.provider_set_key for row in sidecar_rows],
     )
+    ordered_sidecar_rows = _ptg2_serving_sidecar_window(
+        sidecar_rows,
+        provider_set_ids_by_key,
+        limit=limit,
+        offset=offset,
+    )
     rows: list[dict[str, Any]] = []
-    for row in sidecar_rows:
+    for row in ordered_sidecar_rows:
         provider_set_id = provider_set_ids_by_key.get(row.provider_set_key)
         if not provider_set_id:
             continue
@@ -2312,17 +2401,11 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
                 "provider_set_global_id_128": provider_set_id,
                 "provider_count": row.provider_count,
                 "price_set_global_id_128": row.price_set_global_id_128,
+                "price_key": getattr(row, "price_key", None),
                 "source_trace_set_hash": source_trace_set_hash,
                 "network_names": network_names,
             }
         )
-    rows.sort(
-        key=lambda data: (
-            -(int(data.get("provider_count") or 0)),
-            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
-            _ptg2_manifest_id(data.get("price_set_global_id_128")),
-        )
-    )
     return rows
 
 
@@ -2421,7 +2504,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
     apply_window: bool = False,
 ) -> list[dict[str, Any]] | None:
     if not (
-        _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+        serving_tables.serving_binary_table
+        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
         or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
     ):
         return None
@@ -2472,9 +2556,13 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
 
     if apply_window:
         prefer_provider_set_reverse = broad_code_scan and bool(
-            _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+            serving_tables.serving_binary_table
+            or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
         )
-        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code") and not prefer_provider_set_reverse:
+        if (
+            serving_tables.serving_binary_table
+            or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+        ) and not prefer_provider_set_reverse:
             page_limit = max(int(limit or 0), 0)
             if page_limit <= 0:
                 return []
@@ -2564,51 +2652,83 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         entries_by_provider_code: list[tuple[str, int, dict[int, list[tuple[int, str]]]]] = []
         code_by_key: dict[int, Mapping[str, Any]]
         if broad_code_scan:
-            matched_code_keys: set[int] = set()
-            for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
-                patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+            rows: list[dict[str, Any]] = []
+            skipped = 0
+            code_row_offset = 0
+            code_row_batch_size = max(page_limit + page_offset, 1)
+            while True:
+                code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
                     session,
                     serving_tables,
-                    provider_set_key,
-                    code_keys=None,
+                    requested_plan=requested_plan,
+                    code_value=code_value,
+                    code_system=code_system,
+                    q_text=q_text,
+                    code_context=code_context,
+                    limit_rows=code_row_batch_size,
+                    offset_rows=code_row_offset,
                 )
-                entries_by_code: dict[int, list[tuple[int, str]]] = {}
-                for pattern in patterns:
-                    for code_key in pattern.code_keys:
-                        normalized_code_key = int(code_key)
-                        matched_code_keys.add(normalized_code_key)
-                        entries_by_code.setdefault(normalized_code_key, []).extend(pattern.entries)
-                if entries_by_code:
-                    entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
-            if not matched_code_keys:
-                return []
-            code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-                session,
-                serving_tables,
-                requested_plan=requested_plan,
-                code_value=code_value,
-                code_system=code_system,
-                q_text=q_text,
-                code_context=code_context,
-                code_keys=matched_code_keys,
-            )
-            if code_rows is None:
-                return None
-            if not code_rows:
-                return []
-            code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
-            entries_by_provider_code = [
-                (
-                    provider_set_id,
-                    provider_set_key,
-                    {
-                        int(code_key): entries
-                        for code_key, entries in entries_by_code.items()
-                        if int(code_key) in code_by_key
-                    },
-                )
-                for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code
-            ]
+                if code_rows is None:
+                    return None
+                if not code_rows:
+                    break
+                code_by_key = {int(row["code_key"]): row for row in code_rows if row.get("code_key") is not None}
+                if not code_by_key:
+                    break
+                entries_by_provider_code = []
+                for provider_set_id, provider_set_key in provider_set_keys_by_id.items():
+                    patterns = await _ptg2_manifest_lookup_serving_by_provider_set_patterns(
+                        session,
+                        serving_tables,
+                        provider_set_key,
+                        code_keys=code_by_key.keys(),
+                    )
+                    entries_by_code: dict[int, list[tuple[int, str]]] = {}
+                    for pattern in patterns:
+                        for code_key in pattern.code_keys:
+                            if int(code_key) in code_by_key:
+                                entries_by_code.setdefault(int(code_key), []).extend(pattern.entries)
+                    if entries_by_code:
+                        entries_by_provider_code.append((provider_set_id, provider_set_key, entries_by_code))
+                for code_key in code_by_key:
+                    code_candidates: list[dict[str, Any]] = []
+                    for provider_set_id, provider_set_key, entries_by_code in entries_by_provider_code:
+                        for provider_count, price_set_id in entries_by_code.get(int(code_key), ()):
+                            payload = _sidecar_row_payload(
+                                code_by_key=code_by_key,
+                                code_key=int(code_key),
+                                provider_set_id=provider_set_id,
+                                provider_set_key=int(provider_set_key),
+                                provider_count=int(provider_count),
+                                price_set_global_id_128=price_set_id,
+                            )
+                            if payload:
+                                code_candidates.append(payload)
+                    code_candidates.sort(
+                        key=lambda data: (
+                            -(int(data.get("provider_count") or 0)),
+                            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+                            _ptg2_manifest_id(data.get("price_set_global_id_128")),
+                        )
+                    )
+                    candidate_count = len(code_candidates)
+                    if skipped + candidate_count <= page_offset:
+                        skipped += candidate_count
+                        continue
+                    local_start = max(page_offset - skipped, 0)
+                    local_end = local_start + (page_limit - len(rows))
+                    rows.extend(code_candidates[local_start:local_end])
+                    skipped += candidate_count
+                    if len(rows) >= page_limit:
+                        break
+                if len(rows) >= page_limit:
+                    break
+                code_row_offset += len(code_rows)
+                if len(code_rows) < code_row_batch_size:
+                    break
+            for data in rows:
+                data.pop("_code_key", None)
+            return rows
         else:
             code_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
                 session,
@@ -2864,6 +2984,7 @@ def _ptg2_manifest_sidecar_members(
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
+        _raise_local_sidecar_disallowed(serving_tables, name)
         sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
         sidecar_metadata = entry if sidecar_path == Path(path) else None
         cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
@@ -2897,6 +3018,7 @@ def _ptg2_manifest_sidecar_members_many(
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
+        _raise_local_sidecar_disallowed(serving_tables, name)
         sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
         sidecar_metadata = entry if sidecar_path == Path(path) else None
         sha = str(entry.get("sha256") or "")
@@ -2975,6 +3097,7 @@ async def _ptg2_manifest_sidecar_members_many_async(
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
+        _raise_local_sidecar_disallowed(serving_tables, name)
         sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
         sidecar_metadata = entry if sidecar_path == Path(path) else None
         missing = []
@@ -3094,6 +3217,8 @@ def _ptg2_rate_scope_key(
     code_system: str | None,
 ) -> tuple[str, ...]:
     artifact_tokens: list[str] = []
+    if serving_tables.serving_binary_table:
+        artifact_tokens.extend(["serving_binary_table", str(serving_tables.serving_binary_table)])
     for artifact_name in ("provider_forward", "serving_by_code"):
         for artifact_entry in _ptg2_manifest_artifact_entries(serving_tables, artifact_name):
             artifact_tokens.extend(
@@ -3252,7 +3377,7 @@ async def _manifest_rate_provider_groups_from_sidecar(
         if code_system:
             rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
-        if _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
+        if serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"):
             code_result = await session.execute(
                 text(
                     f"""
@@ -3453,44 +3578,129 @@ def _ptg2_manifest_filter_prices(prices: list[dict[str, Any]], args: dict[str, A
     return [price for price in prices if _ptg2_manifest_price_matches_filter(price, args)]
 
 
+def _ptg2_price_atom_attr_specs() -> tuple[tuple[str, str, str, str], ...]:
+    """Describe lean price-atom dictionary attributes in response order."""
+    return (
+        ("negotiated_type", "negotiated_type_key", "text", "negotiated_type.text_value AS negotiated_type"),
+        ("expiration_date", "expiration_date_key", "text", "expiration_date.text_value AS expiration_date"),
+        ("service_code", "service_code_key", "array", "COALESCE(service_code.text_array, ARRAY[]::text[]) AS service_code"),
+        ("billing_class", "billing_class_key", "text", "billing_class.text_value AS billing_class"),
+        ("setting", "setting_key", "text", "setting.text_value AS setting"),
+        (
+            "billing_code_modifier",
+            "billing_code_modifier_key",
+            "array",
+            "COALESCE(billing_code_modifier.text_array, ARRAY[]::text[]) AS billing_code_modifier",
+        ),
+        (
+            "additional_information",
+            "additional_information_key",
+            "text",
+            "additional_information.text_value AS additional_information",
+        ),
+    )
+
+
+def _build_ptg2_price_constant_sql(
+    attr_kind: str,
+    value_kind: str,
+    constant_values: dict[str, Any],
+) -> str | None:
+    """Return a literal SELECT expression for v2 constant price-atom attributes."""
+    if attr_kind not in constant_values:
+        return None
+    if value_kind == "array":
+        return f"{_literal_text_array_sql(constant_values.get(attr_kind) or [])} AS {attr_kind}"
+    return f"{_literal_text_sql(constant_values.get(attr_kind))} AS {attr_kind}"
+
+
+def _ptg2_price_atom_key_expr(column_name: str, constant_keys: dict[str, Any]) -> str:
+    """Resolve a dictionary key from metadata or the physical price-atom row."""
+    if column_name not in constant_keys:
+        return f"price_atom.{column_name}"
+    return str(int(constant_keys[column_name]))
+
+
+def _build_ptg2_price_join_sql(
+    price_atom_dictionary_table: str,
+    attr_kind: str,
+    key_column: str,
+    constant_keys: dict[str, Any],
+) -> str:
+    """Build one dictionary join for a non-constant lean price-atom attribute."""
+    return f"""
+            LEFT JOIN {price_atom_dictionary_table} {attr_kind}
+              ON {attr_kind}.attr_kind = '{attr_kind}'
+             AND {attr_kind}.attr_key = {_ptg2_price_atom_key_expr(key_column, constant_keys)}
+                    """
+
+
+def _build_ptg2_price_select_sql(
+    serving_tables: PTG2ServingTables,
+    price_atom_table: str,
+    price_atom_dictionary_table: str | None,
+    constant_values: dict[str, Any],
+) -> str:
+    """Build the SELECT for dictionary-backed lean price atoms."""
+    constant_keys = (
+        serving_tables.price_atom_constant_keys
+        if isinstance(serving_tables.price_atom_constant_keys, dict)
+        else {}
+    )
+    select_fields = ["price_atom.price_atom_global_id_128"]
+    join_parts: list[str] = []
+    output_by_attr: dict[str, str] = {"negotiated_rate": "price_atom.negotiated_rate"}
+    for attr_kind, key_column, value_kind, dictionary_select in _ptg2_price_atom_attr_specs():
+        constant_output_sql = _build_ptg2_price_constant_sql(attr_kind, value_kind, constant_values)
+        if constant_output_sql is not None:
+            output_by_attr[attr_kind] = constant_output_sql
+            continue
+        output_by_attr[attr_kind] = dictionary_select
+        if price_atom_dictionary_table:
+            join_parts.append(
+                    _build_ptg2_price_join_sql(
+                    price_atom_dictionary_table,
+                    attr_kind,
+                    key_column,
+                    constant_keys,
+                )
+            )
+    select_fields.extend(
+        [
+            output_by_attr["negotiated_type"],
+            output_by_attr["negotiated_rate"],
+            output_by_attr["expiration_date"],
+            output_by_attr["service_code"],
+            output_by_attr["billing_class"],
+            output_by_attr["setting"],
+            output_by_attr["billing_code_modifier"],
+            output_by_attr["additional_information"],
+        ]
+    )
+    return f"""
+            SELECT
+                {", ".join(select_fields)}
+            FROM {price_atom_table} price_atom
+            {" ".join(join_parts)}
+        """
+
+
 def _ptg2_manifest_price_atom_select_sql(serving_tables: PTG2ServingTables, price_atom_table: str) -> str:
+    """Return a price-atom SELECT that rehydrates v1/v2 lean dictionary layouts."""
     price_atom_layout = (serving_tables.price_atom_table_layout or "").strip().lower()
     price_atom_dictionary_table = _safe_table_name(serving_tables.price_atom_dictionary_table)
-    if price_atom_layout == "lean_dict_v1" and price_atom_dictionary_table:
-        return f"""
-            SELECT
-                price_atom.price_atom_global_id_128,
-                negotiated_type.text_value AS negotiated_type,
-                price_atom.negotiated_rate,
-                expiration_date.text_value AS expiration_date,
-                COALESCE(service_code.text_array, ARRAY[]::text[]) AS service_code,
-                billing_class.text_value AS billing_class,
-                setting.text_value AS setting,
-                COALESCE(billing_code_modifier.text_array, ARRAY[]::text[]) AS billing_code_modifier,
-                additional_information.text_value AS additional_information
-            FROM {price_atom_table} price_atom
-            LEFT JOIN {price_atom_dictionary_table} negotiated_type
-              ON negotiated_type.attr_kind = 'negotiated_type'
-             AND negotiated_type.attr_key = price_atom.negotiated_type_key
-            LEFT JOIN {price_atom_dictionary_table} expiration_date
-              ON expiration_date.attr_kind = 'expiration_date'
-             AND expiration_date.attr_key = price_atom.expiration_date_key
-            LEFT JOIN {price_atom_dictionary_table} service_code
-              ON service_code.attr_kind = 'service_code'
-             AND service_code.attr_key = price_atom.service_code_key
-            LEFT JOIN {price_atom_dictionary_table} billing_class
-              ON billing_class.attr_kind = 'billing_class'
-             AND billing_class.attr_key = price_atom.billing_class_key
-            LEFT JOIN {price_atom_dictionary_table} setting
-              ON setting.attr_kind = 'setting'
-             AND setting.attr_key = price_atom.setting_key
-            LEFT JOIN {price_atom_dictionary_table} billing_code_modifier
-              ON billing_code_modifier.attr_kind = 'billing_code_modifier'
-             AND billing_code_modifier.attr_key = price_atom.billing_code_modifier_key
-            LEFT JOIN {price_atom_dictionary_table} additional_information
-              ON additional_information.attr_kind = 'additional_information'
-             AND additional_information.attr_key = price_atom.additional_information_key
-        """
+    constant_values = (
+        serving_tables.price_atom_constant_values
+        if isinstance(serving_tables.price_atom_constant_values, dict)
+        else {}
+    )
+    if price_atom_layout in {"lean_dict_v1", "lean_dict_v2"} and (price_atom_dictionary_table or constant_values):
+        return _build_ptg2_price_select_sql(
+            serving_tables,
+            price_atom_table,
+            price_atom_dictionary_table,
+            constant_values,
+        )
     return f"""
             SELECT
                 price_atom_global_id_128,
@@ -3506,6 +3716,46 @@ def _ptg2_manifest_price_atom_select_sql(serving_tables: PTG2ServingTables, pric
     """
 
 
+def _ptg2_manifest_price_payload(price_atom_row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the API price payload for one hydrated price-atom row."""
+
+    return {
+        "negotiated_type": price_atom_row.get("negotiated_type"),
+        "negotiated_rate": price_atom_row.get("negotiated_rate"),
+        "expiration_date": price_atom_row.get("expiration_date"),
+        "service_code": price_atom_row.get("service_code") or [],
+        "billing_class": price_atom_row.get("billing_class"),
+        "setting": price_atom_row.get("setting"),
+        "billing_code_modifier": price_atom_row.get("billing_code_modifier") or [],
+        "additional_information": price_atom_row.get("additional_information"),
+    }
+
+
+async def _ptg2_price_rows_by_id(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_atom_table: str,
+    atom_ids: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    """Fetch hydrated price-atom rows keyed by global atom id."""
+
+    atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
+    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
+    stmt = text(
+        f"""
+            {price_atom_select_sql}
+            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
+            """
+    )
+    price_atom_result = await session.execute(stmt, {"atom_ids": atom_ids})
+    return {
+        _ptg2_manifest_id(_row_mapping(price_atom_record).get("price_atom_global_id_128")): _row_mapping(
+            price_atom_record
+        )
+        for price_atom_record in price_atom_result
+    }
+
+
 async def _ptg2_manifest_prices_for_price_set(
     session,
     serving_tables: PTG2ServingTables,
@@ -3515,92 +3765,187 @@ async def _ptg2_manifest_prices_for_price_set(
     price_set_global_id = _ptg2_manifest_id(price_set_global_id)
     if not price_atom_table or not price_set_global_id:
         return []
-    price_members = await _ptg2_manifest_sidecar_members_async(
-        session,
-        serving_tables,
-        "price_forward",
-        price_set_global_id,
-    )
+    price_members: tuple[str, ...] = ()
+    if serving_tables.serving_binary_table:
+        binary_members = await lookup_atoms_by_price_id(
+            session,
+            serving_tables.serving_binary_table,
+            (price_set_global_id,),
+        )
+        if price_set_global_id not in binary_members:
+            binary_members = await lookup_binary_price_atoms_from_db(
+                session,
+                serving_tables.serving_binary_table,
+                (price_set_global_id,),
+            )
+        price_members = binary_members.get(price_set_global_id, ())
+    if not price_members:
+        price_members = await _ptg2_manifest_sidecar_members_async(
+            session,
+            serving_tables,
+            "price_forward",
+            price_set_global_id,
+        )
     if not price_members:
         return []
     atom_ids = list(price_members)
-    atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
-    stmt = text(
-        f"""
-            {price_atom_select_sql}
-            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
-            """
+    rows_by_id = await _ptg2_price_rows_by_id(
+        session,
+        serving_tables,
+        price_atom_table,
+        tuple(atom_ids),
     )
-    result = await session.execute(stmt, {"atom_ids": atom_ids})
-    rows_by_id = {_ptg2_manifest_id(_row_mapping(row).get("price_atom_global_id_128")): _row_mapping(row) for row in result}
     prices: list[dict[str, Any]] = []
     for atom_id in atom_ids:
-        row = rows_by_id.get(atom_id)
-        if not row:
+        price_atom_row = rows_by_id.get(atom_id)
+        if not price_atom_row:
             continue
-        prices.append(
-            {
-                "negotiated_type": row.get("negotiated_type"),
-                "negotiated_rate": row.get("negotiated_rate"),
-                "expiration_date": row.get("expiration_date"),
-                "service_code": row.get("service_code") or [],
-                "billing_class": row.get("billing_class"),
-                "setting": row.get("setting"),
-                "billing_code_modifier": row.get("billing_code_modifier") or [],
-                "additional_information": row.get("additional_information"),
-            }
-        )
+        prices.append(_ptg2_manifest_price_payload(price_atom_row))
     return prices
+
+
+def _ptg2_missing_price_set_ids(
+    price_set_ids: tuple[str, ...],
+    members_by_set: Mapping[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Return requested price-set ids not yet resolved to atom ids."""
+
+    return tuple(price_set_id for price_set_id in price_set_ids if price_set_id not in members_by_set)
+
+
+async def _ptg2_members_from_price_ids(
+    session,
+    serving_binary_table: str,
+    price_set_ids: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    """Resolve binary price memberships directly by price-set id."""
+
+    members_by_set = await lookup_atoms_by_price_id(session, serving_binary_table, price_set_ids)
+    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
+    if missing_price_set_ids:
+        members_by_set.update(
+            await lookup_binary_price_atoms_from_db(
+                session,
+                serving_binary_table,
+                missing_price_set_ids,
+            )
+        )
+    return members_by_set
+
+
+async def _ptg2_members_from_price_keys(
+    session,
+    serving_binary_table: str,
+    price_set_ids: tuple[str, ...],
+    price_key_by_set_id: Mapping[str, int],
+) -> dict[str, tuple[str, ...]]:
+    """Resolve binary price memberships using request-local price keys first."""
+
+    requested_price_key_by_set_id = {
+        price_set_id: price_key_by_set_id[price_set_id]
+        for price_set_id in price_set_ids
+        if price_set_id in price_key_by_set_id
+    }
+    members_by_set = await lookup_atoms_by_price_key(session, serving_binary_table, requested_price_key_by_set_id)
+    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
+    if missing_price_set_ids:
+        members_by_set.update(
+            await _ptg2_members_from_price_ids(
+                session,
+                serving_binary_table,
+                missing_price_set_ids,
+            )
+        )
+    return members_by_set
+
+
+async def _ptg2_binary_price_members(
+    session,
+    serving_binary_table: str,
+    price_set_ids: tuple[str, ...],
+    price_key_by_set_id: Mapping[str, int] | None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve price-set atom memberships from PostgreSQL binary blocks."""
+
+    if price_key_by_set_id:
+        return await _ptg2_members_from_price_keys(
+            session,
+            serving_binary_table,
+            price_set_ids,
+            price_key_by_set_id,
+        )
+    return await _ptg2_members_from_price_ids(session, serving_binary_table, price_set_ids)
+
+
+async def _ptg2_price_members_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_set_ids: tuple[str, ...],
+    *,
+    price_key_by_set_id: Mapping[str, int] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve price-set atom memberships from binary blocks, then legacy artifacts."""
+
+    members_by_set: dict[str, tuple[str, ...]] = {}
+    if serving_tables.serving_binary_table:
+        members_by_set.update(
+            await _ptg2_binary_price_members(
+                session,
+                serving_tables.serving_binary_table,
+                price_set_ids,
+                price_key_by_set_id,
+            )
+        )
+    missing_price_set_ids = _ptg2_missing_price_set_ids(price_set_ids, members_by_set)
+    if missing_price_set_ids:
+        members_by_set.update(
+            await _ptg2_manifest_sidecar_members_many_async(
+                session,
+                serving_tables,
+                "price_forward",
+                missing_price_set_ids,
+            )
+        )
+    return members_by_set
+
+
+def _ptg2_manifest_unique_atom_ids(members_by_set: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]:
+    """Return unique atom ids while preserving first-seen membership order."""
+
+    return tuple(dict.fromkeys(atom_id for atom_ids in members_by_set.values() for atom_id in atom_ids))
 
 
 async def _ptg2_manifest_prices_for_price_sets(
     session,
     serving_tables: PTG2ServingTables,
     price_set_global_ids: list[str] | tuple[str, ...],
+    *,
+    price_key_by_set_id: Mapping[str, int] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    """Return hydrated prices for each requested price set, preserving atom order."""
+
     price_atom_table = _safe_table_name(serving_tables.price_atom_table)
     price_set_ids = _ptg2_manifest_ids(tuple(price_set_global_ids))
     if not price_atom_table or not price_set_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
-    members_by_price_set = await _ptg2_manifest_sidecar_members_many_async(
+    members_by_set = await _ptg2_price_members_by_set(
         session,
         serving_tables,
-        "price_forward",
         price_set_ids,
+        price_key_by_set_id=price_key_by_set_id,
     )
-    atom_ids = tuple(dict.fromkeys(atom_id for atoms in members_by_price_set.values() for atom_id in atoms))
+    atom_ids = _ptg2_manifest_unique_atom_ids(members_by_set)
     if not atom_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
-    atom_array_cast = _ptg2_manifest_id_array_cast(serving_tables)
-    price_atom_select_sql = _ptg2_manifest_price_atom_select_sql(serving_tables, price_atom_table)
-    stmt = text(
-        f"""
-            {price_atom_select_sql}
-            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
-            """
-    )
-    result = await session.execute(stmt, {"atom_ids": atom_ids})
-    rows_by_id = {_ptg2_manifest_id(_row_mapping(row).get("price_atom_global_id_128")): _row_mapping(row) for row in result}
+    rows_by_id = await _ptg2_price_rows_by_id(session, serving_tables, price_atom_table, atom_ids)
     prices_by_set: dict[str, list[dict[str, Any]]] = {}
     for price_set_id in price_set_ids:
         prices: list[dict[str, Any]] = []
-        for atom_id in members_by_price_set.get(price_set_id, ()):
-            row = rows_by_id.get(atom_id)
-            if not row:
+        for atom_id in members_by_set.get(price_set_id, ()):
+            price_atom_row = rows_by_id.get(atom_id)
+            if not price_atom_row:
                 continue
-            prices.append(
-                {
-                    "negotiated_type": row.get("negotiated_type"),
-                    "negotiated_rate": row.get("negotiated_rate"),
-                    "expiration_date": row.get("expiration_date"),
-                    "service_code": row.get("service_code") or [],
-                    "billing_class": row.get("billing_class"),
-                    "setting": row.get("setting"),
-                    "billing_code_modifier": row.get("billing_code_modifier") or [],
-                    "additional_information": row.get("additional_information"),
-                }
-            )
+            prices.append(_ptg2_manifest_price_payload(price_atom_row))
         prices_by_set[price_set_id] = prices
     return prices_by_set
 
@@ -4870,7 +5215,9 @@ async def _ptg2_manifest_location_provider_matches(
     provider_group_location_table = _safe_table_name(serving_tables.provider_group_location_table)
     provider_group_rate_scope_table = _manifest_provider_group_rate_scope_table(serving_tables)
     active_provider_group_rate_scope_table = ""
-    has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
+    has_serving_by_code_sidecar = bool(
+        serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    )
     rate_provider_group_ids: tuple[str, ...] = ()
     rate_provider_group_count = 0
     rate_provider_group_scope: _ManifestRateScope | None = None
@@ -6023,7 +6370,9 @@ async def _search_ptg2_manifest_db_serving_table(
     this path intentionally bounded until those readers are wired into the API.
     """
     table_name = _safe_table_name(serving_tables.serving_table)
-    has_serving_by_code_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "serving_by_code"))
+    has_serving_by_code_sidecar = bool(
+        serving_tables.serving_binary_table or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
+    )
     table_available = bool(table_name and await _serving_table_available(session, table_name))
     if not table_available and not has_serving_by_code_sidecar:
         return None
@@ -6240,6 +6589,8 @@ async def _search_ptg2_manifest_db_serving_table(
         manifest_id_sql_type = "uuid" if serving_tables.uses_uuid_ids else "char(32)"
         sidecar_row_data = None
         if has_serving_by_code_sidecar:
+            sidecar_start = 0 if expand_providers else int(params.get("rate_candidate_offset") or 0)
+            sidecar_limit = int(params.get("rate_candidate_limit") or pagination.limit)
             sidecar_rows = await _ptg2_manifest_rows_from_serving_by_code_sidecar(
                 session,
                 serving_tables,
@@ -6247,11 +6598,11 @@ async def _search_ptg2_manifest_db_serving_table(
                 provider_set_keys=params.get("provider_set_keys") if location_filter_requested else None,
                 source_trace_set_hash=source_trace_set_hash,
                 network_names=network_names,
+                limit=sidecar_limit,
+                offset=sidecar_start,
             )
             if sidecar_rows is not None:
-                start = 0 if expand_providers else int(params.get("rate_candidate_offset") or 0)
-                end = start + int(params.get("rate_candidate_limit") or pagination.limit)
-                sidecar_row_data = sidecar_rows[start:end]
+                sidecar_row_data = sidecar_rows
         if sidecar_row_data is not None:
             row_data = sidecar_row_data
         else:
@@ -6366,10 +6717,16 @@ async def _search_ptg2_manifest_db_serving_table(
         if _include_ptg2_sources(args)
         else {}
     )
+    price_key_by_set_id = {
+        _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
+        for data in row_data
+        if data.get("price_key") is not None and _ptg2_manifest_id(data.get("price_set_global_id_128"))
+    }
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
         serving_tables,
         [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
+        price_key_by_set_id=price_key_by_set_id,
     )
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if expand_providers:
@@ -7522,7 +7879,8 @@ async def _search_ptg2_manifest_provider_procedures(
 ) -> dict[str, Any] | None:
     table_name = _safe_table_name(serving_tables.serving_table)
     has_reverse_sidecar = bool(
-        _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
+        serving_tables.serving_binary_table
+        or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
         or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
     )
     table_available = bool(table_name and await _serving_table_available(session, table_name))

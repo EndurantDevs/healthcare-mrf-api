@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -108,6 +109,37 @@ async def test_snapshot_serving_tables_represents_manifest_snapshot_without_v2_t
 
 
 @pytest.mark.asyncio
+async def test_snapshot_serving_tables_reads_postgres_binary_serving_table():
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "arch_version": "postgres_binary_v1",
+                    "provider_scope_strategy": "sidecar_provider_scope",
+                    "serving_binary_table": "mrf.ptg2_serving_binary_snap",
+                    "price_atom_table_layout": "lean_dict_v2",
+                    "price_atom_constant_keys": {"service_code_key": 0},
+                    "price_atom_constant_values": {"service_code": ["11"]},
+                    "materialized_tables": {
+                        "serving_binary": "mrf.ptg2_serving_binary_snap",
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-binary")
+
+    assert tables.serving_binary_table == "mrf.ptg2_serving_binary_snap"
+    assert tables.price_atom_table_layout == "lean_dict_v2"
+    assert tables.price_atom_constant_keys == {"service_code_key": 0}
+    assert tables.price_atom_constant_values == {"service_code": ["11"]}
+    assert tables.effective_arch_version == "postgres_binary_v1"
+    assert tables.uses_sidecar_provider_scope is True
+
+
+@pytest.mark.asyncio
 async def test_snapshot_serving_tables_does_not_resolve_manifest_snapshot_to_fallback_table():
     session = FakeSession(
         [
@@ -175,6 +207,83 @@ async def test_snapshot_serving_tables_keeps_db_artifacts_as_metadata_by_default
 
     tables = await ptg2_tables.snapshot_serving_tables(session, "snap-db-artifact")
 
+    assert tables.artifacts["provider_forward"] == {
+        "name": "provider_forward",
+        "path": "/work/old/provider_forward.ptg2sc",
+        "storage_uri": "db://ptg2_artifact/provider-forward",
+        "byte_count": 123,
+    }
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_materializes_legacy_artifacts_when_enabled(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ", "true")
+    monkeypatch.setattr(
+        ptg2_tables,
+        "hydrate_ptg2_artifact_entry_from_db",
+        AsyncMock(
+            return_value={
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward",
+                "path": "/tmp/materialized/provider_forward.ptg2sc",
+                "cache_path": "/tmp/materialized/provider_forward.ptg2sc",
+            }
+        ),
+    )
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "arch_version": "sidecar_scope_v1",
+                    "artifacts": {
+                        "provider_forward": {
+                            "name": "provider_forward",
+                            "path": "/work/old/provider_forward.ptg2sc",
+                            "storage_uri": "db://ptg2_artifact/provider-forward",
+                        }
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-legacy-artifact")
+
+    assert tables.artifacts["provider_forward"]["path"] == "/tmp/materialized/provider_forward.ptg2sc"
+    assert tables.artifacts["provider_forward"]["cache_path"] == "/tmp/materialized/provider_forward.ptg2sc"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_keeps_postgres_binary_artifacts_as_metadata(monkeypatch):
+    async def fail_hydrate(*_args, **_kwargs):
+        raise AssertionError("postgres_binary_v1 must not materialize db artifacts to local files")
+
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ", "true")
+    monkeypatch.setattr(ptg2_tables, "hydrate_ptg2_artifact_entry_from_db", fail_hydrate)
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "arch_version": "postgres_binary_v1",
+                    "serving_binary_table": "mrf.ptg2_serving_binary_snap",
+                    "artifacts": {
+                        "provider_forward": {
+                            "name": "provider_forward",
+                            "path": "/work/old/provider_forward.ptg2sc",
+                            "storage_uri": "db://ptg2_artifact/provider-forward",
+                            "byte_count": 123,
+                        }
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-postgres-binary-artifact")
+
+    assert tables.effective_arch_version == "postgres_binary_v1"
     assert tables.artifacts["provider_forward"] == {
         "name": "provider_forward",
         "path": "/work/old/provider_forward.ptg2sc",

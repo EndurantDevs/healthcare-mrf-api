@@ -40,6 +40,8 @@ class PTG2ServingTables:
     price_atom_table: str | None = None
     price_atom_table_layout: str | None = None
     price_atom_dictionary_table: str | None = None
+    price_atom_constant_keys: dict[str, Any] | None = None
+    price_atom_constant_values: dict[str, Any] | None = None
     price_set_entry_table: str | None = None
     procedure_table: str | None = None
     code_count_table: str | None = None
@@ -51,6 +53,7 @@ class PTG2ServingTables:
     provider_group_location_table: str | None = None
     provider_group_rate_scope_table: str | None = None
     provider_set_dictionary_table: str | None = None
+    serving_binary_table: str | None = None
     serving_table_layout: str | None = None
     source_trace_set_hash: str | None = None
     network_names: list[str] | None = None
@@ -84,6 +87,8 @@ class PTG2ServingTables:
             and not self.provider_group_rate_scope_table
             and not self.provider_set_component_table
         ):
+            if self.serving_binary_table:
+                return "postgres_binary_v1"
             return "sidecar_scope_v1"
         return "legacy_mixed_v1"
 
@@ -91,4 +96,7 @@ class PTG2ServingTables:
     def uses_sidecar_provider_scope(self) -> bool:
         """Return true when provider-set membership is served from sidecar artifacts."""
         strategy = (self.provider_scope_strategy or "").strip().lower()
-        return strategy == "sidecar_provider_scope" or self.effective_arch_version == "sidecar_scope_v1"
+        return strategy == "sidecar_provider_scope" or self.effective_arch_version in {
+            "sidecar_scope_v1",
+            "postgres_binary_v1",
+        }

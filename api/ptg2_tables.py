@@ -135,15 +135,30 @@ def _is_compact_serving_table(table_name: str | None) -> bool:
     return "compact" in str(table_name or "").lower()
 
 
-def _materialize_db_artifacts_on_read() -> bool:
+def _serving_index_arch_version(serving_index: dict[str, Any]) -> str:
+    return str(serving_index.get("arch_version") or "").strip().lower()
+
+
+def _is_postgres_binary_serving_index(serving_index: dict[str, Any]) -> bool:
+    if _serving_index_arch_version(serving_index) == "postgres_binary_v1":
+        return True
+    if _safe_table_name(serving_index.get("serving_binary_table")):
+        return True
+    materialized_tables = serving_index.get("materialized_tables")
+    return isinstance(materialized_tables, dict) and bool(_safe_table_name(materialized_tables.get("serving_binary")))
+
+
+def _materialize_db_artifacts_on_read(serving_index: dict[str, Any]) -> bool:
+    if _is_postgres_binary_serving_index(serving_index):
+        return False
     raw = os.getenv(PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ_ENV, "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
-async def _hydrate_snapshot_artifacts(session, artifacts: Any) -> dict[str, Any] | None:
+async def _hydrate_snapshot_artifacts(session, artifacts: Any, serving_index: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(artifacts, dict):
         return None
-    if not _materialize_db_artifacts_on_read():
+    if not _materialize_db_artifacts_on_read(serving_index):
         return dict(artifacts)
 
     async def hydrate_entry(value: Any) -> Any:
@@ -225,7 +240,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         or manifest.get("storage_uri")
     )
     network_names = serving_index.get("network_names")
-    artifacts = await _hydrate_snapshot_artifacts(session, serving_index.get("artifacts"))
+    artifacts = await _hydrate_snapshot_artifacts(session, serving_index.get("artifacts"), serving_index)
     return _cache(PTG2ServingTables(
         storage=str(serving_index.get("storage") or "").strip() or None,
         type=str(serving_index.get("type") or "").strip() or None,
@@ -249,6 +264,16 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
         price_atom_table_layout=str(serving_index.get("price_atom_table_layout") or "").strip() or None,
         price_atom_dictionary_table=_safe_table_name(serving_index.get("price_atom_dictionary_table")),
+        price_atom_constant_keys=(
+            dict(serving_index.get("price_atom_constant_keys") or {})
+            if isinstance(serving_index.get("price_atom_constant_keys"), dict)
+            else None
+        ),
+        price_atom_constant_values=(
+            dict(serving_index.get("price_atom_constant_values") or {})
+            if isinstance(serving_index.get("price_atom_constant_values"), dict)
+            else None
+        ),
         price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
         procedure_table=_safe_table_name(serving_index.get("procedure_table")),
         code_count_table=_safe_table_name(serving_index.get("code_count_table")),
@@ -260,4 +285,12 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
         provider_group_rate_scope_table=_safe_table_name(serving_index.get("provider_group_rate_scope_table")),
         provider_set_dictionary_table=_safe_table_name(serving_index.get("provider_set_dictionary_table")),
+        serving_binary_table=_safe_table_name(
+            serving_index.get("serving_binary_table")
+            or (
+                serving_index.get("materialized_tables", {}).get("serving_binary")
+                if isinstance(serving_index.get("materialized_tables"), dict)
+                else None
+            )
+        ),
     ))

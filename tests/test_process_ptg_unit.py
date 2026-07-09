@@ -40,6 +40,7 @@ ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
+ptg_config = importlib.import_module("process.ptg_parts.config")
 
 
 def _write_deflate64_zip(path: Path, member_name: str, member_payload: bytes) -> None:
@@ -5871,6 +5872,72 @@ def test_ptg2_manifest_snapshot_publish_attaches_serving_sidecars_and_drops_tabl
     assert any("DROP TABLE \"mrf\".\"ptg2_serving_" in statement for statement in status_calls)
 
 
+async def _fake_postgres_binary_write_result(**kwargs):
+    assert kwargs["schema_name"] == "mrf"
+    assert kwargs["source_table"].startswith("ptg2_serving_")
+    assert kwargs["target_table"].startswith("ptg2_serving_binary_")
+    return {
+        "format": "ptg2_serving_binary_blocks_v1",
+        "table": f"mrf.{kwargs['target_table']}",
+        "writer": "rust_stream",
+        "row_count": kwargs["expected_row_count"],
+        "timing": {"total_seconds": 1.25, "index_seconds": 0.05},
+        "build_elapsed_seconds": 1.25,
+        "storage": {"total_bytes": 2048},
+    }
+
+
+def test_ptg2_manifest_snapshot_publish_postgres_binary_skips_serving_sidecars(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def is_fake_table_present(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    sidecar_mock = AsyncMock(side_effect=AssertionError("postgres_binary_v1 must not build serving sidecars"))
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "_write_ptg2_manifest_serving_sidecars", sidecar_mock)
+    monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", _fake_postgres_binary_write_result)
+
+    publish_manifest = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    assert publish_manifest["arch_version"] == "postgres_binary_v1"
+    assert publish_manifest["serving_row_strategy"] == "postgres_binary"
+    assert publish_manifest["serving_table_retained"] is False
+    assert publish_manifest["serving_binary_table"].startswith("mrf.ptg2_serving_binary_")
+    assert publish_manifest["materialized_tables"]["serving_binary"] == publish_manifest["serving_binary_table"]
+    assert "serving" not in publish_manifest["materialized_tables"]
+    assert publish_manifest["serving_binary"]["storage"]["total_bytes"] == 2048
+    assert publish_manifest["serving_binary"]["build_elapsed_seconds"] == 1.25
+    assert publish_manifest["serving_binary"]["timing"]["index_seconds"] == 0.05
+    sidecar_mock.assert_not_awaited()
+    assert any("DROP TABLE \"mrf\".\"ptg2_serving_" in statement for statement in status_calls)
+
+
 def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkeypatch):
     status_calls = []
 
@@ -5918,8 +5985,14 @@ def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkey
     assert "GROUP BY source_trace_set_hash, network_names" not in joined
     assert "SELECT DISTINCT ON (serving_content_hash_128)" not in joined
     assert "CREATE UNIQUE INDEX" in joined
-    assert "plan_id,\n                    reported_code_system,\n                    reported_code" in joined
-    assert "provider_set_global_id_128,\n                    price_set_global_id_128" in joined
+    for column in (
+        "plan_id",
+        "reported_code_system",
+        "reported_code",
+        "provider_set_global_id_128",
+        "price_set_global_id_128",
+    ):
+        assert column in joined
     component_mock.assert_not_awaited()
     db_all_mock.assert_not_awaited()
 
@@ -5991,10 +6064,68 @@ def test_ptg2_manifest_snapshot_publish_direct_lean_sidecars_skip_final_serving_
     assert any('DROP TABLE "mrf"."ptg2_manifest_stage_serving_abc"' in statement for statement in status_calls)
     assert "lean_code_lookup_idx" not in "\n".join(status_calls)
     assert "lean_code_idx" in "\n".join(status_calls)
+    assert 'ANALYZE "mrf"."ptg2_manifest_stage_serving_abc";' not in "\n".join(status_calls)
     assert publish_manifest["serving_row_strategy"] == "sidecar"
     assert publish_manifest["serving_table_retained"] is False
     assert publish_manifest["table"].startswith("mrf.ptg2_serving_")
     exact_rows_mock.assert_awaited_with("mrf", "ptg2_manifest_stage_serving_abc")
+
+
+def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def is_fake_table_present(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    async def fake_binary_write(**kwargs):
+        assert kwargs["schema_name"] == "mrf"
+        assert kwargs["source_table"] == "ptg2_manifest_stage_serving_abc"
+        assert kwargs["target_table"].startswith("ptg2_serving_binary_")
+        return {
+            "format": "ptg2_serving_binary_blocks_v1",
+            "table": f"mrf.{kwargs['target_table']}",
+            "writer": "rust_stream",
+            "row_count": kwargs["expected_row_count"],
+            "timing": {"total_seconds": 1.25, "index_seconds": 0.05},
+            "build_elapsed_seconds": 1.25,
+            "storage": {"total_bytes": 2048},
+        }
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v1")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "true")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS", "true")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", AsyncMock(side_effect=AssertionError("unused")))
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", fake_binary_write)
+
+    publish_manifest = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+            artifacts={"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]},
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert "lean_src_uidx" not in joined
+    assert "provider_set_global_id_128,\n                        price_set_global_id_128" not in joined
+    assert any('DROP TABLE "mrf"."ptg2_manifest_stage_serving_abc"' in statement for statement in status_calls)
+    assert publish_manifest["serving_row_strategy"] == "postgres_binary"
+    assert publish_manifest["serving_table_retained"] is False
+    assert publish_manifest["dedupe"]["serving"] == {"skipped": "scanner_dedupe_guarded_postgres_binary"}
 
 
 def test_ptg2_manifest_snapshot_publish_sidecar_arch_overrides_scope_table_env(monkeypatch):
@@ -6052,6 +6183,19 @@ def test_ptg2_manifest_snapshot_publish_sidecar_arch_overrides_scope_table_env(m
     component_mock.assert_not_awaited()
     rate_scope_mock.assert_not_awaited()
     location_mock.assert_awaited_once()
+
+
+def test_ptg2_snapshot_arch_rejects_postgres_posting_alias(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "posting")
+
+    with pytest.raises(ValueError):
+        ptg_config._ptg2_snapshot_arch_from_env()
+
+
+def test_ptg2_snapshot_arch_accepts_postgres_binary_alias(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "db_binary")
+
+    assert ptg_config._ptg2_snapshot_arch_from_env() == "postgres_binary_v1"
 
 
 def test_ptg2_manifest_snapshot_publish_materialized_arch_forces_scope_tables(monkeypatch):
@@ -6581,6 +6725,22 @@ def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatc
     assert stream_calls[0][1] == "ptg2_manifest_stage_serving_abc"
     assert stream_calls[0][3] is process_ptg._copy_lean_manifest_serving_file
     assert all(not path.exists() for path in source_files_by_kind.values())
+
+
+def test_manifest_copy_cleanup_removes_empty_worker_siblings(tmp_path):
+    base_copy = tmp_path / "ptg2_manifest_provider_group_member_test.copy"
+    empty_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.worker0001"
+    empty_provider_ref_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0002"
+    nonempty_provider_ref_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0003"
+    for path in (base_copy, empty_worker, empty_provider_ref_worker, nonempty_provider_ref_worker):
+        path.touch()
+    nonempty_provider_ref_worker.write_text("member-row\n", encoding="utf-8")
+
+    process_ptg._cleanup_empty_manifest_copy_siblings(base_copy)
+
+    assert not empty_worker.exists()
+    assert not empty_provider_ref_worker.exists()
+    assert nonempty_provider_ref_worker.exists()
 
 
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):

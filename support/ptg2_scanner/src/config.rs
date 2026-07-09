@@ -5,11 +5,11 @@ use std::env;
 pub const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
 pub const DEFAULT_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_PROGRESS_OBJECTS: u64 = 2_000_000;
-pub const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 4096;
+pub const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 8192;
 pub const DEFAULT_COMPACT_RUST_WORKERS: usize = 8;
 pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
 pub const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
-pub const DEFAULT_RAW_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_RAW_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_PARSE_IN_WORKERS: bool = true;
 
 pub fn split_interval(name: &str, default_value: usize) -> usize {
@@ -107,27 +107,29 @@ mod tests {
     }
 
     #[test]
-    fn scanner_chunk_experiment_env_values_are_accepted() {
+    fn scanner_chunk_defaults_are_promoted_and_can_be_overridden() {
+        assert_eq!(DEFAULT_SPLIT_NEGOTIATED_RATES, 8192);
+        assert_eq!(DEFAULT_RAW_CHUNK_BYTES, 33_554_432);
         scoped_env(
             "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
-            Some("8192"),
+            Some("4096"),
             || {
                 assert_eq!(
                     split_interval(
                         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
                         DEFAULT_SPLIT_NEGOTIATED_RATES,
                     ),
-                    8192
+                    4096
                 );
             },
         );
         scoped_env(
             "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES",
-            Some("33554432"),
+            Some("16777216"),
             || {
                 assert_eq!(
                     env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES),
-                    33_554_432
+                    16_777_216
                 );
             },
         );

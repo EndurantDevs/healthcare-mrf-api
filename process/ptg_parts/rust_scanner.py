@@ -324,6 +324,7 @@ def _iter_compact_serving_records_rust(
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
+    manifest_price_set_atom_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
@@ -380,6 +381,8 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"] = str(manifest_price_forward_sidecar_path)
     if manifest_price_atom_copy_path is not None:
         env["HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"] = str(manifest_price_atom_copy_path)
+    if manifest_price_set_atom_copy_path is not None:
+        env["HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"] = str(manifest_price_set_atom_copy_path)
     if manifest_provider_group_member_copy_path is not None:
         env["HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(manifest_provider_group_member_copy_path)
     normalized_source_network_names = sorted(
@@ -493,6 +496,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
+    manifest_price_set_atom_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
     source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
@@ -522,6 +526,7 @@ async def _aiter_compact_serving_records_rust(
         manifest_provider_npi_sidecar_path=manifest_provider_npi_sidecar_path,
         manifest_price_forward_sidecar_path=manifest_price_forward_sidecar_path,
         manifest_price_atom_copy_path=manifest_price_atom_copy_path,
+        manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path,
         manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
         source_network_names=source_network_names,
         manifest_only=manifest_only,

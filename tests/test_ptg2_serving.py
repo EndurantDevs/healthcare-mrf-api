@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -385,6 +386,120 @@ def test_ptg2_index_cache_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving.load_ptg2_index_from_path is ptg2_index_cache.load_ptg2_index_from_path
 
 
+@pytest.mark.asyncio
+async def test_postgres_binary_serving_table_does_not_response_cache_direct_lookup(monkeypatch):
+    ptg2_serving.clear_ptg2_index_cache()
+    call_count_by_name = {"uncached": 0}
+
+    async def fake_manifest_db_search(_session, _snapshot_id, _args, _pagination, serving_tables, _mode_value):
+        call_count_by_name["uncached"] += 1
+        return {
+            "items": [{"serving_binary_table": serving_tables.serving_binary_table}],
+            "pagination": {"total": 1},
+            "query": {"snapshot_id": _snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_search_ptg2_manifest_db_serving_table", fake_manifest_db_search)
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v1",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_serving_rate_a",
+        serving_binary_table="mrf.ptg2_serving_binary_a",
+    )
+
+    first_payload = await ptg2_serving.search_ptg2_serving_table(
+        object(),
+        "snapshot-a",
+        {"plan_id": "plan-a", "code": "99213", "code_system": "CPT"},
+        FakePagination(),
+        serving_tables=tables,
+    )
+    second_payload = await ptg2_serving.search_ptg2_serving_table(
+        object(),
+        "snapshot-a",
+        {"plan_id": "plan-a", "code": "99213", "code_system": "CPT"},
+        FakePagination(),
+        serving_tables=tables,
+    )
+    await ptg2_serving.search_ptg2_serving_table(
+        object(),
+        "snapshot-a",
+        {"plan_id": "plan-a", "code": "99213", "code_system": "CPT"},
+        FakePagination(),
+        serving_tables=ptg2_serving.PTG2ServingTables(
+            arch_version="postgres_binary_v1",
+            storage="manifest_snapshot",
+            serving_table="mrf.ptg2_serving_rate_b",
+            serving_binary_table="mrf.ptg2_serving_binary_b",
+        ),
+    )
+
+    assert first_payload == second_payload
+    assert call_count_by_name["uncached"] == 3
+    ptg2_serving.clear_ptg2_index_cache()
+
+
+@pytest.mark.asyncio
+async def test_postgres_binary_provider_procedures_does_not_response_cache_reverse_lookup(monkeypatch):
+    ptg2_serving.clear_ptg2_index_cache()
+    call_count_by_name = {"uncached": 0}
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v1",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_serving_rate_a",
+        serving_binary_table="mrf.ptg2_serving_binary_a",
+    )
+
+    async def fake_resolve_snapshot(_session, _args):
+        return "snapshot-a"
+
+    async def fake_snapshot_tables(_session, _snapshot_id):
+        return tables
+
+    async def fake_provider_procedures(
+        _session,
+        npi,
+        _args,
+        _pagination,
+        *,
+        snapshot_id,
+        serving_tables,
+    ):
+        call_count_by_name["uncached"] += 1
+        return {
+            "items": [{"npi": npi, "serving_binary_table": serving_tables.serving_binary_table}],
+            "pagination": {"total": 1},
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fake_resolve_snapshot)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot_tables)
+    monkeypatch.setattr(ptg2_serving, "_search_ptg2_manifest_provider_procedures", fake_provider_procedures)
+
+    first_payload = await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "plan-a", "include_details": "true"},
+        FakePagination(),
+    )
+    second_payload = await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "plan-a", "include_details": "true"},
+        FakePagination(),
+    )
+    await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        2234567890,
+        {"plan_id": "plan-a", "include_details": "true"},
+        FakePagination(),
+    )
+
+    assert first_payload == second_payload
+    assert call_count_by_name["uncached"] == 3
+    ptg2_serving.clear_ptg2_index_cache()
+
+
 def test_ptg2_snapshot_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving.current_snapshot_id is ptg2_snapshot.current_snapshot_id
     assert ptg2_serving.current_source_snapshot_id_for_plan is ptg2_snapshot.current_source_snapshot_id_for_plan
@@ -514,6 +629,112 @@ async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_diction
     assert "price_atom_global_id_128 = ANY(CAST(:atom_ids AS uuid[]))" in sql
 
 
+@pytest.mark.asyncio
+async def test_manifest_prices_for_price_sets_prefers_serving_binary_atoms(monkeypatch):
+    price_set_id = "00000000000000000000000000000024"
+    price_atom_id = "00000000000000000000000000000025"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "price_atom_global_id_128": price_atom_id,
+                        "negotiated_type": "fee schedule",
+                        "negotiated_rate": "39.50",
+                        "expiration_date": "9999-12-31",
+                        "service_code": ["11"],
+                        "billing_class": "professional",
+                        "setting": None,
+                        "billing_code_modifier": [],
+                        "additional_information": None,
+                    }
+                ]
+            )
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        price_atom_table="mrf.ptg2_price_atom_manifest_snap",
+        serving_binary_table="mrf.ptg2_serving_binary_manifest_snap",
+        id_storage="uuid",
+    )
+
+    async def fake_binary_price_members(_session, table_name, owner_ids):
+        assert table_name == "mrf.ptg2_serving_binary_manifest_snap"
+        assert owner_ids == (price_set_id,)
+        return {price_set_id: (price_atom_id,)}
+
+    async def fail_legacy_binary_price_members(*_args, **_kwargs):
+        raise AssertionError("price dictionary fallback should not be used when direct price-id atom blocks exist")
+
+    async def fail_sidecar_members_many(*_args, **_kwargs):
+        raise AssertionError("price_forward fallback should not be used when serving binary atom blocks exist")
+
+    monkeypatch.setattr(ptg2_serving, "lookup_atoms_by_price_id", fake_binary_price_members)
+    monkeypatch.setattr(ptg2_serving, "lookup_binary_price_atoms_from_db", fail_legacy_binary_price_members)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fail_sidecar_members_many)
+
+    prices_by_set = await ptg2_serving._ptg2_manifest_prices_for_price_sets(session, tables, [price_set_id])
+
+    assert prices_by_set[price_set_id][0]["negotiated_rate"] == "39.50"
+    assert str(session.calls[0][0][0]).count("price_atom_global_id_128 = ANY") == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_prices_rehydrates_lean_price_atom_constants(monkeypatch):
+    price_set_id = "00000000000000000000000000000014"
+    price_atom_id = "00000000000000000000000000000015"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "price_atom_global_id_128": price_atom_id,
+                        "negotiated_type": "fee schedule",
+                        "negotiated_rate": "41.25",
+                        "expiration_date": "9999-12-31",
+                        "service_code": ["11"],
+                        "billing_class": "professional",
+                        "setting": None,
+                        "billing_code_modifier": [],
+                        "additional_information": None,
+                    }
+                ]
+            )
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        price_atom_table="mrf.ptg2_price_atom_manifest_snap",
+        price_atom_table_layout="lean_dict_v2",
+        price_atom_constant_values={
+            "negotiated_type": "fee schedule",
+            "expiration_date": "9999-12-31",
+            "service_code": ["11"],
+            "billing_class": "professional",
+            "setting": None,
+            "billing_code_modifier": [],
+            "additional_information": None,
+        },
+        id_storage="uuid",
+    )
+
+    async def fake_sidecar_members_many(_session, _serving_tables, sidecar_name, owner_ids, **_kwargs):
+        assert sidecar_name == "price_forward"
+        assert owner_ids == (price_set_id,)
+        return {price_set_id: (price_atom_id,)}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    prices_by_set = await ptg2_serving._ptg2_manifest_prices_for_price_sets(session, tables, [price_set_id])
+
+    sql = str(session.calls[0][0][0])
+    assert prices_by_set[price_set_id][0]["negotiated_rate"] == "41.25"
+    assert "price_atom.negotiated_type_key" not in sql
+    assert "price_atom.service_code_key" not in sql
+    assert "LEFT JOIN" not in sql
+    assert "'fee schedule'::text AS negotiated_type" in sql
+    assert "ARRAY['11']::text[] AS service_code" in sql
+
+
 def _lean_source_level_case(monkeypatch):
     """Return fake lean serving state with a source-level code-count row."""
     provider_hash = "00000000000000000000000000000012"
@@ -562,7 +783,7 @@ def _lean_source_level_case(monkeypatch):
         assert table_name == "mrf.ptg2_serving_manifest_snap"
         return True
 
-    async def price_rows(_session, _tables, price_hashes):
+    async def price_rows(_session, _tables, price_hashes, **_kwargs):
         assert price_hashes == [price_hash]
         return {price_hash: [{"negotiated_type": "fee schedule", "negotiated_rate": "66.55"}]}
 
@@ -624,7 +845,7 @@ def _nonlean_source_level_case(monkeypatch):
         assert table_name == "mrf.ptg2_serving_example_packaging_snap"
         return True
 
-    async def price_rows(_session, _tables, price_hashes):
+    async def price_rows(_session, _tables, price_hashes, **_kwargs):
         assert price_hashes == [price_hash]
         return {price_hash: [{"negotiated_type": "fee schedule", "negotiated_rate": "101.23"}]}
 
@@ -720,7 +941,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         artifacts={"serving_by_code": sidecar},
     )
 
-    async def price_rows(_session, _tables, price_hashes):
+    async def price_rows(_session, _tables, price_hashes, **_kwargs):
         assert price_hashes == [price_b, price_a]
         return {
             price_a: [{"negotiated_type": "negotiated", "negotiated_rate": "100.00"}],
@@ -731,6 +952,107 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         assert [row["provider_count"] for row in row_data] == [9, 3]
         return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
 
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:group_fixture",
+        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload["pagination"]["total"] == 2
+    prices_by_provider_set = {
+        item["provider_set_hash"]: item["prices"][0]["negotiated_rate"]
+        for item in payload["items"]
+    }
+    assert prices_by_provider_set == {provider_set_a: 100.0, provider_set_b: 200.0}
+
+
+@pytest.mark.asyncio
+async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeypatch):
+    provider_set_a = "0000000000000000000000000000000a"
+    provider_set_b = "0000000000000000000000000000000b"
+    price_a = "00000000000000000000000000000101"
+    price_b = "00000000000000000000000000000102"
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "010854205",
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "rate_count": 2,
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {"provider_set_key": 1, "provider_set_global_id_128": provider_set_a},
+                    {"provider_set_key": 2, "provider_set_global_id_128": provider_set_b},
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_binary_table="mrf.ptg2_serving_binary_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        source_key="ptg_group_fixture",
+        artifacts={
+            "serving_by_code": {
+                "name": "serving_by_code",
+                "path": "/missing/local/cache/serving_by_code.ptg2sbc",
+            }
+        },
+    )
+
+    async def binary_rows(_session, table_name, code_key, *, provider_set_keys=None):
+        assert table_name == "mrf.ptg2_serving_binary_manifest_snap"
+        assert code_key == 7
+        assert provider_set_keys is None
+        return (
+            SimpleNamespace(code_key=7, provider_set_key=1, provider_count=3, price_set_global_id_128=price_a),
+            SimpleNamespace(code_key=7, provider_set_key=2, provider_count=9, price_set_global_id_128=price_b),
+        )
+
+    async def price_rows(_session, _tables, price_hashes, **_kwargs):
+        assert price_hashes == [price_b, price_a]
+        return {
+            price_a: [{"negotiated_type": "negotiated", "negotiated_rate": "100.00"}],
+            price_b: [{"negotiated_type": "negotiated", "negotiated_rate": "200.00"}],
+        }
+
+    async def procedure_rows(_session, row_data):
+        assert [row["provider_count"] for row in row_data] == [9, 3]
+        return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
+
+    monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", binary_rows)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_serving_by_code_sidecar_from_db",
+        AsyncMock(side_effect=AssertionError("postgres_binary_v1 must not read serving sidecar DB artifact")),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_serving_by_code_sidecar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postgres_binary_v1 must not read local serving sidecar")
+        ),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postgres_binary_v1 must not resolve local serving sidecar path")
+        ),
+    )
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
 
@@ -896,7 +1218,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
         assert table_name == "mrf.ptg2_serving_manifest_token"
         return True
 
-    async def fake_prices(_session, _tables, price_set_ids):
+    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
         assert tuple(price_set_ids) == tuple(price_sets)
         return {
             price_set_id: [{"negotiated_type": "fee schedule", "negotiated_rate": 114.82}]
@@ -1033,7 +1355,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
             ]
         }
 
-    async def fake_prices(_session, _tables, price_set_ids):
+    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
         assert tuple(price_set_ids) == (price_set_id,)
         return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1074.22}]}
 
@@ -1770,7 +2092,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
         assert required_columns == {"network_names"}
         return True
 
-    async def fake_prices(_session, _tables, price_set_ids):
+    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
         assert price_set_ids == [price_set_id]
         return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1138.57}]}
 
@@ -1832,7 +2154,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
         assert required_columns == {"network_names"}
         return True
 
-    async def fake_prices(_session, _tables, price_set_ids):
+    async def fake_prices(_session, _tables, price_set_ids, **_kwargs):
         assert price_set_ids == [price_set_id]
         return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1138.57}]}
 
@@ -2863,7 +3185,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
     async def source_traces(_session, _trace_sets):
         return {}
 
-    async def price_rows(_session, _tables, price_hashes):
+    async def price_rows(_session, _tables, price_hashes, **_kwargs):
         assert price_hashes == [price_set_id]
         return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": "451.25"}]}
 
@@ -3015,8 +3337,10 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
     )
     code_count_sql = str(code_count_call[0][0])
     code_count_params = code_count_call[0][1]
-    assert "code_key = ANY(CAST(:code_keys AS integer[]))" in code_count_sql
-    assert code_count_params["code_keys"] == [7, 8]
+    assert "code_key = ANY(CAST(:code_keys AS integer[]))" not in code_count_sql
+    assert "LIMIT :code_row_limit OFFSET :code_row_offset" in code_count_sql
+    assert code_count_params["code_row_limit"] == 2
+    assert code_count_params["code_row_offset"] == 0
     assert [
         (
             procedure_match["reported_code"],
@@ -3029,6 +3353,187 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
         ("70551", provider_set, 5, price_a),
         ("70552", provider_set, 11, price_b),
     ]
+
+
+def _postgres_binary_reverse_fixture():
+    provider_set_id = "0000000000000000000000000000000a"
+    price_a_id = "00000000000000000000000000000101"
+    price_b_id = "00000000000000000000000000000102"
+    session = FakeSession(
+        [
+            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+            FakeResult(
+                rows=[
+                    {"code_key": 7, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
+                    {"code_key": 8, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        code_count_table="mrf.ptg2_code_count_manifest_snap",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dict_manifest_snap",
+        serving_binary_table="mrf.ptg2_serving_binary_manifest_snap",
+        serving_table_layout="lean_provider_key_v1",
+        artifacts={
+            "serving_by_code": {"path": "/missing/local/cache/serving_by_code.ptg2sbc"},
+            "serving_by_provider_set": {"path": "/missing/local/cache/serving_by_provider_set.ptg2sbp"},
+        },
+    )
+    return provider_set_id, price_a_id, price_b_id, session, tables
+
+
+def _patch_binary_reverse_guards(monkeypatch, *, price_a_id: str, price_b_id: str) -> None:
+    async def binary_patterns(_session, table_name, provider_set_key, *, code_keys=None):
+        assert table_name == "mrf.ptg2_serving_binary_manifest_snap"
+        assert provider_set_key == 3
+        assert sorted(int(code_key) for code_key in code_keys or ()) == [7, 8]
+        return (
+            SimpleNamespace(code_keys=(7,), entries=((5, price_a_id),)),
+            SimpleNamespace(code_keys=(8,), entries=((11, price_b_id),)),
+        )
+
+    monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_provider_set_patterns_from_db", binary_patterns)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_serving_by_provider_set_patterns_from_db",
+        AsyncMock(side_effect=AssertionError("postgres_binary_v1 must not read serving sidecar DB artifact")),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_serving_by_provider_set_patterns",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postgres_binary_v1 must not read local provider-set sidecar")
+        ),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postgres_binary_v1 must not resolve local serving sidecar path")
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_broad_npi_postgres_binary_reverse_avoids_local_sidecars(monkeypatch):
+    """PostgreSQL binary broad NPI paging should not resolve pod-local serving files."""
+    provider_set, price_a, price_b, session, tables = _postgres_binary_reverse_fixture()
+    _patch_binary_reverse_guards(
+        monkeypatch,
+        price_a_id=price_a,
+        price_b_id=price_b,
+    )
+
+    procedure_matches = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+        session,
+        tables,
+        provider_set_ids=(provider_set,),
+        requested_plan="010854205",
+        code_value="",
+        code_system=None,
+        q_text="",
+        code_context=None,
+        source_trace_set_hash="trace-set",
+        network_names=["network"],
+        limit=2,
+        offset=0,
+        apply_window=True,
+    )
+
+    assert [
+        (
+            procedure_match["reported_code"],
+            procedure_match["provider_set_global_id_128"],
+            procedure_match["provider_count"],
+            procedure_match["price_set_global_id_128"],
+        )
+        for procedure_match in procedure_matches
+    ] == [
+        ("70551", provider_set, 5, price_a),
+        ("70552", provider_set, 11, price_b),
+    ]
+
+
+def _malformed_postgres_binary_tables():
+    return ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        arch_version="postgres_binary_v1",
+        artifacts={
+            "serving_by_code": {"path": "/missing/local/cache/serving_by_code.ptg2sbc"},
+            "serving_by_provider_set": {"path": "/missing/local/cache/serving_by_provider_set.ptg2sbp"},
+            "provider_forward": {"path": "/missing/local/cache/provider_forward.ptg2gsc"},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_binary_lookup_fails_closed_without_binary_table(monkeypatch):
+    """postgres_binary_v1 must not fall back to serving sidecar artifacts."""
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not resolve local sidecar")),
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="missing serving_binary_table"):
+        await ptg2_serving._ptg2_manifest_lookup_serving_by_code_sidecar(
+            FakeSession([]),
+            _malformed_postgres_binary_tables(),
+            7,
+        )
+
+
+@pytest.mark.asyncio
+async def test_postgres_binary_reverse_fails_closed_without_binary_table(monkeypatch):
+    """postgres_binary_v1 reverse lookup must not fall back to provider-set sidecars."""
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not resolve local sidecar")),
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="missing serving_binary_table"):
+        await ptg2_serving._ptg2_manifest_lookup_serving_by_provider_set_patterns(
+            FakeSession([]),
+            _malformed_postgres_binary_tables(),
+            3,
+        )
+
+
+def test_postgres_binary_sync_membership_fails_closed_without_db_storage(monkeypatch):
+    """postgres_binary_v1 sync membership reads must not resolve local artifacts."""
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not resolve local sidecar")),
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="requires PostgreSQL artifact storage"):
+        ptg2_serving._ptg2_manifest_sidecar_members(
+            _malformed_postgres_binary_tables(),
+            "provider_forward",
+            "0000000000000000000000000000000a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_postgres_binary_async_membership_fails_closed_without_db_storage(monkeypatch):
+    """postgres_binary_v1 async membership reads must not resolve local artifacts."""
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_resolve_ptg2_manifest_sidecar_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not resolve local sidecar")),
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="requires PostgreSQL artifact storage"):
+        await ptg2_serving._ptg2_manifest_sidecar_members_many_async(
+            FakeSession([]),
+            _malformed_postgres_binary_tables(),
+            "provider_forward",
+            ("0000000000000000000000000000000a",),
+        )
 
 
 @pytest.mark.asyncio

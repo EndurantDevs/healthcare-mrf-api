@@ -127,6 +127,7 @@ from process.ptg_parts.config import (
     PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
     TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
     TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
+    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
     _ptg2_snapshot_arch_from_env, _ptg2_snapshot_arch_variant,
     _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
     _use_rust_compact_serving, _use_serving_only_import,
@@ -205,6 +206,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
     _copy_lean_manifest_serving_file,
+    _copy_price_atom_member_file,
     _copy_ptg2_manifest_price_atom_file,
     _copy_ptg2_manifest_provider_group_member_file,
     _copy_ptg2_manifest_serving_file,
@@ -905,10 +907,30 @@ async def _copy_merged_manifest_kind_with_progress(
 def _cleanup_manifest_copy_paths(copy_files_by_kind: dict[str, list[Path]]) -> None:
     for copy_file_paths in copy_files_by_kind.values():
         for copy_file_path in copy_file_paths:
+            base_copy_path = _manifest_copy_base_path(copy_file_path)
             try:
                 copy_file_path.unlink(missing_ok=True)
             except Exception:
                 logger.debug("Failed to remove PTG2 manifest merge file %s", copy_file_path, exc_info=True)
+            _cleanup_empty_manifest_copy_siblings(base_copy_path)
+
+
+def _manifest_copy_base_path(copy_file_path: Path) -> Path:
+    name = copy_file_path.name
+    copy_suffix_index = name.find(".copy")
+    if copy_suffix_index < 0:
+        return copy_file_path
+    return copy_file_path.with_name(name[: copy_suffix_index + len(".copy")])
+
+
+def _cleanup_empty_manifest_copy_siblings(copy_path: Path) -> None:
+    for pattern in (f"{copy_path.name}.worker*", f"{copy_path.name}.provider_refs.worker*"):
+        for worker_copy_path in copy_path.parent.glob(pattern):
+            try:
+                if worker_copy_path.is_file() and worker_copy_path.stat().st_size == 0:
+                    worker_copy_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to remove empty PTG2 manifest worker copy file %s", worker_copy_path, exc_info=True)
 
 
 async def _merge_and_copy_ptg2_manifest_files(
@@ -917,7 +939,7 @@ async def _merge_and_copy_ptg2_manifest_files(
     manifest_stage_table: str,
 ) -> dict[str, Any]:
     manifest_serving_copy_kind, manifest_serving_copy_func, use_direct_lean_copy = _manifest_serving_copy_settings()
-    copy_kinds = [manifest_serving_copy_kind, "price_atom", "provider_group_member"]
+    copy_kinds = [manifest_serving_copy_kind, "price_atom", "price_set_atom", "provider_group_member"]
     copy_files_by_kind, emitted_rows_by_kind = _collect_manifest_copy_files(successful_files, copy_kinds)
     if not any(copy_files_by_kind.values()):
         return {"enabled": False, "reason": "no_deferred_copy_files"}
@@ -930,10 +952,12 @@ async def _merge_and_copy_ptg2_manifest_files(
         return path
 
     price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
+    price_set_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
     provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
+    has_price_set_atom_files = bool(copy_files_by_kind.get("price_set_atom"))
     if _env_bool(PTG2_MANIFEST_STREAM_MERGE_COPY_ENV, False):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
-        progress_total = 3
+        progress_total = 4 if has_price_set_atom_files else 3
 
         try:
             serving_metrics = await _stream_manifest_copy_kind_with_progress(
@@ -954,12 +978,23 @@ async def _merge_and_copy_ptg2_manifest_files(
                 total_steps=progress_total,
                 emitted_rows=emitted_rows_by_kind.get("price_atom"),
             )
+            price_set_atom_metrics = None
+            if has_price_set_atom_files:
+                price_set_atom_metrics = await _stream_manifest_copy_kind_with_progress(
+                    "price_set_atom",
+                    target_table=price_set_atom_table,
+                    input_paths=copy_files_by_kind["price_set_atom"],
+                    copy_func=_copy_price_atom_member_file,
+                    completed_steps_before_copy=2,
+                    total_steps=progress_total,
+                    emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
+                )
             provider_group_member_metrics = await _stream_manifest_copy_kind_with_progress(
                 "provider_group_member",
                 target_table=provider_group_member_table,
                 input_paths=copy_files_by_kind["provider_group_member"],
                 copy_func=_copy_ptg2_manifest_provider_group_member_file,
-                completed_steps_before_copy=2,
+                completed_steps_before_copy=3 if has_price_set_atom_files else 2,
                 total_steps=progress_total,
                 emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
             )
@@ -968,6 +1003,8 @@ async def _merge_and_copy_ptg2_manifest_files(
                 "price_atom": price_atom_metrics,
                 "provider_group_member": provider_group_member_metrics,
             }
+            if price_set_atom_metrics is not None:
+                merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
             merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
             merge_metrics["streamed_to_copy"] = True
             _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
@@ -980,9 +1017,10 @@ async def _merge_and_copy_ptg2_manifest_files(
     )
     merged_serving = _new_merge_path(serving_merge_prefix)
     merged_price_atom = _new_merge_path("ptg2_manifest_price_atom_merged_")
+    merged_price_set_atom = _new_merge_path("ptg2_manifest_price_set_atom_merged_") if has_price_set_atom_files else None
     merged_provider_group_member = _new_merge_path("ptg2_manifest_provider_group_member_merged_")
     merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
-    progress_total = 6
+    progress_total = 8 if has_price_set_atom_files else 6
 
     try:
         serving_metrics = await _merge_manifest_copy_kind_with_progress(
@@ -1001,11 +1039,21 @@ async def _merge_and_copy_ptg2_manifest_files(
             total_steps=progress_total,
             emitted_rows=emitted_rows_by_kind.get("price_atom"),
         )
+        price_set_atom_metrics = None
+        if merged_price_set_atom is not None:
+            price_set_atom_metrics = await _merge_manifest_copy_kind_with_progress(
+                "price_set_atom",
+                merged_price_set_atom,
+                copy_files_by_kind["price_set_atom"],
+                completed_steps_before_merge=2,
+                total_steps=progress_total,
+                emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
+            )
         provider_group_member_metrics = await _merge_manifest_copy_kind_with_progress(
             "provider_group_member",
             merged_provider_group_member,
             copy_files_by_kind["provider_group_member"],
-            completed_steps_before_merge=2,
+            completed_steps_before_merge=3 if has_price_set_atom_files else 2,
             total_steps=progress_total,
             emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
         )
@@ -1014,7 +1062,7 @@ async def _merge_and_copy_ptg2_manifest_files(
             merged_serving,
             target_table=manifest_stage_table,
             copy_func=manifest_serving_copy_func,
-            completed_steps_before_copy=3,
+            completed_steps_before_copy=4 if has_price_set_atom_files else 3,
             total_steps=progress_total,
         )
         await _copy_merged_manifest_kind_with_progress(
@@ -1022,15 +1070,24 @@ async def _merge_and_copy_ptg2_manifest_files(
             merged_price_atom,
             target_table=price_atom_table,
             copy_func=_copy_ptg2_manifest_price_atom_file,
-            completed_steps_before_copy=4,
+            completed_steps_before_copy=5 if has_price_set_atom_files else 4,
             total_steps=progress_total,
         )
+        if merged_price_set_atom is not None:
+            await _copy_merged_manifest_kind_with_progress(
+                "price_set_atom",
+                merged_price_set_atom,
+                target_table=price_set_atom_table,
+                copy_func=_copy_price_atom_member_file,
+                completed_steps_before_copy=6,
+                total_steps=progress_total,
+            )
         await _copy_merged_manifest_kind_with_progress(
             "provider_group_member",
             merged_provider_group_member,
             target_table=provider_group_member_table,
             copy_func=_copy_ptg2_manifest_provider_group_member_file,
-            completed_steps_before_copy=5,
+            completed_steps_before_copy=7 if has_price_set_atom_files else 5,
             total_steps=progress_total,
         )
         merge_metrics["kinds"] = {
@@ -1038,11 +1095,15 @@ async def _merge_and_copy_ptg2_manifest_files(
             "price_atom": price_atom_metrics,
             "provider_group_member": provider_group_member_metrics,
         }
+        if price_set_atom_metrics is not None:
+            merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
         merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
         _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
         return merge_metrics
     finally:
-        for path in (merged_serving, merged_price_atom, merged_provider_group_member):
+        for path in (merged_serving, merged_price_atom, merged_price_set_atom, merged_provider_group_member):
+            if path is None:
+                continue
             try:
                 path.unlink(missing_ok=True)
             except Exception:
@@ -1076,6 +1137,8 @@ async def _parse_in_network_file_serving_only(
 
     plan_fields = _derive_plan_fields(meta, plan_info)
     source_network_name_values = _normalize_source_network_names(source_network_names)
+    arch_version = _ptg2_snapshot_arch_from_env()
+    use_postgres_binary_arch = arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
     source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
@@ -1105,6 +1168,7 @@ async def _parse_in_network_file_serving_only(
     deferred_copy_files: dict[str, list[dict[str, Any]]] = {
         manifest_serving_copy_kind: [],
         "price_atom": [],
+        "price_set_atom": [],
         "provider_group_member": [],
     }
     deferred_copy_file_paths_by_kind: dict[str, set[str]] = {kind: set() for kind in deferred_copy_files}
@@ -1153,6 +1217,7 @@ async def _parse_in_network_file_serving_only(
         "ptg2_manifest_lean_serving_" if use_direct_lean_copy else "ptg2_manifest_serving_"
     )
     manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
+    manifest_price_set_atom_copy_path = _new_copy_path("ptg2_manifest_price_set_atom_")
     manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
     manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
         str(plan_fields.get("plan_id") or "plan"),
@@ -1169,7 +1234,11 @@ async def _parse_in_network_file_serving_only(
             if provider_npi_sidecar_enabled
             else None
         ),
-        "price_forward": manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc",
+        "price_forward": (
+            None
+            if use_postgres_binary_arch
+            else manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc"
+        ),
     }
 
     def emit_copy_status(status: str, *, kind: str, copy_file: Path, rows: int, target_table: str | None, started_at: float | None = None) -> None:
@@ -1218,6 +1287,9 @@ async def _parse_in_network_file_serving_only(
         if kind == "price_atom":
             target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
             copy_func = _copy_ptg2_manifest_price_atom_file
+        elif kind == "price_set_atom":
+            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
+            copy_func = _copy_price_atom_member_file
         elif kind == "provider_group_member":
             target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
             copy_func = _copy_ptg2_manifest_provider_group_member_file
@@ -1261,6 +1333,7 @@ async def _parse_in_network_file_serving_only(
             manifest_provider_npi_sidecar_path=manifest_sidecar_paths.get("provider_npi"),
             manifest_price_forward_sidecar_path=manifest_sidecar_paths.get("price_forward"),
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
+            manifest_price_set_atom_copy_path=manifest_price_set_atom_copy_path if use_postgres_binary_arch else None,
             manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
             source_network_names=source_network_name_values,
             manifest_only=True,
@@ -1281,6 +1354,9 @@ async def _parse_in_network_file_serving_only(
             elif record_kind == "manifest_price_atom_copy_file":
                 compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("price_atom", record_row)))
                 await wait_for_some_copy_tasks()
+            elif record_kind == "manifest_price_set_atom_copy_file":
+                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("price_set_atom", record_row)))
+                await wait_for_some_copy_tasks()
             elif record_kind == "manifest_provider_group_member_copy_file":
                 compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("provider_group_member", record_row)))
                 await wait_for_some_copy_tasks()
@@ -1290,6 +1366,10 @@ async def _parse_in_network_file_serving_only(
         for copy_path, copy_func in (
             (manifest_serving_copy_path, copy_ready_manifest_serving_file),
             (manifest_price_atom_copy_path, lambda row: copy_ready_manifest_dictionary_file("price_atom", row)),
+            (
+                manifest_price_set_atom_copy_path,
+                lambda row: copy_ready_manifest_dictionary_file("price_set_atom", row),
+            ),
             (manifest_provider_group_member_copy_path, lambda row: copy_ready_manifest_dictionary_file("provider_group_member", row)),
         ):
             for candidate_copy_path in _manifest_copy_candidates(copy_path):
@@ -1304,23 +1384,27 @@ async def _parse_in_network_file_serving_only(
     finally:
         for task in compact_copy_tasks:
             task.cancel()
+        manifest_copy_paths = (
+            manifest_serving_copy_path,
+            manifest_price_atom_copy_path,
+            manifest_price_set_atom_copy_path,
+            manifest_provider_group_member_copy_path,
+        )
+        for copy_path in manifest_copy_paths:
+            try:
+                if copy_path.exists() and copy_path.stat().st_size == 0:
+                    copy_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to remove empty PTG2 manifest copy file %s", copy_path, exc_info=True)
+            _cleanup_empty_manifest_copy_siblings(copy_path)
         if (copy_completed and not defer_manifest_copy) or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
-            for copy_path in (
-                manifest_serving_copy_path,
-                manifest_price_atom_copy_path,
-                manifest_provider_group_member_copy_path,
-            ):
+            for copy_path in manifest_copy_paths:
                 try:
-                    if not defer_manifest_copy or not copy_path.exists() or copy_path.stat().st_size == 0:
+                    if not defer_manifest_copy or not copy_path.exists():
                         copy_path.unlink(missing_ok=True)
                 except Exception:
                     logger.debug("Failed to remove PTG2 manifest copy file %s", copy_path, exc_info=True)
-                for worker_copy_path in copy_path.parent.glob(f"{copy_path.name}.worker*"):
-                    try:
-                        if worker_copy_path.exists() and worker_copy_path.stat().st_size == 0:
-                            worker_copy_path.unlink(missing_ok=True)
-                    except Exception:
-                        logger.debug("Failed to remove empty PTG2 manifest worker copy file %s", worker_copy_path, exc_info=True)
+                _cleanup_empty_manifest_copy_siblings(copy_path)
 
     await flush_error_log(import_log_cls)
     manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(manifest_sidecar_paths)

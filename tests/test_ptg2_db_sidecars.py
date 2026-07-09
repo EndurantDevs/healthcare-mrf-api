@@ -23,6 +23,14 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_sidecar_caches():
+    db_sidecars._CHUNK_CACHE.clear()
+    db_sidecars._CHUNK_CACHE_BYTES = 0
+    db_sidecars._BINARY_DICTIONARY_CACHE.clear()
+    db_sidecars._BINARY_DICTIONARY_CACHE_STATE["byte_count"] = 0
+
+
 class FakeResult:
     def __init__(self, rows=None, scalar=None):
         self._rows = list(rows or [])

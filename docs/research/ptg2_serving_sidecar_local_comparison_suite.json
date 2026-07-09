@@ -29,6 +29,10 @@
     {
       "id": "tableless_serving_sidecar",
       "description": "Proposed tableless serving path with forward and reverse sidecars.",
+      "api_latency_probe": true,
+      "api_latency_max_ms": 40,
+      "api_probe_iterations": 20,
+      "api_probe_warmup": 4,
       "env": {
         "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
         "HLTHPRT_PTG2_RUST_WORKERS": "2",
@@ -61,6 +65,7 @@
       "analyze_serving_sidecar": false,
       "max_bytes": 268435456,
       "gates": {
+        "baseline_variant": "table_serving_current",
         "performance": false
       },
       "variants": [

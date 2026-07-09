@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import zlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
@@ -39,6 +41,14 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ServingSidecarRow,
 )
 
+
+@dataclass(frozen=True)
+class PTG2ServingBinaryRow(PTG2ServingSidecarRow):
+    """Serving row decoded from PostgreSQL binary blocks with its local price key."""
+
+    price_key: int | None = None
+
+
 _DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
 _MEMBERSHIP_HEADER = struct.Struct("<8sIQ")
 _DENSE_MEMBERSHIP_HEADER = struct.Struct("<8sIQQ")
@@ -52,7 +62,17 @@ _MEMBERSHIP_FORMATS = {PTG2_MANIFEST_MEMBERSHIP_FORMAT, PTG2_MANIFEST_DENSE_MEMB
 _CHUNK_CACHE_MAX_BYTES = max(int(os.getenv("HLTHPRT_PTG2_DB_SIDECAR_CHUNK_CACHE_BYTES", str(64 * 1024 * 1024))), 0)
 _INDEX_READ_MAX_BYTES = max(int(os.getenv("HLTHPRT_PTG2_DB_SIDECAR_INDEX_MAX_BYTES", str(128 * 1024 * 1024))), 0)
 _CHUNK_CACHE: OrderedDict[tuple[str, str, int], bytes] = OrderedDict()
-_CHUNK_CACHE_BYTES = 0
+_CHUNK_CACHE_STATE = {"byte_count": 0}
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+_SERVING_BINARY_BY_CODE_KIND = "by_code"
+_SERVING_BINARY_BY_CODE_GROUPED_KIND = "by_code_grouped"
+_SERVING_BINARY_BY_CODE_DICTIONARY_KIND = "by_code_price_dictionary"
+_SERVING_BINARY_BY_PROVIDER_SET_KIND = "by_provider_set"
+_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_dictionary"
+_SERVING_BINARY_PRICE_SET_ATOMS_KIND = "price_set_atoms"
+_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND = "price_set_atoms_by_id"
+_PRICE_SET_ATOM_BLOCK_SIZE = 1024
+_PRICE_SET_ATOM_ID_BUCKETS = 256
 
 
 def _cache_key(artifact_id: str, metadata: Mapping[str, Any], chunk_no: int) -> tuple[str, str, int]:
@@ -67,17 +87,96 @@ def _cache_get(key: tuple[str, str, int]) -> bytes | None:
 
 
 def _cache_set(key: tuple[str, str, int], chunk: bytes) -> None:
-    global _CHUNK_CACHE_BYTES
     if _CHUNK_CACHE_MAX_BYTES <= 0 or len(chunk) > _CHUNK_CACHE_MAX_BYTES:
         return
     existing = _CHUNK_CACHE.pop(key, None)
     if existing is not None:
-        _CHUNK_CACHE_BYTES -= len(existing)
+        _CHUNK_CACHE_STATE["byte_count"] -= len(existing)
     _CHUNK_CACHE[key] = chunk
-    _CHUNK_CACHE_BYTES += len(chunk)
-    while _CHUNK_CACHE_BYTES > _CHUNK_CACHE_MAX_BYTES and _CHUNK_CACHE:
+    _CHUNK_CACHE_STATE["byte_count"] += len(chunk)
+    while _CHUNK_CACHE_STATE["byte_count"] > _CHUNK_CACHE_MAX_BYTES and _CHUNK_CACHE:
         _old_key, old_chunk = _CHUNK_CACHE.popitem(last=False)
-        _CHUNK_CACHE_BYTES -= len(old_chunk)
+        _CHUNK_CACHE_STATE["byte_count"] -= len(old_chunk)
+
+
+_BINARY_DICTIONARY_CACHE_MAX_BYTES = max(
+    int(os.getenv("HLTHPRT_PTG2_DB_BINARY_DICTIONARY_CACHE_BYTES", str(64 * 1024 * 1024))),
+    0,
+)
+_BINARY_DICTIONARY_CACHE: OrderedDict[tuple[str, str], tuple[int, Any]] = OrderedDict()
+_BINARY_DICTIONARY_CACHE_STATE = {"byte_count": 0}
+_BINARY_BLOCK_CACHE_MAX_BYTES = max(
+    int(os.getenv("HLTHPRT_PTG2_DB_BINARY_BLOCK_CACHE_BYTES", str(64 * 1024 * 1024))),
+    0,
+)
+_BINARY_BLOCK_CACHE: OrderedDict[tuple[str, str, int], tuple[int, tuple[dict[str, Any], ...]]] = OrderedDict()
+_BINARY_BLOCK_CACHE_STATE = {"byte_count": 0}
+_CACHE_MISS = object()
+
+
+def _binary_dictionary_cache_get(key: tuple[str, str]) -> Any:
+    cached = _BINARY_DICTIONARY_CACHE.get(key, _CACHE_MISS)
+    if cached is _CACHE_MISS:
+        return _CACHE_MISS
+    _BINARY_DICTIONARY_CACHE.move_to_end(key)
+    return cached[1]
+
+
+def _binary_dictionary_cache_set(key: tuple[str, str], value: Any, byte_count: int) -> None:
+    cache_bytes = max(int(byte_count), 1)
+    if _BINARY_DICTIONARY_CACHE_MAX_BYTES <= 0 or cache_bytes > _BINARY_DICTIONARY_CACHE_MAX_BYTES:
+        return
+    existing = _BINARY_DICTIONARY_CACHE.pop(key, None)
+    if existing is not None:
+        _BINARY_DICTIONARY_CACHE_STATE["byte_count"] -= existing[0]
+    _BINARY_DICTIONARY_CACHE[key] = (cache_bytes, value)
+    _BINARY_DICTIONARY_CACHE_STATE["byte_count"] += cache_bytes
+    while (
+        _BINARY_DICTIONARY_CACHE_STATE["byte_count"] > _BINARY_DICTIONARY_CACHE_MAX_BYTES
+        and _BINARY_DICTIONARY_CACHE
+    ):
+        _old_key, old_value = _BINARY_DICTIONARY_CACHE.popitem(last=False)
+        _BINARY_DICTIONARY_CACHE_STATE["byte_count"] -= old_value[0]
+
+
+def _binary_block_rows_bytes(rows: Iterable[Mapping[str, Any]]) -> int:
+    total_bytes = 0
+    for row in rows:
+        total_bytes += len(bytes(row.get("payload") or b"")) + 128
+        decoded_payload = row.get("_decoded_payload")
+        if decoded_payload is not None:
+            total_bytes += len(bytes(decoded_payload))
+    return max(total_bytes, 1)
+
+
+def _binary_block_cache_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    cached_row_by_column = dict(row)
+    cached_row_by_column["_decoded_payload"] = _decode_serving_binary_payload(cached_row_by_column)
+    return cached_row_by_column
+
+
+def _binary_block_cache_get(key: tuple[str, str, int]) -> list[dict[str, Any]] | object:
+    cached = _BINARY_BLOCK_CACHE.get(key, _CACHE_MISS)
+    if cached is _CACHE_MISS:
+        return _CACHE_MISS
+    _BINARY_BLOCK_CACHE.move_to_end(key)
+    return [dict(row) for row in cached[1]]
+
+
+def _binary_block_cache_set(key: tuple[str, str, int], rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    cached_rows = tuple(_binary_block_cache_row(row) for row in rows)
+    cache_bytes = _binary_block_rows_bytes(cached_rows)
+    if _BINARY_BLOCK_CACHE_MAX_BYTES <= 0 or cache_bytes > _BINARY_BLOCK_CACHE_MAX_BYTES:
+        return [dict(row) for row in cached_rows]
+    existing = _BINARY_BLOCK_CACHE.pop(key, None)
+    if existing is not None:
+        _BINARY_BLOCK_CACHE_STATE["byte_count"] -= existing[0]
+    _BINARY_BLOCK_CACHE[key] = (cache_bytes, cached_rows)
+    _BINARY_BLOCK_CACHE_STATE["byte_count"] += cache_bytes
+    while _BINARY_BLOCK_CACHE_STATE["byte_count"] > _BINARY_BLOCK_CACHE_MAX_BYTES and _BINARY_BLOCK_CACHE:
+        _old_key, old_rows = _BINARY_BLOCK_CACHE.popitem(last=False)
+        _BINARY_BLOCK_CACHE_STATE["byte_count"] -= old_rows[0]
+    return [dict(row) for row in cached_rows]
 
 
 def _metadata_int(metadata: Mapping[str, Any], key: str, default: int = 0) -> int:
@@ -108,6 +207,10 @@ def _id_text(raw: bytes | bytearray | memoryview) -> str:
     return value.hex()
 
 
+def _price_set_atom_id_bucket(price_set_id: bytes | bytearray | memoryview | str) -> int:
+    return int.from_bytes(_normalize_global_id(price_set_id)[:4], "big") % _PRICE_SET_ATOM_ID_BUCKETS
+
+
 def _read_uvarint(payload: bytes | bytearray | memoryview, offset: int) -> tuple[int, int]:
     result = 0
     shift = 0
@@ -123,6 +226,94 @@ def _read_uvarint(payload: bytes | bytearray | memoryview, offset: int) -> tuple
         shift += 7
         if shift > 63:
             raise PTG2ManifestArtifactError("serving sidecar uvarint is too large")
+
+
+def _decode_serving_binary_payload(record: Mapping[str, Any]) -> bytes:
+    decoded_payload = record.get("_decoded_payload")
+    if decoded_payload is not None:
+        return bytes(decoded_payload)
+    payload = bytes(record.get("payload") or b"")
+    compression = str(record.get("payload_compression") or "none").strip().lower()
+    if compression in {"", "none"}:
+        return payload
+    if compression != "zlib":
+        raise PTG2ManifestArtifactError(f"unsupported PTG2 serving binary payload compression: {compression}")
+    raw_payload = zlib.decompress(payload)
+    expected_raw_bytes = record.get("raw_payload_bytes")
+    if expected_raw_bytes is not None and int(expected_raw_bytes or 0) > 0 and len(raw_payload) != int(expected_raw_bytes):
+        raise PTG2ManifestArtifactError("PTG2 serving binary raw payload byte count mismatch")
+    return raw_payload
+
+
+def _read_serving_binary_price_keys(
+    body: bytes,
+    cursor: int,
+    price_ids: tuple[str, ...],
+    *,
+    grouped_payload: bool,
+) -> tuple[list[int], int]:
+    """Decode one legacy price key or one grouped list of price keys."""
+    if grouped_payload:
+        price_key_count, cursor = _read_uvarint(body, cursor)
+        price_keys = []
+        for _price_index in range(price_key_count):
+            price_key, cursor = _read_uvarint(body, cursor)
+            if price_key >= len(price_ids):
+                raise PTG2ManifestArtifactError("PTG2 serving binary price key is out of range")
+            price_keys.append(price_key)
+        return price_keys, cursor
+    price_key, cursor = _read_uvarint(body, cursor)
+    if price_key >= len(price_ids):
+        raise PTG2ManifestArtifactError("PTG2 serving binary price key is out of range")
+    return [price_key], cursor
+
+
+def _decode_serving_binary_by_code_record(
+    binary_record: Mapping[str, Any],
+    *,
+    code_key: int,
+    price_ids: tuple[str, ...],
+    provider_count_map: dict[int, int] | None,
+    grouped_payload: bool,
+    provider_filter: set[int] | None,
+    provider_filter_max: int | None,
+) -> list[PTG2ServingSidecarRow]:
+    """Decode one forward serving-binary record into serving rows."""
+    payload_bytes = _decode_serving_binary_payload(binary_record)
+    cursor = 0
+    provider_set_key = 0
+    decoded_serving_rows: list[PTG2ServingSidecarRow] = []
+    for _ in range(int(binary_record.get("entry_count") or 0)):
+        provider_delta, cursor = _read_uvarint(payload_bytes, cursor)
+        provider_count: int | None = None
+        if provider_count_map is None and not grouped_payload:
+            provider_count, cursor = _read_uvarint(payload_bytes, cursor)
+        provider_set_key += provider_delta
+        if provider_count_map is not None:
+            provider_count = provider_count_map.get(provider_set_key)
+            if provider_count is None:
+                raise PTG2ManifestArtifactError("PTG2 serving binary provider-count key is missing")
+        price_keys, cursor = _read_serving_binary_price_keys(
+            payload_bytes,
+            cursor,
+            price_ids,
+            grouped_payload=grouped_payload,
+        )
+        if provider_filter is not None and provider_set_key not in provider_filter:
+            if provider_filter_max is not None and provider_set_key > provider_filter_max:
+                break
+            continue
+        decoded_serving_rows.extend(
+            PTG2ServingBinaryRow(
+                code_key=int(code_key),
+                provider_set_key=provider_set_key,
+                provider_count=provider_count,
+                price_set_global_id_128=price_ids[price_key],
+                price_key=price_key,
+            )
+            for price_key in price_keys
+        )
+    return decoded_serving_rows
 
 
 def _validate_membership_record_format(metadata: Mapping[str, Any]) -> None:
@@ -336,6 +527,607 @@ class PTG2DbArtifactReader:
 
 def db_artifact_entry_available(entry: Mapping[str, Any] | None) -> bool:
     return bool(entry and ptg2_artifact_id_from_db_uri(str(entry.get("storage_uri") or "")))
+
+
+def _safe_qualified_table_name(value: str) -> str:
+    parts = str(value or "").split(".", 1)
+    if len(parts) != 2 or not _IDENTIFIER_RE.fullmatch(parts[0]) or not _IDENTIFIER_RE.fullmatch(parts[1]):
+        raise PTG2ManifestArtifactError(f"unsafe PTG2 serving binary table name: {value!r}")
+    return f"{_quote_ident(parts[0])}.{_quote_ident(parts[1])}"
+
+
+def _result_rows(result: Any) -> list[Any]:
+    return list(result)
+
+
+def _row_mapping(row: Any) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return dict(mapping)
+    if isinstance(row, dict):
+        return dict(row)
+    return dict(row)
+
+
+async def _serving_binary_payload_rows(
+    session: Any,
+    table_name: str,
+    *,
+    artifact_kind: str,
+    block_key: int,
+) -> list[dict[str, Any]]:
+    qualified_table = _safe_qualified_table_name(table_name)
+    cache_key = (qualified_table, artifact_kind, int(block_key))
+    cached_rows = _binary_block_cache_get(cache_key)
+    if cached_rows is not _CACHE_MISS:
+        return cached_rows
+    binary_block_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                block_no,
+                entry_count,
+                payload,
+                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
+                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+              FROM {qualified_table} binary_block
+             WHERE artifact_kind = :artifact_kind
+               AND block_key = :block_key
+             ORDER BY block_no
+            """
+        ),
+        {"artifact_kind": artifact_kind, "block_key": int(block_key)},
+    )
+    binary_block_rows = [_row_mapping(binary_block_row) for binary_block_row in _result_rows(binary_block_result)]
+    return _binary_block_cache_set(cache_key, binary_block_rows)
+
+
+async def _serving_binary_payload_rows_for_keys(
+    session: Any,
+    table_name: str,
+    *,
+    artifact_kind: str,
+    block_keys: Iterable[int],
+) -> list[dict[str, Any]]:
+    block_key_values = sorted({int(block_key) for block_key in block_keys})
+    if not block_key_values:
+        return []
+    qualified_table = _safe_qualified_table_name(table_name)
+    cached_rows_by_key: dict[int, list[dict[str, Any]]] = {}
+    missing_block_keys: list[int] = []
+    for block_key in block_key_values:
+        cache_key = (qualified_table, artifact_kind, block_key)
+        cached_rows = _binary_block_cache_get(cache_key)
+        if cached_rows is _CACHE_MISS:
+            missing_block_keys.append(block_key)
+        else:
+            cached_rows_by_key[block_key] = cached_rows
+    if not missing_block_keys:
+        return [
+            binary_block_row
+            for block_key in block_key_values
+            for binary_block_row in cached_rows_by_key.get(block_key, [])
+        ]
+
+    fetched_rows_by_key: dict[int, list[dict[str, Any]]] = {block_key: [] for block_key in missing_block_keys}
+    binary_block_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                block_key,
+                block_no,
+                entry_count,
+                payload,
+                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
+                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+              FROM {qualified_table} binary_block
+             WHERE artifact_kind = :artifact_kind
+               AND block_key = ANY(CAST(:block_keys AS integer[]))
+             ORDER BY block_key, block_no
+            """
+        ),
+        {"artifact_kind": artifact_kind, "block_keys": missing_block_keys},
+    )
+    for binary_block_row in _result_rows(binary_block_result):
+        binary_block_row_map = _row_mapping(binary_block_row)
+        fetched_rows_by_key.setdefault(int(binary_block_row_map.get("block_key") or 0), []).append(binary_block_row_map)
+    for block_key in missing_block_keys:
+        fetched_rows_by_key[block_key] = _binary_block_cache_set(
+            (qualified_table, artifact_kind, block_key),
+            fetched_rows_by_key.get(block_key, []),
+        )
+    return [
+        binary_block_row
+        for block_key in block_key_values
+        for binary_block_row in cached_rows_by_key.get(block_key, fetched_rows_by_key.get(block_key, []))
+    ]
+
+
+async def _serving_binary_dictionary(
+    session: Any,
+    table_name: str,
+    *,
+    artifact_kind: str,
+) -> tuple[str, ...]:
+    qualified_table = _safe_qualified_table_name(table_name)
+    cache_key = (qualified_table, artifact_kind)
+    cached_dictionary = _binary_dictionary_cache_get(cache_key)
+    if cached_dictionary is not _CACHE_MISS:
+        return cached_dictionary
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                payload,
+                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
+                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+              FROM {qualified_table} binary_block
+             WHERE artifact_kind = :artifact_kind
+               AND block_key = 0
+               AND block_no = 0
+             LIMIT 1
+            """
+        ),
+        {"artifact_kind": artifact_kind},
+    )
+    dictionary_records = _result_rows(query_result)
+    if not dictionary_records:
+        raise PTG2ManifestArtifactError(f"PTG2 serving binary dictionary is missing: {artifact_kind}")
+    dictionary_payload = _decode_serving_binary_payload(_row_mapping(dictionary_records[0]))
+    if len(dictionary_payload) % 16:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
+    price_set_ids = tuple(
+        _id_text(dictionary_payload[payload_offset : payload_offset + 16])
+        for payload_offset in range(0, len(dictionary_payload), 16)
+    )
+    _binary_dictionary_cache_set(cache_key, price_set_ids, len(dictionary_payload))
+    return price_set_ids
+
+
+async def _serving_binary_dictionary_payload(
+    session: Any,
+    table_name: str,
+    *,
+    artifact_kind: str,
+) -> bytes:
+    """Return a raw binary dictionary payload without expanding every id."""
+
+    qualified_table = _safe_qualified_table_name(table_name)
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                payload,
+                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
+                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+              FROM {qualified_table} binary_block
+             WHERE artifact_kind = :artifact_kind
+               AND block_key = 0
+               AND block_no = 0
+             LIMIT 1
+            """
+        ),
+        {"artifact_kind": artifact_kind},
+    )
+    dictionary_records = _result_rows(query_result)
+    if not dictionary_records:
+        raise PTG2ManifestArtifactError(f"PTG2 serving binary dictionary is missing: {artifact_kind}")
+    dictionary_payload = _decode_serving_binary_payload(_row_mapping(dictionary_records[0]))
+    if len(dictionary_payload) % 16:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
+    return dictionary_payload
+
+
+async def _serving_binary_dictionary_values_for_keys(
+    session: Any,
+    table_name: str,
+    *,
+    artifact_kind: str,
+    item_keys: Iterable[int],
+) -> dict[int, str]:
+    """Return selected 128-bit ids from a binary dictionary payload."""
+
+    requested_keys = tuple(sorted({int(item_key) for item_key in item_keys if item_key is not None}))
+    if not requested_keys:
+        return {}
+    dictionary_payload = await _serving_binary_dictionary_payload(session, table_name, artifact_kind=artifact_kind)
+    item_count = len(dictionary_payload) // 16
+    values_by_key: dict[int, str] = {}
+    for item_key in requested_keys:
+        if item_key < 0 or item_key >= item_count:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary key is out of range")
+        item_start = item_key * 16
+        values_by_key[item_key] = _id_text(dictionary_payload[item_start : item_start + 16])
+    return values_by_key
+
+
+async def _binary_price_key_map_for_sets(
+    session: Any,
+    table_name: str,
+    price_set_ids: Iterable[str],
+) -> dict[str, int]:
+    """Return price keys only for the requested price-set ids."""
+
+    requested_ids = {
+        _normalize_global_id(price_set_id)
+        for price_set_id in price_set_ids
+        if price_set_id
+    }
+    if not requested_ids:
+        return {}
+    dictionary_payload = await _serving_binary_dictionary_payload(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+    )
+    price_key_by_set_id: dict[str, int] = {}
+    for payload_offset in range(0, len(dictionary_payload), 16):
+        candidate_id = bytes(dictionary_payload[payload_offset : payload_offset + 16])
+        if candidate_id not in requested_ids:
+            continue
+        price_key_by_set_id[_id_text(candidate_id)] = payload_offset // 16
+        if len(price_key_by_set_id) >= len(requested_ids):
+            break
+    return price_key_by_set_id
+
+
+async def _binary_price_key_map(
+    session: Any,
+    table_name: str,
+) -> dict[str, int]:
+    """Return cached ``price_set_id -> price_key`` mappings for a binary table."""
+
+    qualified_table = _safe_qualified_table_name(table_name)
+    cache_key = (qualified_table, f"{_SERVING_BINARY_BY_CODE_DICTIONARY_KIND}:key_by_id")
+    cached_key_by_id = _binary_dictionary_cache_get(cache_key)
+    if cached_key_by_id is not _CACHE_MISS:
+        return cached_key_by_id
+    price_set_id_values = await _serving_binary_dictionary(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+    )
+    price_key_by_set_id = {
+        price_set_id: price_key
+        for price_key, price_set_id in enumerate(price_set_id_values)
+    }
+    _binary_dictionary_cache_set(cache_key, price_key_by_set_id, max(len(price_set_id_values) * 48, 1))
+    return price_key_by_set_id
+
+
+async def _serving_binary_provider_counts(
+    session: Any,
+    table_name: str,
+) -> dict[int, int] | None:
+    qualified_table = _safe_qualified_table_name(table_name)
+    cache_key = (qualified_table, "provider_set_count_dictionary")
+    cached_provider_counts = _binary_dictionary_cache_get(cache_key)
+    if cached_provider_counts is not _CACHE_MISS:
+        return cached_provider_counts
+    provider_count_result = await session.execute(
+        text(
+            f"""
+            SELECT
+                entry_count,
+                payload,
+                COALESCE(to_jsonb(binary_block)->>'payload_compression', 'none') AS payload_compression,
+                NULLIF(to_jsonb(binary_block)->>'raw_payload_bytes', '')::integer AS raw_payload_bytes
+              FROM {qualified_table} binary_block
+             WHERE artifact_kind = :artifact_kind
+               AND block_key = 0
+               AND block_no = 0
+             LIMIT 1
+            """
+        ),
+        {"artifact_kind": "provider_set_count_dictionary"},
+    )
+    provider_count_rows = _result_rows(provider_count_result)
+    if not provider_count_rows:
+        _binary_dictionary_cache_set(cache_key, None, 1)
+        return None
+    provider_count_record = _row_mapping(provider_count_rows[0])
+    provider_count_payload = _decode_serving_binary_payload(provider_count_record)
+    provider_count_map: dict[int, int] = {}
+    payload_cursor = 0
+    provider_set_key = 0
+    for _ in range(int(provider_count_record.get("entry_count") or 0)):
+        provider_delta, payload_cursor = _read_uvarint(provider_count_payload, payload_cursor)
+        provider_count, payload_cursor = _read_uvarint(provider_count_payload, payload_cursor)
+        provider_set_key += provider_delta
+        provider_count_map[provider_set_key] = provider_count
+    _binary_dictionary_cache_set(cache_key, provider_count_map, len(provider_count_payload))
+    return provider_count_map
+
+
+async def lookup_binary_price_atoms_from_db(
+    session: Any,
+    table_name: str,
+    price_set_ids: Iterable[str],
+) -> dict[str, tuple[str, ...]]:
+    """Read ``price_set_id -> price_atom_ids`` mappings from PostgreSQL binary blocks."""
+
+    normalized_set_ids = tuple(
+        dict.fromkeys(_id_text(_normalize_global_id(source_price_set_id)) for source_price_set_id in price_set_ids)
+    )
+    if not normalized_set_ids:
+        return {}
+    price_key_by_set_id = await _binary_price_key_map_for_sets(session, table_name, normalized_set_ids)
+    set_id_by_price_key = {
+        price_key_by_set_id[price_set_id]: price_set_id
+        for price_set_id in normalized_set_ids
+        if price_set_id in price_key_by_set_id
+    }
+    if not set_id_by_price_key:
+        return {}
+    binary_block_records = await _serving_binary_payload_rows_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_PRICE_SET_ATOMS_KIND,
+        block_keys=(price_key // _PRICE_SET_ATOM_BLOCK_SIZE for price_key in set_id_by_price_key),
+    )
+    if not binary_block_records:
+        return {}
+    atom_ids_by_set_id: dict[str, tuple[str, ...]] = {}
+    requested_price_keys = set(set_id_by_price_key)
+    for binary_block_record in binary_block_records:
+        block_payload = _decode_serving_binary_payload(binary_block_record)
+        cursor = 0
+        for _ in range(int(binary_block_record.get("entry_count") or 0)):
+            price_key, cursor = _read_uvarint(block_payload, cursor)
+            atom_count, cursor = _read_uvarint(block_payload, cursor)
+            price_atom_ids: list[str] = []
+            for _atom_index in range(atom_count):
+                atom_end = cursor + 16
+                if atom_end > len(block_payload):
+                    raise PTG2ManifestArtifactError("PTG2 serving binary price-set atom payload is truncated")
+                price_atom_ids.append(_id_text(block_payload[cursor:atom_end]))
+                cursor = atom_end
+            if price_key in requested_price_keys:
+                atom_ids_by_set_id[set_id_by_price_key[price_key]] = tuple(price_atom_ids)
+    return atom_ids_by_set_id
+
+
+async def lookup_atoms_by_price_key(
+    session: Any,
+    table_name: str,
+    price_key_by_set_id: Mapping[str, int],
+) -> dict[str, tuple[str, ...]]:
+    """Read ``price_set_id -> price_atom_ids`` mappings when price keys are already known."""
+
+    set_id_by_price_key = {
+        int(price_key): _id_text(_normalize_global_id(price_set_id))
+        for price_set_id, price_key in price_key_by_set_id.items()
+        if price_set_id and price_key is not None
+    }
+    if not set_id_by_price_key:
+        return {}
+    binary_block_records = await _serving_binary_payload_rows_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_PRICE_SET_ATOMS_KIND,
+        block_keys=(price_key // _PRICE_SET_ATOM_BLOCK_SIZE for price_key in set_id_by_price_key),
+    )
+    if not binary_block_records:
+        return {}
+    atom_ids_by_set_id: dict[str, tuple[str, ...]] = {}
+    requested_price_keys = set(set_id_by_price_key)
+    for binary_block_record in binary_block_records:
+        block_payload = _decode_serving_binary_payload(binary_block_record)
+        cursor = 0
+        for _ in range(int(binary_block_record.get("entry_count") or 0)):
+            price_key, cursor = _read_uvarint(block_payload, cursor)
+            atom_count, cursor = _read_uvarint(block_payload, cursor)
+            price_atom_ids: list[str] = []
+            for _atom_index in range(atom_count):
+                atom_end = cursor + 16
+                if atom_end > len(block_payload):
+                    raise PTG2ManifestArtifactError("PTG2 serving binary price-set atom payload is truncated")
+                price_atom_ids.append(_id_text(block_payload[cursor:atom_end]))
+                cursor = atom_end
+            if price_key in requested_price_keys:
+                atom_ids_by_set_id[set_id_by_price_key[price_key]] = tuple(price_atom_ids)
+    return atom_ids_by_set_id
+
+
+async def lookup_atoms_by_price_id(
+    session: Any,
+    table_name: str,
+    price_set_ids: Iterable[str],
+) -> dict[str, tuple[str, ...]]:
+    """Read ``price_set_id -> price_atom_ids`` mappings directly by price-set id."""
+
+    normalized_set_ids = tuple(
+        dict.fromkeys(_id_text(_normalize_global_id(source_price_set_id)) for source_price_set_id in price_set_ids)
+    )
+    if not normalized_set_ids:
+        return {}
+    requested_ids = {bytes.fromhex(price_set_id) for price_set_id in normalized_set_ids}
+    binary_block_records = await _serving_binary_payload_rows_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND,
+        block_keys=(_price_set_atom_id_bucket(price_set_id) for price_set_id in normalized_set_ids),
+    )
+    if not binary_block_records:
+        return {}
+    atom_ids_by_set_id: dict[str, tuple[str, ...]] = {}
+    for binary_block_record in binary_block_records:
+        block_payload = _decode_serving_binary_payload(binary_block_record)
+        cursor = 0
+        for _ in range(int(binary_block_record.get("entry_count") or 0)):
+            price_set_end = cursor + 16
+            if price_set_end > len(block_payload):
+                raise PTG2ManifestArtifactError("PTG2 serving binary price-set-id atom payload is truncated")
+            price_set_id = bytes(block_payload[cursor:price_set_end])
+            cursor = price_set_end
+            atom_count, cursor = _read_uvarint(block_payload, cursor)
+            atom_bytes = atom_count * 16
+            atom_end = cursor + atom_bytes
+            if atom_end > len(block_payload):
+                raise PTG2ManifestArtifactError("PTG2 serving binary price-set-id atom payload is truncated")
+            if price_set_id in requested_ids:
+                price_atom_ids = tuple(
+                    _id_text(block_payload[atom_cursor : atom_cursor + 16])
+                    for atom_cursor in range(cursor, atom_end, 16)
+                )
+                atom_ids_by_set_id[_id_text(price_set_id)] = price_atom_ids
+                if len(atom_ids_by_set_id) >= len(requested_ids):
+                    return atom_ids_by_set_id
+            cursor = atom_end
+    return atom_ids_by_set_id
+
+
+async def lookup_serving_binary_by_code_from_db(
+    session: Any,
+    table_name: str,
+    code_key: int,
+    *,
+    provider_set_keys: Iterable[int] | None = None,
+) -> tuple[PTG2ServingSidecarRow, ...]:
+    records = await _serving_binary_payload_rows(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+        block_key=int(code_key),
+    )
+    grouped_payload = bool(records)
+    if not records:
+        records = await _serving_binary_payload_rows(
+            session,
+            table_name,
+            artifact_kind=_SERVING_BINARY_BY_CODE_KIND,
+            block_key=int(code_key),
+        )
+    if not records:
+        return ()
+    price_ids = await _serving_binary_dictionary(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+    )
+    provider_count_map = await _serving_binary_provider_counts(session, table_name)
+    provider_filter = {int(value) for value in provider_set_keys} if provider_set_keys is not None else None
+    provider_filter_max = max(provider_filter) if provider_filter else None
+    rows: list[PTG2ServingSidecarRow] = []
+    for record in records:
+        rows.extend(
+            _decode_serving_binary_by_code_record(
+                record,
+                code_key=int(code_key),
+                price_ids=price_ids,
+                provider_count_map=provider_count_map,
+                grouped_payload=grouped_payload,
+                provider_filter=provider_filter,
+                provider_filter_max=provider_filter_max,
+            )
+        )
+    return tuple(rows)
+
+
+def _decode_provider_binary_record(
+    binary_record: Mapping[str, Any],
+    code_filter: set[int] | None,
+) -> tuple[list[tuple[tuple[int, ...], tuple[tuple[int, int], ...]]], set[int]]:
+    """Decode one provider-set binary block without resolving price ids."""
+
+    raw_patterns: list[tuple[tuple[int, ...], tuple[tuple[int, int], ...]]] = []
+    needed_price_keys: set[int] = set()
+    provider_block_payload = _decode_serving_binary_payload(binary_record)
+    cursor = 0
+    for _ in range(int(binary_record.get("entry_count") or 0)):
+        code_count, cursor = _read_uvarint(provider_block_payload, cursor)
+        decoded_code_keys: list[int] = []
+        previous_code_key = 0
+        for index in range(code_count):
+            encoded_code_key, cursor = _read_uvarint(provider_block_payload, cursor)
+            code_key = encoded_code_key if index == 0 else previous_code_key + encoded_code_key
+            if code_filter is None or code_key in code_filter:
+                decoded_code_keys.append(code_key)
+            previous_code_key = code_key
+        entry_count, cursor = _read_uvarint(provider_block_payload, cursor)
+        entries: list[tuple[int, int]] = []
+        for _entry_index in range(entry_count):
+            provider_count, cursor = _read_uvarint(provider_block_payload, cursor)
+            price_key, cursor = _read_uvarint(provider_block_payload, cursor)
+            if decoded_code_keys:
+                entries.append((provider_count, price_key))
+                needed_price_keys.add(price_key)
+        if decoded_code_keys and entries:
+            raw_patterns.append((tuple(decoded_code_keys), tuple(entries)))
+    return raw_patterns, needed_price_keys
+
+
+async def lookup_serving_binary_by_provider_set_patterns_from_db(
+    session: Any,
+    table_name: str,
+    provider_set_key: int,
+    *,
+    code_keys: Iterable[int] | None = None,
+) -> tuple[PTG2ServingProviderSetPattern, ...]:
+    records = await _serving_binary_payload_rows(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_PROVIDER_SET_KIND,
+        block_key=int(provider_set_key),
+    )
+    if not records:
+        return ()
+    code_filter = {int(value) for value in code_keys} if code_keys is not None else None
+    raw_patterns: list[tuple[tuple[int, ...], tuple[tuple[int, int], ...]]] = []
+    needed_price_keys: set[int] = set()
+    for record in records:
+        record_patterns, record_price_keys = _decode_provider_binary_record(record, code_filter)
+        raw_patterns.extend(record_patterns)
+        needed_price_keys.update(record_price_keys)
+    price_ids_by_key = await _serving_binary_dictionary_values_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND,
+        item_keys=needed_price_keys,
+    )
+    patterns: list[PTG2ServingProviderSetPattern] = []
+    for decoded_code_keys, entries in raw_patterns:
+        resolved_entries = tuple(
+            (provider_count, price_ids_by_key[price_key])
+            for provider_count, price_key in entries
+            if price_key in price_ids_by_key
+        )
+        if resolved_entries:
+            patterns.append(
+                PTG2ServingProviderSetPattern(
+                    code_keys=decoded_code_keys,
+                    entries=resolved_entries,
+                )
+            )
+    return tuple(patterns)
+
+
+async def lookup_serving_binary_by_provider_set_from_db(
+    session: Any,
+    table_name: str,
+    provider_set_key: int,
+    *,
+    code_keys: Iterable[int] | None = None,
+) -> tuple[PTG2ServingSidecarRow, ...]:
+    patterns = await lookup_serving_binary_by_provider_set_patterns_from_db(
+        session,
+        table_name,
+        int(provider_set_key),
+        code_keys=code_keys,
+    )
+    rows: list[PTG2ServingSidecarRow] = []
+    for pattern in patterns:
+        for code_key in pattern.code_keys:
+            for provider_count, price_set_id in pattern.entries:
+                rows.append(
+                    PTG2ServingSidecarRow(
+                        code_key=code_key,
+                        provider_set_key=int(provider_set_key),
+                        provider_count=provider_count,
+                        price_set_global_id_128=price_set_id,
+                    )
+                )
+    return tuple(rows)
 
 
 def _index_lookup(index_bytes: bytes, key: bytes, entry_count: int) -> tuple[int, int] | None:

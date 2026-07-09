@@ -1,0 +1,218 @@
+{
+  "version": 1,
+  "title": "PTG2 PostgreSQL Binary Serving Local Storage Probe",
+  "description": "Local self-harness suite for testing compact forward and reverse serving blocks stored as PostgreSQL bytea rows instead of pod-local files.",
+  "scanner_binary": "support/ptg2_scanner/target/release/ptg2_scanner",
+  "gates": {
+    "min_improvement_pct": 0.0,
+    "max_memory_growth_pct": 50.0,
+    "min_storage_ratio": 15.0
+  },
+  "variants": [
+    {
+      "id": "table_serving_current",
+      "description": "Current table-backed lean serving layout, retained for direct A/B storage comparison.",
+      "analyze_serving_sidecar": true,
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "8",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "16",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "64",
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "8192",
+        "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "33554432",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "sidecar_scope_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v2",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED": "false",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "false"
+      }
+    },
+    {
+      "id": "postgres_binary_probe",
+      "description": "Sidecar-scope import retaining the lean serving table long enough to materialize and benchmark DB-backed binary serving blocks.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "8",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "16",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "64",
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "8192",
+        "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "33554432",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v2",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED": "false",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "false",
+        "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION": "zlib",
+        "HLTHPRT_PTG2_RESEARCH_POSTGRES_BINARY": "1",
+        "HLTHPRT_PTG2_RESEARCH_POSTGRES_BINARY_REVERSE": "1"
+      }
+    },
+    {
+      "id": "postgres_binary_final",
+      "description": "Final production shape: build PostgreSQL binary serving blocks with Rust/COPY and drop the transient lean serving table.",
+      "expect_serving_row_strategy": "postgres_binary",
+      "expect_serving_table_retained": false,
+      "expect_serving_table_exists": false,
+      "expect_serving_binary_table_exists": true,
+      "expect_serving_binary_writer": "rust_stream",
+      "expect_serving_binary_kinds": [
+        "by_code_grouped",
+        "by_code_price_dictionary",
+        "by_provider_set",
+        "by_provider_set_price_dictionary",
+        "price_set_atoms",
+        "price_set_atoms_by_id",
+        "provider_set_count_dictionary"
+      ],
+      "expect_serving_sidecar_artifacts": false,
+      "api_latency_probe": true,
+      "api_latency_max_ms": 40,
+      "api_probe_iterations": 20,
+      "api_probe_warmup": 4,
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "8",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "16",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "64",
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "8192",
+        "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "33554432",
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v1",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT": "lean_provider_key_v1",
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_LAYOUT": "lean_dict_v2",
+        "HLTHPRT_PTG2_MANIFEST_SIDECARS_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED": "true",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_SIDECARS_ENABLED": "false",
+        "HLTHPRT_PTG2_MANIFEST_DROP_SERVING_TABLE_AFTER_SIDECARS": "true",
+        "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION": "zlib",
+        "HLTHPRT_PTG2_DB_BINARY_BLOCK_CACHE_BYTES": "0",
+        "HLTHPRT_PTG2_DB_BINARY_DICTIONARY_CACHE_BYTES": "0",
+        "HLTHPRT_PTG2_DB_SIDECAR_CHUNK_CACHE_BYTES": "0"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "local-postgres-binary-vs-current-table-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "billing_codes": 64,
+      "provider_sets": 4,
+      "price_reuse_mod": 256,
+      "source_key": "local-postgres-binary-ab-current-shape",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": false,
+      "serving_sidecar_max_rows": 1000000,
+      "max_bytes": 268435456,
+      "gates": {
+        "baseline_variant": "table_serving_current",
+        "performance": false,
+        "memory": false,
+        "min_storage_ratio": 15.0
+      },
+      "variants": ["table_serving_current", "postgres_binary_final"]
+    },
+    {
+      "id": "local-postgres-binary-vs-current-table-256k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 262144,
+      "billing_codes": 128,
+      "provider_sets": 8,
+      "price_reuse_mod": 1024,
+      "source_key": "local-postgres-binary-ab-current-medium",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": false,
+      "serving_sidecar_max_rows": 1000000,
+      "max_bytes": 536870912,
+      "gates": {
+        "baseline_variant": "table_serving_current",
+        "performance": false,
+        "memory": false,
+        "min_storage_ratio": 15.0
+      },
+      "variants": ["table_serving_current", "postgres_binary_final"]
+    },
+    {
+      "id": "local-postgres-binary-vs-current-table-1m",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 1048576,
+      "billing_codes": 256,
+      "provider_sets": 16,
+      "price_reuse_mod": 4096,
+      "source_key": "local-postgres-binary-ab-current-large",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": false,
+      "serving_sidecar_max_rows": 2000000,
+      "max_bytes": 2147483648,
+      "gates": {
+        "baseline_variant": "table_serving_current",
+        "performance": false,
+        "memory": false,
+        "min_storage_ratio": 15.0,
+        "min_snapshot_total_ratio": 20.0,
+        "min_import_total_improvement_pct": 0.0
+      },
+      "variants": ["table_serving_current", "postgres_binary_final"]
+    },
+    {
+      "id": "local-postgres-binary-group-shape-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "billing_codes": 64,
+      "provider_sets": 4,
+      "price_reuse_mod": 256,
+      "source_key": "local-postgres-binary-group-shape",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": true,
+      "serving_sidecar_max_rows": 1000000,
+      "max_bytes": 268435456,
+      "gates": {
+        "performance": false,
+        "min_storage_ratio": 15.0
+      },
+      "variants": ["postgres_binary_probe"]
+    },
+    {
+      "id": "local-postgres-binary-final-tableless-64k",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 65536,
+      "billing_codes": 64,
+      "provider_sets": 4,
+      "price_reuse_mod": 256,
+      "source_key": "local-postgres-binary-final-shape",
+      "import_month": "2026-07",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "analyze_serving_sidecar": false,
+      "max_bytes": 268435456,
+      "gates": {
+        "performance": false,
+        "memory": false,
+        "storage": false,
+        "baseline_variant": "postgres_binary_probe"
+      },
+      "variants": ["postgres_binary_probe", "postgres_binary_final"]
+    }
+  ]
+}
