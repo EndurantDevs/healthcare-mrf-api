@@ -873,6 +873,16 @@ network refs:
   --format markdown
 ```
 
+The full report keeps exact aggregate coverage under
+`source_resource_coverage_summary` and separately emits bounded per-source
+checks under `source_semantic_readiness_summary`. The semantic section verifies
+that downloaded resources produce valid NPIs, canonical addresses, usable
+phones and coordinates, resolved direct or HealthcareService-mediated
+role/location links, resolved role/plan links, and named network evidence.
+These checks use source-keyed `EXISTS` probes with explicit limits; increase
+`--sample-limit` to cover more catalog sources without turning the audit into a
+full-table aggregate scan.
+
 When `--retest-results-path` is present, the audit checks that every
 `valid`, `valid_non_fhir`, and `auth_required` retest endpoint is covered by
 the current normalized `provider_directory_source` catalog or by an intentional

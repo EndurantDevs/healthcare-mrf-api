@@ -2415,7 +2415,7 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
 
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_source_resource_coverage_summary(monkeypatch):
-    async def relation_exists(_conn, _schema, name):
+    async def is_relation_available(_conn, _schema, name):
         return name in {
             "provider_directory_source",
             "provider_directory_location",
@@ -2427,7 +2427,7 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
             "entity_address_unified",
         }
 
-    async def column_exists(_conn, _schema, table, column):
+    async def is_column_available(_conn, _schema, table, column):
         return (table, column) in {
             ("provider_directory_location", "address_key"),
             ("provider_directory_organization", "address_json"),
@@ -2519,8 +2519,8 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
                 }
             ]
 
-    monkeypatch.setattr(audit, "_relation_exists", relation_exists)
-    monkeypatch.setattr(audit, "_column_exists", column_exists)
+    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
+    monkeypatch.setattr(audit, "_column_exists", is_column_available)
 
     summary = await audit._source_resource_coverage_summary(
         FakeConn(),
@@ -2550,6 +2550,182 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
         summary["organization_address_without_unified_samples"][0]["source_id"]
         == "pdfhir_org_no_projection"
     )
+
+
+def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and_typed():
+    sql = audit._source_semantic_readiness_sql(
+        "mrf",
+        available_tables={
+            "provider_directory_practitioner",
+            "provider_directory_organization",
+            "provider_directory_location",
+            "provider_directory_practitioner_role",
+            "provider_directory_insurance_plan",
+            "provider_directory_healthcare_service",
+            "provider_directory_address_overlay",
+            "provider_directory_network_catalog",
+        },
+        include_unified=True,
+    )
+
+    assert "LIMIT ($1::integer + 1)" in sql
+    assert sql.count("LIMIT 1") >= 14
+    assert "count(*)" not in sql.lower()
+    assert "GROUP BY" not in sql
+    assert "practitioner.npi BETWEEN 1000000000::bigint AND 9999999999::bigint" in sql
+    assert "role.source_id = src.source_id" in sql
+    assert "location.source_id = role.source_id" in sql
+    assert "insurance_plan.source_id = role.source_id" in sql
+    assert "healthcare_service.location_refs" in sql
+    assert "telecom.value->>'system'" in sql
+    assert "network_catalog.distinct_ref_count > 0::bigint" in sql
+    assert "AS has_usable_coordinates" in sql
+    assert "AS has_resolved_network_evidence" in sql
+    assert ")::boolean\n                   AS has_valid_npi" in sql
+
+
+def test_provider_directory_coverage_audit_semantic_readiness_sql_types_missing_relations():
+    sql = audit._source_semantic_readiness_sql(
+        "mrf",
+        available_tables=set(),
+        include_unified=False,
+    )
+
+    assert 'FROM "mrf"."provider_directory_source"' in sql
+    assert sql.count("false::boolean") >= 10
+    assert '"mrf"."provider_directory_address_overlay"' not in sql
+    assert '"mrf"."provider_directory_network_catalog"' not in sql
+
+
+def _semantic_readiness_probe_rows():
+    """Return one ready source, one raw-only source, and one truncation sentinel."""
+    return [
+        {
+            "source_id": "pdfhir_ready",
+            "has_provider_rows": True,
+            "has_valid_npi": True,
+            "has_location_rows": True,
+            "has_raw_phone": True,
+            "has_role_rows": True,
+            "has_insurance_plan_rows": True,
+            "has_role_location_refs": True,
+            "has_resolved_role_location": True,
+            "has_role_plan_refs": True,
+            "has_resolved_role_plan": True,
+            "has_network_refs": True,
+            "has_canonical_address": True,
+            "has_usable_phone": True,
+            "has_usable_coordinates": True,
+            "has_resolved_network_evidence": True,
+        },
+        {
+            "source_id": "pdfhir_raw_only",
+            "has_provider_rows": True,
+            "has_valid_npi": True,
+            "has_location_rows": True,
+            "has_raw_phone": True,
+            "has_role_rows": True,
+            "has_insurance_plan_rows": True,
+            "has_role_location_refs": True,
+            "has_resolved_role_location": False,
+            "has_role_plan_refs": True,
+            "has_resolved_role_plan": False,
+            "has_network_refs": True,
+            "has_canonical_address": False,
+            "has_usable_phone": False,
+            "has_usable_coordinates": False,
+            "has_resolved_network_evidence": False,
+        },
+        {"source_id": "pdfhir_truncation_sentinel"},
+    ]
+
+
+def _assert_semantic_readiness_markdown(summary):
+    """Assert the bounded semantic source details are visible in Markdown."""
+    markdown = audit.render_markdown(
+        {
+            "generated_at": "2026-07-10T00:00:00Z",
+            "schema": "mrf",
+            "source_semantic_readiness_summary": summary,
+        }
+    )
+    assert "## Per-Source Semantic Readiness" in markdown
+    assert "`True/True`" in markdown
+    assert "resolved_network_evidence" in markdown
+
+
+def _assert_semantic_readiness_summary(summary):
+    """Assert bounded readiness counts and source-level gap classification."""
+    assert summary["summary_source"] == "bounded_per_source_exists_probes"
+    assert summary["sampled_source_count"] == 2
+    assert summary["source_limit"] == 2
+    assert summary["truncated"] is True
+    assert summary["counts_are_sampled"] is True
+    assert summary["sources_with_resource_rows"] == 2
+    assert summary["sources_with_valid_npis"] == 2
+    assert summary["sources_with_canonical_addresses"] == 1
+    assert summary["sources_with_usable_coordinates"] == 1
+    assert summary["sources_with_resolved_role_locations"] == 1
+    assert summary["sources_with_resolved_role_plans"] == 1
+    assert summary["sources_with_resolved_network_evidence"] == 1
+    assert summary["semantic_ready_source_count"] == 1
+    assert summary["raw_only_source_count"] == 1
+    assert summary["samples"][0]["semantic_ready"] is True
+    assert summary["samples"][1]["semantic_readiness_gaps"] == [
+        "canonical_address",
+        "usable_phone",
+        "usable_coordinates",
+        "resolved_role_location",
+        "resolved_role_plan",
+        "resolved_network_evidence",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_source_semantic_readiness_summary(monkeypatch):
+    """Bounded samples distinguish acquisition rows from usable semantic links."""
+
+    async def is_relation_available(_conn, _schema, name):
+        return name in {
+            "provider_directory_source",
+            "provider_directory_practitioner",
+            "provider_directory_organization",
+            "provider_directory_location",
+            "provider_directory_practitioner_role",
+            "provider_directory_insurance_plan",
+            "provider_directory_healthcare_service",
+            "provider_directory_address_overlay",
+            "provider_directory_network_catalog",
+        }
+
+    async def is_column_available(_conn, _schema, table_name, column_name):
+        return table_name == "provider_directory_address_overlay" and column_name in {"lat", "long"}
+
+    class FakeConn:
+        def __init__(self):
+            self.sql = ""
+            self.args = ()
+
+        async def fetch(self, sql, *args):
+            self.sql = sql
+            self.args = args
+            return _semantic_readiness_probe_rows()
+
+    conn = FakeConn()
+    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
+    monkeypatch.setattr(audit, "_column_exists", is_column_available)
+
+    summary = await audit._bounded_source_semantic_readiness_summary(
+        conn,
+        "mrf",
+        sample_limit=2,
+        include_unified=True,
+    )
+
+    assert conn.args == (2,)
+    assert summary["coordinate_check_available"] is True
+    _assert_semantic_readiness_summary(summary)
+    _assert_semantic_readiness_markdown(summary)
 
 
 @pytest.mark.asyncio

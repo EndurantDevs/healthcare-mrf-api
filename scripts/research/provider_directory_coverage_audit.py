@@ -2807,6 +2807,571 @@ async def _source_resource_coverage_summary(
     return row
 
 
+PROVIDER_DIRECTORY_SEMANTIC_PROBE_TABLES = frozenset(
+    {
+        "provider_directory_practitioner",
+        "provider_directory_organization",
+        "provider_directory_location",
+        "provider_directory_practitioner_role",
+        "provider_directory_insurance_plan",
+        "provider_directory_healthcare_service",
+        "provider_directory_organization_affiliation",
+        "provider_directory_address_overlay",
+        "provider_directory_network_catalog",
+    }
+)
+
+
+def _bounded_source_exists_sql(
+    db_schema: str,
+    available_table_names: set[str],
+    table_name: str,
+    table_alias: str,
+    condition_sql: str = "true",
+) -> str:
+    """Build one source-keyed EXISTS probe with an explicit one-row bound."""
+    if table_name not in available_table_names:
+        return "false::boolean"
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {_qt(db_schema, table_name)} AS {table_alias}
+             WHERE {table_alias}.source_id = src.source_id
+               AND ({condition_sql})
+             LIMIT 1
+        )
+    """
+
+
+def _source_base_probe_sql_by_name(db_schema: str, available_table_names: set[str]) -> dict[str, str]:
+    """Return raw-resource and provider identity probe expressions."""
+    exists_sql = _bounded_source_exists_sql
+    return {
+        "practitioner": exists_sql(
+            db_schema, available_table_names, "provider_directory_practitioner", "practitioner"
+        ),
+        "organization": exists_sql(
+            db_schema, available_table_names, "provider_directory_organization", "organization"
+        ),
+        "practitioner_npi": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_practitioner",
+            "practitioner",
+            "practitioner.npi BETWEEN 1000000000::bigint AND 9999999999::bigint",
+        ),
+        "organization_npi": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_organization",
+            "organization",
+            "organization.npi BETWEEN 1000000000::bigint AND 9999999999::bigint",
+        ),
+        "location": exists_sql(
+            db_schema, available_table_names, "provider_directory_location", "location"
+        ),
+        "raw_phone": _source_raw_phone_sql(db_schema, available_table_names),
+        "role": exists_sql(
+            db_schema, available_table_names, "provider_directory_practitioner_role", "role"
+        ),
+        "plan": exists_sql(
+            db_schema, available_table_names, "provider_directory_insurance_plan", "insurance_plan"
+        ),
+    }
+
+
+def _source_json_telecom_phone_sql(
+    db_schema: str,
+    available_table_names: set[str],
+    table_name: str,
+    table_alias: str,
+) -> str:
+    """Probe a source-scoped FHIR telecom array for a usable phone value."""
+    if table_name not in available_table_names:
+        return "false::boolean"
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {_qt(db_schema, table_name)} AS {table_alias}
+              CROSS JOIN LATERAL jsonb_array_elements(
+                  COALESCE({table_alias}.telecom::jsonb, '[]'::jsonb)
+              ) AS telecom(value)
+             WHERE {table_alias}.source_id = src.source_id
+               AND lower(COALESCE(telecom.value->>'system', '')) = 'phone'
+               AND NULLIF(BTRIM(telecom.value->>'value'), '') IS NOT NULL
+             LIMIT 1
+        )
+    """
+
+
+def _source_raw_phone_sql(db_schema: str, available_table_names: set[str]) -> str:
+    """Probe every contact path used by the address overlay publisher."""
+    phone_sql_list = [
+        _bounded_source_exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_location",
+            "phone_location",
+            "NULLIF(BTRIM(COALESCE(phone_location.phone_number, phone_location.telephone_number)), '') IS NOT NULL",
+        )
+    ]
+    phone_sql_list.extend(
+        _source_json_telecom_phone_sql(
+            db_schema,
+            available_table_names,
+            table_name,
+            table_alias,
+        )
+        for table_name, table_alias in (
+            ("provider_directory_practitioner", "phone_practitioner"),
+            ("provider_directory_organization", "phone_organization"),
+            ("provider_directory_practitioner_role", "phone_role"),
+            ("provider_directory_healthcare_service", "phone_service"),
+        )
+    )
+    return "(" + " OR ".join(phone_sql_list) + ")::boolean"
+
+
+def _resolved_role_reference_sql(
+    db_schema: str,
+    available_table_names: set[str],
+    *,
+    reference_column: str,
+    resource_type: str,
+    target_table_name: str,
+    target_alias: str,
+) -> str:
+    """Resolve one role reference through source/resource primary keys."""
+    required_table_names = {"provider_directory_practitioner_role", target_table_name}
+    if not required_table_names.issubset(available_table_names):
+        return "false::boolean"
+    ref_alias = f"{target_alias}_ref"
+    resource_id_sql = _sql_fhir_reference_resource_id(f"{ref_alias}.value", resource_type)
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {_qt(db_schema, "provider_directory_practitioner_role")} AS role
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                  COALESCE(role.{reference_column}::jsonb, '[]'::jsonb)
+              ) AS {ref_alias}(value)
+              JOIN {_qt(db_schema, target_table_name)} AS {target_alias}
+                ON {target_alias}.source_id = role.source_id
+               AND {target_alias}.resource_id = {resource_id_sql}
+             WHERE role.source_id = src.source_id
+             LIMIT 1
+        )
+    """
+
+
+def _role_healthcare_service_location_sql(
+    db_schema: str,
+    available_table_names: set[str],
+    *,
+    require_resolved_location: bool,
+) -> str:
+    """Probe role-to-service-to-location references, optionally resolving Location."""
+    required_table_names = {
+        "provider_directory_practitioner_role",
+        "provider_directory_healthcare_service",
+    }
+    if require_resolved_location:
+        required_table_names.add("provider_directory_location")
+    if not required_table_names.issubset(available_table_names):
+        return "false::boolean"
+    location_join = ""
+    if require_resolved_location:
+        location_resource_id = _sql_fhir_reference_resource_id(
+            "location_ref.value",
+            "Location",
+        )
+        location_join = f"""
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                  COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+              ) AS location_ref(value)
+              JOIN {_qt(db_schema, "provider_directory_location")} AS location
+                ON location.source_id = role.source_id
+               AND location.resource_id = {location_resource_id}
+        """
+    else:
+        location_join = (
+            "AND jsonb_array_length("
+            "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)"
+            ") > 0"
+        )
+    service_resource_id = _sql_fhir_reference_resource_id(
+        "service_ref.value",
+        "HealthcareService",
+    )
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {_qt(db_schema, "provider_directory_practitioner_role")} AS role
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                  COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+              ) AS service_ref(value)
+              JOIN {_qt(db_schema, "provider_directory_healthcare_service")} AS healthcare_service
+                ON healthcare_service.source_id = role.source_id
+               AND healthcare_service.resource_id = {service_resource_id}
+              {location_join}
+             WHERE role.source_id = src.source_id
+             LIMIT 1
+        )
+    """
+
+
+def _role_location_probe_sql_by_name(
+    db_schema: str,
+    available_table_names: set[str],
+) -> dict[str, str]:
+    """Return direct and HealthcareService-mediated role/location probes."""
+    exists_sql = _bounded_source_exists_sql
+    role_location_refs_sql = exists_sql(
+        db_schema,
+        available_table_names,
+        "provider_directory_practitioner_role",
+        "role",
+        "jsonb_array_length(COALESCE(role.location_refs::jsonb, '[]'::jsonb)) > 0",
+    )
+    service_location_refs_sql = _role_healthcare_service_location_sql(
+        db_schema,
+        available_table_names,
+        require_resolved_location=False,
+    )
+    direct_resolved_location_sql = _resolved_role_reference_sql(
+        db_schema,
+        available_table_names,
+        reference_column="location_refs",
+        resource_type="Location",
+        target_table_name="provider_directory_location",
+        target_alias="location",
+    )
+    service_resolved_location_sql = _role_healthcare_service_location_sql(
+        db_schema,
+        available_table_names,
+        require_resolved_location=True,
+    )
+    return {
+        "role_location_refs": f"({role_location_refs_sql} OR {service_location_refs_sql})::boolean",
+        "resolved_role_location": (
+            f"({direct_resolved_location_sql} OR {service_resolved_location_sql})::boolean"
+        ),
+    }
+
+
+def _source_link_probe_sql_by_name(db_schema: str, available_table_names: set[str]) -> dict[str, str]:
+    """Return raw and resolved role/location, role/plan, and network probes."""
+    exists_sql = _bounded_source_exists_sql
+    role_plan_refs_sql = exists_sql(
+        db_schema,
+        available_table_names,
+        "provider_directory_practitioner_role",
+        "role",
+        "jsonb_array_length(COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)) > 0",
+    )
+    network_ref_sql_list = [
+        exists_sql(
+            db_schema,
+            available_table_names,
+            table_name,
+            table_alias,
+            f"jsonb_array_length(COALESCE({table_alias}.network_refs::jsonb, '[]'::jsonb)) > 0",
+        )
+        for table_name, table_alias in (
+            ("provider_directory_insurance_plan", "network_plan"),
+            ("provider_directory_practitioner_role", "network_role"),
+        )
+        if table_name in available_table_names
+    ]
+    network_refs_sql = (
+        "(" + " OR ".join(network_ref_sql_list) + ")::boolean"
+        if network_ref_sql_list
+        else "false::boolean"
+    )
+    probe_sql_by_name = _role_location_probe_sql_by_name(db_schema, available_table_names)
+    probe_sql_by_name.update({
+        "role_plan_refs": role_plan_refs_sql,
+        "resolved_role_plan": _resolved_role_reference_sql(
+            db_schema,
+            available_table_names,
+            reference_column="insurance_plan_refs",
+            resource_type="InsurancePlan",
+            target_table_name="provider_directory_insurance_plan",
+            target_alias="insurance_plan",
+        ),
+        "network_refs": network_refs_sql,
+    })
+    return probe_sql_by_name
+
+
+def _source_downstream_probe_sql_by_name(
+    db_schema: str,
+    available_table_names: set[str],
+    *,
+    include_unified: bool,
+    include_coordinates: bool,
+) -> dict[str, str]:
+    """Return canonical address, usable phone, and resolved network probes."""
+    exists_sql = _bounded_source_exists_sql
+    canonical_address_sql = "false::boolean"
+    usable_phone_sql = "false::boolean"
+    usable_coordinates_sql = "false::boolean"
+    if include_unified:
+        canonical_address_sql = exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_address_overlay",
+            "address_overlay",
+            "address_overlay.address_key IS NOT NULL",
+        )
+        usable_phone_sql = exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_address_overlay",
+            "phone_overlay",
+            "NULLIF(BTRIM(COALESCE(phone_overlay.phone_number, phone_overlay.telephone_number)), '') IS NOT NULL",
+        )
+        if include_coordinates:
+            usable_coordinates_sql = exists_sql(
+                db_schema,
+                available_table_names,
+                "provider_directory_address_overlay",
+                "coordinate_overlay",
+                "coordinate_overlay.lat BETWEEN -90::numeric AND 90::numeric "
+                "AND coordinate_overlay.long BETWEEN -180::numeric AND 180::numeric "
+                "AND NOT (coordinate_overlay.lat = 0::numeric AND coordinate_overlay.long = 0::numeric)",
+            )
+    return {
+        "canonical_address": canonical_address_sql,
+        "usable_phone": usable_phone_sql,
+        "usable_coordinates": usable_coordinates_sql,
+        "resolved_network": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_network_catalog",
+            "network_catalog",
+            "network_catalog.distinct_ref_count > 0::bigint "
+            "AND network_catalog.provider_directory_network_name IS NOT NULL "
+            "AND network_catalog.provider_directory_issuer_network_match_key IS NOT NULL",
+        ),
+    }
+
+
+def _source_semantic_readiness_sql(
+    schema: str,
+    *,
+    available_tables: set[str],
+    include_unified: bool,
+    include_coordinates: bool = True,
+) -> str:
+    """Build a bounded, typed per-source semantic readiness query."""
+    probe_sql_by_name = _source_base_probe_sql_by_name(schema, available_tables)
+    probe_sql_by_name.update(_source_link_probe_sql_by_name(schema, available_tables))
+    probe_sql_by_name.update(
+        _source_downstream_probe_sql_by_name(
+            schema,
+            available_tables,
+            include_unified=include_unified,
+            include_coordinates=include_coordinates,
+        )
+    )
+    return f"""
+        WITH selected_sources AS (
+            SELECT source_id::varchar AS source_id,
+                   org_name,
+                   plan_name,
+                   canonical_api_base,
+                   last_probe_status,
+                   last_validated_status,
+                   auth_type
+              FROM {_qt(schema, "provider_directory_source")}
+             ORDER BY source_id
+             LIMIT ($1::integer + 1)
+        )
+        SELECT src.*,
+               ({probe_sql_by_name['practitioner']} OR {probe_sql_by_name['organization']})::boolean
+                   AS has_provider_rows,
+               ({probe_sql_by_name['practitioner_npi']} OR {probe_sql_by_name['organization_npi']})::boolean
+                   AS has_valid_npi,
+               ({probe_sql_by_name['location']})::boolean AS has_location_rows,
+               ({probe_sql_by_name['raw_phone']})::boolean AS has_raw_phone,
+               ({probe_sql_by_name['role']})::boolean AS has_role_rows,
+               ({probe_sql_by_name['plan']})::boolean AS has_insurance_plan_rows,
+               ({probe_sql_by_name['role_location_refs']})::boolean AS has_role_location_refs,
+               ({probe_sql_by_name['resolved_role_location']})::boolean AS has_resolved_role_location,
+               ({probe_sql_by_name['role_plan_refs']})::boolean AS has_role_plan_refs,
+               ({probe_sql_by_name['resolved_role_plan']})::boolean AS has_resolved_role_plan,
+               ({probe_sql_by_name['network_refs']})::boolean AS has_network_refs,
+               ({probe_sql_by_name['canonical_address']})::boolean AS has_canonical_address,
+               ({probe_sql_by_name['usable_phone']})::boolean AS has_usable_phone,
+               ({probe_sql_by_name['usable_coordinates']})::boolean AS has_usable_coordinates,
+               ({probe_sql_by_name['resolved_network']})::boolean AS has_resolved_network_evidence
+          FROM selected_sources AS src
+         ORDER BY src.source_id
+    """
+
+
+def _count_sources_with_field(source_samples: list[dict[str, Any]], field_name: str) -> int:
+    """Count sampled sources whose named readiness field is truthy."""
+    return sum(1 for source_sample in source_samples if source_sample.get(field_name))
+
+
+def _annotate_semantic_source_samples(source_samples: list[dict[str, Any]]) -> None:
+    """Add raw acquisition and semantic gap labels to sampled source rows."""
+    gap_label_by_field = {
+        "has_valid_npi": "valid_npi",
+        "has_canonical_address": "canonical_address",
+        "has_usable_phone": "usable_phone",
+        "has_usable_coordinates": "usable_coordinates",
+        "has_resolved_role_location": "resolved_role_location",
+        "has_resolved_role_plan": "resolved_role_plan",
+        "has_resolved_network_evidence": "resolved_network_evidence",
+    }
+    raw_field_names = (
+        "has_provider_rows",
+        "has_location_rows",
+        "has_role_rows",
+        "has_insurance_plan_rows",
+    )
+    for source_sample in source_samples:
+        source_sample["has_raw_resource_rows"] = any(
+            bool(source_sample.get(field_name)) for field_name in raw_field_names
+        )
+        source_sample["semantic_readiness_gaps"] = [
+            gap_label
+            for field_name, gap_label in gap_label_by_field.items()
+            if not source_sample.get(field_name)
+        ]
+        source_sample["semantic_ready"] = not source_sample["semantic_readiness_gaps"]
+
+
+def _semantic_source_counts_by_metric(source_samples: list[dict[str, Any]]) -> dict[str, int]:
+    """Count each acquisition and usability signal in a bounded source sample."""
+    field_by_metric = {
+        "sources_with_resource_rows": "has_raw_resource_rows",
+        "sources_with_provider_rows": "has_provider_rows",
+        "sources_with_valid_npis": "has_valid_npi",
+        "sources_with_location_rows": "has_location_rows",
+        "sources_with_canonical_addresses": "has_canonical_address",
+        "sources_with_raw_phones": "has_raw_phone",
+        "sources_with_usable_phones": "has_usable_phone",
+        "sources_with_usable_coordinates": "has_usable_coordinates",
+        "sources_with_role_rows": "has_role_rows",
+        "sources_with_role_location_refs": "has_role_location_refs",
+        "sources_with_resolved_role_locations": "has_resolved_role_location",
+        "sources_with_role_plan_refs": "has_role_plan_refs",
+        "sources_with_resolved_role_plans": "has_resolved_role_plan",
+        "sources_with_network_refs": "has_network_refs",
+        "sources_with_resolved_network_evidence": "has_resolved_network_evidence",
+        "semantic_ready_source_count": "semantic_ready",
+    }
+    return {
+        metric_name: _count_sources_with_field(source_samples, field_name)
+        for metric_name, field_name in field_by_metric.items()
+    }
+
+
+def _semantic_summary_by_metric(
+    source_samples: list[dict[str, Any]],
+    available_table_names: set[str],
+    *,
+    source_limit: int,
+    is_truncated: bool,
+    include_unified: bool,
+) -> dict[str, Any]:
+    """Assemble bounded semantic counts, percentages, samples, and compatibility keys."""
+    source_counts_by_metric = _semantic_source_counts_by_metric(source_samples)
+    sampled_source_count = len(source_samples)
+    resource_source_count = source_counts_by_metric["sources_with_resource_rows"]
+    location_source_count = source_counts_by_metric["sources_with_location_rows"]
+    canonical_source_count = source_counts_by_metric["sources_with_canonical_addresses"]
+    phone_source_count = source_counts_by_metric["sources_with_usable_phones"]
+    coordinate_source_count = source_counts_by_metric["sources_with_usable_coordinates"]
+    summary_by_metric = {
+        "available": True,
+        "summary_source": "bounded_per_source_exists_probes",
+        "counts_are_sampled": is_truncated,
+        "source_limit": source_limit,
+        "sampled_source_count": sampled_source_count,
+        "source_count": sampled_source_count,
+        "truncated": is_truncated,
+        "available_tables": sorted(available_table_names),
+        "catalog_only_source_count": sampled_source_count - resource_source_count,
+        "raw_only_source_count": sum(
+            1
+            for source_sample in source_samples
+            if source_sample["has_raw_resource_rows"] and not source_sample["semantic_ready"]
+        ),
+        "resource_source_pct": _pct(resource_source_count, sampled_source_count),
+        "location_source_pct": _pct(location_source_count, sampled_source_count),
+        "canonical_address_source_pct": _pct(canonical_source_count, sampled_source_count),
+        "usable_phone_source_pct": _pct(phone_source_count, sampled_source_count),
+        "usable_coordinate_source_pct": _pct(coordinate_source_count, sampled_source_count),
+        "semantic_ready_source_pct": _pct(
+            source_counts_by_metric["semantic_ready_source_count"], sampled_source_count
+        ),
+        "unified_available": (
+            include_unified and "provider_directory_address_overlay" in available_table_names
+        ),
+        "samples": source_samples,
+    }
+    summary_by_metric.update(source_counts_by_metric)
+    return summary_by_metric
+
+
+async def _bounded_source_semantic_readiness_summary(
+    connection: asyncpg.Connection,
+    db_schema: str,
+    *,
+    sample_limit: int,
+    include_unified: bool,
+) -> dict[str, Any]:
+    """Sample per-source acquisition and semantic usability with bounded probes."""
+    if not await _relation_exists(connection, db_schema, "provider_directory_source"):
+        return {"available": False, "samples": []}
+
+    available_tables = {
+        table_name
+        for table_name in PROVIDER_DIRECTORY_SEMANTIC_PROBE_TABLES
+        if await _relation_exists(connection, db_schema, table_name)
+    }
+    include_coordinates = False
+    if "provider_directory_address_overlay" in available_tables:
+        coordinate_columns = [
+            await _column_exists(
+                connection,
+                db_schema,
+                "provider_directory_address_overlay",
+                column_name,
+            )
+            for column_name in ("lat", "long")
+        ]
+        include_coordinates = all(coordinate_columns)
+    source_limit = max(1, int(sample_limit))
+    source_probe_rows = await connection.fetch(
+        _source_semantic_readiness_sql(
+            db_schema,
+            available_tables=available_tables,
+            include_unified=include_unified,
+            include_coordinates=include_coordinates,
+        ),
+        source_limit,
+    )
+    is_truncated = len(source_probe_rows) > source_limit
+    source_samples = [
+        dict(source_probe_row) for source_probe_row in source_probe_rows[:source_limit]
+    ]
+    _annotate_semantic_source_samples(source_samples)
+    summary_by_metric = _semantic_summary_by_metric(
+        source_samples,
+        available_tables,
+        source_limit=source_limit,
+        is_truncated=is_truncated,
+        include_unified=include_unified,
+    )
+    summary_by_metric["coordinate_check_available"] = include_coordinates
+    return summary_by_metric
+
+
 async def _practitioner_role_reimport_gap_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -4087,6 +4652,15 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
                 gaps.append(
                     f"{source_coverage['sources_with_valid_npi_organization_address_rows_without_unified_rows']} Provider Directory source(s) have valid-NPI Organization address rows but no unified-address projection rows."
                 )
+    semantic_readiness = report.get("source_semantic_readiness_summary") or {}
+    if semantic_readiness.get("available") and _int(
+        semantic_readiness.get("raw_only_source_count")
+    ):
+        gaps.append(
+            f"{semantic_readiness['raw_only_source_count']} of "
+            f"{semantic_readiness.get('sampled_source_count', 0)} bounded Provider Directory "
+            "source probe(s) have raw resources but incomplete downstream semantic evidence."
+        )
     role_gap = report.get("practitioner_role_reimport_gap_summary") or {}
     if role_gap.get("available") and _int(role_gap.get("practitioner_role_reimport_gap_source_count")):
         gaps.append(
@@ -4479,6 +5053,21 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     include_unified=not args.skip_unified,
                 )
             ),
+            "source_semantic_readiness_summary": (
+                {
+                    "available": False,
+                    "skipped": True,
+                    "reason": "disabled by --skip-unified",
+                    "samples": [],
+                }
+                if args.skip_unified
+                else await _bounded_source_semantic_readiness_summary(
+                    conn,
+                    schema,
+                    sample_limit=args.sample_limit,
+                    include_unified=True,
+                )
+            ),
             "practitioner_role_reimport_gap_summary": await _practitioner_role_reimport_gap_summary(
                 conn,
                 schema,
@@ -4604,6 +5193,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     alias_fanout = report.get("alias_fanout_summary") or {}
     canonical_resources = report.get("canonical_resource_summary") or {}
     source_coverage = report.get("source_resource_coverage_summary") or {}
+    semantic_readiness = report.get("source_semantic_readiness_summary") or {}
     retest = report.get("source_catalog_retest_coverage") or {}
     lines = [
         "# Provider Directory Coverage Audit",
@@ -4676,13 +5266,25 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"uncovered `{retest.get('uncovered_unchecked_result_count')}`"
             )
     if source_coverage.get("available"):
+        coverage_scope = "sampled " if source_coverage.get("counts_are_sampled") else ""
         lines.append(
-            f"- source/resource coverage: `{source_coverage.get('sources_with_resource_rows')}` / "
+            f"- source/resource coverage: {coverage_scope}`{source_coverage.get('sources_with_resource_rows')}` / "
             f"`{source_coverage.get('source_count')}` source(s) have resource rows "
             f"({source_coverage.get('resource_source_pct')}%); Location sources "
             f"`{source_coverage.get('sources_with_location_rows')}` "
             f"({source_coverage.get('location_source_pct')}%)"
         )
+        if source_coverage.get("summary_source") == "bounded_per_source_exists_probes":
+            lines.append(
+                f"- semantic readiness: `{source_coverage.get('semantic_ready_source_count')}` / "
+                f"`{source_coverage.get('sampled_source_count')}` checked source(s) ready; "
+                f"valid NPI `{source_coverage.get('sources_with_valid_npis')}`, "
+                f"canonical address `{source_coverage.get('sources_with_canonical_addresses')}`, "
+                f"usable phone `{source_coverage.get('sources_with_usable_phones')}`, "
+                f"resolved role/location `{source_coverage.get('sources_with_resolved_role_locations')}`, "
+                f"resolved role/plan `{source_coverage.get('sources_with_resolved_role_plans')}`, "
+                f"resolved network `{source_coverage.get('sources_with_resolved_network_evidence')}`"
+            )
         if source_coverage.get("sources_with_valid_npi_organization_address_rows") is not None:
             lines.append(
                 f"- organization-address coverage: "
@@ -4995,6 +5597,43 @@ def render_markdown(report: dict[str, Any]) -> str:
             error_text = ", ".join(errors) if errors else ""
             lines.append(
                 f"| {item.get('org_name') or item.get('source_id')} | {item.get('plan_name') or ''} | `{item.get('auth_type') or ''}` | `{item.get('canonical_api_base') or ''}` | `{error_text}` |"
+            )
+    if (
+        semantic_readiness.get("summary_source") == "bounded_per_source_exists_probes"
+        and semantic_readiness.get("samples")
+    ):
+        lines.extend(
+            [
+                "",
+                "## Per-Source Semantic Readiness",
+                "",
+                "| Source | Raw | NPI | Canonical address | Phone | Coordinates | Role/location | Role/plan | Network | Gaps |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for item in semantic_readiness["samples"]:
+            gaps = ", ".join(item.get("semantic_readiness_gaps") or [])
+            role_location = (
+                f"{bool(item.get('has_role_location_refs'))}/{bool(item.get('has_resolved_role_location'))}"
+            )
+            role_plan = f"{bool(item.get('has_role_plan_refs'))}/{bool(item.get('has_resolved_role_plan'))}"
+            network_evidence = (
+                f"{bool(item.get('has_network_refs'))}/{bool(item.get('has_resolved_network_evidence'))}"
+            )
+            lines.append(
+                f"| {_markdown_cell(item.get('org_name') or item.get('source_id'))} | "
+                f"`{bool(item.get('has_raw_resource_rows'))}` | "
+                f"`{bool(item.get('has_valid_npi'))}` | "
+                f"`{bool(item.get('has_canonical_address'))}` | "
+                f"`{bool(item.get('has_usable_phone'))}` | "
+                f"`{bool(item.get('has_usable_coordinates'))}` | "
+                f"`{role_location}` | `{role_plan}` | `{network_evidence}` | "
+                f"`{_markdown_cell(gaps)}` |"
+            )
+        if semantic_readiness.get("truncated"):
+            lines.append(
+                f"\n_Per-source checks are bounded to `{semantic_readiness.get('source_limit')}` source(s); "
+                "increase `--sample-limit` for a larger sample._"
             )
     if (
         source_coverage.get("catalog_only_samples")
