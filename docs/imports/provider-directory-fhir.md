@@ -4,6 +4,11 @@
 capability probes, and FHIR resources. It is meant to complement MRF/PTG price data with
 FHIR directory data exposed by CMS-regulated payers.
 
+Maintained endpoint support and configuration are listed in
+[Provider Directory Endpoint Support](provider-directory-endpoint-support.md).
+That generated matrix is deliberately separate from current runtime and import
+status, which is recorded in the endpoint-acquisition campaign report.
+
 ## Source
 
 The importer uses the public `provider-directory-db` SQLite catalog by default:
