@@ -932,7 +932,7 @@ def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> An
     return stmt
 
 
-def _provider_directory_source_details_by_id_from_rows(
+def _map_source_details(
     rows: Sequence[Any],
 ) -> dict[str, dict[str, Any]]:
     details_by_id: dict[str, dict[str, Any]] = {}
@@ -969,7 +969,7 @@ async def _fetch_provider_directory_source_detail_map(
         return {}
     stmt = _provider_directory_source_detail_statement(unique_ids)
     result = await _execute_stmt(stmt, session=session)
-    return _provider_directory_source_details_by_id_from_rows(result.all())
+    return _map_source_details(result.all())
 
 
 def _normalized_provider_directory_api_base(raw_api_base: Any) -> str:
