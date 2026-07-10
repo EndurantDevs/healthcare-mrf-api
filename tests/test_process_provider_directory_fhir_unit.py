@@ -5807,6 +5807,23 @@ def test_resource_start_url_caps_uhc_insurance_plan_page_count():
     assert url == "https://flex.optum.com/fhirpublic/R4/InsurancePlan?_count=1"
 
 
+@pytest.mark.parametrize(
+    ("api_base", "resource_type"),
+    [
+        (importer.WASHINGTON_PROVIDER_DIRECTORY_BASE, "Location"),
+        (importer.WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"),
+    ],
+)
+def test_resource_start_url_caps_fragile_state_directory_pages(api_base, resource_type):
+    url = importer._resource_start_url(
+        {"api_base": api_base},
+        resource_type,
+        page_count=100,
+    )
+
+    assert url == f"{api_base}/{resource_type}?_count=25"
+
+
 def test_resource_start_url_does_not_cap_other_michigan_interopstation_resources():
     url = importer._resource_start_url(
         {"api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE},

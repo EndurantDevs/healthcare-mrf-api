@@ -458,6 +458,8 @@ FHIR_OFFSET_PAGINATION_BASES = frozenset(
     {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}
 )
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
+WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
+WYOMING_PROVIDER_DIRECTORY_BASE = "https://wy.fhir.mhbapp.com/pd/api/v1"
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
@@ -485,6 +487,9 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     # UHC/Flex InsurancePlan accepts tiny pages but returns Azure 504s for
     # _count=10/100, so full imports must walk this resource one row at a time.
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
+    # These state HAPI gateways return HTTP 500 at the default count of 100.
+    (WASHINGTON_PROVIDER_DIRECTORY_BASE, "Location"): 25,
+    (WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
 }
 PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
