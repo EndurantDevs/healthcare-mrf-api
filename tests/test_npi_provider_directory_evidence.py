@@ -210,6 +210,36 @@ def test_provider_directory_role_evidence_keys_do_not_require_existing_aca_array
 
 
 @pytest.mark.asyncio
+async def test_role_evidence_disables_jit_once_per_request_session(monkeypatch):
+    class FakeResult:
+        def all(self):
+            return []
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement, _params=None):
+            self.statements.append(str(statement))
+            return FakeResult()
+
+    session = FakeSession()
+    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+
+    await npi_module._fetch_provider_directory_role_evidence_map(
+        [("pdfhir_example", "role-100")],
+        session=session,
+    )
+    await npi_module._fetch_provider_directory_role_evidence_map(
+        [("pdfhir_example", "role-100")],
+        session=session,
+    )
+
+    assert session.statements.count("SET LOCAL jit = off") == 1
+    assert sum("requested_roles AS" in statement for statement in session.statements) == 2
+
+
+@pytest.mark.asyncio
 async def test_get_npi_exposes_resolved_provider_directory_plan_network_evidence(
     monkeypatch,
     provider_directory_plan_network_fixture,

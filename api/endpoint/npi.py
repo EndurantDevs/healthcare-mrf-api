@@ -608,6 +608,7 @@ def _primary_total_cache_set(value: int) -> int:
 
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 4096
+_PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR = "_healthporta_provider_directory_role_jit_disabled"
 
 
 def _has_insurance_total_cache_key(city: Optional[str], state: Optional[str]) -> str:
@@ -1166,6 +1167,12 @@ async def _fetch_provider_directory_role_evidence_map(
     bounded_keys = list(dict.fromkeys(role_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
     if not bounded_keys:
         return {}
+    if session is None:
+        async with db.session() as evidence_session:
+            return await _fetch_provider_directory_role_evidence_map(
+                bounded_keys,
+                session=evidence_session,
+            )
     required_tables = [
         await _table_exists(table_name, session=session)
         for table_name in (
@@ -1178,7 +1185,10 @@ async def _fetch_provider_directory_role_evidence_map(
         return {}
     has_catalog = await _table_exists("provider_directory_network_catalog", session=session)
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    result = await _execute_stmt(
+    if not getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
+        await session.execute(text("SET LOCAL jit = off"))
+        setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
+    evidence_result = await _execute_stmt(
         text(_provider_directory_role_evidence_sql(schema, has_catalog)),
         session=session,
         params={
@@ -1186,7 +1196,7 @@ async def _fetch_provider_directory_role_evidence_map(
             "role_ids": [role_id for _source_id, role_id in bounded_keys],
         },
     )
-    return _map_provider_directory_role_evidence(result.all())
+    return _map_provider_directory_role_evidence(evidence_result.all())
 
 
 def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
