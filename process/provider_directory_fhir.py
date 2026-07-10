@@ -8919,27 +8919,39 @@ def _synthetic_skip_pagination_next_url(
     return _url_with_replaced_query_item(current_url, "_skip", str(next_skip))
 
 
-def _pagination_allowed_netlocs(
+def _pagination_host_key(url_or_host: str | None) -> str | None:
+    text = _clean_text(url_or_host)
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text if "://" in text else f"https://{text}")
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    return f"{parsed.hostname.lower()}:{port}"
+
+
+def _pagination_allowed_hosts(
     source_record: dict[str, Any],
     current_url: str,
 ) -> set[str]:
     api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
-    allowed_netlocs = {
-        parsed.netloc.lower()
+    allowed_hosts = {
+        host_key
         for candidate_url in (api_base, current_url)
-        if candidate_url and (parsed := urllib.parse.urlsplit(candidate_url)).netloc
+        if (host_key := _pagination_host_key(candidate_url))
     }
     configured_hosts = _string_list(
         _source_metadata(source_record).get("provider_directory_pagination_allowed_hosts")
     )
     for configured_host in configured_hosts:
-        parsed_host = urllib.parse.urlsplit(configured_host)
-        allowed_netlocs.add(
-            (parsed_host.netloc or parsed_host.path).strip().rstrip("/").lower()
-        )
-    return allowed_netlocs
+        if host_key := _pagination_host_key(configured_host):
+            allowed_hosts.add(host_key)
+    return allowed_hosts
 
 
 def _is_trusted_fhir_pagination_url(
@@ -8948,10 +8960,10 @@ def _is_trusted_fhir_pagination_url(
     next_url: str,
 ) -> bool:
     parsed_next = urllib.parse.urlsplit(next_url)
+    next_host_key = _pagination_host_key(next_url)
     return bool(
-        parsed_next.scheme.lower() == "https"
-        and parsed_next.netloc.lower()
-        in _pagination_allowed_netlocs(source_record, current_url)
+        next_host_key
+        and next_host_key in _pagination_allowed_hosts(source_record, current_url)
         and parsed_next.username is None
         and parsed_next.password is None
         and not parsed_next.fragment

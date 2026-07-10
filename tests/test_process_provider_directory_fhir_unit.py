@@ -1065,6 +1065,16 @@ def test_generic_pagination_allows_configured_alias_host():
     ) == next_url
 
 
+def test_generic_pagination_normalizes_default_https_port():
+    next_url = "https://payer.example:443/fhir/Practitioner?page=2"
+
+    assert importer._resolved_fhir_next_url(
+        {"api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=25",
+        next_url,
+    ) == next_url
+
+
 def test_molina_rewrites_exact_sapphire_next_link():
     source_lookup = {
         "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
