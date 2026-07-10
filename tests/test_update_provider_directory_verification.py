@@ -95,7 +95,7 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded |" in serialized_docs
 
 
-def test_nonterminal_report_does_not_replace_unverified_display():
+def test_nonterminal_report_does_not_replace_existing_terminal_display():
     manifest, snapshot = _manifest_and_snapshot()
     report = _report(manifest, status="running")
 
@@ -103,7 +103,9 @@ def test_nonterminal_report_does_not_replace_unverified_display():
     rendered = generator.render_markdown(manifest, verification_snapshot=updated)
 
     assert updated["entries"]["idaho"] == snapshot["entries"]["idaho"]
-    assert "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded |" in rendered
+    idaho_verification = snapshot["entries"]["idaho"]
+    assert idaho_verification["run_id"] in rendered
+    assert generator._display_verification(idaho_verification["terminal_status"]) in rendered
 
 
 def test_updater_direct_script_imports_from_its_own_directory():

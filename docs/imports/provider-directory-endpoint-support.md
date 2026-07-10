@@ -53,11 +53,11 @@ This tracked snapshot is separate from configured support. It records only termi
 
 After a terminal campaign, update this section with `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. CI rejects generated-document drift and reports from a different campaign or manifest.
 
-Verification environment: `not recorded`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `not recorded`.
+Verification environment: `healthporta-dev`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `2026-07-10T17:19:26Z`.
 
 | Source | Terminal status | Run ID | Access verification | Checked at |
 | --- | --- | --- | --- | --- |
-| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Idaho (`idaho`) | Succeeded | run_685b1ff3a18c432e8b2333fe349ce69f | Verified | 2026-07-10T17:19:26Z |
 | Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded |
 | Michigan (`michigan`) | Not recorded | Not recorded | Not recorded | Not recorded |
 | Cigna (`cigna`) | Not recorded | Not recorded | Not recorded | Not recorded |
