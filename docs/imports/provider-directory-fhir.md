@@ -13,7 +13,8 @@ status, which is recorded in the endpoint-acquisition campaign report.
 
 Keep these authorities separate when reviewing Provider Directory coverage:
 
-- Configured support, access requirements, and resource selection live in the
+- Configured support, access and registration requirements, review date, and
+  resource selection live in the
   [acquisition manifest](../../specs/provider_directory_endpoint_acquisition_manifest.json)
   and its [generated support matrix](provider-directory-endpoint-support.md).
   `acquisition-configured` or `externally-supported` means an implementation

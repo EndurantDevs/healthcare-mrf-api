@@ -8,27 +8,26 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+
+try:
+    from scripts.provider_directory_support_contract import (
+        ACCESS_REQUIREMENTS,
+        SUPPORT_LEVELS,
+        SupportDocumentationError,
+        validate_access_review_metadata,
+    )
+except ModuleNotFoundError:
+    from provider_directory_support_contract import (
+        ACCESS_REQUIREMENTS,
+        SUPPORT_LEVELS,
+        SupportDocumentationError,
+        validate_access_review_metadata,
+    )
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 DEFAULT_BLOCKER_REGISTRY = ROOT / "specs/provider_directory_blocker_registry.json"
 DEFAULT_VERIFICATION_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
-SUPPORT_LEVELS = {
-    "supported",
-    "externally-supported",
-    "current-connector",
-    "acquisition-configured",
-    "probe-only",
-    "blocked",
-    "not-supported",
-}
-ACCESS_REQUIREMENTS = {
-    "none",
-    "oauth2-client-credentials",
-    "private-connector",
-    "user-token",
-    "unknown",
-}
 METHODS = {"rest", "bulk", "graphql", "probe"}
 RESOURCE_TYPES = {
     "InsurancePlan",
@@ -79,8 +78,6 @@ BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published"}
 SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
-class SupportDocumentationError(ValueError):
-    """Raised when generated support documentation cannot be trusted."""
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
     """Load the endpoint manifest as a JSON object."""
     decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -112,7 +109,7 @@ def _entry_ids(entries: Any) -> list[str]:
     return entry_ids
 def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     entry_id = str(entry["entry_id"])
-    required_fields = {"support_level", "access_requirement", "method", "limitation"}
+    required_fields = {"support_level", "access_requirement", "requires_registration", "reviewed_at", "method", "limitation"}
     optional_fields = {"documented_resources"}
     if not isinstance(support, dict) or not required_fields.issubset(support) or not set(support).issubset(required_fields | optional_fields):
         raise SupportDocumentationError(f"{entry_id}: support metadata must contain {sorted(required_fields)} and optional documented_resources only")
@@ -124,6 +121,7 @@ def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
         raise SupportDocumentationError(f"{entry_id}: invalid support level {support_level!r}")
     if access_requirement not in ACCESS_REQUIREMENTS:
         raise SupportDocumentationError(f"{entry_id}: invalid access requirement {access_requirement!r}")
+    validate_access_review_metadata(entry_id, support)
     if method not in METHODS:
         raise SupportDocumentationError(f"{entry_id}: invalid method {method!r}")
     if not isinstance(limitation, str) or not limitation.strip():
@@ -342,8 +340,8 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",
-        "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Known blocker or limitation |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Known blocker or limitation |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
 def _configured_support_rows(
     manifest: dict[str, Any],
@@ -364,6 +362,8 @@ def _configured_support_rows(
             resource_text,
             entry["canonical_base"],
             ", ".join(entry["source_ids"]),
+            "Required" if support_record["requires_registration"] else "Not required",
+            support_record["reviewed_at"],
             support_record["limitation"],
         ]
         markdown_rows.append("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |")

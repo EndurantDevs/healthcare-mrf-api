@@ -12,32 +12,42 @@ from scripts.research import provider_directory_endpoint_acquisition_harness as 
 def test_rendered_support_matrix_represents_each_manifest_entry_once():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
 
-    rendered = generator.render_markdown(manifest)
-    configured_table = rendered.split("## Known Not Importable", 1)[0]
-    rows = [line for line in configured_table.splitlines() if line.startswith("| ")][2:]
+    rendered_document = generator.render_markdown(manifest)
+    configured_table = rendered_document.split("## Known Not Importable", 1)[0]
+    configured_rows = [
+        line for line in configured_table.splitlines() if line.startswith("| ")
+    ][2:]
     entry_ids = [entry["entry_id"] for entry in manifest["entries"]]
 
-    assert len(rows) == len(entry_ids)
-    assert all(row.count(f"`{entry_id}`") == 1 for row, entry_id in zip(rows, entry_ids))
-    assert "OAuth2 client credentials | Bulk" in rendered
-    assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered
-    assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered
-    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered
-    assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered
-    assert "does not claim that a live probe succeeded" in rendered
-    assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered
-    assert "selected `--report` path; the report is not tracked" in rendered
-    assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered
-    assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered
-    assert "## Observed Live Verification" in rendered
-    assert "scripts/update_provider_directory_verification.py" in rendered
-    assert "| Idaho (`idaho`) | Current | Succeeded | run_" in rendered
-    assert "## Known Not Importable" in rendered
-    assert "Chorus Community Health Plans" in rendered
-    assert "First Medical Health Plan, Inc." in rendered
-    assert "Territory of Puerto Rico" in rendered
-    assert "User token | Required" in rendered
-    assert "[campaign report]" not in rendered
+    assert len(configured_rows) == len(entry_ids)
+    assert all(
+        configured_row.count(f"`{entry_id}`") == 1
+        for configured_row, entry_id in zip(configured_rows, entry_ids)
+    )
+    assert "OAuth2 client credentials | Bulk" in rendered_document
+    assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
+    assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
+    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
+    assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered_document
+    assert "does not claim that a live probe succeeded" in rendered_document
+    assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered_document
+    assert "selected `--report` path; the report is not tracked" in rendered_document
+    assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered_document
+    assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered_document
+    assert "| Registration | Reviewed at |" in rendered_document
+    assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
+    assert "Required | 2026-07-10 | OAuth2 client credentials and Bulk" in rendered_document
+    assert "Cigna (`cigna`)" in rendered_document
+    assert "Not required | 2026-07-10 | Sequential REST pagination" in rendered_document
+    assert "## Observed Live Verification" in rendered_document
+    assert "scripts/update_provider_directory_verification.py" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | run_" in rendered_document
+    assert "## Known Not Importable" in rendered_document
+    assert "Chorus Community Health Plans" in rendered_document
+    assert "First Medical Health Plan, Inc." in rendered_document
+    assert "Territory of Puerto Rico" in rendered_document
+    assert "User token | Required" in rendered_document
+    assert "[campaign report]" not in rendered_document
 
 
 @pytest.mark.parametrize(
@@ -63,6 +73,40 @@ def test_validate_manifest_rejects_missing_or_extra_entry_metadata():
     entry_support["not-a-manifest-entry"] = copy.deepcopy(entry_support["molina"])
 
     with pytest.raises(generator.SupportDocumentationError, match="missing metadata.*metadata without"):
+        generator.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("requires_registration", "no", "requires_registration must be boolean"),
+        ("reviewed_at", "10 July 2026", "reviewed_at must be an ISO date"),
+    ],
+)
+def test_validate_manifest_rejects_uncontrolled_access_review_metadata(
+    field_name,
+    value,
+    message,
+):
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    manifest["support_documentation"]["entry_support"]["idaho"][field_name] = value
+
+    with pytest.raises(generator.SupportDocumentationError, match=message):
+        generator.validate_manifest(manifest)
+
+
+def test_validate_manifest_rejects_registration_access_contradictions():
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    entry_support = manifest["support_documentation"]["entry_support"]
+    entry_support["idaho"]["requires_registration"] = True
+
+    with pytest.raises(generator.SupportDocumentationError, match="public access"):
+        generator.validate_manifest(manifest)
+
+    entry_support["idaho"]["requires_registration"] = False
+    entry_support["aetna-commercial-medicare"]["requires_registration"] = False
+
+    with pytest.raises(generator.SupportDocumentationError, match="requires registration"):
         generator.validate_manifest(manifest)
 
 
