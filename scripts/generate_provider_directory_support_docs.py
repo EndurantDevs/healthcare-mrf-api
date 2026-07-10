@@ -413,6 +413,8 @@ def _observed_verification_section(
         "",
         "This tracked snapshot is separate from configured support. It records only terminal, credential-safe fields accepted from an endpoint-acquisition report; active, partial, and absent entries remain `Not recorded`.",
         "",
+        "After a terminal campaign, update this section with `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. CI rejects generated-document drift and reports from a different campaign or manifest.",
+        "",
         f"Verification environment: `{snapshot['environment']}`. Campaign: `{snapshot['campaign_id']}`. Snapshot checked at `{checked_at}`.",
         "",
         "| Source | Terminal status | Run ID | Access verification | Checked at |",

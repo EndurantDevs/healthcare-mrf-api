@@ -28,6 +28,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered
     assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered
     assert "## Observed Live Verification" in rendered
+    assert "scripts/update_provider_directory_verification.py" in rendered
     assert "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded |" in rendered
     assert "## Known Not Importable" in rendered
     assert "Chorus Community Health Plans" in rendered

@@ -51,6 +51,8 @@ These sources are intentionally retained as blocked catalog evidence. They are n
 
 This tracked snapshot is separate from configured support. It records only terminal, credential-safe fields accepted from an endpoint-acquisition report; active, partial, and absent entries remain `Not recorded`.
 
+After a terminal campaign, update this section with `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. CI rejects generated-document drift and reports from a different campaign or manifest.
+
 Verification environment: `not recorded`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `not recorded`.
 
 | Source | Terminal status | Run ID | Access verification | Checked at |
