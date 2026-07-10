@@ -12,6 +12,7 @@
   "support_documentation": {
     "schema_version": 1,
     "runtime_status_report": "reports/provider-directory-endpoint-acquisition/report.json",
+    "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Accepts molina.sapphirethreesixtyfive.com cursor continuations."},
@@ -40,7 +41,7 @@
       "scan": {"support_level": "probe-only", "access_requirement": "unknown", "method": "probe", "limitation": "Role reverse lookup and 100-page cap exist, but this campaign only probes."},
       "centene": {"support_level": "probe-only", "access_requirement": "unknown", "method": "probe", "limitation": "Probe only; CloudFront or WAF access can block a runtime probe."},
       "contra-costa": {"support_level": "probe-only", "access_requirement": "unknown", "method": "probe", "limitation": "Official catalog can return 403, so the fallback base is retained; probe-only."},
-      "alohr": {"support_level": "supported", "access_requirement": "private-connector", "method": "graphql", "documented_resources": ["Practitioner", "Organization", "Location", "PractitionerRole", "OrganizationAffiliation"], "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr."}
+      "alohr": {"support_level": "externally-supported", "access_requirement": "private-connector", "method": "graphql", "documented_resources": ["Practitioner", "Organization", "Location", "PractitionerRole", "OrganizationAffiliation"], "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr."}
     }
   },
   "parameter_profiles": {

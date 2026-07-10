@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "provider-directory-blocked-chorus-community-health-plans",
+      "display_name": "Chorus Community Health Plans (fka Children's Community Health Plan)",
+      "plan_name": "Medicaid MCO",
+      "access_requirement": "none",
+      "requires_registration": false,
+      "source_detail": "blocked Provider Directory endpoint discovery",
+      "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
+      "reason": "Official portal present but no importable public FHIR base confirmed.",
+      "note": "Official Chorus developer page exposes Provider Directory documentation through a JavaScript app, but no importable public FHIR base has been confirmed."
+    },
+    {
+      "id": "provider-directory-blocked-first-medical-pr",
+      "display_name": "First Medical Health Plan, Inc.",
+      "plan_name": "Medicaid MCO",
+      "access_requirement": "user-token",
+      "requires_registration": true,
+      "source_detail": "blocked Provider Directory endpoint discovery",
+      "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
+      "reason": "Official portal requires a user token and no open public FHIR base is confirmed.",
+      "note": "Official First Medical developer portal lists Practitioner and Location APIs under a user-token security model; no open importable Provider Directory FHIR base has been confirmed."
+    },
+    {
+      "id": "provider-directory-blocked-territory-of-puerto-rico",
+      "display_name": "Territory of Puerto Rico",
+      "plan_name": "Medicaid FFS",
+      "access_requirement": "none",
+      "requires_registration": false,
+      "source_detail": "CMS SMA Endpoint Directory Provider Directory status not yet started",
+      "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
+      "reason": "CMS SMA Endpoint Directory lists Provider Directory as not yet started/TBD.",
+      "note": "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known."
+    }
+  ]
+}

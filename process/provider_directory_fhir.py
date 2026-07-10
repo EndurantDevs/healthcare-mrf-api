@@ -374,6 +374,9 @@ CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS = "catalog_in_development"
 CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES = {"active", "in development"}
 PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS = "catalog_blocked"
 PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE = "provider-directory-blocker-registry"
+PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[1] / "specs/provider_directory_blocker_registry.json"
+)
 URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
@@ -486,8 +489,6 @@ HAP_PROVIDER_DIRECTORY_DOC_URL = "https://api.hap.org/providerdirectoryapi"
 HAP_PROVIDER_DIRECTORY_BASE = "https://provider-directory-r4.api.hap.org"
 HAP_PROVIDER_DIRECTORY_METADATA_URL = f"{HAP_PROVIDER_DIRECTORY_BASE}/metadata"
 HAP_BLOCKED_PAGINATION_HOST = "fhir-prov-dir-r4.api.hap.org"
-CHORUS_PROVIDER_DIRECTORY_DOC_URL = "https://appconnect.chorushealthplans.org/developers/providerapi"
-FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL = "https://devportal.firstmedicalpr.com/ApiLibrary"
 AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS = {
     "amerihealth caritas dc": "5400",
     "amerihealth caritas district of columbia": "5400",
@@ -8691,72 +8692,53 @@ def _seed_rows_from_cms_sma_endpoint_directory(
 
 
 def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
-    blocker_rows = [
-        {
-            "id": "provider-directory-blocked-chorus-community-health-plans",
-            "org_name": "Chorus Community Health Plans (fka Children's Community Health Plan)",
-            "plan_name": "Medicaid MCO",
-            "api_base": None,
-            "auth_type": "none",
-            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
-            "requires_registration": False,
-            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
-            "source_detail": "blocked Provider Directory endpoint discovery",
-            "source_url": CHORUS_PROVIDER_DIRECTORY_DOC_URL,
-            "note": (
-                "Official Chorus developer page exposes Provider Directory documentation through a "
-                "JavaScript app, but no importable public FHIR base has been confirmed."
-            ),
-            "metadata_json": {
-                "provider_directory_blocked": True,
-                "provider_directory_blocked_reason": "official portal present but no importable public FHIR base confirmed",
-                "provider_directory_confirmed_catalog_url": CHORUS_PROVIDER_DIRECTORY_DOC_URL,
-            },
-        },
-        {
-            "id": "provider-directory-blocked-first-medical-pr",
-            "org_name": "First Medical Health Plan, Inc.",
-            "plan_name": "Medicaid MCO",
-            "api_base": None,
-            "auth_type": "user token",
-            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
-            "requires_registration": True,
-            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
-            "source_detail": "blocked Provider Directory endpoint discovery",
-            "source_url": FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL,
-            "note": (
-                "Official First Medical developer portal lists Practitioner and Location APIs under "
-                "a user-token security model; no open importable Provider Directory FHIR base has "
-                "been confirmed."
-            ),
-            "metadata_json": {
-                "provider_directory_blocked": True,
-                "provider_directory_blocked_reason": "official portal requires user token and no open public FHIR base is confirmed",
-                "provider_directory_confirmed_catalog_url": FIRST_MEDICAL_PROVIDER_DIRECTORY_DOC_URL,
-            },
-        },
-        {
-            "id": "provider-directory-blocked-territory-of-puerto-rico",
-            "org_name": "Territory of Puerto Rico",
-            "plan_name": "Medicaid FFS",
-            "api_base": None,
-            "auth_type": "none",
-            "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
-            "requires_registration": False,
-            "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
-            "source_detail": "CMS SMA Endpoint Directory Provider Directory status not yet started",
-            "source_url": CMS_SMA_ENDPOINT_DIRECTORY_URL,
-            "note": (
-                "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as "
-                "not yet started/TBD, so no importable public FHIR base is currently known."
-            ),
-            "metadata_json": {
-                "provider_directory_blocked": True,
-                "provider_directory_blocked_reason": "CMS SMA Endpoint Directory lists Provider Directory as not yet started/TBD",
-                "provider_directory_confirmed_catalog_url": CMS_SMA_ENDPOINT_DIRECTORY_URL,
-            },
-        },
-    ]
+    registry = json.loads(PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH.read_text(encoding="utf-8"))
+    registry_entries = registry.get("entries") if isinstance(registry, dict) else None
+    if (
+        not isinstance(registry, dict)
+        or registry.get("schema_version") != 1
+        or not isinstance(registry_entries, list)
+    ):
+        raise RuntimeError("Provider Directory blocker registry has an unsupported schema")
+    blocker_rows = []
+    for registry_entry in registry_entries:
+        if not isinstance(registry_entry, dict):
+            raise RuntimeError("Provider Directory blocker registry contains a non-object entry")
+        source_url = _clean_text(registry_entry.get("source_url"))
+        blocked_reason = _clean_text(registry_entry.get("reason"))
+        access_requirement = _clean_text(registry_entry.get("access_requirement"))
+        row_id = _clean_text(registry_entry.get("id"))
+        org_name = _clean_text(registry_entry.get("display_name"))
+        plan_name = _clean_text(registry_entry.get("plan_name"))
+        if (
+            not row_id
+            or not org_name
+            or not plan_name
+            or not source_url
+            or not blocked_reason
+            or access_requirement not in {"none", "user-token"}
+        ):
+            raise RuntimeError("Provider Directory blocker registry entry is incomplete")
+        blocker_rows.append(
+            {
+                "id": row_id,
+                "org_name": org_name,
+                "plan_name": plan_name,
+                "api_base": None,
+                "auth_type": access_requirement.replace("-", " "),
+                "last_validated_status": PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS,
+                "requires_registration": registry_entry.get("requires_registration") is True,
+                "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+                "source_detail": _clean_text(registry_entry.get("source_detail")),
+                "source_url": source_url,
+                "note": _clean_text(registry_entry.get("note")),
+                "metadata_json": {
+                    "provider_directory_blocked": True,
+                    "provider_directory_blocked_reason": blocked_reason,
+                    "provider_directory_confirmed_catalog_url": source_url,
+                },
+            }
+        )
     return [row for row in blocker_rows if _seed_row_matches_query(row, source_query)]
 
 

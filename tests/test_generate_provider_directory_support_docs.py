@@ -11,20 +11,27 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
 
     rendered = generator.render_markdown(manifest)
-    rows = [line for line in rendered.splitlines() if line.startswith("| ")][2:]
+    configured_table = rendered.split("## Known Not Importable", 1)[0]
+    rows = [line for line in configured_table.splitlines() if line.startswith("| ")][2:]
     entry_ids = [entry["entry_id"] for entry in manifest["entries"]]
 
-    assert len(entry_ids) == 28
     assert len(rows) == len(entry_ids)
     assert all(row.count(f"`{entry_id}`") == 1 for row, entry_id in zip(rows, entry_ids))
     assert "OAuth2 client credentials | Bulk" in rendered
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered
     assert "Sequential REST pagination preserves Plan-Net network extensions; no Bulk." in rendered
-    assert "ALOHR (`alohr`) | Supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered
+    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered
     assert "Horizon NJ (`horizon-nj`) | Probe-only | Unknown | Probe | None configured" in rendered
     assert "does not claim that a live probe succeeded" in rendered
     assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered
     assert "selected `--report` path; the report is not tracked" in rendered
+    assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered
+    assert "campaign report is the authority for per-endpoint live verification" in rendered
+    assert "## Known Not Importable" in rendered
+    assert "Chorus Community Health Plans" in rendered
+    assert "First Medical Health Plan, Inc." in rendered
+    assert "Territory of Puerto Rico" in rendered
+    assert "User token | Required" in rendered
     assert "[campaign report]" not in rendered
 
 
@@ -51,6 +58,35 @@ def test_validate_manifest_rejects_missing_or_extra_entry_metadata():
     entry_support["not-a-manifest-entry"] = copy.deepcopy(entry_support["molina"])
 
     with pytest.raises(generator.SupportDocumentationError, match="missing metadata.*metadata without"):
+        generator.validate_manifest(manifest)
+
+
+def test_blocker_registry_is_complete_and_shared_with_generated_docs():
+    registry = generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
+
+    entries = generator.validate_blocker_registry(registry)
+    rendered = generator.render_markdown(
+        generator.load_manifest(generator.DEFAULT_MANIFEST),
+        registry,
+    )
+
+    assert len(entries) == 3
+    assert all(entry["id"] in rendered for entry in entries)
+
+
+def test_validate_blocker_registry_rejects_unknown_access_requirement():
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    registry["entries"][0]["access_requirement"] = "portal-maybe"
+
+    with pytest.raises(generator.SupportDocumentationError, match="invalid access requirement"):
+        generator.validate_blocker_registry(registry)
+
+
+def test_validate_manifest_rejects_unusable_catalog_confirmation():
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    manifest["catalog_confirmation"]["checked_at"] = "not-a-date"
+
+    with pytest.raises(generator.SupportDocumentationError, match="ISO-8601"):
         generator.validate_manifest(manifest)
 
 
