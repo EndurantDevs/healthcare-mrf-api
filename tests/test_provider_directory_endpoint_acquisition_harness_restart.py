@@ -55,15 +55,38 @@ def _metrics(entry):
     }
 
 
-def _run(manifest, entry, run_id, status="succeeded", metrics=None):
+def _run(manifest, entry, run_id, status="succeeded", metrics=None, extra_params=None):
+    params_by_name = harness.entry_params(manifest, entry)
+    params_by_name.update(extra_params or {})
     return {
         "run_id": run_id,
         "importer": manifest["importer"],
         "status": status,
-        "params": harness.entry_params(manifest, entry),
+        "params": params_by_name,
         "metrics": metrics or _metrics(entry),
         "error": None,
     }
+
+
+def _resume_required_run(manifest, entry, run_id, retry_of_run_id, root_run_id):
+    metrics_by_name = _metrics(entry)
+    metrics_by_name["pagination_resume_required"] = ["Practitioner:pdfhir"]
+    extra_params_by_name = {
+        "retry_of_run_id": retry_of_run_id,
+        "provider_directory_pagination_root_run_id": root_run_id,
+    }
+    run_record = _run(
+        manifest,
+        entry,
+        run_id,
+        "failed",
+        metrics_by_name,
+        extra_params_by_name,
+    )
+    run_record["error"] = {
+        "message": "provider_directory_pagination_resume_required"
+    }
+    return run_record
 
 
 def _seed_state(tmp_path, manifest, entry, run, status):
@@ -82,7 +105,15 @@ def _seed_state(tmp_path, manifest, entry, run, status):
     (tmp_path / "state.json").write_text(json.dumps(state_dict), encoding="utf-8")
 
 
-def _execute(tmp_path, manifest, control, *, apply=True, entry_ids=("idaho",)):
+def _execute(
+    tmp_path,
+    manifest,
+    control,
+    *,
+    apply=True,
+    entry_ids=("idaho",),
+    restart=True,
+):
     config = harness.HarnessConfig(
         tmp_path / "state.json",
         tmp_path / "report.json",
@@ -90,9 +121,56 @@ def _execute(tmp_path, manifest, control, *, apply=True, entry_ids=("idaho",)):
         frozenset(entry_ids),
         0,
         0,
-        frozenset(["idaho"]),
+        frozenset(["idaho"] if restart else []),
     )
     return harness.AcquisitionHarness(manifest, control, config, sleeper=lambda _: None).execute_campaign()
+
+
+def _interrupted_retry_runs(manifest, entry):
+    root_run_id = "run_root"
+    first_child_dict = _resume_required_run(
+        manifest,
+        entry,
+        "run_child_1",
+        root_run_id,
+        root_run_id,
+    )
+    second_child_dict = _resume_required_run(
+        manifest,
+        entry,
+        "run_child_2",
+        first_child_dict["run_id"],
+        root_run_id,
+    )
+    final_child_dict = _run(
+        manifest,
+        entry,
+        "run_child_3",
+        extra_params={
+            "retry_of_run_id": second_child_dict["run_id"],
+            "provider_directory_pagination_root_run_id": root_run_id,
+        },
+    )
+    return root_run_id, first_child_dict, second_child_dict, final_child_dict
+
+
+def _write_interrupted_state(tmp_path, manifest, entry, root_run_id, current_run_id):
+    prior_state_dict = {
+        "schema_version": 1,
+        "entries": {
+            "idaho": {
+                "status": "failed",
+                "run_ids": [root_run_id, current_run_id],
+                "root_run_id": root_run_id,
+                "current_run_id": current_run_id,
+                "spec_sha256": harness._entry_fingerprint(manifest, entry),
+            }
+        },
+    }
+    (tmp_path / "state.json").write_text(
+        json.dumps(prior_state_dict),
+        encoding="utf-8",
+    )
 
 
 def test_restart_entry_starts_fresh_root_and_persists_prior_lineage(tmp_path):
@@ -124,6 +202,48 @@ def test_restart_entry_starts_fresh_root_and_persists_prior_lineage(tmp_path):
     }
     assert audit["prior_last_run"] == harness._run_summary(prior_run)
     assert json.loads((tmp_path / "state.json").read_text())["entries"]["idaho"]["restart_history"] == entry_state["restart_history"]
+
+
+def test_interrupted_harness_follows_existing_retry_descendants(tmp_path):
+    """A restarted harness catches up through every existing direct child."""
+    manifest = harness.load_manifest()
+    entry = _entry(manifest)
+    (
+        root_run_id,
+        first_child_dict,
+        second_child_dict,
+        final_child_dict,
+    ) = _interrupted_retry_runs(
+        manifest,
+        entry,
+    )
+    _write_interrupted_state(
+        tmp_path,
+        manifest,
+        entry,
+        root_run_id,
+        first_child_dict["run_id"],
+    )
+    control = FakeImportControl(
+        runs=[first_child_dict, second_child_dict, final_child_dict]
+    )
+
+    state_dict = _execute(
+        tmp_path,
+        manifest,
+        control,
+        restart=False,
+    )
+
+    entry_state_dict = state_dict["entries"]["idaho"]
+    assert entry_state_dict["status"] == "succeeded"
+    assert entry_state_dict["current_run_id"] == final_child_dict["run_id"]
+    assert entry_state_dict["run_ids"] == [
+        root_run_id,
+        first_child_dict["run_id"],
+        second_child_dict["run_id"],
+        final_child_dict["run_id"],
+    ]
 
 
 def test_restart_entry_refuses_active_current_run(tmp_path):
