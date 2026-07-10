@@ -34,13 +34,22 @@ fn shell_quote(path: &Path) -> String {
 fn write_executable(path: &Path, script: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::write(path, script).expect("write fake rapidgzip executable");
-    let mut permissions = path
+    let staging_path = path.with_extension("staging");
+    {
+        let mut staging_file =
+            File::create(&staging_path).expect("create fake rapidgzip staging file");
+        staging_file
+            .write_all(script.as_bytes())
+            .expect("write fake rapidgzip executable");
+    }
+    let mut permissions = staging_path
         .metadata()
         .expect("stat fake rapidgzip executable")
         .permissions();
     permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions).expect("make fake rapidgzip executable runnable");
+    std::fs::set_permissions(&staging_path, permissions)
+        .expect("make fake rapidgzip executable runnable");
+    std::fs::rename(staging_path, path).expect("publish fake rapidgzip executable");
 }
 
 #[cfg(unix)]
