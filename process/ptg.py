@@ -1060,6 +1060,15 @@ def _cleanup_empty_manifest_copy_siblings(copy_path: Path) -> None:
                 logger.debug("Failed to remove empty PTG2 manifest worker copy file %s", worker_copy_path, exc_info=True)
 
 
+def _cleanup_manifest_copy_family(copy_path: Path) -> None:
+    for family_path in (copy_path, *copy_path.parent.glob(f"{copy_path.name}*")):
+        try:
+            if family_path.is_file():
+                family_path.unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove PTG2 manifest copy file %s", family_path, exc_info=True)
+
+
 async def _merge_and_copy_ptg2_manifest_files(
     *,
     successful_files: list[dict[str, Any]],
@@ -1677,14 +1686,12 @@ async def _parse_in_network_file_serving_only(
             except Exception:
                 logger.debug("Failed to remove empty PTG2 manifest copy file %s", copy_path, exc_info=True)
             _cleanup_empty_manifest_copy_siblings(copy_path)
-        if (copy_completed and not defer_manifest_copy) or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
+        remove_copy_families = (copy_completed and not defer_manifest_copy) or (
+            not copy_completed and not _env_bool(PTG2_KEEP_PARTIAL_ENV, False)
+        )
+        if remove_copy_families:
             for copy_path in manifest_copy_paths:
-                try:
-                    if not defer_manifest_copy or not copy_path.exists():
-                        copy_path.unlink(missing_ok=True)
-                except Exception:
-                    logger.debug("Failed to remove PTG2 manifest copy file %s", copy_path, exc_info=True)
-                _cleanup_empty_manifest_copy_siblings(copy_path)
+                _cleanup_manifest_copy_family(copy_path)
 
     membership_graph_metrics_map: dict[str, Any] = {}
     if use_provider_membership_graph:

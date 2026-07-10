@@ -7160,6 +7160,22 @@ def test_manifest_copy_cleanup_removes_empty_worker_siblings(tmp_path):
     assert nonempty_provider_ref_worker.exists()
 
 
+def test_manifest_copy_family_cleanup_removes_nonempty_failed_shards(tmp_path):
+    base_copy = tmp_path / "ptg2_manifest_serving_failed.copy"
+    worker_copy = tmp_path / "ptg2_manifest_serving_failed.copy.worker0001"
+    ready_copy = tmp_path / "ptg2_manifest_serving_failed.copy.worker0001.part000001.ready"
+    unrelated_copy = tmp_path / "ptg2_manifest_serving_other.copy.worker0001"
+    for path in (base_copy, worker_copy, ready_copy, unrelated_copy):
+        path.write_text("row\n", encoding="utf-8")
+
+    process_ptg._cleanup_manifest_copy_family(base_copy)
+
+    assert not base_copy.exists()
+    assert not worker_copy.exists()
+    assert not ready_copy.exists()
+    assert unrelated_copy.exists()
+
+
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     status_calls = []
 
