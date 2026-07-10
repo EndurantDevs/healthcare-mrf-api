@@ -77,9 +77,99 @@ def test_provider_directory_role_evidence_sql_is_keyed_and_bounded():
     assert "insurance_plan.source_id = role.source_id" in sql
     assert "insurance_plan.resource_id = NULLIF(BTRIM(CASE" in sql
     assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
+    assert "role_network_organization.source_id = role_network.source_id" in sql
+    assert "role_network_organization.resource_id = role_network.resource_id" in sql
+    assert "insurance_plan.source_id = requested_source.source_id" in sql
+    assert "plan_network.resource_id = role_network.resource_id" in sql
+    assert "FROM direct_plans AS direct_plan" in sql
+    assert "'network-derived'::varchar AS provenance" in sql
     assert "network_catalog.network_resource_id = network.resource_id" in sql
     assert "network_organization.resource_id = network.resource_id" in sql
     assert f"LIMIT {npi_module.MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS}" in sql
+    assert "jsonb_set" not in sql
+    assert "UPDATE " not in sql
+
+
+def test_network_matched_plan_is_labeled_as_network_derived():
+    evidence_map = npi_module._map_provider_directory_role_evidence(
+        [
+            {
+                "source_id": "pdfhir_example",
+                "role_id": "role-100",
+                "evidence_type": "insurance_plan",
+                "resource_id": "plan-via-network",
+                "identifier": "NETWORK-PLAN",
+                "name": None,
+                "reference": None,
+                "provenance": "network-derived",
+            }
+        ]
+    )
+
+    assert evidence_map[("pdfhir_example", "role-100")]["insurance_plans"] == [
+        {
+            "resource_type": "InsurancePlan",
+            "resource_id": "plan-via-network",
+            "identifier": "NETWORK-PLAN",
+            "provenance": "network-derived",
+        }
+    ]
+
+
+def test_unmatched_role_network_does_not_add_plan_evidence():
+    evidence_map = npi_module._map_provider_directory_role_evidence(
+        [
+            {
+                "source_id": "pdfhir_example",
+                "role_id": "role-100",
+                "evidence_type": "role",
+                "resource_id": "role-100",
+                "identifier": None,
+                "name": None,
+                "reference": None,
+                "provenance": "provider_directory_practitioner_role",
+            },
+            {
+                "source_id": "pdfhir_example",
+                "role_id": "role-100",
+                "evidence_type": "network",
+                "resource_id": "unmatched-network",
+                "identifier": None,
+                "name": "Unmatched Network",
+                "reference": "Organization/unmatched-network",
+                "provenance": "provider_directory_organization",
+            },
+        ]
+    )
+
+    role_evidence = evidence_map[("pdfhir_example", "role-100")]
+    assert role_evidence["insurance_plans"] == []
+    assert role_evidence["networks"][0]["resource_id"] == "unmatched-network"
+
+
+def test_direct_plan_reference_keeps_legacy_plan_evidence_shape():
+    evidence_map = npi_module._map_provider_directory_role_evidence(
+        [
+            {
+                "source_id": "pdfhir_example",
+                "role_id": "role-100",
+                "evidence_type": "insurance_plan",
+                "resource_id": "direct-plan",
+                "identifier": "DIRECT-PLAN",
+                "name": None,
+                "reference": None,
+                "provenance": "provider_directory_insurance_plan",
+            }
+        ]
+    )
+
+    assert evidence_map[("pdfhir_example", "role-100")]["insurance_plans"] == [
+        {
+            "resource_type": "InsurancePlan",
+            "resource_id": "direct-plan",
+            "identifier": "DIRECT-PLAN",
+        }
+    ]
 
 
 def test_provider_directory_role_marker_retains_roles_without_plan_or_network_refs():
