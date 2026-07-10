@@ -3177,6 +3177,35 @@ def _source_link_probe_sql_by_name(db_schema: str, available_table_names: set[st
     return probe_sql_by_name
 
 
+def _source_network_probe_sql_by_name(
+    db_schema: str,
+    available_table_names: set[str],
+) -> dict[str, str]:
+    """Return resolved network and standard Plan-Net bridge probes."""
+    exists_sql = _bounded_source_exists_sql
+    return {
+        "resolved_network": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_network_catalog",
+            "network_catalog",
+            "network_catalog.distinct_ref_count > 0::bigint "
+            "AND network_catalog.provider_directory_network_name IS NOT NULL "
+            "AND network_catalog.provider_directory_issuer_network_match_key IS NOT NULL",
+        ),
+        "role_network_plan_bridge": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_network_catalog",
+            "role_plan_network",
+            "role_plan_network.insurance_plan_ref_count > 0::bigint "
+            "AND role_plan_network.practitioner_role_ref_count > 0::bigint "
+            "AND role_plan_network.provider_directory_network_name IS NOT NULL "
+            "AND role_plan_network.provider_directory_issuer_network_match_key IS NOT NULL",
+        ),
+    }
+
+
 def _source_downstream_probe_sql_by_name(
     db_schema: str,
     available_table_names: set[str],
@@ -3214,20 +3243,15 @@ def _source_downstream_probe_sql_by_name(
                 "AND coordinate_overlay.long BETWEEN -180::numeric AND 180::numeric "
                 "AND NOT (coordinate_overlay.lat = 0::numeric AND coordinate_overlay.long = 0::numeric)",
             )
-    return {
+    downstream_probe_sql_by_name = {
         "canonical_address": canonical_address_sql,
         "usable_phone": usable_phone_sql,
         "usable_coordinates": usable_coordinates_sql,
-        "resolved_network": exists_sql(
-            db_schema,
-            available_table_names,
-            "provider_directory_network_catalog",
-            "network_catalog",
-            "network_catalog.distinct_ref_count > 0::bigint "
-            "AND network_catalog.provider_directory_network_name IS NOT NULL "
-            "AND network_catalog.provider_directory_issuer_network_match_key IS NOT NULL",
-        ),
     }
+    downstream_probe_sql_by_name.update(
+        _source_network_probe_sql_by_name(db_schema, available_table_names)
+    )
+    return downstream_probe_sql_by_name
 
 
 def _semantic_source_selection_sql(schema: str, *, maintained_source_scope: bool) -> str:
@@ -3302,6 +3326,11 @@ def _source_semantic_readiness_sql(
                ({probe_sql_by_name['resolved_role_location']})::boolean AS has_resolved_role_location,
                ({probe_sql_by_name['role_plan_refs']})::boolean AS has_role_plan_refs,
                ({probe_sql_by_name['resolved_role_plan']})::boolean AS has_resolved_role_plan,
+               ({probe_sql_by_name['role_network_plan_bridge']})::boolean
+                   AS has_resolved_role_network_plan,
+               ({probe_sql_by_name['resolved_role_plan']}
+                    OR {probe_sql_by_name['role_network_plan_bridge']})::boolean
+                   AS has_resolved_provider_plan_association,
                ({probe_sql_by_name['network_refs']})::boolean AS has_network_refs,
                ({probe_sql_by_name['canonical_address']})::boolean AS has_canonical_address,
                ({probe_sql_by_name['usable_phone']})::boolean AS has_usable_phone,
@@ -3325,7 +3354,7 @@ def _annotate_semantic_source_samples(source_samples: list[dict[str, Any]]) -> N
         "has_usable_phone": "usable_phone",
         "has_usable_coordinates": "usable_coordinates",
         "has_resolved_role_location": "resolved_role_location",
-        "has_resolved_role_plan": "resolved_role_plan",
+        "has_resolved_provider_plan_association": "resolved_provider_plan_association",
         "has_resolved_network_evidence": "resolved_network_evidence",
     }
     raw_field_names = (
@@ -3362,6 +3391,10 @@ def _semantic_source_counts_by_metric(source_samples: list[dict[str, Any]]) -> d
         "sources_with_resolved_role_locations": "has_resolved_role_location",
         "sources_with_role_plan_refs": "has_role_plan_refs",
         "sources_with_resolved_role_plans": "has_resolved_role_plan",
+        "sources_with_resolved_role_network_plans": "has_resolved_role_network_plan",
+        "sources_with_resolved_provider_plan_associations": (
+            "has_resolved_provider_plan_association"
+        ),
         "sources_with_network_refs": "has_network_refs",
         "sources_with_resolved_network_evidence": "has_resolved_network_evidence",
         "semantic_ready_source_count": "semantic_ready",
@@ -5477,7 +5510,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"canonical address `{semantic_readiness.get('sources_with_canonical_addresses')}`, "
                 f"usable phone `{semantic_readiness.get('sources_with_usable_phones')}`, "
                 f"resolved role/location `{semantic_readiness.get('sources_with_resolved_role_locations')}`, "
-                f"resolved role/plan `{semantic_readiness.get('sources_with_resolved_role_plans')}`, "
+                f"provider/plan association "
+                f"`{semantic_readiness.get('sources_with_resolved_provider_plan_associations')}` "
+                f"(direct `{semantic_readiness.get('sources_with_resolved_role_plans')}`, "
+                f"network-derived `{semantic_readiness.get('sources_with_resolved_role_network_plans')}`), "
                 f"resolved network `{semantic_readiness.get('sources_with_resolved_network_evidence')}`"
             )
         if source_coverage.get("sources_with_valid_npi_organization_address_rows") is not None:
@@ -5802,8 +5838,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Per-Source Semantic Readiness",
                 "",
-                "| Source | Raw | NPI | Canonical address | Phone | Coordinates | Role/location | Role/plan | Network | Gaps |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Source | Raw | NPI | Canonical address | Phone | Coordinates | Role/location | Role/plan direct | Network-derived plan | Provider/plan | Network | Gaps |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for item in semantic_readiness["samples"]:
@@ -5812,6 +5848,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{bool(item.get('has_role_location_refs'))}/{bool(item.get('has_resolved_role_location'))}"
             )
             role_plan = f"{bool(item.get('has_role_plan_refs'))}/{bool(item.get('has_resolved_role_plan'))}"
+            network_plan = bool(item.get("has_resolved_role_network_plan"))
+            provider_plan = bool(item.get("has_resolved_provider_plan_association"))
             network_evidence = (
                 f"{bool(item.get('has_network_refs'))}/{bool(item.get('has_resolved_network_evidence'))}"
             )
@@ -5822,7 +5860,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"`{bool(item.get('has_canonical_address'))}` | "
                 f"`{bool(item.get('has_usable_phone'))}` | "
                 f"`{bool(item.get('has_usable_coordinates'))}` | "
-                f"`{role_location}` | `{role_plan}` | `{network_evidence}` | "
+                f"`{role_location}` | `{role_plan}` | `{network_plan}` | `{provider_plan}` | "
+                f"`{network_evidence}` | "
                 f"`{_markdown_cell(gaps)}` |"
             )
         if semantic_readiness.get("truncated"):

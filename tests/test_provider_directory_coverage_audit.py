@@ -2596,8 +2596,11 @@ def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and
     assert "healthcare_service.location_refs" in sql
     assert "telecom.value->>'system'" in sql
     assert "network_catalog.distinct_ref_count > 0::bigint" in sql
+    assert "role_plan_network.insurance_plan_ref_count > 0::bigint" in sql
+    assert "role_plan_network.practitioner_role_ref_count > 0::bigint" in sql
     assert "AS has_usable_coordinates" in sql
     assert "AS has_resolved_network_evidence" in sql
+    assert "AS has_resolved_provider_plan_association" in sql
     assert ")::boolean\n                   AS has_valid_npi" in sql
 
 
@@ -2641,8 +2644,10 @@ def _semantic_readiness_probe_rows():
             "has_insurance_plan_rows": True,
             "has_role_location_refs": True,
             "has_resolved_role_location": True,
-            "has_role_plan_refs": True,
-            "has_resolved_role_plan": True,
+            "has_role_plan_refs": False,
+            "has_resolved_role_plan": False,
+            "has_resolved_role_network_plan": True,
+            "has_resolved_provider_plan_association": True,
             "has_network_refs": True,
             "has_canonical_address": True,
             "has_usable_phone": True,
@@ -2661,6 +2666,8 @@ def _semantic_readiness_probe_rows():
             "has_resolved_role_location": False,
             "has_role_plan_refs": True,
             "has_resolved_role_plan": False,
+            "has_resolved_role_network_plan": False,
+            "has_resolved_provider_plan_association": False,
             "has_network_refs": True,
             "has_canonical_address": False,
             "has_usable_phone": False,
@@ -2730,7 +2737,9 @@ def _assert_semantic_readiness_summary(summary):
     assert summary["sources_with_canonical_addresses"] == 1
     assert summary["sources_with_usable_coordinates"] == 1
     assert summary["sources_with_resolved_role_locations"] == 1
-    assert summary["sources_with_resolved_role_plans"] == 1
+    assert summary["sources_with_resolved_role_plans"] == 0
+    assert summary["sources_with_resolved_role_network_plans"] == 1
+    assert summary["sources_with_resolved_provider_plan_associations"] == 1
     assert summary["sources_with_resolved_network_evidence"] == 1
     assert summary["semantic_ready_source_count"] == 1
     assert summary["raw_only_source_count"] == 1
@@ -2740,7 +2749,7 @@ def _assert_semantic_readiness_summary(summary):
         "usable_phone",
         "usable_coordinates",
         "resolved_role_location",
-        "resolved_role_plan",
+        "resolved_provider_plan_association",
         "resolved_network_evidence",
     ]
 
