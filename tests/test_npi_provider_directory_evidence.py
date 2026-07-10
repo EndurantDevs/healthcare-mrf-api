@@ -67,27 +67,128 @@ def provider_directory_plan_network_fixture():
     }
 
 
+def _provider_directory_evidence_row(
+    evidence_type,
+    resource_id,
+    provenance,
+    identifier=None,
+    name=None,
+    reference=None,
+):
+    return {
+        "source_id": "pdfhir_aetna",
+        "role_id": "role-100",
+        "evidence_type": evidence_type,
+        "resource_id": resource_id,
+        "identifier": identifier,
+        "name": name,
+        "reference": reference,
+        "provenance": provenance,
+    }
+
+
 def test_provider_directory_role_evidence_sql_is_keyed_and_bounded():
     sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
 
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
+    assert "role.active IS DISTINCT FROM false" in sql
+    assert "role_organization.source_id = role.source_id" in sql
+    assert "role_organization.resource_id = NULLIF(BTRIM(CASE" in sql
+    assert "affiliation.source_id = role_organization.source_id" in sql
+    assert "affiliation.participating_organization_ref" in sql
+    assert "= role_organization.organization_resource_id" in sql
+    assert "affiliation.active IS DISTINCT FROM false" in sql
+    assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)" in sql
     assert "'role'::varchar AS evidence_type" in sql
     assert "FROM roles AS role" in sql
     assert "insurance_plan.source_id = role.source_id" in sql
     assert "insurance_plan.resource_id = NULLIF(BTRIM(CASE" in sql
     assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
+    assert sql.count(
+        "COALESCE(NULLIF(LOWER(BTRIM(insurance_plan.status)), ''), 'active') = 'active'"
+    ) == 2
     assert "role_network_organization.source_id = role_network.source_id" in sql
     assert "role_network_organization.resource_id = role_network.resource_id" in sql
+    assert "FROM (SELECT DISTINCT source_id FROM valid_role_networks) AS requested_source" in sql
     assert "insurance_plan.source_id = requested_source.source_id" in sql
     assert "plan_network.resource_id = role_network.resource_id" in sql
+    assert "BOOL_OR(role_network.plan_provenance = 'network-derived')" in sql
     assert "FROM direct_plans AS direct_plan" in sql
-    assert "'network-derived'::varchar AS provenance" in sql
+    assert "'organization-affiliation-network-derived'::varchar" in sql
+    assert "'provider_directory_organization_affiliation'::varchar AS evidence_provenance" in sql
     assert "network_catalog.network_resource_id = network.resource_id" in sql
     assert "network_organization.resource_id = network.resource_id" in sql
     assert f"LIMIT {npi_module.MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS}" in sql
     assert "jsonb_set" not in sql
     assert "UPDATE " not in sql
+    assert "owned_by" not in sql.lower()
+    assert "administered_by" not in sql.lower()
+    assert "affiliation.organization_ref" not in sql
+
+
+def test_affiliation_mapping_has_provenance():
+    evidence_map = npi_module._map_provider_directory_role_evidence(
+        [
+            _provider_directory_evidence_row(
+                "insurance_plan", "plan-via-role-network", "network-derived", "AETNA-DIRECT"
+            ),
+            _provider_directory_evidence_row(
+                "insurance_plan",
+                "plan-via-affiliation",
+                "organization-affiliation-network-derived",
+                "AETNA-PLAN",
+            ),
+            _provider_directory_evidence_row(
+                "network",
+                "network-via-affiliation",
+                "provider_directory_organization_affiliation",
+                name="Aetna Choice POS II",
+                reference="Organization/network-via-affiliation",
+            ),
+        ]
+    )
+
+    role_evidence = evidence_map[("pdfhir_aetna", "role-100")]
+    assert role_evidence["insurance_plans"] == [
+        {
+            "resource_type": "InsurancePlan",
+            "resource_id": "plan-via-role-network",
+            "identifier": "AETNA-DIRECT",
+            "provenance": "network-derived",
+        },
+        {
+            "resource_type": "InsurancePlan",
+            "resource_id": "plan-via-affiliation",
+            "identifier": "AETNA-PLAN",
+            "provenance": "organization-affiliation-network-derived",
+        }
+    ]
+    assert role_evidence["networks"] == [
+        {
+            "resource_type": "Organization",
+            "resource_id": "network-via-affiliation",
+            "name": "Aetna Choice POS II",
+            "reference": "Organization/network-via-affiliation",
+            "provenance": "provider_directory_organization_affiliation",
+        }
+    ]
+
+
+def test_affiliation_sql_requires_active_resources():
+    sql = npi_module._provider_directory_role_evidence_sql(
+        "mrf",
+        has_catalog=False,
+        has_affiliations=True,
+    )
+
+    assert "role_organization.active IS DISTINCT FROM false" in sql
+    assert "affiliation.active IS DISTINCT FROM false" in sql
+    assert "role_network_organization.active IS DISTINCT FROM false" in sql
+    assert "role_network_organization.resource_id = role_network.resource_id" in sql
+    assert "plan_network.resource_id = role_network.resource_id" in sql
+    assert "plan_network.resource_id = affiliation.resource_id" not in sql
+    assert "insurance_plan.organization_ref" not in sql
 
 
 def test_network_matched_plan_is_labeled_as_network_derived():
@@ -237,6 +338,54 @@ async def test_role_evidence_disables_jit_once_per_request_session(monkeypatch):
 
     assert session.statements.count("SET LOCAL jit = off") == 1
     assert sum("requested_roles AS" in statement for statement in session.statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_affiliation_table_falls_back(monkeypatch):
+    class FakeResult:
+        def all(self):
+            return []
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement, _params=None):
+            self.statements.append(str(statement))
+            return FakeResult()
+
+    checked_tables = []
+
+    async def has_table(table_name, *, session=None):
+        assert session is evidence_session
+        checked_tables.append(table_name)
+        return table_name not in {
+            "provider_directory_organization_affiliation",
+            "provider_directory_network_catalog",
+        }
+
+    evidence_session = FakeSession()
+    monkeypatch.setattr(npi_module, "_table_exists", has_table)
+
+    evidence_map = await npi_module._fetch_provider_directory_role_evidence_map(
+        [("pdfhir_example", "role-100")],
+        session=evidence_session,
+    )
+
+    query_sql = next(
+        statement for statement in evidence_session.statements if "requested_roles AS" in statement
+    )
+    assert evidence_map == {}
+    assert "provider_directory_organization_affiliation AS affiliation" not in query_sql
+    assert "direct_role_networks AS MATERIALIZED" in query_sql
+    assert "FROM direct_plans AS direct_plan" in query_sql
+    assert checked_tables == [
+        "provider_directory_practitioner_role",
+        "provider_directory_insurance_plan",
+        "provider_directory_organization",
+        "provider_directory_organization_affiliation",
+        "provider_directory_network_catalog",
+    ]
 
 
 @pytest.mark.asyncio

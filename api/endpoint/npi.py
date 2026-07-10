@@ -945,6 +945,10 @@ def _provider_directory_reference_resource_id_sql(reference: str, resource_type:
     )
 
 
+def _insurance_plan_active_sql(alias: str) -> str:
+    return f"COALESCE(NULLIF(LOWER(BTRIM({alias}.status)), ''), 'active') = 'active'"
+
+
 def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
     organization_join = (
         f"LEFT JOIN {schema}.provider_directory_organization AS network_organization "
@@ -968,35 +972,67 @@ def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -
     return f"{catalog_join} {organization_join}", network_name, provenance
 
 
-def _provider_directory_network_plan_ctes_sql(schema: str) -> str:
-    """Build same-source network intersection CTEs for role plan evidence."""
-    role_network_id = _provider_directory_reference_resource_id_sql(
-        "role_network_ref.value",
+def _provider_directory_affiliation_network_ctes_sql(
+    schema: str,
+    has_affiliations: bool,
+) -> str:
+    if not has_affiliations:
+        return """
+    affiliation_networks AS MATERIALIZED (
+        SELECT role.source_id, role.role_id, NULL::varchar AS reference,
+               NULL::varchar AS resource_id,
+               'organization-affiliation-network-derived'::varchar AS plan_provenance,
+               'provider_directory_organization_affiliation'::varchar AS evidence_provenance
+          FROM roles AS role
+         WHERE false
+    )
+        """
+    role_organization_id = _provider_directory_reference_resource_id_sql(
+        "role.organization_ref",
         "Organization",
     )
-    plan_network_id = _provider_directory_reference_resource_id_sql(
-        "plan_network_ref.value",
+    participating_organization_id = _provider_directory_reference_resource_id_sql(
+        "affiliation.participating_organization_ref",
+        "Organization",
+    )
+    affiliation_network_id = _provider_directory_reference_resource_id_sql(
+        "affiliation_network_ref.value",
         "Organization",
     )
     return f"""
-    role_networks AS MATERIALIZED (
-        SELECT DISTINCT role.source_id, role.role_id,
-               role_network_ref.value::varchar AS reference,
-               {role_network_id}::varchar AS resource_id
+    role_organizations AS MATERIALIZED (
+        SELECT role.source_id, role.role_id,
+               role_organization.resource_id AS organization_resource_id
           FROM roles AS role
+          JOIN {schema}.provider_directory_organization AS role_organization
+            ON role_organization.source_id = role.source_id
+           AND role_organization.resource_id = {role_organization_id}
+           AND role_organization.active IS DISTINCT FROM false
+    ), affiliation_networks AS MATERIALIZED (
+        SELECT DISTINCT role_organization.source_id, role_organization.role_id,
+               affiliation_network_ref.value::varchar AS reference,
+               {affiliation_network_id}::varchar AS resource_id,
+               'organization-affiliation-network-derived'::varchar AS plan_provenance,
+               'provider_directory_organization_affiliation'::varchar AS evidence_provenance
+          FROM role_organizations AS role_organization
+          JOIN {schema}.provider_directory_organization_affiliation AS affiliation
+            ON affiliation.source_id = role_organization.source_id
+           AND {participating_organization_id} = role_organization.organization_resource_id
+           AND affiliation.active IS DISTINCT FROM false
          CROSS JOIN LATERAL jsonb_array_elements_text(
-               COALESCE(role.network_refs, '[]'::jsonb)
-         ) AS role_network_ref(value)
-    ), valid_role_networks AS MATERIALIZED (
-        SELECT role_network.source_id, role_network.role_id,
-               role_network.reference, role_network.resource_id
-          FROM role_networks AS role_network
-          JOIN {schema}.provider_directory_organization AS role_network_organization
-            ON role_network_organization.source_id = role_network.source_id
-           AND role_network_organization.resource_id = role_network.resource_id
-           AND role_network_organization.active IS DISTINCT FROM false
-         WHERE role_network.resource_id IS NOT NULL
-    ), network_plan_refs AS MATERIALIZED (
+               COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
+         ) AS affiliation_network_ref(value)
+    )
+    """
+
+
+def _network_plan_refs_ctes_sql(
+    schema: str,
+    plan_network_id: str,
+    insurance_plan_active: str,
+) -> str:
+    return f"""
+    network_plan_refs AS MATERIALIZED (
         SELECT insurance_plan.source_id,
                insurance_plan.resource_id AS insurance_plan_resource_id,
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
@@ -1004,13 +1040,18 @@ def _provider_directory_network_plan_ctes_sql(schema: str) -> str:
           FROM (SELECT DISTINCT source_id FROM valid_role_networks) AS requested_source
           JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
             ON insurance_plan.source_id = requested_source.source_id
+           AND {insurance_plan_active}
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
          ) AS plan_network_ref(value)
     ), network_derived_plans AS MATERIALIZED (
-        SELECT DISTINCT role_network.source_id, role_network.role_id,
+        SELECT role_network.source_id, role_network.role_id,
                plan_network.insurance_plan_resource_id AS resource_id,
-               plan_network.identifier
+               plan_network.identifier,
+               CASE WHEN BOOL_OR(role_network.plan_provenance = 'network-derived')
+                    THEN 'network-derived'::varchar
+                    ELSE 'organization-affiliation-network-derived'::varchar
+                END AS provenance
           FROM valid_role_networks AS role_network
           JOIN network_plan_refs AS plan_network
             ON plan_network.source_id = role_network.source_id
@@ -1023,24 +1064,83 @@ def _provider_directory_network_plan_ctes_sql(schema: str) -> str:
                   AND direct_plan.role_id = role_network.role_id
                   AND direct_plan.resource_id = plan_network.insurance_plan_resource_id
            )
+      GROUP BY role_network.source_id, role_network.role_id,
+               plan_network.insurance_plan_resource_id, plan_network.identifier
     )
     """
 
 
-def _provider_directory_role_ctes_sql(schema: str) -> str:
+def _provider_directory_network_plan_ctes_sql(schema: str, has_affiliations: bool) -> str:
+    """Build same-source network intersection CTEs for role plan evidence."""
+    role_network_id = _provider_directory_reference_resource_id_sql(
+        "role_network_ref.value",
+        "Organization",
+    )
+    plan_network_id = _provider_directory_reference_resource_id_sql(
+        "plan_network_ref.value",
+        "Organization",
+    )
+    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    affiliation_ctes_sql = _provider_directory_affiliation_network_ctes_sql(
+        schema,
+        has_affiliations,
+    )
+    plan_ctes_sql = _network_plan_refs_ctes_sql(
+        schema,
+        plan_network_id,
+        insurance_plan_active,
+    )
+    return f"""
+    direct_role_networks AS MATERIALIZED (
+        SELECT DISTINCT role.source_id, role.role_id,
+               role_network_ref.value::varchar AS reference,
+               {role_network_id}::varchar AS resource_id,
+               'network-derived'::varchar AS plan_provenance,
+               NULL::varchar AS evidence_provenance
+          FROM roles AS role
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+               COALESCE(role.network_refs, '[]'::jsonb)
+         ) AS role_network_ref(value)
+    ), {affiliation_ctes_sql}, role_networks AS MATERIALIZED (
+        SELECT source_id, role_id, reference, resource_id,
+               plan_provenance, evidence_provenance
+          FROM direct_role_networks
+        UNION
+        SELECT source_id, role_id, reference, resource_id,
+               plan_provenance, evidence_provenance
+          FROM affiliation_networks
+    ), valid_role_networks AS MATERIALIZED (
+        SELECT role_network.source_id, role_network.role_id,
+               role_network.reference, role_network.resource_id,
+               role_network.plan_provenance, role_network.evidence_provenance
+          FROM role_networks AS role_network
+          JOIN {schema}.provider_directory_organization AS role_network_organization
+            ON role_network_organization.source_id = role_network.source_id
+           AND role_network_organization.resource_id = role_network.resource_id
+           AND role_network_organization.active IS DISTINCT FROM false
+         WHERE role_network.resource_id IS NOT NULL
+    ), {plan_ctes_sql}
+    """
+
+
+def _provider_directory_role_ctes_sql(schema: str, has_affiliations: bool) -> str:
     plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
     evidence_network_id = _provider_directory_reference_resource_id_sql(
         "network_ref.reference",
         "Organization",
     )
-    network_plan_ctes_sql = _provider_directory_network_plan_ctes_sql(schema)
+    network_plan_ctes_sql = _provider_directory_network_plan_ctes_sql(
+        schema,
+        has_affiliations,
+    )
+    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
     return f"""
     requested_roles AS (
         SELECT source_id, role_id
           FROM unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))
                AS requested(source_id, role_id)
     ), roles AS MATERIALIZED (
-        SELECT role.source_id, role.resource_id AS role_id,
+        SELECT role.source_id, role.resource_id AS role_id, role.organization_ref,
                role.insurance_plan_refs::jsonb, role.network_refs::jsonb
           FROM requested_roles AS requested
           JOIN {schema}.provider_directory_practitioner_role AS role
@@ -1057,15 +1157,19 @@ def _provider_directory_role_ctes_sql(schema: str) -> str:
           JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
             ON insurance_plan.source_id = role.source_id
            AND insurance_plan.resource_id = {plan_id}
+           AND {insurance_plan_active}
     ), {network_plan_ctes_sql}, network_references AS (
-        SELECT role_network.source_id, role_network.role_id, role_network.reference
-          FROM role_networks AS role_network
+        SELECT role_network.source_id, role_network.role_id, role_network.reference,
+               role_network.evidence_provenance
+          FROM valid_role_networks AS role_network
         UNION
-        SELECT plan.source_id, plan.role_id, network_ref.value::varchar AS reference
+        SELECT plan.source_id, plan.role_id, network_ref.value::varchar AS reference,
+               NULL::varchar AS evidence_provenance
           FROM direct_plans AS plan
          CROSS JOIN LATERAL jsonb_array_elements_text(plan.network_refs) AS network_ref(value)
     ), networks AS (
         SELECT network_ref.source_id, network_ref.role_id, network_ref.reference,
+               network_ref.evidence_provenance,
                {evidence_network_id}::varchar AS resource_id
           FROM network_references AS network_ref
     )
@@ -1093,21 +1197,26 @@ def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> st
         SELECT derived_plan.source_id, derived_plan.role_id,
                'insurance_plan'::varchar AS evidence_type,
                derived_plan.resource_id, derived_plan.identifier, NULL::varchar AS name,
-               NULL::varchar AS reference, 'network-derived'::varchar AS provenance
+               NULL::varchar AS reference, derived_plan.provenance
           FROM network_derived_plans AS derived_plan
         UNION ALL
         SELECT network.source_id, network.role_id, 'network'::varchar AS evidence_type,
                network.resource_id, NULL::varchar AS identifier,
                NULLIF(BTRIM({network_name}), '')::varchar AS name,
-               network.reference, {network_provenance} AS provenance
+               network.reference,
+               COALESCE(network.evidence_provenance, {network_provenance}) AS provenance
           FROM networks AS network
           {network_joins}
          WHERE network.resource_id IS NOT NULL AND NULLIF(BTRIM({network_name}), '') IS NOT NULL
     """
 
 
-def _provider_directory_role_evidence_sql(schema: str, has_catalog: bool) -> str:
-    role_ctes_sql = _provider_directory_role_ctes_sql(schema)
+def _provider_directory_role_evidence_sql(
+    schema: str,
+    has_catalog: bool,
+    has_affiliations: bool = True,
+) -> str:
+    role_ctes_sql = _provider_directory_role_ctes_sql(schema, has_affiliations)
     evidence_union_sql = _provider_directory_evidence_union_sql(schema, has_catalog)
     return f"""
     WITH {role_ctes_sql}, evidence AS (
@@ -1144,8 +1253,11 @@ def _map_provider_directory_role_evidence(
                 "resource_id": mapping["resource_id"],
                 "identifier": mapping["identifier"],
             }
-            if mapping.get("provenance") == "network-derived":
-                plan_detail_map["provenance"] = "network-derived"
+            if mapping.get("provenance") in {
+                "network-derived",
+                "organization-affiliation-network-derived",
+            }:
+                plan_detail_map["provenance"] = mapping["provenance"]
             _append_unique_mapping(role_evidence["insurance_plans"], plan_detail_map)
         elif mapping["evidence_type"] == "network":
             network_detail_map = {
@@ -1183,13 +1295,17 @@ async def _fetch_provider_directory_role_evidence_map(
     ]
     if not all(required_tables):
         return {}
+    has_affiliations = await _table_exists(
+        "provider_directory_organization_affiliation",
+        session=session,
+    )
     has_catalog = await _table_exists("provider_directory_network_catalog", session=session)
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if not getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
         await session.execute(text("SET LOCAL jit = off"))
         setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
     evidence_result = await _execute_stmt(
-        text(_provider_directory_role_evidence_sql(schema, has_catalog)),
+        text(_provider_directory_role_evidence_sql(schema, has_catalog, has_affiliations)),
         session=session,
         params={
             "source_ids": [source_id for source_id, _role_id in bounded_keys],
