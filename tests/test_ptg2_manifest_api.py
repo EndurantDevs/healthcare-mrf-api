@@ -303,7 +303,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_ex
                     "snapshot_scoped": True,
                     "artifact_uri": manifest_path.resolve().as_uri(),
                 }
-            }
+            },
         ]
     )
 
@@ -320,6 +320,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_ex
     )
 
     assert len(session.calls) == 1
+    assert "status = 'published'" in str(session.calls[0][0][0])
     assert "source" not in payload["query"]
     assert "serving_table" not in payload["query"]
     assert "procedure_consolidation" not in payload["query"]

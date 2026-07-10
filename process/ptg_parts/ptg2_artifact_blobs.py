@@ -113,6 +113,40 @@ async def ensure_ptg2_artifact_blob_table(schema_name: str | None = None) -> Non
     )
 
 
+async def delete_ptg2_artifacts_for_snapshot(
+    snapshot_id: str,
+    *,
+    schema_name: str | None = None,
+) -> None:
+    """Delete PostgreSQL-owned artifacts for one unpublished snapshot."""
+
+    snapshot_id = str(snapshot_id or "").strip()
+    if not snapshot_id:
+        return
+    schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
+    qualified_manifest = f"{_quote_ident(schema)}.ptg2_artifact_manifest"
+    await ensure_ptg2_artifact_blob_table(schema)
+    async with db.transaction() as session:
+        await session.execute(
+            text(
+                f"""
+                DELETE FROM {qualified_chunks}
+                 WHERE artifact_id IN (
+                    SELECT artifact_id
+                      FROM {qualified_manifest}
+                     WHERE snapshot_id = :snapshot_id
+                 )
+                """
+            ),
+            {"snapshot_id": snapshot_id},
+        )
+        await session.execute(
+            text(f"DELETE FROM {qualified_manifest} WHERE snapshot_id = :snapshot_id"),
+            {"snapshot_id": snapshot_id},
+        )
+
+
 def _artifact_id_for(
     *,
     snapshot_id: str | None,

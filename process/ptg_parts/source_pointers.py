@@ -4,12 +4,64 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 from typing import Any
 
 from db.connection import db
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident, _table_exists
+
+
+PTG2_SOURCE_POINTER_GC_LOCK_KEY = "ptg2_source_pointer_gc_v1"
+
+_GLOBAL_SNAPSHOT_POINTER_RECONCILIATION_SQL = """
+WITH publish_lock AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
+), candidate_snapshot AS MATERIALIZED (
+    SELECT candidate.snapshot_id, candidate.published_at
+      FROM __SCHEMA__.ptg2_snapshot AS candidate,
+           publish_lock
+     WHERE candidate.snapshot_id = :snapshot_id
+       AND candidate.status = 'published'
+), updated_global_pointer AS (
+    INSERT INTO __SCHEMA__.ptg2_current_snapshot AS current_pointer
+        (slot, snapshot_id, previous_snapshot_id, updated_at)
+    SELECT 'current', candidate_snapshot.snapshot_id, NULL, :updated_at
+      FROM candidate_snapshot
+    ON CONFLICT (slot) DO UPDATE SET
+        snapshot_id = EXCLUDED.snapshot_id,
+        previous_snapshot_id = CASE
+            WHEN current_pointer.snapshot_id = EXCLUDED.snapshot_id
+            THEN current_pointer.previous_snapshot_id
+            ELSE current_pointer.snapshot_id
+        END,
+        updated_at = EXCLUDED.updated_at
+    WHERE current_pointer.snapshot_id = EXCLUDED.snapshot_id
+       OR NOT EXISTS (
+            SELECT 1
+              FROM __SCHEMA__.ptg2_snapshot AS incumbent
+             WHERE incumbent.snapshot_id = current_pointer.snapshot_id
+               AND incumbent.status = 'published'
+               AND incumbent.published_at >= (
+                    SELECT published_at FROM candidate_snapshot
+               )
+       )
+    RETURNING snapshot_id
+)
+SELECT snapshot_id FROM updated_global_pointer
+UNION ALL
+SELECT current_pointer.snapshot_id
+  FROM __SCHEMA__.ptg2_current_snapshot AS current_pointer,
+       candidate_snapshot
+ WHERE current_pointer.slot = 'current'
+   AND NOT EXISTS (SELECT 1 FROM updated_global_pointer)
+LIMIT 1
+"""
+
+
+class PTG2SourcePointerConflict(RuntimeError):
+    """Raised when a source pointer changed after an import observed it."""
 
 
 def _ptg2_plan_source_key(
@@ -156,6 +208,183 @@ async def _source_plan_rows_from_import_catalog(*, snapshot_id: str, source_key:
     )
 
 
+def _has_result_row(query_result: Any) -> bool:
+    if query_result is None:
+        return True
+    return query_result.first() is not None
+
+
+async def _compare_and_swap_source_pointer(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+    updated_at: datetime.datetime,
+) -> None:
+    cas_query_result = await session.execute(
+        db.text(
+            f"""
+            WITH publish_lock AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
+            ), updated_pointer AS (
+                UPDATE {_quote_ident(schema_name)}.ptg2_current_source_snapshot AS current_pointer
+                   SET snapshot_id = :snapshot_id,
+                       previous_snapshot_id = :previous_snapshot_id,
+                       import_month = :import_month,
+                       updated_at = :updated_at
+                  FROM publish_lock
+                 WHERE current_pointer.source_key = :source_key
+                   AND (
+                        current_pointer.snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
+                        OR current_pointer.snapshot_id = :snapshot_id
+                   )
+                RETURNING current_pointer.snapshot_id
+            ), inserted_pointer AS (
+                INSERT INTO {_quote_ident(schema_name)}.ptg2_current_source_snapshot
+                    (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
+                SELECT :source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at
+                  FROM publish_lock
+                 WHERE :previous_snapshot_id IS NULL
+                ON CONFLICT (source_key) DO NOTHING
+                RETURNING snapshot_id
+            )
+            SELECT snapshot_id FROM updated_pointer
+            UNION ALL
+            SELECT snapshot_id FROM inserted_pointer
+            LIMIT 1
+            """
+        ),
+        {
+            "publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+            "source_key": source_key,
+            "snapshot_id": snapshot_id,
+            "previous_snapshot_id": previous_snapshot_id,
+            "import_month": import_month,
+            "updated_at": updated_at,
+        },
+    )
+    if not _has_result_row(cas_query_result):
+        raise PTG2SourcePointerConflict(
+            f"PTG source pointer changed after import planning for {source_key}; "
+            f"expected {previous_snapshot_id or '<none>'}"
+        )
+
+
+async def _publish_snapshot_in_pointer_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_attributes: dict[str, Any] | None,
+) -> None:
+    if snapshot_attributes is None:
+        return
+    if snapshot_attributes.get("status") != "published":
+        raise ValueError("Atomic source-pointer promotion requires a published snapshot row")
+    publication_query_result = await session.execute(
+        db.text(
+            f"""
+            WITH updated_snapshot AS (
+                UPDATE {_quote_ident(schema_name)}.ptg2_snapshot
+                   SET import_run_id = :import_run_id,
+                       import_month = :import_month,
+                       status = :status,
+                       created_at = :created_at,
+                       validated_at = :validated_at,
+                       published_at = :published_at,
+                       previous_snapshot_id = :previous_snapshot_id,
+                       manifest = CAST(:manifest_json AS json)
+                 WHERE snapshot_id = :snapshot_id
+                   AND status IS DISTINCT FROM 'published'
+                RETURNING status
+            )
+            SELECT status FROM updated_snapshot
+            UNION ALL
+            SELECT status
+              FROM {_quote_ident(schema_name)}.ptg2_snapshot
+             WHERE snapshot_id = :snapshot_id
+               AND NOT EXISTS (SELECT 1 FROM updated_snapshot)
+            LIMIT 1
+            """
+        ),
+        {
+            **snapshot_attributes,
+            "manifest_json": json.dumps(
+                snapshot_attributes.get("manifest") or {},
+                default=str,
+            ),
+        },
+    )
+    if not _has_result_row(publication_query_result):
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_attributes.get('snapshot_id')} disappeared "
+            "during source-pointer promotion"
+        )
+
+
+async def _reconcile_global_snapshot_pointer(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    updated_at: datetime.datetime,
+) -> None:
+    """Advance a stale global pointer without replacing a newer publication."""
+    reconciliation_sql = _GLOBAL_SNAPSHOT_POINTER_RECONCILIATION_SQL.replace(
+        "__SCHEMA__",
+        _quote_ident(schema_name),
+    )
+    reconciliation_result = await session.execute(
+        db.text(reconciliation_sql),
+        {
+            "publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+            "snapshot_id": snapshot_id,
+            "updated_at": updated_at,
+        },
+    )
+    if not _has_result_row(reconciliation_result):
+        raise RuntimeError(
+            f"PTG snapshot {snapshot_id} was not available for global pointer reconciliation"
+        )
+
+
+async def _replace_source_plan_pointers(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    plan_pointer_entries: list[dict[str, Any]],
+) -> None:
+    await session.execute(
+        db.text(
+            f"DELETE FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE source_key = :source_key"
+        ),
+        {"source_key": source_key},
+    )
+    for plan_pointer_entry in plan_pointer_entries:
+        await session.execute(
+            db.text(
+                f"""
+                INSERT INTO {_quote_ident(schema_name)}.ptg2_current_plan_source
+                    (plan_source_key, plan_id, plan_market_type, import_month, source_key, snapshot_id, previous_snapshot_id, updated_at)
+                VALUES
+                    (:plan_source_key, :plan_id, :plan_market_type, :import_month, :source_key, :snapshot_id, :previous_snapshot_id, :updated_at)
+                ON CONFLICT (plan_source_key) DO UPDATE SET
+                    plan_id = EXCLUDED.plan_id,
+                    plan_market_type = EXCLUDED.plan_market_type,
+                    import_month = EXCLUDED.import_month,
+                    source_key = EXCLUDED.source_key,
+                    snapshot_id = EXCLUDED.snapshot_id,
+                    previous_snapshot_id = EXCLUDED.previous_snapshot_id,
+                    updated_at = EXCLUDED.updated_at
+                """
+            ),
+            plan_pointer_entry,
+        )
+
+
 async def _publish_ptg2_source_pointers(
     *,
     source_key: str,
@@ -164,8 +393,9 @@ async def _publish_ptg2_source_pointers(
     import_month: datetime.date,
     updated_at: datetime.datetime,
     serving_index: dict[str, Any] | None,
-) -> None:
-    plan_rows = await _source_plan_rows(
+    snapshot_attributes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    plan_pointer_entries = await _source_plan_rows(
         snapshot_id=snapshot_id,
         source_key=source_key,
         import_month=import_month,
@@ -175,50 +405,37 @@ async def _publish_ptg2_source_pointers(
     )
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
-        await session.execute(
-            db.text(
-                f"""
-                INSERT INTO {_quote_ident(schema_name)}.ptg2_current_source_snapshot
-                    (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
-                VALUES (:source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at)
-                ON CONFLICT (source_key) DO UPDATE SET
-                    snapshot_id = EXCLUDED.snapshot_id,
-                    previous_snapshot_id = EXCLUDED.previous_snapshot_id,
-                    import_month = EXCLUDED.import_month,
-                    updated_at = EXCLUDED.updated_at
-                """
-            ),
-            {
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "previous_snapshot_id": previous_snapshot_id,
-                "import_month": import_month,
-                "updated_at": updated_at,
-            },
+        await _compare_and_swap_source_pointer(
+            session,
+            schema_name=schema_name,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=previous_snapshot_id,
+            import_month=import_month,
+            updated_at=updated_at,
         )
-        await session.execute(
-            db.text(
-                f"DELETE FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE source_key = :source_key"
-            ),
-            {"source_key": source_key},
+        await _publish_snapshot_in_pointer_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_attributes=snapshot_attributes,
         )
-        for row in plan_rows:
-            await session.execute(
-                db.text(
-                    f"""
-                    INSERT INTO {_quote_ident(schema_name)}.ptg2_current_plan_source
-                        (plan_source_key, plan_id, plan_market_type, import_month, source_key, snapshot_id, previous_snapshot_id, updated_at)
-                    VALUES
-                        (:plan_source_key, :plan_id, :plan_market_type, :import_month, :source_key, :snapshot_id, :previous_snapshot_id, :updated_at)
-                    ON CONFLICT (plan_source_key) DO UPDATE SET
-                        plan_id = EXCLUDED.plan_id,
-                        plan_market_type = EXCLUDED.plan_market_type,
-                        import_month = EXCLUDED.import_month,
-                        source_key = EXCLUDED.source_key,
-                        snapshot_id = EXCLUDED.snapshot_id,
-                        previous_snapshot_id = EXCLUDED.previous_snapshot_id,
-                        updated_at = EXCLUDED.updated_at
-                    """
-                ),
-                row,
+        if snapshot_attributes is not None:
+            await _reconcile_global_snapshot_pointer(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                updated_at=updated_at,
             )
+        await _replace_source_plan_pointers(
+            session,
+            schema_name=schema_name,
+            source_key=source_key,
+            plan_pointer_entries=plan_pointer_entries,
+        )
+    return {
+        "status": "promoted",
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "previous_snapshot_id": previous_snapshot_id,
+        "global_pointer": "reconciled" if snapshot_attributes is not None else "not_requested",
+    }

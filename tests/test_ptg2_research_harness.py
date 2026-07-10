@@ -694,6 +694,32 @@ def test_api_latency_probe_failure_classification():
     assert failed == ["code_lookup:max_ms", "npi_reverse:p95_ms", "empty_lookup:no_payload"]
 
 
+def test_api_latency_probe_separates_p95_budget_from_sample_ceiling():
+    probes_by_name = {
+        "code_lookup": {"payload": True, "p95_ms": 39.9, "max_ms": 91.0},
+        "npi_reverse": {"payload": True, "p95_ms": 40.1, "max_ms": 41.0},
+    }
+
+    failed = harness._failed_api_latency_probes(
+        probes_by_name,
+        max_latency_ms=100.0,
+        p95_latency_ms=40.0,
+    )
+
+    assert failed == ["npi_reverse:p95_ms"]
+
+
+def test_api_latency_probe_config_preserves_zero_warmup():
+    config = harness._api_latency_probe_config(
+        snapshot_id="snapshot",
+        case={"api_probe_warmup": 0, "api_probe_iterations": 1},
+        variant={"api_probe_warmup": 7},
+    )
+
+    assert config["warmup"] == 0
+    assert config["iterations"] == 1
+
+
 def test_dry_run_writes_report(tmp_path):
     suite = {
         "variants": [{"id": "baseline"}],
@@ -785,6 +811,22 @@ def test_large_fixture_can_omit_npi_members(tmp_path):
     assert summary["negotiated_prices"] == 4
     assert summary["unique_serving_rates"] == 4
     assert summary["unique_provider_npis"] == 0
+
+
+def test_original_file_summary_distinguishes_declared_and_used_provider_npis(tmp_path):
+    fixture_map = {
+        "id": "partially-used-providers",
+        "fixture": "large_in_network",
+        "negotiated_rates": 4,
+        "provider_sets": 4,
+        "price_reuse_mod": 4,
+    }
+    harness.write_ptg_toc_fixture(fixture_map, tmp_path, base_url="http://127.0.0.1:1")
+
+    summary = harness.expected_original_file_summary(tmp_path / "rates.json.gz")
+
+    assert summary["unique_provider_npis"] == 4
+    assert summary["used_provider_npis"] == 1
 
 
 def test_large_fixture_can_shape_codes_and_reused_prices(tmp_path):

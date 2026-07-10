@@ -89,9 +89,20 @@ jobs:
           tests/test_process_pharmacy_license_unit.py
           tests/test_pharmacy_license_run_failure_unit.py
           tests/test_process_ptg_unit.py
+          tests/test_ptg_publish_state_races.py
           tests/test_ptg2_db_serving_binary.py
+          tests/test_ptg2_db_serving_v3.py
+          tests/test_ptg2_manifest_cleanup.py
+          tests/test_ptg2_postgres_binary_v3_api.py
+          tests/test_ptg2_scanner_parallelism.py
+          tests/test_ptg2_serving.py
+          tests/test_ptg2_serving_binary_v3.py
+          tests/test_ptg2_serving_binary_v3_publish.py
+          tests/test_ptg2_serving_binary_v3_writer.py
           tests/test_ptg2_serving_binary_writer.py
+          tests/test_ptg2_source_snapshot_gc.py
           tests/test_ptg_control_unit.py
+          tests/test_ptg_source_snapshot_control.py
 
   api-contract:
     name: openapi contract

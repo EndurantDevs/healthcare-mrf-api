@@ -13,6 +13,7 @@ class _FakeExecutor:
         if "SELECT DISTINCT snapshot_id" in statement:
             return [{"snapshot_id": "snap_current"}]
         if 'FROM "mrf".ptg2_snapshot' in statement:
+            assert "status IN ('published', 'failed')" in statement
             return [
                 {
                     "snapshot_id": "snap_current",
@@ -25,6 +26,7 @@ class _FakeExecutor:
                 },
                 {
                     "snapshot_id": "snap_old",
+                    "status": "failed",
                     "source_key": "source_a",
                     "serving_index": {
                         "storage": "manifest_snapshot",
@@ -189,4 +191,111 @@ def test_execute_ptg2_source_snapshot_gc_plan_recomputes_and_deletes_metadata(mo
     assert "set_config('lock_timeout'" in status_statements[0]
     assert any('DROP TABLE IF EXISTS "mrf"."ptg2_serving_old"' in statement for statement in status_statements)
     assert any("DELETE FROM \"mrf\".ptg2_artifact_manifest" in statement for statement in status_statements)
-    assert any("DELETE FROM \"mrf\".ptg2_snapshot" in statement for statement in status_statements)
+    snapshot_deletes = [statement for statement in status_statements if "DELETE FROM \"mrf\".ptg2_snapshot" in statement]
+    assert len(snapshot_deletes) == 1
+    assert "status IN ('published', 'failed')" in snapshot_deletes[0]
+
+
+def test_execute_gc_replans_after_concurrent_snapshot_promotion(monkeypatch):
+    events = []
+
+    class InterleavingExecutor(_FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.publisher_committed = False
+
+        async def status(self, statement, **params):
+            self.status_calls.append((statement, params))
+            if "pg_advisory_xact_lock" in statement:
+                events.append("publish_lock_acquired")
+                self.publisher_committed = True
+            return 1
+
+        async def all(self, statement, **params):
+            if "SELECT DISTINCT snapshot_id" in statement:
+                events.append("pointer_state_read")
+                assert self.publisher_committed is True
+                return [{"snapshot_id": "snap_promoted"}]
+            if 'FROM "mrf".ptg2_snapshot' in statement:
+                return [
+                    {
+                        "snapshot_id": "snap_promoted",
+                        "source_key": "source_a",
+                        "serving_index": {
+                            "storage": "manifest_snapshot",
+                            "table": "mrf.ptg2_serving_promoted",
+                        },
+                    }
+                ]
+            raise AssertionError(statement)
+
+    connection = InterleavingExecutor()
+    monkeypatch.setattr(snapshot_gc, "db", _FakeDB(connection))
+    monkeypatch.setattr(snapshot_gc, "ensure_ptg2_artifact_blob_table", _fake_ensure)
+
+    plan = asyncio.run(snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=1024))
+
+    assert events == ["publish_lock_acquired", "pointer_state_read"]
+    assert plan.current_snapshot_ids == ("snap_promoted",)
+    assert plan.candidate_snapshot_ids == ()
+    destructive_statements = [
+        statement
+        for statement, _params in connection.status_calls
+        if "DROP TABLE" in statement or "DELETE FROM" in statement
+    ]
+    assert destructive_statements == []
+
+
+def test_execute_gc_replans_after_failed_snapshot_is_reclaimed(monkeypatch):
+    class ReclaimedSnapshotExecutor(_FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.reclaimed_as_building = False
+
+        async def status(self, statement, **params):
+            self.status_calls.append((statement, params))
+            if "LOCK TABLE \"mrf\".ptg2_snapshot" in statement:
+                self.reclaimed_as_building = True
+            return 1
+
+        async def all(self, statement, **params):
+            if "SELECT DISTINCT snapshot_id" in statement:
+                return []
+            if 'FROM "mrf".ptg2_snapshot' in statement:
+                assert "status IN ('published', 'failed')" in statement
+                if self.reclaimed_as_building:
+                    return []
+                return [
+                    {
+                        "snapshot_id": "snap_retry",
+                        "status": "failed",
+                        "source_key": "source_a",
+                        "serving_index": {
+                            "storage": "manifest_snapshot",
+                            "table": "mrf.ptg2_serving_retry",
+                        },
+                    }
+                ]
+            if "FROM pg_class c" in statement:
+                return [{"table_name": "ptg2_serving_retry", "bytes": 100}]
+            raise AssertionError(statement)
+
+    connection = ReclaimedSnapshotExecutor()
+    dry_run_plan = asyncio.run(snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=connection))
+    assert dry_run_plan.candidate_snapshot_ids == ("snap_retry",)
+
+    monkeypatch.setattr(snapshot_gc, "db", _FakeDB(connection))
+    monkeypatch.setattr(snapshot_gc, "ensure_ptg2_artifact_blob_table", _fake_ensure)
+    executed_plan = asyncio.run(snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=1024))
+
+    assert executed_plan.candidate_snapshot_ids == ()
+    destructive_statements = [
+        statement
+        for statement, _params in connection.status_calls
+        if "DROP TABLE" in statement or "DELETE FROM" in statement
+    ]
+    assert destructive_statements == []
+
+
+async def _fake_ensure(_schema_name=None):
+    return None

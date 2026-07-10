@@ -142,6 +142,172 @@ def test_default_ptg2_import_id_includes_source_inputs():
     assert materialized_id != sidecar_id
 
 
+def _snapshot_identity_test_options() -> dict[str, object]:
+    return {
+        "toc_urls": ["https://example.test/index.json"],
+        "toc_list": None,
+        "in_network_url": None,
+        "allowed_url": None,
+        "provider_ref_url": None,
+        "source_key": "source_a",
+        "plan_ids": [],
+        "plan_name_contains": [],
+        "plan_market_types": [],
+        "file_url_contains": [],
+        "source_network_names": [],
+        "max_files": None,
+        "max_items": None,
+        "compact_import": True,
+        "serving_only_import": True,
+        "source_scoped_compact": True,
+        "serving_storage": "manifest_snapshot",
+        "snapshot_arch": "sidecar_scope_v1",
+        "snapshot_arch_variant": None,
+        "test_mode": False,
+        "allow_partial_import": False,
+        "hash_mode": "checksum64",
+        "provider_bucket_count": 64,
+        "provider_set_inline_npi_limit": 0,
+        "id_storage": "uuid",
+        "manifest_serving_layout": "",
+        "manifest_price_atom_layout": "",
+        "manifest_provider_group_location": True,
+        "manifest_provider_set_component": False,
+        "manifest_provider_group_rate_scope": False,
+        "manifest_serving_sidecars": True,
+        "manifest_drop_serving_table": True,
+        "manifest_postgres_binary_natural_lean_stream": False,
+        "manifest_provider_npi_sidecar": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("option_name", "changed_value"),
+    [
+        ("plan_ids", ["plan-1"]),
+        ("plan_name_contains", ["acme"]),
+        ("plan_market_types", ["group"]),
+        ("file_url_contains", ["rates"]),
+        ("source_network_names", ["Network A"]),
+        ("max_files", 1),
+        ("max_items", 25),
+        ("test_mode", True),
+        ("snapshot_arch", "postgres_binary_v2"),
+        ("snapshot_arch_variant", "candidate_v2"),
+        ("serving_only_import", False),
+        ("allow_partial_import", True),
+        ("hash_mode", "sha256"),
+        ("provider_bucket_count", 32),
+        ("provider_set_inline_npi_limit", 10),
+        ("id_storage", "hex"),
+        ("manifest_serving_layout", "lean_provider_key_v1"),
+        ("manifest_price_atom_layout", "lean_dict_v2"),
+        ("manifest_provider_group_location", False),
+        ("manifest_provider_set_component", True),
+        ("manifest_provider_group_rate_scope", True),
+        ("manifest_serving_sidecars", False),
+        ("manifest_drop_serving_table", False),
+        ("manifest_postgres_binary_natural_lean_stream", True),
+        ("manifest_provider_npi_sidecar", False),
+    ],
+)
+def test_snapshot_identity_changes_for_content_options(option_name, changed_value):
+    month = process_ptg.normalize_import_month("2026-07")
+    base_option_by_name = _snapshot_identity_test_options()
+    changed_option_by_name = {**base_option_by_name, option_name: changed_value}
+
+    base_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=month,
+        import_id="delivery-a",
+        option_by_name=base_option_by_name,
+    )
+    changed_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=month,
+        import_id="delivery-a",
+        option_by_name=changed_option_by_name,
+    )
+
+    assert changed_snapshot_id != base_snapshot_id
+
+
+def test_snapshot_identity_normalizes_filters_and_ignores_operational_options(monkeypatch):
+    month = process_ptg.normalize_import_month("2026-07")
+    first_option_by_name = {
+        **_snapshot_identity_test_options(),
+        "plan_ids": ["PLAN-B", "plan-a", "plan-a"],
+        "reuse_raw_artifacts": True,
+        "keep_partial_artifacts": True,
+        "async_write_tasks": 1,
+        "fast_provider_union": False,
+    }
+    second_option_by_name = {
+        **first_option_by_name,
+        "plan_ids": ["plan-a", "plan-b"],
+        "snapshot_arch_variant": "sidecar_scope_v1",
+        "reuse_raw_artifacts": False,
+        "keep_partial_artifacts": False,
+        "async_write_tasks": 12,
+        "fast_provider_union": True,
+    }
+    monkeypatch.setenv(process_ptg.PTG2_HASH_MODE_ENV, "blake2")
+
+    first_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=month,
+        import_id="delivery-a",
+        option_by_name=first_option_by_name,
+    )
+    second_snapshot_id = process_ptg._ptg2_deterministic_snapshot_id(
+        import_month=month,
+        import_id="delivery-a",
+        option_by_name=second_option_by_name,
+    )
+
+    assert second_snapshot_id == first_snapshot_id
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "effective_mode"),
+    [
+        ("sha256", "sha256"),
+        ("blake2", "blake2_128"),
+        ("blake2b", "blake2_128"),
+        ("blake2_128", "blake2_128"),
+        ("unexpected", "checksum64"),
+    ],
+)
+def test_snapshot_identity_normalizes_effective_hash_mode(
+    monkeypatch,
+    configured_mode,
+    effective_mode,
+):
+    monkeypatch.setenv(process_ptg.PTG2_HASH_MODE_ENV, configured_mode)
+
+    assert process_ptg._ptg2_effective_hash_mode() == effective_mode
+
+
+def test_candidate_serving_index_enumerates_every_possible_final_table():
+    candidate_index = process_ptg._ptg2_candidate_serving_index(
+        source_key="source_a",
+        snapshot_id="ptg2:202607:candidate",
+    )
+
+    candidate_tables = set(process_ptg._snapshot_manifest_table_names(candidate_index))
+
+    assert candidate_tables == {
+        table_name.split(".", 1)[-1]
+        for table_name in candidate_index["materialized_tables"].values()
+    }
+    assert process_ptg._ptg2_manifest_stage_table_names("manifest_stage") == [
+        "manifest_stage",
+        "ptg2_manifest_stage_price_atom_manifest_stage",
+        "ptg2_manifest_stage_price_set_atom_manifest_stage",
+        "ptg2_manifest_stage_provider_group_member_manifest_stage",
+        "ptg2_manifest_stage_provider_npi_scope_manifest_stage",
+        "ptg2_manifest_stage_code_count_manifest_stage",
+        "ptg2_manifest_stage_provider_set_dictionary_manifest_stage",
+    ]
+
+
 def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
     monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV, raising=False)
     monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, raising=False)
@@ -767,18 +933,25 @@ def test_snapshot_cleanup_collects_tables_for_any_storage():
         {
             "storage": "future_snapshot_layout",
             "table": "mrf.ptg2_serving_future",
+            "serving_binary_table": "mrf.ptg2_serving_binary_future",
             "price_atom_table": "ptg2_price_atom_future",
             "provider_set_table": "mrf.plan",
             "provider_group_member_table": "ptg2_provider_group_member_future",
             "provider_npi_scope_table": "mrf.ptg2_provider_npi_scope_future",
+            "materialized_tables": {
+                "serving_binary": "mrf.ptg2_serving_binary_future",
+                "provider_set_dictionary": "mrf.ptg2_provider_set_dict_future",
+            },
         }
     )
 
     assert tables == [
         "ptg2_serving_future",
+        "ptg2_serving_binary_future",
         "ptg2_price_atom_future",
         "ptg2_provider_group_member_future",
         "ptg2_provider_npi_scope_future",
+        "ptg2_provider_set_dict_future",
     ]
 
 
@@ -1000,7 +1173,10 @@ def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
     async def fake_all(statement, **_params):
         if "FROM pg_class" in statement:
             return [
+                {"table_name": "ptg2_serving_abc123def4567890"},
+                {"table_name": "ptg2_serving_binary_abc123def4567890"},
                 {"table_name": "ptg2_serving_rate_compact_abc123def4567890"},
+                {"table_name": "ptg2_price_set_atom_abc123def4567890"},
                 {"table_name": "ptg2_provider_set_component_abc123def4567890"},
                 {"table_name": "ptg2_manifest_serving_abc123def4567890"},
                 {"table_name": "ptg2_plan"},
@@ -1022,7 +1198,10 @@ def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
     plan = asyncio.run(ptg_manifest_cleanup.build_ptg2_manifest_cleanup_plan(schema_name="mrf"))
 
     assert plan.tables == (
+        "ptg2_serving_abc123def4567890",
+        "ptg2_serving_binary_abc123def4567890",
         "ptg2_serving_rate_compact_abc123def4567890",
+        "ptg2_price_set_atom_abc123def4567890",
         "ptg2_provider_set_component_abc123def4567890",
     )
     assert plan.snapshot_ids == ("legacy-snap",)
@@ -1030,6 +1209,32 @@ def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
     assert plan.current_snapshot_slots == ("current",)
     assert plan.current_source_rows == ("legacy-source",)
     assert plan.current_plan_rows == ("legacy-plan",)
+
+
+def test_ptg2_manifest_cleanup_keeps_all_materialized_snapshot_tables():
+    referenced_tables = ptg_manifest_cleanup._manifest_referenced_tables(
+        {
+            "serving_index": {
+                "table": "mrf.ptg2_serving_abc123def4567890",
+                "serving_binary_table": "mrf.ptg2_serving_binary_abc123def4567890",
+                "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123def4567890",
+                "provider_set_component_table": "mrf.ptg2_provider_set_component_abc123def4567890",
+                "materialized_tables": {
+                    "code_count": "mrf.ptg2_code_count_abc123def4567890",
+                    "price_atom_dictionary": "mrf.ptg2_price_atom_dict_abc123def4567890",
+                },
+            }
+        }
+    )
+
+    assert referenced_tables == {
+        "ptg2_serving_abc123def4567890",
+        "ptg2_serving_binary_abc123def4567890",
+        "ptg2_provider_group_location_abc123def4567890",
+        "ptg2_provider_set_component_abc123def4567890",
+        "ptg2_code_count_abc123def4567890",
+        "ptg2_price_atom_dict_abc123def4567890",
+    }
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():
@@ -3631,6 +3836,93 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     assert import_run_rows[-1]["report"]["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
 
 
+def test_ptg2_main_marks_claim_failed_when_import_run_start_fails(monkeypatch):
+    pushed_entries = []
+    final_table_cleanup = AsyncMock()
+    create_stage = AsyncMock()
+
+    async def push(object_entries, cls, **_kwargs):
+        pushed_entries.extend((cls, entry) for entry in object_entries)
+        entry = object_entries[0]
+        if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
+            return {**entry, "snapshot_claim_status": "acquired"}
+        if cls is process_ptg.PTG2ImportRun and entry["status"] == process_ptg.PTG2_STATUS_RUNNING:
+            raise RuntimeError("import run write failed")
+        return None
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value="snap_previous"))
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", final_table_cleanup)
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage)
+
+    with pytest.raises(RuntimeError, match="import run write failed"):
+        asyncio.run(
+            process_ptg.main(
+                in_network_url="https://example.test/rates.json.gz",
+                import_month="2026-07",
+                import_id="import_run_start_failure",
+                source_key="source_a",
+            )
+        )
+
+    snapshot_entries = [
+        entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot
+    ]
+    assert [entry["status"] for entry in snapshot_entries] == [
+        process_ptg.PTG2_STATUS_BUILDING,
+        process_ptg.PTG2_STATUS_FAILED,
+    ]
+    final_table_cleanup.assert_awaited_once_with(None)
+    create_stage.assert_not_awaited()
+
+
+def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkeypatch):
+    pushed_entries = []
+    stage_cleanup = AsyncMock()
+
+    async def push(object_entries, cls, **_kwargs):
+        pushed_entries.extend((cls, entry) for entry in object_entries)
+        entry = object_entries[0]
+        if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
+            return {**entry, "snapshot_claim_status": "acquired"}
+        return None
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", stage_cleanup)
+    monkeypatch.setattr(
+        process_ptg,
+        "_create_ptg2_manifest_serving_stage_table",
+        AsyncMock(side_effect=RuntimeError("stage creation failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="stage creation failed"):
+        asyncio.run(
+            process_ptg.main(
+                in_network_url="https://example.test/rates.json.gz",
+                import_month="2026-07",
+                import_id="stage_creation_failure",
+                source_key="source_a",
+            )
+        )
+
+    stage_table_names = stage_cleanup.await_args.args[0]
+    assert len(stage_table_names) == 7
+    assert stage_table_names[1:] == process_ptg._ptg2_manifest_stage_table_names(
+        stage_table_names[0]
+    )[1:]
+    snapshot_entries = [
+        entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot
+    ]
+    assert snapshot_entries[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+
+
 def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     pushed = []
 
@@ -3655,6 +3947,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
@@ -4014,6 +4307,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
@@ -4060,6 +4354,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
@@ -4445,6 +4740,7 @@ def test_ptg2_rust_compact_serving_mode_emits_copy_oriented_rows(tmp_path):
 
 
 def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
+    """The compact scanner can emit a complete COPY row instead of JSON frames."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -4472,7 +4768,6 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
     }
     with gzip.open(artifact, "wb") as fp:
         fp.write(json.dumps(payload).encode("utf-8"))
-
     env = {
         **os.environ,
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
@@ -4489,9 +4784,9 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-
-    assert copy_path.exists()
-    copy_lines = copy_path.read_text().splitlines()
+    copy_files = [copy_path] if copy_path.exists() else sorted(tmp_path.glob(f"{copy_path.name}*"))
+    assert copy_files
+    copy_lines = [copy_line for copy_file in copy_files for copy_line in copy_file.read_text().splitlines()]
     assert len(copy_lines) in {1}
     fields = copy_lines[0].split("\t")
     assert fields[1] == "snapshot"
@@ -4505,35 +4800,43 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
     assert b"compact_copy_file" in completed.stdout
 
 
-def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp_path):
-    binary = process_ptg._ptg2_rust_scanner_binary()
-    if binary is None:
-        pytest.skip("PTG2 Rust scanner binary is not built")
-    artifact = tmp_path / "rates.json.gz"
-    serving_copy = tmp_path / "serving.copy"
-    member_copy = tmp_path / "provider_group_member.copy"
-    payload = {
+def _inline_provider_worker_payload():
+    inline_group_by_field = {"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}
+    return {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [
+                    {"npi": [1234567000], "tin": {"type": "ein", "value": "98-7654321"}}
+                ],
+            }
+        ],
         "in_network": [
             {
                 "billing_code_type": "CPT",
                 "billing_code": "99213",
                 "negotiated_rates": [
                     {
-                        "provider_groups": [
-                            {"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}
-                        ],
-                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
-                    },
-                    {
-                        "provider_groups": [
-                            {"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}
-                        ],
-                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 125}],
-                    },
+                        "provider_groups": [inline_group_by_field],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": rate}],
+                    }
+                    for rate in (100, 125)
                 ],
             }
         ],
     }
+
+
+def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp_path):
+    """The default worker parser retains inline provider groups and both rates."""
+
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact = tmp_path / "rates.json.gz"
+    serving_copy = tmp_path / "serving.copy"
+    member_copy = tmp_path / "provider_group_member.copy"
+    payload = _inline_provider_worker_payload()
     with gzip.open(artifact, "wb") as fp:
         fp.write(json.dumps(payload).encode("utf-8"))
 
@@ -4546,6 +4849,8 @@ def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(serving_copy),
         "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
         "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": "true",
     }
     completed = subprocess.run(
         [str(binary), "--compact-serving", str(artifact)],
@@ -4555,11 +4860,12 @@ def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp
         stderr=subprocess.PIPE,
     )
 
-    assert serving_copy.exists()
-    assert len(serving_copy.read_text().splitlines()) == 2
-    assert member_copy.exists()
-    member_lines = member_copy.read_text().splitlines()
+    serving_files = [serving_copy] if serving_copy.exists() else sorted(tmp_path.glob("serving.copy.worker*"))
+    member_files = [member_copy] if member_copy.exists() else sorted(tmp_path.glob("provider_group_member.copy.worker*"))
+    assert sum(len(copy_file.read_text().splitlines()) for copy_file in serving_files) == 2
+    member_lines = [line for copy_file in member_files for line in copy_file.read_text().splitlines()]
     assert len(member_lines) in {1}
+    assert b"parallel_top_level_bytes" in completed.stdout
     assert b"compact_copy_file" in completed.stdout
     assert b"provider_group_member_copy_file" in completed.stdout
 
@@ -5979,6 +6285,7 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
 
 def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -6028,13 +6335,39 @@ def test_ptg2_manifest_snapshot_publish_can_use_lean_provider_key_layout(monkeyp
     assert "INCLUDE (code_key, plan_id, rate_count)" in joined
     assert "(code_key, provider_count DESC NULLS LAST)" not in joined
     assert "(code_key)" in joined
+    assert "code_count.reported_code IS NOT DISTINCT FROM serving.reported_code" in joined
     assert "INCLUDE (provider_set_global_id_128)" in joined
     assert "plan_code_provider_set_idx" not in joined
     component_mock.assert_not_awaited()
 
 
+def test_direct_lean_swap_keeps_null_reported_codes(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+
+    asyncio.run(
+        ptg_manifest_publish._swap_direct_lean_stage(
+            schema_name="mrf",
+            final_table="ptg2_serving_source",
+            lean_table="ptg2_serving_lean",
+            code_count_table="ptg2_code_count",
+            provider_set_dictionary_table="ptg2_provider_sets",
+            storage_mode="UNLOGGED ",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert "code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system" in joined
+    assert "code_count.reported_code IS NOT DISTINCT FROM serving.reported_code" in joined
+
+
 def test_ptg2_manifest_snapshot_publish_attaches_serving_sidecars_and_drops_table(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -6226,6 +6559,7 @@ def test_ptg2_manifest_snapshot_publish_v2_uses_membership_graph(monkeypatch):
 
 def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -6285,6 +6619,7 @@ def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkey
 
 def test_ptg2_manifest_snapshot_publish_direct_lean_sidecars_skip_final_serving_table(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -6506,6 +6841,12 @@ def test_ptg2_snapshot_arch_rejects_postgres_posting_alias(monkeypatch):
         ptg_config._ptg2_snapshot_arch_from_env()
 
 
+def test_ptg2_snapshot_arch_defaults_to_durable_postgres_binary_v2(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", raising=False)
+
+    assert ptg_config._ptg2_snapshot_arch_from_env() == "postgres_binary_v2"
+
+
 def test_ptg2_snapshot_arch_accepts_postgres_binary_alias(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "db_binary")
 
@@ -6569,6 +6910,7 @@ def test_ptg2_manifest_snapshot_publish_materialized_arch_forces_scope_tables(mo
 
 def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -6618,8 +6960,7 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
     assert "negotiated_type.attr_key::integer AS negotiated_type_key" in joined
     assert "service_code.attr_key::integer AS service_code_key" in joined
     assert "billing_code_modifier.attr_key::integer AS billing_code_modifier_key" in joined
-    assert "text_lookup_key" in joined
-    assert "array_lookup_key" in joined
+    assert "text_lookup_key" in joined and "array_lookup_key" in joined
     assert "WHERE text_lookup_key IS NOT NULL" in joined
     assert "WHERE array_lookup_key IS NOT NULL" in joined
     assert "md5(to_json(price_atom.service_code)::text)" in joined
@@ -6797,6 +7138,7 @@ def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
 
 def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
     unique_index_failures = {"seen": False}
 
     async def fake_status(statement, **_params):
@@ -6898,6 +7240,7 @@ def _publish_steps(progress_events):
 
 def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     """Pre-copy merge emits progress while merging and copying manifest files."""
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
     merge_calls = []
     copy_calls = []
     progress_events = []
@@ -6949,6 +7292,7 @@ def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
 
 def test_ptg2_manifest_precopy_merge_streams_when_enabled(monkeypatch, tmp_path):
     """Streaming pre-copy merge emits progress around each direct COPY stream."""
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
     stream_calls = []
     progress_events = []
     source_files_by_kind = _write_manifest_copy_files(tmp_path)
@@ -6997,6 +7341,7 @@ def test_ptg2_manifest_precopy_merge_streams_when_enabled(monkeypatch, tmp_path)
 
 def test_ptg2_manifest_precopy_merge_streams_direct_lean_serving_kind(monkeypatch, tmp_path):
     stream_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
     source_files_by_kind = {}
     for kind in ("manifest_lean_serving", "price_atom", "provider_group_member"):
         source_path = tmp_path / f"{kind}.copy"
@@ -7197,6 +7542,7 @@ def test_manifest_copy_family_cleanup_removes_nonempty_failed_shards(tmp_path):
 
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     status_calls = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
@@ -7218,13 +7564,14 @@ def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     assert ptg_manifest_publish.PTG2_MANIFEST_SERVING_COLUMNS[-1] == "network_names"
 
 
-def test_ptg2_manifest_v2_stage_creates_npi_scope(monkeypatch):
+@pytest.mark.parametrize("snapshot_arch", ["postgres_binary_v2", "postgres_binary_v3"])
+def test_ptg2_manifest_membership_stage_creates_npi_scope(monkeypatch, snapshot_arch):
     status_calls = []
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
 
-    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v2")
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", snapshot_arch)
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
 
     asyncio.run(process_ptg._create_ptg2_manifest_serving_stage_table("abc"))
@@ -7371,6 +7718,20 @@ def test_ptg2_source_plan_rows_uses_code_count_for_lean_manifest(monkeypatch):
     assert len(calls) == 2
 
 
+def _build_published_snapshot_fields(import_month, updated_at):
+    return {
+        "snapshot_id": "snap",
+        "import_run_id": "ptg2:run",
+        "import_month": import_month,
+        "status": "published",
+        "created_at": updated_at,
+        "validated_at": updated_at,
+        "published_at": updated_at,
+        "previous_snapshot_id": "prev",
+        "manifest": {"serving_index": {"storage": "manifest_snapshot"}},
+    }
+
+
 def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionally(monkeypatch):
     executed = []
     updated_at = process_ptg._utcnow()
@@ -7403,8 +7764,9 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
 
     monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
     monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+    snapshot_by_field = _build_published_snapshot_fields(import_month, updated_at)
 
-    asyncio.run(
+    promotion_result = asyncio.run(
         process_ptg._publish_ptg2_source_pointers(
             source_key="example_dental",
             snapshot_id="snap",
@@ -7412,14 +7774,19 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
             import_month=import_month,
             updated_at=updated_at,
             serving_index={"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_exact"},
+            snapshot_attributes=snapshot_by_field,
         )
     )
 
     joined = "\n".join(statement for statement, _params in executed)
+    assert promotion_result["global_pointer"] == "reconciled"
     assert "INSERT INTO \"mrf\".ptg2_current_source_snapshot" in joined
+    assert "UPDATE \"mrf\".ptg2_snapshot" in joined
+    assert "updated_global_pointer" in joined
+    assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed) == 3
+    assert len(executed) == 5
 
 
 def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
@@ -7544,7 +7911,9 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
 
 def test_ptg2_precopy_merge_keeps_publish_db_dedupe(monkeypatch):
+    """Ensure precopy merge keeps the publish database dedupe fallback enabled."""
     publish_kwargs = []
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_push(_rows, _cls, **_kwargs):
         return None
@@ -7600,8 +7969,7 @@ def test_ptg2_precopy_merge_keeps_publish_db_dedupe(monkeypatch):
         )
     )
 
-    assert publish_kwargs
-    assert publish_kwargs[-1]["db_dedupe_fallback"] is True
+    assert publish_kwargs and publish_kwargs[-1]["db_dedupe_fallback"] is True
 
 
 def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
@@ -7920,9 +8288,27 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
     assert Path(logical.logical_path).read_bytes() == expected
 
 
+def _assert_recovered_worker_copy_summary(summary, recovered_paths_by_kind):
+    """Check recovered serving, price-atom, and provider-member copy counts."""
+
+    assert summary["serving_rates"] == 2
+    assert summary["manifest"]["serving_rows"] == 2
+    assert summary["manifest"]["copy_files"]["manifest_serving"] == [
+        {"path": recovered_paths_by_kind["serving"], "row_count": 2}
+    ]
+    assert summary["manifest"]["copy_files"]["price_atom"] == [
+        {"path": recovered_paths_by_kind["price"], "row_count": 1}
+    ]
+    assert summary["manifest"]["copy_files"]["provider_group_member"] == [
+        {"path": recovered_paths_by_kind["member"], "row_count": 1}
+    ]
+
+
 def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
+    """Recover worker copy files that the scanner did not report directly."""
     artifact_dir = tmp_path / "artifacts"
     recovered_paths_by_kind = {}
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
     async def fake_push_ptg2_objects(*_args, **_kwargs):
         return None
@@ -7968,17 +8354,7 @@ def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, mon
         )
     )
 
-    assert summary["serving_rates"] == 2
-    assert summary["manifest"]["serving_rows"] == 2
-    assert summary["manifest"]["copy_files"]["manifest_serving"] == [
-        {"path": recovered_paths_by_kind["serving"], "row_count": 2}
-    ]
-    assert summary["manifest"]["copy_files"]["price_atom"] == [
-        {"path": recovered_paths_by_kind["price"], "row_count": 1}
-    ]
-    assert summary["manifest"]["copy_files"]["provider_group_member"] == [
-        {"path": recovered_paths_by_kind["member"], "row_count": 1}
-    ]
+    _assert_recovered_worker_copy_summary(summary, recovered_paths_by_kind)
 
 
 def test_scanner_error_labels_sigterm():

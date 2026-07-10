@@ -139,8 +139,68 @@ def _serving_index_arch_version(serving_index: dict[str, Any]) -> str:
     return str(serving_index.get("arch_version") or "").strip().lower()
 
 
+def _optional_integer(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _serving_index_atom_key_bits(serving_index: dict[str, Any]) -> int | None:
+    direct_bits = _optional_integer(serving_index.get("atom_key_bits"))
+    if direct_bits is not None:
+        return direct_bits
+    serving_binary = serving_index.get("serving_binary")
+    if not isinstance(serving_binary, dict):
+        return None
+    dense_atom_keys = serving_binary.get("dense_atom_keys")
+    if isinstance(dense_atom_keys, dict):
+        dense_bits = _optional_integer(dense_atom_keys.get("atom_key_bits"))
+        if dense_bits is not None:
+            return dense_bits
+    price_atoms = serving_binary.get("price_atoms_v3")
+    if isinstance(price_atoms, dict):
+        return _optional_integer(price_atoms.get("atom_key_bits"))
+    return None
+
+
+def _serving_binary_section_integer(
+    serving_index: dict[str, Any],
+    section_name: str,
+    field_name: str,
+) -> int | None:
+    serving_binary = serving_index.get("serving_binary")
+    if not isinstance(serving_binary, dict):
+        return None
+    section_fields = serving_binary.get(section_name)
+    if not isinstance(section_fields, dict):
+        return None
+    return _optional_integer(section_fields.get(field_name))
+
+
+def _serving_binary_section_storage_integer(
+    serving_index: dict[str, Any],
+    section_name: str,
+    field_name: str,
+) -> int | None:
+    serving_binary = serving_index.get("serving_binary")
+    if not isinstance(serving_binary, dict):
+        return None
+    section_fields = serving_binary.get(section_name)
+    if not isinstance(section_fields, dict):
+        return None
+    storage_fields = section_fields.get("storage")
+    if not isinstance(storage_fields, dict):
+        return None
+    return _optional_integer(storage_fields.get(field_name))
+
+
 def _is_postgres_binary_serving_index(serving_index: dict[str, Any]) -> bool:
-    if _serving_index_arch_version(serving_index) in {"postgres_binary_v1", "postgres_binary_v2"}:
+    if _serving_index_arch_version(serving_index) in {
+        "postgres_binary_v1",
+        "postgres_binary_v2",
+        "postgres_binary_v3",
+    }:
         return True
     if _safe_table_name(serving_index.get("serving_binary_table")):
         return True
@@ -209,6 +269,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
             SELECT manifest
               FROM {PTG2_SCHEMA}.ptg2_snapshot
              WHERE snapshot_id = :snapshot_id
+               AND status = 'published'
              LIMIT 1
             """
         ),
@@ -216,14 +277,14 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
     )
     value = result.scalar()
     if not value:
-        return _cache(PTG2ServingTables())
+        return PTG2ServingTables()
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return _cache(PTG2ServingTables())
+            return PTG2ServingTables()
     if not isinstance(value, dict):
-        return _cache(PTG2ServingTables())
+        return PTG2ServingTables()
     manifest = value
     serving_index = manifest.get("serving_index")
     if isinstance(serving_index, str):
@@ -300,5 +361,31 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
                 if isinstance(serving_index.get("materialized_tables"), dict)
                 else None
             )
+        ),
+        price_dictionary_item_count=_serving_binary_section_integer(
+            serving_index,
+            "price_dictionary",
+            "price_set_count",
+        ),
+        price_dictionary_block_bytes=_serving_binary_section_integer(
+            serving_index,
+            "price_dictionary",
+            "block_bytes",
+        ),
+        price_dictionary_compressed_records=_serving_binary_section_storage_integer(
+            serving_index,
+            "price_dictionary",
+            "compressed_records",
+        ),
+        atom_key_bits=_serving_index_atom_key_bits(serving_index),
+        price_key_block_span=_serving_binary_section_integer(
+            serving_index,
+            "price_set_atom_memberships_v3",
+            "block_span",
+        ),
+        atom_key_block_span=_serving_binary_section_integer(
+            serving_index,
+            "price_atoms_v3",
+            "block_span",
         ),
     ))

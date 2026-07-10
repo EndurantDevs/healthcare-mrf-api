@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,15 @@ class PTG2ArtifactStore:
 def _is_strong_etag(etag: str | None) -> bool:
     if not etag:
         return False
-    return not etag.strip().lower().startswith("w/")
+    normalized = etag.strip()
+    return re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', normalized) is not None
+
+
+def _valid_raw_sha256(candidate: dict[str, Any]) -> str | None:
+    raw_sha256 = candidate.get("raw_sha256")
+    if not isinstance(raw_sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", raw_sha256) is None:
+        return None
+    return raw_sha256.lower()
 
 
 def choose_reusable_raw_artifact(
@@ -170,6 +179,7 @@ def choose_reusable_raw_artifact(
         candidate
         for candidate in candidates
         if candidate.get("status") in (None, "", "available")
+        and _valid_raw_sha256(candidate) is not None
     ]
     if not candidates:
         return None, None
@@ -209,7 +219,7 @@ def choose_reusable_raw_artifact(
     if store is not None and reuse_policy in {"hash", "metadata_or_hash"}:
         for candidate in reversed(candidates):
             raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
-            expected = candidate.get("raw_sha256") or candidate.get("sha256")
+            expected = _valid_raw_sha256(candidate)
             if not raw_uri or not expected:
                 continue
             raw_path = store.path_from_uri(raw_uri)

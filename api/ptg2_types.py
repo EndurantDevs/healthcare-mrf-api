@@ -55,6 +55,12 @@ class PTG2ServingTables:
     provider_group_rate_scope_table: str | None = None
     provider_set_dictionary_table: str | None = None
     serving_binary_table: str | None = None
+    price_dictionary_item_count: int | None = None
+    price_dictionary_block_bytes: int | None = None
+    price_dictionary_compressed_records: int | None = None
+    atom_key_bits: int | None = None
+    price_key_block_span: int | None = None
+    atom_key_block_span: int | None = None
     serving_table_layout: str | None = None
     source_trace_set_hash: str | None = None
     network_names: list[str] | None = None
@@ -101,4 +107,5 @@ class PTG2ServingTables:
             "sidecar_scope_v1",
             "postgres_binary_v1",
             "postgres_binary_v2",
+            "postgres_binary_v3",
         }

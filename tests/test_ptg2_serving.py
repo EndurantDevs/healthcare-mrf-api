@@ -1185,6 +1185,298 @@ async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_mi
 
 
 @pytest.mark.asyncio
+async def test_manifest_provider_rows_keep_authoritative_empty_v2_set(monkeypatch):
+    populated_set_id = "00000000000000000000000000000011"
+    empty_set_id = "00000000000000000000000000000012"
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v2",
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+        },
+    )
+
+    async def fake_provider_npis(_session, _tables, provider_set_ids, **_kwargs):
+        assert provider_set_ids == (populated_set_id, empty_set_id)
+        return {populated_set_id: (1234567890,), empty_set_id: ()}
+
+    async def fake_enriched_provider_rows(_session, *, npis, **_kwargs):
+        assert npis == (1234567890,)
+        return [{"npi": 1234567890, "provider_name": "Example Provider"}]
+
+    async def fail_legacy_fallback(*_args, **_kwargs):
+        raise AssertionError("authoritative graph membership must not use the legacy fallback")
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_npis_for_provider_sets", fake_provider_npis)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        fake_enriched_provider_rows,
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fail_legacy_fallback)
+
+    providers_by_set = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_sets(
+        object(),
+        tables,
+        [populated_set_id, empty_set_id],
+        limit_per_set=1,
+    )
+
+    assert providers_by_set == {
+        populated_set_id: [{"npi": 1234567890, "provider_name": "Example Provider"}],
+        empty_set_id: [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_provider_rows_for_one_authoritative_empty_v2_set(monkeypatch):
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v2",
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+        },
+        provider_group_member_table="mrf.ptg2_provider_group_member_legacy",
+    )
+
+    async def fake_provider_npis(*_args, **_kwargs):
+        return ()
+
+    async def fail_enrichment(*_args, **_kwargs):
+        raise AssertionError("an empty authoritative provider set must not run enrichment")
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_provider_npis_for_provider_set",
+        fake_provider_npis,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        fail_enrichment,
+    )
+
+    providers = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_set(
+        object(),
+        tables,
+        "00000000000000000000000000000012",
+        limit=10,
+    )
+
+    assert providers == []
+
+
+def test_authoritative_provider_membership_requires_usable_artifacts():
+    name_only_tables = ptg2_serving.PTG2ServingTables(
+        artifacts={
+            "provider_forward": {"name": "provider_forward"},
+            "provider_group_npi": {"name": "provider_group_npi"},
+        }
+    )
+    incomplete_tables = ptg2_serving.PTG2ServingTables(
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {"name": "provider_group_npi"},
+        }
+    )
+    db_backed_tables = ptg2_serving.PTG2ServingTables(
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+        }
+    )
+
+    assert not ptg2_serving._has_authoritative_provider_membership(name_only_tables)
+    assert not ptg2_serving._has_authoritative_provider_membership(incomplete_tables)
+    assert ptg2_serving._has_authoritative_provider_membership(db_backed_tables)
+
+
+@pytest.mark.asyncio
+async def test_manifest_provider_rows_fall_back_for_incomplete_membership(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    group_id = "00000000000000000000000000000021"
+    tables = ptg2_serving.PTG2ServingTables(
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {"name": "provider_group_npi"},
+        },
+        provider_group_member_table="mrf.ptg2_provider_group_member_legacy",
+    )
+
+    async def fake_sidecar_members(_session, _tables, name, owner_id, **_kwargs):
+        assert name == "provider_forward"
+        assert owner_id == provider_set_id
+        return (group_id,)
+
+    async def fake_enriched_provider_rows(_session, *, npis, limit, **_kwargs):
+        assert npis == [1234567890]
+        assert limit == 10
+        return [{"npi": 1234567890, "provider_name": "Example Provider"}]
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_async", fake_sidecar_members)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        fake_enriched_provider_rows,
+    )
+
+    providers = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_set(
+        FakeSession([FakeResult(rows=[{"npi": 1234567890}])]),
+        tables,
+        provider_set_id,
+        limit=10,
+    )
+
+    assert providers == [{"npi": 1234567890, "provider_name": "Example Provider"}]
+
+
+@pytest.mark.asyncio
+async def test_manifest_provider_rows_fall_back_when_direct_membership_is_unavailable(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    group_id = "00000000000000000000000000000021"
+    tables = ptg2_serving.PTG2ServingTables(
+        artifacts={
+            "provider_npi": {"name": "provider_npi", "path": "/missing/provider_npi.ptg2sc"},
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+        },
+        provider_group_member_table="mrf.ptg2_provider_group_member_legacy",
+    )
+
+    async def fake_sidecar_members(_session, _tables, name, owner_id, **_kwargs):
+        assert name == "provider_forward"
+        assert owner_id == provider_set_id
+        return (group_id,)
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_async", fake_sidecar_members)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        AsyncMock(return_value=[{"npi": 1234567890, "provider_name": "Example Provider"}]),
+    )
+
+    providers = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_set(
+        FakeSession([FakeResult(rows=[{"npi": 1234567890}])]),
+        tables,
+        provider_set_id,
+        limit=10,
+    )
+
+    assert providers == [{"npi": 1234567890, "provider_name": "Example Provider"}]
+
+
+def _tin_only_serving_tables(arch_version):
+    return ptg2_serving.PTG2ServingTables(
+        arch_version=arch_version,
+        serving_table="mrf.ptg2_serving_manifest_token",
+        price_atom_table="mrf.ptg2_price_atom_manifest_token",
+        artifacts={
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "arch_version",
+    ["postgres_binary_v1", "postgres_binary_v2", "postgres_binary_v3"],
+)
+@pytest.mark.asyncio
+async def test_manifest_serving_preserves_tin_only_rate_during_provider_expansion(
+    monkeypatch,
+    arch_version,
+):
+    """Provider expansion preserves priced TIN-only rows across binary readers."""
+
+    provider_set_id = "00000000000000000000000000000012"
+    price_set_id = "00000000000000000000000000000101"
+    serving_rate_row_by_field = {
+        "serving_content_hash_128": "00000000000000000000000000000201",
+        "plan_id": "465722012",
+        "reported_code_system": "CPT",
+        "reported_code": "99214",
+        "procedure_global_id_128": "00000000000000000000000000000301",
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": 0,
+        "price_set_global_id_128": price_set_id,
+        "source_trace_set_hash": None,
+        "network_names": ["TIN only"],
+    }
+    session = FakeSession(
+        [
+            1,
+            FakeResult(rows=[{"column_name": "network_names"}]),
+            FakeResult(rows=[serving_rate_row_by_field]),
+        ]
+    )
+    tables = _tin_only_serving_tables(arch_version)
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_provider_rows_for_provider_sets",
+        AsyncMock(return_value={provider_set_id: []}),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_prices_for_price_sets",
+        AsyncMock(return_value={price_set_id: [{"negotiated_type": "fee schedule", "negotiated_rate": 114.82}]}),
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", AsyncMock(return_value={}))
+
+    response_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202607:test",
+        {
+            "plan_id": "465722012",
+            "code": "99214",
+            "code_system": "CPT",
+            "include_providers": "true",
+        },
+        _Pagination(limit=10, offset=0),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert response_payload is not None
+    assert response_payload["items"][0]["npi"] is None
+    assert response_payload["items"][0]["provider_expansion_status"] == "no_npi_members"
+    assert response_payload["items"][0]["prices"][0]["negotiated_rate"] == 114.82
+
+
+@pytest.mark.asyncio
 async def test_manifest_membership_graph_resolves_provider_sets_in_both_directions(monkeypatch):
     provider_set_id = "00000000000000000000000000000011"
     group_id = "00000000000000000000000000000021"
@@ -1193,10 +1485,22 @@ async def test_manifest_membership_graph_resolves_provider_sets_in_both_directio
     tables = ptg2_serving.PTG2ServingTables(
         arch_version="postgres_binary_v2",
         artifacts={
-            "provider_forward": {"name": "provider_forward"},
-            "provider_inverted": {"name": "provider_inverted"},
-            "provider_group_npi": {"name": "provider_group_npi"},
-            "provider_npi_group": {"name": "provider_npi_group"},
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_inverted": {
+                "name": "provider_inverted",
+                "storage_uri": "db://ptg2_artifact/provider-inverted-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+            "provider_npi_group": {
+                "name": "provider_npi_group",
+                "storage_uri": "db://ptg2_artifact/provider-npi-group-test",
+            },
         }
     )
 
@@ -1234,8 +1538,14 @@ async def test_manifest_membership_graph_bounds_provider_expansion(monkeypatch):
     tables = ptg2_serving.PTG2ServingTables(
         arch_version="postgres_binary_v2",
         artifacts={
-            "provider_forward": {"name": "provider_forward"},
-            "provider_group_npi": {"name": "provider_group_npi"},
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
         },
     )
 
@@ -1863,8 +2173,7 @@ def _compact_tables(**overrides):
 def _db_serving_session():
     return FakeSession(
         [
-            None,
-            "snap-db",
+            FakeResult(rows=[("example_network", "snap-db")]),
             {"table": "mrf.ptg2_serving_rate"},
             "mrf.ptg2_serving_rate",
             1,
@@ -2563,13 +2872,13 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
     payload["items"][0]["reported_code"] = "mutated"
     cached_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
 
@@ -2597,7 +2906,7 @@ async def test_search_current_ptg2_index_ignores_non_manifest_serving_storage(mo
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
 
@@ -2626,8 +2935,9 @@ async def test_search_current_ptg2_index_caches_missing_payload(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
     monkeypatch.setattr(ptg2_serving, "search_ptg2_serving_table", fake_search)
 
-    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
-    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
+    search_arg_map = {"plan_id": "010854205", "source_key": "example_network"}
+    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), search_arg_map, FakePagination()) is None
+    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), search_arg_map, FakePagination()) is None
     assert calls_by_name == {"snapshot": 1, "search": 1}
 
 
@@ -3057,10 +3367,10 @@ async def test_search_current_ptg2_index_single_network_plan_uses_single_path(mo
 
 @pytest.mark.asyncio
 async def test_search_current_ptg2_index_pinned_snapshot_skips_network_combine(monkeypatch):
-    called = {"ids": 0}
+    call_count_by_name = {"ids": 0}
 
     async def fake_ids(_session, _args):
-        called["ids"] += 1
+        call_count_by_name["ids"] += 1
         return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
 
     async def fake_one(_session, snapshot_id, _args, _pagination):
@@ -3072,17 +3382,22 @@ async def test_search_current_ptg2_index_pinned_snapshot_skips_network_combine(m
 
     monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "resolve_current_ptg2_snapshot_id",
+        AsyncMock(return_value="snap-pinned"),
+    )
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    response_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "010854205", "code": "29888", "snapshot_id": "snap-pinned"},
         FakePagination(),
     )
 
     # A caller-pinned snapshot must not trigger the multi-network resolver/combine.
-    assert called["ids"] == 0
-    assert "combined" not in payload["query"]
-    assert payload["query"]["snapshot_id"] == "snap-pinned"
+    assert call_count_by_name["ids"] == 0
+    assert "combined" not in response_payload["query"]
+    assert response_payload["query"]["snapshot_id"] == "snap-pinned"
 
 
 @pytest.mark.asyncio
@@ -3106,6 +3421,58 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     assert "serving_index" in sql
     assert params["plan_ids"] == ["010854205", "01-0854205"]
     assert params["source_key"] == "example_dental"
+
+
+@pytest.mark.asyncio
+async def test_requested_ptg2_snapshot_must_be_published():
+    published_session = FakeSession(["snap-published"])
+    missing_session = FakeSession([None])
+
+    published = await ptg2_snapshot.current_snapshot_id(
+        published_session,
+        requested_snapshot_id="snap-published",
+    )
+    unavailable = await ptg2_snapshot.current_snapshot_id(
+        missing_session,
+        requested_snapshot_id="snap-building",
+    )
+
+    assert published == "snap-published"
+    assert unavailable is None
+    sql = str(published_session.calls[0][0][0])
+    params = published_session.calls[0][0][1]
+    assert "status = 'published'" in sql
+    assert params == {"snapshot_id": "snap-published"}
+
+
+@pytest.mark.asyncio
+async def test_source_only_snapshot_resolves_published_source_pointer():
+    session = FakeSession(["snap-source"])
+
+    snapshot_id = await ptg2_snapshot.resolve_current_ptg2_snapshot_id(
+        session,
+        {"source_key": "Example_Dental"},
+    )
+
+    assert snapshot_id == "snap-source"
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "ptg2_current_source_snapshot" in sql
+    assert "status = 'published'" in sql
+    assert params == {"source_key": "example_dental"}
+
+
+@pytest.mark.asyncio
+async def test_missing_source_pointer_does_not_fall_back_to_global_snapshot():
+    session = FakeSession([None, "snap-global"])
+
+    snapshot_id = await ptg2_snapshot.resolve_current_ptg2_snapshot_id(
+        session,
+        {"source_key": "missing_source"},
+    )
+
+    assert snapshot_id is None
+    assert len(session.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -3188,16 +3555,16 @@ def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
 
 @pytest.mark.asyncio
 async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fallback():
-    session = FakeSession([RuntimeError("missing source pointer"), "snap-global"])
+    session = FakeSession([RuntimeError("missing source pointer")])
 
     snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
         session,
         {"plan_id": "010854205", "plan_market_type": "group"},
     )
 
-    assert snapshot_id == "snap-global"
+    assert snapshot_id is None
     assert session.rollback_count == 1
-    assert len(session.calls) == 2
+    assert len(session.calls) == 1
 
 
 @pytest.mark.asyncio

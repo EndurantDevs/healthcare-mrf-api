@@ -2,8 +2,8 @@
 """Garbage collect non-current PTG2 source snapshot tables.
 
 This helper is intentionally narrower than the legacy PTG2 cleanup: it only
-targets published manifest-backed source snapshots that are not referenced by
-any current pointer table.
+targets terminal manifest-backed source snapshots that are not referenced by
+any current pointer table. Active building snapshots are never candidates.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
 from process.ptg_parts.snapshot_cleanup import _snapshot_manifest_table_names
+from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,7 @@ async def build_ptg2_source_snapshot_gc_plan(
                manifest->'serving_index' AS serving_index,
                manifest->'serving_index'->>'source_key' AS source_key
           FROM {_quote_ident(schema_name)}.ptg2_snapshot
-         WHERE status = 'published'
+         WHERE status IN ('published', 'failed')
            AND COALESCE(manifest->'serving_index'->>'storage', '') = 'manifest_snapshot'
          ORDER BY snapshot_id
         """
@@ -216,6 +217,27 @@ def validate_ptg2_source_snapshot_gc_plan(
         )
 
 
+async def _lock_ptg2_pointer_state(connection: Any, schema_name: str) -> None:
+    await connection.status(
+        "SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))",
+        publish_lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+    )
+    await connection.status(
+        f"""
+        LOCK TABLE {_quote_ident(schema_name)}.ptg2_snapshot
+        IN SHARE ROW EXCLUSIVE MODE
+        """
+    )
+    await connection.status(
+        f"""
+        LOCK TABLE {_quote_ident(schema_name)}.ptg2_current_snapshot,
+                   {_quote_ident(schema_name)}.ptg2_current_source_snapshot,
+                   {_quote_ident(schema_name)}.ptg2_current_plan_source
+        IN SHARE MODE
+        """
+    )
+
+
 async def execute_ptg2_source_snapshot_gc_plan(
     *,
     schema_name: str | None = None,
@@ -231,6 +253,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
     await ensure_ptg2_artifact_blob_table(schema_name)
     async with db.acquire() as connection:
         await connection.status("SELECT set_config('lock_timeout', :lock_timeout, true)", lock_timeout=lock_timeout)
+        await _lock_ptg2_pointer_state(connection, schema_name)
         plan = await build_ptg2_source_snapshot_gc_plan(
             schema_name=schema_name,
             executor=connection,
@@ -269,6 +292,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
                 f"""
                 DELETE FROM {_quote_ident(schema_name)}.ptg2_snapshot
                  WHERE snapshot_id = ANY(:snapshot_ids)
+                   AND status IN ('published', 'failed')
                 """,
                 snapshot_ids=list(plan.candidate_snapshot_ids),
             )

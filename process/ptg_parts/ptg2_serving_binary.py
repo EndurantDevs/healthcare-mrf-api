@@ -26,6 +26,10 @@ from pathlib import Path
 from typing import Any, AsyncIterable, Callable, Iterable, Mapping
 
 from db.connection import db
+from process.ptg_parts.config import (
+    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
+    _is_postgres_binary_v3_arch,
+)
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
@@ -35,6 +39,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_VERSION,
     PTG2ManifestArtifactError,
 )
+from process.ptg_parts.ptg2_serving_binary_v3 import select_atom_key_bits
 from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 
 PTG2_SERVING_BINARY_TABLE_FORMAT = "ptg2_serving_binary_blocks_v1"
@@ -45,7 +50,16 @@ PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND = "provider_set_count_diction
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_KIND = "by_provider_set"
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_dictionary"
 PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND = "price_set_atoms_by_id_v2"
+PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND = "provider_set_codes_v3"
+PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND = "price_set_atom_memberships_v3"
+PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND = "price_atoms_v3"
+PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND = "by_code_assigned_v3"
+PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND = "by_code_price_dictionary_v3"
+PTG2_SERVING_BINARY_V3_ARTIFACT_VERSION = 3
 PTG2_SERVING_BINARY_BLOCK_BYTES_ENV = "HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES"
+PTG2_SERVING_BINARY_DICTIONARY_BLOCK_BYTES_ENV = (
+    "HLTHPRT_PTG2_SERVING_BINARY_DICTIONARY_BLOCK_BYTES"
+)
 PTG2_SERVING_BINARY_COPY_RECORDS_ENV = "HLTHPRT_PTG2_SERVING_BINARY_COPY_RECORDS"
 PTG2_SERVING_BINARY_RUST_ENV = "HLTHPRT_PTG2_SERVING_BINARY_RUST"
 PTG2_SERVING_BINARY_STREAM_ENV = "HLTHPRT_PTG2_SERVING_BINARY_STREAM"
@@ -56,6 +70,9 @@ PTG2_SERVING_BINARY_TARGET_COPY_FORMAT_ENV = "HLTHPRT_PTG2_SERVING_BINARY_TARGET
 PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION"
 PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_LEVEL_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_LEVEL"
 PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES"
+PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT_ENV = (
+    "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT"
+)
 PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV = "HLTHPRT_PTG2_SERVING_BINARY_COPY_WORK_MEM"
 DB_POOL_MAX_SIZE_ENV = "HLTHPRT_DB_POOL_MAX_SIZE"
 PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED = "keyed"
@@ -70,9 +87,11 @@ PTG2_SERVING_BINARY_COLUMNS = [
     "raw_payload_bytes",
 ]
 _DEFAULT_BLOCK_BYTES = 2 * 1024 * 1024
+_DEFAULT_DICTIONARY_BLOCK_BYTES = 64 * 1024
 _DEFAULT_COPY_RECORDS = 2048
 _DEFAULT_STREAM_TASKS = 3
 _DEFAULT_COMPRESSION_MIN_BYTES = 128
+_DEFAULT_COMPRESSION_MIN_SAVINGS_PCT = 2.0
 _DEFAULT_COPY_WORK_MEM = "128MB"
 _DEFAULT_DB_POOL_MAX_SIZE = 5
 _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
@@ -84,6 +103,35 @@ _DENSE_MEMBER_RECORD = struct.Struct("<I")
 _STANDARD_MEMBERSHIP_MAGICS = {PTG2_MANIFEST_MEMBERSHIP_MAGIC, PTG2_MANIFEST_OLD_MEMBERSHIP_MAGIC}
 _DENSE_MEMBERSHIP_MAGICS = {PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC, PTG2_MANIFEST_OLD_DENSE_MEMBERSHIP_MAGIC}
 _WORK_MEM_RE = re.compile(r"^[1-9][0-9]*(?:kB|MB|GB|TB)?$")
+_V3_MAX_DENSE_KEY_COUNT = 1 << 32
+_V3_ATTRIBUTE_KEY_COLUMNS = (
+    "negotiated_type_key",
+    "expiration_date_key",
+    "service_code_key",
+    "billing_class_key",
+    "setting_key",
+    "billing_code_modifier_key",
+    "additional_information_key",
+)
+_V3_REQUIRED_ARTIFACT_KINDS = frozenset(
+    {
+        PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+        PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+        PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
+    }
+)
+_V3_STREAM_ENCODER_KINDS = frozenset(
+    {
+        PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND,
+        PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
+        PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +152,41 @@ class _AtomMapStageProgress:
     done: int
     total: int
     message: str
+
+
+@dataclass(frozen=True)
+class _V3StageTables:
+    price_key_map: str
+    atom_key_map: str
+
+
+@dataclass(frozen=True)
+class _V3PublishOptions:
+    schema_name: str
+    source_table: str
+    target_table: str
+    expected_row_count: int | None
+    price_set_atom_table: str
+    price_atom_table: str
+    source_layout: str
+    code_count_table: str | None
+    provider_set_dictionary_table: str | None
+    price_atom_table_layout: str | None
+    price_atom_constant_keys: Mapping[str, Any]
+    progress_callback: Callable[..., None] | None
+
+
+@dataclass(frozen=True)
+class _V3BuildState:
+    by_code_summary: Mapping[str, Any]
+    stream_summary_by_kind: Mapping[str, Mapping[str, Any]]
+    provider_stats: Mapping[str, Any]
+    membership_stats: Mapping[str, Any]
+    price_map_stats: Mapping[str, Any]
+    atom_map_stats: Mapping[str, Any]
+    atom_key_bits: int
+    timing_by_stage: dict[str, Any]
+    started_at: float
 
 
 def _elapsed_seconds(started_at: float) -> float:
@@ -166,13 +249,13 @@ def _serving_binary_stream_tasks() -> int:
 
 
 def _serving_binary_source_copy_format() -> str:
-    value = os.getenv(PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT_ENV, "text").strip().lower()
-    return value if value in {"text", "binary"} else "text"
+    value = os.getenv(PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT_ENV, "binary").strip().lower()
+    return value if value in {"text", "binary"} else "binary"
 
 
 def _serving_binary_target_copy_format() -> str:
-    value = os.getenv(PTG2_SERVING_BINARY_TARGET_COPY_FORMAT_ENV, "text").strip().lower()
-    return value if value in {"text", "binary"} else "text"
+    value = os.getenv(PTG2_SERVING_BINARY_TARGET_COPY_FORMAT_ENV, "binary").strip().lower()
+    return value if value in {"text", "binary"} else "binary"
 
 
 def _serving_binary_payload_compression() -> str:
@@ -192,6 +275,24 @@ def _serving_binary_payload_compression_min_bytes() -> int:
         return max(int(os.getenv(PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES_ENV, str(_DEFAULT_COMPRESSION_MIN_BYTES))), 0)
     except ValueError:
         return _DEFAULT_COMPRESSION_MIN_BYTES
+
+
+def _compression_min_savings_pct() -> float:
+    try:
+        return min(
+            max(
+                float(
+                    os.getenv(
+                        PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT_ENV,
+                        str(_DEFAULT_COMPRESSION_MIN_SAVINGS_PCT),
+                    )
+                ),
+                0.0,
+            ),
+            100.0,
+        )
+    except ValueError:
+        return _DEFAULT_COMPRESSION_MIN_SAVINGS_PCT
 
 
 def _serving_binary_copy_work_mem() -> str | None:
@@ -319,7 +420,9 @@ def _serving_binary_payload_for_storage(payload: bytes | bytearray | memoryview)
     if _serving_binary_payload_compression() != "zlib" or len(raw_payload) < _serving_binary_payload_compression_min_bytes():
         return raw_payload, "none", 0
     compressed_payload = zlib.compress(raw_payload, _serving_binary_payload_compression_level())
-    if len(compressed_payload) >= len(raw_payload):
+    saved_bytes = len(raw_payload) - len(compressed_payload)
+    minimum_savings_pct = _compression_min_savings_pct()
+    if saved_bytes <= 0 or (saved_bytes * 100.0) < (len(raw_payload) * minimum_savings_pct):
         return raw_payload, "none", 0
     return compressed_payload, "zlib", len(raw_payload)
 
@@ -468,7 +571,13 @@ async def finalize_ptg2_serving_binary_table(*, schema_name: str, target_table: 
         qualified_target=f"{schema_name}.{target_table}",
     )
     storage_mapping = getattr(storage, "_mapping", None)
-    return dict(storage_mapping) if storage_mapping is not None else dict(storage or {})
+    storage_data = dict(storage_mapping) if storage_mapping is not None else dict(storage or {})
+    if storage_data.get("relation_persistence") != "logged":
+        raise RuntimeError(
+            f"PTG2 serving binary table is not logged: {schema_name}.{target_table} "
+            f"(persistence={storage_data.get('relation_persistence')!r})"
+        )
+    return storage_data
 
 
 async def _copy_serving_binary_query_to_file(sql: str, output_path: Path) -> None:
@@ -738,6 +847,12 @@ async def _copy_through_rust_process(
             raise
 
 
+def _rust_stream_process_kind(encoder_kind: str, source_copy_format: str) -> str:
+    if encoder_kind in _V3_STREAM_ENCODER_KINDS or source_copy_format != "binary":
+        return encoder_kind
+    return f"{encoder_kind}_pg_binary"
+
+
 async def _run_rust_stream_copy(
     *,
     encoder_kind: str,
@@ -747,16 +862,18 @@ async def _run_rust_stream_copy(
     target_table: str,
     source_copy_format: str,
     target_copy_format: str,
+    encoder_options: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Launch one Rust encoder and return its summary with pipeline metrics."""
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
         raise RuntimeError(f"PTG2 Rust {failure_label} encoder is enabled but no scanner binary was found")
-    process_kind = f"{encoder_kind}_pg_binary" if source_copy_format == "binary" else encoder_kind
+    process_kind = _rust_stream_process_kind(encoder_kind, source_copy_format)
     process = await asyncio.create_subprocess_exec(
         str(binary),
         "--serving-binary-copy-from-key-copy-stdio",
         process_kind,
+        *(str(option) for option in encoder_options),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -797,12 +914,14 @@ async def _run_rust_stream_copy(
 async def _stream_serving_binary_copy(
     *, kind: str, sql: str, schema_name: str, target_table: str,
     source_copy_format: str = "text", target_copy_format: str = "text",
+    encoder_options: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Pipe one ordered PostgreSQL stream through a Rust block encoder."""
     return await _run_rust_stream_copy(
         encoder_kind=kind, failure_label=f"streaming serving binary COPY for {kind}",
         sql=sql, schema_name=schema_name, target_table=target_table,
         source_copy_format=source_copy_format, target_copy_format=target_copy_format,
+        encoder_options=encoder_options,
     )
 
 
@@ -1951,6 +2070,965 @@ async def _run_serving_binary_stream_stages(
     return dict(zip(stage_task_by_kind.keys(), stage_results, strict=True))
 
 
+def _v3_stage_tables(target_table: str) -> _V3StageTables:
+    return _V3StageTables(
+        price_key_map=_short_index_name(target_table, "v3_price_key_map"),
+        atom_key_map=_short_index_name(target_table, "v3_atom_key_map"),
+    )
+
+
+async def _drop_v3_stage_tables(*, schema_name: str, stage_tables: _V3StageTables) -> None:
+    qualified_tables = ", ".join(
+        f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
+        for table_name in (stage_tables.price_key_map, stage_tables.atom_key_map)
+    )
+    await db.status(f"DROP TABLE IF EXISTS {qualified_tables} CASCADE;")
+
+
+async def _validate_v3_dense_map(
+    *, schema_name: str, table_name: str, id_column: str, key_column: str
+) -> dict[str, int | None]:
+    dense_row = await db.first(
+        f"""
+        SELECT
+            COUNT(*)::bigint AS row_count,
+            COUNT(DISTINCT {_quote_ident(id_column)})::bigint AS distinct_id_count,
+            COUNT(DISTINCT {_quote_ident(key_column)})::bigint AS distinct_key_count,
+            MIN({_quote_ident(key_column)})::bigint AS minimum_key,
+            MAX({_quote_ident(key_column)})::bigint AS maximum_key
+        FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+        """
+    )
+    dense_stat_by_name = {
+        "row_count": int(_row_value(dense_row, "row_count", 0) or 0),
+        "distinct_id_count": int(_row_value(dense_row, "distinct_id_count", 1) or 0),
+        "distinct_key_count": int(_row_value(dense_row, "distinct_key_count", 2) or 0),
+        "minimum_key": _row_value(dense_row, "minimum_key", 3),
+        "maximum_key": _row_value(dense_row, "maximum_key", 4),
+    }
+    expected_count = int(dense_stat_by_name["row_count"] or 0)
+    expected_minimum = 0 if expected_count else None
+    expected_maximum = expected_count - 1 if expected_count else None
+    observed_counts = {
+        dense_stat_by_name[name]
+        for name in ("row_count", "distinct_id_count", "distinct_key_count")
+    }
+    if observed_counts != {expected_count}:
+        raise RuntimeError(
+            f"PTG2 v3 dense map count mismatch for {schema_name}.{table_name}: "
+            f"{dense_stat_by_name}"
+        )
+    if (
+        dense_stat_by_name["minimum_key"] != expected_minimum
+        or dense_stat_by_name["maximum_key"] != expected_maximum
+    ):
+        raise RuntimeError(
+            f"PTG2 v3 dense map bounds mismatch for {schema_name}.{table_name}: "
+            f"{dense_stat_by_name}"
+        )
+    return dense_stat_by_name
+
+
+async def _create_v3_price_key_stage(
+    *, schema_name: str, price_set_atom_table: str, stage_table: str
+) -> dict[str, int | None]:
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} AS
+        SELECT
+            price_set_global_id_128,
+            (ROW_NUMBER() OVER (ORDER BY price_set_global_id_128) - 1)::bigint AS price_key
+        FROM (
+            SELECT DISTINCT price_set_global_id_128
+            FROM {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)}
+        ) distinct_price_set
+        ORDER BY price_set_global_id_128;
+        """
+    )
+    await db.status(
+        f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
+        "ALTER COLUMN price_set_global_id_128 SET NOT NULL, ALTER COLUMN price_key SET NOT NULL;"
+    )
+    await db.status(
+        f"CREATE UNIQUE INDEX {_quote_ident(_short_index_name(stage_table, 'id_uidx'))} "
+        f"ON {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (price_set_global_id_128);"
+    )
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    dense_stat_by_name = await _validate_v3_dense_map(
+        schema_name=schema_name,
+        table_name=stage_table,
+        id_column="price_set_global_id_128",
+        key_column="price_key",
+    )
+    if int(dense_stat_by_name["row_count"] or 0) > _V3_MAX_DENSE_KEY_COUNT:
+        raise RuntimeError("PTG2 v3 supports at most 2^32 canonical price keys")
+    return dense_stat_by_name
+
+
+async def _create_v3_atom_key_stage(
+    *, schema_name: str, price_atom_table: str, stage_table: str
+) -> dict[str, int | None]:
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} AS
+        SELECT
+            price_atom_global_id_128,
+            (ROW_NUMBER() OVER (ORDER BY price_atom_global_id_128) - 1)::bigint AS atom_key
+        FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
+        ORDER BY price_atom_global_id_128;
+        """
+    )
+    await db.status(
+        f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
+        "ALTER COLUMN price_atom_global_id_128 SET NOT NULL, ALTER COLUMN atom_key SET NOT NULL;"
+    )
+    await db.status(
+        f"CREATE UNIQUE INDEX {_quote_ident(_short_index_name(stage_table, 'id_uidx'))} "
+        f"ON {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (price_atom_global_id_128);"
+    )
+    await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    dense_stat_by_name = await _validate_v3_dense_map(
+        schema_name=schema_name,
+        table_name=stage_table,
+        id_column="price_atom_global_id_128",
+        key_column="atom_key",
+    )
+    select_atom_key_bits(int(dense_stat_by_name["row_count"] or 0))
+    return dense_stat_by_name
+
+
+def _v3_assigned_by_code_sql(
+    *,
+    qualified_source: str,
+    qualified_price_key_map: str,
+    source_layout: str,
+    qualified_code_count_table: str | None,
+    qualified_provider_set_dictionary_table: str | None,
+) -> str:
+    """Return forward rows joined to the one canonical dense price map."""
+    if source_layout == PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN:
+        if not qualified_code_count_table or not qualified_provider_set_dictionary_table:
+            raise ValueError("natural lean v3 streams require dictionary tables")
+        return f"""
+        SELECT
+            code_count.code_key,
+            provider_set_dictionary.provider_set_key,
+            serving.provider_count,
+            price_key_map.price_key
+        FROM {qualified_source} serving
+        JOIN {qualified_code_count_table} code_count
+          ON code_count.plan_id = serving.plan_id
+         AND code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system
+         AND code_count.reported_code = serving.reported_code
+        JOIN {qualified_provider_set_dictionary_table} provider_set_dictionary
+          ON provider_set_dictionary.provider_set_global_id_128 = serving.provider_set_global_id_128
+        JOIN {qualified_price_key_map} price_key_map
+          ON price_key_map.price_set_global_id_128 = serving.price_set_global_id_128
+        ORDER BY code_count.code_key, provider_set_dictionary.provider_set_key, price_key_map.price_key
+        """
+    if source_layout != PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED:
+        raise ValueError(f"unsupported v3 serving source layout: {source_layout}")
+    return f"""
+    SELECT serving.code_key, serving.provider_set_key, serving.provider_count, price_key_map.price_key
+    FROM {qualified_source} serving
+    JOIN {qualified_price_key_map} price_key_map
+      ON price_key_map.price_set_global_id_128 = serving.price_set_global_id_128
+    ORDER BY serving.code_key, serving.provider_set_key, price_key_map.price_key
+    """
+
+
+def _v3_price_dictionary_sql(*, qualified_price_key_map: str) -> str:
+    """Return the canonical price dictionary in dense-key order."""
+    return f"""
+    SELECT price_key, price_set_global_id_128
+    FROM {qualified_price_key_map}
+    ORDER BY price_set_global_id_128
+    """
+
+
+def _v3_provider_set_codes_sql(
+    *,
+    qualified_source: str,
+    source_layout: str,
+    qualified_code_count_table: str | None,
+    qualified_provider_set_dictionary_table: str | None,
+) -> str:
+    """Return distinct provider/code edges in the v3 Rust encoder order."""
+    if source_layout == PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN:
+        if not qualified_code_count_table or not qualified_provider_set_dictionary_table:
+            raise ValueError("natural lean v3 streams require dictionary tables")
+        return f"""
+        SELECT DISTINCT
+            provider_set_dictionary.provider_set_key,
+            code_count.code_key
+        FROM {qualified_source} serving
+        JOIN {qualified_code_count_table} code_count
+          ON code_count.plan_id = serving.plan_id
+         AND code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system
+         AND code_count.reported_code = serving.reported_code
+        JOIN {qualified_provider_set_dictionary_table} provider_set_dictionary
+          ON provider_set_dictionary.provider_set_global_id_128 = serving.provider_set_global_id_128
+        ORDER BY provider_set_dictionary.provider_set_key, code_count.code_key
+        """
+    if source_layout != PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED:
+        raise ValueError(f"unsupported v3 serving source layout: {source_layout}")
+    return f"""
+    SELECT DISTINCT provider_set_key, code_key
+    FROM {qualified_source}
+    ORDER BY provider_set_key, code_key
+    """
+
+
+def _v3_price_membership_sql(
+    *,
+    qualified_price_set_atom_table: str,
+    qualified_price_key_map: str,
+    qualified_atom_key_map: str,
+) -> str:
+    """Return distinct canonical price/atom edges in encoder order."""
+    return f"""
+    SELECT DISTINCT price_key_map.price_key, atom_key_map.atom_key
+    FROM {qualified_price_set_atom_table} price_set_atom
+    LEFT JOIN {qualified_price_key_map} price_key_map
+      ON price_key_map.price_set_global_id_128 = price_set_atom.price_set_global_id_128
+    LEFT JOIN {qualified_atom_key_map} atom_key_map
+      ON atom_key_map.price_atom_global_id_128 = price_set_atom.price_atom_global_id_128
+    ORDER BY price_key_map.price_key, atom_key_map.atom_key
+    """
+
+
+def _v3_price_atom_sql(
+    *,
+    qualified_price_atom_table: str,
+    qualified_atom_key_map: str,
+    constant_key_by_column: Mapping[str, Any] | None,
+) -> str:
+    """Return dense atom payload rows with all seven dictionary keys."""
+    constant_key_by_name = dict(constant_key_by_column or {})
+    attribute_expressions = []
+    for column_name in _V3_ATTRIBUTE_KEY_COLUMNS:
+        if column_name in constant_key_by_name:
+            attribute_expressions.append(
+                f"{int(constant_key_by_name[column_name])}::bigint AS {column_name}"
+            )
+        else:
+            attribute_expressions.append(f"price_atom.{column_name}::bigint AS {column_name}")
+    return f"""
+    SELECT
+        atom_key_map.atom_key,
+        price_atom.negotiated_rate,
+        {", ".join(attribute_expressions)}
+    FROM {qualified_atom_key_map} atom_key_map
+    JOIN {qualified_price_atom_table} price_atom
+      ON price_atom.price_atom_global_id_128 = atom_key_map.price_atom_global_id_128
+    ORDER BY atom_key_map.price_atom_global_id_128
+    """
+
+
+async def _run_v3_streams(
+    *,
+    sql_by_kind: Mapping[str, str],
+    schema_name: str,
+    target_table: str,
+    target_copy_format: str,
+    atom_count: int,
+    atom_key_bits: int,
+) -> dict[str, dict[str, Any]]:
+    stream_limit = min(_serving_binary_stream_tasks(), len(sql_by_kind))
+    stream_semaphore = asyncio.Semaphore(stream_limit)
+    if select_atom_key_bits(atom_count) != atom_key_bits:
+        raise RuntimeError("PTG2 v3 atom-key width changed after map validation")
+
+    async def _stream_kind(kind: str, sql: str) -> dict[str, Any]:
+        encoder_options = (
+            (str(atom_key_bits),)
+            if kind
+            in {
+                PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
+                PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
+            }
+            else ()
+        )
+        async with stream_semaphore:
+            return await _stream_serving_binary_copy(
+                kind=kind,
+                sql=sql,
+                schema_name=schema_name,
+                target_table=target_table,
+                source_copy_format="binary",
+                target_copy_format=target_copy_format,
+                encoder_options=encoder_options,
+            )
+
+    task_by_kind = {
+        kind: asyncio.create_task(_stream_kind(kind, sql)) for kind, sql in sql_by_kind.items()
+    }
+    try:
+        stream_summaries = await asyncio.gather(*task_by_kind.values())
+    except (Exception, asyncio.CancelledError):
+        for stream_task in task_by_kind.values():
+            stream_task.cancel()
+        await asyncio.gather(*task_by_kind.values(), return_exceptions=True)
+        raise
+    return dict(zip(task_by_kind.keys(), stream_summaries, strict=True))
+
+
+def _v3_summary_integer(summary: Mapping[str, Any], label: str, *field_names: str) -> int:
+    for field_name in field_names:
+        if summary.get(field_name) is not None:
+            try:
+                return int(summary[field_name])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"PTG2 v3 {label} summary has invalid {field_name}") from exc
+    raise RuntimeError(f"PTG2 v3 {label} summary is missing {' or '.join(field_names)}")
+
+
+def _validate_v3_summary_kind(summary: Mapping[str, Any], expected_kind: str) -> None:
+    artifact_kind = str(summary.get("artifact_kind") or summary.get("kind") or "")
+    if artifact_kind != expected_kind:
+        raise RuntimeError(
+            f"PTG2 v3 stream summary kind mismatch: expected {expected_kind!r}, got {artifact_kind!r}"
+        )
+
+
+def _validate_v3_atom_width(summary: Mapping[str, Any], label: str, expected_bits: int) -> None:
+    summary_bits = summary.get("atom_key_bits")
+    summary_bytes = summary.get("atom_key_bytes")
+    if summary_bits is None and summary_bytes is None:
+        raise RuntimeError(f"PTG2 v3 {label} summary is missing atom-key width")
+    if summary_bits is not None and int(summary_bits) != expected_bits:
+        raise RuntimeError(f"PTG2 v3 {label} atom-key width mismatch")
+    if summary_bytes is not None and int(summary_bytes) != expected_bits // 8:
+        raise RuntimeError(f"PTG2 v3 {label} atom-key byte width mismatch")
+
+
+def _v3_summary_optional_integer(
+    summary: Mapping[str, Any], label: str, field_name: str
+) -> int | None:
+    if field_name not in summary:
+        raise RuntimeError(f"PTG2 v3 {label} summary is missing {field_name}")
+    value = summary[field_name]
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"PTG2 v3 {label} summary has invalid {field_name}") from exc
+
+
+def _validate_v3_assigned_summary(
+    summary: Mapping[str, Any], *, expected_row_count: int | None, price_set_count: int
+) -> None:
+    if expected_row_count is None:
+        raise RuntimeError("PTG2 v3 assigned by-code validation requires an exact row count")
+    _validate_stream_row_count(
+        label="v3 assigned by-code",
+        expected_row_count=expected_row_count,
+        stream_result=summary,
+    )
+    _validate_v3_summary_kind(summary, PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND)
+    price_key_upper_bound = _v3_summary_integer(
+        summary, "assigned by-code", "price_key_upper_bound"
+    )
+    if _v3_summary_integer(summary, "assigned by-code", "price_set_count") != price_key_upper_bound:
+        raise RuntimeError("PTG2 v3 assigned by-code price-key summary mismatch")
+    if price_key_upper_bound > price_set_count:
+        raise RuntimeError("PTG2 v3 assigned by-code price-key exceeds the canonical map")
+    maximum_price_key = _v3_summary_optional_integer(
+        summary, "assigned by-code", "maximum_price_key"
+    )
+    expected_maximum = price_key_upper_bound - 1 if price_key_upper_bound else None
+    if maximum_price_key != expected_maximum:
+        raise RuntimeError("PTG2 v3 assigned by-code price-key bounds mismatch")
+
+
+def _validate_v3_price_dictionary_summary(
+    summary: Mapping[str, Any], *, price_set_count: int
+) -> None:
+    _validate_v3_summary_kind(summary, PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND)
+    if _v3_summary_integer(summary, "price dictionary", "row_count") != price_set_count:
+        raise RuntimeError("PTG2 v3 price dictionary row count mismatch")
+    if _v3_summary_integer(summary, "price dictionary", "price_set_count") != price_set_count:
+        raise RuntimeError("PTG2 v3 price dictionary price-set count mismatch")
+    if _v3_summary_integer(summary, "price dictionary", "id_bytes") != 16:
+        raise RuntimeError("PTG2 v3 price dictionary ID width mismatch")
+
+
+def _v3_provider_stats_from_summary(summary: Mapping[str, Any]) -> dict[str, int]:
+    _validate_v3_summary_kind(summary, PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND)
+    row_count = _v3_summary_integer(summary, "provider codes", "row_count")
+    pair_count = _v3_summary_integer(summary, "provider codes", "pair_count")
+    code_count = _v3_summary_integer(summary, "provider codes", "code_count")
+    duplicate_pair_count = _v3_summary_integer(
+        summary, "provider codes", "duplicate_pair_count"
+    )
+    provider_set_count = _v3_summary_integer(
+        summary, "provider codes", "provider_set_count"
+    )
+    if row_count != pair_count or pair_count != code_count:
+        raise RuntimeError("PTG2 v3 provider-code stream pair count mismatch")
+    if duplicate_pair_count != 0:
+        raise RuntimeError("PTG2 v3 provider-code stream contains duplicate pairs")
+    if provider_set_count > pair_count:
+        raise RuntimeError("PTG2 v3 provider-code stream provider count exceeds pair count")
+    return {
+        "row_count": row_count,
+        "pair_count": pair_count,
+        "provider_set_count": provider_set_count,
+        "duplicate_pair_count": duplicate_pair_count,
+    }
+
+
+def _v3_membership_stats_from_summary(
+    summary: Mapping[str, Any],
+    *,
+    price_set_count: int,
+    atom_count: int,
+    atom_key_bits: int,
+) -> dict[str, int | None]:
+    _validate_v3_summary_kind(summary, PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND)
+    row_count = _v3_summary_integer(summary, "price memberships", "row_count")
+    atom_reference_count = _v3_summary_integer(
+        summary, "price memberships", "atom_reference_count"
+    )
+    streamed_price_set_count = _v3_summary_integer(
+        summary, "price memberships", "price_set_count"
+    )
+    maximum_price_key = _v3_summary_optional_integer(
+        summary, "price memberships", "maximum_price_key"
+    )
+    expected_maximum_price_key = price_set_count - 1 if price_set_count else None
+    if row_count != atom_reference_count:
+        raise RuntimeError("PTG2 v3 price-membership reference count mismatch")
+    if streamed_price_set_count != price_set_count:
+        raise RuntimeError("PTG2 v3 price-membership stream price-set count mismatch")
+    if maximum_price_key != expected_maximum_price_key:
+        raise RuntimeError("PTG2 v3 price-membership stream dense price-key bounds mismatch")
+    if row_count < streamed_price_set_count:
+        raise RuntimeError("PTG2 v3 price-membership stream omitted a price-set membership")
+    if atom_count == 0 and row_count != 0:
+        raise RuntimeError("PTG2 v3 price-membership stream references an empty atom map")
+    _validate_v3_atom_width(summary, "price memberships", atom_key_bits)
+    return {
+        "row_count": row_count,
+        "atom_reference_count": atom_reference_count,
+        "price_set_count": streamed_price_set_count,
+        "maximum_price_key": maximum_price_key,
+    }
+
+
+def _validate_v3_atom_summary(
+    summary: Mapping[str, Any], *, atom_count: int, atom_key_bits: int
+) -> None:
+    _validate_v3_summary_kind(summary, PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND)
+    if _v3_summary_integer(summary, "price atoms", "atom_count", "row_count") != atom_count:
+        raise RuntimeError("PTG2 v3 price-atom stream row count mismatch")
+    if _v3_summary_integer(summary, "price atoms", "attribute_count") != len(_V3_ATTRIBUTE_KEY_COLUMNS):
+        raise RuntimeError("PTG2 v3 price-atom stream attribute width mismatch")
+    _validate_v3_atom_width(summary, "price atoms", atom_key_bits)
+
+
+async def _v3_physical_artifact_summaries(
+    *, schema_name: str, target_table: str
+) -> dict[str, dict[str, int]]:
+    artifact_rows = await db.all(
+        f"""
+        SELECT
+            artifact_kind,
+            COUNT(*)::bigint AS record_count,
+            COALESCE(SUM(entry_count), 0)::bigint AS entry_count,
+            COALESCE(SUM(octet_length(payload)), 0)::bigint AS stored_payload_bytes,
+            COALESCE(SUM(
+                CASE
+                    WHEN raw_payload_bytes > 0 THEN raw_payload_bytes
+                    ELSE octet_length(payload)
+                END
+            ), 0)::bigint AS raw_payload_bytes,
+            COALESCE(SUM(NULLIF(raw_payload_bytes, 0)), 0)::bigint AS compressed_raw_payload_bytes
+        FROM {_quote_ident(schema_name)}.{_quote_ident(target_table)}
+        GROUP BY artifact_kind
+        ORDER BY artifact_kind
+        """
+    )
+    artifact_summary_by_kind = {}
+    for artifact_row in artifact_rows:
+        artifact_kind = str(_row_value(artifact_row, "artifact_kind", 0) or "")
+        artifact_summary_by_kind[artifact_kind] = {
+            "record_count": int(_row_value(artifact_row, "record_count", 1) or 0),
+            "entry_count": int(_row_value(artifact_row, "entry_count", 2) or 0),
+            "stored_payload_bytes": int(_row_value(artifact_row, "stored_payload_bytes", 3) or 0),
+            "raw_payload_bytes": int(_row_value(artifact_row, "raw_payload_bytes", 4) or 0),
+            "compressed_raw_payload_bytes": int(
+                _row_value(artifact_row, "compressed_raw_payload_bytes", 5) or 0
+            ),
+        }
+    observed_kinds = frozenset(artifact_summary_by_kind)
+    if observed_kinds != _V3_REQUIRED_ARTIFACT_KINDS:
+        raise RuntimeError(
+            "PTG2 v3 persisted artifact kinds mismatch: "
+            f"expected {sorted(_V3_REQUIRED_ARTIFACT_KINDS)}, got {sorted(observed_kinds)}"
+        )
+    return artifact_summary_by_kind
+
+
+def _validate_v3_copy_records(
+    summary: Mapping[str, Any], physical_summary: Mapping[str, Any], label: str
+) -> None:
+    summary_records = _v3_summary_integer(summary, label, "copy_record_count", "record_count")
+    if summary_records != int(physical_summary.get("record_count") or 0):
+        raise RuntimeError(f"PTG2 v3 {label} persisted record count mismatch")
+
+
+def _validate_v3_physical_entries(
+    artifact_summary_by_kind: Mapping[str, Mapping[str, Any]],
+    *,
+    by_code_summary: Mapping[str, Any],
+    price_set_count: int,
+    provider_stats: Mapping[str, Any],
+    membership_stats: Mapping[str, Any],
+    atom_count: int,
+) -> None:
+    expected_entry_count_by_kind = {
+        PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND: _v3_summary_integer(
+            by_code_summary, "assigned by-code", "group_count"
+        ),
+        PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND: price_set_count,
+        PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND: int(provider_stats["provider_set_count"]),
+        PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: int(provider_stats["provider_set_count"]),
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: int(
+            membership_stats["price_set_count"]
+        ),
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: atom_count,
+    }
+    for artifact_kind, expected_count in expected_entry_count_by_kind.items():
+        actual_count = int(artifact_summary_by_kind[artifact_kind].get("entry_count") or 0)
+        if actual_count != expected_count:
+            raise RuntimeError(
+                f"PTG2 v3 persisted {artifact_kind} entry count mismatch: "
+                f"expected {expected_count}, got {actual_count}"
+            )
+
+
+def _validate_v3_stream_storage(
+    summary: Mapping[str, Any], physical_summary: Mapping[str, Any], label: str
+) -> None:
+    storage_summary = summary.get("storage")
+    if not isinstance(storage_summary, Mapping):
+        raise RuntimeError(f"PTG2 v3 {label} summary is missing storage metrics")
+    for field_name in (
+        "record_count",
+        "entry_count",
+        "stored_payload_bytes",
+        "raw_payload_bytes",
+    ):
+        summary_value = _v3_summary_integer(storage_summary, f"{label} storage", field_name)
+        physical_value = int(physical_summary.get(field_name) or 0)
+        if summary_value != physical_value:
+            raise RuntimeError(f"PTG2 v3 {label} persisted {field_name} mismatch")
+
+
+def _validate_v3_stream_artifacts(
+    stream_summary_by_kind: Mapping[str, Mapping[str, Any]],
+    artifact_summary_by_kind: Mapping[str, Mapping[str, Any]],
+) -> None:
+    artifact_kind_by_stream_kind = {
+        PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: (
+            PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND
+        ),
+        PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: (
+            PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND
+        ),
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: (
+            PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND
+        ),
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
+    }
+    for stream_kind, artifact_kind in artifact_kind_by_stream_kind.items():
+        stream_summary = stream_summary_by_kind[stream_kind]
+        physical_summary = artifact_summary_by_kind[artifact_kind]
+        _validate_v3_copy_records(
+            stream_summary,
+            physical_summary,
+            artifact_kind,
+        )
+        _validate_v3_stream_storage(stream_summary, physical_summary, artifact_kind)
+
+
+def _validate_v3_total_storage(
+    storage_summary: Mapping[str, Any],
+    artifact_summary_by_kind: Mapping[str, Mapping[str, Any]],
+) -> None:
+    expected_by_field = {
+        "record_count": sum(summary["record_count"] for summary in artifact_summary_by_kind.values()),
+        "payload_bytes": sum(
+            summary["stored_payload_bytes"] for summary in artifact_summary_by_kind.values()
+        ),
+        "raw_payload_bytes": sum(
+            summary["compressed_raw_payload_bytes"]
+            for summary in artifact_summary_by_kind.values()
+        ),
+    }
+    for storage_field, expected_value in expected_by_field.items():
+        if int(storage_summary.get(storage_field) or 0) != expected_value:
+            raise RuntimeError(f"PTG2 v3 persisted total {storage_field} mismatch")
+
+
+def _qualified_v3_table(schema_name: str, table_name: str) -> str:
+    return f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
+
+
+def _v3_stream_sql_by_kind(
+    publish_options: _V3PublishOptions, stage_tables: _V3StageTables
+) -> dict[str, str]:
+    qualified_source = _qualified_v3_table(publish_options.schema_name, publish_options.source_table)
+    qualified_code_count = (
+        _qualified_v3_table(publish_options.schema_name, publish_options.code_count_table)
+        if publish_options.code_count_table
+        else None
+    )
+    qualified_provider_dictionary = (
+        _qualified_v3_table(publish_options.schema_name, publish_options.provider_set_dictionary_table)
+        if publish_options.provider_set_dictionary_table
+        else None
+    )
+    qualified_price_key_map = _qualified_v3_table(
+        publish_options.schema_name, stage_tables.price_key_map
+    )
+    assigned_by_code_sql = _v3_assigned_by_code_sql(
+        qualified_source=qualified_source,
+        qualified_price_key_map=qualified_price_key_map,
+        source_layout=publish_options.source_layout,
+        qualified_code_count_table=qualified_code_count,
+        qualified_provider_set_dictionary_table=qualified_provider_dictionary,
+    )
+    membership_sql = _v3_price_membership_sql(
+        qualified_price_set_atom_table=_qualified_v3_table(
+            publish_options.schema_name, publish_options.price_set_atom_table
+        ),
+        qualified_price_key_map=qualified_price_key_map,
+        qualified_atom_key_map=_qualified_v3_table(
+            publish_options.schema_name, stage_tables.atom_key_map
+        ),
+    )
+    atom_sql = _v3_price_atom_sql(
+        qualified_price_atom_table=_qualified_v3_table(
+            publish_options.schema_name, publish_options.price_atom_table
+        ),
+        qualified_atom_key_map=_qualified_v3_table(
+            publish_options.schema_name, stage_tables.atom_key_map
+        ),
+        constant_key_by_column=publish_options.price_atom_constant_keys,
+    )
+    return {
+        PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND: assigned_by_code_sql,
+        PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: _v3_price_dictionary_sql(
+            qualified_price_key_map=qualified_price_key_map
+        ),
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: membership_sql,
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: atom_sql,
+    }
+
+
+async def _create_v3_stage_maps(
+    publish_options: _V3PublishOptions,
+    stage_tables: _V3StageTables,
+) -> tuple[dict[str, int | None], dict[str, int | None]]:
+    return await asyncio.gather(
+        _create_v3_price_key_stage(
+            schema_name=publish_options.schema_name,
+            price_set_atom_table=publish_options.price_set_atom_table,
+            stage_table=stage_tables.price_key_map,
+        ),
+        _create_v3_atom_key_stage(
+            schema_name=publish_options.schema_name,
+            price_atom_table=publish_options.price_atom_table,
+            stage_table=stage_tables.atom_key_map,
+        ),
+    )
+
+
+def _v3_build_stats_from_summaries(
+    summary_by_kind: Mapping[str, Mapping[str, Any]],
+    *,
+    expected_row_count: int | None,
+    price_set_count: int,
+    atom_count: int,
+    atom_key_bits: int,
+) -> tuple[dict[str, int], dict[str, int | None]]:
+    by_code_summary = summary_by_kind[PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND]
+    _validate_v3_assigned_summary(
+        by_code_summary,
+        expected_row_count=expected_row_count,
+        price_set_count=price_set_count,
+    )
+    _validate_v3_price_dictionary_summary(
+        summary_by_kind[PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND],
+        price_set_count=price_set_count,
+    )
+    provider_stats = _v3_provider_stats_from_summary(
+        summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND]
+    )
+    membership_stats = _v3_membership_stats_from_summary(
+        summary_by_kind[PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND],
+        price_set_count=price_set_count,
+        atom_count=atom_count,
+        atom_key_bits=atom_key_bits,
+    )
+    _validate_v3_atom_summary(
+        summary_by_kind[PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND],
+        atom_count=atom_count,
+        atom_key_bits=atom_key_bits,
+    )
+    if (
+        _v3_summary_integer(by_code_summary, "assigned by-code", "provider_set_count")
+        != provider_stats["provider_set_count"]
+    ):
+        raise RuntimeError("PTG2 v3 provider-set count differs between required streams")
+    return provider_stats, membership_stats
+
+
+async def _cleanup_v3_stages(
+    *, schema_name: str, stage_tables: _V3StageTables
+) -> None:
+    cleanup_task = asyncio.create_task(
+        _drop_v3_stage_tables(schema_name=schema_name, stage_tables=stage_tables)
+    )
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
+
+
+async def _cleanup_v3_target(*, schema_name: str, target_table: str) -> None:
+    cleanup_task = asyncio.create_task(
+        _drop_ptg2_serving_binary_table(schema_name=schema_name, target_table=target_table)
+    )
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
+
+
+async def _write_v3_serving_binary(publish_options: _V3PublishOptions) -> dict[str, Any]:
+    """Publish the explicit v3 PostgreSQL artifacts without a v2 fallback."""
+    started_at = time.monotonic()
+    stage_tables = _v3_stage_tables(publish_options.target_table)
+    timing_by_stage: dict[str, Any] = {}
+    try:
+        await _drop_v3_stage_tables(
+            schema_name=publish_options.schema_name,
+            stage_tables=stage_tables,
+        )
+        map_started_at = time.monotonic()
+        price_map_stats, atom_map_stats = await _create_v3_stage_maps(
+            publish_options,
+            stage_tables,
+        )
+        timing_by_stage["dense_map_seconds"] = _elapsed_seconds(map_started_at)
+        await create_ptg2_serving_binary_table(
+            schema_name=publish_options.schema_name,
+            target_table=publish_options.target_table,
+        )
+        return await _finish_v3_serving_binary(
+            publish_options=publish_options,
+            stage_tables=stage_tables,
+            price_map_stats=price_map_stats,
+            atom_map_stats=atom_map_stats,
+            timing_by_stage=timing_by_stage,
+            started_at=started_at,
+        )
+    finally:
+        await _cleanup_v3_stages(
+            schema_name=publish_options.schema_name,
+            stage_tables=stage_tables,
+        )
+
+
+async def _finish_v3_serving_binary(
+    *,
+    publish_options: _V3PublishOptions,
+    stage_tables: _V3StageTables,
+    price_map_stats: Mapping[str, Any],
+    atom_map_stats: Mapping[str, Any],
+    timing_by_stage: dict[str, Any],
+    started_at: float,
+) -> dict[str, Any]:
+    price_set_count = int(price_map_stats["row_count"] or 0)
+    atom_count = int(atom_map_stats["row_count"] or 0)
+    atom_key_bits = select_atom_key_bits(atom_count)
+    sql_by_kind = _v3_stream_sql_by_kind(publish_options, stage_tables)
+    stream_started_at = time.monotonic()
+    stream_summary_by_kind = await _run_v3_streams(
+        sql_by_kind=sql_by_kind,
+        schema_name=publish_options.schema_name,
+        target_table=publish_options.target_table,
+        target_copy_format=_serving_binary_target_copy_format(),
+        atom_count=atom_count,
+        atom_key_bits=atom_key_bits,
+    )
+    timing_by_stage["v3_stream_seconds"] = _elapsed_seconds(stream_started_at)
+    by_code_summary = stream_summary_by_kind[PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND]
+    provider_code_summary = by_code_summary.get("provider_set_codes")
+    if not isinstance(provider_code_summary, Mapping):
+        raise RuntimeError("PTG2 v3 fused by-code stream omitted provider-set codes")
+    stream_summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND] = dict(
+        provider_code_summary
+    )
+    provider_stats, membership_stats = _v3_build_stats_from_summaries(
+        stream_summary_by_kind,
+        expected_row_count=publish_options.expected_row_count,
+        price_set_count=price_set_count,
+        atom_count=atom_count,
+        atom_key_bits=atom_key_bits,
+    )
+    return await _finalize_v3_serving_binary(
+        publish_options,
+        _V3BuildState(
+            by_code_summary=by_code_summary,
+            stream_summary_by_kind=stream_summary_by_kind,
+            provider_stats=provider_stats,
+            membership_stats=membership_stats,
+            price_map_stats=price_map_stats,
+            atom_map_stats=atom_map_stats,
+            atom_key_bits=atom_key_bits,
+            timing_by_stage=timing_by_stage,
+            started_at=started_at,
+        ),
+    )
+
+
+async def _finalize_v3_serving_binary(
+    publish_options: _V3PublishOptions, build_state: _V3BuildState
+) -> dict[str, Any]:
+    atom_count = int(build_state.atom_map_stats["row_count"] or 0)
+    price_set_count = int(build_state.price_map_stats["row_count"] or 0)
+    index_started_at = time.monotonic()
+    storage_summary = await finalize_ptg2_serving_binary_table(
+        schema_name=publish_options.schema_name,
+        target_table=publish_options.target_table,
+    )
+    build_state.timing_by_stage["index_seconds"] = _elapsed_seconds(index_started_at)
+    artifact_summary_by_kind = await _v3_physical_artifact_summaries(
+        schema_name=publish_options.schema_name,
+        target_table=publish_options.target_table,
+    )
+    _validate_v3_physical_entries(
+        artifact_summary_by_kind,
+        by_code_summary=build_state.by_code_summary,
+        price_set_count=price_set_count,
+        provider_stats=build_state.provider_stats,
+        membership_stats=build_state.membership_stats,
+        atom_count=atom_count,
+    )
+    _validate_v3_stream_artifacts(build_state.stream_summary_by_kind, artifact_summary_by_kind)
+    _validate_v3_total_storage(storage_summary, artifact_summary_by_kind)
+    by_code_record_count = sum(
+        artifact_summary_by_kind[artifact_kind]["record_count"]
+        for artifact_kind in (
+            PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+        )
+    )
+    _validate_v3_copy_records(
+        build_state.by_code_summary,
+        {"record_count": by_code_record_count},
+        "by-code",
+    )
+    build_state.timing_by_stage["total_seconds"] = _elapsed_seconds(build_state.started_at)
+    return _v3_serving_manifest(
+        publish_options,
+        build_state,
+        artifact_summary_by_kind=artifact_summary_by_kind,
+        storage_summary=storage_summary,
+    )
+
+
+def _v3_source_count_manifest(
+    publish_options: _V3PublishOptions,
+    build_state: _V3BuildState,
+) -> dict[str, Any]:
+    return {
+        "serving_price_key_join": {
+            "expected_rows": publish_options.expected_row_count,
+            "joined_rows": int(build_state.by_code_summary.get("row_count") or 0),
+            "all_serving_price_ids_mapped": True,
+        },
+        "provider_set_codes": dict(build_state.provider_stats),
+        "price_set_atom_memberships": dict(build_state.membership_stats),
+    }
+
+
+def _v3_dense_key_manifest(build_state: _V3BuildState) -> dict[str, Any]:
+    atom_count = int(build_state.atom_map_stats["row_count"] or 0)
+    price_set_count = int(build_state.price_map_stats["row_count"] or 0)
+    return {
+        "canonical_price_keys": {
+            "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+            "price_set_count": price_set_count,
+            "dense_minimum": build_state.price_map_stats.get("minimum_key"),
+            "dense_maximum": build_state.price_map_stats.get("maximum_key"),
+        },
+        "dense_atom_keys": {
+            "atom_count": atom_count,
+            "atom_key_bits": build_state.atom_key_bits,
+            "atom_key_bytes": build_state.atom_key_bits // 8,
+            "dense_minimum": build_state.atom_map_stats.get("minimum_key"),
+            "dense_maximum": build_state.atom_map_stats.get("maximum_key"),
+        },
+    }
+
+
+def _v3_serving_manifest(
+    publish_options: _V3PublishOptions,
+    build_state: _V3BuildState,
+    *,
+    artifact_summary_by_kind: Mapping[str, Mapping[str, Any]],
+    storage_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "format": PTG2_SERVING_BINARY_TABLE_FORMAT,
+        "table": f"{publish_options.schema_name}.{publish_options.target_table}",
+        "writer": "rust_stream_v3",
+        "arch_version": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
+        "artifact_version": PTG2_SERVING_BINARY_V3_ARTIFACT_VERSION,
+        "artifact_kinds": sorted(artifact_summary_by_kind),
+        "block_bytes": _serving_binary_block_bytes(),
+        "row_count": int(build_state.by_code_summary.get("row_count") or 0),
+        "source_copy_format": "binary",
+        "target_copy_format": _serving_binary_target_copy_format(),
+        "stream_tasks": min(_serving_binary_stream_tasks(), len(build_state.stream_summary_by_kind)),
+        "by_code": dict(build_state.by_code_summary),
+        "price_dictionary": dict(
+            build_state.stream_summary_by_kind[
+                PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND
+            ]
+        ),
+        PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: dict(
+            build_state.stream_summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND]
+        ),
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: dict(
+            build_state.stream_summary_by_kind[
+                PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND
+            ]
+        ),
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: dict(
+            build_state.stream_summary_by_kind[PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND]
+        ),
+        **_v3_dense_key_manifest(build_state),
+        "source_counts": _v3_source_count_manifest(publish_options, build_state),
+        "artifact_summaries": {
+            artifact_kind: dict(summary)
+            for artifact_kind, summary in artifact_summary_by_kind.items()
+        },
+        "timing": dict(build_state.timing_by_stage),
+        "build_elapsed_seconds": build_state.timing_by_stage["total_seconds"],
+        "storage": dict(storage_summary),
+    }
+
+
 async def _write_serving_binary_rust_stream(
     *, schema_name: str, source_table: str, target_table: str,
     expected_row_count: int | None = None, price_set_atom_table: str | None = None,
@@ -2345,14 +3423,49 @@ async def write_ptg2_serving_binary_table(
     target_table: str,
     expected_row_count: int | None = None,
     price_set_atom_table: str | None = None,
+    price_atom_table: str | None = None,
     artifacts: Mapping[str, Any] | None = None,
     sidecar_artifacts: Mapping[str, Any] | None = None,
     source_layout: str = PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED,
     code_count_table: str | None = None,
     provider_set_dictionary_table: str | None = None,
+    arch_version: str | None = None,
+    price_atom_table_layout: str | None = None,
+    price_atom_constant_keys: Mapping[str, Any] | None = None,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Create a PostgreSQL-native forward/reverse serving block table."""
+
+    if _is_postgres_binary_v3_arch(arch_version):
+        if not _serving_binary_rust_enabled() or not _use_serving_binary_stream():
+            raise RuntimeError("postgres_binary_v3 requires the Rust streaming serving writer")
+        if _ptg2_rust_scanner_binary() is None:
+            raise RuntimeError("postgres_binary_v3 requires a PTG2 Rust scanner binary")
+        if not price_set_atom_table or not price_atom_table:
+            raise RuntimeError("postgres_binary_v3 requires relational price-atom stages")
+        if expected_row_count is None:
+            raise RuntimeError("postgres_binary_v3 requires an exact serving row count")
+        if price_atom_table_layout not in {"lean_dict_v1", "lean_dict_v2"}:
+            raise RuntimeError("postgres_binary_v3 requires a lean price-atom dictionary layout")
+        publish_options = _V3PublishOptions(
+            schema_name=schema_name,
+            source_table=source_table,
+            target_table=target_table,
+            expected_row_count=expected_row_count,
+            price_set_atom_table=price_set_atom_table,
+            price_atom_table=price_atom_table,
+            source_layout=source_layout,
+            code_count_table=code_count_table,
+            provider_set_dictionary_table=provider_set_dictionary_table,
+            price_atom_table_layout=price_atom_table_layout,
+            price_atom_constant_keys=dict(price_atom_constant_keys or {}),
+            progress_callback=progress_callback,
+        )
+        try:
+            return await _write_v3_serving_binary(publish_options)
+        except (Exception, asyncio.CancelledError):
+            await _cleanup_v3_target(schema_name=schema_name, target_table=target_table)
+            raise
 
     price_forward_artifact = _price_forward_artifact_entry(sidecar_artifacts, artifacts)
     if _serving_binary_rust_enabled() and _ptg2_rust_scanner_binary() is not None:

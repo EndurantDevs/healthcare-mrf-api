@@ -37,6 +37,7 @@ RUN apt-get update \
     && . venv/bin/activate \
     && pip install --no-compile --upgrade pip \
     && pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
+    && ln -sf /opt/venv/bin/rapidgzip /usr/local/bin/rapidgzip \
     && install -d -o nobody -g nogroup -m 755 /run /var/log/nginx \
     && install -d -o nobody -g nogroup -m 700 \
         /var/lib/nginx/body \

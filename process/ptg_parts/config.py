@@ -116,18 +116,26 @@ PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1 = "materialized_v1"
 PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 = "sidecar_scope_v1"
 PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 = "postgres_binary_v1"
 PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2 = "postgres_binary_v2"
+PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3 = "postgres_binary_v3"
 PTG2_SNAPSHOT_ARCH_LEGACY_MIXED_V1 = "legacy_mixed_v1"
 PTG2_POSTGRES_BINARY_SNAPSHOT_ARCHES = frozenset(
     {
         PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
+    }
+)
+PTG2_POSTGRES_BINARY_PROVIDER_MEMBERSHIP_ARCHES = frozenset(
+    {
+        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
     }
 )
 PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE = "materialized_rate_scope"
 PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE = "component_table"
 PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR = "sidecar_provider_scope"
 
-PTG2_DEFAULT_COMPACT_COPY_TASKS = 2
+PTG2_DEFAULT_COMPACT_COPY_TASKS = 4
 PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS = 1
 PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS = 1
 PTG2_DEFAULT_RUST_WORKERS = 8
@@ -174,7 +182,7 @@ def _env_int(name: str, default: int) -> int:
 def _ptg2_snapshot_arch_from_env() -> str | None:
     raw = os.getenv(PTG2_SNAPSHOT_ARCH_ENV)
     if raw is None or not str(raw).strip():
-        return PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1
+        return PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
     normalized = str(raw).strip().lower().replace("-", "_")
     arch_alias_map = {
         "materialized": PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
@@ -189,11 +197,15 @@ def _ptg2_snapshot_arch_from_env() -> str | None:
         "postgres_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "postgres_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "postgres_binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+        "postgres_binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
         "db_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "db_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+        "db_binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+        "db_binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
         "binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+        "binary_v3": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3,
     }
     if normalized not in arch_alias_map:
         raise ValueError(
@@ -201,13 +213,25 @@ def _ptg2_snapshot_arch_from_env() -> str | None:
             f"expected {PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1!r}, "
             f"{PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1!r}, "
             f"{PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1!r}, "
-            f"or {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2!r}"
+            f"{PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2!r}, "
+            f"or {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3!r}"
         )
     return arch_alias_map[normalized]
 
 
 def _is_postgres_binary_snapshot_arch(arch_version: str | None) -> bool:
     return arch_version in PTG2_POSTGRES_BINARY_SNAPSHOT_ARCHES
+
+
+def _is_postgres_binary_v3_arch(arch_version: str | None) -> bool:
+    return arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3
+
+
+_is_postgres_binary_v3_snapshot_arch = _is_postgres_binary_v3_arch
+
+
+def _uses_postgres_binary_provider_membership_graph(arch_version: str | None) -> bool:
+    return arch_version in PTG2_POSTGRES_BINARY_PROVIDER_MEMBERSHIP_ARCHES
 
 
 def _ptg2_snapshot_arch_variant(arch_version: str | None = None) -> str | None:

@@ -28,8 +28,13 @@ def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
 def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list[str]:
     if not serving_index:
         return []
+    materialized_tables = serving_index.get("materialized_tables")
+    materialized_table_values = (
+        list(materialized_tables.values()) if isinstance(materialized_tables, dict) else []
+    )
     table_values = [
         serving_index.get("table"),
+        serving_index.get("serving_binary_table"),
         serving_index.get("price_code_set_table"),
         serving_index.get("price_atom_table"),
         serving_index.get("price_atom_dictionary_table"),
@@ -46,11 +51,14 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         serving_index.get("provider_group_location_table"),
         serving_index.get("provider_group_rate_scope_table"),
         serving_index.get("code_count_table"),
+        *materialized_table_values,
     ]
     allowed_prefixes = (
         "ptg2_serving_",
+        "ptg2_serving_binary_",
         "ptg2_serving_rate_compact_",
         "ptg2_code_count_",
+        "ptg2_price_code_set_",
         "ptg2_price_atom_",
         "ptg2_price_set_",
         "ptg2_price_set_entry_",

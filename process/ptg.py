@@ -54,6 +54,7 @@ from process.ptg_parts.artifacts import (PTG2ArtifactStore,
                                          ptg2_temp_parent,
                                          resolve_ptg2_artifact_dir,
                                          sha256_file)
+from process.ptg_parts.ptg2_artifact_blobs import delete_ptg2_artifacts_for_snapshot
 from process.ptg_parts.canonical import (_canonical_key, _canonical_sort_key,
                                          _canonicalize_for_json,
                                          canonical_json_dumps,
@@ -128,10 +129,10 @@ from process.ptg_parts.config import (
     PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
     TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
     TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
-    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
     _is_postgres_binary_snapshot_arch,
     _ptg2_snapshot_arch_from_env, _ptg2_snapshot_arch_variant,
     _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
+    _uses_postgres_binary_provider_membership_graph,
     _use_rust_compact_serving, _use_serving_only_import,
     _use_stage_serving_as_final)
 from process.ptg_parts.copy_load import (_copy_compact_serving_rate_file,
@@ -216,8 +217,17 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _copy_ptg2_manifest_provider_set_dictionary_file,
     _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
+    _ptg2_id_storage,
+    _ptg2_manifest_drop_serving_table_after_sidecars,
+    _ptg2_manifest_postgres_binary_natural_lean_stream_enabled,
+    _ptg2_manifest_price_atom_layout,
+    _ptg2_manifest_provider_group_location_enabled,
+    _ptg2_manifest_provider_group_rate_scope_enabled,
+    _ptg2_manifest_provider_set_component_enabled,
     _use_direct_lean_manifest_copy,
     _ptg2_manifest_serving_layout,
+    _ptg2_manifest_serving_sidecars_enabled,
+    _ptg2_manifest_stage_table_name,
     _ptg2_manifest_support_stage_table,
     _publish_ptg2_manifest_serving_snapshot)
 from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
@@ -431,31 +441,80 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
         }
 
 
-async def _push_ptg2_objects(rows: list[dict[str, Any]], cls, rewrite: bool = True) -> None:
-    if rows and cls is PTG2PriceSet and _env_bool(PTG2_STREAMING_DEDUPE_ENV, False):
+class PTG2SnapshotInProgressConflict(RuntimeError):
+    """Raised when another delivery owns a deterministic snapshot build."""
+
+
+async def _push_ptg2_snapshot_preserving_publication(
+    snapshot_attributes: dict[str, Any],
+) -> dict[str, Any]:
+    table = PTG2Snapshot.__table__
+    statement = db.insert(table).values(snapshot_attributes)
+    update_values_by_column = {
+        column.name: getattr(statement.excluded, column.name)
+        for column in table.c
+        if column.name != "snapshot_id"
+    }
+    is_snapshot_claim = snapshot_attributes.get("status") == PTG2_STATUS_BUILDING
+    conflict_where = (
+        table.c.status == PTG2_STATUS_FAILED
+        if is_snapshot_claim
+        else table.c.status.is_distinct_from(PTG2_STATUS_PUBLISHED)
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=["snapshot_id"],
+        set_=update_values_by_column,
+        where=conflict_where,
+    ).returning(*table.c)
+    stored_row = await statement.first()
+    has_snapshot_claim = stored_row is not None
+    if stored_row is None:
+        stored_row = await (
+            db.select(*table.c)
+            .where(table.c.snapshot_id == snapshot_attributes["snapshot_id"])
+            .first()
+        )
+    snapshot_state = _row_mapping(stored_row)
+    if is_snapshot_claim:
+        snapshot_state["snapshot_claim_status"] = (
+            "acquired" if has_snapshot_claim else "existing"
+        )
+    return snapshot_state
+
+
+async def _push_ptg2_objects(
+    object_entries: list[dict[str, Any]],
+    cls,
+    rewrite: bool = True,
+) -> dict[str, Any] | None:
+    if object_entries and cls is PTG2Snapshot and rewrite:
+        if len(object_entries) != 1:
+            raise ValueError("PTG snapshot state writes must contain exactly one row")
+        return await _push_ptg2_snapshot_preserving_publication(object_entries[0])
+    if object_entries and cls is PTG2PriceSet and _env_bool(PTG2_STREAMING_DEDUPE_ENV, False):
         try:
-            await _copy_ignore_ptg2_objects(rows, cls)
+            await _copy_ignore_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
             logger.warning("PTG2 copy/ignore fallback for %s: %s", cls.__tablename__, exc)
-    if rows and cls is PTG2ServingRate and _env_bool(PTG2_DIRECT_COPY_SERVING_RATE_ENV, False):
+    if object_entries and cls is PTG2ServingRate and _env_bool(PTG2_DIRECT_COPY_SERVING_RATE_ENV, False):
         try:
-            await _copy_insert_ptg2_objects(rows, cls)
+            await _copy_insert_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
             logger.warning("PTG2 direct COPY fallback for %s: %s", cls.__tablename__, exc)
-    if rows and rewrite and len(rows) >= max(_env_int(PTG2_COPY_UPSERT_ROWS_ENV, 250), 1):
+    if object_entries and rewrite and len(object_entries) >= max(_env_int(PTG2_COPY_UPSERT_ROWS_ENV, 250), 1):
         try:
-            await _copy_upsert_ptg2_objects(rows, cls)
+            await _copy_upsert_ptg2_objects(object_entries, cls)
             return
         except Exception as exc:
             logger.warning("PTG2 copy/upsert fallback for %s: %s", cls.__tablename__, exc)
     try:
-        await push_objects(rows, cls, rewrite=rewrite, use_copy=False)
+        await push_objects(object_entries, cls, rewrite=rewrite, use_copy=False)
     except TypeError as exc:
         if "use_copy" not in str(exc):
             raise
-        await push_objects(rows, cls, rewrite=rewrite)
+        await push_objects(object_entries, cls, rewrite=rewrite)
 
 _PTG2_WORKER_PROVIDER_MAP = None
 _PTG2_WORKER_PLAN_FIELDS: dict[str, Any] | None = None
@@ -1116,7 +1175,9 @@ async def _merge_and_copy_ptg2_manifest_files(
     has_price_set_atom_files = bool(copy_files_by_kind.get("price_set_atom"))
     binary_snapshot_arch = _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
     direct_copy_default = binary_snapshot_arch
-    use_provider_membership_graph = _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
+    use_provider_membership_graph = _uses_postgres_binary_provider_membership_graph(
+        _ptg2_snapshot_arch_from_env()
+    )
     if use_provider_membership_graph or _env_bool(PTG2_MANIFEST_DIRECT_COPY_FILES_ENV, direct_copy_default):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
         progress_total = 6 if has_price_set_atom_files else 5
@@ -1410,7 +1471,7 @@ async def _parse_in_network_file_serving_only(
     rust_scanner_config: dict[str, Any] = {}
     rust_scanner_summary: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
-    use_provider_membership_graph = arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
+    use_provider_membership_graph = _uses_postgres_binary_provider_membership_graph(arch_version)
     defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True) or use_provider_membership_graph
     use_direct_lean_copy = _use_direct_lean_manifest_copy()
     manifest_serving_copy_kind = "manifest_lean_serving" if use_direct_lean_copy else "manifest_serving"
@@ -3053,29 +3114,32 @@ async def _mark_ptg2_import_failed(
     error: BaseException | str,
     report: dict[str, Any] | None = None,
     options: dict[str, Any] | None = None,
+    *,
+    should_preserve_published_snapshot: bool = False,
 ) -> None:
     finished = _utcnow()
     error_text = str(error)
     report_payload = dict(report or {})
     report_payload.setdefault("snapshot_id", snapshot_id)
     try:
-        await _push_ptg2_objects(
-            [
-                {
-                    "snapshot_id": snapshot_id,
-                    "import_run_id": import_run_id,
-                    "import_month": import_month,
-                    "status": PTG2_STATUS_FAILED,
-                    "created_at": started_at,
-                    "validated_at": None,
-                    "published_at": None,
-                    "previous_snapshot_id": None,
-                    "manifest": {**report_payload, "error": error_text},
-                }
-            ],
-            PTG2Snapshot,
-            rewrite=True,
-        )
+        if not should_preserve_published_snapshot:
+            await _push_ptg2_objects(
+                [
+                    {
+                        "snapshot_id": snapshot_id,
+                        "import_run_id": import_run_id,
+                        "import_month": import_month,
+                        "status": PTG2_STATUS_FAILED,
+                        "created_at": started_at,
+                        "validated_at": None,
+                        "published_at": None,
+                        "previous_snapshot_id": None,
+                        "manifest": {**report_payload, "error": error_text},
+                    }
+                ],
+                PTG2Snapshot,
+                rewrite=True,
+            )
         await _push_ptg2_objects(
             [
                 {
@@ -3183,6 +3247,241 @@ def _normalize_source_network_names(value: Any) -> list[str]:
     return names
 
 
+_PTG2_SNAPSHOT_SET_OPTION_KEYS = (
+    "plan_ids",
+    "plan_name_contains",
+    "plan_market_types",
+    "file_url_contains",
+)
+
+_PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
+    "toc_urls",
+    "toc_list",
+    "in_network_url",
+    "allowed_url",
+    "provider_ref_url",
+    "source_key",
+    *_PTG2_SNAPSHOT_SET_OPTION_KEYS,
+    "source_network_names",
+    "max_files",
+    "max_items",
+    "compact_import",
+    "serving_only_import",
+    "source_scoped_compact",
+    "serving_storage",
+    "snapshot_arch",
+    "snapshot_arch_variant",
+    "test_mode",
+    "allow_partial_import",
+    "hash_mode",
+    "provider_bucket_count",
+    "provider_set_inline_npi_limit",
+    "id_storage",
+    "manifest_serving_layout",
+    "manifest_price_atom_layout",
+    "manifest_provider_group_location",
+    "manifest_provider_set_component",
+    "manifest_provider_group_rate_scope",
+    "manifest_serving_sidecars",
+    "manifest_drop_serving_table",
+    "manifest_postgres_binary_natural_lean_stream",
+    "manifest_provider_npi_sidecar",
+)
+
+
+def _ptg2_effective_hash_mode() -> str:
+    raw_mode = str(os.getenv(PTG2_HASH_MODE_ENV, "checksum64")).strip().lower()
+    if raw_mode == "sha256":
+        return "sha256"
+    if raw_mode in {"blake2", "blake2b", "blake2_128"}:
+        return "blake2_128"
+    return "checksum64"
+
+
+def _ptg2_snapshot_content_options(option_by_name: dict[str, Any]) -> dict[str, Any]:
+    content_option_by_name = {
+        key: option_by_name.get(key)
+        for key in _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS
+    }
+    content_option_by_name["toc_urls"] = _dedupe_preserve(
+        [
+            str(value).strip()
+            for value in _as_list(option_by_name.get("toc_urls"))
+            if str(value).strip()
+        ]
+    )
+    for key in _PTG2_SNAPSHOT_SET_OPTION_KEYS:
+        content_option_by_name[key] = sorted(
+            set(_normalize_filter_values(option_by_name.get(key)))
+        )
+    content_option_by_name["source_network_names"] = sorted(
+        set(_normalize_source_network_names(option_by_name.get("source_network_names"))),
+        key=str.casefold,
+    )
+    content_option_by_name["snapshot_arch_variant"] = (
+        option_by_name.get("snapshot_arch_variant")
+        or option_by_name.get("snapshot_arch")
+    )
+    return content_option_by_name
+
+
+def _ptg2_deterministic_snapshot_id(
+    *,
+    import_month: datetime.date,
+    import_id: str,
+    option_by_name: dict[str, Any],
+) -> str:
+    identity_by_field = {
+        "identity_version": 2,
+        "import_id": import_id,
+        "import_month": import_month.isoformat(),
+        "content_options": _ptg2_snapshot_content_options(option_by_name),
+    }
+    identity_bytes = canonical_json_dumps(
+        {"domain": "ptg2_snapshot_identity_v2", "payload": identity_by_field}
+    ).encode("utf-8")
+    identity_hash = hash_prefix(sha256_bytes(identity_bytes), 12)
+    return f"ptg2:{import_month.strftime('%Y%m')}:{identity_hash}"
+
+
+def _published_snapshot_manifest(snapshot_attributes: dict[str, Any]) -> dict[str, Any]:
+    manifest = snapshot_attributes.get("manifest")
+    if isinstance(manifest, dict):
+        return manifest
+    if isinstance(manifest, str):
+        try:
+            parsed = json.loads(manifest)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _published_snapshot_serving_index(
+    snapshot_attributes: dict[str, Any],
+) -> dict[str, Any]:
+    serving_index = _published_snapshot_manifest(snapshot_attributes).get("serving_index")
+    return dict(serving_index) if isinstance(serving_index, dict) else {}
+
+
+async def _reconcile_already_published_snapshot(
+    *,
+    snapshot_attributes: dict[str, Any],
+    snapshot_id: str,
+    source_key: str,
+    import_month: datetime.date,
+) -> dict[str, Any]:
+    serving_index = _published_snapshot_serving_index(snapshot_attributes)
+    if serving_index.get("storage") != "manifest_snapshot":
+        return {"status": "not_applicable", "reason": "snapshot has no source-scoped serving tables"}
+    previous_snapshot_id = snapshot_attributes.get("previous_snapshot_id")
+    return await _publish_ptg2_source_pointers(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=str(previous_snapshot_id) if previous_snapshot_id else None,
+        import_month=import_month,
+        updated_at=_utcnow(),
+        serving_index=serving_index,
+        snapshot_attributes=snapshot_attributes,
+    )
+
+
+_PTG2_CANDIDATE_TABLE_KINDS = (
+    "serving",
+    "serving_binary",
+    "price_atom",
+    "price_set_atom",
+    "provider_group_member",
+    "provider_npi_scope",
+    "provider_group_location",
+    "provider_set_component",
+    "provider_group_rate_scope",
+    "provider_set_dict",
+    "price_atom_dict",
+    "code_count",
+)
+
+_PTG2_MANIFEST_STAGE_SUPPORT_KINDS = (
+    "price_atom",
+    "price_set_atom",
+    "provider_group_member",
+    "provider_npi_scope",
+    "code_count",
+    "provider_set_dictionary",
+)
+
+
+def _ptg2_manifest_stage_table_names(serving_stage_table: str) -> list[str]:
+    return [
+        serving_stage_table,
+        *(
+            _ptg2_manifest_support_stage_table(serving_stage_table, kind)
+            for kind in _PTG2_MANIFEST_STAGE_SUPPORT_KINDS
+        ),
+    ]
+
+
+def _ptg2_candidate_serving_index(
+    *,
+    source_key: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    table_by_kind = {
+        kind: f"{schema_name}.{_ptg2_snapshot_table_name(kind, source_key, snapshot_id)}"
+        for kind in _PTG2_CANDIDATE_TABLE_KINDS
+    }
+    return {
+        "storage": "manifest_snapshot",
+        "type": "ptg2_serving_candidate",
+        "source_key": source_key,
+        "table": table_by_kind["serving"],
+        "serving_binary_table": table_by_kind["serving_binary"],
+        "price_atom_table": table_by_kind["price_atom"],
+        "provider_group_member_table": table_by_kind["provider_group_member"],
+        "provider_npi_scope_table": table_by_kind["provider_npi_scope"],
+        "provider_group_location_table": table_by_kind["provider_group_location"],
+        "provider_set_component_table": table_by_kind["provider_set_component"],
+        "provider_group_rate_scope_table": table_by_kind["provider_group_rate_scope"],
+        "provider_set_dictionary_table": table_by_kind["provider_set_dict"],
+        "price_atom_dictionary_table": table_by_kind["price_atom_dict"],
+        "code_count_table": table_by_kind["code_count"],
+        "materialized_tables": table_by_kind,
+    }
+
+
+def _already_published_result(
+    *,
+    snapshot_attributes: dict[str, Any],
+    snapshot_id: str,
+    import_run_id: str,
+    source_key: str,
+    import_month: datetime.date,
+    pointer_reconciliation: dict[str, Any],
+) -> dict[str, Any]:
+    manifest = _published_snapshot_manifest(snapshot_attributes)
+    serving_index = manifest.get("serving_index")
+    serving_index = serving_index if isinstance(serving_index, dict) else {}
+    rate_count = manifest.get(
+        "serving_rates",
+        manifest.get("rate_count", serving_index.get("serving_rates", serving_index.get("rate_count"))),
+    )
+    return {
+        "status": "succeeded",
+        "publish_status": "already_published",
+        "already_published": True,
+        "message": "PTG snapshot is already published; serving pointers were reconciled",
+        "import_run_id": str(snapshot_attributes.get("import_run_id") or import_run_id),
+        "snapshot_id": snapshot_id,
+        "source_key": source_key,
+        "import_month": import_month.isoformat(),
+        "serving_rates": rate_count,
+        "rate_count": rate_count,
+        "address_refresh": manifest.get("address_refresh"),
+        "pointer_reconciliation": pointer_reconciliation,
+    }
+
+
 async def main(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
@@ -3226,33 +3525,6 @@ async def main(
         )
     )
     import_run_id = f"ptg2:{import_id_val}"
-    snapshot_id = f"ptg2:{import_month_value.strftime('%Y%m')}:{hash_prefix(semantic_hash(import_run_id), 12)}"
-    live_run_id = str(control_run_id or "").strip()
-    live_token = set_live_progress_context(
-        run_id=live_run_id,
-        source_key=source_key_val,
-        snapshot_id=snapshot_id,
-        import_run_id=import_run_id,
-    )
-    setup_stage_timings: dict[str, float] = {}
-    setup_stage_timer = _StageTimer(setup_stage_timings, import_started_monotonic)
-
-    source_network_name_values = _normalize_source_network_names(source_network_names)
-    # Enforce a streaming size cap on every caller-supplied URL (never None for
-    # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
-    max_bytes = fetch_max_bytes(PTG2_DEFAULT_MAX_BYTES)
-    if test_mode:
-        raw_max_bytes = os.getenv("HLTHPRT_PTG2_TEST_MAX_BYTES")
-        if raw_max_bytes:
-            try:
-                max_bytes = int(raw_max_bytes)
-            except ValueError:
-                logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
-    write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
-    await ensure_database(test_mode)
-    setup_stage_timer.mark("ensure_database")
-    await ensure_ptg2_tables()
-    setup_stage_timer.mark("ensure_ptg2_tables")
     compact_import = True
     source_scoped_compact = True
     if source_key_val is None:
@@ -3260,7 +3532,11 @@ async def main(
             source_key_val = _normalize_source_key(import_id_val)
         else:
             raise ValueError("PTG imports require --source-key or HLTHPRT_PTG2_SOURCE_KEY")
-    now = _utcnow()
+    assert source_key_val is not None
+    source_network_name_values = sorted(
+        _normalize_source_network_names(source_network_names),
+        key=str.casefold,
+    )
     options_payload = {
         "toc_urls": toc_urls or [],
         "toc_list": toc_list,
@@ -3288,25 +3564,60 @@ async def main(
         "snapshot_arch": snapshot_arch_version,
         "snapshot_arch_variant": snapshot_arch_variant,
         "test_mode": test_mode,
+        "allow_partial_import": _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False),
+        "hash_mode": _ptg2_effective_hash_mode(),
+        "provider_bucket_count": ptg2_provider_bucket_count(),
+        "provider_set_inline_npi_limit": max(_env_int(PTG2_PROVIDER_SET_INLINE_NPI_LIMIT_ENV, 0), 0),
+        "id_storage": _ptg2_id_storage(),
+        "manifest_serving_layout": _ptg2_manifest_serving_layout(),
+        "manifest_price_atom_layout": _ptg2_manifest_price_atom_layout(),
+        "manifest_provider_group_location": _ptg2_manifest_provider_group_location_enabled(),
+        "manifest_provider_set_component": _ptg2_manifest_provider_set_component_enabled(),
+        "manifest_provider_group_rate_scope": _ptg2_manifest_provider_group_rate_scope_enabled(),
+        "manifest_serving_sidecars": _ptg2_manifest_serving_sidecars_enabled(),
+        "manifest_drop_serving_table": _ptg2_manifest_drop_serving_table_after_sidecars(),
+        "manifest_postgres_binary_natural_lean_stream": (
+            _ptg2_manifest_postgres_binary_natural_lean_stream_enabled()
+        ),
+        "manifest_provider_npi_sidecar": _env_bool(
+            PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
+            True,
+        ),
     }
-    await _push_ptg2_objects(
-        [
-            {
-                "import_run_id": import_run_id,
-                "import_month": import_month_value,
-                "status": PTG2_STATUS_RUNNING,
-                "started_at": now,
-                "finished_at": None,
-                "heartbeat_at": now,
-                "options": options_payload,
-                "report": {},
-                "error": None,
-            }
-        ],
-        PTG2ImportRun,
-        rewrite=True,
+    snapshot_id = _ptg2_deterministic_snapshot_id(
+        import_month=import_month_value,
+        import_id=import_id_val,
+        option_by_name=options_payload,
     )
-    await _push_ptg2_objects(
+    live_run_id = str(control_run_id or "").strip()
+    live_token = set_live_progress_context(
+        run_id=live_run_id,
+        source_key=source_key_val,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+    )
+    setup_stage_timings: dict[str, float] = {}
+    setup_stage_timer = _StageTimer(setup_stage_timings, import_started_monotonic)
+
+    # Enforce a streaming size cap on every caller-supplied URL (never None for
+    # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
+    max_bytes = fetch_max_bytes(PTG2_DEFAULT_MAX_BYTES)
+    if test_mode:
+        raw_max_bytes = os.getenv("HLTHPRT_PTG2_TEST_MAX_BYTES")
+        if raw_max_bytes:
+            try:
+                max_bytes = int(raw_max_bytes)
+            except ValueError:
+                logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
+    write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
+    await ensure_database(test_mode)
+    setup_stage_timer.mark("ensure_database")
+    await ensure_ptg2_tables()
+    setup_stage_timer.mark("ensure_ptg2_tables")
+    now = _utcnow()
+    observed_source_snapshot_id = await _current_source_snapshot_id(source_key_val)
+    setup_stage_timer.mark("source_snapshot_lookup")
+    snapshot_state = await _push_ptg2_objects(
         [
             {
                 "snapshot_id": snapshot_id,
@@ -3323,9 +3634,49 @@ async def main(
         PTG2Snapshot,
         rewrite=True,
     )
-    setup_stage_timer.mark("initial_status_rows")
+    if snapshot_state and snapshot_state.get("status") == PTG2_STATUS_PUBLISHED:
+        try:
+            pointer_reconciliation = await _reconcile_already_published_snapshot(
+                snapshot_attributes=snapshot_state,
+                snapshot_id=snapshot_id,
+                source_key=source_key_val,
+                import_month=import_month_value,
+            )
+            already_published_result = _already_published_result(
+                snapshot_attributes=snapshot_state,
+                snapshot_id=snapshot_id,
+                import_run_id=import_run_id,
+                source_key=source_key_val,
+                import_month=import_month_value,
+                pointer_reconciliation=pointer_reconciliation,
+            )
+            write_live_progress(
+                status="succeeded",
+                phase="succeeded",
+                pct=100,
+                eta_seconds=0,
+                message="PTG snapshot already published; pointers reconciled",
+            )
+            return already_published_result
+        finally:
+            reset_live_progress_context(live_token)
+    if snapshot_state and snapshot_state.get("snapshot_claim_status") == "existing":
+        reset_live_progress_context(live_token)
+        existing_status = snapshot_state.get("status") or "<unknown>"
+        if existing_status == PTG2_STATUS_BUILDING:
+            raise PTG2SnapshotInProgressConflict(
+                f"PTG snapshot {snapshot_id} is already being built by "
+                f"{snapshot_state.get('import_run_id') or 'another delivery'}"
+            )
+        raise RuntimeError(
+            f"Refusing PTG snapshot claim for {snapshot_id}: existing status is "
+            f"{existing_status}"
+        )
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
+    previous_snapshot_id = (
+        str(observed_source_snapshot_id) if observed_source_snapshot_id else None
+    )
     current_pointer_published = False
 
     async def mark_import_failed(error: BaseException | str, *, progress_message: str | None = None) -> None:
@@ -3338,21 +3689,40 @@ async def main(
             eta_seconds=0,
             message=progress_message or f"PTG import failed: {error_text}",
         )
-        if source_scoped_compact and not current_pointer_published:
-            serving_index = failure_report.get("serving_index")
+        serving_index = failure_report.get("serving_index")
+        is_snapshot_known_published = current_pointer_published
+        should_preserve_candidate_tables = current_pointer_published
+        if (
+            source_scoped_compact
+            and not should_preserve_candidate_tables
+            and isinstance(serving_index, dict)
+            and source_key_val
+        ):
+            try:
+                is_snapshot_known_published = (
+                    await _current_source_snapshot_id(source_key_val) == snapshot_id
+                )
+                should_preserve_candidate_tables = is_snapshot_known_published
+            except Exception:
+                should_preserve_candidate_tables = True
+                logger.warning(
+                    "Could not recheck the PTG source pointer during failure handling; "
+                    "preserving candidate tables to avoid deleting live data",
+                    exc_info=True,
+                )
+        if source_scoped_compact and not should_preserve_candidate_tables:
             try:
                 await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
                 if ptg2_manifest_stage_table:
                     await _drop_ptg2_snapshot_table_names(
-                        [
-                            ptg2_manifest_stage_table,
-                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
-                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
-                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_npi_scope"),
-                        ]
+                        _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
                     )
             except Exception:
                 logger.debug("Failed to clean PTG2 source-scoped tables for failed import", exc_info=True)
+            try:
+                await delete_ptg2_artifacts_for_snapshot(snapshot_id)
+            except Exception:
+                logger.debug("Failed to clean PTG2 artifacts for failed import", exc_info=True)
         await _mark_ptg2_import_failed(
             import_run_id,
             snapshot_id,
@@ -3361,12 +3731,32 @@ async def main(
             error_text,
             report=failure_report,
             options=options_payload,
+            should_preserve_published_snapshot=is_snapshot_known_published,
         )
 
     try:
+        await _push_ptg2_objects(
+            [
+                {
+                    "import_run_id": import_run_id,
+                    "import_month": import_month_value,
+                    "status": PTG2_STATUS_RUNNING,
+                    "started_at": now,
+                    "finished_at": None,
+                    "heartbeat_at": now,
+                    "options": options_payload,
+                    "report": {},
+                    "error": None,
+                }
+            ],
+            PTG2ImportRun,
+            rewrite=True,
+        )
+        setup_stage_timer.mark("initial_status_rows")
         assert source_key_val is not None
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
+        ptg2_manifest_stage_table = _ptg2_manifest_stage_table_name(stage_token)
         ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
         setup_stage_timer.mark("manifest_stage_table")
         initial_dynamic_table_names: set[str] | None = None
@@ -3784,6 +4174,10 @@ async def main(
                 total_steps=publish_progress_total,
                 message_text="publishing PTG manifest snapshot tables",
             )
+            failure_report["serving_index"] = _ptg2_candidate_serving_index(
+                source_key=source_key_val,
+                snapshot_id=snapshot_id,
+            )
             serving_index = await _publish_ptg2_manifest_serving_snapshot(
                 ptg2_manifest_stage_table,
                 snapshot_id=snapshot_id,
@@ -3798,6 +4192,7 @@ async def main(
                 scanner_dedupe_guarded=scanner_dedupe_guarded,
                 known_serving_rows=manifest_merge_metrics.get("serving_rows"),
             )
+            failure_report["serving_index"] = serving_index
             ptg2_manifest_stage_table = None
             _emit_ptg2_publish_progress(
                 "snapshot tables published",
@@ -3816,11 +4211,7 @@ async def main(
                     message_text="dropping PTG staging tables without serving files",
                 )
                 await _drop_ptg2_snapshot_table_names(
-                    [
-                        ptg2_manifest_stage_table,
-                        _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
-                        _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
-                    ]
+                    _ptg2_manifest_stage_table_names(ptg2_manifest_stage_table)
                 )
                 ptg2_manifest_stage_table = None
             serving_index = {
@@ -3841,7 +4232,6 @@ async def main(
         )
 
         finished = _utcnow()
-        previous_snapshot_id = None
         global_previous_snapshot_id = None
         try:
             row = await (
@@ -3854,11 +4244,8 @@ async def main(
         except Exception as exc:
             logger.debug("No PTG2 current snapshot found before publish: %s", exc)
         post_publish_stage_timer.mark("current_snapshot_lookup")
-        if source_scoped_compact and source_key_val:
-            previous_snapshot_id = await _current_source_snapshot_id(source_key_val)
-        else:
+        if not (source_scoped_compact and source_key_val):
             previous_snapshot_id = global_previous_snapshot_id
-        post_publish_stage_timer.mark("source_snapshot_lookup")
         serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
         setup_seconds = data_started_monotonic - import_started_monotonic
         post_publish_prepare_seconds = time.monotonic() - post_publish_prepare_started_monotonic
@@ -3893,23 +4280,17 @@ async def main(
             if authoritative_rate_count is not None:
                 report_payload["serving_rates"] = int(authoritative_rate_count)
                 report_payload["rate_count"] = int(authoritative_rate_count)
-        await _push_ptg2_objects(
-            [
-                {
-                    "snapshot_id": snapshot_id,
-                    "import_run_id": import_run_id,
-                    "import_month": import_month_value,
-                    "status": PTG2_STATUS_PUBLISHED,
-                    "created_at": now,
-                    "validated_at": finished,
-                    "published_at": finished,
-                    "previous_snapshot_id": previous_snapshot_id,
-                    "manifest": report_payload,
-                }
-            ],
-            PTG2Snapshot,
-            rewrite=True,
-        )
+        snapshot_publish_by_field = {
+            "snapshot_id": snapshot_id,
+            "import_run_id": import_run_id,
+            "import_month": import_month_value,
+            "status": PTG2_STATUS_PUBLISHED,
+            "created_at": now,
+            "validated_at": finished,
+            "published_at": finished,
+            "previous_snapshot_id": previous_snapshot_id,
+            "manifest": report_payload,
+        }
         if has_serving_files and source_scoped_compact and source_key_val:
             _emit_ptg2_publish_progress(
                 "updating source pointer",
@@ -3924,8 +4305,15 @@ async def main(
                 import_month=import_month_value,
                 updated_at=finished,
                 serving_index=serving_index,
+                snapshot_attributes=snapshot_publish_by_field,
             )
-        if has_serving_files:
+            current_pointer_published = True
+        await _push_ptg2_objects(
+            [snapshot_publish_by_field],
+            PTG2Snapshot,
+            rewrite=True,
+        )
+        if has_serving_files and not (source_scoped_compact and source_key_val):
             await _push_ptg2_objects(
                 [
                     {
