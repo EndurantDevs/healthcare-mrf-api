@@ -194,6 +194,14 @@ unresolved lineage. Do not run `alembic upgrade head` merely to apply this
 change when the deployment's `mrf.alembic_version` intentionally trails its
 sync-managed schema.
 
+When an operator resumes a failed acquisition directly through import-control,
+the campaign harness can attach that existing lineage tip with
+`--adopt-run ENTRY=RUN_ID --apply`. Adoption is GET-only: it requires an exact
+manifest parameter match, validates the acquisition root, rejects a run that
+already has a child, and refuses to proceed while an unrelated Provider
+Directory run is active. This keeps the generated campaign report current
+without hand-editing state or launching a duplicate full import.
+
 Bulk acquisition checkpoints use the same endpoint candidate and acquisition
 root. Their identity additionally binds the canonical API base, resource type,
 source scope, Bulk strategy version, endpoint id, candidate `dataset_id`, and

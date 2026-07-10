@@ -2,7 +2,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Resumable serial Provider Directory endpoint acquisition through import-control."""
 from __future__ import annotations
-import argparse
 import datetime as dt
 import hashlib
 import json
@@ -15,9 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 try:
+    from scripts.research.provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
     from scripts.research.provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 except ModuleNotFoundError:
+    from provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
     from provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +64,7 @@ class HarnessConfig:
     poll_interval_seconds: float = 30.0
     retry_wait_seconds: float = 900.0
     restart_entry_ids: frozenset[str] = frozenset()
+    adopt_run_ids: tuple[tuple[str, str], ...] = ()
 def _utc_now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 def _json_hash(json_value: Any) -> str:
@@ -260,9 +262,17 @@ class AcquisitionHarness:
         self.state = _load_state(config.state_path, manifest)
     def execute_campaign(self) -> dict[str, Any]:
         """Execute selected entries serially, stopping at the first apply failure."""
+        AdoptionManager(
+            self.manifest,
+            self.state,
+            self.client,
+            lambda entry, run_record: _run_param_errors(self.manifest, entry, run_record),
+            self._remember_run,
+        ).apply(self.config.adopt_run_ids, self.config.restart_entry_ids, self.config.apply)
         self._restart_requested_entries()
         self._persist()
-        selected_entry_ids = self.config.selected_entry_ids | self.config.restart_entry_ids
+        adopted_entry_ids = {entry_id for entry_id, _run_id in self.config.adopt_run_ids}
+        selected_entry_ids = self.config.selected_entry_ids | self.config.restart_entry_ids | adopted_entry_ids
         for entry in sorted(self.manifest["entries"], key=lambda candidate: candidate["launch_mode"] == "create"):
             if selected_entry_ids and entry["entry_id"] not in selected_entry_ids:
                 continue
@@ -449,45 +459,10 @@ class AcquisitionHarness:
         }
         _atomic_write_json(self.config.state_path, self.state)
         _atomic_write_json(self.config.report_path, report_dict)
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse harness CLI arguments without reading credentials."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
-    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
-    parser.add_argument("--control-url", default=os.getenv("HP_IMPORT_CONTROL_URL"))
-    parser.add_argument("--token-env", default="HP_IMPORT_CONTROL_TOKEN")
-    parser.add_argument("--entry", action="append", default=[], help="Run only this manifest entry; repeatable.")
-    parser.add_argument("--restart-entry", action="append", default=[], help="Start a fresh root after a guarded terminal failure; repeatable and requires --apply.")
-    parser.add_argument("--apply", action="store_true", help="Permit POST /v1/runs. The default is GET-only dry-run.")
-    parser.add_argument("--validate-only", action="store_true")
-    parser.add_argument("--poll-interval-seconds", type=float, default=30.0)
-    parser.add_argument("--retry-wait-seconds", type=float, default=900.0)
-    parser.add_argument("--request-timeout-seconds", type=float, default=60.0)
-    return parser.parse_args(argv)
-def main(argv: list[str] | None = None) -> int:
-    """Validate or run the acquisition campaign."""
-    args = parse_args(argv)
-    if args.restart_entry and not args.apply:
-        raise SystemExit("--restart-entry requires --apply")
-    manifest = load_manifest(args.manifest)
-    if args.validate_only:
-        print(json.dumps({"valid": True, "entries": len(manifest["entries"]), "manifest_sha256": _json_hash(manifest)}, sort_keys=True))
-        return 0
-    if not args.control_url:
-        raise SystemExit("--control-url or HP_IMPORT_CONTROL_URL is required")
-    known_entry_ids = {entry["entry_id"] for entry in manifest["entries"]}
-    restart_entry_ids = frozenset(args.restart_entry)
-    selected_entry_ids = frozenset(args.entry) | restart_entry_ids
-    unknown_ids = selected_entry_ids - known_entry_ids
-    if unknown_ids:
-        raise SystemExit("unknown manifest entries: " + ",".join(sorted(unknown_ids)))
-    config = HarnessConfig(args.state, args.report, args.apply, selected_entry_ids, args.poll_interval_seconds, args.retry_wait_seconds, restart_entry_ids)
-    client = ImportControlHttpClient(args.control_url, args.token_env, args.request_timeout_seconds)
-    final_state = AcquisitionHarness(manifest, client, config).execute_campaign()
-    selected_states = [state for entry_id, state in final_state["entries"].items() if not selected_entry_ids or entry_id in selected_entry_ids]
-    is_ok = all(state.get("status") in FINISHED_STATE_STATUSES | ({"planned"} if not args.apply else set()) for state in selected_states)
-    print(json.dumps({"ok": is_ok, "mode": "apply" if args.apply else "dry-run", "state": str(args.state), "report": str(args.report)}, sort_keys=True))
-    return 0 if is_ok else 2
+def run_cli(argv: list[str] | None = None) -> int:
+    """Delegate CLI execution without importing credentials at module load."""
+    from scripts.research.provider_directory_endpoint_acquisition_cli import run_acquisition_cli
+
+    return run_acquisition_cli(argv)
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli())

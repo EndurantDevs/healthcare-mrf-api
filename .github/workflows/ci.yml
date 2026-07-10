@@ -66,6 +66,7 @@ jobs:
           tests/test_process_provider_directory_fhir_unit.py
           tests/test_provider_directory_fhir_bulk_security.py
           tests/test_provider_directory_endpoint_acquisition_harness.py
+          tests/test_provider_directory_endpoint_acquisition_harness_adoption.py
           tests/test_provider_directory_endpoint_acquisition_harness_restart.py
           tests/test_provider_directory_coverage_audit.py
           tests/test_provider_directory_artifact_cutover.py

@@ -275,7 +275,7 @@ def test_restart_entry_refuses_dry_run(tmp_path):
     with pytest.raises(harness.HarnessConflict, match="requires --apply"):
         _execute(tmp_path, manifest, control, apply=False)
     with pytest.raises(SystemExit, match="requires --apply"):
-        harness.main(["--restart-entry", "idaho"])
+        harness.run_cli(["--restart-entry", "idaho"])
     assert control.created_requests == []
 
 
