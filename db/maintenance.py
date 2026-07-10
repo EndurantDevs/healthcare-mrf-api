@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
-from importlib import import_module
 from typing import Any, Dict, Iterable, List, Tuple
 
 import click
 from sqlalchemy import inspect, text
 
 from db.connection import Base, db
-
-import_module("db.models")
+from db.models import ProviderDirectoryPaginationCheckpoint
+from db.provider_directory_schema import (
+    ensure_provider_directory_pagination_root_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> 
         "tables": [],
         "columns": [],
         "indexes": [],
+        "constraints": [],
         "skipped_columns": [],
         "retired": [],
     }
@@ -41,7 +43,12 @@ async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> 
     return results
 
 
-def _sync_structure(sync_conn, results: Dict[str, List[str]], add_columns: bool, add_indexes: bool) -> None:
+def _sync_structure(
+    sync_conn,
+    sync_summary_by_kind: Dict[str, List[str]],
+    add_columns: bool,
+    add_indexes: bool,
+) -> None:
     metadata = Base.metadata
     inspector = inspect(sync_conn)
     model_map = _model_by_table_fullname()
@@ -56,16 +63,30 @@ def _sync_structure(sync_conn, results: Dict[str, List[str]], add_columns: bool,
 
         if not inspector.has_table(table_name, schema=schema):
             table.create(bind=sync_conn, checkfirst=True)
-            results["tables"].append(fullname)
+            sync_summary_by_kind["tables"].append(fullname)
             continue
 
         if add_columns:
-            _ensure_columns(sync_conn, inspector, table, results)
+            _ensure_columns(sync_conn, inspector, table, sync_summary_by_kind)
 
         if add_indexes:
             model = model_map.get(fullname)
             if model is not None:
-                _ensure_indexes(sync_conn, inspector, table, model, results)
+                _ensure_indexes(
+                    sync_conn,
+                    inspector,
+                    table,
+                    model,
+                    sync_summary_by_kind,
+                )
+
+    checkpoint_schema = ProviderDirectoryPaginationCheckpoint.__table__.schema
+    if checkpoint_schema in managed_schemas:
+        ensure_provider_directory_pagination_root_identity(
+            sync_conn,
+            checkpoint_schema,
+            sync_summary_by_kind,
+        )
 
 
 def _model_by_table_fullname() -> Dict[str, Any]:
@@ -221,6 +242,8 @@ def render_sync_summary(results: Dict[str, List[str]]) -> None:
         click.echo(f"Added columns: {', '.join(results['columns'])}")
     if results["indexes"]:
         click.echo(f"Added indexes: {', '.join(results['indexes'])}")
+    if results["constraints"]:
+        click.echo(f"Reconciled constraints: {', '.join(results['constraints'])}")
     if results["skipped_columns"]:
         click.echo(
             "Skipped non-nullable columns without defaults: "

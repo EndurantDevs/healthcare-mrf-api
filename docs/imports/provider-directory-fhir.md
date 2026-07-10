@@ -187,6 +187,12 @@ an independent row while failed-root evidence remains available for audit.
 Failed-root checkpoint retention is intentionally conservative: cleanup must
 first prove that the endpoint candidate is neither current nor
 active/incomplete and that no import-control run in the root lineage is live.
+Deployments that manage this database with `manage sync-structure` apply the
+same root-key change through an idempotent, advisory-locked reconciler. It
+accepts only the known legacy or current primary-key shape and fails closed on
+unresolved lineage. Do not run `alembic upgrade head` merely to apply this
+change when the deployment's `mrf.alembic_version` intentionally trails its
+sync-managed schema.
 
 Bulk acquisition checkpoints use the same endpoint candidate and acquisition
 root. Their identity additionally binds the canonical API base, resource type,
