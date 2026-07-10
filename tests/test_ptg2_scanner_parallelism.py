@@ -202,6 +202,7 @@ def _run_parallel_scanner(
     queue_size: int | None = None,
     copy_kinds: tuple[str, ...] | None = None,
     sidecar_kinds: tuple[str, ...] = (),
+    env_overrides: dict[str, str] | None = None,
 ) -> dict:
     run_dir.mkdir()
     selected_copy_kinds = copy_kinds or tuple(COPY_ENV_BY_KIND)
@@ -211,6 +212,7 @@ def _run_parallel_scanner(
     scanner_env_map.update(
         {COPY_ENV_BY_KIND[kind]: str(copy_path) for kind, copy_path in copy_path_by_kind.items()}
     )
+    scanner_env_map.update(env_overrides or {})
     scanner_env_map.update(
         {
             SIDECAR_ENV_BY_KIND[kind]: str(sidecar_path)
@@ -369,7 +371,7 @@ def test_scanner_queue_and_buffer_metrics_stay_bounded(scanner_parallelism_runs)
     assert sum(worker["raw_bytes"] for worker in summary["workers"]) == summary["raw_chunk_total_bytes"]
 
 
-def test_scanner_metric_contract_exposes_healthjoy_bottleneck_split(scanner_parallelism_runs):
+def test_scanner_metric_contract_exposes_dense_fixture_bottleneck_split(scanner_parallelism_runs):
     config = _single_frame(scanner_parallelism_runs[8], "scanner_config")
     summary = _single_frame(scanner_parallelism_runs[8], "scanner_summary")
 
@@ -421,31 +423,6 @@ def test_scanner_metric_contract_exposes_healthjoy_bottleneck_split(scanner_para
             "write_seconds",
             "sidecar_lock_wait_seconds",
         } <= worker.keys()
-
-
-def test_scanner_reports_explicit_fallback_when_provider_references_follow_rates(tmp_path):
-    scanner_binary = _built_scanner_binary()
-    payload = _scanner_fixture_payload()
-    payload = {"in_network": payload["in_network"][:1], "provider_references": payload["provider_references"]}
-    artifact = tmp_path / "after-order.json.gz"
-    _write_gzip_json(artifact, payload)
-    run = _run_parallel_scanner(
-        scanner_binary,
-        artifact,
-        tmp_path / "after-order",
-        workers=8,
-        copy_kinds=("compact",),
-    )
-
-    config = _single_frame(run, "scanner_config")
-    summary = _single_frame(run, "scanner_summary")
-    assert config["execution_mode"] == "serial_struson"
-    assert config["provider_reference_order"] == "after_in_network"
-    assert config["top_level_byte_scan_selected"] is False
-    assert config["top_level_byte_scan_fallback_reason"] == "provider_references_after_in_network"
-    assert summary["top_level_byte_scan_fallback_reason"] == "provider_references_after_in_network"
-    assert summary["order_detection_compressed_bytes"] > 0
-    assert run["copy_rows"]["compact"]
 
 
 def test_python_bridge_emits_metric_progress_with_fallback_and_producer_split(monkeypatch):

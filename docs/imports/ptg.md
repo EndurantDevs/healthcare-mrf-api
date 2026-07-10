@@ -18,7 +18,7 @@ HLTHPRT_PTG2_ARTIFACT_DIR="/Volumes/Data/data" \
 HLTHPRT_PTG2_KEEP_PARTIAL_ARTIFACTS=true \
 python main.py start ptg \
   --toc-url "<SIGNED_UHC_EXAMPLE_GROUP_INDEX_URL>" \
-  --plan-id 010854205 \
+  --plan-id TESTPLAN001 \
   --plan-market-type group \
   --import-month 2026-05-01 \
   --import-id example_group_202605_full \
@@ -151,7 +151,7 @@ Supported import modes:
 The default import-id fingerprint includes the effective snapshot architecture.
 That lets the same carrier/source/month be imported in multiple architectures
 without table-name collisions. Use `HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT` when you
-need a stable, human-readable A/B label such as `heartland_sidecar_v1`.
+need a stable, human-readable A/B label such as `dense_dental_sidecar_v1`.
 Repeating an already-published fingerprint is idempotent and returns the existing
 snapshot without recreating or dropping tables. Only one worker can claim a
 building fingerprint; a concurrent delivery fails with an explicit
@@ -198,9 +198,9 @@ passed.
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
 - `HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true` rejects `target/debug/ptg2_scanner` when the Rust scanner is selected. Keep this enabled in deployed environments; local development can disable it to use a debug binary.
 - `HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS=true` is the default worker-side parser path. The producer transfers bounded raw negotiated-rate chunks to worker threads so `RateLite` construction, normalization, hashing, dedupe, and COPY row writing happen off the producer thread. It still honors `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` for giant `in_network` objects. Set it to `false` to roll back to the previous producer-side parser path for A/B checks.
-- `HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN=true` is the default fast framing path. It automatically uses the checked parser when provider references follow `in_network`, when file outputs are unavailable, or when provider-reference worker parsing is explicitly disabled.
-- `HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED=true` optionally uses the verified parallel `rapidgzip` decoder for the full byte-scan pass; provider-order preflight remains on the built-in decoder. Set `HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS` per resource lane and use `HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN` only when the executable is not on `PATH`. The decoder streams through a pipe and creates no retained index, sidecar, or serving cache.
-- Rust worker parsing accepts both top-level `provider_references` and inline `provider_groups`. A rate that names any unresolved provider-reference id fails the file with `InvalidData`; it is never silently omitted. If `in_network` precedes the top-level reference dictionary, the scanner uses the checked serial path, which still accepts inline groups but fails on a reference that is not yet resolvable.
+- `HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN=true` is the default fast framing path. When `provider_references` follows `in_network` and rapidgzip is enabled, the scanner discovers both uncompressed array ranges while exporting a temporary seek index, then presents the indexed ranges to the existing parallel scanner in dependency order. It uses the checked parser when rapidgzip is disabled, input is not gzip, file outputs are unavailable, or provider-reference worker parsing is explicitly disabled. An enabled rapidgzip/index setup failure aborts the import before output publication instead of silently changing execution mode.
+- `HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED=true` uses the verified parallel `rapidgzip` decoder for full and indexed byte-scan passes. Set `HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS` for the rate-processing pass and `HLTHPRT_PTG2_RUST_RAPIDGZIP_INDEX_THREADS` for the worker-free index pass; defaults are `4` and `8`. Use `HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN` only when the executable is not on `PATH`. Reversed top-level input creates one private ephemeral `gztool` seek index in the system temp directory; it is deleted at scanner exit and is never a retained sidecar or serving cache. Scanner metrics expose `full_decompression_passes`, `order_probe_partial_pass`, `rapidgzip_index_threads`, and `rapidgzip_index_bytes` for this path.
+- Rust worker parsing accepts both top-level `provider_references` and inline `provider_groups`. A rate that names any unresolved provider-reference id fails the file with `InvalidData`; it is never silently omitted. Reversed top-level files use the same provider-reference and rate worker pools after indexed reordering, so input field order no longer forces single-worker processing when rapidgzip is available.
 - `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` defaults to `8192` and `HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES` defaults to 32 MiB. In worker-side parser mode, the producer flushes a raw negotiated-rate worker chunk when either bound is reached. Lower one or both values for memory-sensitive lanes only after comparing peak RSS, scanner elapsed time, producer blocked microseconds, and chunk counts.
 - Rust scanner progress defaults to every 256 MiB or 2,000,000 parsed objects. Override with `HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES` or `HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS` when interactive visibility needs to change.
 - Rust scanner stdout includes `scanner_config` and `scanner_summary` frames. The serving-only summary stores them under `summary.scanner` so A/B runs can compare worker count, queue sizes, parse mode, raw chunk count/bytes, elapsed seconds, and producer blocked microseconds.

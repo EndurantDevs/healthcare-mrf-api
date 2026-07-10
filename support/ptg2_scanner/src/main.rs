@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
@@ -20,7 +20,10 @@ use ptg2_scanner::hashing::{
     checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text, make_checksum,
     semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
 };
-use ptg2_scanner::input::{open_full_scan_reader, open_json_reader, open_reader, RapidgzipConfig};
+use ptg2_scanner::input::{
+    is_gzip, open_full_scan_reader, open_full_scan_reader_exporting_index,
+    open_indexed_ranges_reader, open_json_reader, open_reader, RapidgzipConfig,
+};
 use ptg2_scanner::manifest::{
     normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
     provider_set_global_id_from_group_hashes, write_dense_member_sidecar, write_global_sidecar,
@@ -51,7 +54,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use struson::reader::{JsonReader, JsonStreamReader};
 use struson::writer::{JsonStreamWriter, JsonWriter};
 use xxhash_rust::xxh3::Xxh3;
@@ -714,6 +717,35 @@ fn drain_copy_file_events<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let mut emitted = false;
+    for event in event_rx.try_iter() {
+        emit_copy_file_event(writer, &event)?;
+        emitted = true;
+    }
+    if emitted {
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn drain_copy_file_events_until_workers_finish<W: Write, T>(
+    event_rx: &Receiver<CopyFileEvent>,
+    handles: &[(usize, thread::JoinHandle<T>)],
+    writer: &mut W,
+) -> io::Result<()> {
+    let mut emitted = false;
+    while handles
+        .iter()
+        .any(|(_worker_id, handle)| !handle.is_finished())
+    {
+        match event_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(event) => {
+                emit_copy_file_event(writer, &event)?;
+                emitted = true;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
     for event in event_rx.try_iter() {
         emit_copy_file_event(writer, &event)?;
         emitted = true;
@@ -4455,6 +4487,12 @@ impl<R: Read> Read for PrefixReader<R> {
     }
 }
 
+fn drain_reader_to_eof(reader: &mut impl Read) -> io::Result<()> {
+    let mut discard = vec![0u8; 64 * 1024];
+    while reader.read(&mut discard)? > 0 {}
+    Ok(())
+}
+
 struct BufferedJsonByteReader<R: Read> {
     inner: R,
     buffer: Vec<u8>,
@@ -4746,6 +4784,11 @@ impl<R: Read> BufferedJsonByteReader<R> {
                 "unterminated JSON value",
             ))
         }
+    }
+
+    fn drain_inner_to_eof(&mut self) -> io::Result<()> {
+        self.pos = self.filled;
+        drain_reader_to_eof(&mut self.inner)
     }
 }
 
@@ -6292,6 +6335,191 @@ enum CompactTopLevelArrayKey {
     InNetwork,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopLevelArrayRange {
+    offset: u64,
+    length: u64,
+}
+
+struct TemporaryRapidgzipIndex {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl TemporaryRapidgzipIndex {
+    fn new() -> io::Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("ptg2-rapidgzip-index-")
+            .tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let path = directory.path().join("input.index");
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    fn harden_file_permissions(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+
+struct CompactIndexedReorder {
+    index: TemporaryRapidgzipIndex,
+    provider_references: TopLevelArrayRange,
+    in_network: TopLevelArrayRange,
+    decoder_threads: usize,
+}
+
+struct CompactByteScanOptions {
+    preflight_metrics: CompactPreflightMetrics,
+    rapidgzip_config: RapidgzipConfig,
+    indexed_reorder: Option<CompactIndexedReorder>,
+}
+
+enum ReorderedReaderStage {
+    Prefix,
+    ProviderReferences,
+    Middle,
+    InNetwork,
+    Suffix,
+    Complete,
+}
+
+struct ReorderedTopLevelReader {
+    prefix: Cursor<Vec<u8>>,
+    ranges: Box<dyn Read>,
+    middle: Cursor<Vec<u8>>,
+    suffix: Cursor<Vec<u8>>,
+    provider_bytes_remaining: u64,
+    in_network_bytes_remaining: u64,
+    stage: ReorderedReaderStage,
+}
+
+impl ReorderedTopLevelReader {
+    fn new(ranges: Box<dyn Read>, provider_bytes: u64, in_network_bytes: u64) -> Self {
+        Self {
+            prefix: Cursor::new(br#"{"provider_references":"#.to_vec()),
+            ranges,
+            middle: Cursor::new(br#","in_network":"#.to_vec()),
+            suffix: Cursor::new(b"}".to_vec()),
+            provider_bytes_remaining: provider_bytes,
+            in_network_bytes_remaining: in_network_bytes,
+            stage: ReorderedReaderStage::Prefix,
+        }
+    }
+
+    fn finish_ranges(&mut self) -> io::Result<()> {
+        let mut trailing_byte = [0u8; 1];
+        match self.ranges.read(&mut trailing_byte)? {
+            0 => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rapidgzip indexed ranges emitted extra bytes",
+            )),
+        }
+    }
+}
+
+impl Read for ReorderedTopLevelReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match self.stage {
+                ReorderedReaderStage::Prefix => {
+                    let read = self.prefix.read(buffer)?;
+                    if read > 0 {
+                        return Ok(read);
+                    }
+                    self.stage = ReorderedReaderStage::ProviderReferences;
+                }
+                ReorderedReaderStage::ProviderReferences => {
+                    if self.provider_bytes_remaining == 0 {
+                        self.stage = ReorderedReaderStage::Middle;
+                        continue;
+                    }
+                    let read_limit = buffer.len().min(
+                        self.provider_bytes_remaining
+                            .try_into()
+                            .unwrap_or(usize::MAX),
+                    );
+                    let read = self.ranges.read(&mut buffer[..read_limit])?;
+                    if read == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "rapidgzip provider-reference range ended early",
+                        ));
+                    }
+                    self.provider_bytes_remaining =
+                        self.provider_bytes_remaining.saturating_sub(read as u64);
+                    return Ok(read);
+                }
+                ReorderedReaderStage::Middle => {
+                    let read = self.middle.read(buffer)?;
+                    if read > 0 {
+                        return Ok(read);
+                    }
+                    self.stage = ReorderedReaderStage::InNetwork;
+                }
+                ReorderedReaderStage::InNetwork => {
+                    if self.in_network_bytes_remaining == 0 {
+                        self.finish_ranges()?;
+                        self.stage = ReorderedReaderStage::Suffix;
+                        continue;
+                    }
+                    let read_limit = buffer.len().min(
+                        self.in_network_bytes_remaining
+                            .try_into()
+                            .unwrap_or(usize::MAX),
+                    );
+                    let read = self.ranges.read(&mut buffer[..read_limit])?;
+                    if read == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "rapidgzip in-network range ended early",
+                        ));
+                    }
+                    self.in_network_bytes_remaining =
+                        self.in_network_bytes_remaining.saturating_sub(read as u64);
+                    if self.in_network_bytes_remaining == 0 {
+                        self.finish_ranges()?;
+                        self.stage = ReorderedReaderStage::Suffix;
+                    }
+                    return Ok(read);
+                }
+                ReorderedReaderStage::Suffix => {
+                    let read = self.suffix.read(buffer)?;
+                    if read > 0 {
+                        return Ok(read);
+                    }
+                    self.stage = ReorderedReaderStage::Complete;
+                }
+                ReorderedReaderStage::Complete => return Ok(0),
+            }
+        }
+    }
+}
+
 fn scan_compact_byte_top_level_parallel(
     path: &Path,
     context: CompactContext,
@@ -6299,19 +6527,53 @@ fn scan_compact_byte_top_level_parallel(
     queue_size: usize,
     copy_paths: CopyPathConfig,
     compact_copy_rotate_bytes: u64,
-    preflight_metrics: CompactPreflightMetrics,
+    options: CompactByteScanOptions,
 ) -> io::Result<()> {
+    let CompactByteScanOptions {
+        preflight_metrics,
+        rapidgzip_config,
+        indexed_reorder,
+    } = options;
     let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let rapidgzip_config = RapidgzipConfig {
-        enabled: env_bool("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", false),
-        executable: env::var("HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("rapidgzip")),
-        decoder_threads: env_usize("HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS", 4),
+    let indexed_reorder_used = indexed_reorder.is_some();
+    let provider_reference_order_label = if indexed_reorder_used {
+        "after_in_network"
+    } else {
+        "before_in_network"
     };
-    let mut reader =
-        open_full_scan_reader(path, Arc::clone(&compressed_bytes_read), &rapidgzip_config)?;
+    let indexed_reorder_bytes = indexed_reorder
+        .as_ref()
+        .map(|reorder| reorder.index.byte_len())
+        .unwrap_or(0);
+    let indexed_reorder_decoder_threads = indexed_reorder
+        .as_ref()
+        .map(|reorder| reorder.decoder_threads)
+        .unwrap_or(0);
+    let mut reader: Box<dyn Read> = match indexed_reorder.as_ref() {
+        Some(reorder) => {
+            let ranges = format!(
+                "{}@{},{}@{}",
+                reorder.provider_references.length,
+                reorder.provider_references.offset,
+                reorder.in_network.length,
+                reorder.in_network.offset,
+            );
+            let range_reader = open_indexed_ranges_reader(
+                path,
+                Arc::clone(&compressed_bytes_read),
+                &rapidgzip_config,
+                &reorder.index.path,
+                &ranges,
+            )?;
+            Box::new(ReorderedTopLevelReader::new(
+                range_reader,
+                reorder.provider_references.length,
+                reorder.in_network.length,
+            ))
+        }
+        None => open_full_scan_reader(path, Arc::clone(&compressed_bytes_read), &rapidgzip_config)?,
+    };
     let progress_bytes_interval = progress_interval(
         "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
         DEFAULT_PROGRESS_BYTES,
@@ -6417,14 +6679,22 @@ fn scan_compact_byte_top_level_parallel(
             "top_level_byte_scan_requested": true,
             "top_level_byte_scan_selected": true,
             "top_level_byte_scan_fallback_reason": Value::Null,
-            "execution_mode": "parallel_top_level_bytes",
+            "execution_mode": if indexed_reorder_used {
+                "parallel_top_level_bytes_indexed_reorder"
+            } else {
+                "parallel_top_level_bytes"
+            },
             "decompression": if rapidgzip_config.enabled { "rapidgzip" } else { "flate2" },
             "rapidgzip_threads": if rapidgzip_config.enabled {
                 Some(rapidgzip_config.decoder_threads)
             } else {
                 None
             },
-            "provider_reference_order": "before_in_network",
+            "provider_reference_order": provider_reference_order_label,
+            "rapidgzip_index_bytes": indexed_reorder_bytes,
+            "rapidgzip_index_threads": indexed_reorder_decoder_threads,
+            "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
+            "order_probe_partial_pass": true,
             "order_detection_seconds": preflight_metrics.order_detection_seconds,
             "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
             "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
@@ -6702,6 +6972,7 @@ fn scan_compact_byte_top_level_parallel(
                                 }
                             }
                         }
+                        byte_reader.drain_inner_to_eof()?;
                     } else {
                         let prefixed_reader = PrefixReader::new(prefix, reader);
                         let mut json_reader = JsonStreamReader::new(prefixed_reader);
@@ -6759,6 +7030,7 @@ fn scan_compact_byte_top_level_parallel(
                             }
                         }
                         json_reader.end_array().map_err(to_io_error)?;
+                        drain_reader_to_eof(json_reader.reader_mut())?;
                     }
                     in_network_enqueue_seconds += in_network_started_at.elapsed().as_secs_f64();
                     in_network_compressed_bytes = compressed_bytes_read
@@ -6768,6 +7040,7 @@ fn scan_compact_byte_top_level_parallel(
                     drop(tx);
                     drop(event_tx);
                     let worker_join_started_at = Instant::now();
+                    drain_copy_file_events_until_workers_finish(&event_rx, &handles, &mut writer)?;
                     let mut worker_error: Option<io::Error> = None;
                     let mut copy_file_events = Vec::new();
                     for (worker_id, handle) in handles {
@@ -6915,7 +7188,11 @@ fn scan_compact_byte_top_level_parallel(
                             } else {
                                 None
                             },
-                            "provider_reference_order": "before_in_network",
+                            "provider_reference_order": provider_reference_order_label,
+                            "rapidgzip_index_bytes": indexed_reorder_bytes,
+                            "rapidgzip_index_threads": indexed_reorder_decoder_threads,
+                            "full_decompression_passes": if indexed_reorder_used { 2 } else { 1 },
+                            "order_probe_partial_pass": true,
                             "order_detection_seconds": preflight_metrics.order_detection_seconds,
                             "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
                             "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
@@ -7467,6 +7744,7 @@ fn scan_compact_struson_parallel(
                 drop(tx);
                 drop(event_tx);
                 let worker_join_started_at = Instant::now();
+                drain_copy_file_events_until_workers_finish(&event_rx, &handles, &mut writer)?;
                 let mut worker_error: Option<io::Error> = None;
                 let mut copy_file_events = Vec::new();
                 for (worker_id, handle) in handles {
@@ -7658,6 +7936,7 @@ enum CompactProviderReferenceOrder {
     None,
     BeforeInNetwork,
     AfterInNetwork(HashMap<String, ProviderEntry>),
+    AfterInNetworkIndexed(CompactIndexedReorder),
 }
 
 impl CompactProviderReferenceOrder {
@@ -7665,7 +7944,7 @@ impl CompactProviderReferenceOrder {
         match self {
             Self::None => "missing",
             Self::BeforeInNetwork => "before_in_network",
-            Self::AfterInNetwork(_) => "after_in_network",
+            Self::AfterInNetwork(_) | Self::AfterInNetworkIndexed(_) => "after_in_network",
         }
     }
 }
@@ -7711,9 +7990,183 @@ fn finish_provider_reference_preflight(
     }
 }
 
+fn set_top_level_array_range(
+    key: CompactTopLevelArrayKey,
+    range: TopLevelArrayRange,
+    provider_references: &mut Option<TopLevelArrayRange>,
+    in_network: &mut Option<TopLevelArrayRange>,
+) -> io::Result<()> {
+    let destination = match key {
+        CompactTopLevelArrayKey::ProviderReferences => provider_references,
+        CompactTopLevelArrayKey::InNetwork => in_network,
+    };
+    if destination.replace(range).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate PTG top-level array",
+        ));
+    }
+    Ok(())
+}
+
+fn build_indexed_top_level_reorder(
+    path: &Path,
+    rapidgzip_config: &RapidgzipConfig,
+    compressed_bytes_read: Arc<AtomicU64>,
+) -> io::Result<Option<CompactIndexedReorder>> {
+    let index = TemporaryRapidgzipIndex::new()?;
+    let mut reader = open_full_scan_reader_exporting_index(
+        path,
+        compressed_bytes_read,
+        rapidgzip_config,
+        &index.path,
+    )?;
+    let mut buffer = vec![0u8; READ_BUF_SIZE];
+    let mut stream_offset = 0u64;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut top_level_key_buffer = Vec::with_capacity(32);
+    let mut capturing_top_level_key = false;
+    let mut candidate_key: Option<CompactTopLevelArrayKey> = None;
+    let mut pending_key: Option<CompactTopLevelArrayKey> = None;
+    let mut active_array: Option<(CompactTopLevelArrayKey, usize, u64)> = None;
+    let mut provider_references = None;
+    let mut in_network = None;
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        for (idx, &byte) in buffer[..read].iter().enumerate() {
+            let absolute_offset = stream_offset.saturating_add(idx as u64);
+            if in_string {
+                if escape {
+                    if capturing_top_level_key {
+                        top_level_key_buffer.push(byte);
+                    }
+                    escape = false;
+                } else if byte == b'\\' {
+                    if capturing_top_level_key {
+                        top_level_key_buffer.push(byte);
+                    }
+                    escape = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                    if capturing_top_level_key {
+                        candidate_key = match top_level_key_buffer.as_slice() {
+                            b"provider_references" => {
+                                Some(CompactTopLevelArrayKey::ProviderReferences)
+                            }
+                            b"in_network" => Some(CompactTopLevelArrayKey::InNetwork),
+                            _ => None,
+                        };
+                        capturing_top_level_key = false;
+                    }
+                } else if capturing_top_level_key {
+                    top_level_key_buffer.push(byte);
+                }
+                continue;
+            }
+
+            if byte == b'"' {
+                in_string = true;
+                escape = false;
+                if depth == 1 && active_array.is_none() {
+                    top_level_key_buffer.clear();
+                    capturing_top_level_key = true;
+                } else {
+                    capturing_top_level_key = false;
+                }
+                continue;
+            }
+
+            if let Some(candidate) = candidate_key.take() {
+                if byte.is_ascii_whitespace() {
+                    candidate_key = Some(candidate);
+                    continue;
+                }
+                if byte == b':' {
+                    pending_key = Some(candidate);
+                    continue;
+                }
+            }
+            if let Some(pending) = pending_key.take() {
+                if byte.is_ascii_whitespace() {
+                    pending_key = Some(pending);
+                    continue;
+                }
+                if byte == b'[' && depth == 1 {
+                    depth += 1;
+                    active_array = Some((pending, depth, absolute_offset));
+                    continue;
+                }
+            }
+
+            match byte {
+                b'{' | b'[' => depth += 1,
+                b']' => {
+                    if let Some((key, array_depth, array_offset)) = active_array {
+                        if depth == array_depth {
+                            set_top_level_array_range(
+                                key,
+                                TopLevelArrayRange {
+                                    offset: array_offset,
+                                    length: absolute_offset
+                                        .saturating_sub(array_offset)
+                                        .saturating_add(1),
+                                },
+                                &mut provider_references,
+                                &mut in_network,
+                            )?;
+                            active_array = None;
+                        }
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        stream_offset = stream_offset.saturating_add(read as u64);
+    }
+
+    if in_string || active_array.is_some() || depth != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete JSON while indexing PTG top-level arrays",
+        ));
+    }
+    let (Some(provider_references), Some(in_network)) = (provider_references, in_network) else {
+        return Ok(None);
+    };
+    if provider_references.offset <= in_network.offset {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "indexed reorder requested for non-reversed PTG arrays",
+        ));
+    }
+    if index.byte_len() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rapidgzip produced an empty seek index",
+        ));
+    }
+    index.harden_file_permissions()?;
+    Ok(Some(CompactIndexedReorder {
+        index,
+        provider_references,
+        in_network,
+        decoder_threads: rapidgzip_config.decoder_threads,
+    }))
+}
+
 fn compact_provider_reference_order(
     path: &Path,
     collect_provider_npis: bool,
+    use_indexed_reorder: bool,
+    rapidgzip_config: &RapidgzipConfig,
 ) -> io::Result<CompactProviderReferencePreflight> {
     let started_at = Instant::now();
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
@@ -7754,6 +8207,27 @@ fn compact_provider_reference_order(
             }
             "in_network" => {
                 saw_in_network = true;
+                if use_indexed_reorder {
+                    drop(json_reader);
+                    let indexed_bytes_read = Arc::new(AtomicU64::new(0));
+                    if let Some(indexed_reorder) = build_indexed_top_level_reorder(
+                        path,
+                        rapidgzip_config,
+                        Arc::clone(&indexed_bytes_read),
+                    )? {
+                        return Ok(finish_provider_reference_preflight(
+                            CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder),
+                            started_at,
+                            &indexed_bytes_read,
+                        ));
+                    }
+                    return compact_provider_reference_order(
+                        path,
+                        collect_provider_npis,
+                        false,
+                        rapidgzip_config,
+                    );
+                }
                 json_reader.skip_value().map_err(to_io_error)?;
             }
             _ => json_reader.skip_value().map_err(to_io_error)?,
@@ -7779,11 +8253,6 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
     let confidence_code = env::var("HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE")
         .unwrap_or_else(|_| "tic_rate_npi_tin".to_string());
     let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
-    let mut json_reader = JsonStreamReader::new(reader);
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
     let compact_copy_rotate_bytes = progress_interval(
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES",
         DEFAULT_COMPACT_COPY_ROTATE_BYTES,
@@ -7796,21 +8265,57 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         DEFAULT_COMPACT_RUST_WORK_QUEUE,
     );
     let source_network_names = env_json_text_list("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON");
-    let provider_reference_preflight =
-        compact_provider_reference_order(path, copy_paths.manifest_provider_npi_sidecar.is_some())?;
     let top_level_byte_scan_requested = env_bool(
         "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
         DEFAULT_TOP_LEVEL_BYTE_SCAN,
     );
     let provider_refs_in_workers_requested =
         env_bool("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", true);
+    let rapidgzip_config = RapidgzipConfig {
+        enabled: env_bool("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", false),
+        executable: env::var("HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("rapidgzip")),
+        decoder_threads: env_usize("HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS", 4),
+    };
+    let rapidgzip_index_config = RapidgzipConfig {
+        enabled: rapidgzip_config.enabled,
+        executable: rapidgzip_config.executable.clone(),
+        decoder_threads: env_usize(
+            "HLTHPRT_PTG2_RUST_RAPIDGZIP_INDEX_THREADS",
+            rapidgzip_config
+                .decoder_threads
+                .saturating_mul(2)
+                .min(8)
+                .max(rapidgzip_config.decoder_threads),
+        ),
+    };
+    let use_indexed_reorder = copy_paths.has_file_paths()
+        && top_level_byte_scan_requested
+        && provider_refs_in_workers_requested
+        && rapidgzip_config.enabled
+        && is_gzip(path)?;
+    let provider_reference_preflight = compact_provider_reference_order(
+        path,
+        copy_paths.manifest_provider_npi_sidecar.is_some(),
+        use_indexed_reorder,
+        &rapidgzip_index_config,
+    )?;
     let provider_reference_order_label = provider_reference_preflight.order.label();
-    let provider_references_before_in_network = matches!(
+    let parallel_top_level_order_supported = matches!(
         &provider_reference_preflight.order,
         CompactProviderReferenceOrder::BeforeInNetwork
+            | CompactProviderReferenceOrder::AfterInNetworkIndexed(_)
     );
-    if copy_paths.has_file_paths() && provider_references_before_in_network {
+    if copy_paths.has_file_paths() && parallel_top_level_order_supported {
         if top_level_byte_scan_requested && provider_refs_in_workers_requested {
+            let indexed_reorder = match provider_reference_preflight.order {
+                CompactProviderReferenceOrder::BeforeInNetwork => None,
+                CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder) => {
+                    Some(indexed_reorder)
+                }
+                _ => unreachable!("parallel top-level order was checked above"),
+            };
             return scan_compact_byte_top_level_parallel(
                 path,
                 CompactContext {
@@ -7825,7 +8330,11 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                 rust_queue_size,
                 copy_paths,
                 compact_copy_rotate_bytes,
-                provider_reference_preflight.metrics,
+                CompactByteScanOptions {
+                    preflight_metrics: provider_reference_preflight.metrics,
+                    rapidgzip_config,
+                    indexed_reorder,
+                },
             );
         }
         let byte_scan_fallback_reason = if top_level_byte_scan_requested {
@@ -7862,11 +8371,19 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
             CompactProviderReferenceOrder::AfterInNetwork(_) => {
                 "provider_references_after_in_network"
             }
+            CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
+                "indexed_reorder_unavailable"
+            }
             CompactProviderReferenceOrder::BeforeInNetwork => "parallel_path_unavailable",
         }
     };
     let preflight_metrics = provider_reference_preflight.metrics;
     let provider_reference_order = provider_reference_preflight.order;
+    let compressed_bytes_read = Arc::new(AtomicU64::new(0));
+    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
+    let mut json_reader = JsonStreamReader::new(reader);
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
     let mut compact_copy_writer: Option<CompactCopySink> = match copy_paths.compact.as_ref() {
         Some(copy_path) => Some(CompactCopySink::new_file(
             copy_path.clone(),
@@ -7914,6 +8431,11 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         CompactProviderReferenceOrder::AfterInNetwork(provider_map) => provider_map,
         CompactProviderReferenceOrder::None | CompactProviderReferenceOrder::BeforeInNetwork => {
             HashMap::new()
+        }
+        CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
+            return Err(io::Error::other(
+                "indexed provider-reference reorder did not enter the parallel scanner",
+            ));
         }
     };
     let mut emitted_price_code_sets: HashSet<String> = HashSet::new();
@@ -13725,6 +14247,88 @@ mod tests {
     fn scanner_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct LateErrorReader {
+        bytes: Cursor<Vec<u8>>,
+        emitted_error: bool,
+    }
+
+    impl Read for LateErrorReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.bytes.read(buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            if !self.emitted_error {
+                self.emitted_error = true;
+                return Err(io::Error::other("late indexed range failure"));
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn reordered_top_level_reader_validates_exact_ranges_before_suffix() {
+        let mut reader =
+            ReorderedTopLevelReader::new(Box::new(Cursor::new(b"[][]".to_vec())), 2, 2);
+        let mut output = String::new();
+
+        reader.read_to_string(&mut output).unwrap();
+
+        assert_eq!(output, r#"{"provider_references":[],"in_network":[]}"#);
+    }
+
+    #[test]
+    fn reordered_top_level_reader_rejects_short_or_extra_ranges() {
+        let mut short_reader =
+            ReorderedTopLevelReader::new(Box::new(Cursor::new(b"[][".to_vec())), 2, 2);
+        let short_error = io::read_to_string(&mut short_reader).unwrap_err();
+        assert_eq!(short_error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut extra_reader =
+            ReorderedTopLevelReader::new(Box::new(Cursor::new(b"[][]x".to_vec())), 2, 2);
+        let extra_error = io::read_to_string(&mut extra_reader).unwrap_err();
+        assert_eq!(extra_error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reordered_top_level_reader_surfaces_late_range_failure() {
+        let mut reader = ReorderedTopLevelReader::new(
+            Box::new(LateErrorReader {
+                bytes: Cursor::new(b"[][]".to_vec()),
+                emitted_error: false,
+            }),
+            2,
+            2,
+        );
+
+        let error = io::read_to_string(&mut reader).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("late indexed range failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_rapidgzip_index_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let index = TemporaryRapidgzipIndex::new().unwrap();
+        let directory_mode = index
+            ._directory
+            .path()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+
+        File::create(&index.path).unwrap();
+        index.harden_file_permissions().unwrap();
+        let index_mode = index.path.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(index_mode, 0o600);
     }
 
     #[test]

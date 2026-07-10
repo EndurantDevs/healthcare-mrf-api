@@ -87,6 +87,14 @@ struct RapidgzipReader {
     state: ReaderState,
 }
 
+#[derive(Default)]
+struct RapidgzipReadOptions<'a> {
+    export_index: Option<&'a Path>,
+    import_index: Option<&'a Path>,
+    index_format: Option<&'a str>,
+    ranges: Option<&'a str>,
+}
+
 impl RapidgzipReader {
     fn error(&mut self, error: io::Error) -> io::Error {
         let kind = error.kind();
@@ -197,14 +205,31 @@ fn stop_spawned_child(mut child: Child) {
     let _ = child.wait();
 }
 
-fn spawn_rapidgzip(path: &Path, config: &RapidgzipConfig) -> io::Result<Child> {
+fn spawn_rapidgzip(
+    path: &Path,
+    config: &RapidgzipConfig,
+    options: RapidgzipReadOptions<'_>,
+) -> io::Result<Child> {
     let mut command = Command::new(&config.executable);
     command
         .arg("-d")
         .arg("-c")
         .arg("-P")
         .arg(config.decoder_threads.to_string())
-        .arg("--verify")
+        .arg("--verify");
+    if let Some(index_path) = options.export_index {
+        command.arg("--export-index").arg(index_path);
+    }
+    if let Some(index_format) = options.index_format {
+        command.arg("--index-format").arg(index_format);
+    }
+    if let Some(index_path) = options.import_index {
+        command.arg("--import-index").arg(index_path);
+    }
+    if let Some(ranges) = options.ranges {
+        command.arg("--ranges").arg(ranges);
+    }
+    command
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -237,6 +262,7 @@ fn open_rapidgzip_reader(
     path: &Path,
     compressed_bytes_read: Arc<AtomicU64>,
     config: &RapidgzipConfig,
+    options: RapidgzipReadOptions<'_>,
 ) -> io::Result<Box<dyn Read>> {
     if config.decoder_threads == 0 {
         return Err(io::Error::new(
@@ -246,7 +272,7 @@ fn open_rapidgzip_reader(
     }
 
     let compressed_total = path.metadata()?.len();
-    let mut child = spawn_rapidgzip(path, config)?;
+    let mut child = spawn_rapidgzip(path, config, options)?;
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -297,7 +323,61 @@ pub fn open_full_scan_reader(
     if !rapidgzip.enabled || !is_gzip(path)? {
         return open_reader(path, compressed_bytes_read);
     }
-    open_rapidgzip_reader(path, compressed_bytes_read, rapidgzip)
+    open_rapidgzip_reader(
+        path,
+        compressed_bytes_read,
+        rapidgzip,
+        RapidgzipReadOptions::default(),
+    )
+}
+
+pub fn open_full_scan_reader_exporting_index(
+    path: &Path,
+    compressed_bytes_read: Arc<AtomicU64>,
+    rapidgzip: &RapidgzipConfig,
+    index_path: &Path,
+) -> io::Result<Box<dyn Read>> {
+    if !rapidgzip.enabled || !is_gzip(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "indexed scans require rapidgzip and gzip input",
+        ));
+    }
+    open_rapidgzip_reader(
+        path,
+        compressed_bytes_read,
+        rapidgzip,
+        RapidgzipReadOptions {
+            export_index: Some(index_path),
+            index_format: Some("gztool"),
+            ..RapidgzipReadOptions::default()
+        },
+    )
+}
+
+pub fn open_indexed_ranges_reader(
+    path: &Path,
+    compressed_bytes_read: Arc<AtomicU64>,
+    rapidgzip: &RapidgzipConfig,
+    index_path: &Path,
+    ranges: &str,
+) -> io::Result<Box<dyn Read>> {
+    if !rapidgzip.enabled || !is_gzip(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "indexed range scans require rapidgzip and gzip input",
+        ));
+    }
+    open_rapidgzip_reader(
+        path,
+        compressed_bytes_read,
+        rapidgzip,
+        RapidgzipReadOptions {
+            import_index: Some(index_path),
+            ranges: Some(ranges),
+            ..RapidgzipReadOptions::default()
+        },
+    )
 }
 
 pub fn open_full_scan_json_reader(

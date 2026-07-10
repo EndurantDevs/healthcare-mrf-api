@@ -12,7 +12,10 @@ use std::sync::{
 
 mod rapidgzip;
 
-pub use rapidgzip::{open_full_scan_json_reader, open_full_scan_reader, RapidgzipConfig};
+pub use rapidgzip::{
+    open_full_scan_json_reader, open_full_scan_reader, open_full_scan_reader_exporting_index,
+    open_indexed_ranges_reader, RapidgzipConfig,
+};
 
 struct CountingReader<R: Read> {
     inner: R,
@@ -139,7 +142,7 @@ impl<R: Read> Read for LossyUtf8Reader<R> {
     }
 }
 
-pub(super) fn is_gzip(path: &Path) -> io::Result<bool> {
+pub fn is_gzip(path: &Path) -> io::Result<bool> {
     if path
         .extension()
         .and_then(|value| value.to_str())

@@ -1,5 +1,8 @@
 use flate2::{write::GzEncoder, Compression};
-use ptg2_scanner::input::{open_full_scan_reader, RapidgzipConfig};
+use ptg2_scanner::input::{
+    open_full_scan_reader, open_full_scan_reader_exporting_index, open_indexed_ranges_reader,
+    RapidgzipConfig,
+};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -246,6 +249,87 @@ fn full_scan_reader_constructs_expected_rapidgzip_arguments() {
             input_path.to_str().expect("utf8 test input path"),
         ]
     );
+    std::fs::remove_file(input_path).ok();
+    std::fs::remove_file(executable_path).ok();
+    std::fs::remove_file(arguments_path).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_readers_construct_expected_rapidgzip_arguments() {
+    let input_path = temp_path("indexed-args.json.gz");
+    let executable_path = temp_path("indexed-args.sh");
+    let arguments_path = temp_path("indexed-args.txt");
+    let index_path = temp_path("indexed-args.index");
+    write_gzip(&input_path, b"unused");
+    write_executable(
+        &executable_path,
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  printf '%s\\n' \"$argument\"\ndone > {}\nprintf indexed-ok\n",
+            shell_quote(&arguments_path)
+        ),
+    );
+
+    let config = enabled_rapidgzip(&executable_path, 5);
+    let mut export_reader = open_full_scan_reader_exporting_index(
+        &input_path,
+        Arc::new(AtomicU64::new(0)),
+        &config,
+        &index_path,
+    )
+    .expect("open index-export reader");
+    let mut output = String::new();
+    export_reader
+        .read_to_string(&mut output)
+        .expect("read index-export output");
+    assert_eq!(output, "indexed-ok");
+    let arguments = std::fs::read_to_string(&arguments_path).expect("read export arguments");
+    assert_eq!(
+        arguments.lines().collect::<Vec<_>>(),
+        vec![
+            "-d",
+            "-c",
+            "-P",
+            "5",
+            "--verify",
+            "--export-index",
+            index_path.to_str().expect("utf8 index path"),
+            "--index-format",
+            "gztool",
+            input_path.to_str().expect("utf8 input path"),
+        ]
+    );
+
+    output.clear();
+    let mut range_reader = open_indexed_ranges_reader(
+        &input_path,
+        Arc::new(AtomicU64::new(0)),
+        &config,
+        &index_path,
+        "12@34,56@78",
+    )
+    .expect("open indexed-range reader");
+    range_reader
+        .read_to_string(&mut output)
+        .expect("read indexed-range output");
+    assert_eq!(output, "indexed-ok");
+    let arguments = std::fs::read_to_string(&arguments_path).expect("read range arguments");
+    assert_eq!(
+        arguments.lines().collect::<Vec<_>>(),
+        vec![
+            "-d",
+            "-c",
+            "-P",
+            "5",
+            "--verify",
+            "--import-index",
+            index_path.to_str().expect("utf8 index path"),
+            "--ranges",
+            "12@34,56@78",
+            input_path.to_str().expect("utf8 input path"),
+        ]
+    );
+
     std::fs::remove_file(input_path).ok();
     std::fs::remove_file(executable_path).ok();
     std::fs::remove_file(arguments_path).ok();

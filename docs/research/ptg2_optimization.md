@@ -223,7 +223,7 @@ The v3 reader and Rust streaming writer now implement this shape. Price-set
 keys remain 32-bit, atom widths are selected from complete snapshot
 cardinality, provider/code pairs use bounded spill runs plus a streaming k-way
 merge, and missing referenced blocks fail closed. This remains a real-source
-design budget until the HealthJoy pilot proves its final PostgreSQL footprint;
+design budget until a dense production pilot proves its final PostgreSQL footprint;
 synthetic scaling is evidence for the encoding, not proof of the 2-3 GiB
 headline.
 
@@ -252,12 +252,19 @@ cold report is:
 /tmp/ptg2-v3-cold-4m-report/run-20260710T195429Z/report.json
 ```
 
-The exact 14,822,435,906-byte HealthJoy gzip expands to 293,363,494,314 bytes.
+One production-scale sample was roughly 14.8 GB compressed and 293 GB expanded.
 On the dev PTGHuge lane, verified decode-to-stdout took 124 seconds with four
 rapidgzip threads and 111 seconds with eight, versus the 523-second GNU gzip
 floor. Four threads are the initial integrated-scanner choice because parsing
 workers need the remaining CPU; the full scanner and publish phases still need
 the real import measurement.
+
+A synthetic reversed-order fixture with 960,000 negotiated rates and about
+179 MB of expanded JSON took 48.845 seconds through the checked serial fallback
+and 7.332 seconds through the indexed 16-worker path, a 6.66x wall-time
+improvement. Both produced the same 168 unique COPY rows and SHA-256 after
+deduplication. The temporary `gztool` index was 102,915 bytes; the default
+`indexed_gzip` format was about 46x larger on the same input.
 
 Before promotion, deploy readers first, preserve side-by-side immutable
 snapshots, compare logical tuple checksums against v2, verify forward, reverse,
