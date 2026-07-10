@@ -6424,9 +6424,18 @@ def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
     assert "provider_set_global_id_128,\n                        price_set_global_id_128" not in joined
     assert 'FROM "mrf"."ptg2_manifest_stage_code_count_abc"' in joined
     assert 'FROM "mrf"."ptg2_manifest_stage_provider_set_dictionary_abc"' in joined
+    assert 'CREATE TABLE "mrf"."ptg2_code_count_' in joined
+    assert 'CREATE TABLE "mrf"."ptg2_provider_set_dict_' in joined
+    assert 'CREATE UNLOGGED TABLE "mrf"."ptg2_code_count_' not in joined
+    assert 'CREATE UNLOGGED TABLE "mrf"."ptg2_provider_set_dict_' not in joined
+    assert 'DROP TABLE IF EXISTS "mrf"."ptg2_manifest_stage_code_count_abc"' in joined
     assert "COUNT(*)::bigint AS rate_count" not in joined
     assert "SELECT DISTINCT provider_set_global_id_128\n            FROM \"mrf\".\"ptg2_manifest_stage_serving_abc\"" not in joined
     assert any('DROP TABLE "mrf"."ptg2_manifest_stage_serving_abc"' in statement for statement in status_calls)
+    assert 'ALTER TABLE "mrf"."ptg2_serving_binary_' in joined
+    assert "SET LOGGED" in joined
+    assert "PTG2 materialized table is missing" in joined
+    assert "PTG2 materialized table is not logged" in joined
     assert publish_manifest["serving_row_strategy"] == "postgres_binary"
     assert publish_manifest["serving_table_retained"] is False
     assert publish_manifest["dedupe"]["serving"] == {"skipped": "scanner_dedupe_guarded_postgres_binary"}
@@ -6603,8 +6612,8 @@ def test_ptg2_manifest_snapshot_publish_lean_uses_price_atom_dictionary(monkeypa
     assert publish_manifest["serving_table_layout"] == "lean_provider_key_v1"
     assert publish_manifest["price_atom_table_layout"] == "lean_dict_v1"
     assert publish_manifest["price_atom_dictionary_table"].startswith("mrf.ptg2_price_atom_dict_")
-    assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_price_atom_dict_" in joined
-    assert "CREATE UNLOGGED TABLE \"mrf\".\"ptg2_price_atom_" in joined
+    assert 'CREATE TABLE "mrf"."ptg2_price_atom_dict_' in joined
+    assert 'CREATE TABLE "mrf"."ptg2_price_atom_' in joined
     assert "price_atom.price_atom_global_id_128::uuid AS price_atom_global_id_128" in joined
     assert "negotiated_type.attr_key::integer AS negotiated_type_key" in joined
     assert "service_code.attr_key::integer AS service_code_key" in joined
@@ -7221,7 +7230,8 @@ def test_ptg2_manifest_v2_stage_creates_npi_scope(monkeypatch):
     asyncio.run(process_ptg._create_ptg2_manifest_serving_stage_table("abc"))
 
     joined = "\n".join(status_calls)
-    assert 'CREATE UNLOGGED TABLE "mrf"."ptg2_manifest_stage_provider_npi_scope_abc"' in joined
+    assert 'CREATE TABLE "mrf"."ptg2_manifest_stage_provider_npi_scope_abc"' in joined
+    assert 'CREATE UNLOGGED TABLE "mrf"."ptg2_manifest_stage_provider_npi_scope_abc"' not in joined
 
 
 def test_ptg2_manifest_stage_uses_direct_lean_source_columns(monkeypatch):

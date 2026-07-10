@@ -541,11 +541,10 @@ async def _create_ptg2_manifest_provider_group_member_stage_table(serving_stage_
 async def _create_provider_npi_scope_stage(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_npi_scope")
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
             npi bigint NOT NULL
         );
         """
@@ -585,6 +584,44 @@ async def _create_ptg2_manifest_provider_set_dictionary_stage_table(serving_stag
         """
     )
     return stage_table
+
+
+async def _ensure_materialized_tables_logged(materialized_tables: Mapping[str, str]) -> None:
+    """Make every retained snapshot relation durable before publishing its manifest."""
+    for qualified_table_name in dict.fromkeys(materialized_tables.values()):
+        schema_name, separator, table_name = str(qualified_table_name).partition(".")
+        if not separator or not schema_name or not table_name:
+            raise RuntimeError(f"Invalid PTG2 materialized table name: {qualified_table_name!r}")
+        await db.status(
+            f"""
+            DO $ptg2_logged$
+            DECLARE
+                relation_persistence "char";
+            BEGIN
+                SELECT relation.relpersistence
+                  INTO relation_persistence
+                  FROM pg_class relation
+                  JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                 WHERE namespace.nspname = {_quote_sql_literal(schema_name)}
+                   AND relation.relname = {_quote_sql_literal(table_name)};
+                IF relation_persistence IS NULL THEN
+                    RAISE EXCEPTION 'PTG2 materialized table is missing: %',
+                        {_quote_sql_literal(qualified_table_name)};
+                ELSIF relation_persistence = 'u' THEN
+                    ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(table_name)} SET LOGGED;
+                    SELECT relation.relpersistence
+                      INTO relation_persistence
+                      FROM pg_class relation
+                     WHERE relation.oid = {_quote_sql_literal(qualified_table_name)}::regclass;
+                END IF;
+                IF relation_persistence <> 'p' THEN
+                    RAISE EXCEPTION 'PTG2 materialized table is not logged: % (persistence=%)',
+                        {_quote_sql_literal(qualified_table_name)}, relation_persistence;
+                END IF;
+            END
+            $ptg2_logged$;
+            """
+        )
 
 
 async def _copy_ptg2_manifest_serving_file(copy_path: Path, *, target_table: str) -> None:
@@ -1355,6 +1392,10 @@ def _qualified_table(schema_name: str, table_name: str) -> str:
     return f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
 
 
+def _quote_sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 async def _create_provider_group_location_table(
     *,
     schema_name: str,
@@ -1760,7 +1801,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     if not await _table_exists(schema_name, price_atom_table):
         return None
 
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    temporary_storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     lean_table = _ptg2_snapshot_index_name(price_atom_table, "lean")
     keyed_dictionary_table = _ptg2_snapshot_index_name(price_atom_dictionary_table, "lookup")
@@ -1771,7 +1812,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} CASCADE;")
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dictionary_table)} AS
         WITH dictionary_source AS (
             SELECT 'negotiated_type'::varchar(64) AS attr_kind,
                    negotiated_type::text AS text_value,
@@ -1816,7 +1857,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
     )
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} AS
+        CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(keyed_dictionary_table)} AS
         SELECT
             attr_kind,
             attr_key,
@@ -1921,7 +1962,7 @@ async def _rewrite_ptg2_manifest_price_atom_table_lean_dict(
         )
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
             {", ".join(select_columns)}
         FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} price_atom
@@ -2076,7 +2117,7 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
         )
         return None
 
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    temporary_storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     lean_table = _ptg2_snapshot_index_name(final_table, "lean")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} CASCADE;")
@@ -2086,7 +2127,7 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(lean_table)} CASCADE;")
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(code_count_table)} AS
         SELECT
             row_number() OVER (ORDER BY plan_id, reported_code_system, reported_code)::integer AS code_key,
             plan_id,
@@ -2099,7 +2140,7 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     )
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} AS
+        CREATE TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_set_dictionary_table)} AS
         SELECT
             row_number() OVER (ORDER BY provider_set_global_id_128)::integer AS provider_set_key,
             provider_set_global_id_128
@@ -2111,7 +2152,7 @@ async def _rewrite_ptg2_manifest_serving_table_lean_provider_key(
     )
     await db.status(
         f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
+        CREATE {temporary_storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(lean_table)} AS
         SELECT
             code_count.code_key,
             provider_set_dictionary.provider_set_key,
@@ -2402,7 +2443,7 @@ async def _rewrite_direct_lean_manifest_stage(
     materialize_serving_table: bool = True,
 ) -> dict[str, Any]:
     """Rewrite the narrow direct-copy stage into lean provider-key serving tables."""
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    temporary_storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     lean_table = _ptg2_snapshot_index_name(final_table, "lean")
     if _ptg2_manifest_lean_rewrite_parallel_dictionaries():
         await asyncio.gather(
@@ -2410,14 +2451,14 @@ async def _rewrite_direct_lean_manifest_stage(
                 schema_name=schema_name,
                 final_table=final_table,
                 code_count_table=code_count_table,
-                storage_mode=storage_mode,
+                storage_mode="",
                 code_count_stage_table=code_count_stage_table,
             ),
             _build_direct_lean_provider_sets(
                 schema_name=schema_name,
                 final_table=final_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
-                storage_mode=storage_mode,
+                storage_mode="",
                 provider_set_dictionary_stage_table=provider_set_dictionary_stage_table,
             ),
         )
@@ -2426,14 +2467,14 @@ async def _rewrite_direct_lean_manifest_stage(
             schema_name=schema_name,
             final_table=final_table,
             code_count_table=code_count_table,
-            storage_mode=storage_mode,
+            storage_mode="",
             code_count_stage_table=code_count_stage_table,
         )
         await _build_direct_lean_provider_sets(
             schema_name=schema_name,
             final_table=final_table,
             provider_set_dictionary_table=provider_set_dictionary_table,
-            storage_mode=storage_mode,
+            storage_mode="",
             provider_set_dictionary_stage_table=provider_set_dictionary_stage_table,
         )
     if materialize_serving_table:
@@ -2443,7 +2484,7 @@ async def _rewrite_direct_lean_manifest_stage(
             lean_table=lean_table,
             code_count_table=code_count_table,
             provider_set_dictionary_table=provider_set_dictionary_table,
-            storage_mode=storage_mode,
+            storage_mode=temporary_storage_mode,
         )
     await _index_direct_lean_tables(
         schema_name=schema_name,
@@ -2722,6 +2763,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 final_table=serving_work_table,
                 code_count_table=code_count_table,
                 provider_set_dictionary_table=provider_set_dictionary_table,
+            )
+        if use_lean_source_stage:
+            await db.status(
+                f"DROP TABLE IF EXISTS "
+                f"{_qualified_table(schema_name, code_count_stage)}, "
+                f"{_qualified_table(schema_name, provider_set_dictionary_stage)} CASCADE;"
             )
         mark_stage("lean_serving_rewrite", stage_started_at)
     if lean_serving_manifest is None:
@@ -3068,6 +3115,10 @@ async def _publish_ptg2_manifest_serving_snapshot(
         materialized_table_map["provider_group_rate_scope"] = (
             f"{schema_name}.{materialized_provider_group_rate_scope_table}"
         )
+    if _is_postgres_binary_snapshot_arch(arch_version):
+        stage_started_at = time.monotonic()
+        await _ensure_materialized_tables_logged(materialized_table_map)
+        mark_stage("ensure_materialized_tables_logged", stage_started_at)
     if materialized_provider_group_rate_scope_table:
         provider_scope_strategy = PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE
     elif materialized_provider_set_component_table:
