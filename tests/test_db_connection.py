@@ -75,6 +75,7 @@ class _FakeSession:
         self.committed = False
         self.rolled_back = False
         self.closed = False
+        self.nested_transactions = 0
 
     async def execute(self, stmt, params=None):
         self.executed.append((stmt, params))
@@ -97,8 +98,22 @@ class _FakeSession:
         self._in_tx = True
         try:
             yield self
+        except Exception:
+            self.rolled_back = True
+            raise
+        else:
+            self.committed = True
         finally:
             self._in_tx = False
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        self.nested_transactions += 1
+        try:
+            yield self
+        except Exception:
+            self.rolled_back = True
+            raise
 
 
 @pytest.mark.asyncio
@@ -134,6 +149,158 @@ async def test_transaction_context(monkeypatch):
         assert tx_session is session
 
     assert not session._in_tx
+
+
+@pytest.mark.asyncio
+async def test_transaction_helpers_reuse_one_bound_session():
+    db = Database()
+    sessions = []
+
+    def session_factory():
+        session = _FakeSession()
+        sessions.append(session)
+        return session
+
+    db.session_factory = session_factory
+
+    async with db.transaction() as transaction_session:
+        assert await db.status("UPDATE test_table SET value = 1") == 1
+        assert await db.scalar("SELECT 42") == 42
+        assert await db.all("SELECT 42") == [42]
+        assert await db.select(1).scalar() == 42
+
+    assert sessions == [transaction_session]
+    assert len(transaction_session.executed) == 4
+    assert transaction_session.committed
+    assert transaction_session.closed
+
+
+@pytest.mark.asyncio
+async def test_helpers_keep_independent_sessions_outside_transaction():
+    db = Database()
+    sessions = []
+
+    def session_factory():
+        session = _FakeSession()
+        sessions.append(session)
+        return session
+
+    db.session_factory = session_factory
+
+    await db.status("UPDATE test_table SET value = 1")
+    await db.scalar("SELECT 42")
+    await db.all("SELECT 42")
+
+    assert len(sessions) == 3
+    assert all(session.closed for session in sessions)
+
+
+@pytest.mark.asyncio
+async def test_nested_transaction_uses_savepoint_on_bound_session():
+    db = Database()
+    sessions = []
+
+    def session_factory():
+        session = _FakeSession()
+        sessions.append(session)
+        return session
+
+    db.session_factory = session_factory
+
+    async with db.transaction() as outer_session:
+        async with db.transaction() as nested_session:
+            assert nested_session is outer_session
+            assert await db.scalar("SELECT 42") == 42
+
+    assert sessions == [outer_session]
+    assert outer_session.nested_transactions == 1
+
+
+@pytest.mark.asyncio
+async def test_nested_database_transactions_keep_each_binding():
+    first_db = Database()
+    second_db = Database()
+    first_session = _FakeSession()
+    second_session = _FakeSession()
+    first_db.session_factory = lambda: first_session
+    second_db.session_factory = lambda: second_session
+
+    async with first_db.transaction():
+        async with second_db.transaction():
+            await first_db.scalar("SELECT 1")
+            await second_db.scalar("SELECT 2")
+
+    assert len(first_session.executed) == 1
+    assert len(second_session.executed) == 1
+
+
+@pytest.mark.asyncio
+async def test_transaction_session_is_not_shared_with_child_task():
+    db = Database()
+    session = _FakeSession()
+    db.session_factory = lambda: session
+
+    async with db.transaction():
+        child_call = asyncio.create_task(db.scalar("SELECT 42"))
+        with pytest.raises(RuntimeError, match="child asyncio task"):
+            await child_call
+        assert await db.scalar("SELECT 42") == 42
+
+
+@pytest.mark.asyncio
+async def test_parallel_top_level_transactions_use_distinct_sessions():
+    db = Database()
+    sessions = []
+
+    def session_factory():
+        session = _FakeSession()
+        sessions.append(session)
+        return session
+
+    db.session_factory = session_factory
+
+    async def run_transaction():
+        async with db.transaction() as session:
+            await asyncio.sleep(0)
+            await db.scalar("SELECT 42")
+            return session
+
+    first_session, second_session = await asyncio.gather(
+        run_transaction(),
+        run_transaction(),
+    )
+
+    assert first_session is not second_session
+    assert sessions == [first_session, second_session]
+
+
+@pytest.mark.asyncio
+async def test_transaction_helpers_share_real_postgres_transaction():
+    if "test" not in os.getenv("HLTHPRT_DB_DATABASE", "").lower():
+        pytest.skip("real transaction test requires a disposable test database")
+
+    database = Database()
+    marker = "healthporta-db-transaction-test"
+    await database.connect()
+    try:
+        async with database.transaction():
+            await database.status(
+                "SELECT set_config('application_name', :marker, true);",
+                marker=marker,
+            )
+            backend_pid = await database.scalar("SELECT pg_backend_pid();")
+            rows = await database.all(
+                "SELECT pg_backend_pid(), current_setting('application_name');"
+            )
+
+            assert rows[0][0] == backend_pid
+            assert rows[0][1] == marker
+
+        assert await database.scalar(
+            "SELECT current_setting('application_name');"
+        ) != marker
+    finally:
+        await database.disconnect()
 
 
 @pytest.mark.asyncio

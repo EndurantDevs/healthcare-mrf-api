@@ -2695,8 +2695,9 @@ async def test_provider_directory_shutdown_rejects_support_patch_publish(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monkeypatch):
+async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeypatch):
     statements = []
+    publish_mock = AsyncMock()
 
     class FakeDB:
         async def scalar(self, statement):
@@ -2708,18 +2709,13 @@ async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monke
             statements.append(statement)
             return "OK"
 
-        @asynccontextmanager
-        async def transaction(self):
-            statements.append("BEGIN")
-            yield
-            statements.append("COMMIT")
-
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "none")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(entity_address_unified, "_support_stage_classes", lambda _import_date: {})
     monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_publish_staged_entity_address_tables", publish_mock)
 
     shutdown_payload_map = {
         "import_date": "20260614",
@@ -2745,14 +2741,10 @@ async def test_provider_directory_partial_shutdown_publishes_by_table_swap(monke
 
     joined = "\n".join(statements)
     assert "DELETE FROM" not in joined
-    assert "BEGIN" in statements
-    assert "COMMIT" in statements
-    assert "DROP TABLE IF EXISTS mrf.entity_address_unified_old;" in statements
-    assert "ALTER TABLE IF EXISTS mrf.entity_address_unified RENAME TO entity_address_unified_old;" in statements
-    assert (
-        "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 "
-        "RENAME TO entity_address_unified;"
-    ) in statements
+    publish_mock.assert_awaited_once()
+    assert publish_mock.await_args.args[0] == "mrf"
+    assert publish_mock.await_args.args[1].__tablename__ == "entity_address_unified_20260614"
+    assert publish_mock.await_args.kwargs["partial_support_patch"] is False
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):

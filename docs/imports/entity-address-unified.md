@@ -68,6 +68,21 @@ python main.py worker process.EntityAddressUnified --burst
 Test mode is stage-only by default and does not replace the live serving tables
 unless `--publish` or import-control `publish=true` is supplied.
 
+## Publication Safety
+
+Stage materialization and index construction happen before the serving cutover.
+If the main stage was built as `UNLOGGED`, the importer converts it to a
+permanent `LOGGED` table and verifies `pg_class.relpersistence = 'p'` before
+publication. The live/stage rotations then run in one database transaction, so
+readers observe either the previous or replacement relation name and never a
+committed missing-table interval.
+
+The cutover uses a transaction-scoped publisher advisory lock and deterministic
+`ACCESS EXCLUSIVE ... NOWAIT` table locks. Lock contention rolls back without
+renaming anything and retries with short bounded backoff. The local
+`lock_timeout` is a final guard for DDL locks after the fail-fast relation-lock
+step; it is intentionally separate from the bulk-import lock timeout.
+
 ## Key Environment Variables
 
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BATCH_SIZE`
@@ -135,7 +150,7 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES` (default `true`; set `false` for serving-focused rebuilds that do not need facility-anchor candidate refresh)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY` (default `false`; for full refreshes, publish only the denormalized serving table and leave existing support/provenance tables unchanged)
 - `serving_only_refresh` import-control param / `--serving-only-refresh` CLI option (task-level override for `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY`; used by the daily Provider Directory serving projection)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE` (default `false`; dev-speed option for full rebuilds that builds the main stage table without WAL, trading crash durability for faster refreshes)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE` (default `false`; dev-speed option that builds the main stage without WAL; every published stage is converted to `LOGGED` before cutover)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS` (default `true`; set `false` for compacted serving refreshes to skip the expensive `source_record_ids` aggregation when final rows intentionally keep this array empty)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS` (default `true`; set `false` for full serving refreshes to use the exact aggregate INSERT rowcount for staged rows and skip the final detailed count scan)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE` (default `false`; experiment/retry aid that leaves the raw stage table in place for reuse; do not enable for normal scheduled refreshes)
@@ -145,6 +160,10 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAINTENANCE_WORK_MEM`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEMP_FILE_LIMIT` (best effort; skipped automatically when the database role cannot set it)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LOCK_TIMEOUT`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT` (default `50ms`; transaction-local fallback timeout after `NOWAIT` lock acquisition)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_ATTEMPTS` (default `4`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS` (default `25`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS` (default `100`)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STATEMENT_TIMEOUT`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SYNCHRONOUS_COMMIT`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT`

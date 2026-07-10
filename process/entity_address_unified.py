@@ -81,6 +81,10 @@ DEFAULT_SQL_LOCK_TIMEOUT = "30s"
 DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
+DEFAULT_CUTOVER_LOCK_TIMEOUT = "50ms"
+DEFAULT_CUTOVER_RETRY_ATTEMPTS = 4
+DEFAULT_CUTOVER_RETRY_BACKOFF_MS = 25
+DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS = 100
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
 DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 100
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
@@ -155,6 +159,16 @@ class _SupportStageStatement:
     label: str
     statement: str
     parallel: bool = True
+
+
+@dataclass(frozen=True)
+class _StageTableSwap:
+    live_cls: object
+    stage_cls: object
+
+
+class _CutoverLockUnavailable(RuntimeError):
+    pass
 
 
 def _normalize_import_id(raw: str | None) -> str:
@@ -524,6 +538,8 @@ def _runtime_config_metrics(context: dict) -> dict:
         "final_summary_counts": bool(context.get("final_summary_counts", DEFAULT_FINAL_SUMMARY_COUNTS)),
         "raw_stage_kept": bool(context.get("raw_stage_kept")),
         "unlogged_stage": bool(context.get("unlogged_stage")),
+        "stage_persistence": context.get("stage_persistence"),
+        "cutover_attempts": _int_context_metric(context, "cutover_attempts"),
         "published_elapsed_seconds": (
             round(float(context.get("published_elapsed_seconds")), 3)
             if context.get("published_elapsed_seconds") is not None
@@ -716,6 +732,10 @@ def _disable_autovacuum_sql(db_schema: str, table_name: str) -> str:
 
 def _set_unlogged_table_sql(db_schema: str, table_name: str) -> str:
     return f"ALTER TABLE {db_schema}.{table_name} SET UNLOGGED;"
+
+
+def _set_logged_table_sql(db_schema: str, table_name: str) -> str:
+    return f"ALTER TABLE {db_schema}.{table_name} SET LOGGED;"
 
 
 def _is_support_code_location_index(stage_cls, index: dict) -> bool:
@@ -1559,7 +1579,7 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
     table = live_cls.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-    await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
+    await db.status(f"ALTER TABLE {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
     archived = _archived_identifier(f"{table}_idx_primary")
     await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
@@ -1579,6 +1599,258 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
             f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
         )
+
+
+async def _stage_table_persistence(db_schema: str, table_name: str) -> str | None:
+    value = await db.scalar(
+        """
+        SELECT c.relpersistence::text
+          FROM pg_class AS c
+          JOIN pg_namespace AS n ON n.oid = c.relnamespace
+         WHERE n.nspname = :db_schema
+           AND c.relname = :table_name
+           AND c.relkind IN ('r', 'p');
+        """,
+        db_schema=db_schema,
+        table_name=table_name,
+    )
+    return str(value) if value is not None else None
+
+
+async def _ensure_promoted_stage_logged(db_schema: str, table_name: str) -> None:
+    persistence = await _stage_table_persistence(db_schema, table_name)
+    if persistence is None:
+        raise RuntimeError(f"Entity-address cutover stage {db_schema}.{table_name} does not exist")
+    if persistence != "p":
+        logger.info("Converting entity-address stage %s.%s to LOGGED before cutover", db_schema, table_name)
+        await db.status(_set_logged_table_sql(db_schema, table_name))
+        persistence = await _stage_table_persistence(db_schema, table_name)
+    if persistence != "p":
+        raise RuntimeError(
+            f"Entity-address cutover stage {db_schema}.{table_name} is not permanent: "
+            f"relpersistence={persistence!r}"
+        )
+
+
+def _cutover_relation_sets(
+    swaps: list[_StageTableSwap],
+    support_stage_classes: dict[type, type],
+    *,
+    partial_support_patch: bool,
+    affected_group_table: str,
+) -> tuple[list[str], list[str]]:
+    relation_names: set[str] = set()
+    required_names: set[str] = set()
+    for swap in swaps:
+        live_table = swap.live_cls.__main_table__
+        stage_table = swap.stage_cls.__tablename__
+        relation_names.update((live_table, f"{live_table}_old", stage_table))
+        required_names.add(stage_table)
+    if partial_support_patch:
+        for live_cls, stage_cls in support_stage_classes.items():
+            relation_names.update((live_cls.__main_table__, stage_cls.__tablename__))
+            required_names.add(stage_cls.__tablename__)
+        if affected_group_table:
+            relation_names.add(affected_group_table)
+            required_names.add(affected_group_table)
+    return sorted(relation_names), sorted(required_names)
+
+
+async def _existing_cutover_relations(db_schema: str, relation_names: list[str]) -> list[str]:
+    rows = await db.all(
+        """
+        SELECT c.relname
+          FROM pg_class AS c
+          JOIN pg_namespace AS n ON n.oid = c.relnamespace
+         WHERE n.nspname = :db_schema
+           AND c.relkind IN ('r', 'p')
+           AND c.relname = ANY(CAST(:relation_names AS text[]))
+         ORDER BY c.relname;
+        """,
+        db_schema=db_schema,
+        relation_names=relation_names,
+    )
+    return [str(row[0]) for row in rows]
+
+
+async def _acquire_cutover_locks(
+    db_schema: str,
+    relation_names: list[str],
+    required_names: list[str],
+) -> None:
+    publisher_lock = await db.scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_name, 0));",
+        lock_name=f"entity-address-unified:{db_schema}",
+    )
+    if not publisher_lock:
+        raise _CutoverLockUnavailable("another entity-address publisher owns the cutover lock")
+
+    existing_names = await _existing_cutover_relations(db_schema, relation_names)
+    missing_names = sorted(set(required_names) - set(existing_names))
+    if missing_names:
+        raise RuntimeError(
+            "Entity-address cutover is missing required staged relations: "
+            + ", ".join(missing_names)
+        )
+    if not existing_names:
+        raise RuntimeError("Entity-address cutover found no relations to lock")
+
+    schema = _validate_schema_name(db_schema)
+    qualified_names = [f"{schema}.{_validate_schema_name(name)}" for name in existing_names]
+    await db.status(
+        f"LOCK TABLE {', '.join(qualified_names)} IN ACCESS EXCLUSIVE MODE NOWAIT;"
+    )
+
+
+def _postgres_sqlstate(error: BaseException) -> str | None:
+    original = getattr(error, "orig", None)
+    candidates = (
+        error,
+        original,
+        getattr(error, "__cause__", None),
+        getattr(original, "__cause__", None),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if sqlstate:
+            return str(sqlstate)
+    return None
+
+
+def _is_retryable_cutover_lock_error(error: BaseException) -> bool:
+    return isinstance(error, _CutoverLockUnavailable) or _postgres_sqlstate(error) == "55P03"
+
+
+async def _run_entity_address_cutover(
+    db_schema: str,
+    swaps: list[_StageTableSwap],
+    patch_statements: list[tuple[str, str]],
+    relation_names: list[str],
+    required_names: list[str],
+    context: dict,
+) -> None:
+    lock_timeout = (
+        _env_sql_setting(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT",
+            DEFAULT_CUTOVER_LOCK_TIMEOUT,
+        )
+        or DEFAULT_CUTOVER_LOCK_TIMEOUT
+    )
+    async with db.transaction():
+        await db.status(f"SET LOCAL lock_timeout = {_sql_literal(lock_timeout)};")
+        await _acquire_cutover_locks(db_schema, relation_names, required_names)
+        for swap in swaps:
+            await _swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
+        for label, statement in patch_statements:
+            started = time.monotonic()
+            rowcount = await db.status(statement)
+            _record_phase_timing(
+                context,
+                f"entity-address-unified patching support {label}",
+                time.monotonic() - started,
+                _coerce_rowcount(rowcount),
+            )
+
+
+def _entity_address_cutover_plan(
+    db_schema: str,
+    stage_cls,
+    support_stage_classes: dict[type, type],
+    *,
+    partial_support_patch: bool,
+    affected_group_table: str,
+    context: dict,
+) -> tuple[list[_StageTableSwap], list[tuple[str, str]], list[str], list[str]]:
+    swaps = [_StageTableSwap(EntityAddressUnified, stage_cls)]
+    patch_statements: list[tuple[str, str]] = []
+    if partial_support_patch:
+        patch_statements = _partial_support_patch_sql(
+            db_schema,
+            support_stage_classes,
+            old_entity_table=f"{EntityAddressUnified.__main_table__}_old",
+            affected_group_table=affected_group_table,
+            build_network_bridge=bool(
+                context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)
+            ),
+        )
+    else:
+        swaps.extend(
+            _StageTableSwap(live_cls, support_stage_cls)
+            for live_cls, support_stage_cls in support_stage_classes.items()
+        )
+    relation_names, required_names = _cutover_relation_sets(
+        swaps,
+        support_stage_classes,
+        partial_support_patch=partial_support_patch,
+        affected_group_table=affected_group_table,
+    )
+    return swaps, patch_statements, relation_names, required_names
+
+
+def _cutover_retry_settings() -> tuple[int, int, int]:
+    return (
+        _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_ATTEMPTS",
+            DEFAULT_CUTOVER_RETRY_ATTEMPTS,
+            minimum=1,
+        ),
+        _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS",
+            DEFAULT_CUTOVER_RETRY_BACKOFF_MS,
+        ),
+        _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS",
+            DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS,
+        ),
+    )
+
+
+async def _publish_staged_entity_address_tables(
+    db_schema: str,
+    stage_cls,
+    support_stage_classes: dict[type, type],
+    *,
+    partial_support_patch: bool,
+    affected_group_table: str,
+    context: dict,
+) -> None:
+    swaps, patch_statements, relation_names, required_names = _entity_address_cutover_plan(
+        db_schema,
+        stage_cls,
+        support_stage_classes,
+        partial_support_patch=partial_support_patch,
+        affected_group_table=affected_group_table,
+        context=context,
+    )
+    for swap in swaps:
+        await _ensure_promoted_stage_logged(db_schema, swap.stage_cls.__tablename__)
+    context["stage_persistence"] = "p"
+    max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
+    for attempt in range(1, max_attempts + 1):
+        context["cutover_attempts"] = attempt
+        try:
+            await _run_entity_address_cutover(
+                db_schema,
+                swaps,
+                patch_statements,
+                relation_names,
+                required_names,
+                context,
+            )
+            return
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_cutover_lock_error(exc):
+                raise
+            delay_ms = min(base_backoff_ms * (2 ** (attempt - 1)), max_backoff_ms)
+            logger.warning(
+                "Entity-address cutover lock unavailable on attempt %d/%d; retrying in %dms",
+                attempt,
+                max_attempts,
+                delay_ms,
+            )
+            await asyncio.sleep(delay_ms / 1000)
 
 
 async def _drop_stage_artifacts(
@@ -11052,60 +11324,21 @@ async def shutdown(ctx):
         )
         context["publish_validation"] = publish_validation
 
-    async with db.transaction():
-        table = EntityAddressUnified.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
-
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
+    if partial_support_patch and (
+        not affected_group_table or not await _table_exists(db_schema, affected_group_table)
+    ):
+        raise RuntimeError(
+            "entity-address-unified support patch publish requires "
+            "the affected group table to remain available through shutdown."
         )
-
-        if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
-            for index in stage_cls.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
-                old_live_name = f"{table}_idx_{index_name}"
-                archived_live_name = _archived_identifier(old_live_name)
-                await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                    f"RENAME TO {archived_live_name};"
-                )
-                await db.status(
-                    f"ALTER INDEX IF EXISTS "
-                    f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
-                    f"RENAME TO {old_live_name};"
-                )
-
-        if partial_support_patch:
-            if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
-                raise RuntimeError(
-                    "entity-address-unified support patch publish requires "
-                    "the affected group table to remain available through shutdown."
-                )
-            for label, statement in _partial_support_patch_sql(
-                db_schema,
-                support_stage_classes,
-                old_entity_table=f"{table}_old",
-                affected_group_table=affected_group_table,
-                build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
-            ):
-                started = time.monotonic()
-                rowcount = await db.status(statement)
-                _record_phase_timing(
-                    context,
-                    f"entity-address-unified patching support {label}",
-                    time.monotonic() - started,
-                    _coerce_rowcount(rowcount),
-                )
-        else:
-            for live_cls, support_stage_cls in support_stage_classes.items():
-                await _swap_stage_table(db_schema, live_cls, support_stage_cls)
+    await _publish_staged_entity_address_tables(
+        db_schema,
+        stage_cls,
+        support_stage_classes,
+        partial_support_patch=partial_support_patch,
+        affected_group_table=affected_group_table,
+        context=context,
+    )
 
     if partial_support_patch:
         await _drop_stage_artifacts(

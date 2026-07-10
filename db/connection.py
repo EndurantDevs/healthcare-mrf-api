@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import inspect
 import os
@@ -82,7 +83,7 @@ class StatementAdapter:
         return attr
 
     async def execute(self, **params: Any):
-        async with self._db.session() as session:
+        async with self._db._execution_session() as session:
             return await session.execute(self._stmt, params)
 
     async def all(self, **params: Any):
@@ -102,7 +103,7 @@ class StatementAdapter:
         return getattr(result, "rowcount", None)
 
     async def iterate(self, **params: Any):
-        async with self._db.session() as session:
+        async with self._db._execution_session() as session:
             async_result = await session.stream(self._stmt, params)
             async for row in async_result:
                 yield row
@@ -172,6 +173,18 @@ class ConnectionProxy:
 
 
 _SESSION: contextvars.ContextVar[AsyncSession] = contextvars.ContextVar("db_session")
+
+
+@dataclass(frozen=True)
+class _TransactionBinding:
+    database_id: int
+    session: AsyncSession
+    owner_task: Optional[asyncio.Task[Any]]
+
+
+_TRANSACTION: contextvars.ContextVar[Tuple[_TransactionBinding, ...]] = (
+    contextvars.ContextVar("db_transaction", default=())
+)
 
 
 def current_session() -> AsyncSession:
@@ -282,13 +295,13 @@ class Database:
 
     async def status(self, stmt: Any, **params: Any):
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        async with self.session() as session:
+        async with self._execution_session() as session:
             result = await session.execute(stmt, params)
             return getattr(result, "rowcount", None)
 
     async def execute(self, stmt: Any, **params: Any):
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        async with self.session() as session:
+        async with self._execution_session() as session:
             return await session.execute(stmt, params)
 
     async def all(self, stmt: Any, **params: Any):
@@ -305,7 +318,7 @@ class Database:
 
     async def stream(self, stmt: Any, **params: Any):
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        async with self.session() as session:
+        async with self._execution_session() as session:
             return await session.stream(stmt, params)
 
     async def create_table(self, table: SATable, **kwargs: Any) -> None:
@@ -360,11 +373,55 @@ class Database:
             await session.close()
             _SESSION.reset(token)
 
+    def _transaction_binding(self) -> Optional[_TransactionBinding]:
+        binding = next(
+            (
+                candidate
+                for candidate in reversed(_TRANSACTION.get())
+                if candidate.database_id == id(self)
+            ),
+            None,
+        )
+        if binding is None:
+            return None
+        if binding.owner_task is not asyncio.current_task():
+            raise RuntimeError(
+                "Transaction-bound database helpers cannot run in a child asyncio task"
+            )
+        return binding
+
+    @asynccontextmanager
+    async def _execution_session(self) -> AsyncIterator[AsyncSession]:
+        binding = self._transaction_binding()
+        if binding is not None:
+            yield binding.session
+            return
+        async with self.session() as session:
+            yield session
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncSession]:
+        binding = self._transaction_binding()
+        if binding is not None:
+            async with binding.session.begin_nested():
+                yield binding.session
+            return
         async with self.session() as session:
-            async with session.begin():
-                yield session
+            token = _TRANSACTION.set(
+                _TRANSACTION.get()
+                + (
+                    _TransactionBinding(
+                        database_id=id(self),
+                        session=session,
+                        owner_task=asyncio.current_task(),
+                    ),
+                )
+            )
+            try:
+                async with session.begin():
+                    yield session
+            finally:
+                _TRANSACTION.reset(token)
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[ConnectionProxy]:
