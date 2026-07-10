@@ -438,6 +438,14 @@ AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS = {
     "amerihealth caritas pa": "0500",
     "amerihealth caritas pennsylvania": "0500",
 }
+AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES = (
+    "InsurancePlan",
+    "Location",
+    "Organization",
+    "OrganizationAffiliation",
+    "Practitioner",
+    "PractitionerRole",
+)
 UHC_INTEROPERABILITY_APIS_URL = "https://www.uhc.com/legal/interoperability-apis"
 UHC_PROVIDER_DIRECTORY_BASE = "https://flex.optum.com/fhirpublic/R4"
 UHC_PROVIDER_DIRECTORY_METADATA_URL = f"{UHC_PROVIDER_DIRECTORY_BASE}/metadata"
@@ -1572,6 +1580,8 @@ def _source_full_refresh_page_count(
         return page_count
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     preferred_count = PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE.get(api_base or "")
+    if _is_amerihealth_caritas_provider_api_base(api_base):
+        preferred_count = 250
     if not preferred_count:
         return page_count
     return max(page_count, _bounded_page_count(preferred_count))
@@ -2276,6 +2286,8 @@ def _expected_nonempty_resource_types(source: dict[str, Any]) -> set[str]:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base == CIGNA_PROVIDER_DIRECTORY_BASE:
         return set(CIGNA_EXPECTED_NONEMPTY_RESOURCES)
+    if _is_amerihealth_caritas_provider_api_base(api_base):
+        return set(STATE_EXPECTED_NONEMPTY_RESOURCES)
     if api_base in EXPECTED_NONEMPTY_RESOURCES_BY_BASE:
         return set(EXPECTED_NONEMPTY_RESOURCES_BY_BASE[api_base])
     configured_resources = _source_metadata(source).get(
@@ -2847,7 +2859,26 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
     }
 
 
+def _amerihealth_caritas_api_plan_code(api_base: str | None) -> str | None:
+    parsed_api_base = urllib.parse.urlsplit(_canonical_base(api_base) or "")
+    if parsed_api_base.netloc.lower() != "api-ext.amerihealthcaritas.com":
+        return None
+    path_match = re.fullmatch(
+        r"/([^/]+)/provider-api",
+        parsed_api_base.path.rstrip("/"),
+        re.IGNORECASE,
+    )
+    return _clean_text(path_match.group(1)) if path_match else None
+
+
+def _is_amerihealth_caritas_provider_api_base(api_base: str | None) -> bool:
+    return bool(_amerihealth_caritas_api_plan_code(api_base))
+
+
 def _amerihealth_caritas_plan_code(row: dict[str, Any]) -> str | None:
+    api_plan_code = _amerihealth_caritas_api_plan_code(row.get("api_base"))
+    if api_plan_code:
+        return api_plan_code
     plan_name_key = _payer_alias_key(row.get("plan_name"))
     if plan_name_key in AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS:
         return AMERIHEALTH_CARITAS_PLAN_CODES_BY_ALIAS[plan_name_key]
@@ -2869,13 +2900,11 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
     plan_code = _amerihealth_caritas_plan_code(row)
     parsed_api_base = urllib.parse.urlsplit(api_base or "")
     api_host = parsed_api_base.netloc.lower()
-    api_path = parsed_api_base.path.lower()
-    if api_host == "api-ext.amerihealthcaritas.com" and "/provider-api" in api_path:
-        return None
     should_override = (
         plan_code
         and (
-            "amerihealth caritas" in org_name
+            _is_amerihealth_caritas_provider_api_base(api_base)
+            or "amerihealth caritas" in org_name
             or api_host in {"apps.availity.com", "fhir.amerihealthcaritas.com"}
             or "amerihealthcaritas.com" in portal_url
             or "amerihealthcaritas.com" in source_url
@@ -2903,6 +2932,9 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
             "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
             "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
             "provider_directory_plan_code": plan_code,
+            "provider_directory_supported_resources": list(
+                AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+            ),
         },
     }
 
@@ -7635,6 +7667,15 @@ def _amerihealth_caritas_seed_rows_from_catalog_html(
             "source_url": source_url,
             "source_date": source_date,
             "note": "Supplemental Provider Directory source from AmeriHealth Caritas developer portal.",
+            "metadata_json": {
+                "provider_directory_confirmed_base": provider_base,
+                "provider_directory_confirmed_catalog_url": source_url,
+                "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
+                "provider_directory_plan_code": plan_code,
+                "provider_directory_supported_resources": list(
+                    AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+                ),
+            },
         }
         if _seed_row_matches_query(row, source_query):
             rows.append(row)
@@ -11463,21 +11504,25 @@ def _is_pagination_checkpoint_mode_enabled(
 
 
 def _pagination_checkpoint_context(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     source_ids: list[str],
     *,
     run_id: str | None,
     retry_of_run_id: str | None,
 ) -> PaginationCheckpointContext | None:
     canonical_api_base = _canonical_base(
-        source.get("canonical_api_base") or source.get("api_base")
+        source_record.get("canonical_api_base") or source_record.get("api_base")
     )
-    if not run_id or not source_ids or canonical_api_base not in PAGINATION_CHECKPOINT_API_BASES:
+    supports_checkpoint = (
+        canonical_api_base in PAGINATION_CHECKPOINT_API_BASES
+        or _is_amerihealth_caritas_provider_api_base(canonical_api_base)
+    )
+    if not run_id or not source_ids or not supports_checkpoint:
         return None
     scope_payload = json.dumps(
         {
             "source_ids": sorted(set(source_ids)),
-            "resource_group": _resource_import_group_key(source),
+            "resource_group": _resource_import_group_key(source_record),
         },
         sort_keys=True,
         separators=(",", ":"),

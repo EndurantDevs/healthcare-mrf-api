@@ -328,6 +328,9 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
     assert row["metadata_json"]["provider_directory_override"] == "amerihealth_caritas_api_ext_provider_api"
     assert row["metadata_json"]["provider_directory_plan_code"] == "5400"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == f"{expected_base}/metadata"
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+    )
 
 
 def test_source_row_from_seed_does_not_guess_ambiguous_amerihealth_caritas_retest_base():
@@ -381,6 +384,10 @@ def test_amerihealth_caritas_catalog_parser_emits_plan_specific_sources():
     assert rows[0]["source_url"] == "fixture.html"
     assert rows[1]["plan_name"] == "AmeriHealth Caritas VIP Care"
     assert rows[1]["api_base"] == "https://api-ext.amerihealthcaritas.com/PA02/provider-api"
+    assert rows[1]["metadata_json"]["provider_directory_plan_code"] == "PA02"
+    assert rows[1]["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+    )
 
 
 def test_source_row_from_amerihealth_caritas_catalog_marks_stale_generic_base_replaced():
@@ -399,6 +406,23 @@ def test_source_row_from_amerihealth_caritas_catalog_marks_stale_generic_base_re
         importer.AMERIHEALTH_CARITAS_STALE_GENERIC_BASE
     ]
     assert row["metadata_json"]["provider_directory_confirmed_catalog_url"] == importer.AMERIHEALTH_CARITAS_DOC_URL
+
+
+def test_amerihealth_concrete_plan_base_uses_full_harvest_controls():
+    api_base = "https://api-ext.amerihealthcaritas.com/PA02/provider-api"
+    source_lookup = {"source_id": "ameri-pa02", "api_base": api_base}
+
+    assert importer._amerihealth_caritas_api_plan_code(api_base) == "PA02"
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 0, 0) == 250
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 1, 0) == 100
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["ameri-pa02"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+    assert checkpoint_context is not None
+    assert checkpoint_context.canonical_api_base == api_base
 
 
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
