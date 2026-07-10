@@ -4617,6 +4617,57 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
+def test_identifier_mapping_accepts_type_coded_npi_and_systemless_plan_ids():
+    _role_model, role_row = importer.parse_fhir_resource(
+        "source_michigan",
+        {
+            "resourceType": "PractitionerRole",
+            "id": "role-type-coded-npi",
+            "identifier": [
+                {
+                    "system": "https://example.test/generic-provider-id",
+                    "type": {
+                        "coding": [
+                            {
+                                "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                                "code": "NPI",
+                                "display": "National provider identifier",
+                            }
+                        ]
+                    },
+                    "value": "1588616783",
+                }
+            ],
+        },
+    )
+    _plan_model, plan_row = importer.parse_fhir_resource(
+        "source_cigna",
+        {
+            "resourceType": "InsurancePlan",
+            "id": "plan-systemless",
+            "identifier": [{"value": "CIGNA-PPO-2026"}],
+        },
+    )
+    _hios_model, hios_row = importer.parse_fhir_resource(
+        "source_hios",
+        {
+            "resourceType": "InsurancePlan",
+            "id": "plan-hios",
+            "identifier": [
+                {
+                    "system": "https://example.test/generic-plan-id",
+                    "type": {"coding": [{"code": "HIOS"}]},
+                    "value": "12345IL0010001",
+                }
+            ],
+        },
+    )
+
+    assert role_row["npi"] == 1588616783
+    assert plan_row["plan_identifier"] == "CIGNA-PPO-2026"
+    assert hios_row["plan_identifier"] == "12345IL0010001"
+
+
 def test_address_corroboration_sql_links_overlay_roles():
     """Validate the corroboration view joins overlay NPI addresses to FHIR roles."""
     sql = importer.provider_directory_address_corroboration_sql("mrf")
@@ -11987,7 +12038,13 @@ def test_address_overlay_sql_scope():
     assert "addr_key_v1" in sql
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
-    assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
+    assert "role_phone.telephone_number," in sql
+    assert "loc.telephone_number," in sql
+    assert "practitioner_phone.telephone_number" in sql
+    assert "organization_phone.telephone_number" in sql
+    assert "role.healthcare_service_refs" in sql
+    assert "affiliation.healthcare_service_refs" in sql
+    assert "provider_directory_healthcare_service" in sql
     assert "COALESCE(practitioner.npi, role.npi)::bigint AS npi" in sql
     assert "COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999" in sql
     assert "AS role_phone ON TRUE" in sql
@@ -12034,9 +12091,11 @@ def test_address_overlay_component_sql_is_bounded_to_one_component():
     assert "UNITEDSTATESOFAMERICA" in sql
     assert "THEN 'US'" in sql
     assert sql.count("addr_key_v1(") == 1
+    assert "raw.telephone_number" in sql
+    assert "NULL::varchar AS phone_number" not in sql
 
 
-def test_address_overlay_practitioner_component_uses_role_phone_and_coordinates():
+def test_address_overlay_practitioner_component_uses_all_phone_and_location_paths():
     sql = importer._address_overlay_component_insert_sql(
         "mrf",
         "provider_directory_address_overlay_stage_test",
@@ -12045,14 +12104,39 @@ def test_address_overlay_practitioner_component_uses_role_phone_and_coordinates(
         source_ids=["source_a"],
     )
 
-    assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
-    assert "COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number" in sql
+    assert "role_phone.telephone_number," in sql
+    assert "loc.telephone_number," in sql
+    assert "practitioner_phone.telephone_number" in sql
+    assert "practitioner_fax.fax_number" in sql
     assert "AS role_phone ON TRUE" in sql
     assert "AS role_fax ON TRUE" in sql
+    assert "AS practitioner_phone ON TRUE" in sql
+    assert "AS practitioner_fax ON TRUE" in sql
+    assert "role.healthcare_service_refs" in sql
+    assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
+    assert "healthcare_service.location_refs" in sql
     assert "loc.latitude" in sql
     assert "loc.longitude" in sql
     assert "/ 1000000" in sql
     assert "ABS(" in sql
+
+
+def test_address_overlay_affiliation_component_uses_org_phone_and_service_locations():
+    sql = importer._address_overlay_component_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        component="organization_affiliation",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+
+    assert "COALESCE(loc.telephone_number, organization_phone.telephone_number)" in sql
+    assert "COALESCE(loc.fax_number, organization_fax.fax_number)" in sql
+    assert "AS organization_phone ON TRUE" in sql
+    assert "AS organization_fax ON TRUE" in sql
+    assert "affiliation.healthcare_service_refs" in sql
+    assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
+    assert "healthcare_service.location_refs" in sql
 
 
 def test_address_overlay_stage_index_names_are_hash_safe():

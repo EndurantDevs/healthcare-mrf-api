@@ -3996,18 +3996,38 @@ def _first_reference(value: Any) -> str | None:
     return refs[0] if refs else None
 
 
-def _identifier_value(resource: dict[str, Any], *tokens: str) -> str | None:
+def _identifier_descriptor(identifier: dict[str, Any]) -> str:
+    identifier_type = identifier.get("type") if isinstance(identifier.get("type"), dict) else {}
+    descriptor_parts = [
+        identifier.get("system"),
+        identifier_type.get("text"),
+    ]
+    for coding in identifier_type.get("coding") or []:
+        if not isinstance(coding, dict):
+            continue
+        descriptor_parts.extend((coding.get("system"), coding.get("code"), coding.get("display")))
+    return " ".join(str(part).lower() for part in descriptor_parts if part)
+
+
+def _identifier_value(
+    resource: dict[str, Any],
+    *tokens: str,
+    allow_systemless: bool = False,
+) -> str | None:
     lowered = tuple(token.lower() for token in tokens)
+    systemless_value = None
     for identifier in resource.get("identifier") or []:
         if not isinstance(identifier, dict):
             continue
-        system = str(identifier.get("system") or "").lower()
         value = _clean_text(identifier.get("value"))
         if not value:
             continue
-        if any(token in system for token in lowered):
+        descriptor = _identifier_descriptor(identifier)
+        if any(token in descriptor for token in lowered):
             return value
-    return None
+        if allow_systemless and not identifier.get("system") and not identifier.get("type"):
+            systemless_value = systemless_value or value
+    return systemless_value
 
 
 def _npi(resource: dict[str, Any]) -> int | None:
@@ -4146,6 +4166,25 @@ def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code"
         f"WHEN BTRIM({main}) LIKE '+%' AND length({digits}) BETWEEN 8 AND 15 THEN {digits} "
         "ELSE NULL::varchar END"
     )
+
+
+def _contact_pair_sql_context(
+    context_prefix: str,
+    telephone_expr: str,
+    fax_expr: str,
+    country_expr: str,
+) -> dict[str, str]:
+    """Build canonical phone and fax expressions for one SQL contact source."""
+    return {
+        f"{context_prefix}_phone_number_expr": _canonical_contact_number_expr(
+            telephone_expr,
+            country_expr,
+        ),
+        f"{context_prefix}_fax_number_expr": _canonical_contact_number_expr(
+            fax_expr,
+            country_expr,
+        ),
+    }
 
 
 def _contact_extension_expr(expr: str) -> str:
@@ -4293,7 +4332,18 @@ def parse_fhir_resource(
     if resource_type == "InsurancePlan":
         period_start, period_end = _period(resource)
         plan = next((item for item in resource.get("plan") or [] if isinstance(item, dict)), {})
-        identifier = _identifier_value(plan, "planid", "plan-id", "hios") or _identifier_value(resource, "plan")
+        identifier = _identifier_value(
+            plan,
+            "planid",
+            "plan-id",
+            "hios",
+            allow_systemless=True,
+        ) or _identifier_value(
+            resource,
+            "plan",
+            "hios",
+            allow_systemless=True,
+        )
         row = {
             **base,
             "plan_identifier": identifier,
@@ -18992,8 +19042,8 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             {org_address_country_expr}::varchar AS country_code,
             org_phone.telephone_number::varchar AS telephone_number,
             org_fax.fax_number::varchar AS fax_number,
-            NULL::varchar AS phone_number,
-            NULL::varchar AS fax_number_digits,
+            {org_phone_number_expr}::varchar AS phone_number,
+            {org_fax_number_expr}::varchar AS fax_number_digits,
             NULL::numeric AS lat,
             NULL::numeric AS long,
             'street'::varchar AS address_precision,
@@ -19050,15 +19100,25 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
             {location_country_expr}::varchar AS country_code,
-            COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number,
-            COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number,
+            COALESCE(
+                role_phone.telephone_number,
+                loc.telephone_number,
+                practitioner_phone.telephone_number
+            )::varchar AS telephone_number,
+            COALESCE(
+                role_fax.fax_number,
+                loc.fax_number,
+                practitioner_fax.fax_number
+            )::varchar AS fax_number,
             COALESCE(
                 {role_phone_number_expr},
-                loc.phone_number
+                loc.phone_number,
+                {practitioner_phone_number_expr}
             )::varchar AS phone_number,
             COALESCE(
                 {role_fax_number_expr},
-                loc.fax_number_digits
+                loc.fax_number_digits,
+                {practitioner_fax_number_expr}
             )::varchar AS fax_number_digits,
             {location_lat_expr} AS lat,
             {location_long_expr} AS long,
@@ -19073,8 +19133,26 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
           JOIN {practitioner_table} AS practitioner
             ON practitioner.source_id = role.source_id
            AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
-          JOIN LATERAL jsonb_array_elements_text(COALESCE(role.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
-            ON TRUE
+          JOIN LATERAL (
+              SELECT direct_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                ) AS direct_location_ref(value)
+              UNION
+              SELECT service_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                ) AS service_ref(value)
+                JOIN {healthcare_service_table} AS healthcare_service
+                  ON healthcare_service.source_id = role.source_id
+                 AND healthcare_service.resource_id = NULLIF(
+                        regexp_replace(service_ref.value, '^.*/', ''),
+                        ''
+                     )
+                JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                ) AS service_location_ref(value) ON TRUE
+          ) AS location_ref ON TRUE
           JOIN {location_table} AS loc
             ON loc.source_id = role.source_id
            AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
@@ -19092,6 +19170,20 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                  AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                LIMIT 1
           ) AS role_fax ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS telephone_number
+                FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'phone'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS practitioner_phone ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS fax_number
+                FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'fax'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS practitioner_fax ON TRUE
          WHERE COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999
            AND practitioner.active IS DISTINCT FROM false
            AND role.active IS DISTINCT FROM false
@@ -19127,10 +19219,10 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.state_code::varchar AS state_code,
             loc.postal_code::varchar AS postal_code,
             {location_country_expr}::varchar AS country_code,
-            loc.telephone_number::varchar AS telephone_number,
-            loc.fax_number::varchar AS fax_number,
-            loc.phone_number::varchar AS phone_number,
-            loc.fax_number_digits::varchar AS fax_number_digits,
+            COALESCE(loc.telephone_number, organization_phone.telephone_number)::varchar AS telephone_number,
+            COALESCE(loc.fax_number, organization_fax.fax_number)::varchar AS fax_number,
+            COALESCE(loc.phone_number, {organization_phone_number_expr})::varchar AS phone_number,
+            COALESCE(loc.fax_number_digits, {organization_fax_number_expr})::varchar AS fax_number_digits,
             {location_lat_expr} AS lat,
             {location_long_expr} AS long,
             'street'::varchar AS address_precision,
@@ -19153,11 +19245,43 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
           JOIN {organization_table} AS organization
             ON organization.source_id = affiliation.source_id
            AND organization.resource_id = organization_ref.resource_id
-          JOIN LATERAL jsonb_array_elements_text(COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
-            ON TRUE
+          JOIN LATERAL (
+              SELECT direct_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                ) AS direct_location_ref(value)
+              UNION
+              SELECT service_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                ) AS service_ref(value)
+                JOIN {healthcare_service_table} AS healthcare_service
+                  ON healthcare_service.source_id = affiliation.source_id
+                 AND healthcare_service.resource_id = NULLIF(
+                        regexp_replace(service_ref.value, '^.*/', ''),
+                        ''
+                     )
+                JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                ) AS service_location_ref(value) ON TRUE
+          ) AS location_ref ON TRUE
           JOIN {location_table} AS loc
             ON loc.source_id = affiliation.source_id
            AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS telephone_number
+                FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'phone'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS organization_phone ON TRUE
+          LEFT JOIN LATERAL (
+              SELECT telecom.value->>'value' AS fax_number
+                FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+               WHERE telecom.value->>'system' = 'fax'
+                 AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+               LIMIT 1
+          ) AS organization_fax ON TRUE
          WHERE organization.npi BETWEEN 1000000000 AND 9999999999
            AND organization.active IS DISTINCT FROM false
            AND affiliation.active IS DISTINCT FROM false
@@ -19203,6 +19327,38 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
     """
 
 
+def _address_overlay_contact_sql_context(
+    organization_prefix: str,
+    organization_phone_expr: str,
+    organization_fax_expr: str,
+    organization_country_expr: str,
+    location_country_expr: str,
+) -> dict[str, str]:
+    """Return all normalized contact expressions used by overlay SQL."""
+    contact_sources = (
+        (organization_prefix, organization_phone_expr, organization_fax_expr, organization_country_expr),
+        ("role", "role_phone.telephone_number", "role_fax.fax_number", location_country_expr),
+        (
+            "practitioner",
+            "practitioner_phone.telephone_number",
+            "practitioner_fax.fax_number",
+            location_country_expr,
+        ),
+        (
+            "organization",
+            "organization_phone.telephone_number",
+            "organization_fax.fax_number",
+            location_country_expr,
+        ),
+    )
+    contact_sql_by_name: dict[str, str] = {}
+    for context_prefix, telephone_expr, fax_expr, country_expr in contact_sources:
+        contact_sql_by_name.update(
+            _contact_pair_sql_context(context_prefix, telephone_expr, fax_expr, country_expr)
+        )
+    return contact_sql_by_name
+
+
 def provider_directory_address_overlay_insert_sql(
     db_schema: str | None = None,
     stage_table: str | None = None,
@@ -19214,20 +19370,21 @@ def provider_directory_address_overlay_insert_sql(
     schema = db_schema if db_schema is not None else _schema()
     stage_ref = _qt(schema, stage_table or _address_overlay_stage_table_name(run_id))
     location_country_expr = _country_restore_default_us_sql("loc.country_code")
+    org_address_country_expr = _country_restore_default_us_sql("addr.value->>'country'")
+    contact_sql_by_name = _address_overlay_contact_sql_context(
+        "org",
+        "org_phone.telephone_number",
+        "org_fax.fax_number",
+        org_address_country_expr,
+        location_country_expr,
+    )
     return ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE.format(
         stage_ref=stage_ref,
         columns=", ".join(_provider_directory_address_overlay_columns()),
         qschema=_q(schema),
-        org_address_country_expr=_country_restore_default_us_sql("addr.value->>'country'"),
+        org_address_country_expr=org_address_country_expr,
         location_country_expr=location_country_expr,
-        role_phone_number_expr=_canonical_contact_number_expr(
-            "role_phone.telephone_number",
-            location_country_expr,
-        ),
-        role_fax_number_expr=_canonical_contact_number_expr(
-            "role_fax.fax_number",
-            location_country_expr,
-        ),
+        **contact_sql_by_name,
         location_lat_expr=_coordinate_from_location_sql(
             "loc.latitude",
             "loc.longitude",
@@ -19251,6 +19408,7 @@ def provider_directory_address_overlay_insert_sql(
         organization_table=_qt(schema, "provider_directory_organization"),
         practitioner_table=_qt(schema, "provider_directory_practitioner"),
         location_table=_qt(schema, "provider_directory_location"),
+        healthcare_service_table=_qt(schema, "provider_directory_healthcare_service"),
         practitioner_role_table=_qt(schema, "provider_directory_practitioner_role"),
         affiliation_table=_qt(schema, "provider_directory_organization_affiliation"),
     )
@@ -19402,8 +19560,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
             raw.country_code,
             raw.telephone_number,
             raw.fax_number,
-            NULL::varchar AS phone_number,
-            NULL::varchar AS fax_number_digits,
+            {raw_org_phone_number_expr}::varchar AS phone_number,
+            {raw_org_fax_number_expr}::varchar AS fax_number_digits,
             NULL::numeric AS lat,
             NULL::numeric AS long,
             'street'::varchar AS address_precision,
@@ -19444,10 +19602,26 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
                 {location_country_expr}::varchar AS country_code,
-                COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number,
-                COALESCE(role_fax.fax_number, loc.fax_number)::varchar AS fax_number,
-                COALESCE({role_phone_number_expr}, loc.phone_number)::varchar AS phone_number,
-                COALESCE({role_fax_number_expr}, loc.fax_number_digits)::varchar AS fax_number_digits,
+                COALESCE(
+                    role_phone.telephone_number,
+                    loc.telephone_number,
+                    practitioner_phone.telephone_number
+                )::varchar AS telephone_number,
+                COALESCE(
+                    role_fax.fax_number,
+                    loc.fax_number,
+                    practitioner_fax.fax_number
+                )::varchar AS fax_number,
+                COALESCE(
+                    {role_phone_number_expr},
+                    loc.phone_number,
+                    {practitioner_phone_number_expr}
+                )::varchar AS phone_number,
+                COALESCE(
+                    {role_fax_number_expr},
+                    loc.fax_number_digits,
+                    {practitioner_fax_number_expr}
+                )::varchar AS fax_number_digits,
                 {location_lat_expr} AS lat,
                 {location_long_expr} AS long,
                 'street'::varchar AS address_precision,
@@ -19461,8 +19635,26 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               JOIN {practitioner_table} AS practitioner
                 ON practitioner.source_id = role.source_id
                AND practitioner.resource_id = NULLIF(regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''), '')
-              JOIN LATERAL jsonb_array_elements_text(COALESCE(role.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
-                ON TRUE
+              JOIN LATERAL (
+                  SELECT direct_location_ref.value
+                    FROM jsonb_array_elements_text(
+                        COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                    ) AS direct_location_ref(value)
+                  UNION
+                  SELECT service_location_ref.value
+                    FROM jsonb_array_elements_text(
+                        COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                    ) AS service_ref(value)
+                    JOIN {healthcare_service_table} AS healthcare_service
+                      ON healthcare_service.source_id = role.source_id
+                     AND healthcare_service.resource_id = NULLIF(
+                            regexp_replace(service_ref.value, '^.*/', ''),
+                            ''
+                         )
+                    JOIN LATERAL jsonb_array_elements_text(
+                        COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                    ) AS service_location_ref(value) ON TRUE
+              ) AS location_ref ON TRUE
               JOIN {location_table} AS loc
                 ON loc.source_id = role.source_id
                AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
@@ -19480,6 +19672,20 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                      AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
                    LIMIT 1
               ) AS role_fax ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS telephone_number
+                    FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'phone'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS practitioner_phone ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS fax_number
+                    FROM jsonb_array_elements(COALESCE(practitioner.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'fax'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS practitioner_fax ON TRUE
              WHERE COALESCE(practitioner.npi, role.npi) BETWEEN 1000000000 AND 9999999999
                AND practitioner.active IS DISTINCT FROM false
                AND role.active IS DISTINCT FROM false
@@ -19521,10 +19727,10 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.state_code::varchar AS state_code,
                 loc.postal_code::varchar AS postal_code,
                 {location_country_expr}::varchar AS country_code,
-                loc.telephone_number::varchar AS telephone_number,
-                loc.fax_number::varchar AS fax_number,
-                loc.phone_number::varchar AS phone_number,
-                loc.fax_number_digits::varchar AS fax_number_digits,
+                COALESCE(loc.telephone_number, organization_phone.telephone_number)::varchar AS telephone_number,
+                COALESCE(loc.fax_number, organization_fax.fax_number)::varchar AS fax_number,
+                COALESCE(loc.phone_number, {organization_phone_number_expr})::varchar AS phone_number,
+                COALESCE(loc.fax_number_digits, {organization_fax_number_expr})::varchar AS fax_number_digits,
                 {location_lat_expr} AS lat,
                 {location_long_expr} AS long,
                 'street'::varchar AS address_precision,
@@ -19547,11 +19753,43 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
               JOIN {organization_table} AS organization
                 ON organization.source_id = affiliation.source_id
                AND organization.resource_id = organization_ref.resource_id
-              JOIN LATERAL jsonb_array_elements_text(COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)) AS location_ref(value)
-                ON TRUE
+              JOIN LATERAL (
+                  SELECT direct_location_ref.value
+                    FROM jsonb_array_elements_text(
+                        COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                    ) AS direct_location_ref(value)
+                  UNION
+                  SELECT service_location_ref.value
+                    FROM jsonb_array_elements_text(
+                        COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                    ) AS service_ref(value)
+                    JOIN {healthcare_service_table} AS healthcare_service
+                      ON healthcare_service.source_id = affiliation.source_id
+                     AND healthcare_service.resource_id = NULLIF(
+                            regexp_replace(service_ref.value, '^.*/', ''),
+                            ''
+                         )
+                    JOIN LATERAL jsonb_array_elements_text(
+                        COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                    ) AS service_location_ref(value) ON TRUE
+              ) AS location_ref ON TRUE
               JOIN {location_table} AS loc
                 ON loc.source_id = affiliation.source_id
                AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS telephone_number
+                    FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'phone'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS organization_phone ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT telecom.value->>'value' AS fax_number
+                    FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                   WHERE telecom.value->>'system' = 'fax'
+                     AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                   LIMIT 1
+              ) AS organization_fax ON TRUE
              WHERE organization.npi BETWEEN 1000000000 AND 9999999999
                AND organization.active IS DISTINCT FROM false
                AND affiliation.active IS DISTINCT FROM false
@@ -19569,20 +19807,21 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
 def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: str | None) -> dict[str, str]:
     """Return shared SQL template parameters for Provider Directory overlay inserts."""
     location_country_expr = _country_restore_default_us_sql("loc.country_code")
+    raw_org_country_expr = _country_restore_default_us_sql("raw.country_code")
+    contact_sql_by_name = _address_overlay_contact_sql_context(
+        "raw_org",
+        "raw.telephone_number",
+        "raw.fax_number",
+        raw_org_country_expr,
+        location_country_expr,
+    )
     return {
         "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
         "columns": ", ".join(_provider_directory_address_overlay_columns()),
         "qschema": _q(schema),
         "org_address_country_expr": _country_restore_default_us_sql("addr.value->>'country'"),
         "location_country_expr": location_country_expr,
-        "role_phone_number_expr": _canonical_contact_number_expr(
-            "role_phone.telephone_number",
-            location_country_expr,
-        ),
-        "role_fax_number_expr": _canonical_contact_number_expr(
-            "role_fax.fax_number",
-            location_country_expr,
-        ),
+        **contact_sql_by_name,
         "location_lat_expr": _coordinate_from_location_sql(
             "loc.latitude",
             "loc.longitude",
@@ -19599,6 +19838,7 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         "organization_table": _qt(schema, "provider_directory_organization"),
         "practitioner_table": _qt(schema, "provider_directory_practitioner"),
         "location_table": _qt(schema, "provider_directory_location"),
+        "healthcare_service_table": _qt(schema, "provider_directory_healthcare_service"),
         "practitioner_role_table": _qt(schema, "provider_directory_practitioner_role"),
         "affiliation_table": _qt(schema, "provider_directory_organization_affiliation"),
     }
