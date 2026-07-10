@@ -248,14 +248,109 @@ def test_provider_directory_adapter_scopes_retry_lineage():
     }
 
     ordinary_payload = control_imports._adapter_payload(adapter, ordinary_row_map, {"resource_limit": 100})
-    retry_payload = control_imports._adapter_payload(adapter, retry_row_map, {"resource_limit": 100})
+    retry_payload = control_imports._adapter_payload(
+        adapter,
+        retry_row_map,
+        {
+            "resource_limit": 100,
+            "provider_directory_pagination_root_run_id": "run_root",
+        },
+    )
 
     assert ordinary_payload["task"] == {"test_mode": False, "resource_limit": 100}
     assert retry_payload["task"] == {
         "test_mode": False,
         "resource_limit": 100,
         "retry_of_run_id": "run_original",
+        "provider_directory_pagination_root_run_id": "run_root",
     }
+
+
+@pytest.mark.asyncio
+async def test_retry_import_run_merges_provider_directory_retry_params_into_child(monkeypatch):
+    current_run_map = {
+        "run_id": "run_parent",
+        "importer": "provider-directory-fhir",
+        "params": {"publish_artifacts": False, "resource_limit": 100},
+        "schedule_id": "schedule_monthly",
+        "subscription_id": "subscription_1",
+        "source_file_import_id": None,
+        "import_id": None,
+    }
+    created_payloads = []
+
+    async def fake_get(run_id):
+        assert run_id == "run_parent"
+        return current_run_map
+
+    async def fake_create(payload):
+        created_payloads.append(payload)
+        return payload, True
+
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_create)
+
+    child, created = await control_imports.retry_import_run(
+        "run_parent",
+        {
+            "importer": "npi",
+            "idempotency_key": "retry_provider_directory",
+            "retry_params": {
+                "retry_of_run_id": "run_parent",
+                "provider_directory_pagination_root_run_id": "run_root",
+            },
+        },
+    )
+
+    assert created is True
+    assert child == created_payloads[0]
+    assert created_payloads == [
+        {
+            "importer": "provider-directory-fhir",
+            "params": {
+                "publish_artifacts": False,
+                "resource_limit": 100,
+                "retry_of_run_id": "run_parent",
+                "provider_directory_pagination_root_run_id": "run_root",
+            },
+            "triggered_by": "api",
+            "idempotency_key": "retry_provider_directory",
+            "schedule_id": "schedule_monthly",
+            "subscription_id": "subscription_1",
+            "source_file_import_id": None,
+            "import_id": None,
+            "retry_of_run_id": "run_parent",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_import_run_without_retry_params_preserves_ordinary_child_params(monkeypatch):
+    current_run_map = {
+        "run_id": "run_parent",
+        "importer": "npi",
+        "params": {"test_mode": False, "resource_limit": 100},
+        "schedule_id": None,
+        "subscription_id": None,
+        "source_file_import_id": None,
+        "import_id": None,
+    }
+    created_payloads = []
+
+    async def fake_get(_run_id):
+        return current_run_map
+
+    async def fake_create(payload):
+        created_payloads.append(payload)
+        return payload, True
+
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_create)
+
+    await control_imports.retry_import_run("run_parent", {"idempotency_key": "retry_ordinary"})
+
+    assert created_payloads[0]["importer"] == "npi"
+    assert created_payloads[0]["params"] == {"test_mode": False, "resource_limit": 100}
 
 
 def test_openaddresses_adapter_preserves_parallel_load_params():

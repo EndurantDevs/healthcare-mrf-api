@@ -1242,9 +1242,11 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     current = await get_import_run(run_id)
     if not current:
         return None
+    current_params = current.get("params") if isinstance(current.get("params"), dict) else {}
+    retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}
     retry_payload = {
         "importer": current["importer"],
-        "params": current.get("params") or {},
+        "params": {**current_params, **retry_params},
         "triggered_by": payload.get("triggered_by") or "api",
         "idempotency_key": payload.get("idempotency_key"),
         "schedule_id": current.get("schedule_id"),
