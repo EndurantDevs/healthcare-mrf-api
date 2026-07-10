@@ -152,6 +152,7 @@ def test_aetna_provider_directorydata_supplemental_source_is_not_rewritten_to_me
     assert source_row["metadata_json"]["provider_directory_override"] == "aetna_apif1_providerdirectorydata"
     assert source_row["metadata_json"]["provider_directory_bulk_export_omit_output_format"] is True
     assert source_row["metadata_json"]["provider_directory_bulk_export_auto_enabled"] is True
+    assert source_row["metadata_json"]["provider_directory_bulk_export_eligible"] is True
     assert source_row["metadata_json"]["provider_directory_bulk_export_output_hosts"] == [
         "storage.googleapis.com"
     ]
@@ -2724,25 +2725,63 @@ def test_bulk_export_mode_metrics_distinguish_requested_from_effective():
     assert importer._bulk_export_mode_metrics(True, {}) == {
         "requested": True,
         "effective": False,
+        "requested_resource_fetches": 0,
         "effective_resource_fetches": 0,
+        "ineligible_resource_fetches": 0,
+        "checkpoint_blocked_resource_fetches": 0,
+        "rest_fallback_resource_fetches": 0,
     }
     assert importer._bulk_export_mode_metrics(
         True,
         {
-            "Practitioner": {"bulk_export_sources": 2},
-            "Location": {"bulk_export_sources": 0},
+            "Practitioner": {
+                "bulk_export_requested_sources": 3,
+                "bulk_export_ineligible_sources": 1,
+                "bulk_export_rest_fallback_sources": 1,
+                "bulk_export_sources": 2,
+            },
+            "Location": {
+                "bulk_export_requested_sources": 1,
+                "bulk_export_checkpoint_blocked_sources": 1,
+                "bulk_export_rest_fallback_sources": 1,
+                "bulk_export_sources": 0,
+            },
         },
     ) == {
         "requested": True,
         "effective": True,
+        "requested_resource_fetches": 4,
         "effective_resource_fetches": 2,
+        "ineligible_resource_fetches": 1,
+        "checkpoint_blocked_resource_fetches": 1,
+        "rest_fallback_resource_fetches": 2,
     }
 
 
-def test_aetna_unbounded_bulk_requires_checkpoint():
+def test_cigna_bulk_request_is_ineligible():
+    source_lookup = {"api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE}
+
+    assert not importer._is_source_bulk_export_eligible(source_lookup)
+    assert (
+        importer._source_bulk_export_selection(
+            source_lookup,
+            True,
+            per_resource_limit=25,
+        )
+        == importer.BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE
+    )
+    assert not importer._is_source_bulk_export_effective(
+        source_lookup,
+        True,
+        per_resource_limit=25,
+    )
+
+
+def test_aetna_bulk_source_is_eligible_and_unbounded_use_requires_checkpoint():
     source_lookup = {"api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}
     checkpoint_context = _bulk_test_context()
 
+    assert importer._is_source_bulk_export_eligible(source_lookup)
     assert not importer._is_source_bulk_export_effective(
         source_lookup,
         True,
@@ -2759,6 +2798,62 @@ def test_aetna_unbounded_bulk_requires_checkpoint():
         True,
         per_resource_limit=25,
     )
+
+
+def test_ordinary_rest_source_is_not_bulk_eligible():
+    source_lookup = {"api_base": "https://example.test/fhir"}
+
+    assert not importer._is_source_bulk_export_eligible(source_lookup)
+    assert not importer._is_source_bulk_export_effective(
+        source_lookup,
+        True,
+        per_resource_limit=25,
+    )
+
+
+def test_bulk_eligibility_metadata_is_explicit_extension_point():
+    source_lookup = {
+        "api_base": "https://bulk-capable.example/fhir",
+        "metadata_json": {
+            importer.PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_METADATA_KEY: True,
+        },
+    }
+
+    assert importer._is_source_bulk_export_eligible(source_lookup)
+    assert importer._is_source_bulk_export_effective(
+        source_lookup,
+        True,
+        per_resource_limit=25,
+    )
+
+
+def test_resource_stats_record_ineligible_rest_fallback():
+    fetch_result = importer.ResourceFetchResult(
+        ProviderDirectoryPractitioner,
+        [],
+        0,
+        0,
+        1,
+        True,
+        False,
+        False,
+        False,
+        False,
+        fetch_mode="paged",
+    )
+    resource_stats_by_type: dict[str, dict[str, Any]] = {}
+
+    importer._record_resource_fetch_stats(
+        resource_stats_by_type,
+        "Practitioner",
+        fetch_result,
+        bulk_export_selection=importer.BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
+    )
+
+    practitioner_stats = resource_stats_by_type["Practitioner"]
+    assert practitioner_stats["bulk_export_requested_sources"] == 1
+    assert practitioner_stats["bulk_export_ineligible_sources"] == 1
+    assert practitioner_stats["bulk_export_rest_fallback_sources"] == 1
 
 
 def test_aetna_catalog_opt_in_enables_checkpointed_bulk_for_general_refresh():
@@ -10122,7 +10217,7 @@ async def test_bulk_checkpoint_requires_all_outputs(
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     async def fake_bulk_export(source, resource_type, **kwargs):
-        assert source["source_id"] == "source_a"
+        assert source["source_id"] == "aetna-commercial"
         assert resource_type == "Practitioner"
         assert kwargs["per_resource_limit"] == 10
         return importer.ResourceFetchResult(
@@ -10146,7 +10241,7 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
 
     result = await importer._fetch_resource_rows(
-        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        _bulk_test_source(),
         "Practitioner",
         per_resource_limit=10,
         page_limit=1,
@@ -10165,13 +10260,68 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_resource_rows_uses_rest_for_ineligible_source(monkeypatch):
+    """A Bulk request for an ineligible source must transparently use REST."""
+    bulk_fetch = AsyncMock(
+        side_effect=AssertionError("ineligible sources must not request Bulk export")
+    )
+    rest_fetch = AsyncMock(
+        return_value=(
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "prac-rest",
+                        }
+                    }
+                ],
+            },
+            None,
+            10,
+        )
+    )
+    source_record = {
+        "source_id": "rest-source",
+        "api_base": "https://example.test/fhir",
+    }
+    monkeypatch.setattr(importer, "_fetch_bulk_export_resource_rows", bulk_fetch)
+    monkeypatch.setattr(importer, "_fetch_json", rest_fetch)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_record,
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        bulk_export=True,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.fetch_mode == "paged"
+    assert fetch_result.rows[0]["resource_id"] == "prac-rest"
+    bulk_fetch.assert_not_awaited()
+    rest_fetch.assert_awaited_once_with(
+        "https://example.test/fhir/Practitioner?_count=25",
+        timeout=3,
+    )
+
+
+@pytest.mark.asyncio
 async def test_fetch_resource_rows_falls_back_when_bulk_export_returns_non_bulk_200(monkeypatch):
     async def fake_bulk_http_get_json(*_args, **kwargs):
         assert kwargs["prefer_async"] is True
         return 200, {}, {"resourceType": "Bundle", "entry": []}, None
 
     async def fake_fetch_json(url, *, timeout):
-        assert url == "https://example.test/fhir/Practitioner?_count=25"
+        assert url == (
+            f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
+            "/Practitioner?_count=25"
+        )
         return (
             200,
             {
@@ -10194,7 +10344,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_returns_non_bulk_
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
     result = await importer._fetch_resource_rows(
-        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        _bulk_test_source(),
         "Practitioner",
         per_resource_limit=1,
         page_limit=1,
@@ -10226,7 +10376,7 @@ async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(mon
     monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
 
     result = await importer._fetch_resource_rows(
-        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        _bulk_test_source(),
         "Practitioner",
         per_resource_limit=1,
         page_limit=1,
@@ -10295,7 +10445,10 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
         return None
 
     async def fake_fetch_json(url, *, timeout):
-        assert url == "https://example.test/fhir/Practitioner?_count=25"
+        assert url == (
+            f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}"
+            "/Practitioner?_count=25"
+        )
         return (
             200,
             {
@@ -10318,7 +10471,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
     result = await importer._fetch_resource_rows(
-        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        _bulk_test_source(),
         "Practitioner",
         per_resource_limit=1,
         page_limit=1,

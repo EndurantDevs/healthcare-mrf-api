@@ -440,6 +440,18 @@ AETNA_PROVIDER_DIRECTORY_TOKEN_URL = "https://apif1.aetna.com/fhir/v1/fhirserver
 AETNA_PROVIDER_DIRECTORY_BASES = frozenset(
     {AETNA_PROVIDER_DIRECTORY_BASE, AETNA_PROVIDER_DIRECTORY_DATA_BASE}
 )
+PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_METADATA_KEY = (
+    "provider_directory_bulk_export_eligible"
+)
+# Add new proven Bulk Data sources through explicit metadata. This compatibility
+# allowlist preserves established Aetna records created before that marker existed.
+PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_API_BASES = frozenset(
+    {AETNA_PROVIDER_DIRECTORY_DATA_BASE}
+)
+BULK_EXPORT_SELECTION_NOT_REQUESTED = "not_requested"
+BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE = "source_ineligible"
+BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED = "checkpoint_required"
+BULK_EXPORT_SELECTION_EFFECTIVE = "effective"
 AETNA_COMMERCIAL_SUPPORTED_RESOURCES = tuple(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
@@ -3231,6 +3243,7 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
                 resource_type: 30
                 for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
             },
+            "provider_directory_bulk_export_eligible": True,
             "provider_directory_bulk_export_omit_output_format": True,
             "provider_directory_bulk_export_auto_enabled": True,
             "provider_directory_bulk_export_output_hosts": [
@@ -10690,6 +10703,55 @@ def _bulk_export_enabled(value: Any) -> bool:
     return _bool_or_default(value, False)
 
 
+def _is_source_bulk_export_requested(
+    source: dict[str, Any],
+    requested: bool,
+) -> bool:
+    return bool(
+        requested
+        or _source_metadata(source).get(
+            "provider_directory_bulk_export_auto_enabled"
+        )
+        is True
+    )
+
+
+def _is_source_bulk_export_eligible(source: dict[str, Any]) -> bool:
+    metadata = _source_metadata(source)
+    configured_eligibility = metadata.get(
+        PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_METADATA_KEY
+    )
+    if configured_eligibility is not None:
+        return configured_eligibility is True
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    return api_base in PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_API_BASES
+
+
+def _source_bulk_export_selection(
+    source: dict[str, Any],
+    requested: bool,
+    *,
+    per_resource_limit: int,
+    checkpoint_context: PaginationCheckpointContext | None = None,
+) -> str:
+    if not _is_source_bulk_export_requested(source, requested):
+        return BULK_EXPORT_SELECTION_NOT_REQUESTED
+    if not _is_source_bulk_export_eligible(source):
+        return BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if (
+        api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE
+        and per_resource_limit <= 0
+        and not _is_durable_bulk_checkpoint_context(checkpoint_context)
+    ):
+        return BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED
+    return BULK_EXPORT_SELECTION_EFFECTIVE
+
+
 def _is_source_bulk_export_effective(
     source: dict[str, Any],
     requested: bool,
@@ -10697,21 +10759,15 @@ def _is_source_bulk_export_effective(
     per_resource_limit: int,
     checkpoint_context: PaginationCheckpointContext | None = None,
 ) -> bool:
-    """Require durable candidate-bound state for an unbounded Aetna export."""
-    api_base = _canonical_base(
-        source.get("canonical_api_base") or source.get("api_base")
-    )
-    source_requested = (
-        requested
-        or _source_metadata(source).get("provider_directory_bulk_export_auto_enabled") is True
-    )
-    return bool(
-        source_requested
-        and (
-            api_base != AETNA_PROVIDER_DIRECTORY_DATA_BASE
-            or per_resource_limit > 0
-            or _is_durable_bulk_checkpoint_context(checkpoint_context)
+    """Allow Bulk only for eligible sources with required durable state."""
+    return (
+        _source_bulk_export_selection(
+            source,
+            requested,
+            per_resource_limit=per_resource_limit,
+            checkpoint_context=checkpoint_context,
         )
+        == BULK_EXPORT_SELECTION_EFFECTIVE
     )
 
 
@@ -14934,6 +14990,11 @@ def _empty_resource_stats() -> dict[str, Any]:
         "sources_bounded": 0,
         "sources_failed": 0,
         "sources_empty": 0,
+        "bulk_export_requested_sources": 0,
+        "bulk_export_eligible_sources": 0,
+        "bulk_export_ineligible_sources": 0,
+        "bulk_export_checkpoint_blocked_sources": 0,
+        "bulk_export_rest_fallback_sources": 0,
         "bulk_export_sources": 0,
         "pages_fetched": 0,
         "rows_fetched": 0,
@@ -14944,32 +15005,91 @@ def _bulk_export_mode_metrics(
     requested: bool,
     resource_fetch_stats: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    effective_resource_fetches = sum(
-        int(resource_stats.get("bulk_export_sources") or 0)
-        for resource_stats in resource_fetch_stats.values()
+    effective_resource_fetches = _resource_fetch_metric_total(
+        resource_fetch_stats,
+        "bulk_export_sources",
     )
     return {
         "requested": requested,
         "effective": effective_resource_fetches > 0,
+        "requested_resource_fetches": _resource_fetch_metric_total(
+            resource_fetch_stats,
+            "bulk_export_requested_sources",
+        ),
         "effective_resource_fetches": effective_resource_fetches,
+        "ineligible_resource_fetches": _resource_fetch_metric_total(
+            resource_fetch_stats,
+            "bulk_export_ineligible_sources",
+        ),
+        "checkpoint_blocked_resource_fetches": _resource_fetch_metric_total(
+            resource_fetch_stats,
+            "bulk_export_checkpoint_blocked_sources"
+        ),
+        "rest_fallback_resource_fetches": _resource_fetch_metric_total(
+            resource_fetch_stats,
+            "bulk_export_rest_fallback_sources"
+        ),
     }
 
 
-def _record_resource_fetch_stats(stats: dict[str, dict[str, Any]], resource_type: str, result: ResourceFetchResult) -> None:
-    entry = stats.setdefault(resource_type, _empty_resource_stats())
-    entry["sources_attempted"] += 1
-    entry["pages_fetched"] += result.pages_fetched
-    entry["rows_fetched"] += result.rows_fetched
-    if result.complete:
-        entry["sources_completed"] += 1
-    if result.bounded:
-        entry["sources_bounded"] += 1
-    if result.error:
-        entry["sources_failed"] += 1
-    if result.complete and result.rows_fetched == 0:
-        entry["sources_empty"] += 1
-    if result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
-        entry["bulk_export_sources"] += 1
+def _resource_fetch_metric_total(
+    resource_fetch_stats: dict[str, dict[str, Any]],
+    metric_name: str,
+) -> int:
+    """Sum one numeric fetch metric across resource types."""
+    return sum(
+        int(fetch_stats.get(metric_name) or 0)
+        for fetch_stats in resource_fetch_stats.values()
+    )
+
+
+def _record_resource_fetch_stats(
+    resource_stats_by_type: dict[str, dict[str, Any]],
+    resource_type: str,
+    fetch_result: ResourceFetchResult,
+    *,
+    bulk_export_selection: str | None = None,
+) -> None:
+    resource_stats = resource_stats_by_type.setdefault(
+        resource_type,
+        _empty_resource_stats(),
+    )
+    resource_stats["sources_attempted"] += 1
+    resource_stats["pages_fetched"] += fetch_result.pages_fetched
+    resource_stats["rows_fetched"] += fetch_result.rows_fetched
+    if fetch_result.complete:
+        resource_stats["sources_completed"] += 1
+    if fetch_result.bounded:
+        resource_stats["sources_bounded"] += 1
+    if fetch_result.error:
+        resource_stats["sources_failed"] += 1
+    if fetch_result.complete and fetch_result.rows_fetched == 0:
+        resource_stats["sources_empty"] += 1
+    if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
+        resource_stats["bulk_export_sources"] += 1
+    if bulk_export_selection in {
+        BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
+        BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED,
+        BULK_EXPORT_SELECTION_EFFECTIVE,
+    }:
+        resource_stats["bulk_export_requested_sources"] += 1
+    if bulk_export_selection == BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE:
+        resource_stats["bulk_export_ineligible_sources"] += 1
+    elif bulk_export_selection == BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED:
+        resource_stats["bulk_export_checkpoint_blocked_sources"] += 1
+    elif bulk_export_selection == BULK_EXPORT_SELECTION_EFFECTIVE:
+        resource_stats["bulk_export_eligible_sources"] += 1
+    if (
+        bulk_export_selection
+        in {
+            BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
+            BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED,
+            BULK_EXPORT_SELECTION_EFFECTIVE,
+        }
+        and fetch_result.fetch_mode
+        in {"paged", "partitioned_paged", "checkpoint_complete"}
+    ):
+        resource_stats["bulk_export_rest_fallback_sources"] += 1
 
 
 def _is_resource_fetch_complete_for_publish(result: ResourceFetchResult) -> bool:
@@ -17855,7 +17975,23 @@ async def _import_resources(
                 page_count,
                 result,
             )
-            _record_resource_fetch_stats(source_resource_stats, resource_type, result)
+            _record_resource_fetch_stats(
+                source_resource_stats,
+                resource_type,
+                result,
+                bulk_export_selection=_source_bulk_export_selection(
+                    source,
+                    bulk_export,
+                    per_resource_limit=per_resource_limit,
+                    checkpoint_context=(
+                        source.get("_pagination_checkpoint_context")
+                        if use_streaming
+                        and per_resource_limit <= 0
+                        and page_limit <= 0
+                        else None
+                    ),
+                ),
+            )
             _record_resource_completion(resource_completion, resource_type, source_ids, result)
             if result.rows or resource_type not in rows_by_resource:
                 rows_by_resource[resource_type] = result.rows
