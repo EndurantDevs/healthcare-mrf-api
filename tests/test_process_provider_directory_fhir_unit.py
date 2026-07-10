@@ -921,6 +921,13 @@ def test_source_row_from_seed_overrides_hap_stale_provider_directory_path():
     assert row["last_validated_status"] == "valid"
     assert row["metadata_json"]["provider_directory_override"] == "hap_provider_directory_r4"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.HAP_PROVIDER_DIRECTORY_METADATA_URL
+    assert row["metadata_json"]["provider_directory_supported_resources"] == [
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    ]
 
 
 def test_hap_rewrites_blocked_pagination_sibling_host():
@@ -932,16 +939,19 @@ def test_hap_rewrites_blocked_pagination_sibling_host():
     next_url = importer._resolved_fhir_next_url(
         source_lookup,
         f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1",
-        (
-            "https://fhir-prov-dir-r4.api.hap.org/Practitioner?"
-            "_count=1&_getpages=next-token"
-        ),
+        "https://fhir-prov-dir-r4.api.hap.org:443?_count=1&_getpages=next-token",
     )
 
     assert next_url == (
-        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?"
-        "_count=1&_getpages=next-token"
+        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}?_count=1&_getpages=next-token"
     )
+
+
+def test_hap_full_refresh_uses_documented_page_size():
+    source_lookup = {"api_base": importer.HAP_PROVIDER_DIRECTORY_BASE}
+
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 0, 0) == 1000
+    assert importer._source_full_refresh_page_count(source_lookup, 100, 1, 0) == 100
 
 
 @pytest.mark.parametrize(
@@ -7747,6 +7757,49 @@ async def test_fetch_resource_rows_fails_closed_on_cross_origin_next(monkeypatch
     assert fetch_result.complete is False
     assert fetch_result.error == "untrusted_pagination_link"
     assert fetch_result.next_url_remaining is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_rewrites_live_hap_page_two(monkeypatch):
+    first_url = f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1"
+    second_url = (
+        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}?_count=1&_getpages=next-token"
+    )
+    fetched_urls: list[str] = []
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        assert timeout == 3
+        fetched_urls.append(request_url)
+        if request_url == first_url:
+            return (
+                200,
+                _arkansas_practitioner_bundle(
+                    ["prac-1"],
+                    "https://fhir-prov-dir-r4.api.hap.org:443?"
+                    "_count=1&_getpages=next-token",
+                ),
+                None,
+                1,
+            )
+        assert request_url == second_url
+        return 200, _arkansas_practitioner_bundle(["prac-2"]), None, 1
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "hap", "api_base": importer.HAP_PROVIDER_DIRECTORY_BASE},
+        "Practitioner",
+        per_resource_limit=2,
+        page_limit=0,
+        page_count=1,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 2
+    assert fetched_urls == [first_url, second_url]
 
 
 @pytest.mark.asyncio

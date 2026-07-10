@@ -499,6 +499,9 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     (WASHINGTON_PROVIDER_DIRECTORY_BASE, "Location"): 25,
     (WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
 }
+PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
+    HAP_PROVIDER_DIRECTORY_BASE: 1000,
+}
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
 )
@@ -517,6 +520,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
+        HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
         MAINE_PROVIDER_DIRECTORY_BASE,
@@ -1556,6 +1560,21 @@ def _source_resource_page_count(source: dict[str, Any], resource_type: str, page
     if not caps:
         return bounded_count
     return max(1, min(bounded_count, min(caps)))
+
+
+def _source_full_refresh_page_count(
+    source: dict[str, Any],
+    page_count: int,
+    per_resource_limit: int,
+    page_limit: int,
+) -> int:
+    if per_resource_limit > 0 or page_limit > 0:
+        return page_count
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    preferred_count = PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE.get(api_base or "")
+    if not preferred_count:
+        return page_count
+    return max(page_count, _bounded_page_count(preferred_count))
 
 
 def _source_resource_timeout(source: dict[str, Any], resource_type: str, timeout: int) -> int:
@@ -3068,6 +3087,13 @@ def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
             "provider_directory_confirmed_base": HAP_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": HAP_PROVIDER_DIRECTORY_DOC_URL,
             "provider_directory_confirmed_metadata_url": HAP_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_supported_resources": [
+                "InsurancePlan",
+                "Location",
+                "Organization",
+                "Practitioner",
+                "PractitionerRole",
+            ],
         },
     }
 
@@ -8812,7 +8838,9 @@ def _resolved_fhir_next_url(
         return _resolved_molina_next_url(current_url, next_url)
     if (
         api_base == HAP_PROVIDER_DIRECTORY_BASE
-        and parsed_next.netloc.lower() == HAP_BLOCKED_PAGINATION_HOST
+        and (parsed_next.hostname or "").lower() == HAP_BLOCKED_PAGINATION_HOST
+        and parsed_next.scheme.lower() == "https"
+        and parsed_next.port in {None, 443}
     ):
         public_base = urllib.parse.urlsplit(HAP_PROVIDER_DIRECTORY_BASE)
         next_url = urllib.parse.urlunsplit(
@@ -9991,6 +10019,12 @@ async def _fetch_resource_rows(
             error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
             fetch_mode="source_specific_deferred",
         )
+    page_count = _source_full_refresh_page_count(
+        source,
+        page_count,
+        per_resource_limit,
+        page_limit,
+    )
     start_urls = _resource_start_urls(source, resource_type, page_count=page_count)
     if not start_urls:
         return None
