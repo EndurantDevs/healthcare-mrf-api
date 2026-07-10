@@ -15,6 +15,8 @@ def _provider_directory_available() -> dict[str, bool]:
         "provider_directory_location": True,
         "provider_directory_location.address_key": True,
         "provider_directory_practitioner_role": True,
+        "provider_directory_insurance_plan": True,
+        "provider_directory_network_catalog": True,
         "provider_directory_healthcare_service": True,
         "provider_directory_organization_affiliation": True,
     }
@@ -48,12 +50,42 @@ def test_source_selects_add_provider_directory_practitioner_and_organization_pat
     assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in sql
     assert "healthcare_service.resource_id = service_ref_id.resource_id" in sql
     assert "healthcare_service.active IS DISTINCT FROM false" in sql
-    assert "ORDER BY 1" in sql
+    assert "ORDER BY plan_identifier" in sql
+    assert "ORDER BY network_name" in sql
     assert "'provider_directory_fhir'::varchar AS address_source" in sql
     assert "provider_directory_fhir:practitioner_role:" in sql
     assert "provider_directory_fhir:organization_affiliation:" in sql
     assert "provider_directory_fhir:organization_address:" in sql
     assert "jsonb_array_elements(\n                        COALESCE(organization.address_json::jsonb" in sql
+
+
+def test_practitioner_role_resolves_plan_identifiers_and_network_organizations():
+    selects = entity_address_unified._source_selects("mrf", _provider_directory_available())
+    sql = selects[0]
+
+    assert "COALESCE(role.insurance_plan_refs::jsonb, '[]'::jsonb)" in sql
+    assert "JOIN mrf.provider_directory_insurance_plan AS insurance_plan" in sql
+    assert "insurance_plan.source_id = role.source_id" in sql
+    assert "insurance_plan.resource_id = NULLIF(BTRIM(CASE" in sql
+    assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
+    assert "LEFT JOIN mrf.provider_directory_network_catalog AS network_catalog" in sql
+    assert "network_catalog.network_resource_id = network_ref.network_resource_id" in sql
+    assert "LEFT JOIN mrf.provider_directory_organization AS network_organization" in sql
+    assert "COALESCE(network_catalog.provider_directory_network_name, network_organization.name)" in sql
+    assert "COALESCE(pd.plan_identifiers, ARRAY[]::varchar[])::varchar[] AS aca_plan_array" in sql
+    assert "COALESCE(pd.network_names, ARRAY[]::varchar[])::varchar[] AS aca_network_array" in sql
+    assert "network_ref.value::varchar" not in sql.split("AS aca_network_array", 1)[0][-500:]
+
+
+def test_practitioner_role_network_resolution_falls_back_to_organization_table():
+    available = _provider_directory_available()
+    available["provider_directory_network_catalog"] = False
+
+    sql = entity_address_unified._source_selects("mrf", available)[0]
+
+    assert "provider_directory_network_catalog" not in sql
+    assert "LEFT JOIN mrf.provider_directory_organization AS network_organization" in sql
+    assert "NULLIF(BTRIM(COALESCE(network_organization.name)), '')" in sql
 
 
 def test_provider_directory_source_selects_keep_keyable_address_and_phone_filters():

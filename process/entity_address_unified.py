@@ -2576,6 +2576,141 @@ async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str 
     return _clean_optional(values.get("run_id")), source_ids, scope_sources
 
 
+def _provider_directory_reference_resource_id_sql(reference: str, resource_type: str) -> str:
+    return (
+        "NULLIF(BTRIM(CASE "
+        f"WHEN {reference} LIKE '%/{resource_type}/%' "
+        f"THEN regexp_replace({reference}, '^.*/{resource_type}/', '') "
+        f"WHEN {reference} LIKE '{resource_type}/%' "
+        f"THEN regexp_replace({reference}, '^{resource_type}/', '') "
+        f"ELSE {reference} END), '')"
+    )
+
+
+def _provider_directory_referenced_plans_sql(
+    db_schema: str,
+    owner_alias: str,
+    has_insurance_plan: bool,
+) -> str:
+    if not has_insurance_plan:
+        return (
+            "SELECT NULL::varchar AS resource_id, NULL::varchar AS plan_identifier, "
+            "'[]'::jsonb AS network_refs WHERE FALSE"
+        )
+    plan_resource_id = _provider_directory_reference_resource_id_sql(
+        "plan_ref.value",
+        "InsurancePlan",
+    )
+    return f"""
+        SELECT DISTINCT
+            insurance_plan.resource_id::varchar AS resource_id,
+            NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS plan_identifier,
+            COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb) AS network_refs
+          FROM jsonb_array_elements_text(
+                COALESCE({owner_alias}.insurance_plan_refs::jsonb, '[]'::jsonb)
+          ) AS plan_ref(value)
+          JOIN {db_schema}.provider_directory_insurance_plan AS insurance_plan
+            ON insurance_plan.source_id = {owner_alias}.source_id
+           AND insurance_plan.resource_id = {plan_resource_id}
+    """
+
+
+def _provider_directory_resolved_networks_sql(
+    db_schema: str,
+    owner_alias: str,
+    *,
+    has_network_catalog: bool,
+    has_organization: bool,
+) -> str:
+    network_resource_id = _provider_directory_reference_resource_id_sql(
+        "network_ref.reference",
+        "Organization",
+    )
+    joins: list[str] = []
+    name_candidates: list[str] = []
+    if has_network_catalog:
+        joins.append(
+            f"LEFT JOIN {db_schema}.provider_directory_network_catalog AS network_catalog "
+            f"ON network_catalog.source_id = {owner_alias}.source_id "
+            f"AND network_catalog.network_resource_id = network_ref.network_resource_id"
+        )
+        name_candidates.append("network_catalog.provider_directory_network_name")
+    if has_organization:
+        joins.append(
+            f"LEFT JOIN {db_schema}.provider_directory_organization AS network_organization "
+            f"ON network_organization.source_id = {owner_alias}.source_id "
+            f"AND network_organization.resource_id = network_ref.network_resource_id "
+            "AND network_organization.active IS DISTINCT FROM false"
+        )
+        name_candidates.append("network_organization.name")
+    if not name_candidates:
+        return "SELECT NULL::varchar AS resource_id, NULL::varchar AS network_name WHERE FALSE"
+    network_name = f"NULLIF(BTRIM(COALESCE({', '.join(name_candidates)})), '')"
+    return f"""
+        SELECT DISTINCT
+            network_ref.network_resource_id::varchar AS resource_id,
+            {network_name}::varchar AS network_name
+          FROM (
+                SELECT {network_resource_id}::varchar AS network_resource_id
+                  FROM network_references AS network_ref
+          ) AS network_ref
+          {' '.join(joins)}
+         WHERE network_ref.network_resource_id IS NOT NULL
+           AND {network_name} IS NOT NULL
+    """
+
+
+def _provider_directory_plan_network_join_sql(
+    db_schema: str,
+    owner_alias: str,
+    available: dict[str, bool],
+    *,
+    include_insurance_plans: bool,
+) -> str:
+    referenced_plans_sql = _provider_directory_referenced_plans_sql(
+        db_schema,
+        owner_alias,
+        include_insurance_plans and available.get("provider_directory_insurance_plan", False),
+    )
+    resolved_networks_sql = _provider_directory_resolved_networks_sql(
+        db_schema,
+        owner_alias,
+        has_network_catalog=available.get("provider_directory_network_catalog", False),
+        has_organization=available.get("provider_directory_organization", False),
+    )
+    return f"""
+                  LEFT JOIN LATERAL (
+                      WITH referenced_plans AS MATERIALIZED (
+                          {referenced_plans_sql}
+                      ), network_references AS (
+                          SELECT network_ref.value::varchar AS reference
+                            FROM jsonb_array_elements_text(
+                                  COALESCE({owner_alias}.network_refs::jsonb, '[]'::jsonb)
+                            ) AS network_ref(value)
+                          UNION
+                          SELECT plan_network_ref.value::varchar AS reference
+                            FROM referenced_plans AS referenced_plan
+                           CROSS JOIN LATERAL jsonb_array_elements_text(
+                                  referenced_plan.network_refs
+                           ) AS plan_network_ref(value)
+                      ), resolved_networks AS (
+                          {resolved_networks_sql}
+                      )
+                      SELECT
+                          ARRAY(
+                              SELECT DISTINCT plan_identifier
+                                FROM referenced_plans
+                               WHERE plan_identifier IS NOT NULL
+                            ORDER BY plan_identifier
+                          )::varchar[] AS plan_identifiers,
+                          ARRAY(
+                              SELECT network_name
+                                FROM resolved_networks
+                            ORDER BY network_name
+                          )::varchar[] AS network_names
+                  ) AS plan_network_evidence ON TRUE"""
+
+
 def _source_selects(
     db_schema: str,
     available: dict[str, bool],
@@ -2676,6 +2811,18 @@ def _source_selects(
         "organization",
         source_ids=provider_directory_source_ids,
         run_id=provider_directory_run_id,
+    )
+    provider_directory_role_plan_network_join = _provider_directory_plan_network_join_sql(
+        db_schema,
+        "role",
+        available,
+        include_insurance_plans=True,
+    )
+    provider_directory_affiliation_plan_network_join = _provider_directory_plan_network_join_sql(
+        db_schema,
+        "affiliation",
+        available,
+        include_insurance_plans=False,
     )
     if has_provider_directory_healthcare_service:
         provider_directory_role_location_refs = f"""
@@ -3252,7 +3399,8 @@ def _source_selects(
                     role.source_id,
                     role.resource_id AS role_resource_id,
                     role.updated_at AS role_updated_at,
-                    role.network_refs::jsonb AS network_refs,
+                    plan_network_evidence.plan_identifiers,
+                    plan_network_evidence.network_names,
                     loc.resource_id AS location_resource_id,
                     loc.name::varchar AS location_name,
                     loc.first_line::varchar AS first_line,
@@ -3274,6 +3422,7 @@ def _source_selects(
                         regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
                         ''
                    )
+                  {provider_directory_role_plan_network_join}
                   {provider_directory_role_location_refs}
                   JOIN LATERAL (
                       SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
@@ -3311,13 +3460,8 @@ def _source_selects(
                 {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
                 {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
                 {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
-                ARRAY[]::varchar[] AS aca_plan_array,
-                ARRAY(
-                    SELECT DISTINCT network_ref.value::varchar
-                      FROM jsonb_array_elements_text(COALESCE(pd.network_refs, '[]'::jsonb)) AS network_ref(value)
-                     WHERE NULLIF(network_ref.value, '') IS NOT NULL
-                  ORDER BY 1
-                )::varchar[] AS aca_network_array,
+                COALESCE(pd.plan_identifiers, ARRAY[]::varchar[])::varchar[] AS aca_plan_array,
+                COALESCE(pd.network_names, ARRAY[]::varchar[])::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
@@ -3362,7 +3506,7 @@ def _source_selects(
                     affiliation.source_id,
                     affiliation.resource_id AS affiliation_resource_id,
                     affiliation.updated_at AS affiliation_updated_at,
-                    affiliation.network_refs::jsonb AS network_refs,
+                    plan_network_evidence.network_names,
                     loc.resource_id AS location_resource_id,
                     loc.name::varchar AS location_name,
                     loc.first_line::varchar AS first_line,
@@ -3390,6 +3534,7 @@ def _source_selects(
                   JOIN {db_schema}.provider_directory_organization AS organization
                     ON organization.source_id = affiliation.source_id
                    AND organization.resource_id = organization_ref.resource_id
+                  {provider_directory_affiliation_plan_network_join}
                   {provider_directory_affiliation_location_refs}
                   JOIN LATERAL (
                       SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
@@ -3421,12 +3566,7 @@ def _source_selects(
                 {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
                 {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
                 ARRAY[]::varchar[] AS aca_plan_array,
-                ARRAY(
-                    SELECT DISTINCT network_ref.value::varchar
-                      FROM jsonb_array_elements_text(COALESCE(pd.network_refs, '[]'::jsonb)) AS network_ref(value)
-                     WHERE NULLIF(network_ref.value, '') IS NOT NULL
-                  ORDER BY 1
-                )::varchar[] AS aca_network_array,
+                COALESCE(pd.network_names, ARRAY[]::varchar[])::varchar[] AS aca_network_array,
                 ARRAY[]::varchar[] AS ptg_plan_array,
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
@@ -9732,6 +9872,9 @@ async def process_data(ctx, task=None):
         "provider_directory_organization",
         "provider_directory_location",
         "provider_directory_practitioner_role",
+        "provider_directory_insurance_plan",
+        "provider_directory_network_catalog",
+        "provider_directory_healthcare_service",
         "provider_directory_organization_affiliation",
         "address_archive_v2",
     ]

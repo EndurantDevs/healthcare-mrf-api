@@ -606,6 +606,10 @@ def _primary_total_cache_set(value: int) -> int:
     return int(value)
 
 
+MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
+MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 4096
+
+
 def _has_insurance_total_cache_key(city: Optional[str], state: Optional[str]) -> str:
     city_key = (city or "").strip().upper()
     state_key = (state or "").strip().upper()
@@ -893,6 +897,223 @@ def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> l
     return source_ids
 
 
+def _directory_role_keys_from_records(record_ids: Any) -> list[tuple[str, str]]:
+    candidates = record_ids if isinstance(record_ids, (list, tuple, set)) else [record_ids]
+    role_key_list: list[tuple[str, str]] = []
+    seen_set: set[tuple[str, str]] = set()
+    for raw_record_id in candidates:
+        parts = str(raw_record_id or "").split(":")
+        if len(parts) < 5 or parts[:2] != ["provider_directory_fhir", "practitioner_role"]:
+            continue
+        role_key = (parts[2].strip(), parts[3].strip())
+        if not all(role_key) or role_key in seen_set:
+            continue
+        seen_set.add(role_key)
+        role_key_list.append(role_key)
+    return role_key_list
+
+
+def _provider_directory_role_keys_from_addresses(
+    addresses: Sequence[Any],
+) -> list[tuple[str, str]]:
+    role_key_list: list[tuple[str, str]] = []
+    seen_set: set[tuple[str, str]] = set()
+    for address in addresses or []:
+        if not isinstance(address, Mapping):
+            continue
+        for role_key in _directory_role_keys_from_records(
+            address.get("source_record_ids")
+        ):
+            if role_key in seen_set:
+                continue
+            seen_set.add(role_key)
+            role_key_list.append(role_key)
+            if len(role_key_list) >= MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS:
+                return role_key_list
+    return role_key_list
+
+
+def _provider_directory_reference_resource_id_sql(reference: str, resource_type: str) -> str:
+    return (
+        "NULLIF(BTRIM(CASE "
+        f"WHEN {reference} LIKE '%/{resource_type}/%' "
+        f"THEN regexp_replace({reference}, '^.*/{resource_type}/', '') "
+        f"WHEN {reference} LIKE '{resource_type}/%' "
+        f"THEN regexp_replace({reference}, '^{resource_type}/', '') "
+        f"ELSE {reference} END), '')"
+    )
+
+
+def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
+    organization_join = (
+        f"LEFT JOIN {schema}.provider_directory_organization AS network_organization "
+        "ON network_organization.source_id = network.source_id "
+        "AND network_organization.resource_id = network.resource_id "
+        "AND network_organization.active IS DISTINCT FROM false"
+    )
+    if not has_catalog:
+        return organization_join, "network_organization.name", "'provider_directory_organization'::varchar"
+    catalog_join = (
+        f"LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog "
+        "ON network_catalog.source_id = network.source_id "
+        "AND network_catalog.network_resource_id = network.resource_id"
+    )
+    network_name = "COALESCE(network_catalog.provider_directory_network_name, network_organization.name)"
+    provenance = (
+        "CASE WHEN network_catalog.provider_directory_network_name IS NOT NULL "
+        "THEN 'provider_directory_network_catalog'::varchar "
+        "ELSE 'provider_directory_organization'::varchar END"
+    )
+    return f"{catalog_join} {organization_join}", network_name, provenance
+
+
+def _provider_directory_role_ctes_sql(schema: str) -> str:
+    plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
+    network_id = _provider_directory_reference_resource_id_sql("network_ref.reference", "Organization")
+    return f"""
+    requested_roles AS (
+        SELECT source_id, role_id
+          FROM unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))
+               AS requested(source_id, role_id)
+    ), roles AS MATERIALIZED (
+        SELECT role.source_id, role.resource_id AS role_id,
+               role.insurance_plan_refs::jsonb, role.network_refs::jsonb
+          FROM requested_roles AS requested
+          JOIN {schema}.provider_directory_practitioner_role AS role
+            ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
+         WHERE role.active IS DISTINCT FROM false
+    ), plans AS MATERIALIZED (
+        SELECT role.source_id, role.role_id, insurance_plan.resource_id,
+               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
+               COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb) AS network_refs
+          FROM roles AS role
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+               COALESCE(role.insurance_plan_refs, '[]'::jsonb)
+         ) AS plan_ref(value)
+          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+            ON insurance_plan.source_id = role.source_id
+           AND insurance_plan.resource_id = {plan_id}
+    ), network_references AS (
+        SELECT role.source_id, role.role_id, network_ref.value::varchar AS reference
+          FROM roles AS role
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+               COALESCE(role.network_refs, '[]'::jsonb)
+         ) AS network_ref(value)
+        UNION
+        SELECT plan.source_id, plan.role_id, network_ref.value::varchar AS reference
+          FROM plans AS plan
+         CROSS JOIN LATERAL jsonb_array_elements_text(plan.network_refs) AS network_ref(value)
+    ), networks AS (
+        SELECT network_ref.source_id, network_ref.role_id, network_ref.reference,
+               {network_id}::varchar AS resource_id
+          FROM network_references AS network_ref
+    )
+    """
+
+
+def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> str:
+    network_joins, network_name, network_provenance = _provider_directory_network_resolution_sql(
+        schema,
+        has_catalog,
+    )
+    return f"""
+        SELECT plan.source_id, plan.role_id, 'insurance_plan'::varchar AS evidence_type,
+               plan.resource_id, plan.identifier, NULL::varchar AS name,
+               NULL::varchar AS reference, 'provider_directory_insurance_plan'::varchar AS provenance
+          FROM plans AS plan
+        UNION ALL
+        SELECT network.source_id, network.role_id, 'network'::varchar AS evidence_type,
+               network.resource_id, NULL::varchar AS identifier,
+               NULLIF(BTRIM({network_name}), '')::varchar AS name,
+               network.reference, {network_provenance} AS provenance
+          FROM networks AS network
+          {network_joins}
+         WHERE network.resource_id IS NOT NULL AND NULLIF(BTRIM({network_name}), '') IS NOT NULL
+    """
+
+
+def _provider_directory_role_evidence_sql(schema: str, has_catalog: bool) -> str:
+    role_ctes_sql = _provider_directory_role_ctes_sql(schema)
+    evidence_union_sql = _provider_directory_evidence_union_sql(schema, has_catalog)
+    return f"""
+    WITH {role_ctes_sql}, evidence AS (
+        {evidence_union_sql}
+    )
+    SELECT source_id, role_id, evidence_type, resource_id, identifier, name, reference, provenance
+      FROM evidence
+  ORDER BY source_id, role_id, evidence_type, resource_id
+     LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
+    """
+
+
+def _append_unique_mapping(items: list[dict[str, Any]], value: dict[str, Any]) -> None:
+    marker = json.dumps(value, sort_keys=True, default=str)
+    if any(json.dumps(item, sort_keys=True, default=str) == marker for item in items):
+        return
+    items.append(value)
+
+
+def _map_provider_directory_role_evidence(
+    rows: Sequence[Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    role_evidence_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        mapping = getattr(row, "_mapping", row)
+        role_key = (str(mapping["source_id"]), str(mapping["role_id"]))
+        role_evidence = role_evidence_map.setdefault(
+            role_key,
+            {"insurance_plans": [], "networks": []},
+        )
+        if mapping["evidence_type"] == "insurance_plan":
+            plan_detail_map = {
+                "resource_type": "InsurancePlan",
+                "resource_id": mapping["resource_id"],
+                "identifier": mapping["identifier"],
+            }
+            _append_unique_mapping(role_evidence["insurance_plans"], plan_detail_map)
+        elif mapping["evidence_type"] == "network":
+            network_detail_map = {
+                "resource_type": "Organization",
+                "resource_id": mapping["resource_id"],
+                "name": mapping["name"],
+                "reference": mapping["reference"],
+                "provenance": mapping["provenance"],
+            }
+            _append_unique_mapping(role_evidence["networks"], network_detail_map)
+    return role_evidence_map
+
+
+async def _fetch_provider_directory_role_evidence_map(
+    role_key_list: Sequence[tuple[str, str]],
+    *,
+    session: Any = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    bounded_keys = list(dict.fromkeys(role_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
+    if not bounded_keys:
+        return {}
+    required_tables = [
+        await _table_exists(table_name, session=session)
+        for table_name in (
+            "provider_directory_practitioner_role",
+            "provider_directory_insurance_plan",
+            "provider_directory_organization",
+        )
+    ]
+    if not all(required_tables):
+        return {}
+    has_catalog = await _table_exists("provider_directory_network_catalog", session=session)
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    result = await _execute_stmt(
+        text(_provider_directory_role_evidence_sql(schema, has_catalog)),
+        session=session,
+        params={
+            "source_ids": [source_id for source_id, _role_id in bounded_keys],
+            "role_ids": [role_id for _source_id, role_id in bounded_keys],
+        },
+    )
+    return _map_provider_directory_role_evidence(result.all())
+
+
 def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
     table = ProviderDirectorySource.__table__
     selected_endpoints = (
@@ -1006,9 +1227,49 @@ def _provider_directory_catalog_alias(source_detail: Mapping[str, Any]) -> dict[
     }
 
 
+def _provider_directory_role_evidence_fields(
+    source_ids: Sequence[str],
+    detail_by_id: Mapping[str, Mapping[str, Any]],
+    endpoint_key: tuple[str, str],
+    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    endpoint_source_ids = {
+        source_id
+        for source_id in source_ids
+        if (source_detail := detail_by_id.get(source_id))
+        and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+    }
+    matching_role_evidence_list = [
+        (role_key, role_evidence)
+        for role_key, role_evidence in role_evidence_map.items()
+        if role_key[0] in endpoint_source_ids
+    ]
+    if not matching_role_evidence_list:
+        return {}
+    field_map: dict[str, Any] = {
+        "source_ids": sorted(endpoint_source_ids),
+        "practitioner_role_ids": sorted(
+            {role_key[1] for role_key, _role_evidence in matching_role_evidence_list}
+        ),
+    }
+    insurance_plan_list: list[dict[str, Any]] = []
+    network_list: list[dict[str, Any]] = []
+    for _role_key, role_evidence in matching_role_evidence_list:
+        for plan_detail in role_evidence.get("insurance_plans") or []:
+            _append_unique_mapping(insurance_plan_list, dict(plan_detail))
+        for network_detail in role_evidence.get("networks") or []:
+            _append_unique_mapping(network_list, dict(network_detail))
+    if insurance_plan_list:
+        field_map["insurance_plans"] = insurance_plan_list
+    if network_list:
+        field_map["networks"] = network_list
+    return field_map
+
+
 def _provider_directory_endpoint_provenance(
     source_ids: Sequence[str],
     detail_by_id: Mapping[str, Mapping[str, Any]],
+    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     selected_endpoint_keys: list[tuple[str, str]] = []
     for source_id in source_ids:
@@ -1040,6 +1301,14 @@ def _provider_directory_endpoint_provenance(
         }
         if endpoint_key[0] == "endpoint_id":
             endpoint_provenance_map["endpoint_id"] = endpoint_key[1]
+        endpoint_provenance_map.update(
+            _provider_directory_role_evidence_fields(
+                source_ids,
+                detail_by_id,
+                endpoint_key,
+                role_evidence_map or {},
+            )
+        )
         endpoint_provenance_items.append(endpoint_provenance_map)
     return endpoint_provenance_items
 
@@ -1055,6 +1324,11 @@ async def _attach_provider_directory_source_details(
     detail_by_id = await _fetch_provider_directory_source_detail_map(source_ids, session=session)
     if not detail_by_id:
         return
+    role_key_list = _provider_directory_role_keys_from_addresses(addresses)
+    role_evidence_map = await _fetch_provider_directory_role_evidence_map(
+        role_key_list,
+        session=session,
+    )
     for address in addresses:
         if not isinstance(address, dict):
             continue
@@ -1064,6 +1338,7 @@ async def _attach_provider_directory_source_details(
         endpoint_provenance = _provider_directory_endpoint_provenance(
             address_source_ids,
             detail_by_id,
+            role_evidence_map,
         )
         if endpoint_provenance:
             address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = endpoint_provenance
