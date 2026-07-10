@@ -11,6 +11,22 @@ def test_provider_directory_coverage_audit_parse_args_accepts_ptg_plan_filter():
     assert args.ptg_plan_id == "010854205"
 
 
+def test_provider_directory_coverage_audit_defaults_to_maintained_source_manifest():
+    args = audit.parse_args([])
+
+    assert args.semantic_source_manifest == str(audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST)
+
+
+def test_provider_directory_coverage_audit_loads_all_maintained_source_ids():
+    source_ids = audit._maintained_source_ids_from_manifest(
+        audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST
+    )
+
+    assert len(source_ids) == 28
+    assert len(set(source_ids)) == 28
+    assert all(audit.PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id) for source_id in source_ids)
+
+
 def test_provider_directory_coverage_audit_includes_endpoint_table():
     assert "provider_directory_endpoint" in audit.PROVIDER_DIRECTORY_RESOURCE_TABLES
     assert audit.PROVIDER_DIRECTORY_RESOURCE_TABLE_BY_TYPE["Endpoint"] == "provider_directory_endpoint"
@@ -2585,6 +2601,20 @@ def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and
     assert ")::boolean\n                   AS has_valid_npi" in sql
 
 
+def test_provider_directory_coverage_audit_semantic_readiness_sql_accepts_exact_scope():
+    sql = audit._source_semantic_readiness_sql(
+        "mrf",
+        available_tables={"provider_directory_practitioner"},
+        include_unified=False,
+        maintained_source_scope=True,
+    )
+
+    assert "unnest($1::varchar[])" in sql
+    assert "source.source_id = requested.source_id" in sql
+    assert "LIMIT ($1::integer + 1)" not in sql
+    assert "source.source_id::varchar =" not in sql
+
+
 def test_provider_directory_coverage_audit_semantic_readiness_sql_types_missing_relations():
     sql = audit._source_semantic_readiness_sql(
         "mrf",
@@ -2639,6 +2669,38 @@ def _semantic_readiness_probe_rows():
         },
         {"source_id": "pdfhir_truncation_sentinel"},
     ]
+
+
+def _exact_semantic_readiness_probe_rows(ready_source_id, missing_source_id):
+    """Return one ready maintained source and one catalog-missing source."""
+    ready_fields_by_name = dict(_semantic_readiness_probe_rows()[0])
+    ready_fields_by_name.update(
+        {
+            "source_id": ready_source_id,
+            "catalog_source_present": True,
+        }
+    )
+    return [
+        ready_fields_by_name,
+        {
+            "source_id": missing_source_id,
+            "catalog_source_present": False,
+        },
+    ]
+
+
+class SemanticReadinessFakeConnection:
+    """Capture semantic readiness SQL and return configured rows."""
+
+    def __init__(self, result_rows):
+        self.result_rows = result_rows
+        self.sql = ""
+        self.args = ()
+
+    async def fetch(self, sql, *query_arguments):
+        self.sql = sql
+        self.args = query_arguments
+        return self.result_rows
 
 
 def _assert_semantic_readiness_markdown(summary):
@@ -2728,6 +2790,49 @@ async def test_provider_directory_coverage_audit_source_semantic_readiness_summa
     assert summary["coordinate_check_available"] is True
     _assert_semantic_readiness_summary(summary)
     _assert_semantic_readiness_markdown(summary)
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_exact_semantic_scope_retains_missing_catalog_ids(
+    monkeypatch,
+):
+    """Manifest scope is complete even when one maintained ID is absent from the catalog."""
+    ready_source_id = "pdfhir_111111111111111111111111"
+    missing_source_id = "pdfhir_222222222222222222222222"
+
+    async def is_relation_available(_conn, _schema, _name):
+        return True
+
+    async def is_column_available(_conn, _schema, _table_name, _column_name):
+        return True
+
+    conn = SemanticReadinessFakeConnection(
+        _exact_semantic_readiness_probe_rows(ready_source_id, missing_source_id)
+    )
+    monkeypatch.setattr(audit, "_relation_exists", is_relation_available)
+    monkeypatch.setattr(audit, "_column_exists", is_column_available)
+
+    summary = await audit._bounded_source_semantic_readiness_summary(
+        conn,
+        "mrf",
+        sample_limit=1,
+        include_unified=True,
+        maintained_source_ids=[ready_source_id, missing_source_id],
+    )
+
+    assert conn.args == ([ready_source_id, missing_source_id],)
+    assert "unnest($1::varchar[])" in conn.sql
+    assert summary["scope"] == "maintained_manifest_source_ids"
+    assert summary["sampled_source_count"] == 2
+    assert summary["maintained_source_id_count"] == 2
+    assert summary["missing_maintained_source_count"] == 1
+    assert summary["missing_maintained_source_ids"] == [missing_source_id]
+    assert summary["truncated"] is False
+    assert summary["counts_are_sampled"] is False
+    assert summary["semantic_ready_source_count"] == 1
+    assert "cover all `2` source IDs" in audit.render_markdown(
+        {"source_semantic_readiness_summary": summary}
+    )
 
 
 @pytest.mark.asyncio

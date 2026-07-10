@@ -2807,6 +2807,11 @@ async def _source_resource_coverage_summary(
     return row
 
 
+DEFAULT_SEMANTIC_SOURCE_MANIFEST = (
+    Path(__file__).resolve().parents[2]
+    / "specs/provider_directory_endpoint_acquisition_manifest.json"
+)
+PROVIDER_DIRECTORY_SOURCE_ID_RE = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 PROVIDER_DIRECTORY_SEMANTIC_PROBE_TABLES = frozenset(
     {
         "provider_directory_practitioner",
@@ -2825,6 +2830,41 @@ PROVIDER_DIRECTORY_SEMANTIC_ORDER_COLUMN_BY_TABLE = {
     "provider_directory_address_overlay": "source_id",
     "provider_directory_network_catalog": "network_resource_id",
 }
+
+
+def _validated_maintained_source_ids(
+    source_ids: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """Validate and deduplicate an explicit Provider Directory audit scope."""
+    maintained_source_ids: list[str] = []
+    seen_source_ids: set[str] = set()
+    for source_id_value in source_ids:
+        source_id = str(source_id_value or "").strip()
+        if not PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id):
+            raise ValueError(f"invalid maintained Provider Directory source_id: {source_id!r}")
+        if source_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_id)
+        maintained_source_ids.append(source_id)
+    if not maintained_source_ids:
+        raise ValueError("maintained Provider Directory source scope must not be empty")
+    return tuple(maintained_source_ids)
+
+
+def _maintained_source_ids_from_manifest(manifest_path: str | Path) -> tuple[str, ...]:
+    """Load the exact source scope from the validated acquisition manifest."""
+    try:
+        from scripts.research.provider_directory_endpoint_acquisition_harness import load_manifest
+    except ModuleNotFoundError:
+        from provider_directory_endpoint_acquisition_harness import load_manifest
+
+    manifest = load_manifest(Path(manifest_path))
+    source_ids = [
+        source_id
+        for entry in manifest["entries"]
+        for source_id in entry["source_ids"]
+    ]
+    return _validated_maintained_source_ids(source_ids)
 
 
 def _bounded_source_rows_sql(
@@ -3190,12 +3230,45 @@ def _source_downstream_probe_sql_by_name(
     }
 
 
+def _semantic_source_selection_sql(schema: str, *, maintained_source_scope: bool) -> str:
+    """Select either an exact maintained scope or a bounded catalog sample."""
+    source_table = _qt(schema, "provider_directory_source")
+    if maintained_source_scope:
+        return f"""
+            SELECT requested.source_id::varchar AS source_id,
+                   source.org_name,
+                   source.plan_name,
+                   source.canonical_api_base,
+                   source.last_probe_status,
+                   source.last_validated_status,
+                   source.auth_type,
+                   (source.source_id IS NOT NULL)::boolean AS catalog_source_present
+              FROM unnest($1::varchar[]) AS requested(source_id)
+              LEFT JOIN {source_table} AS source
+                ON source.source_id = requested.source_id
+        """
+    return f"""
+        SELECT source_id::varchar AS source_id,
+               org_name,
+               plan_name,
+               canonical_api_base,
+               last_probe_status,
+               last_validated_status,
+               auth_type,
+               true::boolean AS catalog_source_present
+          FROM {source_table}
+         ORDER BY source_id
+         LIMIT ($1::integer + 1)
+    """
+
+
 def _source_semantic_readiness_sql(
     schema: str,
     *,
     available_tables: set[str],
     include_unified: bool,
     include_coordinates: bool = True,
+    maintained_source_scope: bool = False,
 ) -> str:
     """Build a bounded, typed per-source semantic readiness query."""
     probe_sql_by_name = _source_base_probe_sql_by_name(schema, available_tables)
@@ -3208,18 +3281,13 @@ def _source_semantic_readiness_sql(
             include_coordinates=include_coordinates,
         )
     )
+    selected_sources_sql = _semantic_source_selection_sql(
+        schema,
+        maintained_source_scope=maintained_source_scope,
+    )
     return f"""
         WITH selected_sources AS (
-            SELECT source_id::varchar AS source_id,
-                   org_name,
-                   plan_name,
-                   canonical_api_base,
-                   last_probe_status,
-                   last_validated_status,
-                   auth_type
-              FROM {_qt(schema, "provider_directory_source")}
-             ORDER BY source_id
-             LIMIT ($1::integer + 1)
+            {selected_sources_sql}
         )
         SELECT src.*,
                ({probe_sql_by_name['practitioner']} OR {probe_sql_by_name['organization']})::boolean
@@ -3353,17 +3421,11 @@ def _semantic_summary_by_metric(
     return summary_by_metric
 
 
-async def _bounded_source_semantic_readiness_summary(
+async def _semantic_probe_context(
     connection: asyncpg.Connection,
     db_schema: str,
-    *,
-    sample_limit: int,
-    include_unified: bool,
-) -> dict[str, Any]:
-    """Sample per-source acquisition and semantic usability with bounded probes."""
-    if not await _relation_exists(connection, db_schema, "provider_directory_source"):
-        return {"available": False, "samples": []}
-
+) -> tuple[set[str], bool]:
+    """Return available semantic tables and whether coordinate columns exist."""
     available_tables = {
         table_name
         for table_name in PROVIDER_DIRECTORY_SEMANTIC_PROBE_TABLES
@@ -3381,17 +3443,87 @@ async def _bounded_source_semantic_readiness_summary(
             for column_name in ("lat", "long")
         ]
         include_coordinates = all(coordinate_columns)
-    source_limit = max(1, int(sample_limit))
+    return available_tables, include_coordinates
+
+
+def _semantic_query_scope(
+    sample_limit: int,
+    maintained_source_ids: list[str] | tuple[str, ...] | None,
+) -> tuple[tuple[str, ...] | None, int, int | list[str]]:
+    """Return validated explicit IDs, result limit, and typed SQL argument."""
+    explicit_source_ids = (
+        _validated_maintained_source_ids(maintained_source_ids)
+        if maintained_source_ids is not None
+        else None
+    )
+    source_limit = len(explicit_source_ids) if explicit_source_ids else max(1, int(sample_limit))
+    query_argument: int | list[str] = (
+        list(explicit_source_ids) if explicit_source_ids else source_limit
+    )
+    return explicit_source_ids, source_limit, query_argument
+
+
+def _apply_semantic_scope_metadata(
+    summary_by_metric: dict[str, Any],
+    source_samples: list[dict[str, Any]],
+    explicit_source_ids: tuple[str, ...] | None,
+    *,
+    include_coordinates: bool,
+) -> None:
+    """Attach scope and missing-catalog metadata to a semantic summary."""
+    summary_by_metric["coordinate_check_available"] = include_coordinates
+    summary_by_metric["scope"] = (
+        "maintained_manifest_source_ids" if explicit_source_ids else "bounded_catalog_sample"
+    )
+    if not explicit_source_ids:
+        return
+    missing_source_ids = [
+        str(source_sample["source_id"])
+        for source_sample in source_samples
+        if source_sample.get("catalog_source_present") is False
+    ]
+    summary_by_metric.update(
+        {
+            "counts_are_sampled": False,
+            "truncated": False,
+            "maintained_source_id_count": len(explicit_source_ids),
+            "missing_maintained_source_count": len(missing_source_ids),
+            "missing_maintained_source_ids": missing_source_ids,
+        }
+    )
+
+
+async def _bounded_source_semantic_readiness_summary(
+    connection: asyncpg.Connection,
+    db_schema: str,
+    *,
+    sample_limit: int,
+    include_unified: bool,
+    maintained_source_ids: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Check sampled or explicitly maintained sources with bounded row probes."""
+    if not await _relation_exists(connection, db_schema, "provider_directory_source"):
+        return {"available": False, "samples": []}
+
+    available_tables, include_coordinates = await _semantic_probe_context(
+        connection,
+        db_schema,
+    )
+    explicit_source_ids, source_limit, query_argument = _semantic_query_scope(
+        sample_limit,
+        maintained_source_ids,
+    )
     source_probe_rows = await connection.fetch(
         _source_semantic_readiness_sql(
             db_schema,
             available_tables=available_tables,
             include_unified=include_unified,
             include_coordinates=include_coordinates,
+            maintained_source_scope=explicit_source_ids is not None,
         ),
-        source_limit,
+        query_argument,
     )
-    is_truncated = len(source_probe_rows) > source_limit
+    is_truncated = explicit_source_ids is None and len(source_probe_rows) > source_limit
     source_samples = [
         dict(source_probe_row) for source_probe_row in source_probe_rows[:source_limit]
     ]
@@ -3403,7 +3535,12 @@ async def _bounded_source_semantic_readiness_summary(
         is_truncated=is_truncated,
         include_unified=include_unified,
     )
-    summary_by_metric["coordinate_check_available"] = include_coordinates
+    _apply_semantic_scope_metadata(
+        summary_by_metric,
+        source_samples,
+        explicit_source_ids,
+        include_coordinates=include_coordinates,
+    )
     return summary_by_metric
 
 
@@ -4689,11 +4826,23 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
                 )
     semantic_readiness = report.get("source_semantic_readiness_summary") or {}
     if semantic_readiness.get("available") and _int(
-        semantic_readiness.get("raw_only_source_count")
+        semantic_readiness.get("missing_maintained_source_count")
     ):
         gaps.append(
+            f"{semantic_readiness['missing_maintained_source_count']} maintained Provider Directory "
+            "source(s) are absent from the source catalog."
+        )
+    if semantic_readiness.get("available") and _int(
+        semantic_readiness.get("raw_only_source_count")
+    ):
+        scope_label = (
+            "maintained"
+            if semantic_readiness.get("scope") == "maintained_manifest_source_ids"
+            else "bounded"
+        )
+        gaps.append(
             f"{semantic_readiness['raw_only_source_count']} of "
-            f"{semantic_readiness.get('sampled_source_count', 0)} bounded Provider Directory "
+            f"{semantic_readiness.get('sampled_source_count', 0)} {scope_label} Provider Directory "
             "source probe(s) have raw resources but incomplete downstream semantic evidence."
         )
     role_gap = report.get("practitioner_role_reimport_gap_summary") or {}
@@ -5051,6 +5200,11 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 sample_limit=args.sample_limit,
             )
         )
+        maintained_source_ids = (
+            None
+            if args.skip_unified
+            else _maintained_source_ids_from_manifest(args.semantic_source_manifest)
+        )
         report = {
             "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "schema": schema,
@@ -5101,6 +5255,7 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     schema,
                     sample_limit=args.sample_limit,
                     include_unified=True,
+                    maintained_source_ids=maintained_source_ids,
                 )
             ),
             "practitioner_role_reimport_gap_summary": await _practitioner_role_reimport_gap_summary(
@@ -5309,16 +5464,21 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"`{source_coverage.get('sources_with_location_rows')}` "
             f"({source_coverage.get('location_source_pct')}%)"
         )
-        if source_coverage.get("summary_source") == "bounded_per_source_exists_probes":
+        if semantic_readiness.get("summary_source") == "bounded_per_source_exists_probes":
+            semantic_scope = (
+                "maintained"
+                if semantic_readiness.get("scope") == "maintained_manifest_source_ids"
+                else "checked"
+            )
             lines.append(
-                f"- semantic readiness: `{source_coverage.get('semantic_ready_source_count')}` / "
-                f"`{source_coverage.get('sampled_source_count')}` checked source(s) ready; "
-                f"valid NPI `{source_coverage.get('sources_with_valid_npis')}`, "
-                f"canonical address `{source_coverage.get('sources_with_canonical_addresses')}`, "
-                f"usable phone `{source_coverage.get('sources_with_usable_phones')}`, "
-                f"resolved role/location `{source_coverage.get('sources_with_resolved_role_locations')}`, "
-                f"resolved role/plan `{source_coverage.get('sources_with_resolved_role_plans')}`, "
-                f"resolved network `{source_coverage.get('sources_with_resolved_network_evidence')}`"
+                f"- semantic readiness: `{semantic_readiness.get('semantic_ready_source_count')}` / "
+                f"`{semantic_readiness.get('sampled_source_count')}` {semantic_scope} source(s) ready; "
+                f"valid NPI `{semantic_readiness.get('sources_with_valid_npis')}`, "
+                f"canonical address `{semantic_readiness.get('sources_with_canonical_addresses')}`, "
+                f"usable phone `{semantic_readiness.get('sources_with_usable_phones')}`, "
+                f"resolved role/location `{semantic_readiness.get('sources_with_resolved_role_locations')}`, "
+                f"resolved role/plan `{semantic_readiness.get('sources_with_resolved_role_plans')}`, "
+                f"resolved network `{semantic_readiness.get('sources_with_resolved_network_evidence')}`"
             )
         if source_coverage.get("sources_with_valid_npi_organization_address_rows") is not None:
             lines.append(
@@ -5670,6 +5830,12 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"\n_Per-source checks are bounded to `{semantic_readiness.get('source_limit')}` source(s); "
                 "increase `--sample-limit` for a larger sample._"
             )
+        elif semantic_readiness.get("scope") == "maintained_manifest_source_ids":
+            lines.append(
+                f"\n_Per-source checks cover all `{semantic_readiness.get('maintained_source_id_count')}` "
+                "source IDs in the validated acquisition manifest; "
+                f"`{semantic_readiness.get('missing_maintained_source_count')}` are absent from the catalog._"
+            )
         lines.append(
             f"\n_Each semantic probe inspects at most `{semantic_readiness.get('source_row_limit')}` "
             "rows per source and resource table._"
@@ -5806,6 +5972,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--sample-limit", type=int, default=10)
+    parser.add_argument(
+        "--semantic-source-manifest",
+        default=str(DEFAULT_SEMANTIC_SOURCE_MANIFEST),
+        help=(
+            "Validated endpoint-acquisition manifest whose exact source IDs scope the "
+            "per-source semantic readiness section."
+        ),
+    )
     parser.add_argument(
         "--statement-timeout-ms",
         type=int,
