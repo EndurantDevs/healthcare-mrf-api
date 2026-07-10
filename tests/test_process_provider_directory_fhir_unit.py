@@ -10260,7 +10260,7 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_resource_rows_uses_rest_for_ineligible_source(monkeypatch):
+async def test_ineligible_bulk_source_uses_rest_fetch(monkeypatch):
     """A Bulk request for an ineligible source must transparently use REST."""
     bulk_fetch = AsyncMock(
         side_effect=AssertionError("ineligible sources must not request Bulk export")
@@ -10283,7 +10283,7 @@ async def test_fetch_resource_rows_uses_rest_for_ineligible_source(monkeypatch):
             10,
         )
     )
-    source_record = {
+    source_lookup = {
         "source_id": "rest-source",
         "api_base": "https://example.test/fhir",
     }
@@ -10291,7 +10291,7 @@ async def test_fetch_resource_rows_uses_rest_for_ineligible_source(monkeypatch):
     monkeypatch.setattr(importer, "_fetch_json", rest_fetch)
 
     fetch_result = await importer._fetch_resource_rows(
-        source_record,
+        source_lookup,
         "Practitioner",
         per_resource_limit=1,
         page_limit=1,
