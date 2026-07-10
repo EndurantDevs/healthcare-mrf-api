@@ -13,14 +13,26 @@ except ModuleNotFoundError:
     import provider_directory_endpoint_acquisition_harness as harness
 
 
+def _default_control_url() -> str | None:
+    """Prefer the current runtime variable while retaining legacy compatibility."""
+    return os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_URL")
+
+
+def _default_token_environment_name() -> str:
+    """Select the current token key without reading its secret value."""
+    if "HLTHPRT_IMPORT_CONTROL_TOKEN" in os.environ or "HP_IMPORT_CONTROL_TOKEN" not in os.environ:
+        return "HLTHPRT_IMPORT_CONTROL_TOKEN"
+    return "HP_IMPORT_CONTROL_TOKEN"
+
+
 def parse_acquisition_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse campaign controls without reading credentials."""
     parser = argparse.ArgumentParser(description=harness.__doc__)
     parser.add_argument("--manifest", type=Path, default=harness.DEFAULT_MANIFEST)
     parser.add_argument("--state", type=Path, default=harness.DEFAULT_STATE)
     parser.add_argument("--report", type=Path, default=harness.DEFAULT_REPORT)
-    parser.add_argument("--control-url", default=os.getenv("HP_IMPORT_CONTROL_URL"))
-    parser.add_argument("--token-env", default="HP_IMPORT_CONTROL_TOKEN")
+    parser.add_argument("--control-url", default=_default_control_url())
+    parser.add_argument("--token-env", default=_default_token_environment_name())
     parser.add_argument("--entry", action="append", default=[], help="Run only this manifest entry; repeatable.")
     parser.add_argument("--restart-entry", action="append", default=[], help="Start a fresh root after a guarded terminal failure; repeatable and requires --apply.")
     parser.add_argument("--adopt-run", action="append", default=[], metavar="ENTRY=RUN_ID", help="Adopt an exact existing run as a guarded campaign lineage tip; repeatable and requires --apply.")
@@ -44,7 +56,9 @@ def run_acquisition_cli(argv: list[str] | None = None) -> int:
         print(json.dumps({"valid": True, "entries": len(manifest["entries"]), "manifest_sha256": harness._json_hash(manifest)}, sort_keys=True))
         return 0
     if not args.control_url:
-        raise SystemExit("--control-url or HP_IMPORT_CONTROL_URL is required")
+        raise SystemExit(
+            "--control-url, HLTHPRT_IMPORT_CONTROL_URL, or HP_IMPORT_CONTROL_URL is required"
+        )
     known_entry_ids = {entry["entry_id"] for entry in manifest["entries"]}
     restart_entry_ids = frozenset(args.restart_entry)
     adopt_run_ids = harness.parse_adopt_runs(args.adopt_run, harness.SLUG_PATTERN)
