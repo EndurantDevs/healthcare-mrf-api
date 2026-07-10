@@ -83,16 +83,33 @@ patient-access bases. The importer normalizes those Medicaid Provider Directory
 rows to `https://apif1.aetna.com/fhir/v1/providerdirectory`, then adds a
 separate supplemental source for Commercial/Medicare data at
 `https://apif1.aetna.com/fhir/v1/providerdirectorydata`. Both bases share the
-same secret-backed Aetna OAuth2 credential rule. The Commercial/Medicare base
-supports Bulk Data `$export`; Aetna's API gateway accepts the export request
-when `_outputFormat` is omitted, so the importer suppresses the generic
-`_outputFormat=application/fhir+ndjson` parameter for that base. If bulk export
-is disabled or unsupported during a bounded smoke run, the importer uses
-Aetna-specific state partitions for `Practitioner`, `Organization`, and
-`Location`, plus `name=aetna` search for `InsurancePlan`. `PractitionerRole`,
-`OrganizationAffiliation`, and `HealthcareService` remain bulk-first because
-their broad search contracts require specialty/location or referenced-resource
-lookups and are not safely enumerable through a generic unfiltered search.
+same secret-backed Aetna OAuth2 credential fallback. When both exact API-base
+rules are configured, the exact `providerdirectory` or `providerdirectorydata`
+rule wins without merging the sibling path's rule. Resource credentials are
+forwarded only below the selected base path, not to every path on
+`apif1.aetna.com`.
+
+The Commercial/Medicare source supports the seven Plan-Net resource types other
+than `Endpoint`; the live `Endpoint` collection returns 404. Each paged search
+starts as one unfiltered stream with `_count=30`. State and `name=aetna`
+partitions are not used because they omit blank, non-US, or multi-state
+resources. Aetna can return an HTTP-200 `OperationOutcome` above that page size,
+so any HTTP-200 `OperationOutcome` is treated as a resource-search error.
+Continuation `_page_token` links must remain on the same origin and resource
+path, carry only the bounded count and one non-empty token, and cannot replay a
+previous token. Commercial paging is checkpoint-capable, but it is not claimed
+to be operationally practical: the audited endpoint exposed about 1,414
+`InsurancePlan` rows and roughly 380 million `PractitionerRole` rows.
+
+The Medicaid source supports six resources, excluding `HealthcareService` and
+`Endpoint`. Its metadata declares
+`provider_directory_coverage_mode=targeted` and an empty
+`provider_directory_fully_enumerable_resources` list. A generic collection
+search is stopped before the request with
+`aetna_medicaid_targeted_query_required_npi_or_name_and_location`; an explicit
+NPI search or name-plus-location search can still write source/canonical
+evidence. Targeted evidence is never eligible to replace the current full
+endpoint dataset.
 Some retest rows have no concrete API base and no currently confirmed open FHIR
 endpoint. Supplemental catalog discovery adds explicit `catalog_blocked` rows
 for those cases when there is primary evidence that the endpoint is not
@@ -147,10 +164,12 @@ Checkpointed acquisitions retain the candidate `dataset_id`. Candidate identity
 uses `provider_directory_pagination_root_run_id` when import-control supplies
 it, so pagination and partition/reverse-lookup retries across multiple hops
 continue the same non-current dataset. Partition checkpoints are scoped to that
-root lineage; an unrelated fresh run cannot skip completed partitions into a
-new empty candidate. UHC is included in checkpoint-capable source policy so an
-incomplete partition scan emits the same required-resume signal as an
-incomplete paginated scan, even though its partition state lives in
+root lineage and a stable search-strategy version; changing strategy cannot
+reuse cursors from the prior strategy. An unrelated fresh run cannot skip
+completed partitions into a new empty candidate. Aetna Commercial and UHC are
+included in checkpoint-capable source policy. An incomplete UHC partition scan
+emits the same required-resume signal as an incomplete paginated scan, even
+though its partition state lives in
 `provider_directory_reverse_lookup_checkpoint`.
 
 The candidate is published only when every selected resource reports a
@@ -162,6 +181,13 @@ dataset unchanged. The publication hash and row count are computed in
 `(resource_type, resource_id)` order with an incremental SHA-256 over bounded
 database batches, so promotion does not materialize a multi-million-row
 dataset in worker memory.
+
+Endpoint dataset selection first applies
+`metadata_json.provider_directory_supported_resources`, then intersects an
+explicit `provider_directory_fully_enumerable_resources` list when present.
+An explicit empty list therefore allows typed/source/canonical evidence writes
+without creating or promoting a full/current endpoint dataset. This is the
+guard used for Aetna Medicaid's targeted coverage mode.
 
 Provider, plan, network, and location references are retained as raw FHIR
 references first. Address canonical linkage can be filled later through
@@ -274,6 +300,12 @@ unauthenticated metadata probe returned a valid FHIR CapabilityStatement. This
 keeps stale or overly conservative seed `auth_type` values from hiding a
 directory that is actually readable. Pass `--include-credentialed` or
 `--include-auth-required` only for controlled tests.
+An explicit `source_ids` resource-import request fails with
+`provider_directory_requested_sources_not_selected_for_resource_import` when
+validation and policy select none of those sources. The diagnostic includes
+the requested ids and non-zero selection skip counts. Broad catalog runs retain
+their existing skip-and-continue behavior; there is no implicit allow-empty
+exception for an explicitly requested source import.
 `--full-refresh` makes omitted `resource_limit` and `page_limit` default to `0`,
 where `0` means unbounded. The importer still has a hard pagination loop guard
 from `HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES` (default `10000`) so a broken
@@ -328,7 +360,13 @@ The Aetna Commercial/Medicare base is a known variant of this path: its
 `$export` operation is accepted with `_type=...` and `Prefer: respond-async`,
 but rejects the optional `_outputFormat` query parameter. That exception is
 handled by source metadata so normal Bulk Data servers keep the standards-shaped
-request while Aetna gets the gateway-compatible request.
+request while Aetna gets the gateway-compatible request. Bulk support remains
+available for row-bounded Aetna validation, but an unbounded Aetna full refresh
+uses the paged path until accepted Bulk Data jobs and streamed outputs have
+durable resume checkpoints. Import metrics retain the compatibility
+`bulk_export` flag and add `bulk_export_mode.requested`, `.effective`, and
+`.effective_resource_fetches`, so a globally requested fast path is not
+mistaken for the mode actually used by a source.
 
 Full-refresh stale cleanup also uses an append-only unlogged seen stage by
 default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids
@@ -501,21 +539,18 @@ to the real FHIR base and not only to a public landing page.
 
 Known payer caveat: Aetna publishes an open CapabilityStatement at
 `https://apif1.aetna.com/fhir/v1/providerdirectory/metadata`, but resource reads
-such as `Practitioner`, `PractitionerRole`, `Organization`, `Location`, and
-`InsurancePlan` require a subscribed OAuth client. The importer maps Aetna
-developer-portal seed rows to
-`https://apif1.aetna.com/fhir/v1/providerdirectory` and records resource-level
-`http_401` diagnostics until credentials are configured. Aetna's advertised
-token URL is
+require a subscribed OAuth client. The importer maps Medicaid developer-portal
+seed rows to `https://apif1.aetna.com/fhir/v1/providerdirectory` and records
+resource-level `http_401` diagnostics until credentials are configured. Aetna's
+advertised token URL is
 `https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token`.
 For Provider Directory production client-credentials tokens, Aetna's published
 token-generation guide uses scope `Public NonPII` and Basic client
-authentication. Once authorized, Aetna still rejects broad unfiltered resource
-searches: `Practitioner` needs NPI or name plus location, `PractitionerRole`
-and `OrganizationAffiliation` need specialty, and `Location` /
-`InsurancePlan` need location/state filters. Treat Aetna as credentialed but
-not fully crawlable by the generic broad search importer until an Aetna-specific
-partitioner or exact product swagger bulk-export route is enabled.
+authentication. Once authorized, the Medicaid base still requires NPI or name
+plus location targeting. Its metadata intentionally exposes no fully-enumerable
+resources, and a generic full-refresh attempt fails closed before issuing the
+HTTP-400-producing collection query. This targeted Medicaid contract is
+separate from the Commercial/Medicare base's unfiltered collection streams.
 
 ALOHR / Alabama One Health Record is mixed-mode. The original seed URL
 `https://alohr.esante.us/public/providers` is a public React provider-search app,
@@ -908,14 +943,20 @@ signals:
 catalog, include the upstream `provider-directory-db` retest snapshot
 supplement, include credentialed/auth-required sources when credentials are
 configured, run a full resource refresh (`resource_limit=0`,
-`linked_resource_limit=50000`, `linked_resource_deadline_seconds=1800`,
-`page_limit=0`, `page_count=1000`, `stream_batch_size=5000`,
-`bulk_export=true`, `source_concurrency=1`,
-`publish_artifacts=true`, `publish_corroboration=false`), and delete stale rows
-only for completed source/resource scans.
+`resource_deadline_seconds=21600`, `linked_resource_limit=0`,
+`linked_resource_deadline_seconds=1800`, `page_limit=0`, `page_count=100`,
+`stream_batch_size=5000`, `bulk_export=false`, `source_concurrency=1`). The
+acquisition schedule also sets `stale_cleanup=false`,
+`publish_artifacts=false`, `publish_after_acquisition=false`, and
+`publish_corroboration=false`. This keeps remote acquisition resumable and
+separate from the later projection and artifact-publication schedules. Aetna
+Commercial uses paged mode until its Bulk Data jobs and output streams have
+durable checkpoints; checkpoint-enabled acquisitions persist the guarded Aetna
+continuation tokens.
 The importer may cap `_count` below the schedule-level `page_count` for a
 specific payer/resource when the live FHIR server is known to misbehave at
-larger page sizes. The confirmed case is Michigan InteropStation
+larger page sizes. Aetna Commercial caps all seven supported collections at 30.
+Another confirmed case is Michigan InteropStation
 `PractitionerRole`, where `_count>=50` returns an empty Bundle while `_count=25`
 returns rows and a next link. Future source-specific caps can also be carried
 in source `metadata_json.provider_directory_resource_page_count_caps` without

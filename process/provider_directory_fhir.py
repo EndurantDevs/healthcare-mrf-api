@@ -405,6 +405,23 @@ query ALOHR_HEALTH {
 AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectory"
 AETNA_PROVIDER_DIRECTORY_DATA_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectorydata"
 AETNA_PROVIDER_DIRECTORY_TOKEN_URL = "https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token"
+AETNA_PROVIDER_DIRECTORY_BASES = frozenset(
+    {AETNA_PROVIDER_DIRECTORY_BASE, AETNA_PROVIDER_DIRECTORY_DATA_BASE}
+)
+AETNA_COMMERCIAL_SUPPORTED_RESOURCES = tuple(
+    resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
+)
+AETNA_MEDICAID_SUPPORTED_RESOURCES = tuple(
+    resource_type
+    for resource_type in DEFAULT_RESOURCES
+    if resource_type not in {"HealthcareService", "Endpoint"}
+)
+AETNA_MEDICAID_TARGETED_QUERY_REQUIRED_ERROR = (
+    "aetna_medicaid_targeted_query_required_npi_or_name_and_location"
+)
+AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR = (
+    "aetna_resource_search_returned_operation_outcome"
+)
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
@@ -512,6 +529,10 @@ SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
 }
 PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     **{
+        (AETNA_PROVIDER_DIRECTORY_DATA_BASE, resource_type): 30
+        for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
+    },
+    **{
         (SCAN_PROVIDER_DIRECTORY_BASE, resource_type): 100
         for resource_type in DEFAULT_RESOURCES
     },
@@ -546,6 +567,7 @@ PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
+        AETNA_PROVIDER_DIRECTORY_DATA_BASE,
         ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
         ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
@@ -564,7 +586,11 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
 PAGINATION_CHECKPOINT_ACTIVE = "active"
 PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
+PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
+REQUESTED_SOURCE_IMPORT_EMPTY_ERROR = (
+    "provider_directory_requested_sources_not_selected_for_resource_import"
+)
 ENDPOINT_DATASET_ACQUIRING = "acquiring"
 ENDPOINT_DATASET_INCOMPLETE = "incomplete"
 ENDPOINT_DATASET_FAILED = "failed"
@@ -577,6 +603,7 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
         "_getpagesid",
         "_getpagesoffset",
         "_offset",
+        "_page_token",
         "_skip",
         "cursor",
         "cursormark",
@@ -1724,6 +1751,74 @@ def _source_supported_resource_types(source: dict[str, Any]) -> set[str] | None:
     }
 
 
+def _source_fully_enumerable_resource_types(
+    source: dict[str, Any],
+) -> set[str] | None:
+    configured_resources = _source_metadata(source).get(
+        "provider_directory_fully_enumerable_resources"
+    )
+    if not isinstance(configured_resources, list):
+        return None
+    return {
+        resource_type
+        for resource_type in (_clean_text(value) for value in configured_resources)
+        if resource_type in DEFAULT_RESOURCES
+    }
+
+
+def _source_coverage_mode(source: dict[str, Any]) -> str | None:
+    return _clean_text(
+        _source_metadata(source).get("provider_directory_coverage_mode")
+    )
+
+
+def _is_aetna_medicaid_targeted_source(source: dict[str, Any]) -> bool:
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    return (
+        api_base == AETNA_PROVIDER_DIRECTORY_BASE
+        and _source_coverage_mode(source) == "targeted"
+    )
+
+
+def _is_aetna_medicaid_targeted_search(search_url: str) -> bool:
+    parsed_url = urllib.parse.urlsplit(search_url)
+    query_names = {
+        query_name.lower().split(":", 1)[0]
+        for query_name, _query_value in urllib.parse.parse_qsl(
+            parsed_url.query,
+            keep_blank_values=True,
+        )
+    }
+    has_npi = bool({"identifier", "npi"}.intersection(query_names))
+    has_name = bool({"name", "family", "given"}.intersection(query_names))
+    has_location = bool(
+        {
+            "location",
+            "address",
+            "address-city",
+            "address-state",
+            "address-postalcode",
+        }.intersection(query_names)
+    )
+    return has_npi or (has_name and has_location)
+
+
+def _aetna_medicaid_targeted_search_error(
+    source: dict[str, Any],
+    search_urls: list[str],
+) -> str | None:
+    if not _is_aetna_medicaid_targeted_source(source):
+        return None
+    if search_urls and all(
+        _is_aetna_medicaid_targeted_search(search_url)
+        for search_url in search_urls
+    ):
+        return None
+    return AETNA_MEDICAID_TARGETED_QUERY_REQUIRED_ERROR
+
+
 def _url_with_count(url: str, page_count: int) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1828,20 +1923,6 @@ def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
     if resource_type == "Location":
         return tuple(("name", value) for value in SCAN_SEARCH_ALPHABET)
     return ()
-
-
-def _aetna_provider_directory_data_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
-    if resource_type == "InsurancePlan":
-        return (("name", "aetna"),)
-    state_param_by_resource = {
-        "Practitioner": "address-state:exact",
-        "Organization": "address-state",
-        "Location": "address-state:exact",
-    }
-    state_param = state_param_by_resource.get(resource_type)
-    if not state_param:
-        return ()
-    return tuple((state_param, state) for state in US_STATE_ABBRS)
 
 
 def _uhc_provider_directory_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
@@ -2132,11 +2213,6 @@ def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_cou
     if not start_url:
         return []
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
-        partitions = _aetna_provider_directory_data_partition_values(resource_type)
-        if not partitions:
-            return [start_url]
-        return [_url_with_query_item(start_url, key, value) for key, value in partitions]
     if api_base == UHC_PROVIDER_DIRECTORY_BASE:
         partitions = _uhc_provider_directory_partition_values(resource_type)
         if not partitions:
@@ -2519,6 +2595,30 @@ def _source_hosts(source: dict[str, Any]) -> set[str]:
     return hosts
 
 
+def _credential_api_base_candidates(
+    canonical_api_base: str | None,
+    metadata: dict[str, Any],
+    normalized_api_bases: dict[str, Any],
+) -> list[str]:
+    candidate_api_bases: list[str] = []
+    has_exact_aetna_base_rule = (
+        canonical_api_base in AETNA_PROVIDER_DIRECTORY_BASES
+        and canonical_api_base in normalized_api_bases
+    )
+    _append_unique(candidate_api_bases, canonical_api_base)
+    if has_exact_aetna_base_rule:
+        return candidate_api_bases
+    for equivalent_base in metadata.get(
+        "provider_directory_equivalent_api_bases"
+    ) or []:
+        _append_unique(candidate_api_bases, _canonical_base(equivalent_base))
+    if canonical_api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_BASE)
+    elif canonical_api_base == AETNA_PROVIDER_DIRECTORY_BASE:
+        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_DATA_BASE)
+    return candidate_api_bases
+
+
 def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
     config = _load_credentials_config()
     if not config:
@@ -2544,15 +2644,11 @@ def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
         _canonical_base(str(key)) or str(key).rstrip("/"): key
         for key in api_bases
     }
-    candidate_api_bases: list[str] = []
-    _append_unique(candidate_api_bases, canonical_api_base)
-    for equivalent_base in metadata.get("provider_directory_equivalent_api_bases") or []:
-        _append_unique(candidate_api_bases, _canonical_base(equivalent_base))
-    if canonical_api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
-        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_BASE)
-    elif canonical_api_base == AETNA_PROVIDER_DIRECTORY_BASE:
-        _append_unique(candidate_api_bases, AETNA_PROVIDER_DIRECTORY_DATA_BASE)
-    for candidate_api_base in candidate_api_bases:
+    for candidate_api_base in _credential_api_base_candidates(
+        canonical_api_base,
+        metadata,
+        normalized_api_bases,
+    ):
         if candidate_api_base and candidate_api_base in normalized_api_bases:
             key = normalized_api_bases[candidate_api_base]
             spec = _merge_credential_spec(
@@ -2575,10 +2671,41 @@ def _credential_spec_for_source(source: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
+def _is_url_within_api_base(url: str, api_base: str) -> bool:
+    parsed_url = urllib.parse.urlsplit(url)
+    parsed_base = urllib.parse.urlsplit(api_base)
+    try:
+        url_port = parsed_url.port or (
+            443 if parsed_url.scheme.lower() == "https" else 80
+        )
+        base_port = parsed_base.port or (
+            443 if parsed_base.scheme.lower() == "https" else 80
+        )
+    except ValueError:
+        return False
+    if (
+        parsed_url.scheme.lower() != parsed_base.scheme.lower()
+        or (parsed_url.hostname or "").lower()
+        != (parsed_base.hostname or "").lower()
+        or url_port != base_port
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        return False
+    base_path = parsed_base.path.rstrip("/")
+    request_path = parsed_url.path.rstrip("/")
+    return request_path == base_path or request_path.startswith(f"{base_path}/")
+
+
 def _credential_allowed_for_url(source: dict[str, Any], url: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     if not parsed.netloc:
         return True
+    canonical_api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if canonical_api_base in AETNA_PROVIDER_DIRECTORY_BASES:
+        return _is_url_within_api_base(url, canonical_api_base)
     return parsed.netloc.lower() in _source_hosts(source)
 
 
@@ -2781,6 +2908,22 @@ def _select_resource_import_sources(
     return selected, metrics
 
 
+def _requested_source_import_empty_error(
+    requested_source_ids: list[str],
+    selection_metrics: dict[str, int],
+) -> str:
+    skip_counts_by_reason = {
+        metric_name.removeprefix("source_import_skipped_"): metric_count
+        for metric_name, metric_count in selection_metrics.items()
+        if metric_name.startswith("source_import_skipped_") and metric_count
+    }
+    return (
+        f"{REQUESTED_SOURCE_IMPORT_EMPTY_ERROR}: "
+        f"source_ids={','.join(requested_source_ids)}; "
+        f"skip_counts={json.dumps(skip_counts_by_reason, sort_keys=True)}"
+    )
+
+
 def _url_with_query_params(url: str, query_params: dict[str, str] | None) -> str:
     if not query_params:
         return url
@@ -2860,13 +3003,18 @@ def _aetna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
             "provider_directory_equivalent_api_bases": [
                 AETNA_PROVIDER_DIRECTORY_DATA_BASE,
             ],
+            "provider_directory_supported_resources": list(
+                AETNA_MEDICAID_SUPPORTED_RESOURCES
+            ),
+            "provider_directory_coverage_mode": "targeted",
+            "provider_directory_fully_enumerable_resources": [],
             "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
         },
     }
 
 
 def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
-    row = {
+    commercial_seed_map = {
         "id": "aetna-provider-directory-commercial-medicare-bulk",
         "org_name": "Aetna",
         "plan_name": "Aetna Commercial and Medicare Provider Directory",
@@ -2888,10 +3036,25 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
             "provider_directory_equivalent_api_bases": [
                 AETNA_PROVIDER_DIRECTORY_BASE,
             ],
+            "provider_directory_supported_resources": list(
+                AETNA_COMMERCIAL_SUPPORTED_RESOURCES
+            ),
+            "provider_directory_coverage_mode": "full",
+            "provider_directory_fully_enumerable_resources": list(
+                AETNA_COMMERCIAL_SUPPORTED_RESOURCES
+            ),
+            "provider_directory_resource_page_count_caps": {
+                resource_type: 30
+                for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
+            },
             "provider_directory_bulk_export_omit_output_format": True,
         },
     }
-    return [row] if _seed_row_matches_query(row, source_query) else []
+    return (
+        [commercial_seed_map]
+        if _seed_row_matches_query(commercial_seed_map, source_query)
+        else []
+    )
 
 
 def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -8516,8 +8679,43 @@ def _is_transient_source_fetch_failure(
     fetch_error: str | None,
 ) -> bool:
     if fetch_error:
-        return True
+        return fetch_error != AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
     return status_code in {429, 500, 502, 503, 504}
+
+
+def _fhir_collection_search_resource_type(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> str | None:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if not api_base or not _is_url_within_api_base(request_url, api_base):
+        return None
+    base_path = urllib.parse.urlsplit(api_base).path.rstrip("/")
+    request_path = urllib.parse.urlsplit(request_url).path.rstrip("/")
+    relative_path = request_path[len(base_path) :].strip("/")
+    return relative_path if relative_path in DEFAULT_RESOURCES else None
+
+
+def _aetna_resource_search_payload_error(
+    source_record: dict[str, Any],
+    request_url: str,
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+) -> str | None:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if (
+        api_base in AETNA_PROVIDER_DIRECTORY_BASES
+        and status_code == 200
+        and isinstance(fhir_payload, dict)
+        and fhir_payload.get("resourceType") == "OperationOutcome"
+        and _fhir_collection_search_resource_type(source_record, request_url)
+    ):
+        return AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    return None
 
 
 def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
@@ -8626,6 +8824,23 @@ async def _fetch_source_json_once(
     )
 
 
+def _source_fetch_result_with_payload_error(
+    source_record: dict[str, Any],
+    request_url: str,
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
+    payload_error = _aetna_resource_search_payload_error(
+        source_record,
+        request_url,
+        status_code,
+        fhir_payload,
+    )
+    if not payload_error:
+        return fetch_result
+    return status_code, fhir_payload, payload_error, elapsed_ms
+
+
 async def _fetch_source_json(
     source_record: dict[str, Any],
     url: str,
@@ -8645,10 +8860,14 @@ async def _fetch_source_json(
         should_try_smaller_page = False
         attempt_count = _source_fetch_retry_attempts()
         for attempt_index in range(attempt_count):
-            fetch_result = await _fetch_source_json_once(
+            fetch_result = _source_fetch_result_with_payload_error(
                 source_record,
                 candidate_url,
-                timeout=timeout,
+                await _fetch_source_json_once(
+                    source_record,
+                    candidate_url,
+                    timeout=timeout,
+                ),
             )
             status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
             total_elapsed_ms += elapsed_ms
@@ -8713,6 +8932,60 @@ def _is_access_denied_outcome(resource_payload: dict[str, Any] | None) -> bool:
     )
 
 
+def _targeted_required_resource_probe(
+    resource_url: str,
+    resource_type: str,
+    targeted_search_error: str,
+) -> dict[str, Any]:
+    return {
+        "status": "targeted_required",
+        "http_status": None,
+        "response_time_ms": 0,
+        "url": resource_url,
+        "resource_type": resource_type,
+        "error": targeted_search_error,
+    }
+
+
+def _resource_access_probe_result(
+    resource_url: str,
+    resource_type: str,
+    status_code: int | None,
+    resource_payload: dict[str, Any] | None,
+    fetch_error: str | None,
+    elapsed_ms: int,
+) -> dict[str, Any]:
+    is_access_denied = status_code in {401, 403} or _is_access_denied_outcome(
+        resource_payload
+    )
+    resource_error = fetch_error
+    if not resource_error and status_code != 200:
+        resource_error = f"resource_search_http_{status_code}"
+    if (
+        not resource_error
+        and isinstance(resource_payload, dict)
+        and resource_payload.get("resourceType") == "OperationOutcome"
+    ):
+        resource_error = "resource_search_returned_operation_outcome"
+    if is_access_denied:
+        return {
+            "status": "auth_required",
+            "http_status": status_code,
+            "response_time_ms": elapsed_ms,
+            "url": resource_url,
+            "resource_type": resource_type,
+            "error": resource_error or "resource access denied",
+        }
+    return {
+        "status": "resource_error" if resource_error else "reachable",
+        "http_status": status_code,
+        "response_time_ms": elapsed_ms,
+        "url": resource_url,
+        "resource_type": resource_type,
+        "error": resource_error,
+    }
+
+
 async def _probe_resource_access(
     source_record: dict[str, Any],
     candidate_base: str,
@@ -8741,20 +9014,29 @@ async def _probe_resource_access(
     resource_url = _resource_start_url(resource_probe_source_map, resource_type, page_count=1)
     if not resource_url:
         return None
-    status_code, resource_payload, error, elapsed = await _fetch_source_json(
+    targeted_search_error = _aetna_medicaid_targeted_search_error(
+        resource_probe_source_map,
+        [resource_url],
+    )
+    if targeted_search_error:
+        return _targeted_required_resource_probe(
+            resource_url,
+            resource_type,
+            targeted_search_error,
+        )
+    status_code, resource_payload, fetch_error, elapsed_ms = await _fetch_source_json(
         resource_probe_source_map,
         resource_url,
         timeout=timeout,
     )
-    is_access_denied = status_code in {401, 403} or _is_access_denied_outcome(resource_payload)
-    return {
-        "status": "auth_required" if is_access_denied else "reachable",
-        "http_status": status_code,
-        "response_time_ms": elapsed,
-        "url": resource_url,
-        "resource_type": resource_type,
-        "error": error or ("resource access denied" if is_access_denied else None),
-    }
+    return _resource_access_probe_result(
+        resource_url,
+        resource_type,
+        status_code,
+        resource_payload,
+        fetch_error,
+        elapsed_ms,
+    )
 
 
 async def _probe_metadata_candidate(
@@ -8796,6 +9078,10 @@ async def _probe_metadata_candidate(
             status = "auth_required"
             status_code = resource_probe_map.get("http_status")
             error = resource_probe_map.get("error") or "Provider Directory resource access requires authorization"
+        elif resource_probe_map and resource_probe_map["status"] == "resource_error":
+            status = "resource_error"
+            status_code = resource_probe_map.get("http_status")
+            error = resource_probe_map.get("error") or "Provider Directory resource search failed"
     candidate_probe_map = {
         "status": status,
         "http_status": status_code,
@@ -9221,6 +9507,8 @@ def _resolved_fhir_next_url(
     parsed_next = urllib.parse.urlsplit(next_url)
     if api_base in FHIR_OFFSET_PAGINATION_BASES:
         return _resolved_offset_next_url(api_base, current_url, next_url)
+    if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        return _resolved_aetna_commercial_next_url(current_url, next_url)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
         return _resolved_molina_next_url(current_url, next_url)
     if (
@@ -9241,6 +9529,65 @@ def _resolved_fhir_next_url(
         )
     if not _is_trusted_fhir_pagination_url(source_record, current_url, next_url):
         raise ValueError("untrusted_pagination_link")
+    return next_url
+
+
+def _resolved_aetna_commercial_next_url(
+    current_url: str,
+    next_url: str,
+) -> str:
+    source_map = {
+        "api_base": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        "canonical_api_base": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+    }
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    current_resource_type = _fhir_collection_search_resource_type(
+        source_map,
+        current_url,
+    )
+    next_resource_type = _fhir_collection_search_resource_type(
+        source_map,
+        next_url,
+    )
+    next_query_items = urllib.parse.parse_qsl(
+        parsed_next.query,
+        keep_blank_values=True,
+    )
+    page_tokens = [
+        query_value
+        for query_name, query_value in next_query_items
+        if query_name.lower() == "_page_token"
+    ]
+    count_values = [
+        query_value
+        for query_name, query_value in next_query_items
+        if query_name.lower() == "_count"
+    ]
+    is_count_valid = not count_values or (
+        len(count_values) == 1
+        and count_values[0].isdigit()
+        and 1 <= int(count_values[0]) <= 30
+    )
+    is_allowlisted = (
+        current_resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
+        and next_resource_type == current_resource_type
+        and _is_url_within_api_base(
+            next_url,
+            AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        )
+        and parsed_next.path.rstrip("/") == parsed_current.path.rstrip("/")
+        and not parsed_next.fragment
+        and len(page_tokens) == 1
+        and bool(page_tokens[0])
+        and is_count_valid
+        and all(
+            query_name.lower() in {"_count", "_page_token"}
+            for query_name, _query_value in next_query_items
+        )
+    )
+    if not is_allowlisted:
+        raise ValueError("untrusted_aetna_pagination_link")
     return next_url
 
 
@@ -9394,6 +9741,25 @@ def _bulk_export_enabled(value: Any) -> bool:
     if value is None:
         value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT")
     return _bool_or_default(value, False)
+
+
+def _is_source_bulk_export_effective(
+    source: dict[str, Any],
+    requested: bool,
+    *,
+    per_resource_limit: int,
+) -> bool:
+    """Keep Aetna full scans paged until bulk export can resume durably."""
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    return bool(
+        requested
+        and (
+            api_base != AETNA_PROVIDER_DIRECTORY_DATA_BASE
+            or per_resource_limit > 0
+        )
+    )
 
 
 def _retry_after_seconds(value: str | None) -> int | None:
@@ -9955,7 +10321,7 @@ async def _can_fetch_partition_url(
         if request_identity in state.seen_urls:
             state.error_message = (
                 "pagination_cursor_repeated"
-                if _has_cursor_mark_query_parameter(request_url)
+                if _has_replay_sensitive_continuation(request_url)
                 else "pagination loop detected"
             )
             state.next_url_remaining = True
@@ -9974,7 +10340,37 @@ def _has_cursor_mark_query_parameter(url: str) -> bool:
     )
 
 
+def _page_token_query_value(url: str) -> str | None:
+    page_token_values = [
+        query_value
+        for query_name, query_value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+        if query_name.lower() == "_page_token"
+    ]
+    if len(page_token_values) != 1:
+        return None
+    return page_token_values[0]
+
+
+def _has_replay_sensitive_continuation(url: str) -> bool:
+    return _has_cursor_mark_query_parameter(url) or _page_token_query_value(url) is not None
+
+
 def _pagination_url_identity(url: str) -> str:
+    page_token = _page_token_query_value(url)
+    if page_token is not None:
+        parsed = urllib.parse.urlsplit(url)
+        return urllib.parse.urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path,
+                urllib.parse.urlencode({"_page_token": page_token}),
+                "",
+            )
+        )
     if not _has_cursor_mark_query_parameter(url):
         return url
     parsed = urllib.parse.urlsplit(url)
@@ -10378,8 +10774,50 @@ async def _fetch_resource_rows(
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
+    supported_resource_types = _source_supported_resource_types(source)
+    if (
+        supported_resource_types is not None
+        and resource_type not in supported_resource_types
+    ):
+        return None
     resource_timeout = _source_resource_timeout(source, resource_type, timeout)
-    if bulk_export:
+    start_urls: list[str] | None = None
+    if _is_aetna_medicaid_targeted_source(source):
+        page_count = _source_full_refresh_page_count(
+            source,
+            page_count,
+            per_resource_limit,
+            page_limit,
+        )
+        start_urls = _resource_start_urls(
+            source,
+            resource_type,
+            page_count=page_count,
+        )
+        targeted_search_error = _aetna_medicaid_targeted_search_error(
+            source,
+            start_urls,
+        )
+        if targeted_search_error:
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=0,
+                rows_written=0,
+                pages_fetched=0,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=False,
+                error=targeted_search_error,
+                fetch_mode="targeted_required",
+            )
+    elif _is_source_bulk_export_effective(
+        source,
+        bulk_export,
+        per_resource_limit=per_resource_limit,
+    ):
         result = await _fetch_bulk_export_resource_rows(
             source,
             resource_type,
@@ -10407,13 +10845,18 @@ async def _fetch_resource_rows(
             error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
             fetch_mode="source_specific_deferred",
         )
-    page_count = _source_full_refresh_page_count(
-        source,
-        page_count,
-        per_resource_limit,
-        page_limit,
-    )
-    start_urls = _resource_start_urls(source, resource_type, page_count=page_count)
+    if start_urls is None:
+        page_count = _source_full_refresh_page_count(
+            source,
+            page_count,
+            per_resource_limit,
+            page_limit,
+        )
+        start_urls = _resource_start_urls(
+            source,
+            resource_type,
+            page_count=page_count,
+        )
     if not start_urls:
         return None
     checkpoint_context = (
@@ -10534,7 +10977,7 @@ async def _fetch_resource_rows(
             if request_identity in seen_urls or request_url_hash in persisted_url_hashes:
                 error_message = (
                     "pagination_cursor_repeated"
-                    if _has_cursor_mark_query_parameter(url)
+                    if _has_replay_sensitive_continuation(url)
                     else "pagination loop detected"
                 )
                 next_url_remaining = True
@@ -11379,6 +11822,21 @@ def _empty_resource_stats() -> dict[str, Any]:
     }
 
 
+def _bulk_export_mode_metrics(
+    requested: bool,
+    resource_fetch_stats: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    effective_resource_fetches = sum(
+        int(resource_stats.get("bulk_export_sources") or 0)
+        for resource_stats in resource_fetch_stats.values()
+    )
+    return {
+        "requested": requested,
+        "effective": effective_resource_fetches > 0,
+        "effective_resource_fetches": effective_resource_fetches,
+    }
+
+
 def _record_resource_fetch_stats(stats: dict[str, dict[str, Any]], resource_type: str, result: ResourceFetchResult) -> None:
     entry = stats.setdefault(resource_type, _empty_resource_stats())
     entry["sources_attempted"] += 1
@@ -11992,6 +12450,7 @@ def _pagination_checkpoint_context(
         return None
     scope_payload = json.dumps(
         {
+            "strategy_version": PAGINATION_CHECKPOINT_STRATEGY_VERSION,
             "source_ids": sorted(set(source_ids)),
             "resource_group": _resource_import_group_key(source_record),
         },
@@ -12306,15 +12765,25 @@ def _endpoint_dataset_selected_resources(
 ) -> list[str]:
     source_record = _compatibility_storage_source(source_records)
     supported_resources = _source_supported_resource_types(source_record)
+    fully_enumerable_resources = _source_fully_enumerable_resource_types(
+        source_record
+    )
     if _alohr_source_uses_graphql_connector(source_record):
         supported_resources = set(ALOHR_GRAPHQL_RESOURCE_TYPES)
     unique_requested_resources = list(dict.fromkeys(requested_resources))
-    if supported_resources is None:
+    eligible_resources = supported_resources
+    if fully_enumerable_resources is not None:
+        eligible_resources = (
+            fully_enumerable_resources
+            if eligible_resources is None
+            else eligible_resources.intersection(fully_enumerable_resources)
+        )
+    if eligible_resources is None:
         return unique_requested_resources
     return [
         resource_type
         for resource_type in unique_requested_resources
-        if resource_type in supported_resources
+        if resource_type in eligible_resources
     ]
 
 
@@ -14508,6 +14977,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "page_count": page_count,
             "stream_batch_size": stream_batch_size,
             "bulk_export": bulk_export,
+            "bulk_export_mode": _bulk_export_mode_metrics(bulk_export, {}),
             "source_concurrency": source_concurrency,
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
@@ -14544,6 +15014,14 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 include_auth_required=include_auth_required,
             )
             metrics.update(selection_metrics)
+            if requested_source_ids and not importable:
+                selection_error = _requested_source_import_empty_error(
+                    requested_source_ids,
+                    selection_metrics,
+                )
+                metrics["requested_source_import_error"] = selection_error
+                ctx["context"]["audit"] = metrics
+                raise RuntimeError(selection_error)
             source_import_groups = _group_resource_import_sources(
                 importable,
                 linked_resource_limit=linked_resource_limit,
@@ -14624,6 +15102,10 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 retry_of_run_id=retry_of_run_id,
                 pagination_root_run_id=pagination_root_run_id,
                 pagination_resume_required=pagination_resume_required_entries,
+            )
+            metrics["bulk_export_mode"] = _bulk_export_mode_metrics(
+                bulk_export,
+                metrics.get("resource_fetch_stats") or {},
             )
             if pagination_resume_required_entries:
                 required_entries = sorted(pagination_resume_required_entries)
