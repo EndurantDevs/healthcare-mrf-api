@@ -2570,10 +2570,11 @@ def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and
 
     assert "LIMIT ($1::integer + 1)" in sql
     assert sql.count("LIMIT 1") >= 14
+    assert f"LIMIT {audit.PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT}" in sql
     assert "count(*)" not in sql.lower()
     assert "GROUP BY" not in sql
     assert "practitioner.npi BETWEEN 1000000000::bigint AND 9999999999::bigint" in sql
-    assert "role.source_id = src.source_id" in sql
+    assert "WHERE source_id = src.source_id" in sql
     assert "location.source_id = role.source_id" in sql
     assert "insurance_plan.source_id = role.source_id" in sql
     assert "healthcare_service.location_refs" in sql
@@ -2659,6 +2660,7 @@ def _assert_semantic_readiness_summary(summary):
     assert summary["summary_source"] == "bounded_per_source_exists_probes"
     assert summary["sampled_source_count"] == 2
     assert summary["source_limit"] == 2
+    assert summary["source_row_limit"] == audit.PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT
     assert summary["truncated"] is True
     assert summary["counts_are_sampled"] is True
     assert summary["sources_with_resource_rows"] == 2

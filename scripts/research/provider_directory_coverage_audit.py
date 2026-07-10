@@ -2820,6 +2820,32 @@ PROVIDER_DIRECTORY_SEMANTIC_PROBE_TABLES = frozenset(
         "provider_directory_network_catalog",
     }
 )
+PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT = 1000
+PROVIDER_DIRECTORY_SEMANTIC_ORDER_COLUMN_BY_TABLE = {
+    "provider_directory_address_overlay": "source_id",
+    "provider_directory_network_catalog": "network_resource_id",
+}
+
+
+def _bounded_source_rows_sql(
+    db_schema: str,
+    table_name: str,
+    table_alias: str,
+) -> str:
+    """Build a source-indexed relation with a hard row-scan bound."""
+    order_column = PROVIDER_DIRECTORY_SEMANTIC_ORDER_COLUMN_BY_TABLE.get(
+        table_name,
+        "resource_id",
+    )
+    return f"""
+        LATERAL (
+            SELECT *
+              FROM {_qt(db_schema, table_name)}
+             WHERE source_id = src.source_id
+             ORDER BY {order_column}
+             LIMIT {PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT}
+        ) AS {table_alias}
+    """
 
 
 def _bounded_source_exists_sql(
@@ -2832,12 +2858,12 @@ def _bounded_source_exists_sql(
     """Build one source-keyed EXISTS probe with an explicit one-row bound."""
     if table_name not in available_table_names:
         return "false::boolean"
+    bounded_rows_sql = _bounded_source_rows_sql(db_schema, table_name, table_alias)
     return f"""
         EXISTS (
             SELECT 1
-              FROM {_qt(db_schema, table_name)} AS {table_alias}
-             WHERE {table_alias}.source_id = src.source_id
-               AND ({condition_sql})
+              FROM {bounded_rows_sql}
+             WHERE ({condition_sql})
              LIMIT 1
         )
     """
@@ -2889,15 +2915,15 @@ def _source_json_telecom_phone_sql(
     """Probe a source-scoped FHIR telecom array for a usable phone value."""
     if table_name not in available_table_names:
         return "false::boolean"
+    bounded_rows_sql = _bounded_source_rows_sql(db_schema, table_name, table_alias)
     return f"""
         EXISTS (
             SELECT 1
-              FROM {_qt(db_schema, table_name)} AS {table_alias}
+              FROM {bounded_rows_sql}
               CROSS JOIN LATERAL jsonb_array_elements(
                   COALESCE({table_alias}.telecom::jsonb, '[]'::jsonb)
               ) AS telecom(value)
-             WHERE {table_alias}.source_id = src.source_id
-               AND lower(COALESCE(telecom.value->>'system', '')) = 'phone'
+             WHERE lower(COALESCE(telecom.value->>'system', '')) = 'phone'
                AND NULLIF(BTRIM(telecom.value->>'value'), '') IS NOT NULL
              LIMIT 1
         )
@@ -2947,17 +2973,21 @@ def _resolved_role_reference_sql(
         return "false::boolean"
     ref_alias = f"{target_alias}_ref"
     resource_id_sql = _sql_fhir_reference_resource_id(f"{ref_alias}.value", resource_type)
+    bounded_roles_sql = _bounded_source_rows_sql(
+        db_schema,
+        "provider_directory_practitioner_role",
+        "role",
+    )
     return f"""
         EXISTS (
             SELECT 1
-              FROM {_qt(db_schema, "provider_directory_practitioner_role")} AS role
+              FROM {bounded_roles_sql}
               CROSS JOIN LATERAL jsonb_array_elements_text(
                   COALESCE(role.{reference_column}::jsonb, '[]'::jsonb)
               ) AS {ref_alias}(value)
               JOIN {_qt(db_schema, target_table_name)} AS {target_alias}
                 ON {target_alias}.source_id = role.source_id
                AND {target_alias}.resource_id = {resource_id_sql}
-             WHERE role.source_id = src.source_id
              LIMIT 1
         )
     """
@@ -3002,10 +3032,15 @@ def _role_healthcare_service_location_sql(
         "service_ref.value",
         "HealthcareService",
     )
+    bounded_roles_sql = _bounded_source_rows_sql(
+        db_schema,
+        "provider_directory_practitioner_role",
+        "role",
+    )
     return f"""
         EXISTS (
             SELECT 1
-              FROM {_qt(db_schema, "provider_directory_practitioner_role")} AS role
+              FROM {bounded_roles_sql}
               CROSS JOIN LATERAL jsonb_array_elements_text(
                   COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
               ) AS service_ref(value)
@@ -3013,7 +3048,6 @@ def _role_healthcare_service_location_sql(
                 ON healthcare_service.source_id = role.source_id
                AND healthcare_service.resource_id = {service_resource_id}
               {location_join}
-             WHERE role.source_id = src.source_id
              LIMIT 1
         )
     """
@@ -3291,6 +3325,7 @@ def _semantic_summary_by_metric(
         "summary_source": "bounded_per_source_exists_probes",
         "counts_are_sampled": is_truncated,
         "source_limit": source_limit,
+        "source_row_limit": PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT,
         "sampled_source_count": sampled_source_count,
         "source_count": sampled_source_count,
         "truncated": is_truncated,
@@ -5635,6 +5670,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"\n_Per-source checks are bounded to `{semantic_readiness.get('source_limit')}` source(s); "
                 "increase `--sample-limit` for a larger sample._"
             )
+        lines.append(
+            f"\n_Each semantic probe inspects at most `{semantic_readiness.get('source_row_limit')}` "
+            "rows per source and resource table._"
+        )
     if (
         source_coverage.get("catalog_only_samples")
         or source_coverage.get("location_without_unified_samples")
