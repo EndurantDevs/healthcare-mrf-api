@@ -11258,6 +11258,7 @@ async def test_empty_checkpoint_restart_rejects_concurrent_progress(monkeypatch)
         )
 
     restart_sql = restart_connection.status.await_args.args[0]
+    assert "source_ids::jsonb = CAST(:source_ids AS jsonb)" in restart_sql
     assert "pages_processed = 0" in restart_sql
     assert "rows_processed = 0" in restart_sql
     assert "owner_run_id = :observed_owner_run_id" in restart_sql
@@ -11299,6 +11300,7 @@ async def test_checkpoint_adoption_rejects_concurrent_cursor_change(monkeypatch)
         )
 
     adoption_sql = status_mock.await_args.args[0]
+    assert "source_ids::jsonb = CAST(:source_ids AS jsonb)" in adoption_sql
     assert "next_url IS NOT DISTINCT FROM :observed_next_url" in adoption_sql
     assert "pages_processed = :observed_pages_processed" in adoption_sql
     assert "rows_processed = :observed_rows_processed" in adoption_sql

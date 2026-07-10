@@ -16566,7 +16566,7 @@ def _pagination_checkpoint_adoption_sql() -> str:
            AND source_scope_hash = :source_scope_hash
            AND acquisition_root_run_id = :acquisition_root_run_id
            AND owner_run_id = :previous_owner_run_id
-           AND source_ids = CAST(:source_ids AS jsonb)
+           AND source_ids::jsonb = CAST(:source_ids AS jsonb)
            AND (
                 CAST(:dataset_id AS varchar) IS NULL
                 OR dataset_id = :dataset_id
@@ -16576,7 +16576,7 @@ def _pagination_checkpoint_adoption_sql() -> str:
            AND state = :observed_state
            AND pages_processed = :observed_pages_processed
            AND rows_processed = :observed_rows_processed
-           AND recent_cursor_hashes = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
         """
 
 
@@ -16732,14 +16732,14 @@ def _empty_pagination_checkpoint_restart_sql() -> str:
            AND source_scope_hash = :source_scope_hash
            AND acquisition_root_run_id = :acquisition_root_run_id
            AND dataset_id = :dataset_id
-           AND source_ids = CAST(:source_ids AS jsonb)
+           AND source_ids::jsonb = CAST(:source_ids AS jsonb)
            AND owner_run_id = :observed_owner_run_id
            AND start_url_hash = :observed_start_url_hash
            AND next_url IS NOT DISTINCT FROM :observed_next_url
            AND state = :active_state
            AND pages_processed = 0
            AND rows_processed = 0
-           AND recent_cursor_hashes = CAST(:observed_cursor_hashes AS jsonb);
+           AND recent_cursor_hashes::jsonb = CAST(:observed_cursor_hashes AS jsonb);
         """
 
 
