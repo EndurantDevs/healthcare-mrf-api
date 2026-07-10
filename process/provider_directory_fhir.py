@@ -15001,6 +15001,29 @@ def _selected_resources(raw: str | None) -> list[str]:
     return selected
 
 
+def _source_resource_fetch_order(
+    source: dict[str, Any],
+    requested_resources: list[str],
+) -> list[str]:
+    """Return the requested resources in the order appropriate for one source."""
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if api_base != CIGNA_PROVIDER_DIRECTORY_BASE:
+        return list(requested_resources)
+    foundational_resources = [
+        resource_type
+        for resource_type in requested_resources
+        if resource_type != "PractitionerRole"
+    ]
+    practitioner_role_resources = [
+        resource_type
+        for resource_type in requested_resources
+        if resource_type == "PractitionerRole"
+    ]
+    return foundational_resources + practitioner_role_resources
+
+
 def _bool_or_default(value: Any, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -17491,7 +17514,7 @@ async def _import_resources(
                     dataset_id=source.get("_endpoint_dataset_id"),
                 ),
             )
-        for resource_type in resources:
+        for resource_type in _source_resource_fetch_order(source, resources):
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
             if (

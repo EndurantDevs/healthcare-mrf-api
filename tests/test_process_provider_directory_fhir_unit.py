@@ -11112,6 +11112,47 @@ def test_selected_resources_rejects_unknown_resource():
         importer._selected_resources("InsurancePlan,Patient")
 
 
+def test_source_resource_fetch_order_attempts_cigna_practitioner_role_last():
+    requested_resources = [
+        "PractitionerRole",
+        "InsurancePlan",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+    ]
+
+    fetch_order = importer._source_resource_fetch_order(
+        {"canonical_api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE},
+        requested_resources,
+    )
+
+    assert fetch_order == [
+        "InsurancePlan",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint",
+        "PractitionerRole",
+    ]
+    assert requested_resources[0] == "PractitionerRole"
+
+
+def test_source_resource_fetch_order_preserves_non_cigna_requested_order():
+    requested_resources = ["PractitionerRole", "Location", "Practitioner"]
+
+    fetch_order = importer._source_resource_fetch_order(
+        {"api_base": "https://payer.example/fhir"},
+        requested_resources,
+    )
+
+    assert fetch_order == requested_resources
+
+
 def test_canonical_backfill_resource_sql_uses_existing_resource_rows():
     canonical_sql, edge_sql = importer._canonical_backfill_resource_sql(
         "Location",
