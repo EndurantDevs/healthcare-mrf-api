@@ -1003,6 +1003,33 @@ def test_state_directory_rejects_untrusted_offset_next_link():
         )
 
 
+def test_generic_pagination_rejects_cross_origin_next_link():
+    source_lookup = {"api_base": "https://payer.example/fhir"}
+
+    with pytest.raises(ValueError, match="untrusted_pagination_link"):
+        importer._resolved_fhir_next_url(
+            source_lookup,
+            "https://payer.example/fhir/Practitioner?_count=25",
+            "https://untrusted.example/fhir/Practitioner?page=2",
+        )
+
+
+def test_generic_pagination_allows_configured_alias_host():
+    source_lookup = {
+        "api_base": "https://payer.example/fhir",
+        "metadata_json": {
+            "provider_directory_pagination_allowed_hosts": ["pagination.example"],
+        },
+    }
+    next_url = "https://pagination.example/fhir/Practitioner?page=2"
+
+    assert importer._resolved_fhir_next_url(
+        source_lookup,
+        "https://payer.example/fhir/Practitioner?_count=25",
+        next_url,
+    ) == next_url
+
+
 def test_molina_rewrites_exact_sapphire_next_link():
     source_lookup = {
         "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
@@ -7688,6 +7715,38 @@ async def test_fetch_resource_rows_ignores_dead_arkansas_cursor(monkeypatch):
     assert fetch_result.complete is True
     assert fetch_result.rows_fetched == 3
     assert fetched_urls == expected_urls
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_fails_closed_on_cross_origin_next(monkeypatch):
+    async def fake_fetch_source_json(_source, _request_url, *, timeout):
+        assert timeout == 3
+        return (
+            200,
+            _arkansas_practitioner_bundle(
+                ["prac-1"],
+                "https://untrusted.example/fhir/Practitioner?page=2",
+            ),
+            None,
+            1,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        {"source_id": "payer", "api_base": "https://payer.example/fhir"},
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "untrusted_pagination_link"
+    assert fetch_result.next_url_remaining is True
 
 
 @pytest.mark.asyncio

@@ -882,11 +882,15 @@ class _PractitionerRoleReverseLookupState:
             )
             await self.add_practitioner_role_page(resource_rows)
             next_link = _next_link(bundle_payload)
-            next_lookup_url = _resolved_fhir_next_url(
-                request.source,
-                next_lookup_url,
-                next_link,
-            )
+            try:
+                next_lookup_url = _resolved_fhir_next_url(
+                    request.source,
+                    next_lookup_url,
+                    next_link,
+                )
+            except ValueError as exc:
+                await self.record_reverse_lookup_error(str(exc))
+                return
             if await self.has_reached_page_limit():
                 return
         await self.add_completed_seed(request, seed_resource_type, seed_resource_id)
@@ -8751,6 +8755,45 @@ def _synthetic_skip_pagination_next_url(
     return _url_with_replaced_query_item(current_url, "_skip", str(next_skip))
 
 
+def _pagination_allowed_netlocs(
+    source_record: dict[str, Any],
+    current_url: str,
+) -> set[str]:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    allowed_netlocs = {
+        parsed.netloc.lower()
+        for candidate_url in (api_base, current_url)
+        if candidate_url and (parsed := urllib.parse.urlsplit(candidate_url)).netloc
+    }
+    configured_hosts = _string_list(
+        _source_metadata(source_record).get("provider_directory_pagination_allowed_hosts")
+    )
+    for configured_host in configured_hosts:
+        parsed_host = urllib.parse.urlsplit(configured_host)
+        allowed_netlocs.add(
+            (parsed_host.netloc or parsed_host.path).strip().rstrip("/").lower()
+        )
+    return allowed_netlocs
+
+
+def _is_trusted_fhir_pagination_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    next_url: str,
+) -> bool:
+    parsed_next = urllib.parse.urlsplit(next_url)
+    return bool(
+        parsed_next.scheme.lower() == "https"
+        and parsed_next.netloc.lower()
+        in _pagination_allowed_netlocs(source_record, current_url)
+        and parsed_next.username is None
+        and parsed_next.password is None
+        and not parsed_next.fragment
+    )
+
+
 def _resolved_fhir_next_url(
     source_record: dict[str, Any],
     current_url: str,
@@ -8767,20 +8810,23 @@ def _resolved_fhir_next_url(
         return _resolved_offset_next_url(api_base, current_url, next_url)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
         return _resolved_molina_next_url(current_url, next_url)
-    if api_base != HAP_PROVIDER_DIRECTORY_BASE:
-        return next_url
-    if parsed_next.netloc.lower() != HAP_BLOCKED_PAGINATION_HOST:
-        return next_url
-    public_base = urllib.parse.urlsplit(HAP_PROVIDER_DIRECTORY_BASE)
-    return urllib.parse.urlunsplit(
-        (
-            public_base.scheme,
-            public_base.netloc,
-            parsed_next.path,
-            parsed_next.query,
-            parsed_next.fragment,
+    if (
+        api_base == HAP_PROVIDER_DIRECTORY_BASE
+        and parsed_next.netloc.lower() == HAP_BLOCKED_PAGINATION_HOST
+    ):
+        public_base = urllib.parse.urlsplit(HAP_PROVIDER_DIRECTORY_BASE)
+        next_url = urllib.parse.urlunsplit(
+            (
+                public_base.scheme,
+                public_base.netloc,
+                parsed_next.path,
+                parsed_next.query,
+                parsed_next.fragment,
+            )
         )
-    )
+    if not _is_trusted_fhir_pagination_url(source_record, current_url, next_url):
+        raise ValueError("untrusted_pagination_link")
+    return next_url
 
 
 def _validated_offset_pagination_parts(
@@ -9610,6 +9656,28 @@ async def _consume_partition_entries(
                 )
 
 
+async def _partition_page_next_result(
+    source_record: dict[str, Any],
+    current_url: str,
+    next_link: str | None,
+    state: PartitionFetchState,
+    is_partition_failed: bool,
+) -> PartitionPageFetchResult:
+    try:
+        resolved_next_url = _resolved_fhir_next_url(
+            source_record,
+            current_url,
+            next_link,
+        )
+    except ValueError as exc:
+        await _mark_partition_fetch_error(state, str(exc))
+        return PartitionPageFetchResult(next_url=None, outcome="failed")
+    return PartitionPageFetchResult(
+        next_url=resolved_next_url,
+        outcome="failed" if is_partition_failed else "fetched",
+    )
+
+
 def _enqueue_adaptive_partition_children(
     source_record: dict[str, Any],
     resource_type: str,
@@ -9680,9 +9748,12 @@ async def _fetch_partition_page(
         fetch_options,
     )
     next_url = _next_link(fhir_payload)
-    return PartitionPageFetchResult(
-        next_url=_resolved_fhir_next_url(source_record, current_url, next_url),
-        outcome="failed" if is_partition_failed_on_page else "fetched",
+    return await _partition_page_next_result(
+        source_record,
+        current_url,
+        next_url,
+        state,
+        is_partition_failed_on_page,
     )
 
 
@@ -10141,11 +10212,16 @@ async def _fetch_resource_rows(
             source_api_base = _canonical_base(
                 source.get("canonical_api_base") or source.get("api_base")
             )
-            resolved_next_url = (
-                _synthetic_skip_pagination_next_url(source, url, len(entries))
-                if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
-                else _resolved_fhir_next_url(source, url, next_url)
-            )
+            try:
+                resolved_next_url = (
+                    _synthetic_skip_pagination_next_url(source, url, len(entries))
+                    if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+                    else _resolved_fhir_next_url(source, url, next_url)
+                )
+            except ValueError as exc:
+                error_message = str(exc)
+                next_url_remaining = True
+                break
             if (
                 checkpoint_context
                 and not entries
@@ -10345,7 +10421,16 @@ async def _fetch_scan_practitioner_role_rows(
                     row_limit_reached = entry_index < len(entries) - 1
                     break
             next_url = _next_link(payload)
-            url = _resolved_fhir_next_url(source, url, next_url)
+            try:
+                url = _resolved_fhir_next_url(source, url, next_url)
+            except ValueError as exc:
+                reverse_error_count += 1
+                error_message = (
+                    f"reverse_lookup_errors_{reverse_error_count}_last_{exc}"
+                )
+                next_url_remaining = True
+                url = None
+                break
             if not _limit_allows_more(rows_fetched, options.per_resource_limit) and url:
                 row_limit_reached = True
                 next_url_remaining = True
