@@ -219,10 +219,50 @@ The current measured estimate is 2.63-2.99 GB decimal, or 2.45-2.78 GiB:
 | Binary atom payloads | 0.14-0.18 GB |
 | Provider graph, NPI scope, support, and allowance | 0.29-0.36 GB |
 
-This is a design budget, not a delivered storage result. V3 needs a reader
-deployed before its writer, side-by-side immutable snapshots, logical tuple
-checksums against v2, forward/reverse/geo API parity, and a real import before
-becoming the default architecture.
+The v3 reader and Rust streaming writer now implement this shape. Price-set
+keys remain 32-bit, atom widths are selected from complete snapshot
+cardinality, provider/code pairs use bounded spill runs plus a streaming k-way
+merge, and missing referenced blocks fail closed. This remains a real-source
+design budget until the HealthJoy pilot proves its final PostgreSQL footprint;
+synthetic scaling is evidence for the encoding, not proof of the 2-3 GiB
+headline.
+
+### Current v3 evidence (2026-07-10)
+
+A cache-disabled local PostgreSQL run with 4,194,304 serving rates, 4,096 code
+keys, and 1,024 provider sets produced a complete 14,742,560-byte snapshot. The
+same fixture's previous v2 result was 35,935,248 bytes, so v3 was 2.44 times
+smaller. The v3 run completed in 9.8 seconds, including a 3.977-second binary
+build. With 20 measured requests after two warmups, code lookup p95 was
+34.435 ms and NPI reverse p95 was 39.850 ms; both passed the explicit 40 ms
+p95 gate with binary, dictionary, and sidecar caches disabled. The report is:
+
+```text
+/tmp/ptg2-v3-final-4m-report/run-20260710T194138Z/report.json
+```
+
+A separate fresh-process run with zero warmups measured the first code request
+at 59.704 ms and the following NPI reverse request at 86.436 ms. The current
+validated contract is therefore warm p95 at or below 40 ms plus a 100 ms cold
+sample ceiling; do not describe v3 as a universal 40 ms path until snapshot
+prewarming or fewer PostgreSQL round trips closes that first-request gap. The
+cold report is:
+
+```text
+/tmp/ptg2-v3-cold-4m-report/run-20260710T195429Z/report.json
+```
+
+The exact 14,822,435,906-byte HealthJoy gzip expands to 293,363,494,314 bytes.
+On the dev PTGHuge lane, verified decode-to-stdout took 124 seconds with four
+rapidgzip threads and 111 seconds with eight, versus the 523-second GNU gzip
+floor. Four threads are the initial integrated-scanner choice because parsing
+workers need the remaining CPU; the full scanner and publish phases still need
+the real import measurement.
+
+Before promotion, deploy readers first, preserve side-by-side immutable
+snapshots, compare logical tuple checksums against v2, verify forward, reverse,
+geo, and price hydration parity, and complete the real-source storage and
+memory pilot.
 
 After taxonomy filtering was moved ahead of the v2 location candidate limit,
 the warmed PostgreSQL-only API p95 values were 20.48 ms for code-to-provider,

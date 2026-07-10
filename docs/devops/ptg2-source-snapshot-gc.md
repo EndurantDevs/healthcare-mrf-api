@@ -9,7 +9,7 @@ tables are no longer referenced by the current PTG2 pointer tables.
 The maintenance command targets only snapshots that satisfy all of these
 conditions:
 
-- `mrf.ptg2_snapshot.status = 'published'`
+- `mrf.ptg2_snapshot.status IN ('published', 'failed')`; active `building` snapshots are excluded
 - `manifest->'serving_index'->>'storage' = 'manifest_snapshot'`
 - the snapshot id is outside the protected lineage rooted at all current pointer tables:
   - `mrf.ptg2_current_snapshot`
@@ -54,9 +54,13 @@ Normal source publish cleanup uses the same four-snapshot default through
 the maintenance argument consistently when a deployment needs a different
 history depth.
 
-The execute path recomputes the candidate set inside one database transaction
-before dropping tables. It refuses to run if the recomputed snapshot count,
-table count, or byte total exceeds the supplied bounds.
+The execute path acquires the same advisory lock used by source publication,
+locks snapshot status and all pointer tables against concurrent updates, and
+recomputes the candidate set inside that database transaction before dropping
+tables. A snapshot promoted after a dry-run, or a failed snapshot reclaimed as
+`building`, is therefore protected by the execute-time plan. The command
+refuses to run if the recomputed snapshot count, table count, or byte total
+exceeds the supplied bounds.
 
 ## Dev-Server Access Pattern
 
@@ -91,7 +95,7 @@ WITH current_refs AS (
 ), manifest_snapshots AS (
     SELECT snapshot_id, manifest->'serving_index'->>'source_key' AS source_key
     FROM mrf.ptg2_snapshot
-    WHERE status = 'published'
+    WHERE status IN ('published', 'failed')
       AND COALESCE(manifest->'serving_index'->>'storage', '') = 'manifest_snapshot'
 ), non_current AS (
     SELECT ms.*
@@ -124,16 +128,25 @@ WITH current_refs AS (
     SELECT DISTINCT regexp_replace(table_value, '^.*\.', '') AS table_name
     FROM mrf.ptg2_snapshot s
     JOIN current_refs cr ON cr.snapshot_id = s.snapshot_id
-    CROSS JOIN LATERAL (VALUES
-        (s.manifest->'serving_index'->>'table'),
-        (s.manifest->'serving_index'->>'price_atom_table'),
-        (s.manifest->'serving_index'->>'provider_group_member_table'),
-        (s.manifest->'serving_index'->>'provider_npi_scope_table'),
-        (s.manifest->'serving_index'->>'serving_binary_table'),
-        (s.manifest->'serving_index'->>'provider_group_location_table'),
-        (s.manifest->'serving_index'->>'provider_set_component_table'),
-        (s.manifest->'serving_index'->>'code_count_table')
-    ) AS tables(table_value)
+    CROSS JOIN LATERAL (
+        SELECT value AS table_value
+        FROM json_each_text(
+            COALESCE(s.manifest->'serving_index'->'materialized_tables', '{}'::json)
+        )
+        UNION
+        SELECT table_value
+        FROM (VALUES
+            (s.manifest->'serving_index'->>'table'),
+            (s.manifest->'serving_index'->>'price_atom_table'),
+            (s.manifest->'serving_index'->>'provider_group_member_table'),
+            (s.manifest->'serving_index'->>'provider_npi_scope_table'),
+            (s.manifest->'serving_index'->>'serving_binary_table'),
+            (s.manifest->'serving_index'->>'provider_group_location_table'),
+            (s.manifest->'serving_index'->>'provider_set_component_table'),
+            (s.manifest->'serving_index'->>'provider_group_rate_scope_table'),
+            (s.manifest->'serving_index'->>'code_count_table')
+        ) AS legacy_tables(table_value)
+    ) AS tables
     WHERE COALESCE(s.manifest->'serving_index'->>'storage', '') = 'manifest_snapshot'
       AND table_value IS NOT NULL
       AND table_value <> ''
