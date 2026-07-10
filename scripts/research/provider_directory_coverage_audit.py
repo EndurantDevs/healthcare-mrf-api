@@ -2853,18 +2853,86 @@ def _validated_maintained_source_ids(
 
 def _maintained_source_ids_from_manifest(manifest_path: str | Path) -> tuple[str, ...]:
     """Load the exact source scope from the validated acquisition manifest."""
+    selection = _semantic_source_selection_from_manifest(
+        manifest_path,
+        requested_entry_ids=(),
+        requested_source_ids=(),
+    )
+    return tuple(selection["source_ids"])
+
+
+def _normalized_semantic_request_ids(
+    requested_id_values: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """Strip and deduplicate repeatable semantic audit selector values."""
+    return tuple(
+        dict.fromkeys(
+            str(requested_identity).strip()
+            for requested_identity in requested_id_values
+            if str(requested_identity).strip()
+        )
+    )
+
+
+def _semantic_source_selection_from_manifest(
+    manifest_path: str | Path,
+    *,
+    requested_entry_ids: list[str] | tuple[str, ...],
+    requested_source_ids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Resolve an exact, validated semantic audit scope from the manifest."""
     try:
         from scripts.research.provider_directory_endpoint_acquisition_harness import load_manifest
     except ModuleNotFoundError:
         from provider_directory_endpoint_acquisition_harness import load_manifest
 
     manifest = load_manifest(Path(manifest_path))
-    source_ids = [
+    entries = manifest["entries"]
+    entries_by_id = {str(entry["entry_id"]): entry for entry in entries}
+    source_ids_by_entry_id = {
+        entry_id: _validated_maintained_source_ids(entry["source_ids"])
+        for entry_id, entry in entries_by_id.items()
+    }
+    entry_id_by_source_id = {
+        source_id: entry_id
+        for entry_id, source_ids in source_ids_by_entry_id.items()
+        for source_id in source_ids
+    }
+    requested_entries = _normalized_semantic_request_ids(requested_entry_ids)
+    requested_sources = _normalized_semantic_request_ids(requested_source_ids)
+    unknown_entry_ids = sorted(set(requested_entries) - set(entries_by_id))
+    if unknown_entry_ids:
+        raise ValueError(f"unknown semantic manifest entry_id(s): {', '.join(unknown_entry_ids)}")
+    _validated_maintained_source_ids(requested_sources) if requested_sources else ()
+    unknown_source_ids = sorted(set(requested_sources) - set(entry_id_by_source_id))
+    if unknown_source_ids:
+        raise ValueError(f"unknown semantic manifest source_id(s): {', '.join(unknown_source_ids)}")
+
+    requested_source_set = set(requested_sources)
+    requested_entry_set = set(requested_entries)
+    selected_source_ids = [
         source_id
-        for entry in manifest["entries"]
-        for source_id in entry["source_ids"]
+        for entry in entries
+        for source_id in source_ids_by_entry_id[str(entry["entry_id"])]
+        if not (requested_entries or requested_sources)
+        or str(entry["entry_id"]) in requested_entry_set
+        or source_id in requested_source_set
     ]
-    return _validated_maintained_source_ids(source_ids)
+    selected_source_ids = list(_validated_maintained_source_ids(selected_source_ids))
+    selected_entry_ids = [
+        str(entry["entry_id"])
+        for entry in entries
+        if any(source_id in source_ids_by_entry_id[str(entry["entry_id"])] for source_id in selected_source_ids)
+    ]
+    return {
+        "manifest_path": str(manifest_path),
+        "requested_entry_ids": list(requested_entries),
+        "requested_source_ids": list(requested_sources),
+        "selected_entry_ids": selected_entry_ids,
+        "source_ids": selected_source_ids,
+        "source_count": len(selected_source_ids),
+        "selection_active": bool(requested_entries or requested_sources),
+    }
 
 
 def _bounded_source_rows_sql(
@@ -5252,8 +5320,22 @@ def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
 
 async def build_report(args: argparse.Namespace) -> dict[str, Any]:
     schema = _validate_identifier(args.schema, label="schema")
+    semantic_source_selection = None
+    if args.semantic_source_entry_id or args.semantic_source_id:
+        semantic_source_selection = _semantic_source_selection_from_manifest(
+            args.semantic_source_manifest,
+            requested_entry_ids=args.semantic_source_entry_id,
+            requested_source_ids=args.semantic_source_id,
+        )
     conn = await _connect(args)
     try:
+        if semantic_source_selection:
+            return await _selected_semantic_audit_report(
+                conn,
+                schema,
+                args,
+                semantic_source_selection,
+            )
         network_resolution_summary = (
             {"available": False, "skipped": True, "reason": "disabled by --skip-network-resolution"}
             if args.skip_network_resolution
@@ -5433,6 +5515,67 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
         await conn.close()
 
 
+def _semantic_audit_skipped_section(*, reason: str, samples: bool = False) -> dict[str, Any]:
+    """Return a skipped report section without issuing a broad aggregate query."""
+    section_by_name: dict[str, Any] = {"available": False, "skipped": True, "reason": reason}
+    if samples:
+        section_by_name["samples"] = []
+    return section_by_name
+
+
+async def _selected_semantic_audit_report(
+    conn: asyncpg.Connection,
+    schema: str,
+    args: argparse.Namespace,
+    semantic_source_selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a selector-only report without retaining broad source aggregates."""
+    reason = "disabled by --semantic-source-entry-id/--semantic-source-id"
+    report_by_section = {
+        "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "schema": schema,
+        "ptg_plan_filter": args.ptg_plan_id or None,
+        "semantic_source_selection": semantic_source_selection,
+        "source_summary": _semantic_audit_skipped_section(reason=reason),
+        "credential_onboarding_backlog": _semantic_audit_skipped_section(reason=reason),
+        "probe_timeout_summary": _semantic_audit_skipped_section(reason=reason),
+        "capability_status_counts": [],
+        "resource_summary": {},
+        "source_resource_coverage_summary": _semantic_audit_skipped_section(reason=reason, samples=True),
+        "source_semantic_readiness_summary": await _bounded_source_semantic_readiness_summary(
+            conn,
+            schema,
+            sample_limit=args.sample_limit,
+            include_unified=not args.skip_unified,
+            maintained_source_ids=semantic_source_selection["source_ids"],
+        ),
+        "practitioner_role_reimport_gap_summary": _semantic_audit_skipped_section(reason=reason, samples=True),
+        "canonical_resource_summary": {
+            **_semantic_audit_skipped_section(reason=reason),
+            "resources": [],
+        },
+        "unified_summary": _semantic_audit_skipped_section(reason=reason),
+        "ptg_summary": _skipped_ptg_summary(),
+        "network_resolution_summary": _semantic_audit_skipped_section(reason=reason),
+        "plan_network_context_summary": _semantic_audit_skipped_section(reason=reason, samples=True),
+        "network_catalog_summary": _semantic_audit_skipped_section(reason=reason, samples=True),
+        "top_source_yield": [],
+        "alias_fanout_summary": {
+            **_semantic_audit_skipped_section(reason=reason),
+            "resources": [],
+        },
+        "advertised_resource_gap_summary": _semantic_audit_skipped_section(reason=reason),
+        "valid_sources_without_resource_rows": {
+            **_semantic_audit_skipped_section(reason=reason, samples=True),
+            "source_count": 0,
+        },
+        "source_catalog_retest_coverage": _semantic_audit_skipped_section(reason=reason),
+    }
+    report_by_section["serving_readiness"] = _serving_readiness_summary(report_by_section)
+    report_by_section["gaps"] = _derive_gaps(report_by_section)
+    return report_by_section
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     source = report.get("source_summary") or {}
     unified = report.get("unified_summary") or {}
@@ -5447,6 +5590,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     canonical_resources = report.get("canonical_resource_summary") or {}
     source_coverage = report.get("source_resource_coverage_summary") or {}
     semantic_readiness = report.get("source_semantic_readiness_summary") or {}
+    semantic_source_selection = report.get("semantic_source_selection") or {}
     retest = report.get("source_catalog_retest_coverage") or {}
     lines = [
         "# Provider Directory Coverage Audit",
@@ -5458,6 +5602,19 @@ def render_markdown(report: dict[str, Any]) -> str:
         "## Summary",
         "",
     ]
+    if semantic_source_selection.get("selection_active"):
+        entry_ids = ", ".join(semantic_source_selection.get("selected_entry_ids") or [])
+        source_ids = ", ".join(semantic_source_selection.get("source_ids") or [])
+        lines.extend(
+            [
+                "- semantic audit selection: "
+                f"`{semantic_source_selection.get('source_count')}` source(s) from "
+                f"`{semantic_source_selection.get('manifest_path')}`",
+                f"- selected manifest entries: `{entry_ids or 'none'}`",
+                f"- selected source IDs: `{source_ids or 'none'}`",
+                "- broad source/resource aggregates: were skipped for bounded semantic audit mode",
+            ]
+        )
     if source.get("available"):
         lines.extend(
             [
@@ -5904,6 +6061,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"\n_Per-source checks are bounded to `{semantic_readiness.get('source_limit')}` source(s); "
                 "increase `--sample-limit` for a larger sample._"
             )
+        elif semantic_source_selection.get("selection_active"):
+            lines.append(
+                f"\n_Per-source checks cover the selected `{semantic_source_selection.get('source_count')}` "
+                "validated manifest source ID(s); broad source/resource aggregates were skipped._"
+            )
         elif semantic_readiness.get("scope") == "maintained_manifest_source_ids":
             lines.append(
                 f"\n_Per-source checks cover all `{semantic_readiness.get('maintained_source_id_count')}` "
@@ -6052,6 +6214,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Validated endpoint-acquisition manifest whose exact source IDs scope the "
             "per-source semantic readiness section."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-source-entry-id",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable exact acquisition-manifest entry_id selector for a bounded "
+            "per-source semantic audit."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-source-id",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable exact acquisition-manifest source_id selector for a bounded "
+            "per-source semantic audit."
         ),
     )
     parser.add_argument(

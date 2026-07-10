@@ -17,6 +17,48 @@ def test_provider_directory_coverage_audit_defaults_to_maintained_source_manifes
     assert args.semantic_source_manifest == str(audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST)
 
 
+def test_provider_directory_coverage_audit_parse_args_accepts_semantic_source_selectors():
+    args = audit.parse_args(
+        [
+            "--semantic-source-entry-id",
+            "idaho",
+            "--semantic-source-entry-id",
+            "michigan",
+            "--semantic-source-id",
+            "pdfhir_b6fdc036a4686d0ab69f6f3a",
+        ]
+    )
+
+    assert args.semantic_source_entry_id == ["idaho", "michigan"]
+    assert args.semantic_source_id == ["pdfhir_b6fdc036a4686d0ab69f6f3a"]
+
+
+def test_provider_directory_coverage_audit_semantic_source_selection_is_manifest_validated():
+    selection = audit._semantic_source_selection_from_manifest(
+        audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST,
+        requested_entry_ids=["idaho"],
+        requested_source_ids=[],
+    )
+
+    assert selection["selection_active"] is True
+    assert selection["selected_entry_ids"] == ["idaho"]
+    assert selection["source_ids"] == ["pdfhir_b6fdc036a4686d0ab69f6f3a"]
+    assert selection["source_count"] == 1
+
+    with pytest.raises(ValueError, match="unknown semantic manifest entry_id"):
+        audit._semantic_source_selection_from_manifest(
+            audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST,
+            requested_entry_ids=["unknown-entry"],
+            requested_source_ids=[],
+        )
+    with pytest.raises(ValueError, match="unknown semantic manifest source_id"):
+        audit._semantic_source_selection_from_manifest(
+            audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST,
+            requested_entry_ids=[],
+            requested_source_ids=["pdfhir_000000000000000000000000"],
+        )
+
+
 def test_provider_directory_coverage_audit_loads_all_maintained_source_ids():
     source_ids = audit._maintained_source_ids_from_manifest(
         audit.DEFAULT_SEMANTIC_SOURCE_MANIFEST
@@ -2891,6 +2933,54 @@ async def test_provider_directory_coverage_audit_exact_semantic_scope_retains_mi
     assert "cover all `2` source IDs" in audit.render_markdown(
         {"source_semantic_readiness_summary": summary}
     )
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_selected_pod_safe_report_stays_bounded(monkeypatch):
+    args = audit.parse_args(
+        [
+            "--pod-safe",
+            "--semantic-source-entry-id",
+            "idaho",
+        ]
+    )
+    captured_by_name = {}
+
+    class FakeConn:
+        async def fetch(self, *_args):
+            raise AssertionError("selected semantic audit must not run broad aggregate queries")
+
+        async def close(self):
+            captured_by_name["closed"] = True
+
+    async def bounded_semantic_summary(_conn, _schema, **kwargs):
+        captured_by_name.update(kwargs)
+        return {
+            "available": True,
+            "scope": "maintained_manifest_source_ids",
+            "source_limit": 1,
+            "source_row_limit": audit.PROVIDER_DIRECTORY_SEMANTIC_SOURCE_ROW_LIMIT,
+            "sampled_source_count": 1,
+            "raw_only_source_count": 0,
+            "missing_maintained_source_count": 0,
+            "samples": [],
+        }
+
+    monkeypatch.setattr(audit, "_connect", AsyncMock(return_value=FakeConn()))
+    monkeypatch.setattr(audit, "_bounded_source_semantic_readiness_summary", bounded_semantic_summary)
+
+    report = await audit.build_report(args)
+
+    assert captured_by_name["include_unified"] is False
+    assert captured_by_name["maintained_source_ids"] == ["pdfhir_b6fdc036a4686d0ab69f6f3a"]
+    assert captured_by_name["closed"] is True
+    assert report["semantic_source_selection"]["selected_entry_ids"] == ["idaho"]
+    assert report["source_resource_coverage_summary"]["skipped"] is True
+    assert report["resource_summary"] == {}
+    markdown = audit.render_markdown(report)
+    assert "semantic audit selection: `1` source(s)" in markdown
+    assert "selected manifest entries: `idaho`" in markdown
+    assert "broad source/resource aggregates: were skipped" in markdown
 
 
 @pytest.mark.asyncio
