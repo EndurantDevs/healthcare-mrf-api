@@ -454,9 +454,13 @@ TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL = f"{NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/metadata"
 NEBRASKA_DHHS_PAGINATION_HOST = "dhhs-uat-api.ne.gov"
+ARKANSAS_PROVIDER_DIRECTORY_BASE = (
+    "https://fite.ar-prd.gw02.abacusinsights.ai/provider-directory"
+)
 FHIR_OFFSET_PAGINATION_BASES = frozenset(
     {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}
 )
+FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BASE})
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
 WYOMING_PROVIDER_DIRECTORY_BASE = "https://wy.fhir.mhbapp.com/pd/api/v1"
@@ -497,6 +501,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
         ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
         ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
+        ARKANSAS_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
@@ -514,6 +519,7 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
         "_getpagesid",
         "_getpagesoffset",
         "_offset",
+        "_skip",
         "cursor",
         "cursormark",
         "nexttoken",
@@ -1562,10 +1568,13 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    if api_base not in FHIR_OFFSET_PAGINATION_BASES:
+    if api_base not in FHIR_OFFSET_PAGINATION_BASES | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
         return url
     sorted_url = _url_with_replaced_query_item(url, "_sort", "_id")
-    return _url_with_replaced_query_item(sorted_url, "_offset", "0")
+    offset_parameter = (
+        "_skip" if api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES else "_offset"
+    )
+    return _url_with_replaced_query_item(sorted_url, offset_parameter, "0")
 
 
 def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
@@ -8685,6 +8694,42 @@ def _next_link(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _synthetic_skip_pagination_next_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    bundle_entry_count: int,
+) -> str | None:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if api_base not in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
+        raise ValueError("synthetic skip pagination is not configured for source")
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_base = urllib.parse.urlsplit(api_base)
+    query_items = urllib.parse.parse_qsl(parsed_current.query, keep_blank_values=True)
+    count_values = [parameter_value for key, parameter_value in query_items if key == "_count"]
+    skip_values = [parameter_value for key, parameter_value in query_items if key == "_skip"]
+    sort_values = [parameter_value for key, parameter_value in query_items if key == "_sort"]
+    is_valid = (
+        parsed_current.scheme.lower() == parsed_base.scheme.lower()
+        and parsed_current.netloc.lower() == parsed_base.netloc.lower()
+        and parsed_current.path.startswith(parsed_base.path.rstrip("/") + "/")
+        and not parsed_current.fragment
+        and len(count_values) == 1
+        and count_values[0].isdigit()
+        and int(count_values[0]) > 0
+        and len(skip_values) == 1
+        and skip_values[0].isdigit()
+        and sort_values == ["_id"]
+    )
+    if not is_valid:
+        raise ValueError("invalid synthetic skip pagination URL")
+    if bundle_entry_count < int(count_values[0]):
+        return None
+    next_skip = int(skip_values[0]) + bundle_entry_count
+    return _url_with_replaced_query_item(current_url, "_skip", str(next_skip))
+
+
 def _resolved_fhir_next_url(
     source_record: dict[str, Any],
     current_url: str,
@@ -10072,7 +10117,14 @@ async def _fetch_resource_rows(
                     next_url_remaining = True
                     break
             next_url = _next_link(payload)
-            resolved_next_url = _resolved_fhir_next_url(source, url, next_url)
+            source_api_base = _canonical_base(
+                source.get("canonical_api_base") or source.get("api_base")
+            )
+            resolved_next_url = (
+                _synthetic_skip_pagination_next_url(source, url, len(entries))
+                if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+                else _resolved_fhir_next_url(source, url, next_url)
+            )
             if (
                 checkpoint_context
                 and not entries

@@ -871,6 +871,36 @@ def test_source_row_from_seed_overrides_nebraska_dhhs_stale_oauth_label():
     )
 
 
+def test_arkansas_uses_stable_synthetic_skip_pagination():
+    source_lookup = {
+        "source_id": "arkansas",
+        "api_base": importer.ARKANSAS_PROVIDER_DIRECTORY_BASE,
+    }
+    start_url = importer._resource_start_url(
+        source_lookup,
+        "Practitioner",
+        page_count=25,
+    )
+
+    assert start_url == (
+        f"{importer.ARKANSAS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_count=25&_sort=_id&_skip=0"
+    )
+    assert importer._synthetic_skip_pagination_next_url(
+        source_lookup,
+        start_url,
+        25,
+    ) == start_url.replace("_skip=0", "_skip=25")
+    assert (
+        importer._synthetic_skip_pagination_next_url(
+            source_lookup,
+            start_url,
+            24,
+        )
+        is None
+    )
+
+
 def test_source_row_from_seed_overrides_hap_stale_provider_directory_path():
     row = importer._source_row_from_seed(
         {
@@ -7565,6 +7595,64 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
     assert result is not None
     assert result.fetch_mode == "paged"
     assert result.rows[0]["resource_id"] == "prac-1"
+
+
+def _arkansas_practitioner_bundle(resource_ids, next_link=None):
+    bundle_dict = {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": resource_id,
+                    "name": [{"family": resource_id}],
+                }
+            }
+            for resource_id in resource_ids
+        ],
+    }
+    if next_link:
+        bundle_dict["link"] = [{"relation": "next", "url": next_link}]
+    return bundle_dict
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_ignores_dead_arkansas_cursor(monkeypatch):
+    source_lookup = {
+        "source_id": "arkansas",
+        "api_base": importer.ARKANSAS_PROVIDER_DIRECTORY_BASE,
+    }
+    expected_urls = [
+        f"{importer.ARKANSAS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        f"_count=2&_sort=_id&_skip={skip_count}"
+        for skip_count in (0, 2)
+    ]
+    fetched_urls: list[str] = []
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        assert timeout == 3
+        fetched_urls.append(request_url)
+        if request_url == expected_urls[0]:
+            return 200, _arkansas_practitioner_bundle(["prac-1", "prac-2"], "/dead"), None, 1
+        assert request_url == expected_urls[1]
+        return 200, _arkansas_practitioner_bundle(["prac-3"]), None, 1
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_lookup,
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=2,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 3
+    assert fetched_urls == expected_urls
 
 
 @pytest.mark.asyncio
