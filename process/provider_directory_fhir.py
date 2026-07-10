@@ -3163,6 +3163,7 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
                 for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
             },
             "provider_directory_bulk_export_omit_output_format": True,
+            "provider_directory_bulk_export_auto_enabled": True,
             "provider_directory_bulk_export_output_hosts": [
                 "storage.googleapis.com",
             ],
@@ -10380,8 +10381,12 @@ def _is_source_bulk_export_effective(
     api_base = _canonical_base(
         source.get("canonical_api_base") or source.get("api_base")
     )
-    return bool(
+    source_requested = (
         requested
+        or _source_metadata(source).get("provider_directory_bulk_export_auto_enabled") is True
+    )
+    return bool(
+        source_requested
         and (
             api_base != AETNA_PROVIDER_DIRECTORY_DATA_BASE
             or per_resource_limit > 0

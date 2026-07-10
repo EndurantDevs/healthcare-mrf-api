@@ -151,6 +151,7 @@ def test_aetna_provider_directorydata_supplemental_source_is_not_rewritten_to_me
     assert source_row["last_validated_status"] == "auth_required"
     assert source_row["metadata_json"]["provider_directory_override"] == "aetna_apif1_providerdirectorydata"
     assert source_row["metadata_json"]["provider_directory_bulk_export_omit_output_format"] is True
+    assert source_row["metadata_json"]["provider_directory_bulk_export_auto_enabled"] is True
     assert source_row["metadata_json"]["provider_directory_bulk_export_output_hosts"] == [
         "storage.googleapis.com"
     ]
@@ -2614,6 +2615,25 @@ def test_aetna_unbounded_bulk_requires_checkpoint():
         source_lookup,
         True,
         per_resource_limit=25,
+    )
+
+
+def test_aetna_catalog_opt_in_enables_checkpointed_bulk_for_general_refresh():
+    source_lookup = {
+        "api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+        "metadata_json": {"provider_directory_bulk_export_auto_enabled": True},
+    }
+
+    assert not importer._is_source_bulk_export_effective(
+        source_lookup,
+        False,
+        per_resource_limit=0,
+    )
+    assert importer._is_source_bulk_export_effective(
+        source_lookup,
+        False,
+        per_resource_limit=0,
+        checkpoint_context=_bulk_test_context(),
     )
 
 
