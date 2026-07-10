@@ -107,7 +107,15 @@ acquisition can use the durable Bulk Data path described below. This is
 important because the audited endpoint exposed about 1,414 `InsurancePlan`
 rows and roughly 380 million `PractitionerRole` rows.
 
-The Medicaid source supports six resources, excluding `HealthcareService` and
+Cigna's public Provider Directory accepts at most `_count=100` for the
+`Practitioner` collection. Requests tested with 200, 500, or 1,000 return an
+HTTP-200 search Bundle containing a fatal `OperationOutcome` instead of
+Practitioner resources. The maintained acquisition profile therefore keeps
+`page_count=100`; Cigna remains sequential REST-pagination bound because it
+does not advertise a usable Bulk export and does not provide a reliable Bundle
+total for this collection.
+
+The Aetna Medicaid source supports six resources, excluding `HealthcareService` and
 `Endpoint`. Its metadata declares
 `provider_directory_coverage_mode=targeted` and an empty
 `provider_directory_fully_enumerable_resources` list. A generic collection
