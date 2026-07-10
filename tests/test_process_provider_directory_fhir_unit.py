@@ -1280,6 +1280,40 @@ def test_idaho_medicaid_accepts_exact_alternate_ct_pagination_link():
     ) == next_url
 
 
+def test_idaho_medicaid_accepts_alternate_host_cursor_chain():
+    current_url = (
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?"
+        "_count=100&ct=first-cursor"
+    )
+    next_url = (
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?"
+        "_count=100&ct=second-cursor"
+    )
+
+    assert importer._resolved_fhir_next_url(
+        {"api_base": importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE},
+        current_url,
+        next_url,
+    ) == next_url
+
+
+def test_idaho_medicaid_rejects_cursor_chain_from_untrusted_current_host():
+    next_url = (
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?"
+        "_count=100&ct=second-cursor"
+    )
+
+    with pytest.raises(ValueError, match="untrusted_idaho_medicaid_pagination_link"):
+        importer._resolved_fhir_next_url(
+            {"api_base": importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE},
+            (
+                "https://evil.example/v1/api/provider-directory/Practitioner?"
+                "_count=100&ct=first-cursor"
+            ),
+            next_url,
+        )
+
+
 @pytest.mark.parametrize(
     "next_url",
     [

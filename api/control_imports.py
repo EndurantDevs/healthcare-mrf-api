@@ -1238,15 +1238,37 @@ async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
         return {"redis": False, "removed": False, "error": str(exc), "queue": queue, "job_id": job_id}
 
 
+def _retry_child_params(
+    current_run_map: dict[str, Any],
+    run_id: str,
+    retry_params_by_name: dict[str, Any],
+) -> dict[str, Any]:
+    current_params_by_name = (
+        current_run_map.get("params")
+        if isinstance(current_run_map.get("params"), dict)
+        else {}
+    )
+    child_params_by_name = {**current_params_by_name, **retry_params_by_name}
+    if current_run_map.get("importer") != "provider-directory-fhir":
+        return child_params_by_name
+    root_run_id = str(
+        current_params_by_name.get("provider_directory_pagination_root_run_id")
+        or retry_params_by_name.get("provider_directory_pagination_root_run_id")
+        or run_id
+    ).strip()
+    child_params_by_name["retry_of_run_id"] = run_id
+    child_params_by_name["provider_directory_pagination_root_run_id"] = root_run_id
+    return child_params_by_name
+
+
 async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool] | None:
     current = await get_import_run(run_id)
     if not current:
         return None
-    current_params = current.get("params") if isinstance(current.get("params"), dict) else {}
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}
     retry_payload = {
         "importer": current["importer"],
-        "params": {**current_params, **retry_params},
+        "params": _retry_child_params(current, run_id, retry_params),
         "triggered_by": payload.get("triggered_by") or "api",
         "idempotency_key": payload.get("idempotency_key"),
         "schedule_id": current.get("schedule_id"),

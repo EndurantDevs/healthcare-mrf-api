@@ -353,6 +353,45 @@ async def test_retry_import_run_without_retry_params_preserves_ordinary_child_pa
     assert created_payloads[0]["params"] == {"test_mode": False, "resource_limit": 100}
 
 
+@pytest.mark.asyncio
+async def test_provider_directory_retry_replaces_stale_param_lineage(monkeypatch):
+    current_run_map = {
+        "run_id": "run_parent",
+        "importer": "provider-directory-fhir",
+        "params": {
+            "resource_limit": 0,
+            "retry_of_run_id": "run_grandparent",
+            "provider_directory_pagination_root_run_id": "run_root",
+        },
+        "schedule_id": None,
+        "subscription_id": None,
+        "source_file_import_id": None,
+        "import_id": None,
+    }
+    created_payloads = []
+
+    async def fake_get(_run_id):
+        return current_run_map
+
+    async def fake_create(payload):
+        created_payloads.append(payload)
+        return payload, True
+
+    monkeypatch.setattr(control_imports, "get_import_run", fake_get)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_create)
+
+    await control_imports.retry_import_run(
+        "run_parent",
+        {"idempotency_key": "retry_provider_directory_again"},
+    )
+
+    assert created_payloads[0]["params"] == {
+        "resource_limit": 0,
+        "retry_of_run_id": "run_parent",
+        "provider_directory_pagination_root_run_id": "run_root",
+    }
+
+
 def test_openaddresses_adapter_preserves_parallel_load_params():
     payload = control_imports._adapter_payload(
         control_imports._SINGLE_JOB_ADAPTERS["openaddresses"],

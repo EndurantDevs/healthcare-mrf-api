@@ -10055,9 +10055,13 @@ def _resolved_idaho_medicaid_next_url(
     base_path = parsed_base.path.rstrip("/")
     current_path = parsed_current.path.rstrip("/")
     resource_type = current_path[len(base_path) :].strip("/")
+    allowed_current_hosts = {
+        (parsed_base.hostname or "").lower(),
+        IDAHO_MEDICAID_PAGINATION_HOST,
+    }
     is_allowlisted = (
         parsed_current.scheme.lower() == "https"
-        and (parsed_current.hostname or "").lower() == parsed_base.hostname
+        and (parsed_current.hostname or "").lower() in allowed_current_hosts
         and _url_https_port(parsed_current) == 443
         and parsed_current.username is None
         and parsed_current.password is None
