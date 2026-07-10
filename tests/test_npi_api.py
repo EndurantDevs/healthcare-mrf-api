@@ -11,6 +11,40 @@ from api.endpoint import npi as npi_module
 from api.endpoint.npi import npi_index_status
 
 
+@pytest.fixture
+def uhc_provider_directory_alias_fixture():
+    endpoint_id = "pd_endpoint_uhc_public"
+    canonical_api_base = "https://public.providerexpress.com/providerdirectory"
+    source_ids = [f"pdfhir_uhc_{alias_number:02d}" for alias_number in range(31)]
+    source_record_ids = [
+        (
+            "provider_directory_fhir:practitioner_role:"
+            f"{source_id}:role-{alias_number:02d}:location-{alias_number:02d}"
+        )
+        for alias_number, source_id in enumerate(source_ids)
+    ]
+    source_detail_map = {
+        source_id: {
+            "source": "provider_directory_fhir",
+            "source_id": source_id,
+            "endpoint_id": endpoint_id,
+            "canonical_api_base": canonical_api_base,
+            "org_name": f"UnitedHealthcare catalog alias {alias_number:02d}",
+            "plan_name": f"Choice Plus catalog label {alias_number:02d}",
+            "insurance_plan_refs": [],
+            "network_refs": [],
+        }
+        for alias_number, source_id in enumerate(source_ids)
+    }
+    return {
+        "endpoint_id": endpoint_id,
+        "canonical_api_base": canonical_api_base,
+        "source_ids": source_ids,
+        "source_record_ids": source_record_ids,
+        "source_detail_map": source_detail_map,
+    }
+
+
 @pytest.mark.asyncio
 async def test_npi_index(monkeypatch):
     async def fake_counts():
@@ -158,6 +192,119 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
             "other_provider_identifier_issuer": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_sources_collapse_uhc_aliases(
+    monkeypatch,
+    uhc_provider_directory_alias_fixture,
+):
+    alias_fixture = uhc_provider_directory_alias_fixture
+    stable_source_record_ids = list(alias_fixture["source_record_ids"])
+    provider_address_map = {
+        "source_record_ids": list(stable_source_record_ids),
+        "plans_network_array": [],
+    }
+    fetch_source_details = AsyncMock(return_value=alias_fixture["source_detail_map"])
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_source_detail_map",
+        fetch_source_details,
+    )
+
+    await npi_module._attach_provider_directory_source_details([provider_address_map])
+
+    fetch_source_details.assert_awaited_once_with(alias_fixture["source_ids"], session=None)
+    assert provider_address_map["source_record_ids"] == stable_source_record_ids
+    assert provider_address_map["plans_network_array"] == []
+    endpoint_sources = provider_address_map["provider_directory_sources"]
+    assert len(endpoint_sources) == 1
+    endpoint_provenance = endpoint_sources[0]
+    assert endpoint_provenance["endpoint_id"] == alias_fixture["endpoint_id"]
+    assert endpoint_provenance["catalog_aliases_verified"] is False
+    assert [
+        alias["source_id"] for alias in endpoint_provenance["catalog_aliases"]
+    ] == alias_fixture["source_ids"]
+    assert set(endpoint_provenance) == {
+        "source",
+        "endpoint_id",
+        "catalog_aliases_verified",
+        "catalog_aliases",
+    }
+
+
+def test_provider_directory_legacy_aliases_group_by_canonical_base():
+    canonical_api_base = "https://legacy.example/fhir/"
+    source_detail_map = {
+        source_id: {
+            "source_id": source_id,
+            "endpoint_id": None,
+            "canonical_api_base": canonical_api_base,
+            "org_name": "Legacy catalog organization",
+            "plan_name": plan_name,
+        }
+        for source_id, plan_name in (
+            ("pdfhir_legacy_a", "Legacy label A"),
+            ("pdfhir_legacy_b", "Legacy label B"),
+        )
+    }
+
+    endpoint_sources = npi_module._provider_directory_endpoint_provenance(
+        list(source_detail_map),
+        source_detail_map,
+    )
+
+    assert len(endpoint_sources) == 1
+    assert "endpoint_id" not in endpoint_sources[0]
+    assert "canonical_api_base" not in endpoint_sources[0]
+    assert len(endpoint_sources[0]["catalog_aliases"]) == 2
+
+
+def test_provider_directory_owner_source_expands_all_endpoint_aliases(
+    uhc_provider_directory_alias_fixture,
+):
+    alias_fixture = uhc_provider_directory_alias_fixture
+
+    endpoint_sources = npi_module._provider_directory_endpoint_provenance(
+        [alias_fixture["source_ids"][0]],
+        alias_fixture["source_detail_map"],
+    )
+
+    assert len(endpoint_sources) == 1
+    assert [
+        alias["source_id"] for alias in endpoint_sources[0]["catalog_aliases"]
+    ] == alias_fixture["source_ids"]
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_source_fetch_keeps_endpoint_identity(monkeypatch):
+    class SourceDetailResult:
+        def all(self):
+            return [
+                {
+                    "source_id": "pdfhir_uhc_00",
+                    "endpoint_id": "pd_endpoint_uhc_public",
+                    "canonical_api_base": "https://public.providerexpress.com/providerdirectory",
+                    "org_name": "UnitedHealthcare catalog alias",
+                    "plan_name": "Choice Plus catalog label",
+                }
+            ]
+
+    execute_source_query = AsyncMock(return_value=SourceDetailResult())
+    monkeypatch.setattr(npi_module, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute_source_query)
+
+    source_details = await npi_module._fetch_provider_directory_source_detail_map(
+        ["pdfhir_uhc_00"]
+    )
+
+    assert source_details["pdfhir_uhc_00"]["endpoint_id"] == "pd_endpoint_uhc_public"
+    assert source_details["pdfhir_uhc_00"]["canonical_api_base"] == (
+        "https://public.providerexpress.com/providerdirectory"
+    )
+    source_query = execute_source_query.await_args.args[0]
+    selected_column_names = {column.name for column in source_query.selected_columns}
+    assert {"endpoint_id", "canonical_api_base"} <= selected_column_names
 
 
 @pytest.mark.asyncio

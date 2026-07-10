@@ -2440,6 +2440,7 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
     source_detail = {
         'source': 'provider_directory_fhir',
         'source_id': 'pdfhir_cigna',
+        'endpoint_id': 'pd_endpoint_cigna',
         'org_name': 'Cigna',
         'plan_name': 'Commercial',
         'canonical_api_base': 'https://fhir.cigna.com/ProviderDirectory/v1',
@@ -2473,13 +2474,20 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
     assert address['provider_directory_sources'] == [
         {
             'source': 'provider_directory_fhir',
-            'source_id': 'pdfhir_cigna',
-            'org_name': 'Cigna',
-            'plan_name': 'Commercial',
+            'endpoint_id': 'pd_endpoint_cigna',
+            'catalog_aliases_verified': False,
+            'catalog_aliases': [
+                {
+                    'source_id': 'pdfhir_cigna',
+                    'org_name': 'Cigna',
+                    'plan_name': 'Commercial',
+                }
+            ],
         }
     ]
     source_json = json.dumps(address['provider_directory_sources'])
-    for sensitive_value in (
+    endpoint_source = address['provider_directory_sources'][0]
+    for sensitive_key in (
         'api_base',
         'canonical_api_base',
         'auth_type',
@@ -2487,9 +2495,9 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
         'requires_api_key',
         'credential_name',
         'headers',
-        'secret-token',
     ):
-        assert sensitive_value not in source_json
+        assert sensitive_key not in endpoint_source
+    assert 'secret-token' not in source_json
     assert address['address_sources'] == ['provider_directory_fhir']
     assert 'source_record_ids' not in address
 

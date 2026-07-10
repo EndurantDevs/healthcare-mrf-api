@@ -810,6 +810,8 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
             "pdfhir_alohr": {
                 "source": "provider_directory_fhir",
                 "source_id": "pdfhir_alohr",
+                "endpoint_id": "pd_endpoint_alohr",
+                "canonical_api_base": "https://fhir.alohr.example/provider-directory",
                 "org_name": "Blue Cross and Blue Shield of Alabama",
                 "plan_name": "Provider Directory",
             }
@@ -837,9 +839,15 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     assert row["provider_directory_sources"] == [
         {
             "source": "provider_directory_fhir",
-            "source_id": "pdfhir_alohr",
-            "org_name": "Blue Cross and Blue Shield of Alabama",
-            "plan_name": "Provider Directory",
+            "endpoint_id": "pd_endpoint_alohr",
+            "catalog_aliases_verified": False,
+            "catalog_aliases": [
+                {
+                    "source_id": "pdfhir_alohr",
+                    "org_name": "Blue Cross and Blue Shield of Alabama",
+                    "plan_name": "Provider Directory",
+                }
+            ],
         }
     ]
     assert "source_record_ids" not in row
@@ -1099,6 +1107,8 @@ async def _provider_directory_source_detail_map(source_ids, **_kwargs):
         "pdfhir_alohr": {
             "source": "provider_directory_fhir",
             "source_id": "pdfhir_alohr",
+            "endpoint_id": "pd_endpoint_alohr",
+            "canonical_api_base": "https://fhir.alohr.example/provider-directory",
             "org_name": "Blue Cross and Blue Shield of Alabama",
             "plan_name": "Provider Directory",
         }
@@ -1128,9 +1138,15 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     assert provider_match["provider_directory_sources"] == [
         {
             "source": "provider_directory_fhir",
-            "source_id": "pdfhir_alohr",
-            "org_name": "Blue Cross and Blue Shield of Alabama",
-            "plan_name": "Provider Directory",
+            "endpoint_id": "pd_endpoint_alohr",
+            "catalog_aliases_verified": False,
+            "catalog_aliases": [
+                {
+                    "source_id": "pdfhir_alohr",
+                    "org_name": "Blue Cross and Blue Shield of Alabama",
+                    "plan_name": "Provider Directory",
+                }
+            ],
         }
     ]
     assert "source_record_ids" not in provider_match

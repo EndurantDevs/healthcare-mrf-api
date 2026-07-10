@@ -137,8 +137,8 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
-PUBLIC_PROVIDER_DIRECTORY_SOURCE_DETAIL_COLUMNS = (
-    "source",
+PROVIDER_DIRECTORY_CATALOG_ALIAS_COLUMNS = (
+    # Catalog labels describe ingestion aliases, not provider-verified products.
     "source_id",
     "org_name",
     "plan_name",
@@ -893,49 +893,155 @@ def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> l
     return source_ids
 
 
-async def _fetch_provider_directory_source_detail_map(
-    source_ids: Sequence[str],
-    *,
-    session: Any = None,
-) -> dict[str, dict[str, Any]]:
-    unique_ids = [source_id for source_id in dict.fromkeys(str(item or "").strip() for item in source_ids) if source_id]
-    if not unique_ids:
-        return {}
-    if not await _table_exists(ProviderDirectorySource.__tablename__, session=session):
-        return {}
-
+def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> Any:
     table = ProviderDirectorySource.__table__
+    selected_endpoints = (
+        select(
+            table.c.endpoint_id.label("endpoint_id"),
+            table.c.canonical_api_base.label("canonical_api_base"),
+        )
+        .where(table.c.source_id.in_(source_ids))
+        .subquery()
+    )
     stmt = (
         select(
             table.c.source_id,
+            table.c.endpoint_id,
+            table.c.canonical_api_base,
             table.c.org_name,
             table.c.plan_name,
         )
-        .where(table.c.source_id.in_(unique_ids))
+        .where(
+            or_(
+                table.c.source_id.in_(source_ids),
+                table.c.endpoint_id.in_(
+                    select(selected_endpoints.c.endpoint_id).where(
+                        selected_endpoints.c.endpoint_id.is_not(None)
+                    )
+                ),
+                table.c.canonical_api_base.in_(
+                    select(selected_endpoints.c.canonical_api_base).where(
+                        selected_endpoints.c.endpoint_id.is_(None),
+                        selected_endpoints.c.canonical_api_base.is_not(None),
+                    )
+                ),
+            )
+        )
+        .order_by(table.c.source_id)
     )
-    result = await _execute_stmt(stmt, session=session)
-    rows = result.all()
-    details: dict[str, dict[str, Any]] = {}
+    return stmt
+
+
+def _provider_directory_source_details_by_id_from_rows(
+    rows: Sequence[Any],
+) -> dict[str, dict[str, Any]]:
+    details_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
         mapping = getattr(row, "_mapping", row)
         source_id = str(mapping["source_id"] or "").strip()
         if not source_id:
             continue
-        details[source_id] = {
+        details_by_id[source_id] = {
             "source": "provider_directory_fhir",
             "source_id": source_id,
+            "endpoint_id": mapping["endpoint_id"],
+            "canonical_api_base": mapping["canonical_api_base"],
             "org_name": mapping["org_name"],
             "plan_name": mapping["plan_name"],
         }
-    return details
+    return details_by_id
 
 
-def _public_provider_directory_source_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
+async def _fetch_provider_directory_source_detail_map(
+    source_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch requested sources plus aliases that share their endpoint identity."""
+    unique_ids = [
+        source_id
+        for source_id in dict.fromkeys(str(item or "").strip() for item in source_ids)
+        if source_id
+    ]
+    if not unique_ids:
+        return {}
+    if not await _table_exists(ProviderDirectorySource.__tablename__, session=session):
+        return {}
+    stmt = _provider_directory_source_detail_statement(unique_ids)
+    result = await _execute_stmt(stmt, session=session)
+    return _provider_directory_source_details_by_id_from_rows(result.all())
+
+
+def _normalized_provider_directory_api_base(raw_api_base: Any) -> str:
+    api_base = str(raw_api_base or "").strip()
+    if not api_base:
+        return ""
+    parsed = urllib.parse.urlsplit(api_base)
+    if not parsed.scheme or not parsed.netloc:
+        return api_base.rstrip("/")
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )
+
+
+def _provider_directory_endpoint_group_key(
+    source_detail: Mapping[str, Any],
+) -> tuple[str, str]:
+    endpoint_id = str(source_detail.get("endpoint_id") or "").strip()
+    canonical_api_base = _normalized_provider_directory_api_base(
+        source_detail.get("canonical_api_base")
+    )
+    if endpoint_id:
+        return "endpoint_id", endpoint_id
+    if canonical_api_base:
+        return "canonical_api_base", canonical_api_base
+    return "source_id", str(source_detail.get("source_id") or "").strip()
+
+
+def _provider_directory_catalog_alias(source_detail: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        key: detail[key]
-        for key in PUBLIC_PROVIDER_DIRECTORY_SOURCE_DETAIL_COLUMNS
-        if key in detail and detail[key] is not None
+        key: source_detail[key]
+        for key in PROVIDER_DIRECTORY_CATALOG_ALIAS_COLUMNS
+        if key in source_detail and source_detail[key] is not None
     }
+
+
+def _provider_directory_endpoint_provenance(
+    source_ids: Sequence[str],
+    detail_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_endpoint_keys: list[tuple[str, str]] = []
+    for source_id in source_ids:
+        source_detail = detail_by_id.get(source_id)
+        if not source_detail:
+            continue
+        endpoint_key = _provider_directory_endpoint_group_key(source_detail)
+        if endpoint_key not in selected_endpoint_keys:
+            selected_endpoint_keys.append(endpoint_key)
+
+    endpoint_provenance_items: list[dict[str, Any]] = []
+    for endpoint_key in selected_endpoint_keys:
+        endpoint_aliases = sorted(
+            (
+                source_detail
+                for source_detail in detail_by_id.values()
+                if _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+            ),
+            key=lambda source_detail: str(source_detail.get("source_id") or ""),
+        )
+        # Verified plan/network fields require concrete PractitionerRole references.
+        endpoint_provenance_map: dict[str, Any] = {
+            "source": "provider_directory_fhir",
+            "catalog_aliases_verified": False,
+            "catalog_aliases": [
+                _provider_directory_catalog_alias(source_detail)
+                for source_detail in endpoint_aliases
+            ],
+        }
+        if endpoint_key[0] == "endpoint_id":
+            endpoint_provenance_map["endpoint_id"] = endpoint_key[1]
+        endpoint_provenance_items.append(endpoint_provenance_map)
+    return endpoint_provenance_items
 
 
 async def _attach_provider_directory_source_details(
@@ -952,18 +1058,15 @@ async def _attach_provider_directory_source_details(
     for address in addresses:
         if not isinstance(address, dict):
             continue
-        details: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for source_id in _provider_directory_source_ids_from_record_ids(address.get("source_record_ids")):
-            detail = detail_by_id.get(source_id)
-            if not detail or source_id in seen:
-                continue
-            seen.add(source_id)
-            public_detail = _public_provider_directory_source_detail(detail)
-            if public_detail:
-                details.append(public_detail)
-        if details:
-            address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = details
+        address_source_ids = _provider_directory_source_ids_from_record_ids(
+            address.get("source_record_ids")
+        )
+        endpoint_provenance = _provider_directory_endpoint_provenance(
+            address_source_ids,
+            detail_by_id,
+        )
+        if endpoint_provenance:
+            address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = endpoint_provenance
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
