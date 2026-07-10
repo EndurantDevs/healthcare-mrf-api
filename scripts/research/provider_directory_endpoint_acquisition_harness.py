@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 try:
-    from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, external_run_errors
+    from scripts.research.provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
+    from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 except ModuleNotFoundError:
-    from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, external_run_errors
+    from provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
+    from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 DEFAULT_STATE = ROOT / "reports/provider-directory-endpoint-acquisition/state.json"
@@ -25,8 +27,6 @@ DEFAULT_REPORT = ROOT / "reports/provider-directory-endpoint-acquisition/report.
 RETEST_RESULTS_URL = "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json"
 AUDITED_PROFILE_SHA256 = "cd616fcd2d0d81350b69d76cae088ffd0f4866a1501aacef1c4eae02114afe5e"
 AUDITED_ENTRIES_SHA256 = "9632512ce9231010e5fe771afa5c393b561f96263d4ec717f384b51d20a9ac5d"
-ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
-TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 FINISHED_STATE_STATUSES = {"succeeded", "external_completed"}
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -54,8 +54,6 @@ VALID_CLASSIFICATION_MODES = {
 }
 class ManifestError(ValueError):
     """Raised when the audited manifest fails closed."""
-class HarnessConflict(RuntimeError):
-    """Raised when serial execution cannot safely choose one run."""
 @dataclass(frozen=True)
 class HarnessConfig:
     state_path: Path
@@ -64,6 +62,7 @@ class HarnessConfig:
     selected_entry_ids: frozenset[str] = frozenset()
     poll_interval_seconds: float = 30.0
     retry_wait_seconds: float = 900.0
+    restart_entry_ids: frozenset[str] = frozenset()
 def _utc_now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 def _json_hash(json_value: Any) -> str:
@@ -172,9 +171,11 @@ def _entry_fingerprint(manifest: dict[str, Any], entry: dict[str, Any]) -> str:
     return _json_hash({"entry": entry, "params": entry_params(manifest, entry)})
 def _client_id(manifest: dict[str, Any], entry: dict[str, Any]) -> str:
     return f"{manifest['campaign_id']}:{entry['entry_id']}"
-def create_run_payload(manifest: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+def create_run_payload(manifest: dict[str, Any], entry: dict[str, Any], fresh_root_generation: int = 0) -> dict[str, Any]:
     """Build a deterministic import-control request without credentials."""
     idempotency_seed = f"{manifest['campaign_id']}:{_entry_fingerprint(manifest, entry)}"
+    if fresh_root_generation:
+        idempotency_seed = f"{idempotency_seed}:fresh-root:{fresh_root_generation}"
     return {
         "importer": manifest["importer"], "engine": manifest["engine"],
         "params": entry_params(manifest, entry),
@@ -210,49 +211,6 @@ def _run_param_errors(manifest: dict[str, Any], entry: dict[str, Any], run_recor
         if forbidden_keys:
             errors.append(f"probe-only run contains resource/pagination params: {','.join(forbidden_keys)}")
     return errors
-def _acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    source_ids = list(entry["source_ids"])
-    if metrics.get("source_ids") != source_ids:
-        errors.append("metrics.source_ids does not match the endpoint")
-    if metrics.get("source_import_sources_selected") != len(source_ids):
-        errors.append("selected source count is not exact")
-    if metrics.get("source_import_groups_attempted") != 1:
-        errors.append("selected source group count is not one")
-    completion = metrics.get("resource_fetch_completed_source_ids")
-    completion_by_resource = completion if isinstance(completion, dict) else {}
-    stats = metrics.get("resource_fetch_stats")
-    stats_by_resource = stats if isinstance(stats, dict) else {}
-    for resource_type in entry["resources"]:
-        if completion_by_resource.get(resource_type) != source_ids:
-            errors.append(f"{resource_type} did not complete for the exact source")
-        resource_stats = stats_by_resource.get(resource_type)
-        if not isinstance(resource_stats, dict) or resource_stats.get("sources_completed", 0) < 1:
-            errors.append(f"{resource_type} lacks completed fetch metrics")
-        elif resource_stats.get("sources_bounded", 0) or resource_stats.get("sources_failed", 0):
-            errors.append(f"{resource_type} was bounded or failed")
-    return errors
-
-
-def _bulk_acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
-    bulk_export_mode = metrics.get("bulk_export_mode")
-    if bulk_export_mode is None:
-        return []
-    if not isinstance(bulk_export_mode, dict) or bulk_export_mode.get("effective") is not True:
-        return ["bulk_export_mode must be effective for every selected resource"]
-    source_count = len(entry["source_ids"])
-    expected_fetches = len(entry["resources"]) * source_count
-    if bulk_export_mode.get("effective_resource_fetches") != expected_fetches:
-        return ["bulk_export_mode effective resource fetch count is not exact"]
-    stats_by_resource = metrics.get("resource_fetch_stats")
-    if not isinstance(stats_by_resource, dict):
-        return ["bulk_export_mode lacks resource fetch metrics"]
-    return [
-        f"{resource_type} was not effectively acquired through bulk export"
-        for resource_type in entry["resources"]
-        if not isinstance(stats_by_resource.get(resource_type), dict)
-        or stats_by_resource[resource_type].get("bulk_export_sources") != source_count
-    ]
 def terminal_metric_errors(manifest: dict[str, Any], entry: dict[str, Any], run_record: dict[str, Any]) -> list[str]:
     """Return terminal safety and completeness failures for one run."""
     errors = _run_param_errors(manifest, entry, run_record)
@@ -263,9 +221,9 @@ def terminal_metric_errors(manifest: dict[str, Any], entry: dict[str, Any], run_
     if metrics.get("pagination_resume_required"):
         errors.append("pagination resume is still required")
     if entry["classification"] in ACQUISITION_CLASSIFICATIONS:
-        errors.extend(_acquisition_metric_errors(entry, metrics))
+        errors.extend(acquisition_metric_errors(entry, metrics))
         if entry["classification"] == "bulk_acquisition":
-            errors.extend(_bulk_acquisition_metric_errors(entry, metrics))
+            errors.extend(bulk_acquisition_metric_errors(entry, metrics))
     elif entry["classification"] == "probe_only":
         if metrics.get("source_ids") != entry["source_ids"] or metrics.get("sources_probed") != len(entry["source_ids"]):
             errors.append("probe did not inspect the exact source")
@@ -302,9 +260,11 @@ class AcquisitionHarness:
         self.state = _load_state(config.state_path, manifest)
     def execute_campaign(self) -> dict[str, Any]:
         """Execute selected entries serially, stopping at the first apply failure."""
+        self._restart_requested_entries()
         self._persist()
+        selected_entry_ids = self.config.selected_entry_ids | self.config.restart_entry_ids
         for entry in sorted(self.manifest["entries"], key=lambda candidate: candidate["launch_mode"] == "create"):
-            if self.config.selected_entry_ids and entry["entry_id"] not in self.config.selected_entry_ids:
+            if selected_entry_ids and entry["entry_id"] not in selected_entry_ids:
                 continue
             entry_state = self.state["entries"][entry["entry_id"]]
             if entry_state.get("status") in FINISHED_STATE_STATUSES:
@@ -318,6 +278,29 @@ class AcquisitionHarness:
             if self.config.apply and not should_continue:
                 break
         return self.state
+    def _restart_requested_entries(self) -> None:
+        if not self.config.restart_entry_ids:
+            return
+        if not self.config.apply:
+            raise HarnessConflict("--restart-entry requires --apply")
+        entries_by_id = {entry["entry_id"]: entry for entry in self.manifest["entries"]}
+        for entry_id in sorted(self.config.restart_entry_ids):
+            self._restart_entry(entries_by_id[entry_id], self.state["entries"][entry_id])
+    def _restart_entry(self, entry: dict[str, Any], entry_state: dict[str, Any]) -> None:
+        lineage = restart_lineage(entry, entry_state)
+        run_record = self.client.get_run(lineage.current_run_id)
+        metric_errors = terminal_metric_errors(self.manifest, entry, run_record)
+        validate_restart_run(
+            str(entry["entry_id"]),
+            lineage,
+            run_record,
+            metric_errors,
+            resume_required=_is_resume_required(run_record),
+            has_retry_child=self._retry_child(run_record) is not None,
+            has_bounded_metrics=_has_bounded_metrics(run_record),
+        )
+        archive_restart(entry_state, lineage, _run_summary(run_record), metric_errors, _utc_now())
+        clear_launch_lineage(entry_state)
     def _should_continue_entry(self, entry: dict[str, Any], entry_state: dict[str, Any]) -> bool:
         if entry["launch_mode"] == "external_completed":
             external_run = self.client.get_run(entry["external_run_id"])
@@ -340,7 +323,7 @@ class AcquisitionHarness:
     def _should_continue_preview(self, entry: dict[str, Any], entry_state: dict[str, Any]) -> bool:
         run_record = self._resolve_starting_run(entry, entry_state)
         if run_record is None:
-            entry_state.update({"status": "planned", "action": "create", "request": create_run_payload(self.manifest, entry)})
+            entry_state.update({"status": "planned", "action": "create", "request": self._create_run_payload(entry, entry_state)})
         else:
             entry_state.update({"status": "planned", "action": "attach", "current_run_id": run_record["run_id"], "last_run": _run_summary(run_record)})
         return True
@@ -349,7 +332,7 @@ class AcquisitionHarness:
         if run_record is None:
             if entry["launch_mode"] == "attach":
                 raise HarnessConflict(f"{entry['entry_id']}: attached run could not be resolved")
-            request_body = create_run_payload(self.manifest, entry)
+            request_body = self._create_run_payload(entry, entry_state)
             entry_state.update({"status": "launching", "action": "create", "request": request_body})
             self._persist()
             run_record = self.client.create_run(request_body)
@@ -359,6 +342,8 @@ class AcquisitionHarness:
         self._remember_run(entry_state, run_record)
         self._persist()
         return self._is_lineage_successful(entry, entry_state, run_record)
+    def _create_run_payload(self, entry: dict[str, Any], entry_state: dict[str, Any]) -> dict[str, Any]:
+        return create_run_payload(self.manifest, entry, fresh_root_generation(entry_state))
     def _resolve_starting_run(self, entry: dict[str, Any], entry_state: dict[str, Any]) -> dict[str, Any] | None:
         attached_run_id = entry.get("attached_run_id")
         if attached_run_id: entry_state["root_run_id"] = attached_run_id
@@ -366,7 +351,12 @@ class AcquisitionHarness:
         if known_run_id: return self.client.get_run(str(known_run_id))
         run_list = self.client.list_runs()
         campaign_id = _client_id(self.manifest, entry)
-        campaign_runs = [run for run in run_list if campaign_id in ((run.get("metrics") or {}).get("client_ids") or [])]
+        prior_run_ids = archived_run_ids(entry_state)
+        campaign_runs = [
+            run for run in run_list
+            if str(run.get("run_id") or "") not in prior_run_ids
+            and campaign_id in ((run.get("metrics") or {}).get("client_ids") or [])
+        ]
         if campaign_runs:
             roots = [run for run in campaign_runs if not (run.get("params") or {}).get("retry_of_run_id")]
             if len(roots) != 1:
@@ -468,6 +458,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-url", default=os.getenv("HP_IMPORT_CONTROL_URL"))
     parser.add_argument("--token-env", default="HP_IMPORT_CONTROL_TOKEN")
     parser.add_argument("--entry", action="append", default=[], help="Run only this manifest entry; repeatable.")
+    parser.add_argument("--restart-entry", action="append", default=[], help="Start a fresh root after a guarded terminal failure; repeatable and requires --apply.")
     parser.add_argument("--apply", action="store_true", help="Permit POST /v1/runs. The default is GET-only dry-run.")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--poll-interval-seconds", type=float, default=30.0)
@@ -477,6 +468,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Validate or run the acquisition campaign."""
     args = parse_args(argv)
+    if args.restart_entry and not args.apply:
+        raise SystemExit("--restart-entry requires --apply")
     manifest = load_manifest(args.manifest)
     if args.validate_only:
         print(json.dumps({"valid": True, "entries": len(manifest["entries"]), "manifest_sha256": _json_hash(manifest)}, sort_keys=True))
@@ -484,11 +477,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.control_url:
         raise SystemExit("--control-url or HP_IMPORT_CONTROL_URL is required")
     known_entry_ids = {entry["entry_id"] for entry in manifest["entries"]}
-    selected_entry_ids = frozenset(args.entry)
+    restart_entry_ids = frozenset(args.restart_entry)
+    selected_entry_ids = frozenset(args.entry) | restart_entry_ids
     unknown_ids = selected_entry_ids - known_entry_ids
     if unknown_ids:
         raise SystemExit("unknown manifest entries: " + ",".join(sorted(unknown_ids)))
-    config = HarnessConfig(args.state, args.report, args.apply, selected_entry_ids, args.poll_interval_seconds, args.retry_wait_seconds)
+    config = HarnessConfig(args.state, args.report, args.apply, selected_entry_ids, args.poll_interval_seconds, args.retry_wait_seconds, restart_entry_ids)
     client = ImportControlHttpClient(args.control_url, args.token_env, args.request_timeout_seconds)
     final_state = AcquisitionHarness(manifest, client, config).execute_campaign()
     selected_states = [state for entry_id, state in final_state["entries"].items() if not selected_entry_ids or entry_id in selected_entry_ids]

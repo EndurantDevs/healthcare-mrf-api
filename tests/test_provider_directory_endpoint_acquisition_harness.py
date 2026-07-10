@@ -93,7 +93,7 @@ def _run_record(manifest, entry, run_id, status="succeeded", metrics=None, extra
     }
 
 
-def _case_config(tmp_path, entry_ids, *, apply=True, retry_wait=0):
+def _case_config(tmp_path, entry_ids, *, apply=True, retry_wait=0, restart_entry_ids=()):
     return harness.HarnessConfig(
         tmp_path / "state.json",
         tmp_path / "report.json",
@@ -101,11 +101,12 @@ def _case_config(tmp_path, entry_ids, *, apply=True, retry_wait=0):
         frozenset(entry_ids),
         0,
         retry_wait,
+        frozenset(restart_entry_ids),
     )
 
 
-def _execute_case(tmp_path, manifest, control, entry_ids, *, apply=True, retry_wait=0):
-    config = _case_config(tmp_path, entry_ids, apply=apply, retry_wait=retry_wait)
+def _execute_case(tmp_path, manifest, control, entry_ids, *, apply=True, retry_wait=0, restart_entry_ids=()):
+    config = _case_config(tmp_path, entry_ids, apply=apply, retry_wait=retry_wait, restart_entry_ids=restart_entry_ids)
     campaign = harness.AcquisitionHarness(manifest, control, config, sleeper=lambda _seconds: None)
     return campaign.execute_campaign()
 

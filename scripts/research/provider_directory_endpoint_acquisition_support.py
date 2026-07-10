@@ -58,6 +58,55 @@ class ImportControlHttpClient:
         return self._request_json("/v1/runs", method="POST", body=request_body)
 
 
+def acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
+    """Validate exact completion metrics for one REST acquisition entry."""
+
+    errors: list[str] = []
+    source_ids = list(entry["source_ids"])
+    if metrics.get("source_ids") != source_ids:
+        errors.append("metrics.source_ids does not match the endpoint")
+    if metrics.get("source_import_sources_selected") != len(source_ids):
+        errors.append("selected source count is not exact")
+    if metrics.get("source_import_groups_attempted") != 1:
+        errors.append("selected source group count is not one")
+    completion = metrics.get("resource_fetch_completed_source_ids")
+    completion_by_resource = completion if isinstance(completion, dict) else {}
+    stats = metrics.get("resource_fetch_stats")
+    stats_by_resource = stats if isinstance(stats, dict) else {}
+    for resource_type in entry["resources"]:
+        if completion_by_resource.get(resource_type) != source_ids:
+            errors.append(f"{resource_type} did not complete for the exact source")
+        resource_stats = stats_by_resource.get(resource_type)
+        if not isinstance(resource_stats, dict) or resource_stats.get("sources_completed", 0) < 1:
+            errors.append(f"{resource_type} lacks completed fetch metrics")
+        elif resource_stats.get("sources_bounded", 0) or resource_stats.get("sources_failed", 0):
+            errors.append(f"{resource_type} was bounded or failed")
+    return errors
+
+
+def bulk_acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
+    """Validate that every selected resource used the configured Bulk path."""
+
+    bulk_export_mode = metrics.get("bulk_export_mode")
+    if bulk_export_mode is None:
+        return []
+    if not isinstance(bulk_export_mode, dict) or bulk_export_mode.get("effective") is not True:
+        return ["bulk_export_mode must be effective for every selected resource"]
+    source_count = len(entry["source_ids"])
+    expected_fetches = len(entry["resources"]) * source_count
+    if bulk_export_mode.get("effective_resource_fetches") != expected_fetches:
+        return ["bulk_export_mode effective resource fetch count is not exact"]
+    stats_by_resource = metrics.get("resource_fetch_stats")
+    if not isinstance(stats_by_resource, dict):
+        return ["bulk_export_mode lacks resource fetch metrics"]
+    return [
+        f"{resource_type} was not effectively acquired through bulk export"
+        for resource_type in entry["resources"]
+        if not isinstance(stats_by_resource.get(resource_type), dict)
+        or stats_by_resource[resource_type].get("bulk_export_sources") != source_count
+    ]
+
+
 def external_run_errors(entry: dict[str, Any], run_record: dict[str, Any]) -> list[str]:
     """Bind an externally completed acquisition to its audited endpoint and data."""
     errors: list[str] = []
