@@ -10725,10 +10725,10 @@ async def test_pagination_retry_requires_verified_lineage_before_reset(monkeypat
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_checkpoints_only_after_page_write(monkeypatch):
-    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=75"
     next_url = (
         f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
-        "_getpages=opaque&_count=100"
+        "_getpages=opaque&_count=75"
     )
     calls: list[str] = []
     events: list[tuple[str, Any]] = []
@@ -10844,10 +10844,10 @@ async def test_fetch_resource_rows_resumes_exact_checkpoint_url(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
-    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=75"
     resume_url = (
         f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
-        "_getpages=expired&_count=100"
+        "_getpages=expired&_count=75"
     )
     calls: list[str] = []
     saved_next_urls: list[str | None] = []
@@ -11217,6 +11217,21 @@ def test_source_resource_fetch_order_preserves_non_cigna_requested_order():
     )
 
     assert fetch_order == requested_resources
+
+
+def test_cigna_resource_page_count_avoids_false_empty_hundred_row_bundles():
+    source_lookup = {"api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE}
+
+    assert importer._source_resource_page_count(
+        source_lookup,
+        "PractitionerRole",
+        100,
+    ) == 75
+    assert importer._source_resource_page_count(
+        source_lookup,
+        "Practitioner",
+        50,
+    ) == 50
 
 
 def test_canonical_backfill_resource_sql_uses_existing_resource_rows():

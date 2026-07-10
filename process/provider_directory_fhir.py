@@ -587,6 +587,12 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
         (AETNA_PROVIDER_DIRECTORY_DATA_BASE, resource_type): 30
         for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
     },
+    # Cigna returns false empty Bundles at _count=100 while _count=75 remains
+    # populated and paginated for the same resources.
+    **{
+        (CIGNA_PROVIDER_DIRECTORY_BASE, resource_type): 75
+        for resource_type in DEFAULT_RESOURCES
+    },
     **{
         (SCAN_PROVIDER_DIRECTORY_BASE, resource_type): 100
         for resource_type in DEFAULT_RESOURCES
