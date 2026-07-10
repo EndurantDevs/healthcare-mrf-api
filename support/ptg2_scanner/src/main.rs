@@ -1844,6 +1844,155 @@ impl ManifestSidecarCollector {
     }
 }
 
+struct ManifestSidecarWriteJob {
+    order: usize,
+    record_kind: &'static str,
+    path: String,
+    spool: ManifestPairSpool,
+}
+
+struct ManifestSidecarWriteResult {
+    order: usize,
+    record_kind: &'static str,
+    path: String,
+    entry_count: u64,
+}
+
+fn configured_spooled_manifest_sidecars(
+    paths: &CopyPathConfig,
+    collector: &mut ManifestSidecarCollector,
+) -> io::Result<Option<Vec<ManifestSidecarWriteResult>>> {
+    let Some(spools) = collector.spools.take() else {
+        return Ok(None);
+    };
+    let ManifestSidecarSpools {
+        provider_forward,
+        provider_inverted,
+        provider_npi,
+        price_forward,
+    } = spools;
+    let mut jobs = Vec::new();
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        0,
+        "provider_forward",
+        "manifest_provider_forward_sidecar_file",
+        paths.manifest_provider_forward_sidecar.as_deref(),
+        provider_forward,
+    )?;
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        1,
+        "provider_inverted",
+        "manifest_provider_inverted_sidecar_file",
+        paths.manifest_provider_inverted_sidecar.as_deref(),
+        provider_inverted,
+    )?;
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        2,
+        "provider_npi",
+        "manifest_provider_npi_sidecar_file",
+        paths.manifest_provider_npi_sidecar.as_deref(),
+        provider_npi,
+    )?;
+    push_manifest_sidecar_write_job(
+        &mut jobs,
+        3,
+        "price_forward",
+        "manifest_price_forward_sidecar_file",
+        paths.manifest_price_forward_sidecar.as_deref(),
+        price_forward,
+    )?;
+    let worker_count = env_usize("HLTHPRT_PTG2_MANIFEST_SIDECAR_WRITE_WORKERS", 4)
+        .max(1)
+        .min(jobs.len().max(1));
+    write_manifest_sidecar_jobs(jobs, worker_count).map(Some)
+}
+
+fn push_manifest_sidecar_write_job(
+    jobs: &mut Vec<ManifestSidecarWriteJob>,
+    order: usize,
+    sidecar_name: &'static str,
+    record_kind: &'static str,
+    path: Option<&str>,
+    spool: Option<ManifestPairSpool>,
+) -> io::Result<()> {
+    match (path, spool) {
+        (Some(path), Some(spool)) => jobs.push(ManifestSidecarWriteJob {
+            order,
+            record_kind,
+            path: path.to_string(),
+            spool,
+        }),
+        (Some(_), None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("configured manifest sidecar {sidecar_name} has no spool"),
+            ));
+        }
+        (None, _) => {}
+    }
+    Ok(())
+}
+
+fn write_manifest_sidecar_jobs(
+    jobs: Vec<ManifestSidecarWriteJob>,
+    worker_count: usize,
+) -> io::Result<Vec<ManifestSidecarWriteResult>> {
+    let mut pending_jobs = jobs.into_iter();
+    let mut results = Vec::new();
+    loop {
+        let batch: Vec<ManifestSidecarWriteJob> =
+            pending_jobs.by_ref().take(worker_count.max(1)).collect();
+        if batch.is_empty() {
+            break;
+        }
+        if batch.len() == 1 {
+            results.push(write_manifest_sidecar_job(
+                batch.into_iter().next().unwrap(),
+            )?);
+            continue;
+        }
+        let handles: Vec<_> = batch
+            .into_iter()
+            .map(|job| thread::spawn(move || write_manifest_sidecar_job(job)))
+            .collect();
+        let mut first_error = None;
+        for handle in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(payload) => Err(io::Error::other(format!(
+                    "manifest sidecar writer panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ))),
+            };
+            match result {
+                Ok(result) => results.push(result),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    results.sort_unstable_by_key(|result| result.order);
+    Ok(results)
+}
+
+fn write_manifest_sidecar_job(
+    mut job: ManifestSidecarWriteJob,
+) -> io::Result<ManifestSidecarWriteResult> {
+    let (entry_count, _member_count) = job.spool.write_dense_sidecar(&job.path)?;
+    Ok(ManifestSidecarWriteResult {
+        order: job.order,
+        record_kind: job.record_kind,
+        path: job.path,
+        entry_count,
+    })
+}
+
 fn emit_manifest_sidecar_file<W: Write>(
     writer: &mut W,
     record_kind: &str,
@@ -1904,6 +2053,17 @@ fn emit_configured_manifest_sidecars<W: Write>(
     let Some(collector) = collector else {
         return Ok(());
     };
+    if let Some(results) = configured_spooled_manifest_sidecars(paths, collector)? {
+        for result in results {
+            emit_manifest_sidecar_path(
+                writer,
+                result.record_kind,
+                &result.path,
+                result.entry_count,
+            )?;
+        }
+        return Ok(());
+    }
     if let Some(path) = paths.manifest_provider_forward_sidecar.as_deref() {
         if let Some((entry_count, _member_count)) =
             collector.write_spooled_standard_sidecar("provider_forward", path, true)?
@@ -10037,6 +10197,50 @@ mod tests {
         assert!(spools.provider_inverted.is_none());
         assert!(spools.provider_npi.is_none());
         assert!(spools.price_forward.is_none());
+    }
+
+    #[test]
+    fn configured_manifest_sidecars_write_independent_spools_in_parallel() {
+        let base =
+            std::env::temp_dir().join(format!("ptg2-parallel-sidecar-test-{}", std::process::id()));
+        let forward_path = base.with_extension("forward.ptg2sc");
+        let inverted_path = base.with_extension("inverted.ptg2sc");
+        let paths = CopyPathConfig {
+            manifest_provider_forward_sidecar: Some(forward_path.display().to_string()),
+            manifest_provider_inverted_sidecar: Some(inverted_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut collector = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::for_paths(&paths).unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+        collector
+            .record_provider_set(
+                GlobalId128([5; GLOBAL_ID_BYTES]),
+                &[20, 10, 20],
+                &[1003002106, 1003007311],
+            )
+            .unwrap();
+
+        let results = configured_spooled_manifest_sidecars(&paths, &mut collector)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].record_kind,
+            "manifest_provider_forward_sidecar_file"
+        );
+        assert_eq!(results[0].entry_count, 1);
+        assert_eq!(
+            results[1].record_kind,
+            "manifest_provider_inverted_sidecar_file"
+        );
+        assert_eq!(results[1].entry_count, 2);
+        assert_eq!(&std::fs::read(&forward_path).unwrap()[..8], b"PTG2MNDS");
+        assert_eq!(&std::fs::read(&inverted_path).unwrap()[..8], b"PTG2MNDS");
+        let _ = std::fs::remove_file(forward_path);
+        let _ = std::fs::remove_file(inverted_path);
     }
 
     #[test]
