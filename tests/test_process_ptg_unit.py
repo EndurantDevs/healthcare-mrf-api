@@ -7086,7 +7086,16 @@ def test_ptg2_manifest_precopy_direct_copies_files_for_binary_arch(monkeypatch, 
     assert all(not path.exists() for path in source_files_by_kind.values())
 
 
+def _assert_manifest_copy_throughput_metrics(metrics_by_name, *, expected_bytes):
+    """Assert persisted direct-COPY counters are populated."""
+    assert metrics_by_name["input_bytes"] == expected_bytes
+    assert metrics_by_name["elapsed_seconds"] >= 0
+    assert metrics_by_name["rows_per_second"] is not None
+    assert metrics_by_name["bytes_per_second"] is not None
+
+
 def test_ptg2_manifest_precopy_direct_copy_reports_parallel_tasks(monkeypatch, tmp_path):
+    """Direct COPY metrics preserve file bytes, time, and task concurrency."""
     source_files_by_kind = {"manifest_serving": []}
     copy_calls = []
     for index in range(3):
@@ -7134,6 +7143,7 @@ def test_ptg2_manifest_precopy_direct_copy_reports_parallel_tasks(monkeypatch, t
     assert metrics["direct_to_copy"] is True
     assert metrics["kinds"]["manifest_serving"]["copy_tasks"] == 2
     assert metrics["kinds"]["manifest_serving"]["output_rows"] == 3
+    _assert_manifest_copy_throughput_metrics(metrics["kinds"]["manifest_serving"], expected_bytes=18)
     assert sorted(name for name, _target in copy_calls if name.startswith("manifest_serving_")) == [
         "manifest_serving_0.copy",
         "manifest_serving_1.copy",

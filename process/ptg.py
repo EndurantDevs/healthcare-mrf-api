@@ -908,6 +908,7 @@ async def _copy_manifest_files_direct_with_progress(
     emitted_rows: int | None,
 ) -> dict[str, Any]:
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
+    input_bytes = sum(input_path.stat().st_size for input_path in existing_paths)
     copy_tasks = max(_env_int(PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, 8), 1)
     _emit_ptg2_publish_progress(
         f"copying {kind}",
@@ -923,6 +924,7 @@ async def _copy_manifest_files_direct_with_progress(
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
     )
+    copy_started_at = time.monotonic()
     if copy_tasks <= 1 or len(existing_paths) <= 1:
         for input_path in existing_paths:
             await copy_func(input_path, target_table=target_table)
@@ -934,6 +936,7 @@ async def _copy_manifest_files_direct_with_progress(
                 await copy_func(input_path, target_table=target_table)
 
         await asyncio.gather(*(copy_one(input_path) for input_path in existing_paths))
+    elapsed_seconds = time.monotonic() - copy_started_at
     row_count = int(emitted_rows or 0)
     _emit_ptg2_publish_progress(
         f"copied {kind}",
@@ -945,20 +948,26 @@ async def _copy_manifest_files_direct_with_progress(
         copy_kind=kind,
         target_table=target_table,
         input_files=len(existing_paths),
+        input_bytes=input_bytes,
         input_rows=row_count,
         output_rows=row_count,
         dropped_rows=0,
         direct_to_copy=True,
         copy_tasks=min(copy_tasks, max(len(existing_paths), 1)),
+        elapsed_seconds=elapsed_seconds,
     )
     return {
         "kind": kind,
         "input_files": len(existing_paths),
+        "input_bytes": input_bytes,
         "input_rows": row_count,
         "output_rows": row_count,
         "dropped_rows": 0,
         "direct_to_copy": True,
         "copy_tasks": min(copy_tasks, max(len(existing_paths), 1)),
+        "elapsed_seconds": elapsed_seconds,
+        "rows_per_second": row_count / elapsed_seconds if elapsed_seconds > 0 else None,
+        "bytes_per_second": input_bytes / elapsed_seconds if elapsed_seconds > 0 else None,
     }
 
 

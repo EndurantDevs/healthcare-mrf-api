@@ -523,10 +523,20 @@ def _parse_serving_binary_stream_summary(stderr: bytes) -> dict[str, Any]:
     raise RuntimeError(f"PTG2 Rust streaming COPY did not emit a summary: {stderr_text[-1000:]}")
 
 
-async def _feed_rust_stdin(process: Any, data: bytes) -> None:
+async def _feed_rust_stdin(
+    process: Any,
+    data: bytes,
+    *,
+    metrics: dict[str, Any] | None = None,
+    started_at: float | None = None,
+) -> None:
     """Forward one PostgreSQL COPY chunk into the Rust encoder stdin."""
     if process.stdin is None:
         raise RuntimeError("PTG2 Rust streaming COPY process stdin is closed")
+    if metrics is not None:
+        metrics["source_copy_bytes"] = int(metrics.get("source_copy_bytes") or 0) + len(data)
+        if "source_first_byte_seconds" not in metrics and started_at is not None:
+            metrics["source_first_byte_seconds"] = time.monotonic() - started_at
     process.stdin.write(data)
     await process.stdin.drain()
 
@@ -542,7 +552,12 @@ async def _close_rust_stdin(process: Any) -> None:
         return
 
 
-async def _rust_stdout_chunks(process: Any):
+async def _rust_stdout_chunks(
+    process: Any,
+    *,
+    metrics: dict[str, Any] | None = None,
+    started_at: float | None = None,
+):
     """Yield PostgreSQL COPY rows produced by the Rust encoder stdout."""
     if process.stdout is None:
         raise RuntimeError("PTG2 Rust streaming COPY process stdout is closed")
@@ -550,7 +565,13 @@ async def _rust_stdout_chunks(process: Any):
         chunk = await process.stdout.read(1024 * 1024)
         if not chunk:
             break
+        if metrics is not None:
+            metrics["target_copy_bytes"] = int(metrics.get("target_copy_bytes") or 0) + len(chunk)
+            if "target_first_byte_seconds" not in metrics and started_at is not None:
+                metrics["target_first_byte_seconds"] = time.monotonic() - started_at
         yield chunk
+    if metrics is not None and started_at is not None:
+        metrics["target_copy_complete_seconds"] = time.monotonic() - started_at
 
 
 async def _copy_pg_query_to_rust(
@@ -559,6 +580,8 @@ async def _copy_pg_query_to_rust(
     process: Any,
     *,
     source_copy_format: str = "text",
+    metrics: dict[str, Any] | None = None,
+    started_at: float | None = None,
 ) -> Any:
     """Stream a PostgreSQL COPY query into the Rust encoder process."""
     copy_kwargs: dict[str, Any]
@@ -566,6 +589,11 @@ async def _copy_pg_query_to_rust(
         copy_kwargs = {"format": "binary"}
     else:
         copy_kwargs = {"format": "text", "delimiter": "\t", "null": "\\N"}
+
+    async def feed(data: bytes) -> None:
+        """Count and forward one PostgreSQL COPY chunk."""
+        await _feed_rust_stdin(process, data, metrics=metrics, started_at=started_at)
+
     try:
         work_mem = _serving_binary_copy_work_mem()
         if work_mem and hasattr(source_driver, "transaction"):
@@ -573,15 +601,17 @@ async def _copy_pg_query_to_rust(
                 await source_driver.execute(f"SET LOCAL work_mem TO '{work_mem}'")
                 return await source_driver.copy_from_query(
                     sql,
-                    output=lambda data: _feed_rust_stdin(process, data),
+                    output=feed,
                     **copy_kwargs,
                 )
         return await source_driver.copy_from_query(
             sql,
-            output=lambda data: _feed_rust_stdin(process, data),
+            output=feed,
             **copy_kwargs,
         )
     finally:
+        if metrics is not None and started_at is not None:
+            metrics["source_copy_complete_seconds"] = time.monotonic() - started_at
         await _close_rust_stdin(process)
 
 
@@ -609,6 +639,8 @@ async def _stream_serving_binary_copy(
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise RuntimeError("PTG2 Rust streaming COPY process did not expose stdio pipes")
     stderr_task = asyncio.create_task(process.stderr.read())
+    stream_started_at = time.monotonic()
+    stream_metrics_by_name: dict[str, Any] = {}
 
     try:
         async with db.acquire() as source_conn, db.acquire() as target_conn:
@@ -628,10 +660,16 @@ async def _stream_serving_binary_copy(
                     sql,
                     process,
                     source_copy_format=source_copy_format,
+                    metrics=stream_metrics_by_name,
+                    started_at=stream_started_at,
                 ),
                 target_driver.copy_to_table(
                     target_table,
-                    source=_rust_stdout_chunks(process),
+                    source=_rust_stdout_chunks(
+                        process,
+                        metrics=stream_metrics_by_name,
+                        started_at=stream_started_at,
+                    ),
                     schema_name=schema_name,
                     columns=PTG2_SERVING_BINARY_COLUMNS,
                     **target_copy_kwargs,
@@ -651,7 +689,10 @@ async def _stream_serving_binary_copy(
             "PTG2 Rust streaming serving binary COPY encoder failed "
             f"for {kind}: stderr={stderr.decode('utf-8', errors='replace')[-2000:]}"
         )
-    return _parse_serving_binary_stream_summary(stderr)
+    summary = _parse_serving_binary_stream_summary(stderr)
+    summary.update(stream_metrics_by_name)
+    summary["pipeline_seconds"] = time.monotonic() - stream_started_at
+    return summary
 
 
 async def _stream_serving_binary_combined_copy(
@@ -677,6 +718,8 @@ async def _stream_serving_binary_combined_copy(
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise RuntimeError("PTG2 Rust combined COPY process did not expose stdio pipes")
     stderr_task = asyncio.create_task(process.stderr.read())
+    stream_started_at = time.monotonic()
+    stream_metrics_by_name: dict[str, Any] = {}
 
     try:
         async with db.acquire() as source_conn, db.acquire() as target_conn:
@@ -696,10 +739,16 @@ async def _stream_serving_binary_combined_copy(
                     sql,
                     process,
                     source_copy_format=source_copy_format,
+                    metrics=stream_metrics_by_name,
+                    started_at=stream_started_at,
                 ),
                 target_driver.copy_to_table(
                     target_table,
-                    source=_rust_stdout_chunks(process),
+                    source=_rust_stdout_chunks(
+                        process,
+                        metrics=stream_metrics_by_name,
+                        started_at=stream_started_at,
+                    ),
                     schema_name=schema_name,
                     columns=PTG2_SERVING_BINARY_COLUMNS,
                     **target_copy_kwargs,
@@ -719,7 +768,10 @@ async def _stream_serving_binary_combined_copy(
             "PTG2 Rust combined serving binary COPY encoder failed "
             f"stderr={stderr.decode('utf-8', errors='replace')[-2000:]}"
         )
-    return _parse_serving_binary_stream_summary(stderr)
+    summary = _parse_serving_binary_stream_summary(stderr)
+    summary.update(stream_metrics_by_name)
+    summary["pipeline_seconds"] = time.monotonic() - stream_started_at
+    return summary
 
 
 async def _copy_serving_binary_record_batches(

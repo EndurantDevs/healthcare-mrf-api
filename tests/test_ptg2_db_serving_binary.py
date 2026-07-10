@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import time
 import zlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,8 +204,15 @@ async def test_copy_pg_query_to_rust_sets_local_work_mem(monkeypatch):
     monkeypatch.setenv(serving_binary_writer.PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, "256MB")
     driver = FakeCopyDriver()
     process = FakeRustProcess()
+    metrics_by_name = {}
 
-    result = await serving_binary_writer._copy_pg_query_to_rust(driver, "SELECT 1", process)
+    result = await serving_binary_writer._copy_pg_query_to_rust(
+        driver,
+        "SELECT 1",
+        process,
+        metrics=metrics_by_name,
+        started_at=time.monotonic(),
+    )
 
     assert result == "copied"
     assert driver.events == [
@@ -214,6 +223,34 @@ async def test_copy_pg_query_to_rust_sets_local_work_mem(monkeypatch):
     ]
     assert process.stdin.chunks == [b"copy-row\n"]
     assert process.stdin.closed is True
+    assert metrics_by_name["source_copy_bytes"] == len(b"copy-row\n")
+    assert metrics_by_name["source_first_byte_seconds"] >= 0
+    assert metrics_by_name["source_copy_complete_seconds"] >= metrics_by_name["source_first_byte_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_rust_stdout_chunks_records_target_copy_metrics():
+    class FakeStdout:
+        def __init__(self):
+            self.chunks = [b"first", b"second", b""]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    metrics_by_name = {}
+    chunks = [
+        chunk
+        async for chunk in serving_binary_writer._rust_stdout_chunks(
+            SimpleNamespace(stdout=FakeStdout()),
+            metrics=metrics_by_name,
+            started_at=time.monotonic(),
+        )
+    ]
+
+    assert chunks == [b"first", b"second"]
+    assert metrics_by_name["target_copy_bytes"] == len(b"firstsecond")
+    assert metrics_by_name["target_first_byte_seconds"] >= 0
+    assert metrics_by_name["target_copy_complete_seconds"] >= metrics_by_name["target_first_byte_seconds"]
 
 
 @pytest.mark.asyncio
