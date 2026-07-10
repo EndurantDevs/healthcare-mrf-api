@@ -18,8 +18,10 @@ from sqlalchemy.dialects import postgresql
 
 import process as process_cli
 from db.models import (
+    ProviderDirectoryAPIEndpoint,
     ProviderDirectoryCapability,
     ProviderDirectoryCanonicalResource,
+    ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
@@ -2673,6 +2675,51 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert stats["Location"]["sources_completed"] == 1
 
 
+@pytest.mark.asyncio
+async def test_alohr_alias_group_uses_compatibility_owner(monkeypatch):
+    capture = _AliasImportCapture()
+    capture.install(monkeypatch)
+
+    async def fetch_page(_query, root_key, _item_key, *, next_token, timeout):
+        assert root_key == "providers" and next_token is None and timeout == 3
+        return (
+            [{"providerId": "prac-1", "firstName": "Ada", "lastName": "Lovelace"}],
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fetch_page)
+    options = importer.AlohrGraphQLImportOptions(
+        0,
+        0,
+        3,
+        "run_retry",
+        True,
+        None,
+        None,
+        None,
+        "dataset_alohr",
+    )
+    source_ids, diagnostics, counts, _linked, stats, _stale, _ready = (
+        await importer._import_alohr_graphql_source_group(
+            _shared_alias_sources(importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE),
+            ["Practitioner"],
+            options,
+        )
+    )
+
+    assert source_ids == [f"source_{alias_index:02d}" for alias_index in range(31)]
+    assert counts == {"Practitioner": 1}
+    assert diagnostics["Practitioner"]["rows_written"] == 1
+    assert stats["Practitioner"]["rows_fetched"] == 1
+    assert stats["Practitioner"]["sources_attempted"] == 1
+    assert capture.rows_by_model[ProviderDirectoryPractitioner][0]["source_id"] == "source_00"
+    assert capture.rows_by_model[ProviderDirectorySourceResource][0]["source_id"] == "source_00"
+    assert len(capture.rows_by_model[ProviderDirectoryDatasetResource]) == 1
+    assert capture.seen_source_ids == ["source_00"]
+    assert capture.stale_source_ids == ["source_00"]
+
+
 def test_alohr_organization_query_uses_supported_nested_contacts_field():
     assert "contacts { contacts { system value use } }" in importer.ALOHR_ORGANIZATION_QUERY
     assert "organizationContact" not in importer.ALOHR_ORGANIZATION_QUERY
@@ -4323,6 +4370,450 @@ def test_group_resource_import_sources_collapses_shared_base_with_linked_limit()
     ]
 
 
+def _shared_alias_sources(
+    api_base: str = "https://shared.example/fhir",
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_id": f"source_{alias_index:02d}",
+            "org_name": f"Alias {alias_index:02d}",
+            "api_base": api_base,
+            "canonical_api_base": api_base,
+        }
+        for alias_index in reversed(range(31))
+    ]
+
+
+class _AliasImportCapture:
+    def __init__(self):
+        self.rows_by_model: dict[type, list[dict[str, Any]]] = {}
+        self.seen_source_ids: list[str] = []
+        self.stale_source_ids: list[str] = []
+        self.metadata_source_ids: list[str] = []
+        self.fetch_sources: list[dict[str, Any]] = []
+        self.finalized_diagnostics: list[dict[str, dict[str, Any]]] = []
+
+    async def upsert(self, model, resource_rows, **_kwargs):
+        self.rows_by_model.setdefault(model, []).extend(resource_rows)
+        return len(resource_rows)
+
+    async def fetch(self, source_record, resource_type, **_kwargs):
+        self.fetch_sources.append(source_record)
+        assert resource_type == "Practitioner"
+        resource_rows = [
+            {"source_id": source_record["source_id"], "resource_id": "prac-1"}
+        ]
+        return importer.ResourceFetchResult(
+            ProviderDirectoryPractitioner,
+            resource_rows,
+            1,
+            0,
+            1,
+            True,
+            False,
+            False,
+            False,
+            False,
+        )
+
+    async def mark_seen(self, _model, resource_rows, _run_id, **_kwargs):
+        self.seen_source_ids.extend(row["source_id"] for row in resource_rows)
+        return len(resource_rows)
+
+    async def delete_stale(self, _model, source_id, _run_id, **_kwargs):
+        self.stale_source_ids.append(source_id)
+        return 0
+
+    async def update_metadata(self, _sql, **query_params):
+        self.metadata_source_ids.append(query_params["source_id"])
+        return 1
+
+    async def prepare_candidate(self, source_records, resource_types, **options):
+        return importer.EndpointDatasetCandidate(
+            endpoint_id=source_records[0]["endpoint_id"],
+            dataset_id="dataset_1",
+            source_ids=tuple(sorted(row["source_id"] for row in source_records)),
+            selected_resources=tuple(resource_types),
+            import_run_id=options["run_id"],
+            previous_dataset_id=None,
+        )
+
+    async def finalize_candidate(self, _candidate, diagnostics):
+        self.finalized_diagnostics.append(diagnostics)
+        return {"dataset_id": "dataset_1", "published": True}
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(importer, "_upsert_rows", self.upsert)
+        monkeypatch.setattr(importer, "_fetch_resource_rows", self.fetch)
+        monkeypatch.setattr(importer, "_mark_resource_rows_seen", self.mark_seen)
+        monkeypatch.setattr(importer, "_delete_stale_resource_rows", self.delete_stale)
+        monkeypatch.setattr(importer, "_prepare_endpoint_dataset_candidate", self.prepare_candidate)
+        monkeypatch.setattr(importer, "_finalize_endpoint_dataset_candidate", self.finalize_candidate)
+        monkeypatch.setattr(importer, "_seen_stage_enabled", lambda: False)
+        monkeypatch.setattr(importer.db, "status", self.update_metadata)
+
+
+@pytest.mark.asyncio
+async def test_alias_group_writes_one_compatibility_copy(monkeypatch):
+    capture = _AliasImportCapture()
+    capture.install(monkeypatch)
+    source_rows = _shared_alias_sources()
+    endpoint_count = await importer._upsert_provider_directory_source_rows(source_rows)
+    fetch_stats_by_resource: dict[str, dict[str, Any]] = {}
+    completed_source_ids_by_resource: dict[str, set[str]] = {}
+
+    resource_counts = await importer._import_resources(
+        source_rows,
+        resources=["Practitioner"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry_2",
+        retry_of_run_id="run_retry_1",
+        pagination_root_run_id="run_root",
+        stale_cleanup=True,
+        resource_fetch_stats=fetch_stats_by_resource,
+        resource_completion=completed_source_ids_by_resource,
+    )
+
+    assert endpoint_count == 1
+    assert resource_counts == {"Practitioner": 1}
+    assert len(capture.rows_by_model[ProviderDirectorySource]) == 31
+    assert len({source_record["endpoint_id"] for source_record in source_rows}) == 1
+    assert len(capture.rows_by_model[ProviderDirectoryDatasetResource]) == 1
+    assert len(capture.rows_by_model[ProviderDirectoryCanonicalResource]) == 1
+    assert capture.rows_by_model[ProviderDirectoryPractitioner][0]["source_id"] == "source_00"
+    assert capture.rows_by_model[ProviderDirectorySourceResource][0]["source_id"] == "source_00"
+    assert capture.seen_source_ids == ["source_00"]
+    assert capture.stale_source_ids == ["source_00"]
+    assert sorted(capture.metadata_source_ids) == sorted(
+        source_record["source_id"] for source_record in source_rows
+    )
+    assert fetch_stats_by_resource["Practitioner"]["rows_fetched"] == 1
+    assert fetch_stats_by_resource["Practitioner"]["sources_attempted"] == 1
+    assert completed_source_ids_by_resource["Practitioner"] == {
+        source_record["source_id"] for source_record in source_rows
+    }
+    assert capture.finalized_diagnostics[0]["Practitioner"]["rows_written"] == 1
+    assert capture.fetch_sources[0]["_partition_checkpoint_owner_run_id"] == "run_root"
+
+
+def _endpoint_dataset_candidate() -> importer.EndpointDatasetCandidate:
+    return importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_1",
+        dataset_id="dataset_new",
+        source_ids=("source_a", "source_b"),
+        selected_resources=("Practitioner",),
+        import_run_id="run_2",
+        previous_dataset_id="dataset_old",
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatch):
+    mark_candidate = AsyncMock()
+    promote_candidate = AsyncMock()
+    monkeypatch.setattr(importer, "_mark_endpoint_dataset_candidate", mark_candidate)
+    monkeypatch.setattr(importer, "_promote_endpoint_dataset_candidate", promote_candidate)
+    diagnostics_by_resource = {
+        "Practitioner": {
+            "complete": False,
+            "bounded": True,
+            "error": None,
+            "next_url_remaining": True,
+        }
+    }
+
+    finalization_summary_map = await importer._finalize_endpoint_dataset_candidate(
+        _endpoint_dataset_candidate(),
+        diagnostics_by_resource,
+    )
+
+    assert finalization_summary_map == {
+        "dataset_id": "dataset_new",
+        "status": importer.ENDPOINT_DATASET_INCOMPLETE,
+        "published": False,
+    }
+    mark_candidate.assert_awaited_once_with(
+        _endpoint_dataset_candidate(),
+        importer.ENDPOINT_DATASET_INCOMPLETE,
+        diagnostics_by_resource,
+    )
+    promote_candidate.assert_not_awaited()
+
+
+class _EndpointDatasetPromotionHarness:
+    def __init__(self):
+        self.datasets = {
+            "dataset_old": {"dataset_id": "dataset_old", "is_current": True, "status": "published"},
+            "dataset_new": {"dataset_id": "dataset_new", "is_current": False, "status": "acquiring"},
+        }
+        self.resources = [
+            {"resource_type": "Practitioner", "resource_id": "prac-2", "payload_hash": "hash-2"},
+            {"resource_type": "Organization", "resource_id": "org-1", "payload_hash": "hash-1"},
+            {"resource_type": "Practitioner", "resource_id": "prac-1", "payload_hash": "hash-3"},
+        ]
+        self.events: list[str] = []
+        self.committed = False
+        self.max_batch_rows = 0
+
+    async def __aenter__(self):
+        self.events.append("begin")
+        return self
+
+    async def __aexit__(self, exc_type, _exc, _traceback):
+        self.committed = exc_type is None
+        self.events.append("commit" if self.committed else "rollback")
+
+    async def first(self, sql, **params):
+        if "provider_directory_api_endpoint" in sql:
+            self.events.append("lock_endpoint")
+            return {"endpoint_id": params["endpoint_id"]}
+        if "SELECT dataset_id, is_current" in sql:
+            self.events.append("lock_candidate")
+            return self.datasets[params["dataset_id"]]
+        self.events.append("lock_current")
+        return self.datasets["dataset_old"]
+
+    async def all(self, _sql, **params):
+        ordered_resources = sorted(
+            self.resources,
+            key=lambda resource: (resource["resource_type"], resource["resource_id"]),
+        )
+        after_key = (
+            params.get("after_resource_type", ""),
+            params.get("after_resource_id", ""),
+        )
+        available_resources = [
+            resource
+            for resource in ordered_resources
+            if (resource["resource_type"], resource["resource_id"]) > after_key
+        ]
+        resource_batch = available_resources[: params["batch_size"]]
+        self.max_batch_rows = max(self.max_batch_rows, len(resource_batch))
+        self.events.append("read_resources")
+        return resource_batch
+
+    async def status(self, sql, **params):
+        if sql.startswith("SET TRANSACTION"):
+            self.events.append("set_snapshot")
+        elif "superseded_at = now()" in sql:
+            self.events.append("supersede")
+            self.datasets[params["previous_dataset_id"]].update(
+                is_current=False,
+                status=params["status"],
+            )
+        else:
+            self.events.append("publish")
+            self.datasets[params["dataset_id"]].update(
+                is_current=True,
+                status=params["status"],
+                previous_dataset_id=params["previous_dataset_id"],
+            )
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_publication_atomically_supersedes_current(monkeypatch):
+    harness = _EndpointDatasetPromotionHarness()
+    monkeypatch.setattr(importer.db, "acquire", lambda: harness)
+    monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 2)
+    diagnostics_by_resource = {
+        "Practitioner": {
+            "complete": True,
+            "bounded": False,
+            "error": None,
+            "next_url_remaining": False,
+        }
+    }
+
+    publication_summary_map = await importer._finalize_endpoint_dataset_candidate(
+        _endpoint_dataset_candidate(),
+        diagnostics_by_resource,
+    )
+
+    assert harness.committed is True
+    assert harness.events == [
+        "begin",
+        "set_snapshot",
+        "lock_endpoint",
+        "lock_candidate",
+        "lock_current",
+        "read_resources",
+        "read_resources",
+        "supersede",
+        "publish",
+        "commit",
+    ]
+    assert harness.datasets["dataset_old"] == {
+        "dataset_id": "dataset_old",
+        "is_current": False,
+        "status": importer.ENDPOINT_DATASET_SUPERSEDED,
+    }
+    assert harness.datasets["dataset_new"]["previous_dataset_id"] == "dataset_old"
+    assert harness.datasets["dataset_new"]["is_current"] is True
+    assert publication_summary_map["resource_count"] == 3
+    assert harness.max_batch_rows == 2
+    expected_hash_input = "\n".join(
+        importer._stable_identity_json(identity)
+        for identity in sorted(
+            (
+                dataset_resource["resource_type"],
+                dataset_resource["resource_id"],
+                dataset_resource["payload_hash"],
+            )
+            for dataset_resource in harness.resources
+        )
+    )
+    assert publication_summary_map["dataset_hash"] == hashlib.sha256(
+        expected_hash_input.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_retry_reuses_checkpoint_candidate(monkeypatch):
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base="https://shared.example/fhir",
+        source_scope_hash="scope_1",
+        source_ids=("source_a", "source_b"),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+    )
+    checkpoint_dataset = AsyncMock(return_value="dataset_original")
+    ensure_candidate = AsyncMock()
+    monkeypatch.setattr(importer, "_checkpoint_candidate_dataset_id", checkpoint_dataset)
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(
+            return_value={
+                "endpoint_id": "endpoint_1",
+                "status": importer.ENDPOINT_DATASET_INCOMPLETE,
+                "is_current": False,
+                "previous_dataset_id": "dataset_old",
+            }
+        ),
+    )
+    monkeypatch.setattr(importer, "_ensure_endpoint_dataset_candidate", ensure_candidate)
+    current_dataset = AsyncMock()
+    monkeypatch.setattr(importer, "_current_endpoint_dataset_id", current_dataset)
+
+    candidate = await importer._prepare_endpoint_dataset_candidate(
+        [
+            {"source_id": source_id, "endpoint_id": "endpoint_1"}
+            for source_id in ("source_a", "source_b")
+        ],
+        ["Practitioner"],
+        run_id="run_retry",
+        retry_of_run_id="run_original",
+        pagination_root_run_id="run_original",
+        checkpoint_context=checkpoint_context,
+    )
+
+    assert candidate is not None
+    assert candidate.dataset_id == "dataset_original"
+    assert candidate.reused_from_checkpoint is True
+    assert candidate.checkpoint_context.dataset_id == "dataset_original"
+    assert candidate.checkpoint_context.endpoint_id == "endpoint_1"
+    current_dataset.assert_not_awaited()
+    ensure_candidate.assert_awaited_once_with(candidate)
+
+
+@pytest.mark.asyncio
+async def test_partition_candidate_reuses_root_lineage(monkeypatch):
+    datasets_by_id: dict[str, dict[str, Any]] = {}
+
+    async def dataset_state(dataset_id):
+        return datasets_by_id.get(dataset_id, {})
+
+    async def ensure_candidate(candidate):
+        datasets_by_id[candidate.dataset_id] = {
+            "endpoint_id": candidate.endpoint_id,
+            "status": importer.ENDPOINT_DATASET_INCOMPLETE,
+            "is_current": False,
+        }
+
+    monkeypatch.setattr(importer, "_checkpoint_candidate_dataset_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer, "_endpoint_dataset_state", dataset_state)
+    monkeypatch.setattr(importer, "_current_endpoint_dataset_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer, "_ensure_endpoint_dataset_candidate", ensure_candidate)
+    source_records = [{"source_id": "aetna", "endpoint_id": "endpoint_aetna"}]
+
+    root_candidate = await importer._prepare_endpoint_dataset_candidate(
+        source_records,
+        ["Practitioner"],
+        run_id="run_root",
+        retry_of_run_id=None,
+        pagination_root_run_id="run_root",
+        checkpoint_context=None,
+    )
+    retry_candidate = await importer._prepare_endpoint_dataset_candidate(
+        source_records,
+        ["Practitioner"],
+        run_id="run_retry_2",
+        retry_of_run_id="run_retry_1",
+        pagination_root_run_id="run_root",
+        checkpoint_context=None,
+    )
+
+    assert root_candidate is not None and retry_candidate is not None
+    assert retry_candidate.dataset_id == root_candidate.dataset_id
+    assert retry_candidate.reused_from_checkpoint is True
+    delete_status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", delete_status)
+    await importer._clear_uncheckpointed_endpoint_dataset_candidate(retry_candidate)
+    delete_status.assert_not_awaited()
+
+
+def test_endpoint_dataset_uses_only_resources_supported_by_endpoint_connector():
+    requested_resources = list(importer.DEFAULT_RESOURCES)
+    molina_source_map = {
+        "source_id": "pdfhir_molina",
+        "metadata_json": {
+            "provider_directory_supported_resources": [
+                "Location",
+                "Practitioner",
+                "PractitionerRole",
+            ]
+        },
+    }
+    alohr_source_map = {
+        "source_id": "pdfhir_alohr",
+        "api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._endpoint_dataset_selected_resources(
+        [molina_source_map],
+        requested_resources,
+    ) == ["PractitionerRole", "Practitioner", "Location"]
+    assert importer._endpoint_dataset_selected_resources(
+        [alohr_source_map],
+        requested_resources,
+    ) == [
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "OrganizationAffiliation",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_does_not_publish_an_empty_resource_selection():
+    candidate = await importer._prepare_endpoint_dataset_candidate(
+        [{"source_id": "source_empty", "endpoint_id": "endpoint_empty"}],
+        [],
+        run_id="run_empty",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        checkpoint_context=None,
+    )
+
+    assert candidate is None
+
+
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
     async def fake_fetch_json(url, *, timeout):
@@ -4419,7 +4910,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
 
 
 @pytest.mark.asyncio
-async def test_import_linked_resource_rows_mirrors_grouped_source_ids(monkeypatch):
+async def test_linked_rows_use_compatibility_owner(monkeypatch):
     async def fake_fetch_json(fetch_url, *, timeout):
         if "/Practitioner/prac-1" in fetch_url:
             return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
@@ -4447,10 +4938,10 @@ async def test_import_linked_resource_rows_mirrors_grouped_source_ids(monkeypatc
         per_source_limit=5,
         timeout=3,
         run_id="run_1",
-        source_ids=["source_a", "source_b"],
+        source_ids=["source_b", "source_a"],
     )
 
-    assert linked_resource_counts == {"Practitioner": 2}
+    assert linked_resource_counts == {"Practitioner": 1}
     practitioner_rows = [
         practitioner_row
         for resource_model, resource_rows, _upsert_kwargs in captured_upsert_calls
@@ -4463,14 +4954,12 @@ async def test_import_linked_resource_rows_mirrors_grouped_source_ids(monkeypatc
         if resource_model is ProviderDirectorySourceResource
         for source_edge_row in resource_rows
     ]
-    assert {
-        practitioner_row["source_id"]
-        for practitioner_row in practitioner_rows
-    } == {"source_a", "source_b"}
-    assert {
-        source_edge_row["source_id"]
-        for source_edge_row in source_edge_rows
-    } == {"source_a", "source_b"}
+    assert [practitioner_row["source_id"] for practitioner_row in practitioner_rows] == [
+        "source_a"
+    ]
+    assert [source_edge_row["source_id"] for source_edge_row in source_edge_rows] == [
+        "source_a"
+    ]
 
 
 @pytest.mark.asyncio
@@ -5026,8 +5515,9 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
     )
     upserted: list[dict[str, Any]] = []
 
-    async def fake_upsert(_model, rows, **_kwargs):
-        upserted.extend(rows)
+    async def fake_upsert(model, rows, **_kwargs):
+        if model is ProviderDirectorySource:
+            upserted.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
@@ -5084,8 +5574,9 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     cms_sma_catalog_path.write_text("State Medicaid Agency Interoperability and Patient Access Endpoint Directory\n", encoding="utf-8")
     upserted: list[dict[str, Any]] = []
 
-    async def fake_upsert(_model, rows, **_kwargs):
-        upserted.extend(rows)
+    async def fake_upsert(model, rows, **_kwargs):
+        if model is ProviderDirectorySource:
+            upserted.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
@@ -5151,8 +5642,9 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
 async def test_process_data_skips_full_refresh_source_catalog_stale_cleanup_without_retest(monkeypatch):
     upserted: list[dict[str, Any]] = []
 
-    async def fake_upsert(_model, rows, **_kwargs):
-        upserted.extend(rows)
+    async def fake_upsert(model, rows, **_kwargs):
+        if model is ProviderDirectorySource:
+            upserted.extend(rows)
         return len(rows)
 
     cleanup = AsyncMock(return_value={"provider_directory_source": 1})
@@ -5203,8 +5695,9 @@ async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_wi
     )
     upserted: list[dict[str, Any]] = []
 
-    async def fake_upsert(_model, rows, **_kwargs):
-        upserted.extend(rows)
+    async def fake_upsert(model, rows, **_kwargs):
+        if model is ProviderDirectorySource:
+            upserted.extend(rows)
         return len(rows)
 
     cleanup = AsyncMock(return_value={"provider_directory_source": 1})
@@ -5621,8 +6114,9 @@ async def test_process_data_skips_artifact_publish_when_required_fetches_are_bou
 async def test_process_data_source_id_scopes_seed_probe_and_resource_import(monkeypatch):
     upserted_source_rows: list[dict[str, Any]] = []
 
-    async def fake_upsert(_model, source_rows_to_upsert, **_kwargs):
-        upserted_source_rows.extend(source_rows_to_upsert)
+    async def fake_upsert(model, source_rows_to_upsert, **_kwargs):
+        if model is ProviderDirectorySource:
+            upserted_source_rows.extend(source_rows_to_upsert)
         return len(source_rows_to_upsert)
 
     def fake_source_row(seed_row):
@@ -6537,9 +7031,10 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
         checkpoint_batches.append(rows)
         return len(rows)
 
-    async def fake_clear_checkpoints(source_record, *, seed_resource_type=None):
+    async def fake_clear_checkpoints(source_record, **options):
+        assert options["run_id"] == "run_1"
         cleared_checkpoints.append(
-            (source_record["canonical_api_base"], seed_resource_type)
+            (source_record["canonical_api_base"], options.get("seed_resource_type"))
         )
         return 1
 
@@ -6578,6 +7073,89 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     assert checkpoint_batches[0][0]["seed_resource_type"] == checkpoint_type
     assert checkpoint_batches[0][0]["seed_resource_id"] == "1"
     assert cleared_checkpoints == [(importer.UHC_PROVIDER_DIRECTORY_BASE, checkpoint_type)]
+
+
+@pytest.mark.asyncio
+async def test_partition_checkpoints_require_matching_lineage(monkeypatch):
+    checkpoint_queries: list[tuple[str, dict[str, Any]]] = []
+
+    async def load_checkpoints(statement, **query_params):
+        checkpoint_queries.append((statement, query_params))
+        if query_params["checkpoint_owner_run_id"] == "run_root":
+            return [("1",)]
+        return []
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_UHC_ROLE_POSTAL_PARTITIONS", "1")
+    monkeypatch.setattr(importer.db, "all", load_checkpoints)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "_partition_checkpoint_owner_run_id": "run_root",
+    }
+
+    resumed_prefixes = await importer._load_partition_checkpoints(
+        source_lookup,
+        "PractitionerRole",
+        "run_retry_2",
+    )
+    fresh_prefixes = await importer._load_partition_checkpoints(
+        {
+            source_key: source_value
+            for source_key, source_value in source_lookup.items()
+            if not source_key.startswith("_")
+        },
+        "PractitionerRole",
+        "run_fresh",
+    )
+    checkpoint_row = importer._reverse_lookup_checkpoint_row(
+        source_lookup,
+        importer._uhc_role_postal_checkpoint_type(source_lookup),
+        "1",
+        "run_retry_2",
+    )
+
+    assert resumed_prefixes == {"1"}
+    assert fresh_prefixes == set()
+    assert checkpoint_row["last_completed_run_id"] == "run_root"
+    assert "last_completed_run_id = :checkpoint_owner_run_id" in checkpoint_queries[0][0]
+    assert [query[1]["checkpoint_owner_run_id"] for query in checkpoint_queries] == [
+        "run_root",
+        "run_fresh",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uhc_incomplete_partition_requires_resume():
+    source_lookup = {
+        "source_id": "uhc_owner",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["uhc_owner"],
+        run_id="run_retry",
+        retry_of_run_id="run_root",
+    )
+    source_lookup["_pagination_checkpoint_context"] = checkpoint_context
+    resume_required_entries: set[str] = set()
+
+    await importer._finalize_source_pagination_checkpoints(
+        source_lookup,
+        {
+            "Practitioner": {
+                "complete": False,
+                "error": "partition_errors_1_last_http_503",
+                "bounded": False,
+            }
+        },
+        resume_required_entries,
+    )
+
+    assert importer.UHC_PROVIDER_DIRECTORY_BASE in importer.PAGINATION_CHECKPOINT_API_BASES
+    assert checkpoint_context is not None
+    assert resume_required_entries == {"uhc_owner:Practitioner"}
 
 
 @pytest.mark.asyncio
@@ -8610,8 +9188,8 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    stats: dict[str, dict[str, Any]] = {}
-    counts = await importer._import_resources(
+    stats_by_resource: dict[str, dict[str, Any]] = {}
+    resource_counts = await importer._import_resources(
         [
             {"source_id": "source_a", "api_base": "https://a.example/fhir"},
             {"source_id": "source_b", "api_base": "https://b.example/fhir"},
@@ -8623,14 +9201,14 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
         page_count=100,
         timeout=3,
         run_id="run_1",
-        resource_fetch_stats=stats,
+        resource_fetch_stats=stats_by_resource,
         source_concurrency=2,
     )
 
-    assert counts == {"Location": 3}
+    assert resource_counts == {"Location": 3}
     assert concurrency_by_name["max_active"] == 2
-    assert stats["Location"]["sources_completed"] == 3
-    assert stats["Location"]["rows_fetched"] == 3
+    assert stats_by_resource["Location"]["sources_completed"] == 3
+    assert stats_by_resource["Location"]["rows_fetched"] == 3
 
 
 @pytest.mark.asyncio
@@ -8718,7 +9296,7 @@ async def test_mark_provider_directory_progress_persists_structured_detail(monke
 
 
 @pytest.mark.asyncio
-async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(monkeypatch):
+async def test_duplicate_base_uses_one_compatibility_row(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
     fetch_calls: list[tuple[str, str]] = []
@@ -8747,8 +9325,8 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    stats: dict[str, dict[str, Any]] = {}
-    counts = await importer._import_resources(
+    stats_by_resource: dict[str, dict[str, Any]] = {}
+    resource_counts = await importer._import_resources(
         [
             {"source_id": "source_a", "api_base": "https://same.example/fhir"},
             {"source_id": "source_b", "api_base": "https://same.example/fhir/"},
@@ -8759,14 +9337,14 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
         page_count=100,
         timeout=3,
         run_id="run_1",
-        resource_fetch_stats=stats,
+        resource_fetch_stats=stats_by_resource,
     )
 
     assert fetch_calls == [("source_a", "Location")]
-    assert sorted(upserted_source_ids) == ["source_a", "source_b"]
-    assert counts == {"Location": 2}
-    assert stats["Location"]["sources_attempted"] == 2
-    assert stats["Location"]["sources_completed"] == 2
+    assert upserted_source_ids == ["source_a"]
+    assert resource_counts == {"Location": 1}
+    assert stats_by_resource["Location"]["sources_attempted"] == 1
+    assert stats_by_resource["Location"]["sources_completed"] == 1
 
 
 def test_selected_resources_rejects_unknown_resource():

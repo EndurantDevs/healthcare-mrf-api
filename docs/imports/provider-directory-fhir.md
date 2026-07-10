@@ -104,6 +104,9 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 
 ## Tables
 
+- `provider_directory_api_endpoint`
+- `provider_directory_endpoint_dataset`
+- `provider_directory_dataset_resource`
 - `provider_directory_source`
 - `provider_directory_capability`
 - `provider_directory_insurance_plan`
@@ -114,6 +117,51 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 - `provider_directory_healthcare_service`
 - `provider_directory_organization_affiliation`
 - `provider_directory_endpoint`
+
+### Endpoint dataset publication
+
+`provider_directory_source` remains the plan/source alias catalog, but each
+row with an importable API base also points to a deterministic
+`provider_directory_api_endpoint`. The endpoint identity is the same identity
+used to group resource acquisition: canonical API base, non-secret credential
+descriptor, and the complete resource-endpoint signature. Endpoint rows are
+upserted before their source aliases, so every alias in one acquisition group
+has the same `endpoint_id` without making plan names part of transport
+identity.
+
+Each endpoint acquisition writes to a non-current
+`provider_directory_endpoint_dataset` candidate. Normalized resources are
+stored once per `(dataset_id, resource_type, resource_id)` in
+`provider_directory_dataset_resource`; the existing source-specific resource
+tables and `provider_directory_source_resource` edges are still written for
+compatibility. One deterministic compatibility alias owns those physical rows:
+the lexicographically smallest `source_id` in the endpoint/resource import
+group. Typed rows, source-resource edges, seen rows, linked-resource rows, and
+stale cleanup are restricted to that owner. Catalog, probe, endpoint identity,
+and import-diagnostic metadata still update every logical alias. Counts report
+remote rows once rather than multiplying them by the alias count. Existing
+historical alias copies are intentionally not deleted by this change; their
+cleanup is a separate migration.
+
+Checkpointed acquisitions retain the candidate `dataset_id`. Candidate identity
+uses `provider_directory_pagination_root_run_id` when import-control supplies
+it, so pagination and partition/reverse-lookup retries across multiple hops
+continue the same non-current dataset. Partition checkpoints are scoped to that
+root lineage; an unrelated fresh run cannot skip completed partitions into a
+new empty candidate. UHC is included in checkpoint-capable source policy so an
+incomplete partition scan emits the same required-resume signal as an
+incomplete paginated scan, even though its partition state lives in
+`provider_directory_reverse_lookup_checkpoint`.
+
+The candidate is published only when every selected resource reports a
+complete, unbounded, error-free scan with no next page remaining. Publication
+locks the endpoint identity and atomically marks the prior current dataset
+superseded before making the candidate current. Bounded, failed, interrupted,
+or still-resumable candidates remain non-current, leaving the prior current
+dataset unchanged. The publication hash and row count are computed in
+`(resource_type, resource_id)` order with an incremental SHA-256 over bounded
+database batches, so promotion does not materialize a multi-million-row
+dataset in worker memory.
 
 Provider, plan, network, and location references are retained as raw FHIR
 references first. Address canonical linkage can be filled later through

@@ -309,6 +309,7 @@ _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
+ENDPOINT_DATASET_HASH_BATCH_SIZE = 10000
 DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
@@ -351,6 +352,13 @@ ALOHR_GRAPHQL_URL = "https://api.esante.us/graphql"
 ALOHR_TENANT_ID = "alohr"
 ALOHR_PROVIDER_CHECKPOINT_RESOURCE = "ALOHRGraphQLProvider"
 ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE = "ALOHRGraphQLOrganization"
+ALOHR_GRAPHQL_RESOURCE_TYPES = (
+    "Location",
+    "Organization",
+    "OrganizationAffiliation",
+    "Practitioner",
+    "PractitionerRole",
+)
 ALOHR_PROVIDER_QUERY = """
 query ALOHR_PROVIDER_FIND($criteria: ProviderSearchCriteria, $nextToken: String) {
   providers(criteria: $criteria, nextToken: $nextToken) {
@@ -548,6 +556,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         MAINE_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
+        UHC_PROVIDER_DIRECTORY_BASE,
         WASHINGTON_PROVIDER_DIRECTORY_BASE,
         WYOMING_PROVIDER_DIRECTORY_BASE,
     }
@@ -556,6 +565,11 @@ PAGINATION_CHECKPOINT_ACTIVE = "active"
 PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
+ENDPOINT_DATASET_ACQUIRING = "acquiring"
+ENDPOINT_DATASET_INCOMPLETE = "incomplete"
+ENDPOINT_DATASET_FAILED = "failed"
+ENDPOINT_DATASET_PUBLISHED = "published"
+ENDPOINT_DATASET_SUPERSEDED = "superseded"
 FHIR_CONTINUATION_QUERY_NAMES = frozenset(
     {
         "_continuationtoken",
@@ -607,6 +621,27 @@ class PaginationCheckpointContext:
     source_ids: tuple[str, ...]
     owner_run_id: str
     retry_of_run_id: str | None = None
+    endpoint_id: str | None = None
+    dataset_id: str | None = None
+
+
+@dataclass(frozen=True)
+class EndpointDatasetCandidate:
+    endpoint_id: str
+    dataset_id: str
+    source_ids: tuple[str, ...]
+    selected_resources: tuple[str, ...]
+    import_run_id: str | None
+    previous_dataset_id: str | None
+    checkpoint_context: PaginationCheckpointContext | None = None
+    reused_from_checkpoint: bool = False
+
+
+@dataclass(frozen=True)
+class EndpointDatasetCandidateSelection:
+    dataset_id: str
+    previous_dataset_id: str | None
+    reused_from_checkpoint: bool
 
 
 @dataclass(frozen=True)
@@ -930,6 +965,15 @@ def _reverse_lookup_checkpoint_flush_rows() -> int:
     return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_REVERSE_LOOKUP_CHECKPOINT_FLUSH_ROWS", 250))
 
 
+def _partition_checkpoint_owner_run_id(
+    source_record: dict[str, Any],
+    run_id: str | None,
+) -> str | None:
+    return _clean_text(
+        source_record.get("_partition_checkpoint_owner_run_id")
+    ) or _clean_text(run_id)
+
+
 def _reverse_lookup_checkpoint_row(
     source: dict[str, Any],
     seed_resource_type: str,
@@ -944,7 +988,7 @@ def _reverse_lookup_checkpoint_row(
         "canonical_api_base": canonical_api_base,
         "seed_resource_type": seed_resource_type,
         "seed_resource_id": seed_resource_id,
-        "last_completed_run_id": run_id,
+        "last_completed_run_id": _partition_checkpoint_owner_run_id(source, run_id),
         "completed_at": now,
         "updated_at": now,
     }
@@ -958,7 +1002,15 @@ def _reverse_lookup_checkpoint_exclusion_sql(
     canonical_api_base = _canonical_base(
         (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
     )
-    if not options.resume_completed_seeds or not canonical_api_base:
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        options.source or {},
+        options.run_id,
+    )
+    if (
+        not options.resume_completed_seeds
+        or not canonical_api_base
+        or not checkpoint_owner_run_id
+    ):
         return ""
     checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
     return f"""
@@ -966,6 +1018,7 @@ def _reverse_lookup_checkpoint_exclusion_sql(
                        SELECT 1
                          FROM {checkpoint_ref} AS checkpoint
                         WHERE checkpoint.canonical_api_base = :checkpoint_canonical_api_base
+                          AND checkpoint.last_completed_run_id = :checkpoint_owner_run_id
                           AND checkpoint.seed_resource_type = :resource_type
                           AND checkpoint.seed_resource_id = {resource_id_expr}
                    )
@@ -973,12 +1026,15 @@ def _reverse_lookup_checkpoint_exclusion_sql(
 
 
 async def _clear_reverse_lookup_checkpoints(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     *,
     seed_resource_type: str | None = None,
+    run_id: str | None = None,
 ) -> int:
     """Start the next completed scan fresh after every seed finished once."""
-    canonical_api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
     if not canonical_api_base:
         return 0
     seed_type_filter = (
@@ -986,18 +1042,30 @@ async def _clear_reverse_lookup_checkpoints(
         if seed_resource_type
         else ""
     )
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        source_record,
+        run_id,
+    )
+    owner_filter = (
+        "AND last_completed_run_id = :checkpoint_owner_run_id"
+        if checkpoint_owner_run_id
+        else ""
+    )
     query_params_by_name = {"canonical_api_base": canonical_api_base}
     if seed_resource_type:
         query_params_by_name["seed_resource_type"] = seed_resource_type
-    result = await db.status(
+    if checkpoint_owner_run_id:
+        query_params_by_name["checkpoint_owner_run_id"] = checkpoint_owner_run_id
+    deleted_count = await db.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)}
          WHERE canonical_api_base = :canonical_api_base
-           {seed_type_filter};
+           {seed_type_filter}
+           {owner_filter};
         """,
         **query_params_by_name,
     )
-    return int(result or 0)
+    return int(deleted_count or 0)
 
 
 def _reverse_lookup_checkpoint_source_ids(
@@ -1053,7 +1121,11 @@ async def _mark_checkpointed_reverse_lookup_roles_seen(
     canonical_api_base = _canonical_base(
         (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
     )
-    if not source_ids or not canonical_api_base:
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        options.source or {},
+        options.run_id,
+    )
+    if not source_ids or not canonical_api_base or not checkpoint_owner_run_id:
         return 0
     role_ref = _qt(_schema(), ProviderDirectoryPractitionerRole.__tablename__)
     checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
@@ -1068,11 +1140,13 @@ async def _mark_checkpointed_reverse_lookup_roles_seen(
           FROM {checkpoint_ref} AS checkpoint
          WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
            AND checkpoint.canonical_api_base = :canonical_api_base
+           AND checkpoint.last_completed_run_id = :checkpoint_owner_run_id
            AND {role_match_sql};
         """,
         run_id=options.run_id,
         source_ids=source_ids,
         canonical_api_base=canonical_api_base,
+        checkpoint_owner_run_id=checkpoint_owner_run_id,
     )
     return int(
         await db.status(
@@ -1085,6 +1159,7 @@ async def _mark_checkpointed_reverse_lookup_roles_seen(
               FROM {role_ref} AS role
               JOIN {checkpoint_ref} AS checkpoint
                 ON checkpoint.canonical_api_base = :canonical_api_base
+               AND checkpoint.last_completed_run_id = :checkpoint_owner_run_id
                AND {role_match_sql}
              WHERE role.source_id = ANY(CAST(:source_ids AS varchar[]))
             {run_filter};
@@ -1092,9 +1167,38 @@ async def _mark_checkpointed_reverse_lookup_roles_seen(
             run_id=options.run_id,
             source_ids=source_ids,
             canonical_api_base=canonical_api_base,
+            checkpoint_owner_run_id=checkpoint_owner_run_id,
         )
         or 0
     )
+
+
+def _postal_checkpoint_seen_params(
+    source_record: dict[str, Any],
+    source_ids: list[str],
+    run_id: str | None,
+) -> dict[str, Any] | None:
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        source_record,
+        run_id,
+    )
+    if (
+        not run_id
+        or not source_ids
+        or not canonical_api_base
+        or not checkpoint_owner_run_id
+    ):
+        return None
+    return {
+        "run_id": run_id,
+        "source_ids": source_ids,
+        "canonical_api_base": canonical_api_base,
+        "checkpoint_owner_run_id": checkpoint_owner_run_id,
+        "checkpoint_type": _uhc_role_postal_checkpoint_type(source_record),
+    }
 
 
 async def _mark_postal_checkpointed_roles_seen(
@@ -1104,10 +1208,12 @@ async def _mark_postal_checkpointed_roles_seen(
     seen_table: str | None,
 ) -> int:
     """Preserve prior ZIP-partition rows during a resumed stale-cleanup run."""
-    canonical_api_base = _canonical_base(
-        source_record.get("canonical_api_base") or source_record.get("api_base")
+    query_params_by_name = _postal_checkpoint_seen_params(
+        source_record,
+        source_ids,
+        run_id,
     )
-    if not run_id or not source_ids or not canonical_api_base:
+    if query_params_by_name is None:
         return 0
     role_ref = _qt(_schema(), ProviderDirectoryPractitionerRole.__tablename__)
     checkpoint_ref = _qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)
@@ -1117,18 +1223,13 @@ async def _mark_postal_checkpointed_roles_seen(
             SELECT 1
               FROM {checkpoint_ref} AS checkpoint
              WHERE checkpoint.canonical_api_base = :canonical_api_base
+               AND checkpoint.last_completed_run_id = :checkpoint_owner_run_id
                AND checkpoint.seed_resource_type = :checkpoint_type
         )
     """
     run_conflict_sql = (
         "" if seen_table else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
     )
-    query_params_by_name = {
-        "run_id": run_id,
-        "source_ids": source_ids,
-        "canonical_api_base": canonical_api_base,
-        "checkpoint_type": _uhc_role_postal_checkpoint_type(source_record, source_ids),
-    }
     await db.status(
         f"""
         UPDATE {role_ref} AS role
@@ -1961,16 +2062,26 @@ async def _load_partition_checkpoints(
     canonical_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
-    if not canonical_api_base or not _is_uhc_role_postal_partition_enabled(source_record):
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        source_record,
+        run_id,
+    )
+    if (
+        not canonical_api_base
+        or not checkpoint_owner_run_id
+        or not _is_uhc_role_postal_partition_enabled(source_record)
+    ):
         return set()
     checkpoint_rows = await db.all(
         f"""
         SELECT seed_resource_id
           FROM {_qt(_schema(), ProviderDirectoryReverseLookupCheckpoint.__tablename__)}
          WHERE canonical_api_base = :canonical_api_base
+           AND last_completed_run_id = :checkpoint_owner_run_id
            AND seed_resource_type = :seed_resource_type;
         """,
         canonical_api_base=canonical_api_base,
+        checkpoint_owner_run_id=checkpoint_owner_run_id,
         seed_resource_type=_uhc_role_postal_checkpoint_type(source_record),
     )
     return {
@@ -2129,6 +2240,10 @@ async def _scan_role_stage_seeds(
     checkpoint_canonical_api_base = _canonical_base(
         (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
     )
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        options.source or {},
+        options.run_id,
+    )
     for resource_type in _practitioner_role_reverse_lookup_resources(options.source):
         search_param = search_params.get(resource_type)
         if not search_param:
@@ -2151,6 +2266,7 @@ async def _scan_role_stage_seeds(
                 last_resource_id=last_resource_id,
                 limit=page_size,
                 checkpoint_canonical_api_base=checkpoint_canonical_api_base,
+                checkpoint_owner_run_id=checkpoint_owner_run_id,
             )
             if not resource_rows:
                 break
@@ -2176,6 +2292,10 @@ async def _scan_role_db_seed_rows(
     checkpoint_exclusion_sql = _reverse_lookup_checkpoint_exclusion_sql(options, "seed.resource_id")
     checkpoint_canonical_api_base = _canonical_base(
         (options.source or {}).get("canonical_api_base") or (options.source or {}).get("api_base")
+    )
+    checkpoint_owner_run_id = _partition_checkpoint_owner_run_id(
+        options.source or {},
+        options.run_id,
     )
     seed_table_by_resource_type = {
         "Practitioner": "provider_directory_practitioner",
@@ -2204,6 +2324,7 @@ async def _scan_role_db_seed_rows(
                 last_resource_id=last_resource_id,
                 limit=page_size,
                 checkpoint_canonical_api_base=checkpoint_canonical_api_base,
+                checkpoint_owner_run_id=checkpoint_owner_run_id,
             )
             if not resource_rows:
                 break
@@ -6603,6 +6724,11 @@ def _effective_update_expression(table, statement, column: str):
     excluded_value = getattr(statement.excluded, column)
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
         return func.coalesce(table.c.first_seen_run_id, excluded_value)
+    if (
+        table.name == ProviderDirectoryAPIEndpoint.__tablename__
+        and column in {"first_seen_at", "created_at"}
+    ):
+        return func.coalesce(getattr(table.c, column), excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         return func.coalesce(table.c.metadata_json.cast(JSONB), func.jsonb_build_object()).op("||")(
             func.coalesce(excluded_value.cast(JSONB), func.jsonb_build_object())
@@ -6619,6 +6745,11 @@ def _effective_update_expression(table, statement, column: str):
 
 def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
+        return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
+    if (
+        table.name == ProviderDirectoryAPIEndpoint.__tablename__
+        and column in {"first_seen_at", "created_at"}
+    ):
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         quoted = _q(column)
@@ -6812,6 +6943,37 @@ def _canonical_resource_rows(
             "updated_at": row.get("updated_at") or observed_at,
         }
     return list(seen.values())
+
+
+def _endpoint_dataset_resource_rows(
+    model: type,
+    rows: list[dict[str, Any]],
+    *,
+    dataset_id: str | None,
+) -> list[dict[str, Any]]:
+    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+    if not dataset_id or not resource_type:
+        return []
+    resources_by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        resource_id = _clean_text(row.get("resource_id"))
+        if not resource_id:
+            continue
+        payload = _canonical_resource_payload(row)
+        resources_by_id[resource_id] = {
+            "dataset_id": dataset_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "payload_hash": hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    default=_json_default,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "payload_json": payload,
+        }
+    return [resources_by_id[resource_id] for resource_id in sorted(resources_by_id)]
 
 
 def _source_resource_edge_rows(
@@ -8790,6 +8952,7 @@ async def _probe_sources(
     run_id: str | None,
 ) -> tuple[int, int, set[str]]:
     semaphore = asyncio.Semaphore(max(1, min(concurrency, 10)))
+    endpoint_rows: list[dict[str, Any]] = []
     capability_rows: list[dict[str, Any]] = []
     source_updates: list[dict[str, Any]] = []
     valid_source_ids: set[str] = set()
@@ -8811,10 +8974,14 @@ async def _probe_sources(
         async with flush_lock:
             if not force and len(source_updates) < flush_every:
                 return
+            endpoint_flush_rows = list(endpoint_rows)
             capability_flush_rows = list(capability_rows)
             source_update_rows = list(source_updates)
+            endpoint_rows.clear()
             capability_rows.clear()
             source_updates.clear()
+        if endpoint_flush_rows:
+            await _upsert_rows(ProviderDirectoryAPIEndpoint, endpoint_flush_rows)
         if capability_flush_rows:
             await _upsert_rows(ProviderDirectoryCapability, capability_flush_rows)
         if source_update_rows:
@@ -8875,6 +9042,14 @@ async def _probe_sources(
                 source["canonical_api_base"] = resolved_api_base
                 update["api_base"] = resolved_api_base
                 update["canonical_api_base"] = resolved_api_base
+            endpoint_row = _provider_directory_api_endpoint_row(
+                source,
+                observed_at=now,
+            )
+            if endpoint_row is not None:
+                source["endpoint_id"] = endpoint_row["endpoint_id"]
+                update["endpoint_id"] = endpoint_row["endpoint_id"]
+                endpoint_rows.append(endpoint_row)
             if payload and payload.get("resourceType") == "CapabilityStatement":
                 capability_rows.append(parse_capability(source, payload, probe))
                 update["fhir_version"] = _clean_text(payload.get("fhirVersion")) or update.get("fhir_version")
@@ -10164,6 +10339,7 @@ async def _fetch_partitioned_resource_rows(
         await _clear_reverse_lookup_checkpoints(
             source_record,
             seed_resource_type=_uhc_role_postal_checkpoint_type(source_record),
+            run_id=fetch_options.run_id,
         )
     is_complete = is_partition_scan_complete and not residual_error
     return ResourceFetchResult(
@@ -10381,6 +10557,10 @@ async def _fetch_resource_rows(
                         has_restart_attempted=has_restart_attempted,
                     )
                 ):
+                    await _clear_checkpoint_dataset_resource_type(
+                        checkpoint_context,
+                        resource_type,
+                    )
                     await _save_pagination_checkpoint(
                         checkpoint_context,
                         resource_type,
@@ -10725,7 +10905,10 @@ async def _fetch_scan_practitioner_role_rows(
         fetch_mode="source_specific_reverse_lookup",
     )
     if reverse_lookup_result.complete and options.resume_completed_seeds:
-        await _clear_reverse_lookup_checkpoints(options.source or source)
+        await _clear_reverse_lookup_checkpoints(
+            options.source or source,
+            run_id=options.run_id,
+        )
     return reverse_lookup_result
 
 
@@ -10910,7 +11093,10 @@ async def _fetch_scan_practitioner_role_rows_concurrent(
         fetch_state,
     )
     if reverse_lookup_result.complete and options.resume_completed_seeds:
-        await _clear_reverse_lookup_checkpoints(options.source or source_config)
+        await _clear_reverse_lookup_checkpoints(
+            options.source or source_config,
+            run_id=options.run_id,
+        )
     return reverse_lookup_result
 
 
@@ -11074,6 +11260,7 @@ async def _import_linked_resource_rows(
     progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
     deadline_seconds: int = 0,
     flush_rows: int | None = None,
+    dataset_id: str | None = None,
 ) -> dict[str, int]:
     if per_source_limit <= 0:
         return {}
@@ -11111,7 +11298,9 @@ async def _import_linked_resource_rows(
             return resource_type, model, row
 
     counts: dict[str, int] = {}
-    edge_source_ids = source_ids or [source["source_id"]]
+    logical_source_ids = source_ids or [source["source_id"]]
+    compatibility_source_id = _compatibility_storage_source_id(logical_source_ids)
+    edge_source_ids = [compatibility_source_id]
     canonical_api_base = source.get("canonical_api_base") or source.get("api_base")
     by_model: dict[type, list[dict[str, Any]]] = {}
     linked_counts_by_name = {"pending_rows": 0}
@@ -11126,7 +11315,7 @@ async def _import_linked_resource_rows(
         for model, rows in pending.items():
             if not rows:
                 continue
-            rows = _copy_rows_for_source_ids(rows, edge_source_ids)
+            rows = _rows_for_compatibility_source(rows, compatibility_source_id)
             imported = await _upsert_resource_rows(
                 model,
                 rows,
@@ -11135,6 +11324,7 @@ async def _import_linked_resource_rows(
                 seen_table=seen_table,
                 canonical_api_base=canonical_api_base,
                 source_ids=edge_source_ids,
+                dataset_id=dataset_id,
             )
             if imported:
                 resource_name = model.__name__.removeprefix("ProviderDirectory")
@@ -11221,7 +11411,11 @@ def _record_resource_completion(
     completion.setdefault(resource_type, set()).update(source_ids)
 
 
-def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_source: int) -> dict[str, Any]:
+def _resource_fetch_diagnostic(
+    result: ResourceFetchResult,
+    *,
+    rows_written: int,
+) -> dict[str, Any]:
     return {
         "complete": result.complete,
         "bounded": result.bounded,
@@ -11229,7 +11423,7 @@ def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_
         "fetch_mode": result.fetch_mode,
         "pages_fetched": result.pages_fetched,
         "rows_fetched": result.rows_fetched,
-        "rows_written": rows_written_per_source,
+        "rows_written": rows_written,
         "row_limit_reached": result.row_limit_reached,
         "page_limit_reached": result.page_limit_reached,
         "hard_page_limit_reached": result.hard_page_limit_reached,
@@ -11275,11 +11469,19 @@ async def _upsert_resource_rows(
     seen_table: str | None = None,
     canonical_api_base: str | None = None,
     source_ids: list[str] | None = None,
+    dataset_id: str | None = None,
 ) -> int:
     if not rows:
         return 0
     if model is ProviderDirectoryLocation and _location_contact_fields_missing(rows):
         rows = _attach_location_contact_fields(rows)
+    dataset_rows = _endpoint_dataset_resource_rows(
+        model,
+        rows,
+        dataset_id=dataset_id,
+    )
+    if dataset_rows:
+        await _upsert_rows(ProviderDirectoryDatasetResource, dataset_rows)
     if canonical_api_base and source_ids:
         canonical_rows = _canonical_resource_rows(
             model,
@@ -11628,6 +11830,82 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
     )
 
 
+def _stable_identity_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+
+
+def _identity_hash(value: Any) -> str:
+    return hashlib.sha256(_stable_identity_json(value).encode("utf-8")).hexdigest()
+
+
+def _provider_directory_api_endpoint_row(
+    source_record: dict[str, Any],
+    *,
+    observed_at: datetime.datetime | None = None,
+) -> dict[str, Any] | None:
+    api_base, credential_json, endpoint_signature_items = _resource_import_group_key(
+        source_record
+    )
+    if not api_base or not endpoint_signature_items:
+        return None
+    credential_descriptor = json.loads(credential_json or "{}")
+    endpoint_signature_map = dict(endpoint_signature_items)
+    credential_descriptor_hash = _identity_hash(credential_descriptor)
+    endpoint_signature_hash = _identity_hash(endpoint_signature_map)
+    identity_payload_map = {
+        "canonical_api_base": api_base,
+        "credential_descriptor": credential_descriptor,
+        "endpoint_signature": endpoint_signature_map,
+    }
+    now = observed_at or _now()
+    return {
+        "endpoint_id": _identity_hash(identity_payload_map),
+        "canonical_api_base": api_base,
+        "credential_descriptor_hash": credential_descriptor_hash,
+        "endpoint_signature_hash": endpoint_signature_hash,
+        "credential_descriptor_json": credential_descriptor,
+        "endpoint_signature_json": endpoint_signature_map,
+        "first_seen_at": now,
+        "last_seen_at": now,
+        "metadata_json": {"identity_version": "resource-import-group-v1"},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _attach_provider_directory_endpoint_ids(
+    source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    endpoint_rows_by_id: dict[str, dict[str, Any]] = {}
+    observed_at = _now()
+    for source_row in source_rows:
+        endpoint_row = _provider_directory_api_endpoint_row(
+            source_row,
+            observed_at=observed_at,
+        )
+        source_row["endpoint_id"] = (
+            endpoint_row["endpoint_id"] if endpoint_row is not None else None
+        )
+        if endpoint_row is not None:
+            endpoint_rows_by_id[endpoint_row["endpoint_id"]] = endpoint_row
+    return list(endpoint_rows_by_id.values())
+
+
+async def _upsert_provider_directory_source_rows(
+    source_rows: list[dict[str, Any]],
+) -> int:
+    endpoint_rows = _attach_provider_directory_endpoint_ids(source_rows)
+    if endpoint_rows:
+        await _upsert_rows(ProviderDirectoryAPIEndpoint, endpoint_rows)
+    await _upsert_rows(ProviderDirectorySource, source_rows)
+    return len(endpoint_rows)
+
+
 def _group_resource_import_sources(
     sources: list[dict[str, Any]],
     *,
@@ -11641,14 +11919,36 @@ def _group_resource_import_sources(
             groups[key] = []
             ordered_groups.append(groups[key])
         groups[key].append(source)
-    return ordered_groups
+    return [
+        sorted(
+            source_group,
+            key=lambda source_record: _clean_text(source_record.get("source_id")) or "",
+        )
+        for source_group in ordered_groups
+    ]
+
+
+def _compatibility_storage_source(
+    source_group: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_records = [
+        source_record
+        for source_record in source_group
+        if _clean_text(source_record.get("source_id"))
+    ]
+    if not source_records:
+        raise ValueError("resource import group has no source identity")
+    return min(
+        source_records,
+        key=lambda source_record: _clean_text(source_record.get("source_id")) or "",
+    )
 
 
 def _scoped_partition_source_record(
     source_group: list[dict[str, Any]],
     source_ids: list[str],
 ) -> dict[str, Any]:
-    source_by_name = dict(source_group[0])
+    source_by_name = dict(_compatibility_storage_source(source_group))
     source_by_name["_partition_checkpoint_source_ids"] = tuple(source_ids)
     return source_by_name
 
@@ -11732,6 +12032,292 @@ def _pagination_checkpoint_row_mapping(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _endpoint_dataset_candidate_id(
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+    owner_key: str,
+) -> str:
+    identity_payload_map = {
+        "endpoint_id": endpoint_id,
+        "owner_key": owner_key,
+        "selected_resources": selected_resources,
+    }
+    return f"pdds_{_identity_hash(identity_payload_map)}"
+
+
+async def _checkpoint_candidate_dataset_id(
+    context: PaginationCheckpointContext | None,
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+) -> str | None:
+    if context is None:
+        return None
+    owner_run_ids = [context.owner_run_id]
+    if context.retry_of_run_id:
+        owner_run_ids.append(context.retry_of_run_id)
+    checkpoint_row = await db.first(
+        f"""
+        SELECT checkpoint.dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)} AS checkpoint
+          JOIN {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+            ON dataset.dataset_id = checkpoint.dataset_id
+         WHERE checkpoint.canonical_api_base = :canonical_api_base
+           AND checkpoint.source_scope_hash = :source_scope_hash
+           AND checkpoint.owner_run_id = ANY(CAST(:owner_run_ids AS varchar[]))
+           AND dataset.endpoint_id = :endpoint_id
+           AND dataset.is_current = false
+           AND COALESCE(
+                dataset.publication_metadata_json::jsonb -> 'selected_resources',
+                '[]'::jsonb
+               ) = CAST(:selected_resources AS jsonb)
+         ORDER BY checkpoint.updated_at DESC
+         LIMIT 1;
+        """,
+        canonical_api_base=context.canonical_api_base,
+        source_scope_hash=context.source_scope_hash,
+        owner_run_ids=owner_run_ids,
+        endpoint_id=endpoint_id,
+        selected_resources=json.dumps(selected_resources),
+    )
+    return _clean_text(
+        _pagination_checkpoint_row_mapping(checkpoint_row).get("dataset_id")
+    )
+
+
+async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
+    row = await db.first(
+        f"""
+        SELECT endpoint_id, status, is_current, previous_dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = :dataset_id;
+        """,
+        dataset_id=dataset_id,
+    )
+    return _pagination_checkpoint_row_mapping(row)
+
+
+async def _current_endpoint_dataset_id(
+    endpoint_id: str,
+    *,
+    exclude_dataset_id: str,
+) -> str | None:
+    row = await db.first(
+        f"""
+        SELECT dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE endpoint_id = :endpoint_id
+           AND is_current = true
+           AND dataset_id <> :exclude_dataset_id
+         LIMIT 1;
+        """,
+        endpoint_id=endpoint_id,
+        exclude_dataset_id=exclude_dataset_id,
+    )
+    return _clean_text(_pagination_checkpoint_row_mapping(row).get("dataset_id"))
+
+
+async def _ensure_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    metadata = {
+        "selected_resources": list(candidate.selected_resources),
+        "source_ids": list(candidate.source_ids),
+    }
+    await db.status(
+        f"""
+        INSERT INTO {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS candidate (
+            dataset_id, endpoint_id, import_run_id, previous_dataset_id,
+            status, is_current, resource_count, created_at,
+            publication_metadata_json
+        ) VALUES (
+            :dataset_id, :endpoint_id, :import_run_id, :previous_dataset_id,
+            :status, false, 0, now(), CAST(:publication_metadata_json AS jsonb)
+        )
+        ON CONFLICT (dataset_id) DO UPDATE SET
+            import_run_id = COALESCE(candidate.import_run_id, EXCLUDED.import_run_id),
+            previous_dataset_id = COALESCE(
+                candidate.previous_dataset_id,
+                EXCLUDED.previous_dataset_id
+            ),
+            status = CASE
+                WHEN candidate.is_current THEN candidate.status
+                ELSE EXCLUDED.status
+            END,
+            publication_metadata_json = CASE
+                WHEN candidate.is_current THEN candidate.publication_metadata_json
+                ELSE EXCLUDED.publication_metadata_json
+            END;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        import_run_id=candidate.import_run_id,
+        previous_dataset_id=candidate.previous_dataset_id,
+        status=ENDPOINT_DATASET_ACQUIRING,
+        publication_metadata_json=json.dumps(metadata, sort_keys=True),
+    )
+    await _clear_uncheckpointed_endpoint_dataset_candidate(candidate)
+
+
+async def _clear_uncheckpointed_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    if candidate.reused_from_checkpoint:
+        return
+    await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+         WHERE resource.dataset_id = :dataset_id
+           AND dataset.dataset_id = resource.dataset_id
+           AND dataset.endpoint_id = :endpoint_id
+           AND dataset.is_current = false;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+
+
+def _endpoint_id_for_source_records(
+    source_records: list[dict[str, Any]],
+) -> str | None:
+    endpoint_ids = {
+        endpoint_id
+        for source_record in source_records
+        if (endpoint_id := _clean_text(source_record.get("endpoint_id")))
+    }
+    if not endpoint_ids:
+        return None
+    if len(endpoint_ids) != 1:
+        raise ValueError("resource import group contains multiple endpoint identities")
+    return next(iter(endpoint_ids))
+
+
+async def _select_endpoint_dataset_candidate(
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+    *,
+    run_id: str | None,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> EndpointDatasetCandidateSelection:
+    checkpoint_dataset_id = await _checkpoint_candidate_dataset_id(
+        checkpoint_context,
+        endpoint_id,
+        selected_resources,
+    )
+    owner_key = (
+        pagination_root_run_id
+        or retry_of_run_id
+        or run_id
+        or f"adhoc:{time.time_ns()}"
+    )
+    dataset_id = checkpoint_dataset_id or _endpoint_dataset_candidate_id(
+        endpoint_id,
+        selected_resources,
+        owner_key,
+    )
+    existing_dataset_map = await _endpoint_dataset_state(dataset_id)
+    if (
+        existing_dataset_map
+        and _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_identity_collision")
+    if existing_dataset_map.get("is_current") is True:
+        dataset_id = _endpoint_dataset_candidate_id(
+            endpoint_id,
+            selected_resources,
+            f"{owner_key}:replay:{time.time_ns()}",
+        )
+        existing_dataset_map = {}
+        checkpoint_dataset_id = None
+    previous_dataset_id = _clean_text(
+        existing_dataset_map.get("previous_dataset_id")
+    )
+    if not previous_dataset_id:
+        previous_dataset_id = await _current_endpoint_dataset_id(
+            endpoint_id,
+            exclude_dataset_id=dataset_id,
+        )
+    return EndpointDatasetCandidateSelection(
+        dataset_id=dataset_id,
+        previous_dataset_id=previous_dataset_id,
+        reused_from_checkpoint=(
+            checkpoint_dataset_id is not None or bool(existing_dataset_map)
+        ),
+    )
+
+
+async def _prepare_endpoint_dataset_candidate(
+    source_records: list[dict[str, Any]],
+    resources: list[str],
+    *,
+    run_id: str | None,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> EndpointDatasetCandidate | None:
+    endpoint_id = _endpoint_id_for_source_records(source_records)
+    if endpoint_id is None:
+        return None
+    selected_resources = tuple(sorted(set(resources)))
+    if not selected_resources:
+        return None
+    selection = await _select_endpoint_dataset_candidate(
+        endpoint_id,
+        selected_resources,
+        run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+        pagination_root_run_id=pagination_root_run_id,
+        checkpoint_context=checkpoint_context,
+    )
+    bound_checkpoint_context = (
+        replace(
+            checkpoint_context,
+            endpoint_id=endpoint_id,
+            dataset_id=selection.dataset_id,
+        )
+        if checkpoint_context is not None
+        else None
+    )
+    candidate = EndpointDatasetCandidate(
+        endpoint_id=endpoint_id,
+        dataset_id=selection.dataset_id,
+        source_ids=tuple(
+            sorted(
+                source_id
+                for source_record in source_records
+                if (source_id := _clean_text(source_record.get("source_id")))
+            )
+        ),
+        selected_resources=selected_resources,
+        import_run_id=run_id,
+        previous_dataset_id=selection.previous_dataset_id,
+        checkpoint_context=bound_checkpoint_context,
+        reused_from_checkpoint=selection.reused_from_checkpoint,
+    )
+    await _ensure_endpoint_dataset_candidate(candidate)
+    return candidate
+
+
+def _endpoint_dataset_selected_resources(
+    source_records: list[dict[str, Any]],
+    requested_resources: list[str],
+) -> list[str]:
+    source_record = _compatibility_storage_source(source_records)
+    supported_resources = _source_supported_resource_types(source_record)
+    if _alohr_source_uses_graphql_connector(source_record):
+        supported_resources = set(ALOHR_GRAPHQL_RESOURCE_TYPES)
+    unique_requested_resources = list(dict.fromkeys(requested_resources))
+    if supported_resources is None:
+        return unique_requested_resources
+    return [
+        resource_type
+        for resource_type in unique_requested_resources
+        if resource_type in supported_resources
+    ]
+
+
 def _pagination_checkpoint_table_ref() -> str:
     return _qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)
 
@@ -11742,7 +12328,7 @@ async def _fetch_pagination_checkpoint(
 ) -> dict[str, Any]:
     checkpoint_row = await db.first(
         f"""
-        SELECT source_ids, owner_run_id, start_url_hash, next_url, state,
+        SELECT dataset_id, source_ids, owner_run_id, start_url_hash, next_url, state,
                pages_processed, rows_processed, recent_cursor_hashes
           FROM {_pagination_checkpoint_table_ref()}
          WHERE canonical_api_base = :canonical_api_base
@@ -11767,11 +12353,16 @@ def _compatible_pagination_resume_state(
         context.retry_of_run_id is not None
         and existing_owner_run_id == context.retry_of_run_id
     )
+    has_matching_dataset = (
+        context.dataset_id is None
+        or _clean_text(checkpoint.get("dataset_id")) == context.dataset_id
+    )
     if (
         not checkpoint
         or existing_source_ids != context.source_ids
         or _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
         or not has_matching_owner
+        or not has_matching_dataset
     ):
         return None
     is_complete = checkpoint.get("state") == PAGINATION_CHECKPOINT_COMPLETE
@@ -11818,20 +12409,25 @@ async def _adopt_pagination_checkpoint_owner(
 
 def _pagination_checkpoint_reset_sql() -> str:
     return f"""
+    WITH cleared_dataset_resources AS (
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type
+    )
     INSERT INTO {_pagination_checkpoint_table_ref()} (
         canonical_api_base, resource_type, source_scope_hash, dataset_id,
         source_ids, owner_run_id, retry_of_run_id, start_url_hash,
         next_url, state, pages_processed, rows_processed,
         recent_cursor_hashes, created_at, updated_at, completed_at
     ) VALUES (
-        :canonical_api_base, :resource_type, :source_scope_hash, NULL,
+        :canonical_api_base, :resource_type, :source_scope_hash, :dataset_id,
         CAST(:source_ids AS jsonb), :owner_run_id, :retry_of_run_id,
         :start_url_hash, :next_url, :state, 0, 0,
         '[]'::jsonb, now(), now(), NULL
     )
     ON CONFLICT (canonical_api_base, resource_type, source_scope_hash)
     DO UPDATE SET
-        dataset_id = NULL,
+        dataset_id = EXCLUDED.dataset_id,
         source_ids = EXCLUDED.source_ids,
         owner_run_id = EXCLUDED.owner_run_id,
         retry_of_run_id = EXCLUDED.retry_of_run_id,
@@ -11847,6 +12443,23 @@ def _pagination_checkpoint_reset_sql() -> str:
     """
 
 
+async def _clear_checkpoint_dataset_resource_type(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> None:
+    if not context.dataset_id:
+        return
+    await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+    )
+
+
 async def _reset_pagination_checkpoint(
     context: PaginationCheckpointContext,
     resource_type: str,
@@ -11858,6 +12471,7 @@ async def _reset_pagination_checkpoint(
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
         source_scope_hash=context.source_scope_hash,
+        dataset_id=context.dataset_id,
         source_ids=json.dumps(context.source_ids),
         owner_run_id=context.owner_run_id,
         retry_of_run_id=context.retry_of_run_id,
@@ -12027,16 +12641,23 @@ async def _reset_unexpected_empty_pagination_checkpoint(
     )
 
 
-def _copy_rows_for_source_ids(rows: list[dict[str, Any]], source_ids: list[str]) -> list[dict[str, Any]]:
-    if len(source_ids) <= 1:
-        return rows
-    copied: list[dict[str, Any]] = []
-    for row in rows:
-        for source_id in source_ids:
-            item = dict(row)
-            item["source_id"] = source_id
-            copied.append(item)
-    return copied
+def _compatibility_storage_source_id(source_ids: list[str]) -> str:
+    cleaned_source_ids = sorted(_clean_source_id_list(source_ids))
+    if not cleaned_source_ids:
+        raise ValueError("resource import group has no compatibility source identity")
+    return cleaned_source_ids[0]
+
+
+def _rows_for_compatibility_source(
+    resource_rows: list[dict[str, Any]],
+    source_id: str,
+) -> list[dict[str, Any]]:
+    if all(resource_row.get("source_id") == source_id for resource_row in resource_rows):
+        return resource_rows
+    return [
+        {**resource_row, "source_id": source_id}
+        for resource_row in resource_rows
+    ]
 
 
 async def _fetch_alohr_graphql_page(
@@ -12173,11 +12794,13 @@ class AlohrGraphQLImportOptions:
     seen_table: str | None
     checkpoint_context: PaginationCheckpointContext | None
     resume_required_entries: set[str] | None
+    dataset_id: str | None = None
 
 
 @dataclass
 class AlohrGraphQLImportState:
     source_ids: list[str]
+    compatibility_source_id: str
     selected_resource_types: set[str]
     canonical_api_base: str
     options: AlohrGraphQLImportOptions
@@ -12217,12 +12840,15 @@ def _initialize_alohr_graphql_import_state(
     resource_types: list[str],
     options: AlohrGraphQLImportOptions,
 ) -> AlohrGraphQLImportState:
-    source_ids = [source_record["source_id"] for source_record in source_group]
+    source_ids = sorted(source_record["source_id"] for source_record in source_group)
+    compatibility_source = _compatibility_storage_source(source_group)
     canonical_api_base = (
-        source_group[0].get("canonical_api_base") or source_group[0].get("api_base")
+        compatibility_source.get("canonical_api_base")
+        or compatibility_source.get("api_base")
     )
     return AlohrGraphQLImportState(
         source_ids=source_ids,
+        compatibility_source_id=compatibility_source["source_id"],
         selected_resource_types=set(resource_types),
         canonical_api_base=canonical_api_base,
         options=options,
@@ -12294,8 +12920,11 @@ async def _write_alohr_graphql_page(
 ) -> dict[str, int]:
     resource_rows_by_model: dict[type, list[dict[str, Any]]] = {}
     for source_item in source_items:
-        for source_id in import_state.source_ids:
-            append_item(resource_rows_by_model, source_id, source_item)
+        append_item(
+            resource_rows_by_model,
+            import_state.compatibility_source_id,
+            source_item,
+        )
     written_counts_by_resource: dict[str, int] = {}
     for model, model_rows in resource_rows_by_model.items():
         resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
@@ -12308,7 +12937,8 @@ async def _write_alohr_graphql_page(
             track_seen=import_state.options.stale_cleanup,
             seen_table=import_state.options.seen_table,
             canonical_api_base=import_state.canonical_api_base,
-            source_ids=import_state.source_ids,
+            source_ids=[import_state.compatibility_source_id],
+            dataset_id=import_state.options.dataset_id,
         )
         prior_count = import_state.source_counts_by_resource.get(resource_type, 0)
         import_state.source_counts_by_resource[resource_type] = prior_count + written_count
@@ -12354,8 +12984,7 @@ def _record_alohr_graphql_stream(
         error=stream_state.error,
         pages_fetched=stream_state.pages_fetched,
         rows_fetched=stream_state.rows_fetched,
-        rows_written=sum(stream_state.written_counts_by_resource.values())
-        // max(1, len(import_state.source_ids)),
+        rows_written=sum(stream_state.written_counts_by_resource.values()),
         row_limit_reached=stream_state.is_row_limit_reached,
         page_limit_reached=stream_state.is_page_limit_reached,
         next_url_remaining=bool(stream_state.current_locator),
@@ -12369,7 +12998,6 @@ def _record_alohr_graphql_stream(
         resource_diagnostic_by_field = dict(stream_diagnostic)
         resource_diagnostic_by_field["rows_written"] = (
             stream_state.written_counts_by_resource.get(resource_type, 0)
-            // max(1, len(import_state.source_ids))
         )
         import_state.diagnostics_by_resource[resource_type] = (
             _merge_alohr_resource_diagnostic(
@@ -12462,22 +13090,20 @@ async def _fetch_alohr_graphql_stream(
 
 
 def _finalize_alohr_graphql_stats(import_state: AlohrGraphQLImportState) -> None:
-    source_count = len(import_state.source_ids)
     for resource_type, diagnostic in import_state.diagnostics_by_resource.items():
         diagnostic["rows_written"] = (
             import_state.source_counts_by_resource.get(resource_type, 0)
-            // max(1, source_count)
         )
         import_state.stats_by_resource[resource_type] = {
-            "sources_attempted": source_count,
-            "sources_completed": source_count if diagnostic.get("complete") else 0,
-            "sources_bounded": source_count if diagnostic.get("bounded") else 0,
-            "sources_failed": source_count if diagnostic.get("error") else 0,
-            "sources_empty": source_count
+            "sources_attempted": 1,
+            "sources_completed": 1 if diagnostic.get("complete") else 0,
+            "sources_bounded": 1 if diagnostic.get("bounded") else 0,
+            "sources_failed": 1 if diagnostic.get("error") else 0,
+            "sources_empty": 1
             if diagnostic.get("complete") and not diagnostic.get("rows_fetched")
             else 0,
-            "pages_fetched": int(diagnostic.get("pages_fetched") or 0) * source_count,
-            "rows_fetched": int(diagnostic.get("rows_fetched") or 0) * source_count,
+            "pages_fetched": int(diagnostic.get("pages_fetched") or 0),
+            "rows_fetched": int(diagnostic.get("rows_fetched") or 0),
         }
 
 
@@ -12488,23 +13114,22 @@ async def _finalize_alohr_stale_rows(import_state: AlohrGraphQLImportState) -> N
         if not diagnostic.get("complete"):
             continue
         if import_state.options.seen_table:
-            import_state.stale_ready_source_ids_by_resource[resource_type] = list(
-                import_state.source_ids
-            )
+            import_state.stale_ready_source_ids_by_resource[resource_type] = [
+                import_state.compatibility_source_id
+            ]
             continue
         model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
         if model is None:
             continue
-        for source_id in import_state.source_ids:
-            deleted_count = await _delete_stale_resource_rows(
-                model,
-                source_id,
-                import_state.options.run_id,
-                use_seen_table=True,
-            )
-            if deleted_count:
-                prior_count = import_state.stale_counts_by_resource.get(resource_type, 0)
-                import_state.stale_counts_by_resource[resource_type] = prior_count + deleted_count
+        deleted_count = await _delete_stale_resource_rows(
+            model,
+            import_state.compatibility_source_id,
+            import_state.options.run_id,
+            use_seen_table=True,
+        )
+        if deleted_count:
+            prior_count = import_state.stale_counts_by_resource.get(resource_type, 0)
+            import_state.stale_counts_by_resource[resource_type] = prior_count + deleted_count
 
 
 async def _finalize_alohr_checkpoints(import_state: AlohrGraphQLImportState) -> None:
@@ -12607,6 +13232,398 @@ async def _import_alohr_graphql_source_group(
     )
 
 
+def _endpoint_dataset_publication_metadata(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]],
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "selected_resources": list(candidate.selected_resources),
+        "source_ids": list(candidate.source_ids),
+        "resource_diagnostics": diagnostics,
+        "reused_from_checkpoint": candidate.reused_from_checkpoint,
+        **extra,
+    }
+
+
+def _is_endpoint_dataset_publishable(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]],
+) -> bool:
+    for resource_type in candidate.selected_resources:
+        diagnostic = diagnostics.get(resource_type)
+        if (
+            not diagnostic
+            or diagnostic.get("complete") is not True
+            or diagnostic.get("error")
+            or diagnostic.get("bounded")
+            or diagnostic.get("next_url_remaining")
+        ):
+            return False
+    return True
+
+
+async def _mark_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+    status: str,
+    diagnostics: dict[str, dict[str, Any]],
+    *,
+    error: str | None = None,
+) -> None:
+    metadata = _endpoint_dataset_publication_metadata(
+        candidate,
+        diagnostics,
+        **({"error": error} if error else {}),
+    )
+    await db.status(
+        f"""
+        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+           SET status = :status,
+               resource_count = (
+                    SELECT count(*)
+                      FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+                     WHERE resource.dataset_id = dataset.dataset_id
+               ),
+               publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
+         WHERE dataset.dataset_id = :dataset_id
+           AND dataset.endpoint_id = :endpoint_id
+           AND dataset.is_current = false;
+        """,
+        status=status,
+        publication_metadata_json=json.dumps(metadata, sort_keys=True, default=_json_default),
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+
+
+def _endpoint_dataset_hash_identity(resource_row: Any) -> tuple[str, str, str]:
+    resource_map = _pagination_checkpoint_row_mapping(resource_row)
+    return (
+        _clean_text(resource_map.get("resource_type")) or "",
+        _clean_text(resource_map.get("resource_id")) or "",
+        _clean_text(resource_map.get("payload_hash")) or "",
+    )
+
+
+def _endpoint_dataset_hash_page_sql(has_cursor: bool) -> str:
+    cursor_filter = ""
+    if has_cursor:
+        cursor_filter = """
+           AND (
+                resource_type > :after_resource_type
+                OR (
+                    resource_type = :after_resource_type
+                    AND resource_id > :after_resource_id
+                )
+           )
+        """
+    return f"""
+        SELECT resource_type, resource_id, payload_hash
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           {cursor_filter}
+         ORDER BY resource_type, resource_id
+         LIMIT :batch_size;
+    """
+
+
+async def _endpoint_dataset_content_hash(
+    connection: Any,
+    dataset_id: str,
+) -> tuple[str, int]:
+    """Hash an ordered dataset using bounded keyset pages."""
+    content_hash = hashlib.sha256()
+    resource_count = 0
+    after_resource_type: str | None = None
+    after_resource_id: str | None = None
+    batch_size = max(1, ENDPOINT_DATASET_HASH_BATCH_SIZE)
+    while True:
+        query_params_by_name: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "batch_size": batch_size,
+        }
+        has_cursor = after_resource_type is not None
+        if has_cursor:
+            query_params_by_name.update(
+                after_resource_type=after_resource_type,
+                after_resource_id=after_resource_id,
+            )
+        resource_rows = await connection.all(
+            _endpoint_dataset_hash_page_sql(has_cursor),
+            **query_params_by_name,
+        )
+        if not resource_rows:
+            break
+        for resource_row in resource_rows:
+            if resource_count:
+                content_hash.update(b"\n")
+            identity = _endpoint_dataset_hash_identity(resource_row)
+            content_hash.update(_stable_identity_json(identity).encode("utf-8"))
+            resource_count += 1
+        after_resource_type, after_resource_id, _payload_hash = (
+            _endpoint_dataset_hash_identity(resource_rows[-1])
+        )
+        if len(resource_rows) < batch_size:
+            break
+    return content_hash.hexdigest(), resource_count
+
+
+async def _lock_endpoint_dataset_for_promotion(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> str | None:
+    endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
+    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    endpoint_record = await connection.first(
+        f"SELECT endpoint_id FROM {endpoint_ref} WHERE endpoint_id = :endpoint_id FOR UPDATE;",
+        endpoint_id=candidate.endpoint_id,
+    )
+    if endpoint_record is None:
+        raise RuntimeError("provider_directory_api_endpoint_missing_during_promotion")
+    candidate_record = await connection.first(
+        f"""
+        SELECT dataset_id, is_current, status, previous_dataset_id
+          FROM {dataset_ref}
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+         FOR UPDATE;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+    if candidate_record is None:
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_missing")
+    current_dataset_record = await connection.first(
+        f"""
+        SELECT dataset_id
+          FROM {dataset_ref}
+         WHERE endpoint_id = :endpoint_id
+           AND is_current = true
+           AND dataset_id <> :dataset_id
+         FOR UPDATE;
+        """,
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=candidate.dataset_id,
+    )
+    current_dataset_map = _pagination_checkpoint_row_mapping(
+        current_dataset_record
+    )
+    return _clean_text(current_dataset_map.get("dataset_id"))
+
+
+async def _supersede_endpoint_dataset(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    previous_dataset_id: str | None,
+) -> None:
+    if not previous_dataset_id:
+        return
+    await connection.status(
+        f"""
+        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+           SET status = :status,
+               is_current = false,
+               superseded_at = now()
+         WHERE dataset_id = :previous_dataset_id
+           AND endpoint_id = :endpoint_id
+           AND is_current = true;
+        """,
+        status=ENDPOINT_DATASET_SUPERSEDED,
+        previous_dataset_id=previous_dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+
+
+async def _publish_endpoint_dataset(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    previous_dataset_id: str | None,
+    dataset_hash: str,
+    resource_count: int,
+    metadata: dict[str, Any],
+) -> None:
+    promoted_count = await connection.status(
+        f"""
+        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+           SET previous_dataset_id = :previous_dataset_id,
+               dataset_hash = :dataset_hash,
+               status = :status,
+               is_current = true,
+               resource_count = :resource_count,
+               validated_at = now(),
+               published_at = now(),
+               superseded_at = NULL,
+               publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id;
+        """,
+        previous_dataset_id=previous_dataset_id,
+        dataset_hash=dataset_hash,
+        status=ENDPOINT_DATASET_PUBLISHED,
+        resource_count=resource_count,
+        publication_metadata_json=json.dumps(
+            metadata,
+            sort_keys=True,
+            default=_json_default,
+        ),
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+    if _coerce_rowcount(promoted_count) <= 0:
+        raise RuntimeError("provider_directory_endpoint_dataset_promotion_lost")
+
+
+async def _promote_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    async with db.acquire() as connection:
+        await connection.status(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
+        )
+        current_dataset_id = await _lock_endpoint_dataset_for_promotion(
+            connection,
+            candidate,
+        )
+        previous_dataset_id = current_dataset_id or candidate.previous_dataset_id
+        dataset_hash, resource_count = await _endpoint_dataset_content_hash(
+            connection,
+            candidate.dataset_id,
+        )
+        metadata = _endpoint_dataset_publication_metadata(
+            candidate,
+            diagnostics,
+            dataset_hash=dataset_hash,
+            resource_count=resource_count,
+        )
+        await _supersede_endpoint_dataset(
+            connection,
+            candidate,
+            current_dataset_id,
+        )
+        await _publish_endpoint_dataset(
+            connection,
+            candidate,
+            previous_dataset_id,
+            dataset_hash,
+            resource_count,
+            metadata,
+        )
+    return {
+        "dataset_id": candidate.dataset_id,
+        "previous_dataset_id": previous_dataset_id,
+        "dataset_hash": dataset_hash,
+        "resource_count": resource_count,
+    }
+
+
+async def _finalize_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate | None,
+    diagnostics: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    if _is_endpoint_dataset_publishable(candidate, diagnostics):
+        return await _promote_endpoint_dataset_candidate(candidate, diagnostics)
+    status = (
+        ENDPOINT_DATASET_FAILED
+        if any(diagnostic.get("error") for diagnostic in diagnostics.values())
+        else ENDPOINT_DATASET_INCOMPLETE
+    )
+    await _mark_endpoint_dataset_candidate(candidate, status, diagnostics)
+    return {
+        "dataset_id": candidate.dataset_id,
+        "status": status,
+        "published": False,
+    }
+
+
+async def _prepare_resource_import_source_group(
+    source_records: list[dict[str, Any]],
+    resources: list[str],
+    *,
+    run_id: str | None,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+    is_checkpointing_enabled: bool,
+) -> tuple[list[dict[str, Any]], EndpointDatasetCandidate | None]:
+    source_id_values = sorted(
+        source_record["source_id"] for source_record in source_records
+    )
+    checkpoint_source_record = _scoped_partition_source_record(
+        source_records,
+        source_id_values,
+    )
+    checkpoint_context = (
+        _pagination_checkpoint_context(
+            checkpoint_source_record,
+            source_id_values,
+            run_id=run_id,
+            retry_of_run_id=retry_of_run_id,
+        )
+        if is_checkpointing_enabled
+        else None
+    )
+    dataset_resources = _endpoint_dataset_selected_resources(
+        source_records,
+        resources,
+    )
+    candidate = await _prepare_endpoint_dataset_candidate(
+        source_records,
+        dataset_resources,
+        run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+        pagination_root_run_id=pagination_root_run_id,
+        checkpoint_context=checkpoint_context,
+    )
+    prepared_source_records = [dict(source_record) for source_record in source_records]
+    checkpoint_owner_run_id = pagination_root_run_id or retry_of_run_id or run_id
+    if candidate is not None:
+        checkpoint_context = candidate.checkpoint_context
+    for source_record in prepared_source_records:
+        if candidate is not None:
+            source_record["_endpoint_dataset_id"] = candidate.dataset_id
+        if checkpoint_context is not None:
+            source_record["_pagination_checkpoint_context"] = checkpoint_context
+        if checkpoint_owner_run_id:
+            source_record["_partition_checkpoint_owner_run_id"] = (
+                checkpoint_owner_run_id
+            )
+    return prepared_source_records, candidate
+
+
+ResourceImportGroupResult = tuple[
+    list[str],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+    dict[str, list[str]],
+]
+
+
+async def _mark_failed_endpoint_dataset_without_masking(
+    candidate: EndpointDatasetCandidate | None,
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    failure: BaseException,
+) -> None:
+    if candidate is None:
+        return
+    try:
+        await _mark_endpoint_dataset_candidate(
+            candidate,
+            ENDPOINT_DATASET_FAILED,
+            diagnostics_by_resource,
+            error=_short_error(failure),
+        )
+    except Exception:
+        LOGGER.exception(
+            "Failed to mark Provider Directory endpoint dataset %s failed",
+            candidate.dataset_id,
+        )
+
+
 async def _import_resources(
     sources: list[dict[str, Any]],
     *,
@@ -12634,6 +13651,7 @@ async def _import_resources(
     preserve_seen_stage: bool = False,
     is_pagination_checkpointing_enabled: bool = False,
     retry_of_run_id: str | None = None,
+    pagination_root_run_id: str | None = None,
     pagination_resume_required: set[str] | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
@@ -12719,27 +13737,12 @@ async def _import_resources(
 
     async def import_one_group(
         source_group: list[dict[str, Any]],
-    ) -> tuple[
-        list[str],
-        dict[str, dict[str, Any]],
-        dict[str, int],
-        dict[str, int],
-        dict[str, dict[str, Any]],
-        dict[str, int],
-        dict[str, list[str]],
-    ]:
+    ) -> ResourceImportGroupResult:
         if cancel_ctx is not None:
             await raise_if_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
-        source_ids = [item["source_id"] for item in source_group]
+        source_ids = sorted(item["source_id"] for item in source_group)
         source = _scoped_partition_source_record(source_group, source_ids)
-        if is_pagination_checkpointing_enabled:
-            source["_pagination_checkpoint_context"] = _pagination_checkpoint_context(
-                source,
-                source_ids,
-                run_id=run_id,
-                retry_of_run_id=retry_of_run_id,
-            )
         async with progress_lock:
             active_group_details[group_key] = {
                 "source_ids": source_ids[:10],
@@ -12769,17 +13772,18 @@ async def _import_resources(
             if not stale_cleanup or not _is_resource_fetch_complete_for_publish(result):
                 return
             if seen_stage_table:
-                source_stale_ready_source_ids[resource_type] = list(source_ids)
+                source_stale_ready_source_ids[resource_type] = [source["source_id"]]
                 return
-            for source_id in source_ids:
-                stale_deleted = await _delete_stale_resource_rows(
-                    result.model,
-                    source_id,
-                    run_id,
-                    use_seen_table=True,
+            stale_deleted = await _delete_stale_resource_rows(
+                result.model,
+                source["source_id"],
+                run_id,
+                use_seen_table=True,
+            )
+            if stale_deleted:
+                source_stale_counts[resource_type] = (
+                    source_stale_counts.get(resource_type, 0) + stale_deleted
                 )
-                if stale_deleted:
-                    source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
 
         def should_retry_zero_practitioner_role(result: ResourceFetchResult | None) -> bool:
             return (
@@ -12812,6 +13816,7 @@ async def _import_resources(
                     seen_table=seen_stage_table,
                     checkpoint_context=source.get("_pagination_checkpoint_context"),
                     resume_required_entries=pagination_resume_required,
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 ),
             )
         for resource_type in resources:
@@ -12839,12 +13844,16 @@ async def _import_resources(
                     )
                 written = await _upsert_resource_rows(
                     model,
-                    _copy_rows_for_source_ids(rows, source_ids),
+                    _rows_for_compatibility_source(
+                        rows,
+                        source["source_id"],
+                    ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                     canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=source_ids,
+                    source_ids=[source["source_id"]],
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, resource_type, written)
                 return written
@@ -12856,7 +13865,7 @@ async def _import_resources(
             ):
                 await _mark_postal_checkpointed_roles_seen(
                     source,
-                    source_ids,
+                    [source["source_id"]],
                     run_id,
                     seen_stage_table,
                 )
@@ -12890,8 +13899,7 @@ async def _import_resources(
                 page_count,
                 result,
             )
-            for _source_id in source_ids:
-                _record_resource_fetch_stats(source_resource_stats, resource_type, result)
+            _record_resource_fetch_stats(source_resource_stats, resource_type, result)
             _record_resource_completion(resource_completion, resource_type, source_ids, result)
             if result.rows or resource_type not in rows_by_resource:
                 rows_by_resource[resource_type] = result.rows
@@ -12900,18 +13908,22 @@ async def _import_resources(
                 if use_streaming
                 else await _upsert_resource_rows(
                     result.model,
-                    _copy_rows_for_source_ids(result.rows, source_ids),
+                    _rows_for_compatibility_source(
+                        result.rows,
+                        source["source_id"],
+                    ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                     canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=source_ids,
+                    source_ids=[source["source_id"]],
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 )
             )
             source_counts[resource_type] += written_total
             source_resource_diagnostics[resource_type] = _resource_fetch_diagnostic(
                 result,
-                rows_written_per_source=written_total // max(1, len(source_ids)),
+                rows_written=written_total,
             )
             if (
                 resource_type == "PractitionerRole"
@@ -12936,12 +13948,16 @@ async def _import_resources(
             async def retry_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
                 written = await _upsert_resource_rows(
                     model,
-                    _copy_rows_for_source_ids(rows, source_ids),
+                    _rows_for_compatibility_source(
+                        rows,
+                        source["source_id"],
+                    ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                     canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=source_ids,
+                    source_ids=[source["source_id"]],
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
@@ -12972,8 +13988,11 @@ async def _import_resources(
                 retry_written_total = 0
             else:
                 retry_result = replace(retry_result, fetch_mode=f"{retry_result.fetch_mode}_retry")
-                for _source_id in source_ids:
-                    _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", retry_result)
+                _record_resource_fetch_stats(
+                    source_resource_stats,
+                    "PractitionerRole",
+                    retry_result,
+                )
                 _record_resource_completion(
                     resource_completion,
                     "PractitionerRole",
@@ -12987,12 +14006,16 @@ async def _import_resources(
                     if use_streaming
                     else await _upsert_resource_rows(
                         retry_result.model,
-                        _copy_rows_for_source_ids(retry_result.rows, source_ids),
+                        _rows_for_compatibility_source(
+                            retry_result.rows,
+                            source["source_id"],
+                        ),
                         run_id=run_id,
                         track_seen=stale_cleanup,
                         seen_table=seen_stage_table,
                         canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                        source_ids=source_ids,
+                        source_ids=[source["source_id"]],
+                        dataset_id=source.get("_endpoint_dataset_id"),
                     )
                 )
                 source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + retry_written_total
@@ -13010,7 +14033,7 @@ async def _import_resources(
                     )
             retry_diagnostic = _resource_fetch_diagnostic(
                 retry_result,
-                rows_written_per_source=retry_written_total // max(1, len(source_ids)),
+                rows_written=retry_written_total,
             )
             retry_diagnostic["retry_of_zero_rows"] = True
             retry_diagnostic["retry_reason"] = PRACTITIONER_ROLE_ZERO_RETRY_REASON
@@ -13041,15 +14064,19 @@ async def _import_resources(
                     rows_by_resource.pop(seed_resource_type, None)
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
-                """Write streamed SCAN PractitionerRole rows for each mirrored source."""
+                """Write streamed SCAN PractitionerRole rows for the compatibility owner."""
                 written = await _upsert_resource_rows(
                     model,
-                    _copy_rows_for_source_ids(rows, source_ids),
+                    _rows_for_compatibility_source(
+                        rows,
+                        source["source_id"],
+                    ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                     canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=source_ids,
+                    source_ids=[source["source_id"]],
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 )
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
@@ -13071,33 +14098,48 @@ async def _import_resources(
                     deadline_seconds=linked_resource_deadline_seconds,
                     source=source,
                     seed_stage_table=scan_seed_stage_table,
-                    seed_source_ids=tuple(source_ids) if scan_seed_stage_table else (),
-                    existing_seed_source_ids=tuple(source_ids) if not scan_seed_stage_table else (),
+                    seed_source_ids=(
+                        (source["source_id"],)
+                        if scan_seed_stage_table
+                        else ()
+                    ),
+                    existing_seed_source_ids=(
+                        (source["source_id"],)
+                        if not scan_seed_stage_table
+                        else ()
+                    ),
                     resume_completed_seeds=per_resource_limit <= 0 and page_limit <= 0,
                     seen_table=seen_stage_table,
                 ),
             )
-            for _source_id in source_ids:
-                _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", result)
+            _record_resource_fetch_stats(
+                source_resource_stats,
+                "PractitionerRole",
+                result,
+            )
             _record_resource_completion(resource_completion, "PractitionerRole", source_ids, result)
             written_total = (
                 result.rows_written
                 if use_streaming
                 else await _upsert_resource_rows(
                     result.model,
-                    _copy_rows_for_source_ids(result.rows, source_ids),
+                    _rows_for_compatibility_source(
+                        result.rows,
+                        source["source_id"],
+                    ),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                     canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
-                    source_ids=source_ids,
+                    source_ids=[source["source_id"]],
+                    dataset_id=source.get("_endpoint_dataset_id"),
                 )
             )
             source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + written_total
             rows_by_resource["PractitionerRole"] = result.rows
             source_resource_diagnostics["PractitionerRole"] = _resource_fetch_diagnostic(
                 result,
-                rows_written_per_source=written_total // max(1, len(source_ids)),
+                rows_written=written_total,
             )
             await mark_resource_stale_cleanup_ready("PractitionerRole", result)
         if linked_resource_limit > 0 and rows_by_resource:
@@ -13117,11 +14159,12 @@ async def _import_resources(
                 concurrency=linked_resource_concurrency,
                 timeout=timeout,
                 run_id=run_id,
-                source_ids=source_ids,
+                source_ids=[source["source_id"]],
                 track_seen=stale_cleanup,
                 seen_table=seen_stage_table,
                 progress_callback=linked_progress,
                 deadline_seconds=linked_resource_deadline_seconds,
+                dataset_id=source.get("_endpoint_dataset_id"),
             )
         await _finalize_source_pagination_checkpoints(
             source,
@@ -13146,21 +14189,41 @@ async def _import_resources(
     stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
 
     async def run_with_limit(
-        source_group: list[dict[str, Any]],
-    ) -> tuple[
-        list[str],
-        dict[str, dict[str, Any]],
-        dict[str, int],
-        dict[str, int],
-        dict[str, dict[str, Any]],
-        dict[str, int],
-        dict[str, list[str]],
-    ]:
+        source_records: list[dict[str, Any]],
+    ) -> ResourceImportGroupResult:
         async with semaphore:
+            candidate: EndpointDatasetCandidate | None = None
+            diagnostics_by_resource: dict[str, dict[str, Any]] = {}
+            prepared_source_records = source_records
             try:
-                return await import_one_group(source_group)
+                prepared_source_records, candidate = (
+                    await _prepare_resource_import_source_group(
+                        source_records,
+                        resources,
+                        run_id=run_id,
+                        retry_of_run_id=retry_of_run_id,
+                        pagination_root_run_id=pagination_root_run_id,
+                        is_checkpointing_enabled=(
+                            is_pagination_checkpointing_enabled
+                        ),
+                    )
+                )
+                import_summary = await import_one_group(prepared_source_records)
+                diagnostics_by_resource = import_summary[1]
+                await _finalize_endpoint_dataset_candidate(
+                    candidate,
+                    diagnostics_by_resource,
+                )
+                return import_summary
+            except BaseException as failure:
+                await _mark_failed_endpoint_dataset_without_masking(
+                    candidate,
+                    diagnostics_by_resource,
+                    failure,
+                )
+                raise
             finally:
-                await clear_partial_progress(id(source_group))
+                await clear_partial_progress(id(prepared_source_records))
 
     tasks: list[asyncio.Task] = []
     try:
@@ -13234,6 +14297,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
 
     run_id = _clean_text(task.get("run_id")) or _clean_text(ctx.get("control_run_id"))
     retry_of_run_id = _clean_text(task.get("retry_of_run_id"))
+    pagination_root_run_id = _clean_text(
+        task.get("provider_directory_pagination_root_run_id")
+    )
     requested_source_ids = _clean_source_id_list(
         task.get("source_ids")
         or task.get("source_id")
@@ -13409,7 +14475,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
-        await _upsert_rows(ProviderDirectorySource, source_rows)
+        endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
         stale_source_rows_deleted = {}
         if _source_catalog_stale_cleanup_enabled(
             stale_cleanup=stale_cleanup,
@@ -13424,6 +14490,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             )
         metrics: dict[str, Any] = {
             "sources_seeded": len(source_rows),
+            "api_endpoints_seeded": endpoint_rows_seeded,
             "source_ids": requested_source_ids,
             "supplemental_retest_sources_considered": len(supplemental_retest_seed_rows),
             "supplemental_catalog_sources_considered": len(supplemental_catalog_seed_rows),
@@ -13448,6 +14515,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "publish_corroboration": publish_corroboration,
             "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
             "retry_of_run_id": retry_of_run_id,
+            "provider_directory_pagination_root_run_id": pagination_root_run_id,
             "credential_config_file_configured": bool(credential_config_file),
         }
         await _mark_provider_directory_progress(
@@ -13554,6 +14622,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 preserve_seen_stage=bool(seen_stage_table_for_publish),
                 is_pagination_checkpointing_enabled=is_pagination_checkpointing_enabled,
                 retry_of_run_id=retry_of_run_id,
+                pagination_root_run_id=pagination_root_run_id,
                 pagination_resume_required=pagination_resume_required_entries,
             )
             if pagination_resume_required_entries:
@@ -13685,6 +14754,7 @@ async def main(
     retest_results_path: str | None = None,
     retest_results_url: str | None = None,
     run_id: str | None = None,
+    provider_directory_pagination_root_run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | str | None = None,
     limit: int | None = None,
     source_query: str | None = None,
@@ -13728,6 +14798,9 @@ async def main(
         "retest_results_path": retest_results_path,
         "retest_results_url": retest_results_url,
         "run_id": run_id,
+        "provider_directory_pagination_root_run_id": (
+            provider_directory_pagination_root_run_id
+        ),
         "source_ids": source_ids,
         "limit": limit,
         "source_query": source_query,
