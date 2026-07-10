@@ -9,8 +9,11 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const MAX_STDERR_BYTES: usize = 16 * 1024;
+const SPAWN_BUSY_RETRIES: usize = 10;
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RapidgzipConfig {
@@ -194,6 +197,42 @@ fn stop_spawned_child(mut child: Child) {
     let _ = child.wait();
 }
 
+fn spawn_rapidgzip(path: &Path, config: &RapidgzipConfig) -> io::Result<Child> {
+    let mut command = Command::new(&config.executable);
+    command
+        .arg("-d")
+        .arg("-c")
+        .arg("-P")
+        .arg(config.decoder_threads.to_string())
+        .arg("--verify")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for retry_no in 0..=SPAWN_BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && retry_no < SPAWN_BUSY_RETRIES =>
+            {
+                thread::sleep(SPAWN_BUSY_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to spawn rapidgzip executable {}: {error}",
+                        config.executable.display()
+                    ),
+                ));
+            }
+        }
+    }
+    unreachable!("rapidgzip spawn retry loop always returns")
+}
+
 fn open_rapidgzip_reader(
     path: &Path,
     compressed_bytes_read: Arc<AtomicU64>,
@@ -207,26 +246,7 @@ fn open_rapidgzip_reader(
     }
 
     let compressed_total = path.metadata()?.len();
-    let mut child = Command::new(&config.executable)
-        .arg("-d")
-        .arg("-c")
-        .arg("-P")
-        .arg(config.decoder_threads.to_string())
-        .arg("--verify")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to spawn rapidgzip executable {}: {error}",
-                    config.executable.display()
-                ),
-            )
-        })?;
+    let mut child = spawn_rapidgzip(path, config)?;
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {

@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_path(suffix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -277,6 +277,44 @@ fn full_scan_reader_only_uses_rapidgzip_for_gzip_inputs() {
 
     assert_eq!(output, "plain input");
     assert!(!invoked_path.exists());
+    std::fs::remove_file(input_path).ok();
+    std::fs::remove_file(executable_path).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn full_scan_reader_retries_an_executable_that_is_temporarily_busy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let input_path = temp_path("busy.json.gz");
+    let executable_path = temp_path("busy.sh");
+    write_gzip(&input_path, b"unused");
+    let mut executable_file = File::create(&executable_path).expect("create busy executable");
+    executable_file
+        .write_all(b"#!/bin/sh\nprintf busy-retry-ok\n")
+        .expect("write busy executable");
+    let mut permissions = executable_file
+        .metadata()
+        .expect("stat busy executable")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&executable_path, permissions).expect("make busy executable runnable");
+    let release_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        drop(executable_file);
+    });
+
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let config = enabled_rapidgzip(&executable_path, 1);
+    let mut reader =
+        open_full_scan_reader(&input_path, bytes_read, &config).expect("retry busy executable");
+    let mut output = String::new();
+    reader
+        .read_to_string(&mut output)
+        .expect("read retried output");
+    release_thread.join().expect("release busy executable");
+
+    assert_eq!(output, "busy-retry-ok");
     std::fs::remove_file(input_path).ok();
     std::fs::remove_file(executable_path).ok();
 }
