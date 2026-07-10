@@ -12,7 +12,7 @@ import io
 import json
 import importlib
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from click.testing import CliRunner
@@ -10933,6 +10933,7 @@ def _cigna_checkpoint_context(
     *,
     root_run_id: str | None = None,
     is_lineage_verified: bool | None = None,
+    dataset_id: str | None = None,
 ):
     if root_run_id is None:
         root_run_id = retry_of_run_id or owner_run_id
@@ -10945,6 +10946,7 @@ def _cigna_checkpoint_context(
         owner_run_id=owner_run_id,
         retry_of_run_id=retry_of_run_id,
         acquisition_root_run_id=root_run_id,
+        dataset_id=dataset_id,
         lineage_verified=is_lineage_verified,
     )
 
@@ -10997,6 +10999,33 @@ def _checkpoint_page_callbacks(
     return load_checkpoint, fetch_source_json
 
 
+def _stub_checkpoint_restart_connection(monkeypatch, *status_results):
+    connection = AsyncMock()
+    connection.status = AsyncMock(side_effect=status_results)
+
+    @contextlib.asynccontextmanager
+    async def acquire_connection():
+        yield connection
+
+    monkeypatch.setattr(importer.db, "acquire", acquire_connection)
+    return connection
+
+
+def _checkpoint_complete_fetch_result(model, rows_written: int):
+    return importer.ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=rows_written,
+        rows_written=rows_written,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+
 def test_pagination_checkpoint_mode_requires_acquisition_only():
     enabled_options_by_name = {
         "run_id": "run_1",
@@ -11023,6 +11052,60 @@ def test_pagination_checkpoint_mode_requires_acquisition_only():
     ):
         options_by_name = {**enabled_options_by_name, option_name: disabled_value}
         assert importer._is_pagination_checkpoint_mode_enabled(**options_by_name) is False
+
+
+def test_pagination_guard_serializes_same_endpoint_across_roots():
+    first_context = _cigna_checkpoint_context("run_first")
+    second_context = _cigna_checkpoint_context("run_second")
+
+    assert importer._pagination_checkpoint_guard_key(first_context) == (
+        importer._pagination_checkpoint_guard_key(second_context)
+    )
+
+
+@pytest.mark.asyncio
+async def test_pagination_guard_uses_dedicated_connection(monkeypatch):
+    guard_connection = AsyncMock()
+    open_connection = AsyncMock(return_value=guard_connection)
+    monkeypatch.setattr(
+        importer,
+        "_open_pagination_checkpoint_guard_connection",
+        open_connection,
+    )
+
+    async with importer._pagination_checkpoint_worker_guard(
+        _cigna_checkpoint_context("run_1")
+    ):
+        assert guard_connection.fetchval.await_count == 1
+
+    open_connection.assert_awaited_once_with()
+    assert guard_connection.fetchval.await_count == 2
+    assert "pg_advisory_lock" in guard_connection.fetchval.await_args_list[0].args[0]
+    assert "pg_advisory_unlock" in guard_connection.fetchval.await_args_list[1].args[0]
+    guard_connection.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_pagination_guard_terminates_connection_when_lock_wait_is_cancelled(
+    monkeypatch,
+):
+    guard_connection = AsyncMock()
+    guard_connection.fetchval.side_effect = asyncio.CancelledError
+    guard_connection.terminate = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_open_pagination_checkpoint_guard_connection",
+        AsyncMock(return_value=guard_connection),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with importer._pagination_checkpoint_worker_guard(
+            _cigna_checkpoint_context("run_1")
+        ):
+            raise AssertionError("guard must not yield after cancellation")
+
+    guard_connection.terminate.assert_called_once_with()
+    guard_connection.close.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -11055,6 +11138,299 @@ async def test_pagination_checkpoint_retry_adopts_direct_predecessor(monkeypatch
     assert resume_state.rows_processed == 500
     assert "UPDATE" in status_mock.await_args.args[0]
     assert status_mock.await_args.kwargs["previous_owner_run_id"] == "run_original"
+
+
+@pytest.mark.asyncio
+async def test_completed_checkpoint_survives_page_size_change(monkeypatch):
+    old_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=75"
+    new_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_older_retry",
+        "start_url_hash": hashlib.sha256(old_start_url.encode("utf-8")).hexdigest(),
+        "next_url": None,
+        "state": importer.PAGINATION_CHECKPOINT_COMPLETE,
+        "pages_processed": 7,
+        "rows_processed": 541,
+        "recent_cursor_hashes": ["prior_hash"],
+    }
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    resume_state = await importer._load_or_initialize_pagination_checkpoint(
+        _cigna_checkpoint_context(
+            "run_current_retry",
+            "run_direct_parent",
+            root_run_id="run_original",
+            dataset_id="dataset_a",
+        ),
+        "Practitioner",
+        new_start_url,
+    )
+
+    assert resume_state.complete is True
+    assert resume_state.pages_processed == 7
+    assert resume_state.rows_processed == 541
+    assert status_mock.await_args.kwargs["previous_owner_run_id"] == "run_older_retry"
+
+
+@pytest.mark.asyncio
+async def test_empty_checkpoint_restarts_after_page_size_change(monkeypatch):
+    old_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=75"
+    new_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_older_retry",
+        "start_url_hash": hashlib.sha256(old_start_url.encode("utf-8")).hexdigest(),
+        "next_url": old_start_url,
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 0,
+        "rows_processed": 0,
+        "recent_cursor_hashes": [],
+    }
+    status_mock = AsyncMock(return_value=1)
+    first_mock = AsyncMock(return_value=checkpoint_by_name)
+    restart_connection = _stub_checkpoint_restart_connection(monkeypatch, 1, 0)
+    monkeypatch.setattr(importer.db, "first", first_mock)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    resume_state = await importer._load_or_initialize_pagination_checkpoint(
+        _cigna_checkpoint_context(
+            "run_current_retry",
+            "run_direct_parent",
+            root_run_id="run_original",
+            dataset_id="dataset_a",
+        ),
+        "Location",
+        new_start_url,
+    )
+
+    assert resume_state.resumed is False
+    assert resume_state.next_url == new_start_url
+    restart_call = restart_connection.status.await_args_list[0]
+    assert restart_call.kwargs["start_url_hash"] == hashlib.sha256(
+        new_start_url.encode("utf-8")
+    ).hexdigest()
+    cleanup_call = restart_connection.status.await_args_list[1]
+    assert "UPDATE" in restart_call.args[0]
+    assert "DELETE FROM" in cleanup_call.args[0]
+    status_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_checkpoint_restart_rejects_concurrent_progress(monkeypatch):
+    old_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=75"
+    new_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_direct_parent",
+        "start_url_hash": hashlib.sha256(old_start_url.encode("utf-8")).hexdigest(),
+        "next_url": old_start_url,
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 0,
+        "rows_processed": 0,
+        "recent_cursor_hashes": [],
+    }
+    first_mock = AsyncMock(return_value=checkpoint_by_name)
+    restart_connection = _stub_checkpoint_restart_connection(monkeypatch, 0)
+    monkeypatch.setattr(importer.db, "first", first_mock)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_pagination_checkpoint_ownership_lost",
+    ):
+        await importer._load_or_initialize_pagination_checkpoint(
+            _cigna_checkpoint_context(
+                "run_current_retry",
+                "run_direct_parent",
+                root_run_id="run_original",
+                dataset_id="dataset_a",
+            ),
+            "Location",
+            new_start_url,
+        )
+
+    restart_sql = restart_connection.status.await_args.args[0]
+    assert "pages_processed = 0" in restart_sql
+    assert "rows_processed = 0" in restart_sql
+    assert "owner_run_id = :observed_owner_run_id" in restart_sql
+    assert restart_connection.status.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_adoption_rejects_concurrent_cursor_change(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_direct_parent",
+        "start_url_hash": hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+        "next_url": start_url + "&_getpages=resume",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 5,
+        "rows_processed": 500,
+        "recent_cursor_hashes": ["prior_hash"],
+    }
+    status_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_pagination_checkpoint_ownership_lost",
+    ):
+        await importer._load_or_initialize_pagination_checkpoint(
+            _cigna_checkpoint_context(
+                "run_current_retry",
+                "run_direct_parent",
+                root_run_id="run_original",
+                dataset_id="dataset_a",
+            ),
+            "Practitioner",
+            start_url,
+        )
+
+    adoption_sql = status_mock.await_args.args[0]
+    assert "next_url IS NOT DISTINCT FROM :observed_next_url" in adoption_sql
+    assert "pages_processed = :observed_pages_processed" in adoption_sql
+    assert "rows_processed = :observed_rows_processed" in adoption_sql
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_worker_guard_covers_group_writes(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+    source_record = _cigna_checkpoint_source()
+    checkpoint_context = _cigna_checkpoint_context("run_1")
+    events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_guard(context):
+        assert context.owner_run_id == "run_1"
+        events.append("guard_enter")
+        yield
+        events.append("guard_exit")
+
+    async def fake_prepare(source_records, *_args, **_kwargs):
+        prepared_source_lookup = dict(source_records[0])
+        prepared_source_lookup["_pagination_checkpoint_context"] = checkpoint_context
+        return [prepared_source_lookup], None
+
+    async def fake_fetch(source_record, _resource_type, **kwargs):
+        events.append("fetch")
+        written = await kwargs["row_batch_handler"](
+            ProviderDirectoryLocation,
+            [{"source_id": source_record["source_id"], "resource_id": "loc-1"}],
+        )
+        return _checkpoint_complete_fetch_result(
+            ProviderDirectoryLocation,
+            written,
+        )
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        events.append("write")
+        return len(rows)
+
+    async def fake_finalize(*_args, **_kwargs):
+        events.append("finalize")
+
+    monkeypatch.setattr(importer, "_pagination_checkpoint_worker_guard", fake_guard)
+    monkeypatch.setattr(importer, "_prepare_resource_import_source_group", fake_prepare)
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_finalize_source_pagination_checkpoints", fake_finalize)
+
+    counts = await importer._import_resources(
+        [source_record], resources=["Location"], per_resource_limit=0,
+        page_limit=0, page_count=100, timeout=3, run_id="run_1",
+        stream_batch_size=1, is_pagination_checkpointing_enabled=True,
+    )
+
+    assert counts == {"Location": 1}
+    assert events == ["guard_enter", "fetch", "write", "finalize", "guard_exit"]
+
+
+@pytest.mark.asyncio
+async def test_progressed_checkpoint_rejects_page_size_change(monkeypatch):
+    old_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=75"
+    new_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_direct_parent",
+        "start_url_hash": hashlib.sha256(old_start_url.encode("utf-8")).hexdigest(),
+        "next_url": old_start_url + "&_getpages=resume",
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 1,
+        "rows_processed": 75,
+        "recent_cursor_hashes": ["prior_hash"],
+    }
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_pagination_checkpoint_lineage_conflict",
+    ):
+        await importer._load_or_initialize_pagination_checkpoint(
+            _cigna_checkpoint_context(
+                "run_current_retry",
+                "run_direct_parent",
+                root_run_id="run_original",
+                dataset_id="dataset_a",
+            ),
+            "Location",
+            new_start_url,
+        )
+
+    status_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_older_checkpoint_owner_requires_verified_dataset_lineage(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
+    checkpoint_by_name = {
+        "dataset_id": "dataset_a",
+        "source_ids": ["source_a"],
+        "acquisition_root_run_id": "run_original",
+        "owner_run_id": "run_older_retry",
+        "start_url_hash": hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
+        "next_url": start_url,
+        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
+        "pages_processed": 0,
+        "rows_processed": 0,
+        "recent_cursor_hashes": [],
+    }
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_pagination_checkpoint_lineage_conflict",
+    ):
+        await importer._load_or_initialize_pagination_checkpoint(
+            _cigna_checkpoint_context(
+                "run_current_retry",
+                "run_direct_parent",
+                root_run_id="run_original",
+                is_lineage_verified=False,
+                dataset_id="dataset_a",
+            ),
+            "Location",
+            start_url,
+        )
+
+    status_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

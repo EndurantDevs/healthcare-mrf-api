@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import aiohttp
+import asyncpg
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func, or_, text as sa_text
 from sqlalchemy.dialects import postgresql
@@ -15874,6 +15875,68 @@ def _pagination_checkpoint_context(
     )
 
 
+def _pagination_checkpoint_guard_key(
+    context: PaginationCheckpointContext,
+) -> str:
+    return f"provider-directory-pagination:{context.canonical_api_base}"
+
+
+async def _open_pagination_checkpoint_guard_connection() -> Any:
+    if db.engine is None:
+        await db.connect()
+    assert db.engine is not None
+    guard_dsn = db.engine.url.set(drivername="postgresql").render_as_string(
+        hide_password=False
+    )
+    return await asyncpg.connect(dsn=guard_dsn)
+
+
+@contextlib.asynccontextmanager
+async def _pagination_checkpoint_worker_guard(
+    context: PaginationCheckpointContext | None,
+) -> AsyncIterator[None]:
+    """Serialize all writes and checkpoint changes for one FHIR endpoint."""
+    if context is None:
+        yield
+        return
+    lock_key = _pagination_checkpoint_guard_key(context)
+    guard_connection = await _open_pagination_checkpoint_guard_connection()
+    try:
+        await guard_connection.fetchval(
+            "SELECT pg_advisory_lock(hashtextextended($1, 0));",
+            lock_key,
+        )
+    except asyncio.CancelledError:
+        guard_connection.terminate()
+        raise
+    except Exception as exc:
+        guard_connection.terminate()
+        raise RuntimeError(
+            "provider_directory_pagination_checkpoint_guard_unavailable"
+        ) from exc
+    try:
+        yield
+    finally:
+        try:
+            await guard_connection.fetchval(
+                "SELECT pg_advisory_unlock(hashtextextended($1, 0));",
+                lock_key,
+            )
+        except asyncio.CancelledError:
+            guard_connection.terminate()
+            raise
+        except Exception:
+            guard_connection.terminate()
+        else:
+            try:
+                await guard_connection.close()
+            except asyncio.CancelledError:
+                guard_connection.terminate()
+                raise
+            except Exception:
+                guard_connection.terminate()
+
+
 def _pagination_url_hash(url: str) -> str:
     identity = _pagination_url_identity(url)
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -16408,29 +16471,14 @@ def _compatible_pagination_resume_state(
     context: PaginationCheckpointContext,
     start_url_hash: str,
 ) -> PaginationResumeState | None:
-    existing_source_ids = tuple(sorted(_json_text_list(checkpoint.get("source_ids"))))
-    existing_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
-    existing_root_run_id = _clean_text(
-        checkpoint.get("acquisition_root_run_id")
-    )
-    has_matching_owner = existing_owner_run_id == context.owner_run_id or (
-        context.retry_of_run_id is not None
-        and existing_owner_run_id == context.retry_of_run_id
-    )
-    has_matching_dataset = (
-        context.dataset_id is None
-        or _clean_text(checkpoint.get("dataset_id")) == context.dataset_id
-    )
-    if (
-        not checkpoint
-        or existing_source_ids != context.source_ids
-        or _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
-        or existing_root_run_id != context.acquisition_root_run_id
-        or not has_matching_owner
-        or not has_matching_dataset
-    ):
+    if not _has_matching_pagination_checkpoint_identity(checkpoint, context):
         return None
     is_complete = checkpoint.get("state") == PAGINATION_CHECKPOINT_COMPLETE
+    if (
+        not is_complete
+        and _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
+    ):
+        return None
     next_url = _clean_text(checkpoint.get("next_url"))
     if not is_complete and not next_url:
         return None
@@ -16446,15 +16494,69 @@ def _compatible_pagination_resume_state(
     )
 
 
-async def _adopt_pagination_checkpoint_owner(
+def _has_matching_pagination_checkpoint_identity(
+    checkpoint: dict[str, Any],
     context: PaginationCheckpointContext,
-    resource_type: str,
-    previous_owner_run_id: str,
-) -> None:
-    if context.retry_of_run_id != previous_owner_run_id:
-        raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
-    updated = await db.status(
-        f"""
+) -> bool:
+    existing_source_ids = tuple(sorted(_json_text_list(checkpoint.get("source_ids"))))
+    existing_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+    existing_root_run_id = _clean_text(
+        checkpoint.get("acquisition_root_run_id")
+    )
+    is_direct_owner = existing_owner_run_id == context.owner_run_id or (
+        context.retry_of_run_id is not None
+        and existing_owner_run_id == context.retry_of_run_id
+    )
+    has_verified_ancestor = bool(
+        context.lineage_verified
+        and context.dataset_id
+        and _clean_text(checkpoint.get("dataset_id")) == context.dataset_id
+    )
+    has_matching_dataset = (
+        context.dataset_id is None
+        or _clean_text(checkpoint.get("dataset_id")) == context.dataset_id
+    )
+    return bool(
+        checkpoint
+        and existing_source_ids == context.source_ids
+        and existing_root_run_id == context.acquisition_root_run_id
+        and (is_direct_owner or has_verified_ancestor)
+        and has_matching_dataset
+    )
+
+
+def _can_reset_empty_pagination_checkpoint(
+    checkpoint: dict[str, Any],
+    context: PaginationCheckpointContext,
+) -> bool:
+    return bool(
+        context.lineage_verified
+        and context.dataset_id
+        and _has_matching_pagination_checkpoint_identity(checkpoint, context)
+        and checkpoint.get("state") == PAGINATION_CHECKPOINT_ACTIVE
+        and int(checkpoint.get("pages_processed") or 0) == 0
+        and int(checkpoint.get("rows_processed") or 0) == 0
+    )
+
+
+def _pagination_checkpoint_observation_params(
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "observed_owner_run_id": _clean_text(checkpoint.get("owner_run_id")),
+        "observed_start_url_hash": _clean_text(checkpoint.get("start_url_hash")),
+        "observed_next_url": _clean_text(checkpoint.get("next_url")),
+        "observed_state": _clean_text(checkpoint.get("state")),
+        "observed_pages_processed": int(checkpoint.get("pages_processed") or 0),
+        "observed_rows_processed": int(checkpoint.get("rows_processed") or 0),
+        "observed_cursor_hashes": json.dumps(
+            _json_text_list(checkpoint.get("recent_cursor_hashes"))
+        ),
+    }
+
+
+def _pagination_checkpoint_adoption_sql() -> str:
+    return f"""
         UPDATE {_pagination_checkpoint_table_ref()}
            SET owner_run_id = :owner_run_id,
                retry_of_run_id = :previous_owner_run_id,
@@ -16463,17 +16565,59 @@ async def _adopt_pagination_checkpoint_owner(
            AND resource_type = :resource_type
            AND source_scope_hash = :source_scope_hash
            AND acquisition_root_run_id = :acquisition_root_run_id
-           AND owner_run_id = :previous_owner_run_id;
-        """,
+           AND owner_run_id = :previous_owner_run_id
+           AND source_ids = CAST(:source_ids AS jsonb)
+           AND (
+                CAST(:dataset_id AS varchar) IS NULL
+                OR dataset_id = :dataset_id
+               )
+           AND start_url_hash = :observed_start_url_hash
+           AND next_url IS NOT DISTINCT FROM :observed_next_url
+           AND state = :observed_state
+           AND pages_processed = :observed_pages_processed
+           AND rows_processed = :observed_rows_processed
+           AND recent_cursor_hashes = CAST(:observed_cursor_hashes AS jsonb);
+        """
+
+
+async def _adopt_pagination_checkpoint_owner(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    previous_owner_run_id: str,
+    checkpoint: dict[str, Any],
+    start_url_hash: str,
+) -> PaginationResumeState:
+    """Atomically adopt the exact resume cursor observed by this retry."""
+    is_direct_predecessor = context.retry_of_run_id == previous_owner_run_id
+    is_verified_ancestor = bool(context.lineage_verified and context.dataset_id)
+    if not (is_direct_predecessor or is_verified_ancestor):
+        raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
+    resume_state = _compatible_pagination_resume_state(
+        checkpoint,
+        context,
+        start_url_hash,
+    )
+    if (
+        resume_state is None
+        or _clean_text(checkpoint.get("owner_run_id")) != previous_owner_run_id
+    ):
+        raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
+    observed_checkpoint_params = _pagination_checkpoint_observation_params(checkpoint)
+    updated = await db.status(
+        _pagination_checkpoint_adoption_sql(),
         owner_run_id=context.owner_run_id,
         previous_owner_run_id=previous_owner_run_id,
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
         source_scope_hash=context.source_scope_hash,
         acquisition_root_run_id=context.acquisition_root_run_id,
+        source_ids=json.dumps(context.source_ids),
+        dataset_id=context.dataset_id,
+        **observed_checkpoint_params,
     )
     if _coerce_rowcount(updated) <= 0:
         raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+    return resume_state
 
 
 def _pagination_checkpoint_reset_sql() -> str:
@@ -16524,10 +16668,13 @@ def _pagination_checkpoint_reset_sql() -> str:
 async def _clear_checkpoint_dataset_resource_type(
     context: PaginationCheckpointContext,
     resource_type: str,
+    *,
+    database_connection: Any | None = None,
 ) -> None:
     if not context.dataset_id:
         return
-    await db.status(
+    database_executor = database_connection or db
+    await database_executor.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
          USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
@@ -16564,12 +16711,78 @@ async def _reset_pagination_checkpoint(
     )
 
 
+def _empty_pagination_checkpoint_restart_sql() -> str:
+    return f"""
+        UPDATE {_pagination_checkpoint_table_ref()}
+           SET dataset_id = :dataset_id,
+               source_ids = CAST(:source_ids AS jsonb),
+               owner_run_id = :owner_run_id,
+               retry_of_run_id = :retry_of_run_id,
+               start_url_hash = :start_url_hash,
+               next_url = :next_url,
+               state = :active_state,
+               pages_processed = 0,
+               rows_processed = 0,
+               recent_cursor_hashes = '[]'::jsonb,
+               created_at = now(),
+               updated_at = now(),
+               completed_at = NULL
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND dataset_id = :dataset_id
+           AND source_ids = CAST(:source_ids AS jsonb)
+           AND owner_run_id = :observed_owner_run_id
+           AND start_url_hash = :observed_start_url_hash
+           AND next_url IS NOT DISTINCT FROM :observed_next_url
+           AND state = :active_state
+           AND pages_processed = 0
+           AND rows_processed = 0
+           AND recent_cursor_hashes = CAST(:observed_cursor_hashes AS jsonb);
+        """
+
+
+async def _restart_empty_pagination_checkpoint(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    start_url: str,
+    start_url_hash: str,
+    checkpoint: dict[str, Any],
+) -> None:
+    """Restart an unchanged zero-progress checkpoint and clear it atomically."""
+    observed_checkpoint_params = _pagination_checkpoint_observation_params(checkpoint)
+    async with db.acquire() as connection:
+        restarted_count = await connection.status(
+            _empty_pagination_checkpoint_restart_sql(),
+            canonical_api_base=context.canonical_api_base,
+            resource_type=resource_type,
+            source_scope_hash=context.source_scope_hash,
+            dataset_id=context.dataset_id,
+            source_ids=json.dumps(context.source_ids),
+            acquisition_root_run_id=context.acquisition_root_run_id,
+            owner_run_id=context.owner_run_id,
+            retry_of_run_id=context.retry_of_run_id,
+            start_url_hash=start_url_hash,
+            next_url=start_url,
+            active_state=PAGINATION_CHECKPOINT_ACTIVE,
+            **observed_checkpoint_params,
+        )
+        if _coerce_rowcount(restarted_count) != 1:
+            raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
+        await _clear_checkpoint_dataset_resource_type(
+            context,
+            resource_type,
+            database_connection=connection,
+        )
+
+
 async def _load_or_initialize_pagination_checkpoint(
     context: PaginationCheckpointContext,
     resource_type: str,
     start_url: str,
 ) -> PaginationResumeState:
-    """Load only same-run or direct-retry state; otherwise reset the scan."""
+    """Resume verified lineage and restart only empty incompatible scans."""
     start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
     checkpoint = await _fetch_pagination_checkpoint(context, resource_type)
     resume_state = _compatible_pagination_resume_state(
@@ -16580,12 +16793,28 @@ async def _load_or_initialize_pagination_checkpoint(
     if resume_state:
         previous_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
         if previous_owner_run_id and previous_owner_run_id != context.owner_run_id:
-            await _adopt_pagination_checkpoint_owner(
+            resume_state = await _adopt_pagination_checkpoint_owner(
                 context,
                 resource_type,
                 previous_owner_run_id,
+                checkpoint,
+                start_url_hash,
             )
         return resume_state
+    if checkpoint and _can_reset_empty_pagination_checkpoint(checkpoint, context):
+        await _restart_empty_pagination_checkpoint(
+            context,
+            resource_type,
+            start_url,
+            start_url_hash,
+            checkpoint,
+        )
+        return PaginationResumeState(
+            next_url=start_url,
+            pages_processed=0,
+            rows_processed=0,
+            recent_url_hashes=(),
+        )
     if checkpoint:
         raise RuntimeError("provider_directory_pagination_checkpoint_lineage_conflict")
     if context.retry_of_run_id and not context.lineage_verified:
@@ -17761,20 +17990,12 @@ async def _prepare_resource_import_source_group(
     source_id_values = sorted(
         source_record["source_id"] for source_record in source_records
     )
-    checkpoint_source_record = _scoped_partition_source_record(
+    checkpoint_context = _resource_group_pagination_checkpoint_context(
         source_records,
-        source_id_values,
-    )
-    checkpoint_context = (
-        _pagination_checkpoint_context(
-            checkpoint_source_record,
-            source_id_values,
-            run_id=run_id,
-            retry_of_run_id=retry_of_run_id,
-            pagination_root_run_id=pagination_root_run_id,
-        )
-        if is_checkpointing_enabled
-        else None
+        run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+        pagination_root_run_id=pagination_root_run_id,
+        is_checkpointing_enabled=is_checkpointing_enabled,
     )
     dataset_resources = _endpoint_dataset_selected_resources(
         source_records,
@@ -17802,6 +18023,32 @@ async def _prepare_resource_import_source_group(
                 checkpoint_owner_run_id
             )
     return prepared_source_records, candidate
+
+
+def _resource_group_pagination_checkpoint_context(
+    source_records: list[dict[str, Any]],
+    *,
+    run_id: str | None,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+    is_checkpointing_enabled: bool,
+) -> PaginationCheckpointContext | None:
+    if not is_checkpointing_enabled:
+        return None
+    source_id_values = sorted(
+        source_record["source_id"] for source_record in source_records
+    )
+    checkpoint_source_record = _scoped_partition_source_record(
+        source_records,
+        source_id_values,
+    )
+    return _pagination_checkpoint_context(
+        checkpoint_source_record,
+        source_id_values,
+        run_id=run_id,
+        retry_of_run_id=retry_of_run_id,
+        pagination_root_run_id=pagination_root_run_id,
+    )
 
 
 ResourceImportGroupResult = tuple[
@@ -18423,33 +18670,50 @@ async def _import_resources(
             candidate: EndpointDatasetCandidate | None = None
             diagnostics_by_resource: dict[str, dict[str, Any]] = {}
             prepared_source_records = source_records
+            checkpoint_guard_context = (
+                _resource_group_pagination_checkpoint_context(
+                    source_records,
+                    run_id=run_id,
+                    retry_of_run_id=retry_of_run_id,
+                    pagination_root_run_id=pagination_root_run_id,
+                    is_checkpointing_enabled=(
+                        is_pagination_checkpointing_enabled
+                    ),
+                )
+            )
             try:
-                prepared_source_records, candidate = (
-                    await _prepare_resource_import_source_group(
-                        source_records,
-                        resources,
-                        run_id=run_id,
-                        retry_of_run_id=retry_of_run_id,
-                        pagination_root_run_id=pagination_root_run_id,
-                        is_checkpointing_enabled=(
-                            is_pagination_checkpointing_enabled
-                        ),
+                async with _pagination_checkpoint_worker_guard(
+                    checkpoint_guard_context
+                ):
+                    prepared_source_records, candidate = (
+                        await _prepare_resource_import_source_group(
+                            source_records,
+                            resources,
+                            run_id=run_id,
+                            retry_of_run_id=retry_of_run_id,
+                            pagination_root_run_id=pagination_root_run_id,
+                            is_checkpointing_enabled=(
+                                is_pagination_checkpointing_enabled
+                            ),
+                        )
                     )
-                )
-                import_summary = await import_one_group(prepared_source_records)
-                diagnostics_by_resource = import_summary[1]
-                await _finalize_endpoint_dataset_candidate(
-                    candidate,
-                    diagnostics_by_resource,
-                )
-                return import_summary
-            except BaseException as failure:
-                await _mark_failed_endpoint_dataset_without_masking(
-                    candidate,
-                    diagnostics_by_resource,
-                    failure,
-                )
-                raise
+                    try:
+                        import_summary = await import_one_group(
+                            prepared_source_records
+                        )
+                        diagnostics_by_resource = import_summary[1]
+                        await _finalize_endpoint_dataset_candidate(
+                            candidate,
+                            diagnostics_by_resource,
+                        )
+                        return import_summary
+                    except BaseException as failure:
+                        await _mark_failed_endpoint_dataset_without_masking(
+                            candidate,
+                            diagnostics_by_resource,
+                            failure,
+                        )
+                        raise
             finally:
                 await clear_partial_progress(id(prepared_source_records))
 
