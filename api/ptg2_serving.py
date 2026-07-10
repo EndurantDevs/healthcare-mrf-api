@@ -5317,6 +5317,40 @@ def _membership_geo_sql(
     ]
 
 
+def _membership_taxonomy_filters(
+    args: dict[str, Any],
+    parameter_map: dict[str, Any],
+) -> list[str]:
+    """Build taxonomy predicates that must run before location limits."""
+    filter_clauses: list[str] = []
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active:
+        filter_clauses.append(
+            "addr.npi IN ("
+            + provider_specialty_taxonomy_semijoin_sql(
+                parameter_map,
+                "membership_location_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+            + ")"
+        )
+    inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
+        args,
+        nt_alias="membership_location_nt",
+        schema=PTG2_SCHEMA,
+        params=parameter_map,
+        param_prefix="membership_location_inferred_taxonomy",
+    )
+    if inferred_taxonomy_sql:
+        filter_clauses.append(
+            f"addr.npi IN (SELECT membership_location_nt.npi FROM {PTG2_SCHEMA}.npi_taxonomy "
+            f"membership_location_nt WHERE {inferred_taxonomy_sql})"
+        )
+        filter_clauses.append(_ptg2_individual_npi_exists_sql("addr.npi"))
+    return filter_clauses
+
+
 def _membership_filter_sql(
     args: dict[str, Any],
     *,
@@ -5332,6 +5366,7 @@ def _membership_filter_sql(
             return None
         filter_clauses.append("addr.npi = ANY(CAST(:candidate_npis AS bigint[]))")
         parameter_map["candidate_npis"] = list(candidate_npis)
+    filter_clauses.extend(_membership_taxonomy_filters(args, parameter_map))
     state_code = str(args.get("state") or "").strip().upper()
     city_name = str(args.get("city") or "").strip().upper()
     zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))

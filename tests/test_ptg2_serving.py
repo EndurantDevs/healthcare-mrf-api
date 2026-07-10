@@ -1324,6 +1324,34 @@ async def test_membership_location_query_keeps_site_addresses(monkeypatch):
     assert invalid_radius_query is None
 
 
+@pytest.mark.asyncio
+async def test_membership_location_query_filters_taxonomy_before_candidate_limit(monkeypatch):
+    tables = ptg2_serving.PTG2ServingTables(provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test")
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    location_query = await ptg2_serving._membership_location_query(
+        object(),
+        tables,
+        {
+            "zip5": "60654",
+            "taxonomy_codes": ["207Q00000X"],
+            "primary_only": True,
+        },
+        candidate_npis=(1234567890, 1003179466),
+        limit=200,
+    )
+
+    assert "addr.npi IN (SELECT" in location_query.filter_sql
+    assert "membership_location_specialty_nt.npi" in location_query.filter_sql
+    assert "healthcare_provider_primary_taxonomy_switch" in location_query.filter_sql
+    assert location_query.parameter_map["membership_location_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert location_query.parameter_map["limit"] == 200
+
+
 def test_graph_provider_data_preserves_street_fallback():
     enriched_address = json.dumps({"first_line": "100 Test Street", "city": "BATTLE CREEK"})
     matched_address = json.dumps({"first_line": None, "city": "BATTLE CREEK"})
