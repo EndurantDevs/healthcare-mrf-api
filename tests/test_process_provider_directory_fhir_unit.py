@@ -3704,19 +3704,13 @@ async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_cre
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):
-        return (
-            200,
-            {
-                "resourceType": "CapabilityStatement",
-                "fhirVersion": "4.0.1",
-                "rest": [{"resource": [{"type": "Practitioner"}]}],
-            },
-            None,
-            14,
-        )
+    def fake_post_json(url, request_payload_by_name, *, timeout, extra_headers=None):
+        assert url == importer.ALOHR_GRAPHQL_URL
+        assert request_payload_by_name == {"query": importer.ALOHR_PROBE_QUERY, "variables": {}}
+        assert extra_headers == {"tenantId": importer.ALOHR_TENANT_ID}
+        return 200, {"data": {"providers": {"nextToken": "next"}}}, None, 14
 
-    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_post_json_sync", fake_post_json)
 
     probe, payload = await importer._probe_source(
         {
@@ -3730,9 +3724,53 @@ async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_cre
         run_id="run_1",
     )
 
-    assert payload["resourceType"] == "CapabilityStatement"
+    assert payload is None
     assert probe["status"] == "valid"
-    assert probe["credential"] is None
+    assert probe["url"] == importer.ALOHR_GRAPHQL_URL
+    assert probe["credential"]["header_names"] == ["tenantId"]
+
+
+@pytest.mark.asyncio
+async def test_probe_sources_uses_alohr_graphql_when_fhir_metadata_is_gone(monkeypatch):
+    def fake_post_json(url, request_payload_by_name, *, timeout, extra_headers=None):
+        assert url == importer.ALOHR_GRAPHQL_URL
+        assert request_payload_by_name == {"query": importer.ALOHR_PROBE_QUERY, "variables": {}}
+        assert timeout == 3
+        assert extra_headers == {"tenantId": importer.ALOHR_TENANT_ID}
+        return 200, {"data": {"providers": {"nextToken": "next"}}}, None, 25
+
+    upsert_batches = []
+
+    async def fake_upsert(model, model_rows, **_kwargs):
+        upsert_batches.append((model, model_rows))
+        return len(model_rows)
+
+    monkeypatch.setattr(importer, "_post_json_sync", fake_post_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    source_by_name = {
+        "source_id": "source_alohr",
+        "api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+        "auth_type": "OAuth2/SMART",
+        "requires_registration": True,
+        "metadata_json": {"provider_directory_graphql_tenant_id": importer.ALOHR_TENANT_ID},
+    }
+    probed, valid, valid_source_ids = await importer._probe_sources(
+        [source_by_name],
+        timeout=3,
+        concurrency=1,
+        run_id="run_1",
+    )
+
+    assert (probed, valid, valid_source_ids) == (1, 1, {"source_alohr"})
+    capability_rows = next(model_rows for model, model_rows in upsert_batches if model is ProviderDirectoryCapability)
+    source_rows = next(model_rows for model, model_rows in upsert_batches if model is ProviderDirectorySource)
+    assert capability_rows[0]["probe_status"] == "valid"
+    assert capability_rows[0]["metadata_url"] == importer.ALOHR_GRAPHQL_URL
+    assert source_rows[0]["last_probe_status"] == "valid"
+    assert source_rows[0]["last_validated_status"] == "valid"
+    assert source_rows[0]["metadata_json"]["credential"]["header_names"] == ["tenantId"]
 
 
 @pytest.mark.asyncio

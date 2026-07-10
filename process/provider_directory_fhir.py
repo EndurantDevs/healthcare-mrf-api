@@ -389,6 +389,11 @@ query ALOHR_ORG_FIND($criteria: ProviderOrgSearchCriteria, $nextToken: String) {
   }
 }
 """
+ALOHR_PROBE_QUERY = """
+query ALOHR_HEALTH {
+  providers(criteria: {}) { nextToken }
+}
+"""
 AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectory"
 AETNA_PROVIDER_DIRECTORY_DATA_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectorydata"
 AETNA_PROVIDER_DIRECTORY_TOKEN_URL = "https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token"
@@ -8643,7 +8648,83 @@ async def _probe_metadata_candidate(
     return candidate_probe_map, capability_payload
 
 
+async def _probe_alohr_graphql_connector(
+    source_record: dict[str, Any],
+    *,
+    timeout: int,
+    run_id: str | None,
+) -> tuple[dict[str, Any], None]:
+    status_code, response_payload, request_error, elapsed = await asyncio.to_thread(
+        _post_json_sync,
+        ALOHR_GRAPHQL_URL,
+        {"query": ALOHR_PROBE_QUERY, "variables": {}},
+        timeout=timeout,
+        extra_headers={"tenantId": ALOHR_TENANT_ID},
+    )
+    graphql_errors = response_payload.get("errors") if isinstance(response_payload, dict) else None
+    graphql_data = response_payload.get("data") if isinstance(response_payload, dict) else None
+    provider_data = graphql_data.get("providers") if isinstance(graphql_data, dict) else None
+    is_valid = status_code == 200 and not request_error and not graphql_errors and isinstance(provider_data, dict)
+    probe_error = request_error
+    if not is_valid and not probe_error:
+        probe_error = "graphql_errors" if graphql_errors else f"http_{status_code}"
+    return (
+        {
+            "status": "valid" if is_valid else "graphql_error",
+            "http_status": status_code,
+            "response_time_ms": elapsed,
+            "url": ALOHR_GRAPHQL_URL,
+            "api_base": _canonical_base(
+                source_record.get("canonical_api_base") or source_record.get("api_base")
+            ),
+            "error": probe_error,
+            "run_id": run_id,
+            "credential": {"matched_by": ["alohr_graphql_tenant"], "header_names": ["tenantId"]},
+        },
+        None,
+    )
+
+
+def _missing_credential_probe_result(
+    source_record: dict[str, Any],
+    metadata_urls: list[tuple[str, str]],
+    *,
+    run_id: str | None,
+) -> tuple[dict[str, Any], None] | None:
+    """Return an auth-required result without calling a credential-gated source."""
+    requires_credentials = (
+        _source_declares_credentialed_access(source_record)
+        or _source_uses_known_onboarding_gateway(source_record)
+    )
+    has_credentials = any(
+        _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
+        for _candidate_base, metadata_url in metadata_urls
+    )
+    if not requires_credentials or has_credentials:
+        return None
+    candidate_base, metadata_url = metadata_urls[0]
+    return (
+        {
+            "status": "auth_required",
+            "http_status": None,
+            "response_time_ms": 0,
+            "url": metadata_url,
+            "api_base": candidate_base,
+            "error": (
+                "source requires credentialed Provider Directory access "
+                "but no matching credentials are configured"
+            ),
+            "run_id": run_id,
+            "credential": None,
+        },
+        None,
+    )
+
+
 async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Probe the source's actual acquisition transport and return normalized status."""
+    if _alohr_source_uses_graphql_connector(source_record):
+        return await _probe_alohr_graphql_connector(source_record, timeout=timeout, run_id=run_id)
     metadata_urls = _candidate_metadata_urls(source_record)
     if not metadata_urls:
         source_probe_map = {
@@ -8655,35 +8736,13 @@ async def _probe_source(source_record: dict[str, Any], *, timeout: int, run_id: 
             "run_id": run_id,
         }
         return source_probe_map, None
-    missing_credential_blocks_probe = (
-        (
-            _source_declares_credentialed_access(source_record)
-            or _source_uses_known_onboarding_gateway(source_record)
-        )
-        and not _alohr_source_uses_graphql_connector(source_record)
-        and not any(
-            _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
-            for _candidate_base, metadata_url in metadata_urls
-        )
+    missing_credential_result = _missing_credential_probe_result(
+        source_record,
+        metadata_urls,
+        run_id=run_id,
     )
-    if missing_credential_blocks_probe:
-        candidate_base, metadata_url = metadata_urls[0]
-        return (
-            {
-                "status": "auth_required",
-                "http_status": None,
-                "response_time_ms": 0,
-                "url": metadata_url,
-                "api_base": candidate_base,
-                "error": (
-                    "source requires credentialed Provider Directory access "
-                    "but no matching credentials are configured"
-                ),
-                "run_id": run_id,
-                "credential": None,
-            },
-            None,
-        )
+    if missing_credential_result:
+        return missing_credential_result
     best_probe: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
     for candidate_base, metadata_url in metadata_urls:
@@ -8837,6 +8896,9 @@ async def _probe_sources(
                         "run_id": run_id,
                     }
                 )
+                if probe["status"] == "valid" and _alohr_source_uses_graphql_connector(source):
+                    probe_counts_by_name["valid"] += 1
+                    valid_source_ids.add(source["source_id"])
             source_updates.append(update)
             probe_counts_by_name["probed"] += 1
             await _flush_probe_rows()
