@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib.util
+import io
 import json
 import types
 from pathlib import Path
@@ -333,6 +334,22 @@ async def test_node_health_reports_degraded_when_redis_fails(monkeypatch):
     assert payload["status"] == "degraded"
     assert payload["checks"]["redis"] == {"ok": False, "error": "redis unavailable"}
     assert payload["failing_checks"] == ["redis"]
+
+
+def test_ram_status_excludes_reserved_huge_pages_from_schedulable_memory(monkeypatch):
+    meminfo = """\
+MemTotal:       197461180 kB
+MemAvailable:    83394928 kB
+Hugetlb:         92274688 kB
+"""
+
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: io.StringIO(meminfo))
+
+    assert control_imports._ram_status() == {
+        "total": 197461180 * 1024,
+        "available": 83394928 * 1024,
+        "schedulable": (197461180 - 92274688) * 1024,
+    }
 
 
 def test_normalize_run_accepts_plain_dict():

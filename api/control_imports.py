@@ -371,11 +371,11 @@ async def node_health() -> dict[str, Any]:
 
 
 def _ram_status() -> dict[str, int | None]:
-    total = None
-    available = None
+    total = available = None
+    values: dict[str, int] = {}
+
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as handle:
-            values: dict[str, int] = {}
             for line in handle:
                 key, _sep, raw_value = line.partition(":")
                 parts = raw_value.strip().split()
@@ -390,7 +390,7 @@ def _ram_status() -> dict[str, int | None]:
             total = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
         except (OSError, ValueError, TypeError):
             total = None
-    return {"total": total, "available": available}
+    return {"total": total, "available": available, "schedulable": None if total is None else max(total - values.get("Hugetlb", 0), 0)}
 
 
 async def _database_check() -> dict[str, Any]:
