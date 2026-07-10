@@ -9,6 +9,73 @@ Maintained endpoint support and configuration are listed in
 That generated matrix is deliberately separate from current runtime and import
 status, which is recorded in the endpoint-acquisition campaign report.
 
+## Support Documentation Lifecycle
+
+Keep these authorities separate when reviewing Provider Directory coverage:
+
+- Configured support, access requirements, and resource selection live in the
+  [acquisition manifest](../../specs/provider_directory_endpoint_acquisition_manifest.json)
+  and its [generated support matrix](provider-directory-endpoint-support.md).
+  `acquisition-configured` or `externally-supported` means an implementation
+  path is maintained; it does not mean that a live endpoint or current dataset
+  has been verified. `probe-only` means that no resource acquisition is
+  configured.
+- Known non-importable coverage is maintained in the [blocker registry](../../specs/provider_directory_blocker_registry.json).
+  Its required access, registration flag, operational state, review date, and
+  primary evidence are rendered in the matrix as `Not supported`. Do not turn
+  an unresolved discovery gap into a supported source without current primary
+  evidence.
+- Live evidence is maintained in the [verification snapshot](../../specs/provider_directory_endpoint_verification.json).
+  The campaign report is the untracked runtime observation; the snapshot is
+  the tracked terminal proof. A newer active run can supersede older proof, so
+  do not read configured support as live verification.
+
+Use this sequence for a campaign or documentation review:
+
+1. Validate the manifest without starting runs:
+
+   ```bash
+   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+     --validate-only
+   ```
+
+2. Run the acquisition harness in its default GET-only mode for inspection.
+   Add `--apply` only when the selected campaign should create or resume live
+   import-control runs. Keep the report at the manifest's configured path, or
+   pass an explicit `--report` path:
+
+   ```bash
+   ./venv314/bin/python scripts/research/provider_directory_endpoint_acquisition_cli.py \
+     --control-url "$HLTHPRT_IMPORT_CONTROL_URL" \
+     --apply \
+     --report reports/provider-directory-endpoint-acquisition/report.json
+   ```
+
+3. After the report is eligible for verification, update the snapshot and
+   regenerate the matrix together. Use the report's `verification_update.argv`
+   when it names a non-default report path:
+
+   ```bash
+   ./venv314/bin/python scripts/update_provider_directory_verification.py \
+     --report reports/provider-directory-endpoint-acquisition/report.json \
+     --environment healthporta-dev
+   ```
+
+   The updater rejects stale reports, campaign or manifest mismatches, and
+   terminal labels backed by nonterminal runs. Never hand-edit the generated
+   matrix or verification snapshot.
+
+4. Check for drift before review. This is also the [CI drift check](../../.github/workflows/ci.yml):
+
+   ```bash
+   ./venv314/bin/python scripts/generate_provider_directory_support_docs.py \
+     --check
+   ```
+
+   The focused documentation workflow tests cover the local links and these
+   lifecycle anchors; the CI job runs them with the other Provider Directory
+   checks.
+
 ## Source
 
 The importer uses the public `provider-directory-db` SQLite catalog by default:

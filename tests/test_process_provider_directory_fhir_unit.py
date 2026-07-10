@@ -7719,14 +7719,17 @@ def test_resource_start_url_caps_uhc_insurance_plan_page_count():
         (importer.WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"),
     ],
 )
-def test_resource_start_url_caps_fragile_state_directory_pages(api_base, resource_type):
+def test_resource_start_url_uses_standard_count_for_state_directory_pages(
+    api_base,
+    resource_type,
+):
     url = importer._resource_start_url(
         {"api_base": api_base},
         resource_type,
         page_count=100,
     )
 
-    assert url == f"{api_base}/{resource_type}?_count=25"
+    assert url == f"{api_base}/{resource_type}?_count=100"
 
 
 def test_resource_start_url_does_not_cap_other_michigan_interopstation_resources():

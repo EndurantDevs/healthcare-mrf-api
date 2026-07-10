@@ -630,9 +630,6 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     # UHC/Flex InsurancePlan accepts tiny pages but returns Azure 504s for
     # _count=10/100, so full imports must walk this resource one row at a time.
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
-    # These state HAPI gateways return HTTP 500 at the default count of 100.
-    (WASHINGTON_PROVIDER_DIRECTORY_BASE, "Location"): 25,
-    (WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
 }
 PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
     HAP_PROVIDER_DIRECTORY_BASE: 1000,

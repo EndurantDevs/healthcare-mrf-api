@@ -1,5 +1,7 @@
 import copy
 import json
+import re
+from pathlib import Path
 
 import pytest
 
@@ -132,12 +134,12 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),
-        ("washington", "Location pages are capped at 25"),
-        ("wyoming", "PractitionerRole pages are capped at 25"),
+        ("washington", "Location pagination was revalidated"),
+        ("wyoming", "PractitionerRole pagination was revalidated"),
         ("amerihealth-nh", "Plan code 0900; full-refresh pages target 250 rows"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
-        ("uhc", "PractitionerRole reverse lookup, and one-row InsurancePlan pages"),
+        ("uhc", "full acquisition currently fails closed"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("scan", "Role reverse lookup and 100-page cap exist, but this campaign only probes"),
         ("centene", "CloudFront or WAF access can block a runtime probe"),
@@ -177,6 +179,44 @@ def test_check_reports_generated_documentation_drift(tmp_path):
     output_path.write_text("stale\n", encoding="utf-8")
 
     assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path), "--check"]) == 1
+
+
+def test_provider_directory_guide_local_links_resolve():
+    root = Path(__file__).resolve().parents[1]
+    guide_path = root / "docs/imports/provider-directory-fhir.md"
+    guide = guide_path.read_text(encoding="utf-8")
+    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", guide)
+
+    assert links
+    for target in links:
+        assert not target.startswith(("http://", "https://", "#"))
+        assert (guide_path.parent / target).resolve().is_file(), target
+
+
+def test_provider_directory_guide_documents_the_full_lifecycle():
+    root = Path(__file__).resolve().parents[1]
+    guide = (root / "docs/imports/provider-directory-fhir.md").read_text(encoding="utf-8")
+    expected_links = {
+        "../../specs/provider_directory_endpoint_acquisition_manifest.json",
+        "provider-directory-endpoint-support.md",
+        "../../specs/provider_directory_blocker_registry.json",
+        "../../specs/provider_directory_endpoint_verification.json",
+        "../../.github/workflows/ci.yml",
+    }
+    actual_links = set(re.findall(r"\[[^\]]+\]\(([^)]+)\)", guide))
+
+    assert expected_links <= actual_links
+    for command in (
+        "scripts/research/provider_directory_endpoint_acquisition_cli.py",
+        "--validate-only",
+        "--control-url \"$HLTHPRT_IMPORT_CONTROL_URL\"",
+        "--apply",
+        "scripts/update_provider_directory_verification.py",
+        "scripts/generate_provider_directory_support_docs.py",
+        "--check",
+    ):
+        assert command in guide
+    assert "Never hand-edit the generated" in guide
 
 
 def test_verification_snapshot_rejects_terminal_record_without_timestamp():
