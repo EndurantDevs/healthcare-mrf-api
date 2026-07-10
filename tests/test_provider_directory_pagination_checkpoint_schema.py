@@ -137,9 +137,12 @@ def test_pagination_checkpoint_migration_matches_model_and_parent(monkeypatch):
         for column_or_constraint in recorded_table["items"]
         if isinstance(column_or_constraint, sa.Column)
     }
-    assert tuple(recorded_columns_by_name) == tuple(
-        ProviderDirectoryPaginationCheckpoint.__table__.c.keys()
+    revision_model_columns = tuple(
+        column_name
+        for column_name in ProviderDirectoryPaginationCheckpoint.__table__.c.keys()
+        if column_name != "acquisition_root_run_id"
     )
+    assert tuple(recorded_columns_by_name) == revision_model_columns
     assert isinstance(recorded_columns_by_name["source_ids"].type, postgresql.JSONB)
     assert isinstance(recorded_columns_by_name["recent_cursor_hashes"].type, postgresql.JSONB)
     assert isinstance(recorded_columns_by_name["next_url"].type, sa.Text)

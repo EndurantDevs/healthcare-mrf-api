@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import csv
 import datetime
 import email.utils
 import hashlib
+import hmac
 import io
+import ipaddress
+import inspect
 import json
 import logging
 import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import ssl
 import tempfile
@@ -30,6 +35,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import aiohttp
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func, or_
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
@@ -39,6 +45,8 @@ from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
     ProviderDirectoryAPIEndpoint,
+    ProviderDirectoryBulkAcquisitionCheckpoint,
+    ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryCapability,
     ProviderDirectoryCanonicalResource,
     ProviderDirectoryDatasetResource,
@@ -233,6 +241,8 @@ CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryDatasetResource,
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
+    ProviderDirectoryBulkAcquisitionCheckpoint,
+    ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryPaginationCheckpoint,
     ProviderDirectoryReverseLookupCheckpoint,
 )
@@ -411,6 +421,9 @@ AETNA_PROVIDER_DIRECTORY_BASES = frozenset(
 AETNA_COMMERCIAL_SUPPORTED_RESOURCES = tuple(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
+AETNA_COMMERCIAL_EXPECTED_NONEMPTY_RESOURCES = frozenset(
+    {"InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location"}
+)
 AETNA_MEDICAID_SUPPORTED_RESOURCES = tuple(
     resource_type
     for resource_type in DEFAULT_RESOURCES
@@ -427,6 +440,9 @@ CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
+EXPECTED_NONEMPTY_RESOURCE_ERROR = (
+    "provider_directory_expected_nonempty_resource_returned_zero_rows"
+)
 CENTENE_PARTNER_PORTAL_APIS_URL = "https://partners.centene.com/apis"
 CENTENE_PROVIDER_DIRECTORY_BASE = "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory"
 CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE = "https://iopc-provider.api.centene.com/iopc/provider/ca"
@@ -588,6 +604,24 @@ PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
+BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-bulk-v1"
+BULK_EXPORT_CHECKPOINT_STARTING = "starting"
+BULK_EXPORT_CHECKPOINT_ACCEPTED = "accepted"
+BULK_EXPORT_CHECKPOINT_MANIFEST_READY = "manifest_ready"
+BULK_EXPORT_CHECKPOINT_STREAMING = "streaming"
+BULK_EXPORT_CHECKPOINT_RETRYABLE = "retryable"
+BULK_EXPORT_CHECKPOINT_COMPLETE = "complete"
+BULK_EXPORT_CHECKPOINT_FAILED = "failed"
+BULK_EXPORT_CAPABILITY_CIPHER_PREFIX = "fernet:v1:"
+BULK_EXPORT_DEFAULT_LEASE_SECONDS = 900
+BULK_EXPORT_MIN_LEASE_SECONDS = 60
+BULK_EXPORT_MAX_LEASE_SECONDS = 3600
+BULK_EXPORT_DEFAULT_MAX_AGE_SECONDS = 45 * 24 * 60 * 60
+BULK_EXPORT_DEFAULT_FUTURE_SKEW_SECONDS = 15 * 60
+BULK_EXPORT_OUTPUT_PENDING = "pending"
+BULK_EXPORT_OUTPUT_STREAMING = "streaming"
+BULK_EXPORT_OUTPUT_COMPLETE = "complete"
+BULK_EXPORT_OUTPUT_FAILED = "failed"
 REQUESTED_SOURCE_IMPORT_EMPTY_ERROR = (
     "provider_directory_requested_sources_not_selected_for_resource_import"
 )
@@ -650,12 +684,76 @@ class PaginationCheckpointContext:
     retry_of_run_id: str | None = None
     endpoint_id: str | None = None
     dataset_id: str | None = None
+    acquisition_root_run_id: str | None = None
+    lineage_verified: bool = False
+
+
+@dataclass(frozen=True)
+class BulkExportCheckpointIdentity:
+    checkpoint_id: str
+    canonical_api_base: str
+    resource_type: str
+    source_scope_hash: str
+    strategy_version: str
+    acquisition_root_run_id: str
+    owner_run_id: str
+    retry_of_run_id: str | None
+    endpoint_id: str
+    dataset_id: str
+    start_url: str
+    start_url_hash: str
+
+
+@dataclass(frozen=True)
+class BulkExportManifestOutput:
+    output_index: int
+    resource_type: str
+    url: str
+    url_hash: str
+    identity_hash: str
+
+
+@dataclass(frozen=True)
+class BulkExportManifest:
+    identity_hash: str
+    payload: dict[str, Any]
+    requires_access_token: bool
+    outputs: tuple[BulkExportManifestOutput, ...]
+
+
+@dataclass(frozen=True)
+class BulkExportStreamOptions:
+    model: type
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]]
+    row_batch_size: int
+    retain_rows: bool
+    polls: int
+    ownership_probe: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class BulkExportFetchOptions:
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]]
+    row_batch_size: int
+    retain_rows: bool
+
+
+@dataclass
+class BulkExportStreamState:
+    retained_resource_rows: list[dict[str, Any]] = field(default_factory=list)
+    rows_written_this_run: int = 0
+    outputs_processed: int = 0
 
 
 @dataclass(frozen=True)
 class EndpointDatasetCandidate:
     endpoint_id: str
     dataset_id: str
+    acquisition_root_run_id: str | None
     source_ids: tuple[str, ...]
     selected_resources: tuple[str, ...]
     import_run_id: str | None
@@ -667,6 +765,7 @@ class EndpointDatasetCandidate:
 @dataclass(frozen=True)
 class EndpointDatasetCandidateSelection:
     dataset_id: str
+    acquisition_root_run_id: str | None
     previous_dataset_id: str | None
     reused_from_checkpoint: bool
 
@@ -2512,6 +2611,8 @@ def _source_metadata(source: dict[str, Any]) -> dict[str, Any]:
 
 def _expected_nonempty_resource_types(source: dict[str, Any]) -> set[str]:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
+        return set(AETNA_COMMERCIAL_EXPECTED_NONEMPTY_RESOURCES)
     if api_base == CIGNA_PROVIDER_DIRECTORY_BASE:
         return set(CIGNA_EXPECTED_NONEMPTY_RESOURCES)
     if _is_amerihealth_caritas_provider_api_base(api_base):
@@ -2544,10 +2645,17 @@ def _fail_closed_on_unexpected_empty_resource(
         or result.rows_written > 0
     ):
         return result
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
     return replace(
         result,
         complete=False,
-        error=CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR,
+        error=(
+            CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
+            if api_base == CIGNA_PROVIDER_DIRECTORY_BASE
+            else EXPECTED_NONEMPTY_RESOURCE_ERROR
+        ),
     )
 
 
@@ -3048,6 +3156,12 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
                 for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
             },
             "provider_directory_bulk_export_omit_output_format": True,
+            "provider_directory_bulk_export_output_hosts": [
+                "storage.googleapis.com",
+            ],
+            "provider_directory_expected_nonempty_resources": sorted(
+                AETNA_COMMERCIAL_EXPECTED_NONEMPTY_RESOURCES
+            ),
         },
     }
     return (
@@ -9721,6 +9835,245 @@ def _resolved_molina_next_url(current_url: str, next_url: str) -> str:
     )
 
 
+class _PublicBulkResolver(aiohttp.abc.AbstractResolver):
+    """Resolve Bulk Data hosts once and reject every non-public address."""
+
+    def __init__(self) -> None:
+        self._resolver = aiohttp.DefaultResolver()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: socket.AddressFamily = socket.AF_INET,
+    ) -> list[dict[str, Any]]:
+        """Return resolver answers only when every address is globally routable."""
+        resolved_hosts = await self._resolver.resolve(host, port, family)
+        for resolved_host in resolved_hosts:
+            try:
+                address = ipaddress.ip_address(
+                    str(resolved_host.get("host") or "")
+                )
+            except ValueError as exc:
+                raise OSError("bulk_export_non_public_dns_address") from exc
+            if not address.is_global:
+                raise OSError("bulk_export_non_public_dns_address")
+        return resolved_hosts
+
+    async def close(self) -> None:
+        """Close the delegated aiohttp resolver."""
+        await self._resolver.close()
+
+
+def _bulk_client_session() -> aiohttp.ClientSession:
+    connector = aiohttp.TCPConnector(
+        resolver=_PublicBulkResolver(),
+        ttl_dns_cache=300,
+    )
+    return aiohttp.ClientSession(connector=connector)
+
+
+def _bulk_checkpoint_lease_seconds() -> int:
+    configured_seconds = _env_int(
+        "HLTHPRT_PROVIDER_DIRECTORY_BULK_LEASE_SECONDS",
+        BULK_EXPORT_DEFAULT_LEASE_SECONDS,
+    )
+    return max(
+        BULK_EXPORT_MIN_LEASE_SECONDS,
+        min(configured_seconds, BULK_EXPORT_MAX_LEASE_SECONDS),
+    )
+
+
+async def _bulk_guard_autocommit_connection(guard_connection: Any) -> Any:
+    autocommit_connection = guard_connection.execution_options(
+        isolation_level="AUTOCOMMIT"
+    )
+    if inspect.isawaitable(autocommit_connection):
+        return await autocommit_connection
+    return autocommit_connection
+
+
+async def _assert_bulk_checkpoint_guard_owner(
+    autocommit_connection: Any,
+    identity: BulkExportCheckpointIdentity,
+) -> None:
+    """Fail before a write when the guard connection or owner is lost."""
+    try:
+        is_owner = await autocommit_connection.scalar(
+            db.text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM {_bulk_acquisition_checkpoint_table_ref()}
+                     WHERE checkpoint_id = :checkpoint_id
+                       AND owner_run_id = :owner_run_id
+                       AND state NOT IN (:complete_state, :failed_state)
+                );
+                """
+            ),
+            {
+                "checkpoint_id": identity.checkpoint_id,
+                "owner_run_id": identity.owner_run_id,
+                "complete_state": BULK_EXPORT_CHECKPOINT_COMPLETE,
+                "failed_state": BULK_EXPORT_CHECKPOINT_FAILED,
+            },
+        )
+    except Exception as exc:
+        raise RuntimeError("bulk_export_checkpoint_worker_guard_lost") from exc
+    if is_owner is not True:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+
+
+@contextlib.asynccontextmanager
+async def _bulk_checkpoint_worker_guard(
+    identity: BulkExportCheckpointIdentity,
+) -> AsyncIterator[Callable[[], Awaitable[None]]]:
+    """Fence one checkpoint worker with a session advisory lock."""
+    if db.engine is None:
+        await db.connect()
+    assert db.engine is not None
+    async with db.engine.connect() as guard_connection:
+        autocommit_connection = await _bulk_guard_autocommit_connection(
+            guard_connection
+        )
+        lock_sql = db.text(
+            "SELECT pg_try_advisory_lock(hashtextextended(:checkpoint_id, 0));"
+        )
+        lock_acquired = await autocommit_connection.scalar(
+            lock_sql,
+            {"checkpoint_id": identity.checkpoint_id},
+        )
+        if lock_acquired is not True:
+            raise RuntimeError("bulk_export_checkpoint_worker_active")
+        ownership_probe = partial(
+            _assert_bulk_checkpoint_guard_owner,
+            autocommit_connection,
+            identity,
+        )
+        try:
+            yield ownership_probe
+        finally:
+            with contextlib.suppress(Exception):
+                await autocommit_connection.scalar(
+                    db.text(
+                        "SELECT pg_advisory_unlock(hashtextextended(:checkpoint_id, 0));"
+                    ),
+                    {"checkpoint_id": identity.checkpoint_id},
+                )
+
+
+def _bulk_checkpoint_primary_secret() -> str:
+    master_secret = _clean_text(
+        os.getenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY")
+        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
+    )
+    if not master_secret:
+        raise RuntimeError("bulk_export_checkpoint_encryption_key_missing")
+    return master_secret
+
+
+def _bulk_checkpoint_previous_secrets() -> tuple[str, ...]:
+    raw_keyring = _clean_text(
+        os.getenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS")
+    )
+    if not raw_keyring:
+        return ()
+    if raw_keyring.startswith("["):
+        try:
+            decoded_keyring = json.loads(raw_keyring)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("bulk_export_checkpoint_keyring_invalid") from exc
+        if not isinstance(decoded_keyring, list):
+            raise RuntimeError("bulk_export_checkpoint_keyring_invalid")
+        secret_candidates = decoded_keyring
+    else:
+        secret_candidates = raw_keyring.split(",")
+    return tuple(
+        secret
+        for secret_candidate in secret_candidates
+        if (secret := _clean_text(secret_candidate))
+    )
+
+
+def _bulk_checkpoint_decryption_secrets() -> tuple[str, ...]:
+    primary_secret = _clean_text(
+        os.getenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY")
+        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
+    )
+    secret_candidates = (
+        primary_secret,
+        *_bulk_checkpoint_previous_secrets(),
+        _clean_text(os.getenv("HLTHPRT_CONTROL_API_TOKEN")),
+        _clean_text(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")),
+    )
+    decryption_secrets = tuple(
+        dict.fromkeys(
+            secret for secret in secret_candidates if secret is not None
+        )
+    )
+    if not decryption_secrets:
+        raise RuntimeError("bulk_export_checkpoint_encryption_key_missing")
+    return decryption_secrets
+
+
+def _bulk_checkpoint_fernet(master_secret: str | None = None) -> Fernet:
+    encryption_secret = master_secret or _bulk_checkpoint_primary_secret()
+    derived_key = hmac.new(
+        encryption_secret.encode("utf-8"),
+        b"healthporta:provider-directory:bulk-checkpoint:v1",
+        hashlib.sha256,
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(derived_key))
+
+
+def _encrypt_bulk_capability(value: str) -> str:
+    encrypted_value = _bulk_checkpoint_fernet().encrypt(value.encode("utf-8"))
+    return BULK_EXPORT_CAPABILITY_CIPHER_PREFIX + encrypted_value.decode("ascii")
+
+
+def _decrypt_bulk_capability(value: Any) -> str:
+    encrypted_value = _clean_text(value)
+    if not encrypted_value or not encrypted_value.startswith(
+        BULK_EXPORT_CAPABILITY_CIPHER_PREFIX
+    ):
+        raise RuntimeError("bulk_export_checkpoint_ciphertext_invalid")
+    token = encrypted_value.removeprefix(BULK_EXPORT_CAPABILITY_CIPHER_PREFIX)
+    for decryption_secret in _bulk_checkpoint_decryption_secrets():
+        try:
+            return _bulk_checkpoint_fernet(decryption_secret).decrypt(
+                token.encode("ascii")
+            ).decode("utf-8")
+        except (InvalidToken, UnicodeError, ValueError):
+            continue
+    raise RuntimeError("bulk_export_checkpoint_decryption_failed")
+
+
+def _bulk_manifest_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    def hashed_entries(field_name: str) -> list[dict[str, str]]:
+        """Return URL-free identities for one manifest entry collection."""
+        return [
+            {
+                "type": str(item["type"]),
+                "url_hash": hashlib.sha256(
+                    str(item["url"]).encode("utf-8")
+                ).hexdigest(),
+            }
+            for item in payload.get(field_name, [])
+            if isinstance(item, dict) and item.get("type") and item.get("url")
+        ]
+
+    request_url = str(payload.get("request") or "")
+    return {
+        "transactionTime": payload.get("transactionTime"),
+        "request_hash": hashlib.sha256(request_url.encode("utf-8")).hexdigest(),
+        "requiresAccessToken": payload.get("requiresAccessToken"),
+        "output": hashed_entries("output"),
+        "deleted": hashed_entries("deleted"),
+    }
+
+
 def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | None:
     api_base = _canonical_base(source.get("api_base"))
     if not api_base:
@@ -9748,8 +10101,9 @@ def _is_source_bulk_export_effective(
     requested: bool,
     *,
     per_resource_limit: int,
+    checkpoint_context: PaginationCheckpointContext | None = None,
 ) -> bool:
-    """Keep Aetna full scans paged until bulk export can resume durably."""
+    """Require durable candidate-bound state for an unbounded Aetna export."""
     api_base = _canonical_base(
         source.get("canonical_api_base") or source.get("api_base")
     )
@@ -9758,7 +10112,399 @@ def _is_source_bulk_export_effective(
         and (
             api_base != AETNA_PROVIDER_DIRECTORY_DATA_BASE
             or per_resource_limit > 0
+            or _is_durable_bulk_checkpoint_context(checkpoint_context)
         )
+    )
+
+
+def _is_durable_bulk_checkpoint_context(
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> bool:
+    return bool(
+        checkpoint_context
+        and checkpoint_context.canonical_api_base
+        and checkpoint_context.source_scope_hash
+        and checkpoint_context.owner_run_id
+        and checkpoint_context.acquisition_root_run_id
+        and checkpoint_context.endpoint_id
+        and checkpoint_context.dataset_id
+    )
+
+
+def _is_bulk_domain_hostname(hostname: str | None) -> bool:
+    normalized_hostname = (hostname or "").rstrip(".").lower()
+    if not normalized_hostname:
+        return False
+    try:
+        ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        return True
+    return False
+
+
+def _is_safe_bulk_https_url(url: str) -> bool:
+    if not url or any(character.isspace() for character in url):
+        return False
+    parsed_url = urllib.parse.urlsplit(url)
+    try:
+        parsed_url.port
+    except ValueError:
+        return False
+    return bool(
+        parsed_url.scheme.lower() == "https"
+        and _is_bulk_domain_hostname(parsed_url.hostname)
+        and parsed_url.netloc
+        and parsed_url.username is None
+        and parsed_url.password is None
+        and not parsed_url.fragment
+    )
+
+
+def _is_same_bulk_url_origin(first_url: str, second_url: str) -> bool:
+    if not _is_safe_bulk_https_url(first_url) or not _is_safe_bulk_https_url(
+        second_url
+    ):
+        return False
+    first = urllib.parse.urlsplit(first_url)
+    second = urllib.parse.urlsplit(second_url)
+    return (
+        (first.hostname or "").lower() == (second.hostname or "").lower()
+        and (first.port or 443) == (second.port or 443)
+    )
+
+
+def _resolved_bulk_export_status_url(
+    source: dict[str, Any],
+    start_url: str,
+    status_location: str | None,
+) -> str:
+    raw_status_location = _clean_text(status_location)
+    if not raw_status_location:
+        raise ValueError("bulk_export_missing_status_url")
+    status_url = urllib.parse.urljoin(start_url, raw_status_location)
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if (
+        not api_base
+        or not _is_safe_bulk_https_url(status_url)
+        or not _is_same_bulk_url_origin(status_url, api_base)
+    ):
+        raise ValueError("bulk_export_untrusted_status_url")
+    return status_url
+
+
+def _bulk_export_source_request_options(
+    source: dict[str, Any],
+    url: str,
+) -> dict[str, Any]:
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if (
+        not api_base
+        or not _is_safe_bulk_https_url(url)
+        or not _is_same_bulk_url_origin(url, api_base)
+    ):
+        raise ValueError("bulk_export_untrusted_source_url")
+    return _credential_request_options_for_source(source, url)
+
+
+def _bulk_output_allowed_hosts(source: dict[str, Any]) -> set[str]:
+    configured_hosts = _source_metadata(source).get(
+        "provider_directory_bulk_export_output_hosts"
+    )
+    if not isinstance(configured_hosts, list):
+        return set()
+    return {
+        normalized_host
+        for configured_host in configured_hosts
+        if (
+            normalized_host := (_clean_text(configured_host) or "")
+            .rstrip(".")
+            .lower()
+        )
+        and "/" not in normalized_host
+        and ":" not in normalized_host
+        and "*" not in normalized_host
+        and _is_bulk_domain_hostname(normalized_host)
+    }
+
+
+def _is_allowed_bulk_output_url(source: dict[str, Any], output_url: str) -> bool:
+    if not _is_safe_bulk_https_url(output_url):
+        return False
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    if api_base and _is_same_bulk_url_origin(output_url, api_base):
+        return True
+    parsed_output = urllib.parse.urlsplit(output_url)
+    output_host = (parsed_output.hostname or "").rstrip(".").lower()
+    return bool(
+        output_host
+        and (parsed_output.port or 443) == 443
+        and output_host in _bulk_output_allowed_hosts(source)
+    )
+
+
+def _bulk_export_output_request_options(
+    source: dict[str, Any],
+    output_url: str,
+    *,
+    requires_access_token: bool | None,
+) -> dict[str, Any]:
+    if not _is_allowed_bulk_output_url(source, output_url):
+        raise ValueError("bulk_export_untrusted_output_url")
+    api_base = _canonical_base(
+        source.get("canonical_api_base") or source.get("api_base")
+    )
+    is_payer_url = bool(
+        api_base and _is_url_within_api_base(output_url, api_base)
+    )
+    if not is_payer_url:
+        if requires_access_token is True:
+            raise ValueError("bulk_export_external_output_requires_access_token")
+        return {"headers": {}, "query_params": {}, "descriptor": None}
+    if requires_access_token is False:
+        return {"headers": {}, "query_params": {}, "descriptor": None}
+    return _credential_request_options_for_source(source, output_url)
+
+
+def _normalized_bulk_manifest_entries(
+    status_payload: dict[str, Any],
+    field_name: str,
+    *,
+    is_required: bool,
+) -> list[dict[str, str]]:
+    raw_outputs = status_payload.get(field_name)
+    if raw_outputs is None and not is_required:
+        return []
+    if not isinstance(raw_outputs, list):
+        raise ValueError("bulk_export_manifest_invalid_output")
+    normalized_outputs: list[dict[str, str]] = []
+    for raw_output in raw_outputs:
+        if not isinstance(raw_output, dict):
+            raise ValueError("bulk_export_manifest_invalid_output")
+        output_type = _clean_text(raw_output.get("type"))
+        output_url = _clean_text(raw_output.get("url"))
+        if not output_type or not output_url:
+            raise ValueError("bulk_export_manifest_invalid_output")
+        if not _is_safe_bulk_https_url(output_url):
+            raise ValueError("bulk_export_untrusted_output_url")
+        normalized_outputs.append({"type": output_type, "url": output_url})
+    normalized_outputs.sort(key=lambda output: (output["type"], output["url"]))
+    if len({(output["type"], output["url"]) for output in normalized_outputs}) != len(
+        normalized_outputs
+    ):
+        raise ValueError("bulk_export_manifest_duplicate_output")
+    return normalized_outputs
+
+
+def _normalized_bulk_request_identity(url: str) -> str:
+    if not _is_safe_bulk_https_url(url):
+        raise ValueError("bulk_export_manifest_invalid_request")
+    parsed_url = urllib.parse.urlsplit(url)
+    normalized_query = urllib.parse.urlencode(
+        sorted(urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)),
+        doseq=True,
+    )
+    hostname = (parsed_url.hostname or "").rstrip(".").lower()
+    port = parsed_url.port or 443
+    netloc = hostname if port == 443 else f"{hostname}:{port}"
+    return urllib.parse.urlunsplit(
+        ("https", netloc, parsed_url.path, normalized_query, "")
+    )
+
+
+def _validated_bulk_transaction_time(value: Any) -> str:
+    transaction_time = _clean_text(value)
+    if not transaction_time:
+        raise ValueError("bulk_export_manifest_missing_transaction_time")
+    try:
+        parsed_time = datetime.datetime.fromisoformat(
+            transaction_time.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError("bulk_export_manifest_invalid_transaction_time") from exc
+    if parsed_time.tzinfo is None:
+        raise ValueError("bulk_export_manifest_invalid_transaction_time")
+    return transaction_time
+
+
+def _parsed_bulk_transaction_time(value: Any) -> datetime.datetime:
+    transaction_time = _validated_bulk_transaction_time(value)
+    return datetime.datetime.fromisoformat(
+        transaction_time.replace("Z", "+00:00")
+    )
+
+
+def _assert_bulk_transaction_time_window(
+    transaction_time: str,
+    *,
+    reference_time: datetime.datetime | None = None,
+) -> None:
+    parsed_time = _parsed_bulk_transaction_time(transaction_time).astimezone(
+        datetime.UTC
+    )
+    observed_time = reference_time or datetime.datetime.now(datetime.UTC)
+    if observed_time.tzinfo is None:
+        observed_time = observed_time.replace(tzinfo=datetime.UTC)
+    observed_time = observed_time.astimezone(datetime.UTC)
+    max_age_seconds = max(
+        24 * 60 * 60,
+        _env_int(
+            "HLTHPRT_PROVIDER_DIRECTORY_BULK_MANIFEST_MAX_AGE_SECONDS",
+            BULK_EXPORT_DEFAULT_MAX_AGE_SECONDS,
+        ),
+    )
+    future_skew_seconds = max(
+        0,
+        min(
+            24 * 60 * 60,
+            _env_int(
+                "HLTHPRT_PROVIDER_DIRECTORY_BULK_MANIFEST_FUTURE_SKEW_SECONDS",
+                BULK_EXPORT_DEFAULT_FUTURE_SKEW_SECONDS,
+            ),
+        ),
+    )
+    if parsed_time < observed_time - datetime.timedelta(seconds=max_age_seconds):
+        raise ValueError("bulk_export_manifest_transaction_time_stale")
+    if parsed_time > observed_time + datetime.timedelta(seconds=future_skew_seconds):
+        raise ValueError("bulk_export_manifest_transaction_time_future")
+
+
+def _bulk_manifest_identity_map(
+    status_payload: dict[str, Any],
+    transaction_time: str,
+    request_url: str,
+    requires_access_token: bool,
+    normalized_outputs: list[dict[str, str]],
+    normalized_deleted: list[dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "transactionTime": transaction_time,
+        "request": request_url,
+        "requiresAccessToken": requires_access_token,
+        "output": normalized_outputs,
+        "deleted": normalized_deleted,
+        "error": (
+            status_payload.get("error")
+            if isinstance(status_payload.get("error"), list)
+            else []
+        ),
+    }
+
+
+def _bulk_manifest_outputs(
+    selected_outputs: list[dict[str, str]],
+    resource_type: str,
+) -> tuple[BulkExportManifestOutput, ...]:
+    return tuple(
+        BulkExportManifestOutput(
+            output_index=output_index,
+            resource_type=resource_type,
+            url=output_record["url"],
+            url_hash=hashlib.sha256(
+                output_record["url"].encode("utf-8")
+            ).hexdigest(),
+            identity_hash=_identity_hash(
+                {
+                    "resource_type": resource_type,
+                    "url": output_record["url"],
+                }
+            ),
+        )
+        for output_index, output_record in enumerate(selected_outputs)
+    )
+
+
+def _bulk_export_manifest_from_payload(
+    status_payload: dict[str, Any] | None,
+    resource_type: str,
+    *,
+    expected_request_url: str | None = None,
+) -> BulkExportManifest:
+    """Normalize and hash the immutable fields of one ready export manifest."""
+    if not _bulk_export_status_payload(status_payload):
+        raise ValueError("bulk_export_status_non_bulk_payload")
+    assert isinstance(status_payload, dict)
+    requires_access_token = status_payload.get("requiresAccessToken")
+    if not isinstance(requires_access_token, bool):
+        raise ValueError("bulk_export_manifest_invalid_requires_access_token")
+    transaction_time = _validated_bulk_transaction_time(
+        status_payload.get("transactionTime")
+    )
+    request_url = _clean_text(status_payload.get("request"))
+    if not request_url:
+        raise ValueError("bulk_export_manifest_missing_request")
+    request_identity = _normalized_bulk_request_identity(request_url)
+    if expected_request_url and request_identity != _normalized_bulk_request_identity(
+        expected_request_url
+    ):
+        raise ValueError("bulk_export_manifest_request_mismatch")
+    normalized_outputs = _normalized_bulk_manifest_entries(
+        status_payload,
+        "output",
+        is_required=True,
+    )
+    normalized_deleted = _normalized_bulk_manifest_entries(
+        status_payload,
+        "deleted",
+        is_required=False,
+    )
+    selected_outputs = [
+        output for output in normalized_outputs if output["type"] == resource_type
+    ]
+    if not selected_outputs:
+        raise ValueError("bulk_export_manifest_missing_resource_output")
+    manifest_map = _bulk_manifest_identity_map(
+        status_payload,
+        transaction_time,
+        request_url,
+        requires_access_token,
+        normalized_outputs,
+        normalized_deleted,
+    )
+    return BulkExportManifest(
+        identity_hash=_identity_hash(manifest_map),
+        payload=manifest_map,
+        requires_access_token=requires_access_token,
+        outputs=_bulk_manifest_outputs(selected_outputs, resource_type),
+    )
+
+
+def _bulk_export_checkpoint_identity(
+    checkpoint_context: PaginationCheckpointContext,
+    resource_type: str,
+    start_url: str,
+) -> BulkExportCheckpointIdentity:
+    if not _is_durable_bulk_checkpoint_context(checkpoint_context):
+        raise ValueError("bulk_export_checkpoint_context_incomplete")
+    start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
+    identity_map = {
+        "canonical_api_base": checkpoint_context.canonical_api_base,
+        "resource_type": resource_type,
+        "source_scope_hash": checkpoint_context.source_scope_hash,
+        "strategy_version": BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION,
+        "acquisition_root_run_id": checkpoint_context.acquisition_root_run_id,
+        "endpoint_id": checkpoint_context.endpoint_id,
+        "dataset_id": checkpoint_context.dataset_id,
+        "start_url_hash": start_url_hash,
+    }
+    return BulkExportCheckpointIdentity(
+        checkpoint_id=_identity_hash(identity_map),
+        canonical_api_base=checkpoint_context.canonical_api_base,
+        resource_type=resource_type,
+        source_scope_hash=checkpoint_context.source_scope_hash,
+        strategy_version=BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION,
+        acquisition_root_run_id=checkpoint_context.acquisition_root_run_id or "",
+        owner_run_id=checkpoint_context.owner_run_id,
+        retry_of_run_id=checkpoint_context.retry_of_run_id,
+        endpoint_id=checkpoint_context.endpoint_id or "",
+        dataset_id=checkpoint_context.dataset_id or "",
+        start_url=start_url,
+        start_url_hash=start_url_hash,
     )
 
 
@@ -9844,6 +10590,20 @@ def _bulk_export_log_url(url: str | None) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def _bulk_capability_log_identity(url: str | None) -> str | None:
+    capability_url = _clean_text(url)
+    if not capability_url:
+        return None
+    parsed_url = urllib.parse.urlsplit(capability_url)
+    capability_hash = hashlib.sha256(
+        capability_url.encode("utf-8")
+    ).hexdigest()[:16]
+    hostname = (parsed_url.hostname or "").rstrip(".").lower()
+    if not hostname:
+        return f"relative:sha256:{capability_hash}"
+    return f"{parsed_url.scheme.lower()}://{hostname}/<redacted>:sha256:{capability_hash}"
+
+
 def _bulk_export_log(event: str, **details: Any) -> None:
     rendered = " ".join(
         f"{key}={value}"
@@ -9854,19 +10614,28 @@ def _bulk_export_log(event: str, **details: Any) -> None:
     print(f"Provider Directory bulk export {event}{suffix}", flush=True)
 
 
+def _bulk_transport_error(exc: BaseException) -> str:
+    error_name = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        type(exc).__name__.lower(),
+    ).strip("_")
+    return f"bulk_export_transport_{error_name or 'error'}"
+
+
 async def _bulk_http_get_json(
     session: aiohttp.ClientSession,
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     url: str,
     *,
     timeout: int,
     prefer_async: bool = False,
 ) -> tuple[int | None, dict[str, str], dict[str, Any] | None, str | None]:
-    options = _credential_request_options_for_source(source, url)
-    headers = _bulk_json_headers(prefer_async=prefer_async)
-    headers.update(options["headers"])
-    fetch_url = _url_with_query_params(url, options["query_params"])
     try:
+        options = _bulk_export_source_request_options(source_record, url)
+        headers = _bulk_json_headers(prefer_async=prefer_async)
+        headers.update(options["headers"])
+        fetch_url = _url_with_query_params(url, options["query_params"])
         async with session.get(
             fetch_url,
             headers=headers,
@@ -9875,10 +10644,35 @@ async def _bulk_http_get_json(
             ssl=_ssl_context(),
         ) as response:
             body = await response.read()
-            header_map = {str(key).lower(): str(value) for key, value in response.headers.items()}
+            header_map = {
+                str(header_name).lower(): str(header_value)
+                for header_name, header_value in response.headers.items()
+            }
             return response.status, header_map, _decode_json_body(body), None
+    except ValueError as exc:
+        return None, {}, None, str(exc)
+    except OSError as exc:
+        error_text = str(exc)
+        if error_text == "bulk_export_non_public_dns_address":
+            return None, {}, None, error_text
+        return None, {}, None, _bulk_transport_error(exc)
     except Exception as exc:
-        return None, {}, None, f"{type(exc).__name__}: {exc}"
+        if "bulk_export_non_public_dns_address" in str(exc):
+            return None, {}, None, "bulk_export_non_public_dns_address"
+        return None, {}, None, _bulk_transport_error(exc)
+
+
+def _bulk_export_poll_settings() -> tuple[int, int]:
+    return (
+        _env_int(
+            "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_POLLS",
+            DEFAULT_BULK_EXPORT_MAX_POLLS,
+        ),
+        _env_int(
+            "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_POLL_SECONDS",
+            DEFAULT_BULK_EXPORT_POLL_SECONDS,
+        ),
+    )
 
 
 async def _bulk_export_poll_outputs(
@@ -9890,11 +10684,7 @@ async def _bulk_export_poll_outputs(
     timeout: int,
 ) -> tuple[list[str] | None, str | None, int]:
     """Poll a Bulk Data status URL until output URLs, an error, or timeout."""
-    max_polls = _env_int("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_POLLS", DEFAULT_BULK_EXPORT_MAX_POLLS)
-    poll_seconds = _env_int(
-        "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_POLL_SECONDS",
-        DEFAULT_BULK_EXPORT_POLL_SECONDS,
-    )
+    max_polls, poll_seconds = _bulk_export_poll_settings()
     for poll in range(1, max(1, max_polls) + 1):
         status_code, headers, payload, error = await _bulk_http_get_json(
             session,
@@ -9932,8 +10722,66 @@ async def _bulk_export_poll_outputs(
         resource=resource_type,
         polls=max(1, max_polls),
         max_polls=max_polls,
-        status_url=_bulk_export_log_url(status_url),
+        status_url=_bulk_capability_log_identity(status_url),
     )
+    return None, "bulk_export_timeout", max(1, max_polls)
+
+
+async def _bulk_export_poll_manifest(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    status_url: str,
+    *,
+    resource_type: str,
+    timeout: int,
+    lease_handler: Callable[[], Awaitable[None]] | None = None,
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    """Poll one accepted export while extending its ownership lease."""
+    max_polls, poll_seconds = _bulk_export_poll_settings()
+    for poll in range(1, max(1, max_polls) + 1):
+        status_code, headers, status_payload, request_error = await _bulk_http_get_json(
+            session,
+            source_record,
+            status_url,
+            timeout=timeout,
+        )
+        if lease_handler:
+            await lease_handler()
+        if request_error:
+            _bulk_export_log_poll_error(
+                source_record,
+                resource_type,
+                poll,
+                max_polls,
+                request_error,
+            )
+            return None, request_error, poll
+        if status_code == 202:
+            await _bulk_export_sleep_after_poll_wait(
+                source_record,
+                resource_type,
+                poll,
+                max_polls,
+                headers,
+                poll_seconds,
+                status_url,
+            )
+            continue
+        if status_code == 200:
+            if not _bulk_export_status_payload(status_payload):
+                return None, "bulk_export_status_non_bulk_payload", poll
+            return (
+                status_payload,
+                _bulk_export_payload_error(status_payload),
+                poll,
+            )
+        _bulk_export_log_poll_http_error(
+            source_record,
+            resource_type,
+            poll,
+            status_code,
+        )
+        return None, f"bulk_export_status_http_{status_code}", poll
     return None, "bulk_export_timeout", max(1, max_polls)
 
 
@@ -9973,7 +10821,7 @@ async def _bulk_export_sleep_after_poll_wait(
             max_polls=max_polls,
             status=202,
             sleep_seconds=sleep_seconds,
-            status_url=_bulk_export_log_url(status_url),
+            status_url=_bulk_capability_log_identity(status_url),
         )
     await asyncio.sleep(sleep_seconds)
 
@@ -10024,6 +10872,841 @@ def _bulk_export_log_poll_http_error(
     )
 
 
+def _bulk_acquisition_checkpoint_table_ref() -> str:
+    return _qt(
+        _schema(),
+        ProviderDirectoryBulkAcquisitionCheckpoint.__tablename__,
+    )
+
+
+def _bulk_output_checkpoint_table_ref() -> str:
+    return _qt(_schema(), ProviderDirectoryBulkOutputCheckpoint.__tablename__)
+
+
+def _bulk_checkpoint_identity_error(
+    checkpoint: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+) -> str | None:
+    expected_value_by_field = {
+        "checkpoint_id": identity.checkpoint_id,
+        "canonical_api_base": identity.canonical_api_base,
+        "resource_type": identity.resource_type,
+        "source_scope_hash": identity.source_scope_hash,
+        "strategy_version": identity.strategy_version,
+        "acquisition_root_run_id": identity.acquisition_root_run_id,
+        "endpoint_id": identity.endpoint_id,
+        "dataset_id": identity.dataset_id,
+        "start_url_hash": identity.start_url_hash,
+    }
+    for field_name, expected_value in expected_value_by_field.items():
+        if _clean_text(checkpoint.get(field_name)) != expected_value:
+            return f"bulk_export_checkpoint_identity_mismatch_{field_name}"
+    return None
+
+
+def _bulk_checkpoint_status_url_error(
+    checkpoint: dict[str, Any],
+) -> str | None:
+    status_url_ciphertext = _clean_text(checkpoint.get("status_url_ciphertext"))
+    status_url_hash = _clean_text(checkpoint.get("status_url_hash"))
+    if status_url_ciphertext is None and status_url_hash is None:
+        return None
+    if (
+        status_url_ciphertext is None
+        and status_url_hash is not None
+        and checkpoint.get("state")
+        in {BULK_EXPORT_CHECKPOINT_COMPLETE, BULK_EXPORT_CHECKPOINT_FAILED}
+    ):
+        return None
+    if status_url_ciphertext is None or status_url_hash is None:
+        return "bulk_export_status_url_hash_mismatch"
+    try:
+        status_url = _decrypt_bulk_capability(status_url_ciphertext)
+    except RuntimeError as exc:
+        return str(exc)
+    calculated_hash = hashlib.sha256(status_url.encode("utf-8")).hexdigest()
+    if calculated_hash != status_url_hash:
+        return "bulk_export_status_url_hash_mismatch"
+    return None
+
+
+def _bulk_checkpoint_status_url(checkpoint: dict[str, Any]) -> str | None:
+    status_url_error = _bulk_checkpoint_status_url_error(checkpoint)
+    if status_url_error:
+        raise RuntimeError(status_url_error)
+    status_url_ciphertext = _clean_text(checkpoint.get("status_url_ciphertext"))
+    return (
+        _decrypt_bulk_capability(status_url_ciphertext)
+        if status_url_ciphertext
+        else None
+    )
+
+
+async def _load_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+) -> dict[str, Any]:
+    checkpoint_row = await db.first(
+        f"""
+        SELECT checkpoint_id, canonical_api_base, resource_type,
+               source_scope_hash, strategy_version, acquisition_root_run_id,
+               owner_run_id, retry_of_run_id, endpoint_id, dataset_id,
+               start_url_hash, status_url_ciphertext, status_url_hash,
+               manifest_hash, manifest_ciphertext, manifest_json, state,
+               rows_written, error, lease_expires_at, created_at,
+               accepted_at, last_polled_at, manifest_received_at,
+               completed_at, failed_at, updated_at
+          FROM {_bulk_acquisition_checkpoint_table_ref()}
+         WHERE checkpoint_id = :checkpoint_id;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+    )
+    checkpoint = _pagination_checkpoint_row_mapping(checkpoint_row)
+    if not checkpoint:
+        return {}
+    identity_error = _bulk_checkpoint_identity_error(checkpoint, identity)
+    if identity_error:
+        raise RuntimeError(identity_error)
+    status_url_error = _bulk_checkpoint_status_url_error(checkpoint)
+    if status_url_error:
+        raise RuntimeError(status_url_error)
+    return checkpoint
+
+
+async def _adopt_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+) -> dict[str, Any]:
+    previous_owner_run_id = identity.retry_of_run_id
+    if not previous_owner_run_id:
+        raise RuntimeError("bulk_export_checkpoint_lineage_mismatch")
+    adopted_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET owner_run_id = :owner_run_id,
+               retry_of_run_id = :previous_owner_run_id,
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND endpoint_id = :endpoint_id
+           AND dataset_id = :dataset_id
+           AND owner_run_id = :previous_owner_run_id
+           AND state NOT IN (:complete_state, :failed_state, :starting_state)
+           AND (
+                state = :retryable_state
+                OR lease_expires_at IS NULL
+                OR lease_expires_at <= now()
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
+        endpoint_id=identity.endpoint_id,
+        dataset_id=identity.dataset_id,
+        owner_run_id=identity.owner_run_id,
+        previous_owner_run_id=previous_owner_run_id,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+        starting_state=BULK_EXPORT_CHECKPOINT_STARTING,
+        retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
+    )
+    if _coerce_rowcount(adopted_count) <= 0:
+        raise RuntimeError("bulk_export_checkpoint_ownership_conflict")
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    if not checkpoint:
+        raise RuntimeError("bulk_export_checkpoint_adoption_lost")
+    return checkpoint
+
+
+async def _reserve_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+) -> tuple[dict[str, Any], bool]:
+    reservation_row = await db.first(
+        f"""
+        INSERT INTO {_bulk_acquisition_checkpoint_table_ref()} (
+            checkpoint_id, canonical_api_base, resource_type,
+            source_scope_hash, strategy_version, acquisition_root_run_id,
+            owner_run_id, retry_of_run_id, endpoint_id, dataset_id,
+            start_url_hash, state, rows_written, lease_expires_at,
+            created_at, updated_at
+        ) VALUES (
+            :checkpoint_id, :canonical_api_base, :resource_type,
+            :source_scope_hash, :strategy_version, :acquisition_root_run_id,
+            :owner_run_id, :retry_of_run_id, :endpoint_id, :dataset_id,
+            :start_url_hash, :state, 0,
+            now() + make_interval(secs => :lease_seconds), now(), now()
+        ) ON CONFLICT DO NOTHING
+        RETURNING checkpoint_id;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        canonical_api_base=identity.canonical_api_base,
+        resource_type=identity.resource_type,
+        source_scope_hash=identity.source_scope_hash,
+        strategy_version=identity.strategy_version,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
+        owner_run_id=identity.owner_run_id,
+        retry_of_run_id=identity.retry_of_run_id,
+        endpoint_id=identity.endpoint_id,
+        dataset_id=identity.dataset_id,
+        start_url_hash=identity.start_url_hash,
+        state=BULK_EXPORT_CHECKPOINT_STARTING,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+    )
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    if not checkpoint:
+        raise RuntimeError("bulk_export_checkpoint_reservation_lost")
+    return checkpoint, bool(reservation_row)
+
+
+async def _release_bulk_export_reservation(
+    identity: BulkExportCheckpointIdentity,
+) -> None:
+    await db.status(
+        f"""
+        DELETE FROM {_bulk_acquisition_checkpoint_table_ref()}
+         WHERE checkpoint_id = :checkpoint_id
+           AND state = :state
+           AND status_url_ciphertext IS NULL
+           AND manifest_hash IS NULL;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        state=BULK_EXPORT_CHECKPOINT_STARTING,
+    )
+
+
+async def _insert_accepted_bulk_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+    status_url: str | None,
+) -> None:
+    status_url_ciphertext = (
+        _encrypt_bulk_capability(status_url) if status_url else None
+    )
+    status_url_hash = hashlib.sha256(status_url.encode("utf-8")).hexdigest() if status_url else None
+    await db.status(
+        f"""
+        INSERT INTO {_bulk_acquisition_checkpoint_table_ref()} (
+            checkpoint_id, canonical_api_base, resource_type,
+            source_scope_hash, strategy_version, acquisition_root_run_id,
+            owner_run_id, retry_of_run_id, endpoint_id, dataset_id,
+            start_url_hash, status_url_ciphertext, status_url_hash, state,
+            rows_written, lease_expires_at, created_at, accepted_at, updated_at
+        ) VALUES (
+            :checkpoint_id, :canonical_api_base, :resource_type,
+            :source_scope_hash, :strategy_version, :acquisition_root_run_id,
+            :owner_run_id, :retry_of_run_id, :endpoint_id, :dataset_id,
+            :start_url_hash, :status_url_ciphertext, :status_url_hash, :state, 0,
+            now() + make_interval(secs => :lease_seconds), now(), now(), now()
+        ) ON CONFLICT DO NOTHING;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        canonical_api_base=identity.canonical_api_base,
+        resource_type=identity.resource_type,
+        source_scope_hash=identity.source_scope_hash,
+        strategy_version=identity.strategy_version,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
+        owner_run_id=identity.owner_run_id,
+        retry_of_run_id=identity.retry_of_run_id,
+        endpoint_id=identity.endpoint_id,
+        dataset_id=identity.dataset_id,
+        start_url_hash=identity.start_url_hash,
+        status_url_ciphertext=status_url_ciphertext,
+        status_url_hash=status_url_hash,
+        state=BULK_EXPORT_CHECKPOINT_ACCEPTED,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+    )
+
+
+async def _mark_bulk_checkpoint_accepted(
+    identity: BulkExportCheckpointIdentity,
+    status_url: str | None,
+) -> None:
+    status_url_ciphertext = (
+        _encrypt_bulk_capability(status_url) if status_url else None
+    )
+    status_url_hash = hashlib.sha256(status_url.encode("utf-8")).hexdigest() if status_url else None
+    await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET status_url_ciphertext = :status_url_ciphertext,
+               status_url_hash = :status_url_hash,
+               state = :accepted_state,
+               error = NULL,
+               accepted_at = COALESCE(accepted_at, now()),
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id
+           AND (
+                state = :starting_state
+                OR (
+                    state = :accepted_state
+                    AND status_url_hash IS NOT DISTINCT FROM :status_url_hash
+                )
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        status_url_ciphertext=status_url_ciphertext,
+        status_url_hash=status_url_hash,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        starting_state=BULK_EXPORT_CHECKPOINT_STARTING,
+        accepted_state=BULK_EXPORT_CHECKPOINT_ACCEPTED,
+    )
+
+
+async def _accept_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+    status_url: str | None,
+) -> dict[str, Any]:
+    await _insert_accepted_bulk_checkpoint(identity, status_url)
+    await _mark_bulk_checkpoint_accepted(identity, status_url)
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    if _clean_text(checkpoint.get("owner_run_id")) != identity.owner_run_id:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+    stored_status_url = _bulk_checkpoint_status_url(checkpoint)
+    if stored_status_url != status_url:
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            "bulk_export_status_url_mismatch",
+            terminal=True,
+        )
+        raise RuntimeError("bulk_export_status_url_mismatch")
+    return checkpoint
+
+
+def _is_bulk_export_error_terminal(error: str | None) -> bool:
+    if not error:
+        return False
+    terminal_errors = {
+        "bulk_export_missing_status_url",
+        "bulk_export_untrusted_status_url",
+        "bulk_export_untrusted_source_url",
+        "bulk_export_untrusted_output_url",
+        "bulk_export_external_output_requires_access_token",
+        "bulk_export_status_url_mismatch",
+        "bulk_export_status_url_hash_mismatch",
+        "bulk_export_acceptance_outcome_unknown",
+        "bulk_export_manifest_mismatch",
+        "bulk_export_manifest_checkpoint_corrupt",
+        "bulk_export_status_non_bulk_payload",
+        "bulk_export_checkpoint_output_bounded",
+        "bulk_export_checkpoint_ciphertext_invalid",
+        "bulk_export_non_public_dns_address",
+        "bulk_export_output_resource_type_mismatch",
+        "invalid_ndjson",
+    }
+    terminal_prefixes = ("bulk_export_manifest_", "bulk_export_error_")
+    if error in terminal_errors or error.startswith(terminal_prefixes):
+        return True
+    if error.startswith("bulk_export_status_http_"):
+        status_text = error.rsplit("_", 1)[-1]
+        return status_text.isdigit() and 300 <= int(status_text) < 500
+    if error.startswith("bulk_export_output_http_"):
+        status_text = error.rsplit("_", 1)[-1]
+        return status_text.isdigit() and 300 <= int(status_text) < 500
+    return False
+
+
+async def _record_bulk_export_checkpoint_error(
+    identity: BulkExportCheckpointIdentity,
+    error: str,
+    *,
+    terminal: bool,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET state = CASE
+                    WHEN :terminal THEN :failed_state
+                    ELSE :retryable_state
+               END,
+               error = :error,
+               last_polled_at = now(),
+               failed_at = CASE WHEN :terminal THEN now() ELSE failed_at END,
+               lease_expires_at = now(),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id
+           AND state <> :complete_state;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        terminal=terminal,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+        retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        error=error,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+    if terminal:
+        await _clear_bulk_export_capabilities(identity)
+
+
+async def _clear_bulk_export_capabilities(
+    identity: BulkExportCheckpointIdentity,
+) -> None:
+    async with db.acquire() as connection:
+        await connection.status(
+            f"""
+            UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+               SET status_url_ciphertext = NULL,
+                   manifest_ciphertext = NULL,
+                   updated_at = now()
+             WHERE checkpoint_id = :checkpoint_id
+               AND owner_run_id = :owner_run_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+        )
+        await connection.status(
+            f"""
+            UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+               SET output_url_ciphertext = NULL,
+                   updated_at = now()
+              FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+             WHERE output.checkpoint_id = :checkpoint_id
+               AND acquisition.checkpoint_id = output.checkpoint_id
+               AND acquisition.owner_run_id = :owner_run_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+        )
+
+
+def _bulk_manifest_payload_from_checkpoint(
+    checkpoint: dict[str, Any],
+) -> dict[str, Any] | None:
+    manifest_ciphertext = _clean_text(checkpoint.get("manifest_ciphertext"))
+    if not manifest_ciphertext:
+        return None
+    try:
+        manifest_payload = json.loads(
+            _decrypt_bulk_capability(manifest_ciphertext)
+        )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("bulk_export_manifest_checkpoint_corrupt") from exc
+    if not isinstance(manifest_payload, dict):
+        raise RuntimeError("bulk_export_manifest_checkpoint_corrupt")
+    return manifest_payload
+
+
+def _bulk_manifest_from_checkpoint(
+    checkpoint: dict[str, Any],
+    resource_type: str,
+    expected_request_url: str,
+) -> BulkExportManifest | None:
+    manifest_hash = _clean_text(checkpoint.get("manifest_hash"))
+    manifest_payload = _bulk_manifest_payload_from_checkpoint(checkpoint)
+    if not manifest_hash and manifest_payload is None:
+        return None
+    if not manifest_hash or manifest_payload is None:
+        raise ValueError("bulk_export_manifest_checkpoint_corrupt")
+    manifest = _bulk_export_manifest_from_payload(
+        manifest_payload,
+        resource_type,
+        expected_request_url=expected_request_url,
+    )
+    if manifest.identity_hash != manifest_hash:
+        raise ValueError("bulk_export_manifest_checkpoint_corrupt")
+    return manifest
+
+
+def _assert_bulk_export_manifest_unchanged(
+    checkpoint: dict[str, Any],
+    manifest: BulkExportManifest,
+) -> None:
+    stored_manifest_hash = _clean_text(checkpoint.get("manifest_hash"))
+    if stored_manifest_hash and stored_manifest_hash != manifest.identity_hash:
+        raise ValueError("bulk_export_manifest_mismatch")
+
+
+def _bulk_manifest_output_id(
+    checkpoint_id: str,
+    output: BulkExportManifestOutput,
+) -> str:
+    return _identity_hash(
+        {
+            "checkpoint_id": checkpoint_id,
+            "output_identity_hash": output.identity_hash,
+        }
+    )
+
+
+async def _persist_bulk_manifest_outputs(
+    connection: Any,
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+) -> None:
+    for manifest_output in manifest.outputs:
+        await connection.status(
+            f"""
+            INSERT INTO {_bulk_output_checkpoint_table_ref()} (
+                checkpoint_id, output_id, output_index, resource_type,
+                output_url_ciphertext, output_url_hash, state, rows_written,
+                attempt_count, created_at, updated_at
+            ) VALUES (
+                :checkpoint_id, :output_id, :output_index, :resource_type,
+                :output_url_ciphertext, :output_url_hash, :state, 0, 0,
+                now(), now()
+            ) ON CONFLICT DO NOTHING;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            output_id=_bulk_manifest_output_id(
+                identity.checkpoint_id,
+                manifest_output,
+            ),
+            output_index=manifest_output.output_index,
+            resource_type=manifest_output.resource_type,
+            output_url_ciphertext=_encrypt_bulk_capability(manifest_output.url),
+            output_url_hash=manifest_output.url_hash,
+            state=BULK_EXPORT_OUTPUT_PENDING,
+        )
+
+
+async def _persist_bulk_export_manifest(
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+) -> dict[str, Any]:
+    """Persist one immutable encrypted manifest under the current owner lease."""
+    _assert_bulk_transaction_time_window(
+        str(manifest.payload["transactionTime"])
+    )
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    _assert_bulk_export_manifest_unchanged(checkpoint, manifest)
+    manifest_json = json.dumps(manifest.payload, sort_keys=True)
+    manifest_ciphertext = _encrypt_bulk_capability(manifest_json)
+    manifest_audit_json = json.dumps(
+        _bulk_manifest_audit_payload(manifest.payload),
+        sort_keys=True,
+    )
+    async with db.acquire() as connection:
+        manifest_update_count = await connection.status(
+            f"""
+            UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+               SET manifest_hash = :manifest_hash,
+                   manifest_ciphertext = :manifest_ciphertext,
+                   manifest_json = CAST(:manifest_audit_json AS jsonb),
+                   state = :state,
+                   error = NULL,
+                   last_polled_at = now(),
+                   lease_expires_at = now() + make_interval(secs => :lease_seconds),
+                   manifest_received_at = COALESCE(manifest_received_at, now()),
+                   updated_at = now()
+             WHERE checkpoint_id = :checkpoint_id
+               AND owner_run_id = :owner_run_id
+               AND state NOT IN (:complete_state, :failed_state)
+               AND (manifest_hash IS NULL OR manifest_hash = :manifest_hash);
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+            complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+            failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+            manifest_hash=manifest.identity_hash,
+            manifest_ciphertext=manifest_ciphertext,
+            manifest_audit_json=manifest_audit_json,
+            lease_seconds=_bulk_checkpoint_lease_seconds(),
+            state=BULK_EXPORT_CHECKPOINT_MANIFEST_READY,
+        )
+        if _coerce_rowcount(manifest_update_count) <= 0:
+            raise ValueError("bulk_export_manifest_mismatch")
+        await _persist_bulk_manifest_outputs(connection, identity, manifest)
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    _assert_bulk_export_manifest_unchanged(checkpoint, manifest)
+    return checkpoint
+
+
+async def _load_bulk_output_checkpoints(
+    checkpoint_id: str,
+) -> list[dict[str, Any]]:
+    output_rows = await db.all(
+        f"""
+        SELECT checkpoint_id, output_id, output_index, resource_type,
+               output_url_ciphertext, output_url_hash, state, rows_written,
+               attempt_count, error, started_at, completed_at, updated_at
+          FROM {_bulk_output_checkpoint_table_ref()}
+         WHERE checkpoint_id = :checkpoint_id
+         ORDER BY output_index;
+        """,
+        checkpoint_id=checkpoint_id,
+    )
+    return [_pagination_checkpoint_row_mapping(row) for row in output_rows]
+
+
+def _bulk_output_checkpoint_error(
+    checkpoint_id: str,
+    manifest: BulkExportManifest,
+    output_checkpoints: list[dict[str, Any]],
+) -> str | None:
+    expected_output_identities = [
+        (
+            _bulk_manifest_output_id(checkpoint_id, output),
+            output.output_index,
+            output.resource_type,
+            output.url_hash,
+        )
+        for output in manifest.outputs
+    ]
+    observed_output_identities = [
+        (
+            _clean_text(output.get("output_id")),
+            output.get("output_index"),
+            _clean_text(output.get("resource_type")),
+            _clean_text(output.get("output_url_hash")),
+        )
+        for output in output_checkpoints
+    ]
+    if observed_output_identities != expected_output_identities:
+        return "bulk_export_manifest_output_checkpoint_mismatch"
+    return None
+
+
+async def _refresh_bulk_export_rows_written(
+    identity: BulkExportCheckpointIdentity,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+           SET rows_written = (
+                SELECT COALESCE(sum(output.rows_written), 0)
+                  FROM {_bulk_output_checkpoint_table_ref()} AS output
+                 WHERE output.checkpoint_id = acquisition.checkpoint_id
+               ),
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE acquisition.checkpoint_id = :checkpoint_id
+           AND acquisition.owner_run_id = :owner_run_id
+           AND acquisition.state NOT IN (:complete_state, :failed_state);
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+
+
+async def _begin_bulk_export_output(
+    identity: BulkExportCheckpointIdentity,
+    output_id: str,
+) -> None:
+    output_update_count = await db.status(
+        f"""
+        UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+           SET state = :state,
+               rows_written = 0,
+               attempt_count = attempt_count + 1,
+               error = NULL,
+               started_at = now(),
+               completed_at = NULL,
+               updated_at = now()
+         WHERE output.checkpoint_id = :checkpoint_id
+           AND output.output_id = :output_id
+           AND output.state <> :complete_state
+           AND EXISTS (
+                SELECT 1
+                  FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+                 WHERE acquisition.checkpoint_id = output.checkpoint_id
+                   AND acquisition.owner_run_id = :owner_run_id
+                   AND acquisition.state NOT IN (
+                        :checkpoint_complete_state,
+                        :checkpoint_failed_state
+                   )
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        output_id=output_id,
+        owner_run_id=identity.owner_run_id,
+        state=BULK_EXPORT_OUTPUT_STREAMING,
+        complete_state=BULK_EXPORT_OUTPUT_COMPLETE,
+        checkpoint_complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        checkpoint_failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+    )
+    if _coerce_rowcount(output_update_count) <= 0:
+        raise RuntimeError("bulk_export_output_ownership_lost")
+    checkpoint_update_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET state = :state,
+               error = NULL,
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id
+           AND state <> :complete_state;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        state=BULK_EXPORT_CHECKPOINT_STREAMING,
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+    )
+    if _coerce_rowcount(checkpoint_update_count) <= 0:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+    await _refresh_bulk_export_rows_written(identity)
+
+
+async def _record_bulk_export_output_progress(
+    identity: BulkExportCheckpointIdentity,
+    output_id: str,
+    rows_written: int,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+           SET rows_written = :rows_written,
+               updated_at = now()
+         WHERE output.checkpoint_id = :checkpoint_id
+           AND output.output_id = :output_id
+           AND output.state = :state
+           AND EXISTS (
+                SELECT 1
+                  FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+                 WHERE acquisition.checkpoint_id = output.checkpoint_id
+                   AND acquisition.owner_run_id = :owner_run_id
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        output_id=output_id,
+        owner_run_id=identity.owner_run_id,
+        rows_written=rows_written,
+        state=BULK_EXPORT_OUTPUT_STREAMING,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_output_ownership_lost")
+    await _refresh_bulk_export_rows_written(identity)
+
+
+async def _complete_bulk_export_output(
+    identity: BulkExportCheckpointIdentity,
+    output_id: str,
+    rows_written: int,
+) -> None:
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+           SET state = :state,
+               rows_written = :rows_written,
+               error = NULL,
+               completed_at = now(),
+               updated_at = now()
+         WHERE output.checkpoint_id = :checkpoint_id
+           AND output.output_id = :output_id
+           AND output.state = :streaming_state
+           AND EXISTS (
+                SELECT 1
+                  FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+                 WHERE acquisition.checkpoint_id = output.checkpoint_id
+                   AND acquisition.owner_run_id = :owner_run_id
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        output_id=output_id,
+        owner_run_id=identity.owner_run_id,
+        state=BULK_EXPORT_OUTPUT_COMPLETE,
+        streaming_state=BULK_EXPORT_OUTPUT_STREAMING,
+        rows_written=rows_written,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_output_ownership_lost")
+    await _refresh_bulk_export_rows_written(identity)
+
+
+async def _record_bulk_export_output_error(
+    identity: BulkExportCheckpointIdentity,
+    output_id: str,
+    rows_written: int,
+    error: str,
+) -> None:
+    is_terminal = _is_bulk_export_error_terminal(error)
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_output_checkpoint_table_ref()} AS output
+           SET state = :state,
+               rows_written = :rows_written,
+               error = :error,
+               updated_at = now()
+         WHERE output.checkpoint_id = :checkpoint_id
+           AND output.output_id = :output_id
+           AND EXISTS (
+                SELECT 1
+                  FROM {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+                 WHERE acquisition.checkpoint_id = output.checkpoint_id
+                   AND acquisition.owner_run_id = :owner_run_id
+           );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        output_id=output_id,
+        owner_run_id=identity.owner_run_id,
+        state=(
+            BULK_EXPORT_OUTPUT_FAILED
+            if is_terminal
+            else BULK_EXPORT_OUTPUT_PENDING
+        ),
+        rows_written=rows_written,
+        error=error,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_output_ownership_lost")
+    await _refresh_bulk_export_rows_written(identity)
+    await _record_bulk_export_checkpoint_error(
+        identity,
+        error,
+        terminal=is_terminal,
+    )
+
+
+async def _complete_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+) -> None:
+    completed_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()} AS acquisition
+           SET state = :state,
+               error = NULL,
+               completed_at = now(),
+               updated_at = now()
+         WHERE acquisition.checkpoint_id = :checkpoint_id
+           AND acquisition.owner_run_id = :owner_run_id
+           AND acquisition.state <> :failed_state
+           AND EXISTS (
+                SELECT 1
+                  FROM {_bulk_output_checkpoint_table_ref()} AS output
+                 WHERE output.checkpoint_id = acquisition.checkpoint_id
+               )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {_bulk_output_checkpoint_table_ref()} AS output
+                 WHERE output.checkpoint_id = acquisition.checkpoint_id
+                   AND output.state <> :output_complete_state
+               );
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+        output_complete_state=BULK_EXPORT_OUTPUT_COMPLETE,
+    )
+    checkpoint_row = await db.first(
+        f"""
+        SELECT state
+          FROM {_bulk_acquisition_checkpoint_table_ref()}
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+    )
+    checkpoint = _pagination_checkpoint_row_mapping(checkpoint_row)
+    if (
+        _coerce_rowcount(completed_count) <= 0
+        or checkpoint.get("state") != BULK_EXPORT_CHECKPOINT_COMPLETE
+    ):
+        raise RuntimeError("bulk_export_checkpoint_completion_lost")
+    await _clear_bulk_export_capabilities(identity)
+
+
 async def _stream_bulk_export_output_rows(
     session: aiohttp.ClientSession,
     source: dict[str, Any],
@@ -10037,11 +11720,9 @@ async def _stream_bulk_export_output_rows(
     row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
     row_batch_size: int,
     retain_rows: bool,
+    requires_access_token: bool | None = None,
+    row_progress_handler: Callable[[int], Awaitable[None]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
-    options = _credential_request_options_for_source(source, url)
-    headers = _bulk_ndjson_headers()
-    headers.update(options["headers"])
-    fetch_url = _url_with_query_params(url, options["query_params"])
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     stream_counts_by_name = {"rows_fetched": 0, "rows_written": 0}
@@ -10052,6 +11733,8 @@ async def _stream_bulk_export_output_rows(
             pending_rows_list = list(pending_rows)
             pending_rows.clear()
             stream_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
+            if row_progress_handler:
+                await row_progress_handler(stream_counts_by_name["rows_written"])
 
     def handle_line(raw_line: bytes) -> str | None:
         line = raw_line.strip()
@@ -10061,12 +11744,18 @@ async def _stream_bulk_export_output_rows(
             resource = json.loads(line.decode("utf-8-sig", errors="replace"))
         except json.JSONDecodeError:
             return "invalid_ndjson"
-        if not isinstance(resource, dict) or resource.get("resourceType") != resource_type:
-            return None
+        if not isinstance(resource, dict):
+            return "invalid_ndjson" if row_progress_handler is not None else None
+        if resource.get("resourceType") != resource_type:
+            return (
+                "bulk_export_output_resource_type_mismatch"
+                if row_progress_handler is not None
+                else None
+            )
         parsed = parse_fhir_resource(
             source["source_id"],
             resource,
-            resource_url=url,
+            resource_url=_bulk_capability_log_identity(url),
             run_id=run_id,
             normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
         )
@@ -10085,18 +11774,26 @@ async def _stream_bulk_export_output_rows(
         return None
 
     try:
+        options = _bulk_export_output_request_options(
+            source,
+            url,
+            requires_access_token=requires_access_token,
+        )
+        headers = _bulk_ndjson_headers()
+        headers.update(options["headers"])
+        fetch_url = _url_with_query_params(url, options["query_params"])
         _bulk_export_log(
             "stream_start",
             source_id=source.get("source_id"),
             resource=resource_type,
-            output_url=_bulk_export_log_url(url),
+            output_url=_bulk_capability_log_identity(url),
             row_batch_size=row_batch_size,
         )
         async with session.get(
             fetch_url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=timeout, sock_read=timeout),
-            allow_redirects=True,
+            allow_redirects=False,
             ssl=_ssl_context(),
         ) as response:
             if response.status != 200:
@@ -10120,8 +11817,58 @@ async def _stream_bulk_export_output_rows(
                     return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, error)
             await flush_pending_rows()
             return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, None)
+    except ValueError as exc:
+        return _bulk_stream_result(
+            rows,
+            stream_counts_by_name,
+            row_limit_by_name,
+            str(exc),
+        )
+    except RuntimeError as exc:
+        if str(exc) in {
+            "bulk_export_checkpoint_ownership_lost",
+            "bulk_export_checkpoint_worker_guard_lost",
+        }:
+            return _bulk_stream_result(
+                rows,
+                stream_counts_by_name,
+                row_limit_by_name,
+                str(exc),
+            )
+        return _bulk_stream_result(
+            rows,
+            stream_counts_by_name,
+            row_limit_by_name,
+            _bulk_transport_error(exc),
+        )
+    except OSError as exc:
+        if str(exc) == "bulk_export_non_public_dns_address":
+            return _bulk_stream_result(
+                rows,
+                stream_counts_by_name,
+                row_limit_by_name,
+                "bulk_export_non_public_dns_address",
+            )
+        return _bulk_stream_result(
+            rows,
+            stream_counts_by_name,
+            row_limit_by_name,
+            _bulk_transport_error(exc),
+        )
     except Exception as exc:
-        return _bulk_stream_result(rows, stream_counts_by_name, row_limit_by_name, f"{type(exc).__name__}: {exc}")
+        if "bulk_export_non_public_dns_address" in str(exc):
+            return _bulk_stream_result(
+                rows,
+                stream_counts_by_name,
+                row_limit_by_name,
+                "bulk_export_non_public_dns_address",
+            )
+        return _bulk_stream_result(
+            rows,
+            stream_counts_by_name,
+            row_limit_by_name,
+            _bulk_transport_error(exc),
+        )
 
 
 def _bulk_stream_result(
@@ -10139,6 +11886,730 @@ def _bulk_stream_result(
     )
 
 
+def _checkpointed_bulk_fetch_result(
+    model: type,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+    rows_fetched: int = 0,
+    rows_written: int = 0,
+    outputs_processed: int = 0,
+    polls: int = 0,
+    complete: bool = False,
+    error: str | None = None,
+) -> ResourceFetchResult:
+    return ResourceFetchResult(
+        model=model,
+        rows=rows or [],
+        rows_fetched=rows_fetched,
+        rows_written=rows_written,
+        pages_fetched=outputs_processed + polls,
+        complete=complete,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=not complete,
+        error=error,
+        fetch_mode="checkpointed_bulk_export",
+    )
+
+
+async def _accept_checkpointed_bulk_start(
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    status_code: int,
+    raw_status_location: str | None,
+    status_payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    status_url: str | None = None
+    if status_code == 202:
+        try:
+            status_url = _resolved_bulk_export_status_url(
+                source_record,
+                identity.start_url,
+                raw_status_location,
+            )
+        except ValueError as exc:
+            checkpoint = await _accept_bulk_export_checkpoint(
+                identity,
+                None,
+            )
+            await _record_bulk_export_checkpoint_error(
+                identity,
+                str(exc),
+                terminal=True,
+            )
+            return checkpoint, None, str(exc)
+    try:
+        checkpoint = await _accept_bulk_export_checkpoint(identity, status_url)
+    except RuntimeError as exc:
+        return await _load_bulk_export_checkpoint(identity), None, str(exc)
+    return checkpoint, status_payload if status_code == 200 else None, None
+
+
+async def _start_checkpointed_bulk_export(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    *,
+    timeout: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    status_code, headers, status_payload, start_error = await _bulk_http_get_json(
+        session,
+        source_record,
+        identity.start_url,
+        timeout=timeout,
+        prefer_async=True,
+    )
+    raw_status_location = _clean_text(
+        headers.get("content-location") or headers.get("location")
+    )
+    _bulk_export_log(
+        "start",
+        source_id=source_record.get("source_id"),
+        resource=identity.resource_type,
+        status=status_code,
+        error=start_error,
+        start_url=_bulk_export_log_url(identity.start_url),
+        status_url=_bulk_capability_log_identity(raw_status_location),
+    )
+    if start_error or status_code is None:
+        return await _fail_unknown_bulk_export_acceptance(identity)
+    if status_code not in {200, 202}:
+        await _release_bulk_export_reservation(identity)
+        return None, None, None
+    if status_code == 200 and not _bulk_export_status_payload(status_payload):
+        await _release_bulk_export_reservation(identity)
+        return None, None, None
+    return await _accept_checkpointed_bulk_start(
+        source_record,
+        identity,
+        status_code,
+        raw_status_location,
+        status_payload,
+    )
+
+
+async def _poll_checkpointed_bulk_export_manifest(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    *,
+    timeout: int,
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    try:
+        stored_status_url = _bulk_checkpoint_status_url(checkpoint)
+        status_url = _resolved_bulk_export_status_url(
+            source_record,
+            identity.start_url,
+            stored_status_url,
+        )
+    except (RuntimeError, ValueError) as exc:
+        checkpoint_error = str(exc)
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            checkpoint_error,
+            terminal=_is_bulk_export_error_terminal(checkpoint_error),
+        )
+        return None, checkpoint_error, 0
+    status_payload, poll_error, polls = await _bulk_export_poll_manifest(
+        session,
+        source_record,
+        status_url,
+        resource_type=identity.resource_type,
+        timeout=timeout,
+        lease_handler=partial(_refresh_bulk_export_rows_written, identity),
+    )
+    if poll_error:
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            poll_error,
+            terminal=_is_bulk_export_error_terminal(poll_error),
+        )
+    return status_payload, poll_error, polls
+
+
+async def _persist_ready_bulk_export_manifest(
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    status_payload: dict[str, Any] | None,
+    *,
+    polls: int,
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    payload_error = _bulk_export_payload_error(status_payload)
+    if payload_error:
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            payload_error,
+            terminal=True,
+        )
+        return None, payload_error, polls
+    try:
+        manifest = _bulk_export_manifest_from_payload(
+            status_payload,
+            identity.resource_type,
+            expected_request_url=identity.start_url,
+        )
+        for manifest_output in manifest.outputs:
+            _bulk_export_output_request_options(
+                source_record,
+                manifest_output.url,
+                requires_access_token=manifest.requires_access_token,
+            )
+        await _persist_bulk_export_manifest(identity, manifest)
+    except (RuntimeError, ValueError) as exc:
+        manifest_error = str(exc)
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            manifest_error,
+            terminal=_is_bulk_export_error_terminal(manifest_error),
+        )
+        return None, manifest_error, polls
+    return manifest, None, polls
+
+
+async def _checkpointed_bulk_export_manifest(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    *,
+    initial_status_payload: dict[str, Any] | None,
+    timeout: int,
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    try:
+        stored_manifest = _bulk_manifest_from_checkpoint(
+            checkpoint,
+            identity.resource_type,
+            identity.start_url,
+        )
+    except (RuntimeError, ValueError) as exc:
+        checkpoint_error = str(exc)
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            checkpoint_error,
+            terminal=_is_bulk_export_error_terminal(checkpoint_error),
+        )
+        return None, checkpoint_error, 0
+    if stored_manifest is not None:
+        return stored_manifest, None, 0
+    status_payload = initial_status_payload
+    polls = 0
+    if status_payload is None:
+        status_payload, poll_error, polls = (
+            await _poll_checkpointed_bulk_export_manifest(
+                session,
+                source_record,
+                identity,
+                checkpoint,
+                timeout=timeout,
+            )
+        )
+        if poll_error:
+            return None, poll_error, polls
+    return await _persist_ready_bulk_export_manifest(
+        source_record,
+        identity,
+        status_payload,
+        polls=polls,
+    )
+
+
+def _bulk_output_rows_written(
+    output_checkpoints: list[dict[str, Any]],
+) -> int:
+    return sum(max(0, int(output.get("rows_written") or 0)) for output in output_checkpoints)
+
+
+def _checkpointed_bulk_stream_result(
+    options: BulkExportStreamOptions,
+    stream_state: BulkExportStreamState,
+    output_checkpoints: list[dict[str, Any]],
+    *,
+    is_complete: bool = False,
+    error: str | None = None,
+) -> ResourceFetchResult:
+    return _checkpointed_bulk_fetch_result(
+        options.model,
+        rows=stream_state.retained_resource_rows,
+        rows_fetched=_bulk_output_rows_written(output_checkpoints),
+        rows_written=stream_state.rows_written_this_run,
+        outputs_processed=stream_state.outputs_processed,
+        polls=options.polls,
+        complete=is_complete,
+        error=error,
+    )
+
+
+def _bulk_stream_options(
+    model: type,
+    fetch_options: BulkExportFetchOptions,
+    polls: int,
+    ownership_probe: Callable[[], Awaitable[None]],
+) -> BulkExportStreamOptions:
+    return BulkExportStreamOptions(
+        model=model,
+        timeout=fetch_options.timeout,
+        run_id=fetch_options.run_id,
+        row_batch_handler=fetch_options.row_batch_handler,
+        row_batch_size=fetch_options.row_batch_size,
+        retain_rows=fetch_options.retain_rows,
+        polls=polls,
+        ownership_probe=ownership_probe,
+    )
+
+
+def _log_checkpointed_bulk_output(
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    *,
+    rows_fetched: int,
+    rows_written: int,
+    is_limited: bool,
+    output_error: str | None,
+) -> None:
+    _bulk_export_log(
+        "stream_output",
+        source_id=source_record.get("source_id"),
+        resource=identity.resource_type,
+        fetched=rows_fetched,
+        written=rows_written,
+        limited=is_limited,
+        error=output_error,
+    )
+
+
+async def _request_checkpointed_bulk_output(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    manifest_output: BulkExportManifestOutput,
+    options: BulkExportStreamOptions,
+    progress_handler: Callable[[int], Awaitable[None]],
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    guarded_row_batch_handler = partial(
+        _write_owned_bulk_batch,
+        options,
+    )
+    return await _stream_bulk_export_output_rows(
+        session,
+        source_record,
+        manifest_output.url,
+        model=options.model,
+        resource_type=identity.resource_type,
+        per_resource_limit=0,
+        timeout=options.timeout,
+        run_id=options.run_id,
+        row_batch_handler=guarded_row_batch_handler,
+        row_batch_size=options.row_batch_size,
+        retain_rows=options.retain_rows,
+        requires_access_token=manifest.requires_access_token,
+        row_progress_handler=progress_handler,
+    )
+
+
+async def _write_owned_bulk_batch(
+    options: BulkExportStreamOptions,
+    model: type,
+    resource_rows: list[dict[str, Any]],
+) -> int:
+    await options.ownership_probe()
+    return await options.row_batch_handler(model, resource_rows)
+
+
+async def _stream_one_checkpointed_bulk_output(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    manifest_output: BulkExportManifestOutput,
+    options: BulkExportStreamOptions,
+    stream_state: BulkExportStreamState,
+) -> str | None:
+    """Restart one incomplete output and persist progress after each write batch."""
+    output_id = _bulk_manifest_output_id(identity.checkpoint_id, manifest_output)
+    await options.ownership_probe()
+    await _begin_bulk_export_output(identity, output_id)
+    persist_output_progress = partial(
+        _record_bulk_export_output_progress,
+        identity,
+        output_id,
+    )
+    streamed_resource_rows, rows_fetched, rows_written, is_limited, stream_error = (
+        await _request_checkpointed_bulk_output(
+            session,
+            source_record,
+            identity,
+            manifest,
+            manifest_output,
+            options,
+            persist_output_progress,
+        )
+    )
+    stream_state.outputs_processed += 1
+    stream_state.rows_written_this_run += rows_written
+    stream_state.retained_resource_rows.extend(streamed_resource_rows)
+    output_error = stream_error or (
+        "bulk_export_checkpoint_output_bounded" if is_limited else None
+    )
+    _log_checkpointed_bulk_output(
+        source_record,
+        identity,
+        rows_fetched=rows_fetched,
+        rows_written=rows_written,
+        is_limited=is_limited,
+        output_error=output_error,
+    )
+    if output_error:
+        await _record_bulk_export_output_error(
+            identity,
+            output_id,
+            rows_written,
+            output_error,
+        )
+        return output_error
+    await options.ownership_probe()
+    await _complete_bulk_export_output(
+        identity,
+        output_id,
+        rows_written,
+    )
+    return None
+
+
+async def _finalize_checkpointed_bulk_outputs(
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    options: BulkExportStreamOptions,
+    stream_state: BulkExportStreamState,
+    output_checkpoints: list[dict[str, Any]],
+) -> ResourceFetchResult:
+    output_checkpoint_error = _bulk_output_checkpoint_error(
+        identity.checkpoint_id,
+        manifest,
+        output_checkpoints,
+    )
+    is_every_output_complete = bool(output_checkpoints) and all(
+        output.get("state") == BULK_EXPORT_OUTPUT_COMPLETE
+        for output in output_checkpoints
+    )
+    if output_checkpoint_error or not is_every_output_complete:
+        final_error = output_checkpoint_error or "bulk_export_outputs_incomplete"
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            final_error,
+            terminal=True,
+        )
+        return _checkpointed_bulk_stream_result(
+            options,
+            stream_state,
+            output_checkpoints,
+            error=final_error,
+        )
+    try:
+        await options.ownership_probe()
+        await _complete_bulk_export_checkpoint(identity)
+    except RuntimeError as exc:
+        return _checkpointed_bulk_stream_result(
+            options,
+            stream_state,
+            output_checkpoints,
+            error=str(exc),
+        )
+    return _checkpointed_bulk_stream_result(
+        options,
+        stream_state,
+        output_checkpoints,
+        is_complete=True,
+    )
+
+
+async def _validated_bulk_output_checkpoints(
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+) -> tuple[list[dict[str, Any]], str | None]:
+    output_checkpoints = await _load_bulk_output_checkpoints(identity.checkpoint_id)
+    checkpoint_error = _bulk_output_checkpoint_error(
+        identity.checkpoint_id,
+        manifest,
+        output_checkpoints,
+    )
+    if checkpoint_error:
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            checkpoint_error,
+            terminal=True,
+        )
+    return output_checkpoints, checkpoint_error
+
+
+async def _resume_checkpointed_bulk_outputs(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    options: BulkExportStreamOptions,
+    output_checkpoints: list[dict[str, Any]],
+) -> tuple[BulkExportStreamState, str | None]:
+    output_checkpoint_by_id = {
+        _clean_text(output.get("output_id")): output
+        for output in output_checkpoints
+    }
+    stream_state = BulkExportStreamState()
+    for manifest_output in manifest.outputs:
+        output_id = _bulk_manifest_output_id(identity.checkpoint_id, manifest_output)
+        output_checkpoint = output_checkpoint_by_id[output_id]
+        if output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_COMPLETE:
+            continue
+        if output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_FAILED:
+            return stream_state, (
+                _clean_text(output_checkpoint.get("error"))
+                or "bulk_export_output_checkpoint_failed"
+            )
+        output_error = await _stream_one_checkpointed_bulk_output(
+            session,
+            source_record,
+            identity,
+            manifest,
+            manifest_output,
+            options,
+            stream_state,
+        )
+        if output_error:
+            return stream_state, output_error
+    return stream_state, None
+
+
+async def _stream_checkpointed_bulk_outputs(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    manifest: BulkExportManifest,
+    options: BulkExportStreamOptions,
+) -> ResourceFetchResult:
+    output_checkpoints, checkpoint_error = await _validated_bulk_output_checkpoints(
+        identity,
+        manifest,
+    )
+    if checkpoint_error:
+        return _checkpointed_bulk_stream_result(
+            options,
+            BulkExportStreamState(),
+            output_checkpoints,
+            error=checkpoint_error,
+        )
+    stream_state, output_error = await _resume_checkpointed_bulk_outputs(
+        session,
+        source_record,
+        identity,
+        manifest,
+        options,
+        output_checkpoints,
+    )
+    if output_error:
+        output_checkpoints = await _load_bulk_output_checkpoints(
+            identity.checkpoint_id
+        )
+        return _checkpointed_bulk_stream_result(
+            options,
+            stream_state,
+            output_checkpoints,
+            error=output_error,
+        )
+    output_checkpoints = await _load_bulk_output_checkpoints(identity.checkpoint_id)
+    return await _finalize_checkpointed_bulk_outputs(
+        identity,
+        manifest,
+        options,
+        stream_state,
+        output_checkpoints,
+    )
+
+
+async def _load_or_start_checkpointed_bulk_export(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    *,
+    timeout: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    if checkpoint:
+        return await _claim_existing_bulk_export_checkpoint(identity, checkpoint)
+    try:
+        _bulk_checkpoint_primary_secret()
+    except RuntimeError as exc:
+        return {}, None, str(exc)
+    checkpoint, is_reservation_owner = await _reserve_bulk_export_checkpoint(
+        identity
+    )
+    if not is_reservation_owner:
+        return await _claim_existing_bulk_export_checkpoint(identity, checkpoint)
+    return await _start_checkpointed_bulk_export(
+        session,
+        source_record,
+        identity,
+        timeout=timeout,
+    )
+
+
+async def _claim_existing_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+) -> tuple[dict[str, Any], None, str | None]:
+    claim_deadline = time.monotonic() + _bulk_checkpoint_lease_seconds()
+    while True:
+        checkpoint_owner = _clean_text(checkpoint.get("owner_run_id"))
+        checkpoint_state = _clean_text(checkpoint.get("state"))
+        if checkpoint_owner == identity.owner_run_id:
+            if checkpoint_state == BULK_EXPORT_CHECKPOINT_STARTING:
+                return await _fail_unknown_bulk_export_acceptance(identity)
+            return checkpoint, None, None
+        if checkpoint_state in {
+            BULK_EXPORT_CHECKPOINT_COMPLETE,
+            BULK_EXPORT_CHECKPOINT_FAILED,
+        }:
+            return checkpoint, None, None
+        if identity.retry_of_run_id != checkpoint_owner:
+            return checkpoint, None, "bulk_export_checkpoint_lineage_mismatch"
+        try:
+            adopted_checkpoint = await _adopt_bulk_export_checkpoint(identity)
+            return adopted_checkpoint, None, None
+        except RuntimeError as exc:
+            if str(exc) != "bulk_export_checkpoint_ownership_conflict":
+                return checkpoint, None, str(exc)
+        if time.monotonic() >= claim_deadline:
+            error = (
+                "bulk_export_acceptance_outcome_unknown"
+                if checkpoint_state == BULK_EXPORT_CHECKPOINT_STARTING
+                else "bulk_export_checkpoint_ownership_conflict"
+            )
+            return checkpoint, None, error
+        await asyncio.sleep(5)
+        checkpoint = await _load_bulk_export_checkpoint(identity)
+        if not checkpoint:
+            return {}, None, "bulk_export_checkpoint_adoption_lost"
+
+
+async def _fail_unknown_bulk_export_acceptance(
+    identity: BulkExportCheckpointIdentity,
+) -> tuple[dict[str, Any], None, str]:
+    acceptance_error = "bulk_export_acceptance_outcome_unknown"
+    await _record_bulk_export_checkpoint_error(
+        identity,
+        acceptance_error,
+        terminal=True,
+    )
+    checkpoint = await _load_bulk_export_checkpoint(identity)
+    return checkpoint, None, acceptance_error
+
+
+def _terminal_bulk_checkpoint_result(
+    model: type,
+    checkpoint: dict[str, Any],
+) -> ResourceFetchResult | None:
+    checkpoint_state = checkpoint.get("state")
+    checkpoint_rows = max(0, int(checkpoint.get("rows_written") or 0))
+    if checkpoint_state == BULK_EXPORT_CHECKPOINT_COMPLETE:
+        return _checkpointed_bulk_fetch_result(
+            model,
+            rows_fetched=checkpoint_rows,
+            complete=True,
+        )
+    if checkpoint_state == BULK_EXPORT_CHECKPOINT_FAILED:
+        return _checkpointed_bulk_fetch_result(
+            model,
+            rows_fetched=checkpoint_rows,
+            error=_clean_text(checkpoint.get("error"))
+            or "bulk_export_checkpoint_failed",
+        )
+    return None
+
+
+async def _fetch_checkpointed_bulk_export_resource_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    checkpoint_context: PaginationCheckpointContext,
+    fetch_options: BulkExportFetchOptions,
+) -> ResourceFetchResult | None:
+    """Resume one candidate-bound export without replacing an accepted job."""
+    model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+    start_url = _bulk_export_start_url(source_record, resource_type)
+    if model is None or not start_url:
+        return None
+    identity = _bulk_export_checkpoint_identity(
+        checkpoint_context,
+        resource_type,
+        start_url,
+    )
+    try:
+        async with _bulk_checkpoint_worker_guard(identity) as ownership_probe:
+            return await _fetch_owned_checkpointed_bulk_resource_rows(
+                source_record,
+                identity,
+                model,
+                fetch_options,
+                ownership_probe,
+            )
+    except RuntimeError as exc:
+        if str(exc) == "bulk_export_checkpoint_worker_active":
+            return _checkpointed_bulk_fetch_result(model, error=str(exc))
+        raise
+
+
+async def _fetch_owned_checkpointed_bulk_resource_rows(
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    model: type,
+    fetch_options: BulkExportFetchOptions,
+    ownership_probe: Callable[[], Awaitable[None]],
+) -> ResourceFetchResult | None:
+    async with _bulk_client_session() as session:
+        checkpoint, initial_status_payload, start_error = (
+            await _load_or_start_checkpointed_bulk_export(
+                session,
+                source_record,
+                identity,
+                timeout=fetch_options.timeout,
+            )
+        )
+        if checkpoint is None:
+            return None
+        if start_error:
+            return _checkpointed_bulk_fetch_result(model, error=start_error)
+        terminal_result = _terminal_bulk_checkpoint_result(model, checkpoint)
+        if terminal_result is not None:
+            return terminal_result
+        manifest, manifest_error, polls = await _checkpointed_bulk_export_manifest(
+            session,
+            source_record,
+            identity,
+            checkpoint,
+            initial_status_payload=initial_status_payload,
+            timeout=fetch_options.timeout,
+        )
+        if manifest_error or manifest is None:
+            return _checkpointed_bulk_fetch_result(
+                model,
+                rows_fetched=max(0, int(checkpoint.get("rows_written") or 0)),
+                polls=polls,
+                error=manifest_error or "bulk_export_manifest_unavailable",
+            )
+        return await _stream_checkpointed_bulk_outputs(
+            session,
+            source_record,
+            identity,
+            manifest,
+            _bulk_stream_options(
+                model,
+                fetch_options,
+                polls,
+                ownership_probe,
+            ),
+        )
+
+
 async def _fetch_bulk_export_resource_rows(
     source: dict[str, Any],
     resource_type: str,
@@ -10150,11 +12621,29 @@ async def _fetch_bulk_export_resource_rows(
     row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
     retain_rows: bool = True,
 ) -> ResourceFetchResult | None:
+    checkpoint_context = source.get("_pagination_checkpoint_context")
+    if (
+        per_resource_limit <= 0
+        and row_batch_handler is not None
+        and _is_durable_bulk_checkpoint_context(checkpoint_context)
+    ):
+        return await _fetch_checkpointed_bulk_export_resource_rows(
+            source,
+            resource_type,
+            checkpoint_context,
+            BulkExportFetchOptions(
+                timeout=timeout,
+                run_id=run_id,
+                row_batch_handler=row_batch_handler,
+                row_batch_size=row_batch_size,
+                retain_rows=retain_rows,
+            ),
+        )
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     url = _bulk_export_start_url(source, resource_type)
     if model is None or not url:
         return None
-    async with aiohttp.ClientSession() as session:
+    async with _bulk_client_session() as session:
         status_code, headers, _payload, error = await _bulk_http_get_json(
             session,
             source,
@@ -10162,7 +12651,9 @@ async def _fetch_bulk_export_resource_rows(
             timeout=timeout,
             prefer_async=True,
         )
-        status_url = _clean_text(headers.get("content-location") or headers.get("location"))
+        status_location = _clean_text(
+            headers.get("content-location") or headers.get("location")
+        )
         _bulk_export_log(
             "start",
             source_id=source.get("source_id"),
@@ -10170,16 +12661,19 @@ async def _fetch_bulk_export_resource_rows(
             status=status_code,
             error=error,
             start_url=_bulk_export_log_url(url),
-            status_url=_bulk_export_log_url(status_url),
+            status_url=_bulk_capability_log_identity(status_location),
         )
         if _bulk_export_pre_stream_should_fallback(status_code, error):
             return None
 
         polls = 0
+        requires_access_token: bool | None = None
         if status_code == 200:
             if not _bulk_export_status_payload(_payload):
                 return None
             output_urls = _bulk_export_output_urls(_payload, resource_type)
+            if isinstance(_payload.get("requiresAccessToken"), bool):
+                requires_access_token = _payload["requiresAccessToken"]
             payload_error = _bulk_export_payload_error(_payload)
             if payload_error and not output_urls:
                 return ResourceFetchResult(
@@ -10197,7 +12691,13 @@ async def _fetch_bulk_export_resource_rows(
                     fetch_mode="bulk_export",
                 )
         else:
-            if not status_url:
+            try:
+                status_url = _resolved_bulk_export_status_url(
+                    source,
+                    url,
+                    status_location,
+                )
+            except ValueError as exc:
                 return ResourceFetchResult(
                     model=model,
                     rows=[],
@@ -10209,13 +12709,13 @@ async def _fetch_bulk_export_resource_rows(
                     page_limit_reached=False,
                     hard_page_limit_reached=False,
                     next_url_remaining=False,
-                    error="bulk_export_missing_status_url",
+                    error=str(exc),
                     fetch_mode="bulk_export",
                 )
             output_urls, poll_error, polls = await _bulk_export_poll_outputs(
                 session,
                 source,
-                urllib.parse.urljoin(url, status_url),
+                status_url,
                 resource_type=resource_type,
                 timeout=timeout,
             )
@@ -10252,6 +12752,7 @@ async def _fetch_bulk_export_resource_rows(
                 row_batch_handler=row_batch_handler,
                 row_batch_size=row_batch_size,
                 retain_rows=retain_rows,
+                requires_access_token=requires_access_token,
             )
             _bulk_export_log(
                 "stream_output",
@@ -10279,15 +12780,17 @@ async def _fetch_bulk_export_resource_rows(
         rows=rows,
         rows_fetched=rows_fetched,
         rows_written=rows_written,
-            pages_fetched=(output_urls and len(output_urls) or 0) + polls,
-            complete=complete,
-            row_limit_reached=row_limit_reached,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=row_limit_reached,
+        pages_fetched=(output_urls and len(output_urls) or 0) + polls,
+        complete=complete,
+        row_limit_reached=row_limit_reached,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=row_limit_reached,
         error=output_error,
         fetch_mode="bulk_export",
     )
+
+
 async def _flush_partition_resource_rows(
     state: PartitionFetchState,
     row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
@@ -10782,6 +13285,16 @@ async def _fetch_resource_rows(
         return None
     resource_timeout = _source_resource_timeout(source, resource_type, timeout)
     start_urls: list[str] | None = None
+    bulk_checkpoint_context = (
+        pagination_checkpoint
+        if (
+            pagination_checkpoint is not None
+            and row_batch_handler is not None
+            and per_resource_limit <= 0
+            and page_limit <= 0
+        )
+        else None
+    )
     if _is_aetna_medicaid_targeted_source(source):
         page_count = _source_full_refresh_page_count(
             source,
@@ -10817,9 +13330,16 @@ async def _fetch_resource_rows(
         source,
         bulk_export,
         per_resource_limit=per_resource_limit,
+        checkpoint_context=bulk_checkpoint_context,
     ):
+        bulk_source_lookup = source
+        if bulk_checkpoint_context is not None:
+            bulk_source_lookup = {
+                **source,
+                "_pagination_checkpoint_context": bulk_checkpoint_context,
+            }
         result = await _fetch_bulk_export_resource_rows(
-            source,
+            bulk_source_lookup,
             resource_type,
             per_resource_limit=per_resource_limit,
             timeout=resource_timeout,
@@ -11850,7 +14370,7 @@ def _record_resource_fetch_stats(stats: dict[str, dict[str, Any]], resource_type
         entry["sources_failed"] += 1
     if result.complete and result.rows_fetched == 0:
         entry["sources_empty"] += 1
-    if result.fetch_mode == "bulk_export":
+    if result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
         entry["bulk_export_sources"] += 1
 
 
@@ -12438,6 +14958,7 @@ def _pagination_checkpoint_context(
     *,
     run_id: str | None,
     retry_of_run_id: str | None,
+    pagination_root_run_id: str | None = None,
 ) -> PaginationCheckpointContext | None:
     canonical_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
@@ -12448,6 +14969,14 @@ def _pagination_checkpoint_context(
     )
     if not run_id or not source_ids or not supports_checkpoint:
         return None
+    if retry_of_run_id:
+        if not pagination_root_run_id:
+            raise ValueError("provider_directory_pagination_retry_root_missing")
+        acquisition_root_run_id = pagination_root_run_id
+    else:
+        if pagination_root_run_id and pagination_root_run_id != run_id:
+            raise ValueError("provider_directory_pagination_fresh_root_mismatch")
+        acquisition_root_run_id = run_id
     scope_payload = json.dumps(
         {
             "strategy_version": PAGINATION_CHECKPOINT_STRATEGY_VERSION,
@@ -12464,6 +14993,7 @@ def _pagination_checkpoint_context(
         source_ids=tuple(sorted(set(source_ids))),
         owner_run_id=run_id,
         retry_of_run_id=retry_of_run_id,
+        acquisition_root_run_id=acquisition_root_run_id,
     )
 
 
@@ -12509,22 +15039,34 @@ async def _checkpoint_candidate_dataset_id(
     endpoint_id: str,
     selected_resources: tuple[str, ...],
 ) -> str | None:
-    if context is None:
+    if context is None or not context.acquisition_root_run_id:
         return None
-    owner_run_ids = [context.owner_run_id]
-    if context.retry_of_run_id:
-        owner_run_ids.append(context.retry_of_run_id)
+    expected_owner_run_id = context.retry_of_run_id or context.owner_run_id
     checkpoint_row = await db.first(
         f"""
+        WITH checkpoint AS (
+            SELECT dataset_id, updated_at
+              FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)}
+             WHERE canonical_api_base = :canonical_api_base
+               AND source_scope_hash = :source_scope_hash
+               AND acquisition_root_run_id = :acquisition_root_run_id
+               AND owner_run_id = :expected_owner_run_id
+            UNION ALL
+            SELECT dataset_id, updated_at
+              FROM {_bulk_acquisition_checkpoint_table_ref()}
+             WHERE canonical_api_base = :canonical_api_base
+               AND source_scope_hash = :source_scope_hash
+               AND acquisition_root_run_id = :acquisition_root_run_id
+               AND owner_run_id = :expected_owner_run_id
+        )
         SELECT checkpoint.dataset_id
-          FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)} AS checkpoint
+          FROM checkpoint
           JOIN {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
             ON dataset.dataset_id = checkpoint.dataset_id
-         WHERE checkpoint.canonical_api_base = :canonical_api_base
-           AND checkpoint.source_scope_hash = :source_scope_hash
-           AND checkpoint.owner_run_id = ANY(CAST(:owner_run_ids AS varchar[]))
-           AND dataset.endpoint_id = :endpoint_id
+         WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.is_current = false
+           AND dataset.acquisition_root_run_id = :acquisition_root_run_id
+           AND dataset.status = ANY(CAST(:resumable_statuses AS varchar[]))
            AND COALESCE(
                 dataset.publication_metadata_json::jsonb -> 'selected_resources',
                 '[]'::jsonb
@@ -12534,8 +15076,14 @@ async def _checkpoint_candidate_dataset_id(
         """,
         canonical_api_base=context.canonical_api_base,
         source_scope_hash=context.source_scope_hash,
-        owner_run_ids=owner_run_ids,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        expected_owner_run_id=expected_owner_run_id,
         endpoint_id=endpoint_id,
+        resumable_statuses=[
+            ENDPOINT_DATASET_ACQUIRING,
+            ENDPOINT_DATASET_INCOMPLETE,
+            ENDPOINT_DATASET_FAILED,
+        ],
         selected_resources=json.dumps(selected_resources),
     )
     return _clean_text(
@@ -12546,7 +15094,9 @@ async def _checkpoint_candidate_dataset_id(
 async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
     row = await db.first(
         f"""
-        SELECT endpoint_id, status, is_current, previous_dataset_id
+        SELECT endpoint_id, import_run_id, acquisition_root_run_id, status,
+               is_current, previous_dataset_id, published_at,
+               publication_metadata_json
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id;
         """,
@@ -12575,46 +15125,135 @@ async def _current_endpoint_dataset_id(
     return _clean_text(_pagination_checkpoint_row_mapping(row).get("dataset_id"))
 
 
-async def _ensure_endpoint_dataset_candidate(
+async def _assert_locked_endpoint_candidate(
+    connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> None:
-    metadata = {
-        "selected_resources": list(candidate.selected_resources),
-        "source_ids": list(candidate.source_ids),
-    }
-    await db.status(
+    existing_candidate = await connection.first(
         f"""
+        SELECT dataset_id, acquisition_root_run_id, status, is_current
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = :dataset_id
+         FOR UPDATE;
+        """,
+        dataset_id=candidate.dataset_id,
+    )
+    if existing_candidate is not None and not candidate.reused_from_checkpoint:
+        raise RuntimeError("provider_directory_endpoint_dataset_active_conflict")
+    existing_candidate_map = _pagination_checkpoint_row_mapping(
+        existing_candidate
+    )
+    if existing_candidate_map and (
+        existing_candidate_map.get("is_current") is True
+        or _clean_text(existing_candidate_map.get("status"))
+        in {ENDPOINT_DATASET_PUBLISHED, ENDPOINT_DATASET_SUPERSEDED}
+        or _clean_text(existing_candidate_map.get("acquisition_root_run_id"))
+        != candidate.acquisition_root_run_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
+
+
+async def _assert_no_conflicting_endpoint_candidate(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    conflicting_candidate = await connection.first(
+        f"""
+        SELECT dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE endpoint_id = :endpoint_id
+           AND dataset_id <> :dataset_id
+           AND is_current = false
+           AND status = ANY(CAST(:active_statuses AS varchar[]))
+         LIMIT 1
+         FOR UPDATE;
+        """,
+        endpoint_id=candidate.endpoint_id,
+        dataset_id=candidate.dataset_id,
+        active_statuses=[
+            ENDPOINT_DATASET_ACQUIRING,
+            ENDPOINT_DATASET_INCOMPLETE,
+        ],
+    )
+    if conflicting_candidate is not None:
+        raise RuntimeError("provider_directory_endpoint_dataset_active_conflict")
+
+
+def _endpoint_dataset_candidate_upsert_sql() -> str:
+    return f"""
         INSERT INTO {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS candidate (
-            dataset_id, endpoint_id, import_run_id, previous_dataset_id,
-            status, is_current, resource_count, created_at,
-            publication_metadata_json
+            dataset_id, endpoint_id, import_run_id, acquisition_root_run_id,
+            previous_dataset_id, status, is_current, resource_count,
+            created_at, publication_metadata_json
         ) VALUES (
-            :dataset_id, :endpoint_id, :import_run_id, :previous_dataset_id,
-            :status, false, 0, now(), CAST(:publication_metadata_json AS jsonb)
+            :dataset_id, :endpoint_id, :import_run_id,
+            :acquisition_root_run_id, :previous_dataset_id, :status,
+            false, 0, now(), CAST(:publication_metadata_json AS jsonb)
         )
         ON CONFLICT (dataset_id) DO UPDATE SET
-            import_run_id = COALESCE(candidate.import_run_id, EXCLUDED.import_run_id),
+            import_run_id = EXCLUDED.import_run_id,
             previous_dataset_id = COALESCE(
                 candidate.previous_dataset_id,
                 EXCLUDED.previous_dataset_id
             ),
             status = CASE
-                WHEN candidate.is_current THEN candidate.status
+                WHEN candidate.is_current
+                  OR candidate.status IN (:published_status, :superseded_status)
+                THEN candidate.status
                 ELSE EXCLUDED.status
             END,
             publication_metadata_json = CASE
-                WHEN candidate.is_current THEN candidate.publication_metadata_json
+                WHEN candidate.is_current
+                THEN candidate.publication_metadata_json
                 ELSE EXCLUDED.publication_metadata_json
             END;
-        """,
+        """
+
+
+async def _upsert_endpoint_dataset_candidate(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    metadata: dict[str, Any],
+) -> None:
+    await connection.status(
+        _endpoint_dataset_candidate_upsert_sql(),
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
         import_run_id=candidate.import_run_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
         previous_dataset_id=candidate.previous_dataset_id,
         status=ENDPOINT_DATASET_ACQUIRING,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+        superseded_status=ENDPOINT_DATASET_SUPERSEDED,
         publication_metadata_json=json.dumps(metadata, sort_keys=True),
     )
-    await _clear_uncheckpointed_endpoint_dataset_candidate(candidate)
+
+
+async def _ensure_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Serialize and initialize one non-current endpoint dataset candidate."""
+    metadata = {
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "selected_resources": list(candidate.selected_resources),
+        "source_ids": list(candidate.source_ids),
+    }
+    async with db.acquire() as connection:
+        await connection.first(
+            "SELECT pg_advisory_xact_lock(hashtextextended(:endpoint_id, 0));",
+            endpoint_id=candidate.endpoint_id,
+        )
+        await _assert_locked_endpoint_candidate(connection, candidate)
+        await _assert_no_conflicting_endpoint_candidate(connection, candidate)
+        await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
+        if not candidate.reused_from_checkpoint:
+            await connection.status(
+                f"""
+                DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+                 WHERE dataset_id = :dataset_id;
+                """,
+                dataset_id=candidate.dataset_id,
+            )
 
 
 async def _clear_uncheckpointed_endpoint_dataset_candidate(
@@ -12651,6 +15290,73 @@ def _endpoint_id_for_source_records(
     return next(iter(endpoint_ids))
 
 
+def _endpoint_dataset_acquisition_root(
+    run_id: str | None,
+    pagination_root_run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> str | None:
+    acquisition_root_run_id = (
+        checkpoint_context.acquisition_root_run_id
+        if checkpoint_context is not None
+        else run_id
+    )
+    if (
+        checkpoint_context is not None
+        and pagination_root_run_id is not None
+        and pagination_root_run_id != acquisition_root_run_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
+    return acquisition_root_run_id
+
+
+def _assert_endpoint_dataset_selection(
+    existing_dataset_map: dict[str, Any],
+    endpoint_id: str,
+    acquisition_root_run_id: str | None,
+    checkpoint_dataset_id: str | None,
+    retry_of_run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> None:
+    if (
+        existing_dataset_map
+        and _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_identity_collision")
+    existing_root_run_id = _clean_text(
+        existing_dataset_map.get("acquisition_root_run_id")
+    )
+    if existing_dataset_map and existing_root_run_id != acquisition_root_run_id:
+        raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
+    existing_status = _clean_text(existing_dataset_map.get("status"))
+    if existing_dataset_map.get("is_current") is True or existing_status in {
+        ENDPOINT_DATASET_PUBLISHED,
+        ENDPOINT_DATASET_SUPERSEDED,
+    }:
+        raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
+    if existing_dataset_map and checkpoint_dataset_id is None:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_uncheckpointed_candidate_exists"
+        )
+    if retry_of_run_id and checkpoint_context is not None and not existing_dataset_map:
+        raise RuntimeError("provider_directory_endpoint_dataset_retry_candidate_missing")
+
+
+async def _previous_endpoint_dataset_id(
+    existing_dataset_map: dict[str, Any],
+    endpoint_id: str,
+    dataset_id: str,
+) -> str | None:
+    previous_dataset_id = _clean_text(
+        existing_dataset_map.get("previous_dataset_id")
+    )
+    if previous_dataset_id:
+        return previous_dataset_id
+    return await _current_endpoint_dataset_id(
+        endpoint_id,
+        exclude_dataset_id=dataset_id,
+    )
+
+
 async def _select_endpoint_dataset_candidate(
     endpoint_id: str,
     selected_resources: tuple[str, ...],
@@ -12660,50 +15366,46 @@ async def _select_endpoint_dataset_candidate(
     pagination_root_run_id: str | None,
     checkpoint_context: PaginationCheckpointContext | None,
 ) -> EndpointDatasetCandidateSelection:
+    """Select a root-bound candidate only when persisted lineage proves reuse."""
+    acquisition_root_run_id = _endpoint_dataset_acquisition_root(
+        run_id,
+        pagination_root_run_id,
+        checkpoint_context,
+    )
+    owner_key = acquisition_root_run_id or f"adhoc:{time.time_ns()}"
+    dataset_id = _endpoint_dataset_candidate_id(
+        endpoint_id,
+        selected_resources,
+        owner_key,
+    )
     checkpoint_dataset_id = await _checkpoint_candidate_dataset_id(
         checkpoint_context,
         endpoint_id,
         selected_resources,
     )
-    owner_key = (
-        pagination_root_run_id
-        or retry_of_run_id
-        or run_id
-        or f"adhoc:{time.time_ns()}"
-    )
-    dataset_id = checkpoint_dataset_id or _endpoint_dataset_candidate_id(
-        endpoint_id,
-        selected_resources,
-        owner_key,
-    )
+    if checkpoint_dataset_id and checkpoint_dataset_id != dataset_id:
+        raise RuntimeError("provider_directory_endpoint_dataset_lineage_mismatch")
+    if retry_of_run_id and checkpoint_context and not checkpoint_dataset_id:
+        raise RuntimeError("provider_directory_endpoint_dataset_retry_unverified")
     existing_dataset_map = await _endpoint_dataset_state(dataset_id)
-    if (
-        existing_dataset_map
-        and _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
-    ):
-        raise RuntimeError("provider_directory_endpoint_dataset_identity_collision")
-    if existing_dataset_map.get("is_current") is True:
-        dataset_id = _endpoint_dataset_candidate_id(
-            endpoint_id,
-            selected_resources,
-            f"{owner_key}:replay:{time.time_ns()}",
-        )
-        existing_dataset_map = {}
-        checkpoint_dataset_id = None
-    previous_dataset_id = _clean_text(
-        existing_dataset_map.get("previous_dataset_id")
+    _assert_endpoint_dataset_selection(
+        existing_dataset_map,
+        endpoint_id,
+        acquisition_root_run_id,
+        checkpoint_dataset_id,
+        retry_of_run_id,
+        checkpoint_context,
     )
-    if not previous_dataset_id:
-        previous_dataset_id = await _current_endpoint_dataset_id(
-            endpoint_id,
-            exclude_dataset_id=dataset_id,
-        )
+    previous_dataset_id = await _previous_endpoint_dataset_id(
+        existing_dataset_map,
+        endpoint_id,
+        dataset_id,
+    )
     return EndpointDatasetCandidateSelection(
         dataset_id=dataset_id,
+        acquisition_root_run_id=acquisition_root_run_id,
         previous_dataset_id=previous_dataset_id,
-        reused_from_checkpoint=(
-            checkpoint_dataset_id is not None or bool(existing_dataset_map)
-        ),
+        reused_from_checkpoint=checkpoint_dataset_id is not None,
     )
 
 
@@ -12735,6 +15437,7 @@ async def _prepare_endpoint_dataset_candidate(
             checkpoint_context,
             endpoint_id=endpoint_id,
             dataset_id=selection.dataset_id,
+            lineage_verified=True,
         )
         if checkpoint_context is not None
         else None
@@ -12742,6 +15445,7 @@ async def _prepare_endpoint_dataset_candidate(
     candidate = EndpointDatasetCandidate(
         endpoint_id=endpoint_id,
         dataset_id=selection.dataset_id,
+        acquisition_root_run_id=selection.acquisition_root_run_id,
         source_ids=tuple(
             sorted(
                 source_id
@@ -12797,7 +15501,8 @@ async def _fetch_pagination_checkpoint(
 ) -> dict[str, Any]:
     checkpoint_row = await db.first(
         f"""
-        SELECT dataset_id, source_ids, owner_run_id, start_url_hash, next_url, state,
+        SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
+               retry_of_run_id, start_url_hash, next_url, state,
                pages_processed, rows_processed, recent_cursor_hashes
           FROM {_pagination_checkpoint_table_ref()}
          WHERE canonical_api_base = :canonical_api_base
@@ -12818,6 +15523,9 @@ def _compatible_pagination_resume_state(
 ) -> PaginationResumeState | None:
     existing_source_ids = tuple(sorted(_json_text_list(checkpoint.get("source_ids"))))
     existing_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+    existing_root_run_id = _clean_text(
+        checkpoint.get("acquisition_root_run_id")
+    )
     has_matching_owner = existing_owner_run_id == context.owner_run_id or (
         context.retry_of_run_id is not None
         and existing_owner_run_id == context.retry_of_run_id
@@ -12830,6 +15538,7 @@ def _compatible_pagination_resume_state(
         not checkpoint
         or existing_source_ids != context.source_ids
         or _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
+        or existing_root_run_id != context.acquisition_root_run_id
         or not has_matching_owner
         or not has_matching_dataset
     ):
@@ -12855,6 +15564,8 @@ async def _adopt_pagination_checkpoint_owner(
     resource_type: str,
     previous_owner_run_id: str,
 ) -> None:
+    if context.retry_of_run_id != previous_owner_run_id:
+        raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
     updated = await db.status(
         f"""
         UPDATE {_pagination_checkpoint_table_ref()}
@@ -12864,6 +15575,7 @@ async def _adopt_pagination_checkpoint_owner(
          WHERE canonical_api_base = :canonical_api_base
            AND resource_type = :resource_type
            AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
            AND owner_run_id = :previous_owner_run_id;
         """,
         owner_run_id=context.owner_run_id,
@@ -12871,6 +15583,7 @@ async def _adopt_pagination_checkpoint_owner(
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
         source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
     )
     if _coerce_rowcount(updated) <= 0:
         raise RuntimeError("provider_directory_pagination_checkpoint_ownership_lost")
@@ -12885,12 +15598,14 @@ def _pagination_checkpoint_reset_sql() -> str:
     )
     INSERT INTO {_pagination_checkpoint_table_ref()} (
         canonical_api_base, resource_type, source_scope_hash, dataset_id,
-        source_ids, owner_run_id, retry_of_run_id, start_url_hash,
+        source_ids, acquisition_root_run_id, owner_run_id, retry_of_run_id,
+        start_url_hash,
         next_url, state, pages_processed, rows_processed,
         recent_cursor_hashes, created_at, updated_at, completed_at
     ) VALUES (
         :canonical_api_base, :resource_type, :source_scope_hash, :dataset_id,
-        CAST(:source_ids AS jsonb), :owner_run_id, :retry_of_run_id,
+        CAST(:source_ids AS jsonb), :acquisition_root_run_id,
+        :owner_run_id, :retry_of_run_id,
         :start_url_hash, :next_url, :state, 0, 0,
         '[]'::jsonb, now(), now(), NULL
     )
@@ -12898,6 +15613,7 @@ def _pagination_checkpoint_reset_sql() -> str:
     DO UPDATE SET
         dataset_id = EXCLUDED.dataset_id,
         source_ids = EXCLUDED.source_ids,
+        acquisition_root_run_id = EXCLUDED.acquisition_root_run_id,
         owner_run_id = EXCLUDED.owner_run_id,
         retry_of_run_id = EXCLUDED.retry_of_run_id,
         start_url_hash = EXCLUDED.start_url_hash,
@@ -12942,6 +15658,7 @@ async def _reset_pagination_checkpoint(
         source_scope_hash=context.source_scope_hash,
         dataset_id=context.dataset_id,
         source_ids=json.dumps(context.source_ids),
+        acquisition_root_run_id=context.acquisition_root_run_id,
         owner_run_id=context.owner_run_id,
         retry_of_run_id=context.retry_of_run_id,
         start_url_hash=start_url_hash,
@@ -12972,6 +15689,10 @@ async def _load_or_initialize_pagination_checkpoint(
                 previous_owner_run_id,
             )
         return resume_state
+    if checkpoint:
+        raise RuntimeError("provider_directory_pagination_checkpoint_lineage_conflict")
+    if context.retry_of_run_id and not context.lineage_verified:
+        raise RuntimeError("provider_directory_pagination_checkpoint_retry_unverified")
     await _reset_pagination_checkpoint(
         context,
         resource_type,
@@ -13010,6 +15731,7 @@ async def _save_pagination_checkpoint(
          WHERE canonical_api_base = :canonical_api_base
            AND resource_type = :resource_type
            AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
            AND owner_run_id = :owner_run_id;
         """,
         next_url=next_url,
@@ -13025,6 +15747,7 @@ async def _save_pagination_checkpoint(
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
         source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
         owner_run_id=context.owner_run_id,
     )
     if _coerce_rowcount(updated) <= 0:
@@ -13042,11 +15765,13 @@ async def _clear_pagination_checkpoints(
         DELETE FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)}
          WHERE canonical_api_base = :canonical_api_base
            AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
            AND owner_run_id = :owner_run_id
            AND resource_type = ANY(CAST(:resource_types AS varchar[]));
         """,
         canonical_api_base=context.canonical_api_base,
         source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
         owner_run_id=context.owner_run_id,
         resource_types=resource_types,
     )
@@ -13707,6 +16432,7 @@ def _endpoint_dataset_publication_metadata(
     **extra: Any,
 ) -> dict[str, Any]:
     return {
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "source_ids": list(candidate.source_ids),
         "resource_diagnostics": diagnostics,
@@ -13756,12 +16482,17 @@ async def _mark_endpoint_dataset_candidate(
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
          WHERE dataset.dataset_id = :dataset_id
            AND dataset.endpoint_id = :endpoint_id
-           AND dataset.is_current = false;
+           AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM :acquisition_root_run_id
+           AND dataset.is_current = false
+           AND dataset.status NOT IN (:published_status, :superseded_status);
         """,
         status=status,
         publication_metadata_json=json.dumps(metadata, sort_keys=True, default=_json_default),
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+        superseded_status=ENDPOINT_DATASET_SUPERSEDED,
     )
 
 
@@ -13837,6 +16568,71 @@ async def _endpoint_dataset_content_hash(
     return content_hash.hexdigest(), resource_count
 
 
+async def _endpoint_dataset_bulk_transaction_times(
+    connection: Any,
+    dataset_id: str | None,
+) -> dict[str, str]:
+    if not dataset_id:
+        return {}
+    transaction_rows = await connection.all(
+        f"""
+        SELECT resource_type,
+               manifest_json::jsonb ->> 'transactionTime' AS transaction_time
+          FROM {_bulk_acquisition_checkpoint_table_ref()}
+         WHERE dataset_id = :dataset_id
+           AND state = :complete_state;
+        """,
+        dataset_id=dataset_id,
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+    )
+    return {
+        resource_type: transaction_time
+        for transaction_row in transaction_rows
+        if (
+            resource_type := _clean_text(
+                _pagination_checkpoint_row_mapping(transaction_row).get(
+                    "resource_type"
+                )
+            )
+        )
+        and (
+            transaction_time := _clean_text(
+                _pagination_checkpoint_row_mapping(transaction_row).get(
+                    "transaction_time"
+                )
+            )
+        )
+    }
+
+
+def _assert_endpoint_dataset_bulk_freshness(
+    diagnostics: dict[str, dict[str, Any]],
+    candidate_transaction_times: dict[str, str],
+    previous_transaction_times: dict[str, str],
+) -> None:
+    expected_bulk_resources = {
+        resource_type
+        for resource_type, diagnostic in diagnostics.items()
+        if diagnostic.get("fetch_mode") == "checkpointed_bulk_export"
+    }
+    missing_transaction_times = expected_bulk_resources - set(
+        candidate_transaction_times
+    )
+    if missing_transaction_times:
+        raise RuntimeError("provider_directory_bulk_transaction_time_missing")
+    try:
+        for candidate_time in candidate_transaction_times.values():
+            _assert_bulk_transaction_time_window(candidate_time)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    for resource_type, candidate_time in candidate_transaction_times.items():
+        previous_time = previous_transaction_times.get(resource_type)
+        if previous_time and _parsed_bulk_transaction_time(
+            candidate_time
+        ) < _parsed_bulk_transaction_time(previous_time):
+            raise RuntimeError("provider_directory_bulk_snapshot_older_than_current")
+
+
 async def _lock_endpoint_dataset_for_promotion(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -13851,7 +16647,8 @@ async def _lock_endpoint_dataset_for_promotion(
         raise RuntimeError("provider_directory_api_endpoint_missing_during_promotion")
     candidate_record = await connection.first(
         f"""
-        SELECT dataset_id, is_current, status, previous_dataset_id
+        SELECT dataset_id, acquisition_root_run_id, is_current, status,
+               previous_dataset_id
           FROM {dataset_ref}
          WHERE dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
@@ -13862,6 +16659,15 @@ async def _lock_endpoint_dataset_for_promotion(
     )
     if candidate_record is None:
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_missing")
+    candidate_record_map = _pagination_checkpoint_row_mapping(candidate_record)
+    if (
+        candidate_record_map.get("is_current") is True
+        or _clean_text(candidate_record_map.get("status"))
+        in {ENDPOINT_DATASET_PUBLISHED, ENDPOINT_DATASET_SUPERSEDED}
+        or _clean_text(candidate_record_map.get("acquisition_root_run_id"))
+        != candidate.acquisition_root_run_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     current_dataset_record = await connection.first(
         f"""
         SELECT dataset_id
@@ -13877,7 +16683,10 @@ async def _lock_endpoint_dataset_for_promotion(
     current_dataset_map = _pagination_checkpoint_row_mapping(
         current_dataset_record
     )
-    return _clean_text(current_dataset_map.get("dataset_id"))
+    current_dataset_id = _clean_text(current_dataset_map.get("dataset_id"))
+    if current_dataset_id != candidate.previous_dataset_id:
+        raise RuntimeError("provider_directory_endpoint_dataset_current_changed")
+    return current_dataset_id
 
 
 async def _supersede_endpoint_dataset(
@@ -13924,7 +16733,10 @@ async def _publish_endpoint_dataset(
                superseded_at = NULL,
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
          WHERE dataset_id = :dataset_id
-           AND endpoint_id = :endpoint_id;
+           AND endpoint_id = :endpoint_id
+           AND acquisition_root_run_id IS NOT DISTINCT FROM :acquisition_root_run_id
+           AND is_current = false
+           AND status NOT IN (:published_status, :superseded_status);
         """,
         previous_dataset_id=previous_dataset_id,
         dataset_hash=dataset_hash,
@@ -13937,15 +16749,41 @@ async def _publish_endpoint_dataset(
         ),
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+        superseded_status=ENDPOINT_DATASET_SUPERSEDED,
     )
     if _coerce_rowcount(promoted_count) <= 0:
         raise RuntimeError("provider_directory_endpoint_dataset_promotion_lost")
+
+
+async def _validated_endpoint_bulk_transaction_times(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    previous_dataset_id: str | None,
+    diagnostics: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    candidate_transaction_times = await _endpoint_dataset_bulk_transaction_times(
+        connection,
+        candidate.dataset_id,
+    )
+    previous_transaction_times = await _endpoint_dataset_bulk_transaction_times(
+        connection,
+        previous_dataset_id,
+    )
+    _assert_endpoint_dataset_bulk_freshness(
+        diagnostics,
+        candidate_transaction_times,
+        previous_transaction_times,
+    )
+    return candidate_transaction_times
 
 
 async def _promote_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    """Atomically replace the current endpoint dataset with a fresher candidate."""
     async with db.acquire() as connection:
         await connection.status(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
@@ -13954,7 +16792,13 @@ async def _promote_endpoint_dataset_candidate(
             connection,
             candidate,
         )
-        previous_dataset_id = current_dataset_id or candidate.previous_dataset_id
+        previous_dataset_id = current_dataset_id
+        candidate_transaction_times = await _validated_endpoint_bulk_transaction_times(
+            connection,
+            candidate,
+            previous_dataset_id,
+            diagnostics,
+        )
         dataset_hash, resource_count = await _endpoint_dataset_content_hash(
             connection,
             candidate.dataset_id,
@@ -13964,6 +16808,7 @@ async def _promote_endpoint_dataset_candidate(
             diagnostics,
             dataset_hash=dataset_hash,
             resource_count=resource_count,
+            bulk_transaction_times=candidate_transaction_times,
         )
         await _supersede_endpoint_dataset(
             connection,
@@ -14029,6 +16874,7 @@ async def _prepare_resource_import_source_group(
             source_id_values,
             run_id=run_id,
             retry_of_run_id=retry_of_run_id,
+            pagination_root_run_id=pagination_root_run_id,
         )
         if is_checkpointing_enabled
         else None

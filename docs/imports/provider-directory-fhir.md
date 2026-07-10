@@ -97,9 +97,10 @@ resources. Aetna can return an HTTP-200 `OperationOutcome` above that page size,
 so any HTTP-200 `OperationOutcome` is treated as a resource-search error.
 Continuation `_page_token` links must remain on the same origin and resource
 path, carry only the bounded count and one non-empty token, and cannot replay a
-previous token. Commercial paging is checkpoint-capable, but it is not claimed
-to be operationally practical: the audited endpoint exposed about 1,414
-`InsurancePlan` rows and roughly 380 million `PractitionerRole` rows.
+previous token. Commercial paging remains checkpoint-capable, but unbounded
+acquisition can use the durable Bulk Data path described below. This is
+important because the audited endpoint exposed about 1,414 `InsurancePlan`
+rows and roughly 380 million `PractitionerRole` rows.
 
 The Medicaid source supports six resources, excluding `HealthcareService` and
 `Endpoint`. Its metadata declares
@@ -124,6 +125,8 @@ non-importable coverage blockers from unresolved endpoint-discovery gaps.
 - `provider_directory_api_endpoint`
 - `provider_directory_endpoint_dataset`
 - `provider_directory_dataset_resource`
+- `provider_directory_bulk_acquisition_checkpoint`
+- `provider_directory_bulk_output_checkpoint`
 - `provider_directory_source`
 - `provider_directory_capability`
 - `provider_directory_insurance_plan`
@@ -171,6 +174,27 @@ included in checkpoint-capable source policy. An incomplete UHC partition scan
 emits the same required-resume signal as an incomplete paginated scan, even
 though its partition state lives in
 `provider_directory_reverse_lookup_checkpoint`.
+
+Bulk acquisition checkpoints use the same endpoint candidate and acquisition
+root. Their identity additionally binds the canonical API base, resource type,
+source scope, Bulk strategy version, endpoint id, candidate `dataset_id`, and
+export start request. The acquisition row stores encrypted status and manifest
+capabilities, their immutable hashes, a URL-free manifest audit projection,
+mutable owner/retry lineage, a lease, row count, lifecycle timestamps, state,
+and error. Output rows store an encrypted URL capability and immutable hash plus
+attempt, row-count, completion, timestamp, and error state for every selected
+manifest output. Encryption derives a domain-separated Fernet key from
+`HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY`, falling back to an existing
+control/import-control token. Decryption also tries the fallback tokens and the
+comma-separated or JSON-array
+`HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS` key ring, allowing a
+dedicated key or control token to rotate while an accepted export is active.
+Missing/wrong key configuration fails closed but remains retryable and does not
+erase encrypted capabilities. Terminal completion or data-level failure clears
+capability ciphertext while retaining hashes and audit data. A retry can adopt
+an expired/retryable checkpoint only from its direct prior owner through the
+same root and candidate identity; a fresh run receives a different checkpoint
+and cannot adopt the old snapshot.
 
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication
@@ -360,13 +384,67 @@ The Aetna Commercial/Medicare base is a known variant of this path: its
 `$export` operation is accepted with `_type=...` and `Prefer: respond-async`,
 but rejects the optional `_outputFormat` query parameter. That exception is
 handled by source metadata so normal Bulk Data servers keep the standards-shaped
-request while Aetna gets the gateway-compatible request. Bulk support remains
-available for row-bounded Aetna validation, but an unbounded Aetna full refresh
-uses the paged path until accepted Bulk Data jobs and streamed outputs have
-durable resume checkpoints. Import metrics retain the compatibility
+request while Aetna gets the gateway-compatible request. Row-bounded Aetna
+validation keeps the compatibility Bulk path. Unbounded Aetna Bulk is enabled
+only when the acquisition-only checkpoint mode has a run id, root lineage,
+endpoint id, non-current candidate `dataset_id`, streaming writes, no resource
+or page limit, `stale_cleanup=false`, and `publish_artifacts=false`. Otherwise
+the importer keeps the existing paged behavior. Import metrics retain the compatibility
 `bulk_export` flag and add `bulk_export_mode.requested`, `.effective`, and
 `.effective_resource_fetches`, so a globally requested fast path is not
 mistaken for the mode actually used by a source.
+
+Before the export request, the importer reserves the root/candidate checkpoint.
+Once a Bulk request returns HTTP 202, the accepted status URL is persisted
+before polling. If a worker disappears while acceptance is in flight and leaves
+an unresolved reservation, a retry fails closed rather than issuing a second
+export with an unknown first-job outcome. A retry with a stored status URL polls
+that same job until a manifest is accepted, or it uses the stored manifest
+directly. The canonical manifest includes
+`transactionTime`, `request`, `requiresAccessToken`, and the complete sorted
+output identity. A changed manifest, unsafe status/output URL, expired status
+job, or expired output fails closed. The importer never starts a replacement
+export inside the same candidate after acceptance, and the prior current
+endpoint dataset remains untouched.
+
+Each checkpointed resource also holds a PostgreSQL session advisory lock for
+the complete request/poll/stream lifecycle. A competing retry fails retryably
+before checkpoint adoption while that worker is alive. Before every streamed
+database batch and before output/checkpoint completion, the worker checks the
+same guard connection and persisted owner. Losing either fails before the next
+write, closing the lease-expiry window between a row batch and its progress
+update.
+
+Each completed NDJSON output is skipped on retry. If a worker stops while one
+output is streaming, that output is requested again from byte/line zero and
+rewritten through idempotent resource upserts; this is output-level restart,
+not byte-level resume. Batch progress persists rows written during the attempt,
+and the output is marked complete only after the final batch succeeds. Endpoint
+dataset promotion remains blocked until every output for every selected
+resource is complete and every resource diagnostic is unbounded and error-free.
+
+Bulk start and status requests must be HTTPS and remain on the payer origin.
+Payer credentials are resolved only for the payer request URL. Manifest outputs
+must be absolute HTTPS URLs without userinfo or fragments; IP-literal hosts are
+rejected before `aiohttp` can bypass DNS resolution. Same-base outputs can
+receive payer credentials only when `requiresAccessToken=true`; each external
+host must exactly match `provider_directory_bulk_export_output_hosts` source
+metadata and is downloaded without auth. Aetna currently allows only the
+observed `storage.googleapis.com` host. External output that claims it requires
+the payer access token is rejected. A custom resolver rejects non-global DNS
+answers on every connection, and redirects are not followed, preventing DNS
+rebinding or moving credentials/snapshot identity to a URL not present in the
+accepted manifest. Status and output capability paths/queries are never logged;
+operational logs retain only the host and a short SHA-256 identity.
+
+Bulk `transactionTime` values must be timezone-aware, no more than 15 minutes
+in the future, and no older than 45 days by default. The bounds are configurable
+with `HLTHPRT_PROVIDER_DIRECTORY_BULK_MANIFEST_FUTURE_SKEW_SECONDS` and
+`HLTHPRT_PROVIDER_DIRECTORY_BULK_MANIFEST_MAX_AGE_SECONDS`. They are checked
+when accepting the manifest and again before endpoint-dataset promotion, so an
+old snapshot cannot replace a paged/pre-migration current dataset that lacks
+Bulk lineage, and an excessive future timestamp cannot poison later freshness
+comparisons.
 
 Full-refresh stale cleanup also uses an append-only unlogged seen stage by
 default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids
@@ -949,10 +1027,13 @@ configured, run a full resource refresh (`resource_limit=0`,
 acquisition schedule also sets `stale_cleanup=false`,
 `publish_artifacts=false`, `publish_after_acquisition=false`, and
 `publish_corroboration=false`. This keeps remote acquisition resumable and
-separate from the later projection and artifact-publication schedules. Aetna
-Commercial uses paged mode until its Bulk Data jobs and output streams have
-durable checkpoints; checkpoint-enabled acquisitions persist the guarded Aetna
-continuation tokens.
+separate from the later projection and artifact-publication schedules. The
+documented schedule currently leaves `bulk_export=false`; setting it to true on
+this acquisition shape enables durable unbounded Aetna Commercial Bulk Data.
+The importer will not enable unbounded Aetna Bulk if stale deletion or artifact
+publication is folded back into the acquisition run. Paged fallback remains
+available before a Bulk job is accepted, and accepted jobs must resume from the
+stored status/manifest checkpoint instead of creating a mixed snapshot.
 The importer may cap `_count` below the schedule-level `page_count` for a
 specific payer/resource when the live FHIR server is known to misbehave at
 larger page sizes. Aetna Commercial caps all seven supported collections at 30.

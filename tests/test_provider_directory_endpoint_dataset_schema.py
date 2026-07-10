@@ -167,7 +167,15 @@ def test_endpoint_dataset_migration_mirrors_models(monkeypatch):
             for table_item in recorder.tables[table_name]["items"]
             if isinstance(table_item, sa.Column)
         ]
-        assert columns == list(model_cls.__table__.columns.keys())
+        revision_model_columns = [
+            column_name
+            for column_name in model_cls.__table__.columns.keys()
+            if not (
+                table_name == "provider_directory_endpoint_dataset"
+                and column_name == "acquisition_root_run_id"
+            )
+        ]
+        assert columns == revision_model_columns
         assert recorder.tables[table_name]["schema"] == model_cls.__table__.schema
 
     current_index = recorder.indexes["provider_directory_endpoint_dataset_current_idx"]

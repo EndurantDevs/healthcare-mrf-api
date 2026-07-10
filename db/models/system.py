@@ -35,6 +35,8 @@ __all__ = (
     "PartDImportRun",
     "PartDFormularySnapshot",
     "ProviderDirectoryAPIEndpoint",
+    "ProviderDirectoryBulkAcquisitionCheckpoint",
+    "ProviderDirectoryBulkOutputCheckpoint",
     "ProviderDirectoryCapability",
     "ProviderDirectoryCanonicalResource",
     "ProviderDirectoryDatasetResource",
@@ -411,6 +413,12 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
             "unique": True,
             "where": "is_current = true",
         },
+        {
+            "index_elements": ("endpoint_id", "acquisition_root_run_id"),
+            "name": "provider_directory_endpoint_dataset_acquisition_root_idx",
+            "unique": True,
+            "where": "acquisition_root_run_id IS NOT NULL",
+        },
         {"index_elements": ("dataset_hash",), "name": "provider_directory_endpoint_dataset_hash_idx"},
     ]
 
@@ -424,6 +432,7 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
         nullable=False,
     )
     import_run_id = Column(String(64))
+    acquisition_root_run_id = Column(String(64))
     previous_dataset_id = Column(String(96))
     dataset_hash = Column(String(64))
     status = Column(String(32), nullable=False)
@@ -931,6 +940,133 @@ class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     updated_at = Column(TIMESTAMP)
 
 
+class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
+    """Durable identity and lifecycle for one accepted FHIR Bulk Data export."""
+
+    __tablename__ = "provider_directory_bulk_acquisition_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("checkpoint_id"),
+        UniqueConstraint(
+            "canonical_api_base",
+            "resource_type",
+            "source_scope_hash",
+            "strategy_version",
+            "acquisition_root_run_id",
+            "dataset_id",
+            name="provider_directory_bulk_acquisition_identity_key",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["checkpoint_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("dataset_id",),
+            "name": "provider_directory_bulk_acquisition_dataset_idx",
+        },
+        {
+            "index_elements": ("owner_run_id",),
+            "name": "provider_directory_bulk_acquisition_owner_idx",
+        },
+        {
+            "index_elements": ("acquisition_root_run_id",),
+            "name": "provider_directory_bulk_acquisition_root_idx",
+        },
+        {
+            "index_elements": ("state", "updated_at"),
+            "name": "provider_directory_bulk_acquisition_state_updated_idx",
+        },
+    ]
+
+    checkpoint_id = Column(String(64), nullable=False)
+    canonical_api_base = Column(TEXT, nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    source_scope_hash = Column(String(64), nullable=False)
+    strategy_version = Column(String(64), nullable=False)
+    acquisition_root_run_id = Column(String(64), nullable=False)
+    owner_run_id = Column(String(64), nullable=False)
+    retry_of_run_id = Column(String(64))
+    endpoint_id = Column(
+        String(64),
+        ForeignKey(
+            ProviderDirectoryAPIEndpoint.endpoint_id,
+            name="provider_directory_bulk_acquisition_endpoint_id_fkey",
+        ),
+        nullable=False,
+    )
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="provider_directory_bulk_acquisition_dataset_id_fkey",
+        ),
+        nullable=False,
+    )
+    start_url_hash = Column(String(64), nullable=False)
+    status_url_ciphertext = Column(TEXT)
+    status_url_hash = Column(String(64))
+    manifest_hash = Column(String(64))
+    manifest_ciphertext = Column(TEXT)
+    manifest_json = Column(JSON)
+    state = Column(String(32), nullable=False)
+    lease_expires_at = Column(TIMESTAMP)
+    rows_written = Column(BigInteger, nullable=False, default=0)
+    error = Column(TEXT)
+    created_at = Column(TIMESTAMP, nullable=False)
+    accepted_at = Column(TIMESTAMP)
+    last_polled_at = Column(TIMESTAMP)
+    manifest_received_at = Column(TIMESTAMP)
+    completed_at = Column(TIMESTAMP)
+    failed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP, nullable=False)
+
+
+class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
+    """Completion state for one immutable Bulk Data manifest output."""
+
+    __tablename__ = "provider_directory_bulk_output_checkpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("checkpoint_id", "output_id"),
+        UniqueConstraint(
+            "checkpoint_id",
+            "output_index",
+            name="provider_directory_bulk_output_index_key",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["checkpoint_id", "output_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("state", "updated_at"),
+            "name": "provider_directory_bulk_output_state_updated_idx",
+        },
+    ]
+
+    checkpoint_id = Column(
+        String(64),
+        ForeignKey(
+            ProviderDirectoryBulkAcquisitionCheckpoint.checkpoint_id,
+            name="provider_directory_bulk_output_checkpoint_id_fkey",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    output_id = Column(String(64), nullable=False)
+    output_index = Column(Integer, nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    output_url_ciphertext = Column(TEXT)
+    output_url_hash = Column(String(64), nullable=False)
+    state = Column(String(32), nullable=False)
+    rows_written = Column(BigInteger, nullable=False, default=0)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    error = Column(TEXT)
+    created_at = Column(TIMESTAMP, nullable=False)
+    started_at = Column(TIMESTAMP)
+    completed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP, nullable=False)
+
+
 class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
     """Durable resume state for one source-scoped paginated resource scan."""
 
@@ -967,6 +1103,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
         ),
     )
     source_ids = Column(JSON, nullable=False)
+    acquisition_root_run_id = Column(String(64), nullable=False)
     owner_run_id = Column(String(64), nullable=False)
     retry_of_run_id = Column(String(64))
     start_url_hash = Column(String(64), nullable=False)
