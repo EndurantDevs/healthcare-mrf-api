@@ -104,7 +104,7 @@ async def build_ptg2_source_snapshot_gc_plan(
     *,
     schema_name: str | None = None,
     executor: Any | None = None,
-    retain_current_lineage: int = 3,
+    retain_current_lineage: int = 4,
 ) -> PTG2SourceSnapshotGCPlan:
     """Build a plan while retaining recent lineage behind every current pointer."""
 
@@ -223,7 +223,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
     max_tables: int = 2000,
     max_bytes: int = 80 * 1024 * 1024 * 1024,
     lock_timeout: str = "5s",
-    retain_current_lineage: int = 3,
+    retain_current_lineage: int = 4,
 ) -> PTG2SourceSnapshotGCPlan:
     """Recompute and execute a bounded cleanup plan in one transaction."""
 
@@ -309,7 +309,7 @@ async def _amain(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--max-tables", type=_positive_int, default=2000)
     parser.add_argument("--max-bytes-gb", type=_positive_int, default=80)
     parser.add_argument("--lock-timeout", default="5s")
-    parser.add_argument("--retain-current-lineage", type=_positive_int, default=3)
+    parser.add_argument("--retain-current-lineage", type=_positive_int, default=4)
     args = parser.parse_args(list(argv) if argv is not None else None)
     max_bytes = args.max_bytes_gb * 1024 * 1024 * 1024
     if args.execute:

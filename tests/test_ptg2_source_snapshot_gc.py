@@ -134,7 +134,12 @@ def test_build_ptg2_source_snapshot_gc_plan_retains_three_snapshot_lineage():
                 return [{"table_name": "ptg2_serving_fourth", "bytes": 100}]
             raise AssertionError(statement)
 
-    plan = asyncio.run(snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=LineageExecutor()))
+    plan = asyncio.run(
+        snapshot_gc.build_ptg2_source_snapshot_gc_plan(
+            executor=LineageExecutor(),
+            retain_current_lineage=3,
+        )
+    )
 
     assert plan.candidate_snapshot_ids == ("snap_fourth",)
     assert [(table.snapshot_id, table.table_name) for table in plan.tables] == [

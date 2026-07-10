@@ -11,12 +11,14 @@ conditions:
 
 - `mrf.ptg2_snapshot.status = 'published'`
 - `manifest->'serving_index'->>'storage' = 'manifest_snapshot'`
-- the snapshot id is absent from all current pointer tables:
+- the snapshot id is outside the protected lineage rooted at all current pointer tables:
   - `mrf.ptg2_current_snapshot`
   - `mrf.ptg2_current_source_snapshot`
   - `mrf.ptg2_current_plan_source`
 
-For those snapshots it drops only manifest-declared PTG2 tables with known
+By default the current snapshot and its three predecessors are protected for
+each pointer (`--retain-current-lineage 4`). For snapshots outside that lineage
+the command drops only manifest-declared PTG2 tables with known
 snapshot-table prefixes, then deletes matching `ptg2_artifact_manifest` and
 `ptg2_snapshot` metadata rows. It does not remove raw payer downloads or
 sidecar artifact files.
@@ -30,7 +32,8 @@ Dry-run first:
   --schema mrf \
   --max-snapshots 400 \
   --max-tables 2000 \
-  --max-bytes-gb 80
+  --max-bytes-gb 80 \
+  --retain-current-lineage 4
 ```
 
 Execute only after reviewing the dry-run counts:
@@ -41,9 +44,15 @@ Execute only after reviewing the dry-run counts:
   --max-snapshots 400 \
   --max-tables 2000 \
   --max-bytes-gb 80 \
+  --retain-current-lineage 4 \
   --lock-timeout 5s \
   --execute
 ```
+
+Normal source publish cleanup uses the same four-snapshot default through
+`HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE`. Set the environment value and
+the maintenance argument consistently when a deployment needs a different
+history depth.
 
 The execute path recomputes the candidate set inside one database transaction
 before dropping tables. It refuses to run if the recomputed snapshot count,
@@ -68,7 +77,9 @@ variables.
 
 ## Verification Queries
 
-After cleanup, non-current manifest snapshots should be zero:
+After cleanup, snapshots outside the configured current lineage should be zero.
+The query below is a broad inventory; non-current rows are expected while they
+remain inside that protected lineage:
 
 ```sql
 WITH current_refs AS (

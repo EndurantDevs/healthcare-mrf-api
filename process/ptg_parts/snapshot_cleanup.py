@@ -12,6 +12,9 @@ from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 
 
+PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV = "HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE"
+
+
 def _dedupe_preserve_table_names(seq: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -82,17 +85,43 @@ async def _drop_ptg2_snapshot_tables_for_manifest(serving_index: dict[str, Any] 
     await _drop_ptg2_snapshot_table_names(_snapshot_manifest_table_names(serving_index))
 
 
+def _source_snapshot_lineage_limit() -> int:
+    raw_value = os.getenv(PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE_ENV, "4")
+    try:
+        return max(1, min(int(raw_value), 50))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _source_snapshot_keep_ids(rows: list[Any], current_snapshot_ids: set[str]) -> set[str]:
+    previous_snapshot_by_id = {}
+    for row in rows:
+        data = row if isinstance(row, dict) else row._mapping
+        snapshot_id = str(data.get("snapshot_id") or "")
+        previous_snapshot_by_id[snapshot_id] = str(data.get("previous_snapshot_id") or "")
+    keep_snapshot_ids = {str(snapshot_id) for snapshot_id in current_snapshot_ids if snapshot_id}
+    for current_snapshot_id in tuple(keep_snapshot_ids):
+        lineage_snapshot_id = current_snapshot_id
+        for _lineage_depth in range(1, _source_snapshot_lineage_limit()):
+            lineage_snapshot_id = previous_snapshot_by_id.get(lineage_snapshot_id, "")
+            if not lineage_snapshot_id or lineage_snapshot_id in keep_snapshot_ids:
+                break
+            keep_snapshot_ids.add(lineage_snapshot_id)
+    return keep_snapshot_ids
+
+
 async def _cleanup_old_ptg2_source_tables(source_key: str, keep_snapshot_ids: set[str]) -> None:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     rows = await db.all(
         f"""
-        SELECT snapshot_id, manifest
+        SELECT snapshot_id, previous_snapshot_id, manifest
           FROM {_quote_ident(schema_name)}.ptg2_snapshot
          WHERE manifest->'serving_index'->>'source_key' = :source_key
         """,
         source_key=source_key,
     )
     table_names: list[str] = []
+    keep_snapshot_ids = _source_snapshot_keep_ids(rows, keep_snapshot_ids)
     for row in rows:
         data = row if isinstance(row, dict) else row._mapping
         if str(data.get("snapshot_id") or "") in keep_snapshot_ids:

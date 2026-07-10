@@ -867,6 +867,21 @@ def test_cleanup_old_ptg2_source_tables_scans_all_storage_generations(monkeypatc
     )
 
 
+def test_source_snapshot_cleanup_retains_four_snapshot_lineage(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE", raising=False)
+    rows = [
+        {"snapshot_id": "snap-current", "previous_snapshot_id": "snap-previous"},
+        {"snapshot_id": "snap-previous", "previous_snapshot_id": "snap-third"},
+        {"snapshot_id": "snap-third", "previous_snapshot_id": "snap-fourth"},
+        {"snapshot_id": "snap-fourth", "previous_snapshot_id": "snap-fifth"},
+        {"snapshot_id": "snap-fifth", "previous_snapshot_id": None},
+    ]
+
+    keep_snapshot_ids = ptg_snapshot_cleanup._source_snapshot_keep_ids(rows, {"snap-current"})
+
+    assert keep_snapshot_ids == {"snap-current", "snap-previous", "snap-third", "snap-fourth"}
+
+
 def test_snapshot_artifact_split_keeps_facade_helpers_stable():
     assert process_ptg._row_mapping is ptg_snapshot_artifacts._row_mapping
     assert process_ptg.build_ptg2_snapshot_index_artifact is ptg_snapshot_artifacts.build_ptg2_snapshot_index_artifact

@@ -3930,10 +3930,7 @@ async def main(
                 total_steps=publish_progress_total,
                 message_text="cleaning old PTG source tables",
             )
-            keep_snapshot_ids = {snapshot_id}
-            if previous_snapshot_id:
-                keep_snapshot_ids.add(previous_snapshot_id)
-            await _cleanup_old_ptg2_source_tables(source_key_val, keep_snapshot_ids)
+            await _cleanup_old_ptg2_source_tables(source_key_val, {snapshot_id})
         _emit_ptg2_publish_progress(
             "address refresh",
             completed_steps=7,
