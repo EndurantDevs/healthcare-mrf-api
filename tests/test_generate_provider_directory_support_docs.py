@@ -19,7 +19,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert all(row.count(f"`{entry_id}`") == 1 for row, entry_id in zip(rows, entry_ids))
     assert "OAuth2 client credentials | Bulk" in rendered
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered
-    assert "Sequential REST pagination preserves Plan-Net network extensions; no Bulk." in rendered
+    assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered
     assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered
     assert "does not claim that a live probe succeeded" in rendered
@@ -126,7 +126,7 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
         ("molina", "molina.sapphirethreesixtyfive.com cursor continuations"),
         ("michigan", "PractitionerRole pages are capped at 25"),
-        ("cigna", "Sequential REST pagination preserves Plan-Net network extensions; no Bulk"),
+        ("cigna", "_count=75 returns false-empty search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
         ("humana", "Overrides portal or stale paths to the public FHIR base"),
         ("iehp", "Normalizes portal and resource paths"),
