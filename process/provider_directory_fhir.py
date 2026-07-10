@@ -464,6 +464,10 @@ FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BA
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
 WYOMING_PROVIDER_DIRECTORY_BASE = "https://wy.fhir.mhbapp.com/pd/api/v1"
+MAINE_PROVIDER_DIRECTORY_BASE = "https://maineproviderdirectory.verityanalytics.org/fhir"
+MISSOURI_PROVIDER_DIRECTORY_BASE = (
+    "https://iox.mohealthnet.conduent.com/providerDirectory/api/R4"
+)
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
@@ -495,6 +499,16 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     (WASHINGTON_PROVIDER_DIRECTORY_BASE, "Location"): 25,
     (WYOMING_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
 }
+STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
+    {"Location", "Organization", "Practitioner", "PractitionerRole"}
+)
+EXPECTED_NONEMPTY_RESOURCES_BY_BASE = {
+    ARKANSAS_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    MAINE_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    MISSOURI_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    WASHINGTON_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    WYOMING_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+}
 PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_and_location_rows"
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 PAGINATION_CHECKPOINT_API_BASES = frozenset(
@@ -505,7 +519,11 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
+        MAINE_PROVIDER_DIRECTORY_BASE,
+        MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
+        WASHINGTON_PROVIDER_DIRECTORY_BASE,
+        WYOMING_PROVIDER_DIRECTORY_BASE,
     }
 )
 PAGINATION_CHECKPOINT_ACTIVE = "active"
@@ -522,6 +540,7 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
         "_skip",
         "cursor",
         "cursormark",
+        "ct",
         "nexttoken",
         "page",
         "pagetoken",
@@ -2234,6 +2253,8 @@ def _expected_nonempty_resource_types(source: dict[str, Any]) -> set[str]:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base == CIGNA_PROVIDER_DIRECTORY_BASE:
         return set(CIGNA_EXPECTED_NONEMPTY_RESOURCES)
+    if api_base in EXPECTED_NONEMPTY_RESOURCES_BY_BASE:
+        return set(EXPECTED_NONEMPTY_RESOURCES_BY_BASE[api_base])
     configured_resources = _source_metadata(source).get(
         "provider_directory_expected_nonempty_resources"
     )
@@ -12410,7 +12431,7 @@ async def _import_resources(
         scan_role_reverse_lookup_planned = _scan_practitioner_role_reverse_lookup_planned(source, resources)
 
         async def mark_resource_stale_cleanup_ready(resource_type: str, result: ResourceFetchResult) -> None:
-            if not stale_cleanup or not result.complete:
+            if not stale_cleanup or not _is_resource_fetch_complete_for_publish(result):
                 return
             if seen_stage_table:
                 source_stale_ready_source_ids[resource_type] = list(source_ids)

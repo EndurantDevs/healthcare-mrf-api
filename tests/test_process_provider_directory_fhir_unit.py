@@ -3176,6 +3176,7 @@ async def test_source_fetch_retries_transient_failure_without_resizing(monkeypat
         "_offset=100",
         "_continuationToken=opaque",
         "cursorMark=opaque",
+        "ct=opaque",
         "nextToken=opaque",
     ],
 )
@@ -3231,6 +3232,40 @@ def test_cigna_empty_endpoint_remains_complete():
     )
 
     assert guarded_result is result
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        importer.ARKANSAS_PROVIDER_DIRECTORY_BASE,
+        importer.MAINE_PROVIDER_DIRECTORY_BASE,
+        importer.MISSOURI_PROVIDER_DIRECTORY_BASE,
+        importer.WASHINGTON_PROVIDER_DIRECTORY_BASE,
+        importer.WYOMING_PROVIDER_DIRECTORY_BASE,
+    ],
+)
+def test_state_directory_empty_core_resource_fails_closed(api_base):
+    fetch_result = importer.ResourceFetchResult(
+        model=object,
+        rows=[],
+        rows_fetched=0,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+    guarded_result = importer._fail_closed_on_unexpected_empty_resource(
+        {"canonical_api_base": api_base},
+        "Practitioner",
+        fetch_result,
+    )
+
+    assert guarded_result.complete is False
+    assert guarded_result.error == importer.CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
 
 
 @pytest.mark.asyncio
