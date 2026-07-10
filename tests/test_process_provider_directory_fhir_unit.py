@@ -945,6 +945,7 @@ def test_source_row_from_seed_overrides_hap_stale_provider_directory_path():
     assert row["last_validated_status"] == "valid"
     assert row["metadata_json"]["provider_directory_override"] == "hap_provider_directory_r4"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.HAP_PROVIDER_DIRECTORY_METADATA_URL
+    assert row["metadata_json"]["provider_directory_request_interval_seconds"] == 20
     assert row["metadata_json"]["provider_directory_supported_resources"] == [
         "InsurancePlan",
         "Location",
@@ -3157,6 +3158,55 @@ async def test_source_fetch_retries_transient_get_failures(monkeypatch):
     assert fetch_error is None
     assert elapsed_ms == 23
     assert responses == []
+
+
+@pytest.mark.asyncio
+async def test_hap_source_request_pacing_serializes_anonymous_calls(monkeypatch):
+    source_lookup = {
+        "source_id": "hap",
+        "api_base": importer.HAP_PROVIDER_DIRECTORY_BASE,
+        "_provider_directory_last_request_monotonic": importer.time.monotonic() - 10.0,
+    }
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_json",
+        AsyncMock(return_value=(200, {"resourceType": "Bundle"}, None, 1)),
+    )
+
+    await importer._fetch_source_json_once(
+        source_lookup,
+        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1",
+        timeout=3,
+    )
+
+    sleep_mock.assert_awaited_once()
+    assert 9.0 <= sleep_mock.await_args.args[0] <= 10.0
+
+
+@pytest.mark.asyncio
+async def test_source_fetch_honors_retry_after_for_429(monkeypatch):
+    responses = [
+        (429, {importer.SOURCE_RETRY_AFTER_FIELD: "3"}, None, 1),
+        (200, {"resourceType": "Bundle", "entry": []}, None, 1),
+    ]
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json_once",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: responses.pop(0)),
+    )
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    fetch_result = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=1",
+        timeout=3,
+    )
+
+    assert fetch_result[0] == 200
+    sleep_mock.assert_awaited_once_with(3.0)
 
 
 @pytest.mark.asyncio

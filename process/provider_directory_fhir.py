@@ -7,6 +7,7 @@ import base64
 import contextvars
 import csv
 import datetime
+import email.utils
 import hashlib
 import io
 import json
@@ -514,6 +515,10 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
 PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
     HAP_PROVIDER_DIRECTORY_BASE: 1000,
 }
+SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
+    HAP_PROVIDER_DIRECTORY_BASE: 20.0,
+}
+SOURCE_RETRY_AFTER_FIELD = "_healthporta_retry_after"
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
 )
@@ -3140,6 +3145,7 @@ def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
             "provider_directory_confirmed_base": HAP_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": HAP_PROVIDER_DIRECTORY_DOC_URL,
             "provider_directory_confirmed_metadata_url": HAP_PROVIDER_DIRECTORY_METADATA_URL,
+            "provider_directory_request_interval_seconds": 20,
             "provider_directory_supported_resources": [
                 "InsurancePlan",
                 "Location",
@@ -8269,7 +8275,12 @@ def _fetch_json_sync(
             body = exc.read(1024 * 1024)
         except Exception:
             body = b""
-        return exc.code, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
+        error_payload_dict = _decode_json_body(body)
+        retry_after = _clean_text(exc.headers.get("Retry-After"))
+        if retry_after:
+            error_payload_dict = dict(error_payload_dict or {})
+            error_payload_dict[SOURCE_RETRY_AFTER_FIELD] = retry_after
+        return exc.code, error_payload_dict, None, int((time.monotonic() - started) * 1000)
     except Exception as exc:
         return None, None, f"{type(exc).__name__}: {exc}", int((time.monotonic() - started) * 1000)
 
@@ -8375,12 +8386,68 @@ def _should_reduce_source_page_size(
     return fetch_error is None and status_code in {400, 413}
 
 
+def _source_request_interval_seconds(source_record: dict[str, Any]) -> float:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    configured_interval = _source_metadata(source_record).get(
+        "provider_directory_request_interval_seconds"
+    )
+    try:
+        interval_seconds = float(configured_interval)
+    except (TypeError, ValueError):
+        interval_seconds = SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE.get(
+            api_base or "",
+            0.0,
+        )
+    return max(0.0, interval_seconds)
+
+
+async def _pace_source_request(source_record: dict[str, Any]) -> None:
+    interval_seconds = _source_request_interval_seconds(source_record)
+    if interval_seconds <= 0:
+        return
+    pacing_lock = source_record.get("_provider_directory_request_pacing_lock")
+    if pacing_lock is None:
+        pacing_lock = asyncio.Lock()
+        source_record["_provider_directory_request_pacing_lock"] = pacing_lock
+    async with pacing_lock:
+        last_started_at = float(
+            source_record.get("_provider_directory_last_request_monotonic") or 0.0
+        )
+        wait_seconds = max(0.0, last_started_at + interval_seconds - time.monotonic())
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+        source_record["_provider_directory_last_request_monotonic"] = time.monotonic()
+
+
+def _source_retry_after_seconds(fhir_payload: dict[str, Any] | None) -> float | None:
+    retry_after = _clean_text((fhir_payload or {}).get(SOURCE_RETRY_AFTER_FIELD))
+    if not retry_after:
+        return None
+    try:
+        numeric_delay = float(retry_after)
+    except ValueError:
+        numeric_delay = None
+    if numeric_delay is not None:
+        return min(600.0, max(0.0, numeric_delay))
+    try:
+        retry_at = email.utils.parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.UTC)
+    delay_seconds = (retry_at - datetime.datetime.now(datetime.UTC)).total_seconds()
+    return min(600.0, max(0.0, delay_seconds))
+
+
 async def _fetch_source_json_once(
     source_record: dict[str, Any],
     url: str,
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    await _pace_source_request(source_record)
     options = _credential_request_options_for_source(source_record, url)
     if not options["headers"] and not options["query_params"]:
         return await _fetch_json(url, timeout=timeout)
@@ -8427,7 +8494,16 @@ async def _fetch_source_json(
             if not _is_transient_source_fetch_failure(status_code, fetch_error):
                 return status_code, fhir_payload, fetch_error, total_elapsed_ms
             if attempt_index + 1 < attempt_count:
-                await asyncio.sleep(_source_fetch_retry_delay_seconds(attempt_index))
+                retry_delay = (
+                    _source_retry_after_seconds(fhir_payload)
+                    if status_code == 429
+                    else None
+                )
+                await asyncio.sleep(
+                    retry_delay
+                    if retry_delay is not None
+                    else _source_fetch_retry_delay_seconds(attempt_index)
+                )
         if not should_try_smaller_page:
             return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
     return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
