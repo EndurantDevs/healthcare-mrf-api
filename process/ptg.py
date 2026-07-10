@@ -284,7 +284,8 @@ from process.ptg_parts.snapshot_artifacts import (
     build_ptg2_snapshot_index_artifact)
 from process.ptg_parts.snapshot_cleanup import (
     _cleanup_old_ptg2_source_tables, _drop_ptg2_snapshot_table_names,
-    _drop_ptg2_snapshot_tables_for_manifest, _snapshot_manifest_table_names)
+    _drop_ptg2_snapshot_tables_for_manifest,
+    _missing_snapshot_serving_resources, _snapshot_manifest_table_names)
 from process.ptg_parts.snapshot_tables import (_normalize_source_key,
                                                _ptg2_snapshot_index_name,
                                                _ptg2_snapshot_table_name,
@@ -318,7 +319,9 @@ from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
                                            _ptg_job_identity,
                                            parse_toc_catalog_entries)
 from process.ptg_parts.source_pointers import (_current_source_snapshot_id,
+                                               _acquire_source_pointer_gc_lock,
                                                _ptg2_plan_source_key,
+                                               _publish_ptg2_global_snapshot_pointer,
                                                _publish_ptg2_source_pointers,
                                                _source_plan_rows)
 from process.ptg_parts.source_versions import _record_source_version
@@ -466,20 +469,30 @@ async def _push_ptg2_snapshot_preserving_publication(
         set_=update_values_by_column,
         where=conflict_where,
     ).returning(*table.c)
-    stored_row = await statement.first()
-    has_snapshot_claim = stored_row is not None
-    if stored_row is None:
-        stored_row = await (
-            db.select(*table.c)
-            .where(table.c.snapshot_id == snapshot_attributes["snapshot_id"])
-            .first()
-        )
-    snapshot_state = _row_mapping(stored_row)
-    if is_snapshot_claim:
-        snapshot_state["snapshot_claim_status"] = (
-            "acquired" if has_snapshot_claim else "existing"
-        )
-    return snapshot_state
+
+    async def execute_snapshot_state_write() -> dict[str, Any]:
+        """Store one snapshot state and report whether a building claim won."""
+
+        stored_row = await statement.first()
+        has_snapshot_claim = stored_row is not None
+        if stored_row is None:
+            stored_row = await (
+                db.select(*table.c)
+                .where(table.c.snapshot_id == snapshot_attributes["snapshot_id"])
+                .first()
+            )
+        snapshot_state = _row_mapping(stored_row)
+        if is_snapshot_claim:
+            snapshot_state["snapshot_claim_status"] = (
+                "acquired" if has_snapshot_claim else "existing"
+            )
+        return snapshot_state
+
+    if not is_snapshot_claim:
+        return await execute_snapshot_state_write()
+    async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        return await execute_snapshot_state_write()
 
 
 async def _push_ptg2_objects(
@@ -3375,15 +3388,29 @@ async def _reconcile_already_published_snapshot(
     if serving_index.get("storage") != "manifest_snapshot":
         return {"status": "not_applicable", "reason": "snapshot has no source-scoped serving tables"}
     previous_snapshot_id = snapshot_attributes.get("previous_snapshot_id")
-    return await _publish_ptg2_source_pointers(
-        source_key=source_key,
-        snapshot_id=snapshot_id,
-        previous_snapshot_id=str(previous_snapshot_id) if previous_snapshot_id else None,
-        import_month=import_month,
-        updated_at=_utcnow(),
-        serving_index=serving_index,
-        snapshot_attributes=snapshot_attributes,
-    )
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
+            schema_name,
+            snapshot_id,
+            serving_index,
+        )
+        if missing_tables or missing_artifacts:
+            missing_resources = [*missing_tables, *missing_artifacts]
+            raise RuntimeError(
+                "Published PTG snapshot serving resources are missing: "
+                + ", ".join(missing_resources)
+            )
+        return await _publish_ptg2_source_pointers(
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=str(previous_snapshot_id) if previous_snapshot_id else None,
+            import_month=import_month,
+            updated_at=_utcnow(),
+            serving_index=serving_index,
+            snapshot_attributes=snapshot_attributes,
+        )
 
 
 _PTG2_CANDIDATE_TABLE_KINDS = (
@@ -4291,7 +4318,10 @@ async def main(
             "previous_snapshot_id": previous_snapshot_id,
             "manifest": report_payload,
         }
-        if has_serving_files and source_scoped_compact and source_key_val:
+        source_pointer_published = bool(
+            has_serving_files and source_scoped_compact and source_key_val
+        )
+        if source_pointer_published:
             _emit_ptg2_publish_progress(
                 "updating source pointer",
                 completed_steps=6,
@@ -4308,33 +4338,30 @@ async def main(
                 snapshot_attributes=snapshot_publish_by_field,
             )
             current_pointer_published = True
-        await _push_ptg2_objects(
-            [snapshot_publish_by_field],
-            PTG2Snapshot,
-            rewrite=True,
-        )
-        if has_serving_files and not (source_scoped_compact and source_key_val):
-            await _push_ptg2_objects(
-                [
-                    {
-                        "slot": "current",
-                        "snapshot_id": snapshot_id,
-                        "previous_snapshot_id": global_previous_snapshot_id,
-                        "updated_at": finished,
-                    }
-                ],
-                PTG2CurrentSnapshot,
-                rewrite=True,
+        elif has_serving_files:
+            await _publish_ptg2_global_snapshot_pointer(
+                snapshot_attributes=snapshot_publish_by_field,
+                updated_at=finished,
             )
             current_pointer_published = True
-        if has_serving_files and source_scoped_compact and source_key_val:
+        else:
+            await _push_ptg2_objects(
+                [snapshot_publish_by_field],
+                PTG2Snapshot,
+                rewrite=True,
+            )
+        if source_pointer_published:
             _emit_ptg2_publish_progress(
                 "cleaning old source tables",
                 completed_steps=7,
                 total_steps=publish_progress_total,
                 message_text="cleaning old PTG source tables",
             )
-            await _cleanup_old_ptg2_source_tables(source_key_val, {snapshot_id})
+            await _cleanup_old_ptg2_source_tables(
+                source_key_val,
+                {snapshot_id},
+                lock_pointer_state=True,
+            )
         _emit_ptg2_publish_progress(
             "address refresh",
             completed_steps=7,

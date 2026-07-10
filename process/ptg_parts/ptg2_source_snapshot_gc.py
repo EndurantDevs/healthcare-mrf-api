@@ -22,6 +22,10 @@ from process.ptg_parts.snapshot_cleanup import _snapshot_manifest_table_names
 from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 
 
+_GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
+_GC_CANDIDATE_STORAGE = "manifest_snapshot"
+
+
 @dataclass(frozen=True)
 class PTG2SnapshotGCTable:
     snapshot_id: str
@@ -117,9 +121,15 @@ async def build_ptg2_source_snapshot_gc_plan(
           FROM (
                 SELECT snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_snapshot WHERE snapshot_id IS NOT NULL
                 UNION ALL
+                SELECT previous_snapshot_id AS snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_snapshot WHERE previous_snapshot_id IS NOT NULL
+                UNION ALL
                 SELECT snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_source_snapshot WHERE snapshot_id IS NOT NULL
                 UNION ALL
+                SELECT previous_snapshot_id AS snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_source_snapshot WHERE previous_snapshot_id IS NOT NULL
+                UNION ALL
                 SELECT snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE snapshot_id IS NOT NULL
+                UNION ALL
+                SELECT previous_snapshot_id AS snapshot_id FROM {_quote_ident(schema_name)}.ptg2_current_plan_source WHERE previous_snapshot_id IS NOT NULL
           ) refs
          ORDER BY snapshot_id
         """
@@ -128,17 +138,16 @@ async def build_ptg2_source_snapshot_gc_plan(
     snapshot_rows = await executor.all(
         f"""
         SELECT snapshot_id,
+               status,
                previous_snapshot_id,
                manifest,
                manifest->'serving_index' AS serving_index,
                manifest->'serving_index'->>'source_key' AS source_key
           FROM {_quote_ident(schema_name)}.ptg2_snapshot
-         WHERE status IN ('published', 'failed')
-           AND COALESCE(manifest->'serving_index'->>'storage', '') = 'manifest_snapshot'
          ORDER BY snapshot_id
         """
     )
-    current_table_refs: set[str] = set()
+    retained_table_refs: set[str] = set()
     protected_snapshot_ids = _protected_snapshot_lineage_ids(
         snapshot_rows,
         current_snapshot_ids,
@@ -151,13 +160,21 @@ async def build_ptg2_source_snapshot_gc_plan(
         snapshot_id = str(row.get("snapshot_id") or "")
         serving_index = _serving_index(row)
         table_names = _snapshot_manifest_table_names(serving_index)
-        if snapshot_id in protected_snapshot_ids:
-            current_table_refs.update(table_names)
+        is_gc_candidate = (
+            bool(snapshot_id)
+            and str(row.get("status") or "") in _GC_CANDIDATE_STATUSES
+            and str(serving_index.get("storage") or "") == _GC_CANDIDATE_STORAGE
+            and snapshot_id not in protected_snapshot_ids
+        )
+        if not is_gc_candidate:
+            retained_table_refs.update(table_names)
             continue
         candidate_snapshot_ids.append(snapshot_id)
         source_key = str(row.get("source_key") or serving_index.get("source_key") or "")
         candidate_table_rows.extend((snapshot_id, source_key, table_name) for table_name in table_names)
-    candidate_table_names = sorted({table_name for _, _, table_name in candidate_table_rows} - current_table_refs)
+    candidate_table_names = sorted(
+        {table_name for _, _, table_name in candidate_table_rows} - retained_table_refs
+    )
     size_by_table: dict[str, int] = {}
     if candidate_table_names:
         size_rows = await executor.all(
@@ -186,7 +203,7 @@ async def build_ptg2_source_snapshot_gc_plan(
             bytes=size_by_table[table_name],
         )
         for snapshot_id, source_key, table_name in candidate_table_rows
-        if table_name in size_by_table and table_name not in current_table_refs
+        if table_name in size_by_table and table_name not in retained_table_refs
     )
     return PTG2SourceSnapshotGCPlan(
         current_snapshot_ids=current_snapshot_ids,

@@ -144,6 +144,13 @@ def test_deterministic_rerun_returns_already_published_without_table_work(monkey
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value="snap_previous"))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", publish_pointers)
+    monkeypatch.setattr(process_ptg.db, "transaction", lambda: _Transaction(SimpleNamespace()))
+    monkeypatch.setattr(process_ptg, "_acquire_source_pointer_gc_lock", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_missing_snapshot_serving_resources",
+        AsyncMock(return_value=([], [])),
+    )
     monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", cleanup)
 
@@ -211,56 +218,6 @@ def test_source_pointer_read_failure_leaves_no_building_claim(monkeypatch):
     push.assert_not_awaited()
 
 
-def test_building_snapshot_claim_only_reclaims_failed_candidate(monkeypatch):
-    conflict_options_by_name = {}
-
-    class ExcludedValues:
-        def __getattr__(self, name):
-            return f"excluded.{name}"
-
-    class InsertStatement:
-        excluded = ExcludedValues()
-
-        def values(self, _row):
-            return self
-
-        def on_conflict_do_update(self, **kwargs):
-            conflict_options_by_name.update(kwargs)
-            return self
-
-        def returning(self, *_columns):
-            return self
-
-        async def first(self):
-            return None
-
-    class ExistingSnapshotQuery:
-        def where(self, *_args):
-            return self
-
-        async def first(self):
-            return {
-                "snapshot_id": "snap_building",
-                "status": process_ptg.PTG2_STATUS_BUILDING,
-                "manifest": {},
-            }
-
-    monkeypatch.setattr(process_ptg.db, "insert", lambda *_args: InsertStatement())
-    monkeypatch.setattr(process_ptg.db, "select", lambda *_args: ExistingSnapshotQuery())
-
-    snapshot_state = asyncio.run(
-        process_ptg._push_ptg2_snapshot_preserving_publication(
-            {
-                "snapshot_id": "snap_building",
-                "status": process_ptg.PTG2_STATUS_BUILDING,
-            }
-        )
-    )
-
-    assert conflict_options_by_name["where"].right.value == process_ptg.PTG2_STATUS_FAILED
-    assert snapshot_state["snapshot_claim_status"] == "existing"
-
-
 def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
     executed_statements = []
 
@@ -286,9 +243,13 @@ def test_source_pointer_compare_and_swap_rejects_stale_candidate(monkeypatch):
         )
 
     assert transaction.entered == 1
-    assert len(executed_statements) == 1
-    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[0][0]
-    assert "DELETE FROM" not in executed_statements[0][0]
+    assert len(executed_statements) == 2
+    assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert executed_statements[0][1] == {
+        "publish_lock_key": source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    }
+    assert "IS NOT DISTINCT FROM :previous_snapshot_id" in executed_statements[1][0]
+    assert "DELETE FROM" not in executed_statements[1][0]
 
 
 def test_pre_pointer_failure_drops_final_tables_and_marks_candidate_failed(monkeypatch):
@@ -458,9 +419,38 @@ def test_post_pointer_failure_preserves_published_snapshot_and_tables(monkeypatc
     ]
     assert [entry["status"] for entry in snapshot_entries] == [
         process_ptg.PTG2_STATUS_BUILDING,
-        process_ptg.PTG2_STATUS_PUBLISHED,
     ]
     import_entries = [
         entry for cls, entry in pushed_entries if cls is process_ptg.PTG2ImportRun
     ]
     assert import_entries[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+
+
+def test_successful_publish_requests_locked_cleanup_replan(monkeypatch):
+    async def push(object_entries, cls, **_kwargs):
+        candidate = object_entries[0]
+        if (
+            cls is process_ptg.PTG2Snapshot
+            and candidate["status"] == process_ptg.PTG2_STATUS_BUILDING
+        ):
+            return {
+                **candidate,
+                "snapshot_claim_status": "acquired",
+                "observed_source_snapshot_id": "snap_previous",
+            }
+        return None
+
+    _install_successful_import_path(
+        monkeypatch,
+        push=push,
+        publish_pointer=AsyncMock(return_value={"status": "promoted"}),
+    )
+    source_cleanup = process_ptg._cleanup_old_ptg2_source_tables
+
+    result = _run_source_import()
+
+    assert result["status"] == "succeeded"
+    source_cleanup.assert_awaited_once()
+    cleanup_call = source_cleanup.await_args
+    assert cleanup_call.args[0] == "source_a"
+    assert cleanup_call.kwargs == {"lock_pointer_state": True}

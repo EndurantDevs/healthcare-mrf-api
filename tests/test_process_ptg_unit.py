@@ -313,9 +313,9 @@ def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
     monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, raising=False)
 
     payload = process_ptg._ptg2_auto_address_refresh_payload(
-        source_key="healthjoy",
+        source_key="source-alpha",
         snapshot_id="snap-new",
-        import_run_id="run-healthjoy",
+        import_run_id="run-source-alpha",
         test_mode=False,
     )
 
@@ -324,15 +324,15 @@ def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
         "importer": "entity-address-unified",
         "params": {
             "refresh_mode": "full",
-            "trigger_source_key": "healthjoy",
+            "trigger_source_key": "source-alpha",
             "trigger_snapshot_id": "snap-new",
             "publish": True,
         },
-        "idempotency_key": "entity-address-unified:healthjoy:snap-new",
+        "idempotency_key": "entity-address-unified:source-alpha:snap-new",
         "triggered_by": "ptg_import",
         "schedule_id": None,
         "subscription_id": None,
-        "import_id": "entity-address-unified:run-healthjoy",
+        "import_id": "entity-address-unified:run-source-alpha",
     }
 
 
@@ -341,9 +341,9 @@ def test_ptg2_auto_address_refresh_payload_honors_limit_and_publish_env(monkeypa
     monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, "false")
 
     payload = process_ptg._ptg2_auto_address_refresh_payload(
-        source_key="healthjoy",
+        source_key="source-alpha",
         snapshot_id="snap-new",
-        import_run_id="run-healthjoy",
+        import_run_id="run-source-alpha",
         test_mode=True,
     )
 
@@ -358,9 +358,9 @@ def test_ptg2_auto_address_refresh_skips_test_mode_by_default(monkeypatch):
 
     result = asyncio.run(
         process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
-            source_key="healthjoy",
+            source_key="source-alpha",
             snapshot_id="snap-new",
-            import_run_id="run-healthjoy",
+            import_run_id="run-source-alpha",
             has_serving_files=True,
             source_scoped_compact=True,
             test_mode=True,
@@ -387,9 +387,9 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
 
     result = asyncio.run(
         process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
-            source_key="healthjoy",
+            source_key="source-alpha",
             snapshot_id="snap-new",
-            import_run_id="run-healthjoy",
+            import_run_id="run-source-alpha",
             has_serving_files=True,
             source_scoped_compact=True,
             test_mode=False,
@@ -401,10 +401,10 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     assert result["run_id"] == "run-refresh"
     assert calls[0] == {"ensure": True}
     assert calls[1]["importer"] == "entity-address-unified"
-    assert calls[1]["idempotency_key"] == "entity-address-unified:healthjoy:snap-new"
+    assert calls[1]["idempotency_key"] == "entity-address-unified:source-alpha:snap-new"
     assert calls[1]["triggered_by"] == "ptg_import"
     assert calls[1]["params"]["refresh_mode"] == "full"
-    assert calls[1]["params"]["trigger_source_key"] == "healthjoy"
+    assert calls[1]["params"]["trigger_source_key"] == "source-alpha"
     assert calls[1]["params"]["trigger_snapshot_id"] == "snap-new"
 
 
@@ -422,9 +422,9 @@ def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypat
     monkeypatch.setattr(control_imports, "create_import_run", fake_existing_import_run)
     existing = asyncio.run(
         process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
-            source_key="healthjoy",
+            source_key="source-alpha",
             snapshot_id="snap-new",
-            import_run_id="run-healthjoy",
+            import_run_id="run-source-alpha",
             has_serving_files=True,
             source_scoped_compact=True,
             test_mode=False,
@@ -437,9 +437,9 @@ def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypat
     monkeypatch.setattr(control_imports, "create_import_run", fake_failed_import_run)
     failed = asyncio.run(
         process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
-            source_key="healthjoy",
+            source_key="source-alpha",
             snapshot_id="snap-new",
-            import_run_id="run-healthjoy",
+            import_run_id="run-source-alpha",
             has_serving_files=True,
             source_scoped_compact=True,
             test_mode=False,
@@ -963,7 +963,7 @@ def _old_snapshot_cleanup_rows():
             "manifest": {
                 "serving_index": {
                     "storage": "manifest_snapshot",
-                    "source_key": "ptg_heartland",
+                    "source_key": "ptg_source_alpha",
                     "table": "ptg2_serving_keep",
                 }
             },
@@ -973,7 +973,7 @@ def _old_snapshot_cleanup_rows():
             "manifest": {
                 "serving_index": {
                     "storage": "db_compact_snapshot",
-                    "source_key": "ptg_heartland",
+                    "source_key": "ptg_source_alpha",
                     "table": "ptg2_serving_compact_old",
                 }
             },
@@ -983,7 +983,7 @@ def _old_snapshot_cleanup_rows():
             "manifest": {
                 "serving_index": {
                     "storage": "manifest_snapshot",
-                    "source_key": "ptg_heartland",
+                    "source_key": "ptg_source_alpha",
                     "price_atom_table": "ptg2_price_atom_manifest_old",
                     "provider_set_table": "mrf.ptg2_provider_set_manifest_old",
                 }
@@ -994,7 +994,7 @@ def _old_snapshot_cleanup_rows():
             "manifest": {
                 "serving_index": {
                     "storage": "future_snapshot_layout",
-                    "source_key": "ptg_heartland",
+                    "source_key": "ptg_source_alpha",
                     "provider_group_member_table": "ptg2_provider_group_member_future_old",
                     "provider_group_location_table": "mrf.unrelated_table",
                 }
@@ -1009,7 +1009,7 @@ def test_cleanup_old_ptg2_source_tables_scans_all_storage_generations(monkeypatc
 
     async def fake_all(statement, **params):
         queries.append((statement, params))
-        assert params == {"source_key": "ptg_heartland"}
+        assert params == {}
         return _old_snapshot_cleanup_rows()
 
     async def fake_status(statement, **_params):
@@ -1021,13 +1021,14 @@ def test_cleanup_old_ptg2_source_tables_scans_all_storage_generations(monkeypatc
 
     asyncio.run(
         ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables(
-            "ptg_heartland",
+            "ptg_source_alpha",
             {"snap-current"},
         )
     )
 
     cleanup_query = queries[0][0]
-    assert "manifest->'serving_index'->>'source_key' = :source_key" in cleanup_query
+    assert "FROM \"mrf\".ptg2_snapshot" in cleanup_query
+    assert "source_key" not in cleanup_query
     assert "db_compact_snapshot" not in cleanup_query
     assert "manifest_snapshot" not in cleanup_query
     assert "\n".join(dropped_tables) == "\n".join(
@@ -1038,6 +1039,62 @@ def test_cleanup_old_ptg2_source_tables_scans_all_storage_generations(monkeypatc
             'DROP TABLE IF EXISTS "mrf"."ptg2_provider_group_member_future_old";',
         ]
     )
+
+
+def test_cleanup_old_ptg2_source_tables_preserves_cross_source_shared_table(monkeypatch):
+    dropped_tables = []
+    snapshot_rows = [
+        {
+            "snapshot_id": "source-a-current",
+            "manifest": {
+                "serving_index": {
+                    "source_key": "source_a",
+                    "table": "ptg2_serving_source_a_current",
+                }
+            },
+        },
+        {
+            "snapshot_id": "source-a-old",
+            "manifest": {
+                "serving_index": {
+                    "source_key": "source_a",
+                    "table": "ptg2_serving_shared",
+                    "price_atom_table": "ptg2_price_atom_source_a_old",
+                }
+            },
+        },
+        {
+            "snapshot_id": "source-b-current",
+            "manifest": {
+                "serving_index": {
+                    "source_key": "source_b",
+                    "table": "ptg2_serving_shared",
+                }
+            },
+        },
+    ]
+
+    async def fake_all(_statement, **params):
+        assert params == {}
+        return snapshot_rows
+
+    async def fake_status(statement, **_params):
+        dropped_tables.append(statement)
+        return "DROP TABLE"
+
+    monkeypatch.setattr(ptg_snapshot_cleanup.db, "all", fake_all)
+    monkeypatch.setattr(ptg_snapshot_cleanup.db, "status", fake_status)
+
+    asyncio.run(
+        ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables(
+            "source_a",
+            {"source-a-current"},
+        )
+    )
+
+    assert dropped_tables == [
+        'DROP TABLE IF EXISTS "mrf"."ptg2_price_atom_source_a_old";'
+    ]
 
 
 def test_source_snapshot_cleanup_retains_four_snapshot_lineage(monkeypatch):
@@ -1497,9 +1554,9 @@ def test_filter_reporting_plans_matches_group_plan_id():
             "plan_market_type": "individual",
         },
         {
-            "plan_name": "DEWITT, LLP-HPS",
-            "plan_id": "391804522",
-            "plan_sponsor_name": "DEWITT, LLP",
+            "plan_name": "Example Employer Group Plan",
+            "plan_id": "TESTPLAN001",
+            "plan_sponsor_name": "Example Employer",
             "issuer_name": "WPS",
             "plan_market_type": "group",
         },
@@ -1507,7 +1564,7 @@ def test_filter_reporting_plans_matches_group_plan_id():
 
     result = process_ptg._filter_reporting_plans(
         plans,
-        plan_ids=["391804522"],
+        plan_ids=["TESTPLAN001"],
         plan_market_types=["group"],
     )
 
@@ -1702,15 +1759,15 @@ def test_ptg2_fast_object_iterator_yields_selected_top_level_arrays():
 def test_filter_reporting_plans_matches_name_contains_case_insensitive():
     plans = [
         {
-            "plan_name": "LIBERTY TITLE AND ABSTRACT INC-Statewide",
-            "plan_id": "391937180",
+            "plan_name": "Example Employer Group Plan",
+            "plan_id": "TESTPLAN002",
             "plan_market_type": "group",
         },
     ]
 
     result = process_ptg._filter_reporting_plans(
         plans,
-        plan_name_contains=["liberty title"],
+        plan_name_contains=["example employer"],
         plan_market_types=["GROUP"],
     )
 
@@ -1814,7 +1871,7 @@ def test_ptg2_semantic_hash_changes_for_rate_context_modifier_and_setting(change
         "negotiated_rate": Decimal("12.34"),
         "billing_code_modifier": ["26", "TC"],
         "setting": "outpatient",
-        "context": {"plan_id": "010854205"},
+        "context": {"plan_id": "TESTPLAN001"},
     }
     modified = dict(base)
     modified.update(changed)
@@ -2050,7 +2107,7 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
                 "reporting_plans": [
                     {
                         "plan_name": "Example Plan",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "plan_sponser_name": "Example Sponsor Co",
                         "plan_market_type": "group",
                     }
@@ -2066,7 +2123,7 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
     entries = process_ptg.parse_toc_catalog_entries(
         toc,
         "https://payer.test/toc.json",
-        plan_ids=["010854205"],
+        plan_ids=["TESTPLAN001"],
     )
     in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
 
@@ -2199,7 +2256,7 @@ def test_ptg2_toc_parser_normalizes_asr_download_links():
                 "reporting_plans": [
                     {
                         "plan_name": "ASR Health Benefits - ASR1",
-                        "plan_id": "823166837",
+                        "plan_id": "TESTPLAN001",
                         "plan_market_type": "group",
                     }
                 ],
@@ -2238,7 +2295,7 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
                 "reporting_plans": [
                     {
                         "plan_name": "ASR Health Benefits - ASR1",
-                        "plan_id": "823166837",
+                        "plan_id": "TESTPLAN001",
                         "plan_market_type": "group",
                     }
                 ],
@@ -2272,7 +2329,7 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
             "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1208",
             {"PTGFile": object, "ImportLog": object},
             test_mode=False,
-            plan_ids=["823166837"],
+            plan_ids=["TESTPLAN001"],
             plan_market_types=["group"],
         )
     )
@@ -3047,7 +3104,7 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     state = process_ptg._compact_state(batch_rows=1)
     state["snapshot_id"] = "snap"
-    state["plan_fields"] = {"plan_id": "010854205", "plan_name": "Example Plan"}
+    state["plan_fields"] = {"plan_id": "TESTPLAN001", "plan_name": "Example Plan"}
     state["procedure_payloads"] = {
         "proc-a": {
             "billing_code_type": "CPT",
@@ -3071,7 +3128,7 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
 
     serving_row = pushed["PTG2ServingRate"][0]
     assert serving_row["snapshot_id"] == "snap"
-    assert serving_row["plan_id"] == "010854205"
+    assert serving_row["plan_id"] == "TESTPLAN001"
     assert serving_row["reported_code"] == "00102"
     assert serving_row["procedure_code"] == process_ptg.return_checksum(["CPT", "00102"])
     assert serving_row["provider_count"] == 30
@@ -3416,7 +3473,7 @@ def test_ptg2_single_pass_in_network_parser_uses_provider_cache(tmp_path, monkey
             process_ptg._parse_in_network_file_single_pass(
                 str(raw_path),
                 99,
-                {"plan_id": "010854205"},
+                {"plan_id": "TESTPLAN001"},
                 None,
                 cache,
                 classes,
@@ -4398,7 +4455,7 @@ def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_pa
 
     rows = [
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_name": "Example Plan",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
@@ -4446,14 +4503,14 @@ def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_pa
     assert result["plan_count"] in {1}
     artifact_path = tmp_path / "snapshot_index" / "snap-test.json"
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert payload["rates"]["010854205"]["70551"][0]["prices"][0]["negotiated_rate"] == 450
+    assert payload["rates"]["TESTPLAN001"]["70551"][0]["prices"][0]["negotiated_rate"] == 450
 
 
 def test_ptg2_compact_snapshot_artifact_keeps_source_file_version_id(monkeypatch, tmp_path):
     observed = {}
     rows = [
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_name": "Example Plan",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
@@ -4500,7 +4557,7 @@ def test_ptg2_compact_snapshot_artifact_keeps_source_file_version_id(monkeypatch
     assert "sts.canonical_payload::jsonb->'source_trace_hashes'" not in observed["sql"]
     artifact_path = tmp_path / "snapshot_index" / "snap-test.json"
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    trace = payload["rates"]["010854205"]["29888"][0]["source_trace"]
+    trace = payload["rates"]["TESTPLAN001"]["29888"][0]["source_trace"]
     assert trace[0]["source_file_version_id"] == "source-version-1"
 
 
@@ -4577,8 +4634,8 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
-        plan_id=("391804522",),
-        plan_name_contains=("dewitt",),
+        plan_id=("TESTPLAN001",),
+        plan_name_contains=("example employer",),
         plan_market_type=("group",),
         file_url_contains=("ps1-50",),
         reuse_raw_artifacts=False,
@@ -4598,8 +4655,8 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
-        plan_ids=["391804522"],
-        plan_name_contains=["dewitt"],
+        plan_ids=["TESTPLAN001"],
+        plan_name_contains=["example employer"],
         plan_market_types=["group"],
         file_url_contains=["ps1-50"],
         reuse_raw_artifacts=False,
@@ -7616,7 +7673,7 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
     async def fake_all(statement, **_params):
         calls.append(statement)
         if "FROM \"mrf\".\"ptg2_serving_rate_compact_exact\"" in statement:
-            return [{"plan_id": "010854205", "plan_market_type": ""}]
+            return [{"plan_id": "TESTPLAN001", "plan_market_type": ""}]
         return []
 
     monkeypatch.setattr(ptg_source_pointers.db, "all", fake_all)
@@ -7637,12 +7694,12 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
     assert rows == [
         {
             "plan_source_key": process_ptg._ptg2_plan_source_key(
-                "010854205",
+                "TESTPLAN001",
                 "",
                 process_ptg.normalize_import_month("2026-04"),
                 "example_dental",
             ),
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_market_type": "",
             "import_month": process_ptg.normalize_import_month("2026-04"),
             "source_key": "example_dental",
@@ -7661,7 +7718,7 @@ def test_ptg2_source_plan_rows_uses_manifest_table_without_snapshot_column(monke
         calls.append(statement)
         if "FROM \"mrf\".\"ptg2_manifest_serving_exact\"" in statement:
             assert "snapshot_id" not in statement
-            return [{"plan_id": "010854205", "plan_market_type": ""}]
+            return [{"plan_id": "TESTPLAN001", "plan_market_type": ""}]
         return []
 
     monkeypatch.setattr(ptg_source_pointers.db, "all", fake_all)
@@ -7679,7 +7736,7 @@ def test_ptg2_source_plan_rows_uses_manifest_table_without_snapshot_column(monke
         )
     )
 
-    assert rows[0]["plan_id"] == "010854205"
+    assert rows[0]["plan_id"] == "TESTPLAN001"
     assert rows[0]["snapshot_id"] == "snap"
 
 
@@ -7690,7 +7747,7 @@ def test_ptg2_source_plan_rows_uses_code_count_for_lean_manifest(monkeypatch):
         calls.append(statement)
         if "FROM \"mrf\".\"ptg2_code_count_exact\"" in statement:
             assert "FROM \"mrf\".\"ptg2_manifest_serving_exact\"" not in statement
-            return [{"plan_id": "010854205", "plan_market_type": ""}]
+            return [{"plan_id": "TESTPLAN001", "plan_market_type": ""}]
         return []
 
     monkeypatch.setattr(ptg_source_pointers.db, "all", fake_all)
@@ -7713,7 +7770,7 @@ def test_ptg2_source_plan_rows_uses_code_count_for_lean_manifest(monkeypatch):
         )
     )
 
-    assert rows[0]["plan_id"] == "010854205"
+    assert rows[0]["plan_id"] == "TESTPLAN001"
     assert rows[0]["snapshot_id"] == "snap"
     assert len(calls) == 2
 
@@ -7741,7 +7798,7 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
         return [
             {
                 "plan_source_key": "plan-source-key",
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "plan_market_type": "group",
                 "import_month": import_month,
                 "source_key": "example_dental",
@@ -7786,19 +7843,26 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed) == 5
+    assert len(executed) == 6
 
 
 def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
     transaction_started_map = {"value": False}
+    executed_statements = []
 
     async def fake_source_plan_rows(**_kwargs):
+        assert transaction_started_map["value"] is True
+        assert executed_statements and "pg_advisory_xact_lock" in executed_statements[0][0]
         raise RuntimeError("plan resolution failed")
+
+    class FakeSession:
+        async def execute(self, statement, params=None):
+            executed_statements.append((str(statement), params or {}))
 
     class FakeTransaction:
         async def __aenter__(self):
             transaction_started_map["value"] = True
-            return object()
+            return FakeSession()
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
@@ -7818,7 +7882,82 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
             )
         )
 
-    assert transaction_started_map["value"] is False
+    assert transaction_started_map["value"] is True
+    assert len(executed_statements) == 1
+    assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert executed_statements[0][1] == {
+        "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    }
+
+
+def test_ptg2_global_publish_is_atomic(monkeypatch):
+    executed_statements = []
+    updated_at = process_ptg._utcnow()
+    snapshot_attributes = _build_published_snapshot_fields(
+        process_ptg.normalize_import_month("2026-04"),
+        updated_at,
+    )
+
+    class FakeSession:
+        async def execute(self, statement, params=None):
+            executed_statements.append((str(statement), params or {}))
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+
+    publication_outcome = asyncio.run(
+        ptg_source_pointers._publish_ptg2_global_snapshot_pointer(
+            snapshot_attributes=snapshot_attributes,
+            updated_at=updated_at,
+        )
+    )
+
+    assert publication_outcome == {
+        "status": "promoted",
+        "snapshot_id": "snap",
+        "global_pointer": "reconciled",
+    }
+    assert len(executed_statements) == 3
+    assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[1][0]
+    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[2][0]
+    assert executed_statements[0][1] == {
+        "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
+    }
+
+
+def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(monkeypatch):
+    executed_statements = []
+
+    class FakeSession:
+        async def execute(self, statement, params=None):
+            executed_statements.append((str(statement), params or {}))
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
+
+    with pytest.raises(ValueError, match="requires a published snapshot row"):
+        asyncio.run(
+            ptg_source_pointers._publish_ptg2_global_snapshot_pointer(
+                snapshot_attributes={"snapshot_id": "snap", "status": "validated"},
+                updated_at=process_ptg._utcnow(),
+            )
+        )
+
+    assert len(executed_statements) == 1
+    assert "pg_advisory_xact_lock" in executed_statements[0][0]
 
 
 def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():
@@ -7848,6 +7987,7 @@ def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsa
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
     pushed = []
+    publish_source_pointers = AsyncMock()
 
     async def fake_push(rows, cls, **_kwargs):
         pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
@@ -7888,7 +8028,11 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
     monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", fake_publish)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
+    monkeypatch.setattr(
+        process_ptg,
+        "_publish_ptg2_source_pointers",
+        publish_source_pointers,
+    )
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
 
     asyncio.run(
@@ -7901,13 +8045,13 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     )
 
     import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
-    snapshot_rows = [row for cls_name, row in pushed if cls_name == "PTG2Snapshot"]
     final_report = import_run_rows[-1]["report"]
     assert final_report["serving_rates"] == 987
     assert final_report["rate_count"] == 987
     assert final_report["serving_index"]["serving_rates"] == 987
     assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
-    assert snapshot_rows[-1]["manifest"]["serving_rates"] == 987
+    published_snapshot = publish_source_pointers.await_args.kwargs["snapshot_attributes"]
+    assert published_snapshot["manifest"]["serving_rates"] == 987
 
 
 def test_ptg2_precopy_merge_keeps_publish_db_dedupe(monkeypatch):

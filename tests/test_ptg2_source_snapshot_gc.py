@@ -11,12 +11,15 @@ class _FakeExecutor:
 
     async def all(self, statement, **params):
         if "SELECT DISTINCT snapshot_id" in statement:
+            assert statement.count("previous_snapshot_id AS snapshot_id") == 3
             return [{"snapshot_id": "snap_current"}]
         if 'FROM "mrf".ptg2_snapshot' in statement:
-            assert "status IN ('published', 'failed')" in statement
+            assert "status IN ('published', 'failed')" not in statement
+            assert "manifest_snapshot" not in statement
             return [
                 {
                     "snapshot_id": "snap_current",
+                    "status": "published",
                     "source_key": "source_a",
                     "serving_index": {
                         "storage": "manifest_snapshot",
@@ -38,6 +41,7 @@ class _FakeExecutor:
                 },
                 {
                     "snapshot_id": "snap_old_missing_physical_table",
+                    "status": "failed",
                     "source_key": "source_b",
                     "serving_index": {
                         "storage": "manifest_snapshot",
@@ -83,6 +87,38 @@ class _FakeDB:
         return _FakeAcquire(self.connection)
 
 
+class _ArchitectureOwnerExecutor:
+    def __init__(
+        self,
+        *,
+        current_snapshot_ids,
+        snapshot_manifests,
+        bytes_by_table_name,
+    ):
+        self.current_snapshot_ids = current_snapshot_ids
+        self.snapshot_manifests = snapshot_manifests
+        self.bytes_by_table_name = bytes_by_table_name
+
+    async def all(self, statement, **params):
+        if "SELECT DISTINCT snapshot_id" in statement:
+            assert statement.count("previous_snapshot_id AS snapshot_id") == 3
+            return [
+                {"snapshot_id": snapshot_id}
+                for snapshot_id in self.current_snapshot_ids
+            ]
+        if 'FROM "mrf".ptg2_snapshot' in statement:
+            assert "status IN ('published', 'failed')" not in statement
+            assert "manifest_snapshot" not in statement
+            return list(self.snapshot_manifests)
+        if "FROM pg_class c" in statement:
+            assert params["table_names"] == sorted(self.bytes_by_table_name)
+            return [
+                {"table_name": table_name, "bytes": table_bytes}
+                for table_name, table_bytes in self.bytes_by_table_name.items()
+            ]
+        raise AssertionError(statement)
+
+
 def test_build_ptg2_source_snapshot_gc_plan_targets_only_non_current_manifest_tables():
     executor = _FakeExecutor()
 
@@ -99,6 +135,85 @@ def test_build_ptg2_source_snapshot_gc_plan_targets_only_non_current_manifest_ta
     assert plan.total_bytes == 150
 
 
+def test_gc_protects_current_compact_table():
+    executor = _ArchitectureOwnerExecutor(
+        current_snapshot_ids=("snap_current_compact",),
+        snapshot_manifests=(
+            {
+                "snapshot_id": "snap_old_manifest",
+                "status": "failed",
+                "source_key": "source_a",
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "table": "mrf.ptg2_serving_rate_compact_shared",
+                },
+            },
+            {
+                "snapshot_id": "snap_current_compact",
+                "status": "published",
+                "source_key": "source_b",
+                "serving_index": {
+                    "storage": "db_compact_snapshot",
+                    "table": "mrf.ptg2_serving_rate_compact_shared",
+                },
+            },
+        ),
+        bytes_by_table_name={},
+    )
+
+    plan = asyncio.run(snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=executor))
+
+    assert plan.current_snapshot_ids == ("snap_current_compact",)
+    assert plan.candidate_snapshot_ids == ("snap_old_manifest",)
+    assert plan.tables == ()
+
+
+def test_gc_protects_future_storage_owner():
+    executor = _ArchitectureOwnerExecutor(
+        current_snapshot_ids=("snap_current_manifest",),
+        snapshot_manifests=(
+            {
+                "snapshot_id": "snap_current_manifest",
+                "status": "published",
+                "source_key": "source_a",
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "table": "mrf.ptg2_serving_current",
+                },
+            },
+            {
+                "snapshot_id": "snap_old_manifest",
+                "status": "failed",
+                "source_key": "source_a",
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "table": "mrf.ptg2_serving_shared",
+                    "price_atom_table": "mrf.ptg2_price_atom_old",
+                },
+            },
+            {
+                "snapshot_id": "snap_future_owner",
+                "status": "published",
+                "source_key": "source_b",
+                "serving_index": {
+                    "storage": "future_snapshot_layout",
+                    "materialized_tables": {
+                        "serving": "mrf.ptg2_serving_shared",
+                    },
+                },
+            },
+        ),
+        bytes_by_table_name={"ptg2_price_atom_old": 20},
+    )
+
+    plan = asyncio.run(snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=executor))
+
+    assert plan.candidate_snapshot_ids == ("snap_old_manifest",)
+    assert [(table.snapshot_id, table.table_name) for table in plan.tables] == [
+        ("snap_old_manifest", "ptg2_price_atom_old")
+    ]
+
+
 def test_build_ptg2_source_snapshot_gc_plan_retains_three_snapshot_lineage():
     class LineageExecutor(_FakeExecutor):
         async def all(self, statement, **params):
@@ -108,24 +223,28 @@ def test_build_ptg2_source_snapshot_gc_plan_retains_three_snapshot_lineage():
                 return [
                     {
                         "snapshot_id": "snap_current",
+                        "status": "published",
                         "previous_snapshot_id": "snap_previous",
                         "source_key": "source_a",
                         "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_current"},
                     },
                     {
                         "snapshot_id": "snap_previous",
+                        "status": "published",
                         "previous_snapshot_id": "snap_third",
                         "source_key": "source_a",
                         "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_previous"},
                     },
                     {
                         "snapshot_id": "snap_third",
+                        "status": "published",
                         "previous_snapshot_id": "snap_fourth",
                         "source_key": "source_a",
                         "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_third"},
                     },
                     {
                         "snapshot_id": "snap_fourth",
+                        "status": "published",
                         "previous_snapshot_id": None,
                         "source_key": "source_a",
                         "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_fourth"},
@@ -220,6 +339,7 @@ def test_execute_gc_replans_after_concurrent_snapshot_promotion(monkeypatch):
                 return [
                     {
                         "snapshot_id": "snap_promoted",
+                        "status": "published",
                         "source_key": "source_a",
                         "serving_index": {
                             "storage": "manifest_snapshot",
@@ -262,13 +382,10 @@ def test_execute_gc_replans_after_failed_snapshot_is_reclaimed(monkeypatch):
             if "SELECT DISTINCT snapshot_id" in statement:
                 return []
             if 'FROM "mrf".ptg2_snapshot' in statement:
-                assert "status IN ('published', 'failed')" in statement
-                if self.reclaimed_as_building:
-                    return []
                 return [
                     {
                         "snapshot_id": "snap_retry",
-                        "status": "failed",
+                        "status": "building" if self.reclaimed_as_building else "failed",
                         "source_key": "source_a",
                         "serving_index": {
                             "storage": "manifest_snapshot",

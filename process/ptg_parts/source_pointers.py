@@ -214,6 +214,13 @@ def _has_result_row(query_result: Any) -> bool:
     return query_result.first() is not None
 
 
+async def _acquire_source_pointer_gc_lock(session: Any) -> None:
+    await session.execute(
+        db.text("SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))"),
+        {"publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
+    )
+
+
 async def _compare_and_swap_source_pointer(
     session: Any,
     *,
@@ -395,16 +402,17 @@ async def _publish_ptg2_source_pointers(
     serving_index: dict[str, Any] | None,
     snapshot_attributes: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    plan_pointer_entries = await _source_plan_rows(
-        snapshot_id=snapshot_id,
-        source_key=source_key,
-        import_month=import_month,
-        previous_snapshot_id=previous_snapshot_id,
-        updated_at=updated_at,
-        serving_index=serving_index,
-    )
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        plan_pointer_entries = await _source_plan_rows(
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+            import_month=import_month,
+            previous_snapshot_id=previous_snapshot_id,
+            updated_at=updated_at,
+            serving_index=serving_index,
+        )
         await _compare_and_swap_source_pointer(
             session,
             schema_name=schema_name,
@@ -438,4 +446,33 @@ async def _publish_ptg2_source_pointers(
         "snapshot_id": snapshot_id,
         "previous_snapshot_id": previous_snapshot_id,
         "global_pointer": "reconciled" if snapshot_attributes is not None else "not_requested",
+    }
+
+
+async def _publish_ptg2_global_snapshot_pointer(
+    *,
+    snapshot_attributes: dict[str, Any],
+    updated_at: datetime.datetime,
+) -> dict[str, Any]:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    snapshot_id = str(snapshot_attributes.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise ValueError("Global snapshot-pointer promotion requires a snapshot id")
+    async with db.transaction() as session:
+        await _acquire_source_pointer_gc_lock(session)
+        await _publish_snapshot_in_pointer_transaction(
+            session,
+            schema_name=schema_name,
+            snapshot_attributes=snapshot_attributes,
+        )
+        await _reconcile_global_snapshot_pointer(
+            session,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+            updated_at=updated_at,
+        )
+    return {
+        "status": "promoted",
+        "snapshot_id": snapshot_id,
+        "global_pointer": "reconciled",
     }
