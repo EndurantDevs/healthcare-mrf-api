@@ -1,5 +1,7 @@
 import copy
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -277,6 +279,23 @@ def test_restart_entry_refuses_dry_run(tmp_path):
     with pytest.raises(SystemExit, match="requires --apply"):
         harness.run_cli(["--restart-entry", "idaho"])
     assert control.created_requests == []
+
+
+def test_harness_direct_script_validate_only():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(harness.ROOT / "scripts/research/provider_directory_endpoint_acquisition_harness.py"),
+            "--validate-only",
+        ],
+        cwd=harness.ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["valid"] is True
 
 
 def test_cigna_campaign_entry_creates_a_fresh_root():

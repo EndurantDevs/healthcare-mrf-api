@@ -461,7 +461,10 @@ class AcquisitionHarness:
         _atomic_write_json(self.config.report_path, report_dict)
 def run_cli(argv: list[str] | None = None) -> int:
     """Delegate CLI execution without importing credentials at module load."""
-    from scripts.research.provider_directory_endpoint_acquisition_cli import run_acquisition_cli
+    try:
+        from scripts.research.provider_directory_endpoint_acquisition_cli import run_acquisition_cli
+    except ModuleNotFoundError:
+        from provider_directory_endpoint_acquisition_cli import run_acquisition_cli
 
     return run_acquisition_cli(argv)
 if __name__ == "__main__":

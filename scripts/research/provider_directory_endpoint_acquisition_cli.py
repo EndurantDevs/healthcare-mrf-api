@@ -7,7 +7,10 @@ import json
 import os
 from pathlib import Path
 
-from scripts.research import provider_directory_endpoint_acquisition_harness as harness
+try:
+    from scripts.research import provider_directory_endpoint_acquisition_harness as harness
+except ModuleNotFoundError:
+    import provider_directory_endpoint_acquisition_harness as harness
 
 
 def parse_acquisition_arguments(argv: list[str] | None = None) -> argparse.Namespace:
