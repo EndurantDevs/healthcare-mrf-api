@@ -7133,6 +7133,11 @@ const PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND: &str = "provider_set_c
 const PTG2_SERVING_BINARY_BY_PROVIDER_SET_KIND: &str = "by_provider_set";
 const PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND: &str =
     "by_provider_set_price_dictionary";
+const PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND: &str = "price_set_atoms_by_id_v2";
+const PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_FORMAT: &str = "price_set_atoms_by_id_v2";
+const PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES: usize = 2;
+const PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_BUCKETS: usize =
+    1 << (PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES * 8);
 const PTG2_SERVING_BINARY_BLOCK_BYTES_ENV: &str = "HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES";
 const PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV: &str =
     "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION";
@@ -7227,6 +7232,12 @@ struct ServingBinaryInputRow {
     price_set_id: [u8; GLOBAL_ID_BYTES],
 }
 
+#[derive(Clone, Copy)]
+struct ServingBinaryPriceSetAtomInputRow {
+    price_set_id: [u8; GLOBAL_ID_BYTES],
+    price_atom_id: [u8; GLOBAL_ID_BYTES],
+}
+
 fn serving_binary_row_from_text_fields(
     fields: &[&[u8]],
     label: &str,
@@ -7242,6 +7253,24 @@ fn serving_binary_row_from_text_fields(
         second_key: serving_parse_i32(fields[1], "second_key")?,
         provider_count: serving_parse_u64(fields[2], "provider_count")?,
         price_set_id: serving_parse_global_id(fields[3])?,
+    })
+}
+
+fn serving_binary_price_set_atom_row_from_text_fields(
+    fields: &[&[u8]],
+) -> io::Result<ServingBinaryPriceSetAtomInputRow> {
+    if fields.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "price-set atom serving-binary COPY rows must have 2 fields, got {}",
+                fields.len()
+            ),
+        ));
+    }
+    Ok(ServingBinaryPriceSetAtomInputRow {
+        price_set_id: serving_parse_global_id(fields[0])?,
+        price_atom_id: serving_parse_global_id(fields[1])?,
     })
 }
 
@@ -7388,6 +7417,29 @@ fn read_pg_binary_serving_row<R: Read>(
         second_key: pg_binary_i32(&second_key, "second_key")?,
         provider_count: pg_binary_u64(&provider_count, "provider_count")?,
         price_set_id: serving_parse_global_id_binary(&price_set_id)?,
+    }))
+}
+
+fn read_pg_binary_price_set_atom_row<R: Read>(
+    reader: &mut R,
+) -> io::Result<Option<ServingBinaryPriceSetAtomInputRow>> {
+    let Some(field_count) = read_i16_be(reader)? else {
+        return Ok(None);
+    };
+    if field_count == -1 {
+        return Ok(None);
+    }
+    if field_count != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("price-set atom serving-binary COPY row must have 2 fields, got {field_count}"),
+        ));
+    }
+    let price_set_id = read_pg_binary_field(reader)?;
+    let price_atom_id = read_pg_binary_field(reader)?;
+    Ok(Some(ServingBinaryPriceSetAtomInputRow {
+        price_set_id: serving_parse_global_id_binary(&price_set_id)?,
+        price_atom_id: serving_parse_global_id_binary(&price_atom_id)?,
     }))
 }
 
@@ -7620,6 +7672,260 @@ fn write_serving_binary_copy_record<W: Write>(
             pg_text_copy_field(Some(payload_compression)),
             raw_payload_bytes.to_string(),
         ],
+    )
+}
+
+fn uvarint_encoded_len(mut value: usize) -> usize {
+    let mut encoded_len = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        encoded_len += 1;
+    }
+    encoded_len
+}
+
+struct ServingBinaryPriceSetAtomState {
+    max_payload_bytes: usize,
+    current_bucket_key: Option<i32>,
+    current_block_no: usize,
+    current_payload: Vec<u8>,
+    current_entry_count: usize,
+    current_price_set_id: Option<[u8; GLOBAL_ID_BYTES]>,
+    current_atom_ids: Vec<[u8; GLOBAL_ID_BYTES]>,
+    previous_atom_id: Option<[u8; GLOBAL_ID_BYTES]>,
+    block_count: u64,
+    price_set_count: u64,
+    atom_ref_count: u64,
+    record_count: u64,
+}
+
+impl ServingBinaryPriceSetAtomState {
+    fn new(max_payload_bytes: usize) -> Self {
+        Self {
+            max_payload_bytes,
+            current_bucket_key: None,
+            current_block_no: 0,
+            current_payload: Vec::with_capacity(max_payload_bytes.min(1024 * 1024)),
+            current_entry_count: 0,
+            current_price_set_id: None,
+            current_atom_ids: Vec::new(),
+            previous_atom_id: None,
+            block_count: 0,
+            price_set_count: 0,
+            atom_ref_count: 0,
+            record_count: 0,
+        }
+    }
+
+    fn membership_payload_bytes(atom_count: usize) -> io::Result<usize> {
+        atom_count
+            .checked_mul(GLOBAL_ID_BYTES)
+            .and_then(|atom_bytes| atom_bytes.checked_add(GLOBAL_ID_BYTES))
+            .and_then(|payload_bytes| payload_bytes.checked_add(uvarint_encoded_len(atom_count)))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "price-set atom membership payload length overflowed usize",
+                )
+            })
+    }
+
+    fn ensure_membership_fits(&self, atom_count: usize) -> io::Result<()> {
+        let membership_bytes = Self::membership_payload_bytes(atom_count)?;
+        if membership_bytes > self.max_payload_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "price-set atom membership requires {membership_bytes} bytes, exceeding the maximum single-membership size of {} bytes",
+                    self.max_payload_bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_block<W: Write>(
+        &mut self,
+        writer: &mut W,
+        target_format: ServingBinaryTargetCopyFormat,
+    ) -> io::Result<()> {
+        let Some(bucket_key) = self.current_bucket_key else {
+            return Ok(());
+        };
+        if self.current_entry_count == 0 {
+            return Ok(());
+        }
+        write_serving_binary_copy_record(
+            writer,
+            target_format,
+            PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND,
+            bucket_key,
+            self.current_block_no,
+            self.current_entry_count,
+            &self.current_payload,
+        )?;
+        self.current_payload.clear();
+        self.current_entry_count = 0;
+        self.current_block_no += 1;
+        self.block_count = self.block_count.saturating_add(1);
+        self.record_count = self.record_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn flush_membership<W: Write>(
+        &mut self,
+        writer: &mut W,
+        target_format: ServingBinaryTargetCopyFormat,
+    ) -> io::Result<()> {
+        let Some(price_set_id) = self.current_price_set_id.take() else {
+            return Ok(());
+        };
+        let atom_ids = std::mem::take(&mut self.current_atom_ids);
+        self.ensure_membership_fits(atom_ids.len())?;
+        let bucket_key = i32::from(u16::from_be_bytes([
+            price_set_id[0],
+            price_set_id[PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES - 1],
+        ]));
+        let entry_bytes = Self::membership_payload_bytes(atom_ids.len())?;
+        if self.current_bucket_key != Some(bucket_key) {
+            self.flush_block(writer, target_format)?;
+            self.current_bucket_key = Some(bucket_key);
+            self.current_block_no = 0;
+        } else if self.current_entry_count > 0
+            && self
+                .current_payload
+                .len()
+                .checked_add(entry_bytes)
+                .is_none_or(|payload_bytes| payload_bytes > self.max_payload_bytes)
+        {
+            self.flush_block(writer, target_format)?;
+        }
+        self.current_payload.extend_from_slice(&price_set_id);
+        write_uvarint_to_vec(&mut self.current_payload, atom_ids.len() as u64);
+        for atom_id in atom_ids {
+            self.current_payload.extend_from_slice(&atom_id);
+        }
+        self.current_entry_count += 1;
+        self.price_set_count = self.price_set_count.saturating_add(1);
+        self.previous_atom_id = None;
+        Ok(())
+    }
+
+    fn push_row<W: Write>(
+        &mut self,
+        writer: &mut W,
+        target_format: ServingBinaryTargetCopyFormat,
+        row: ServingBinaryPriceSetAtomInputRow,
+    ) -> io::Result<()> {
+        if let Some(current_price_set_id) = self.current_price_set_id {
+            if row.price_set_id < current_price_set_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "price-set atom rows must be ordered by price_set_global_id_128",
+                ));
+            }
+            if row.price_set_id != current_price_set_id {
+                self.flush_membership(writer, target_format)?;
+            }
+        }
+        if self.current_price_set_id.is_none() {
+            self.current_price_set_id = Some(row.price_set_id);
+        }
+        if let Some(previous_atom_id) = self.previous_atom_id {
+            if row.price_atom_id < previous_atom_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "price-set atom rows must be ordered by price_atom_global_id_128 within each price set",
+                ));
+            }
+        }
+        self.ensure_membership_fits(self.current_atom_ids.len().saturating_add(1))?;
+        self.current_atom_ids.push(row.price_atom_id);
+        self.previous_atom_id = Some(row.price_atom_id);
+        self.atom_ref_count = self.atom_ref_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish<W: Write>(
+        &mut self,
+        writer: &mut W,
+        target_format: ServingBinaryTargetCopyFormat,
+    ) -> io::Result<()> {
+        self.flush_membership(writer, target_format)?;
+        self.flush_block(writer, target_format)
+    }
+}
+
+fn write_serving_binary_price_set_atoms_copy_from_rows<W: Write, F>(
+    mut next_row: F,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+    source_copy_format: &str,
+) -> io::Result<Value>
+where
+    F: FnMut() -> io::Result<Option<ServingBinaryPriceSetAtomInputRow>>,
+{
+    let max_payload_bytes = serving_binary_block_bytes();
+    let mut state = ServingBinaryPriceSetAtomState::new(max_payload_bytes);
+    write_serving_binary_copy_header(writer, target_format)?;
+    while let Some(row) = next_row()? {
+        state.push_row(writer, target_format, row)?;
+    }
+    state.finish(writer, target_format)?;
+    write_serving_binary_copy_trailer(writer, target_format)?;
+    writer.flush()?;
+    Ok(json!({
+        "name": "serving_binary_price_set_atoms_by_id_v2",
+        "format": PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_FORMAT,
+        "artifact_kind": PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND,
+        "id_prefix_bytes": PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES,
+        "id_bucket_count": PTG2_SERVING_BINARY_PRICE_SET_ATOM_ID_V2_BUCKETS,
+        "id_block_count": state.block_count,
+        "price_set_count": state.price_set_count,
+        "atom_ref_count": state.atom_ref_count,
+        "row_count": state.atom_ref_count,
+        "copied_records": state.record_count,
+        "copy_record_count": state.record_count,
+        "byte_count": writer.byte_count(),
+        "block_bytes": max_payload_bytes,
+        "max_single_membership_bytes": max_payload_bytes,
+        "source_copy_format": source_copy_format,
+        "target_copy_format": if target_format == ServingBinaryTargetCopyFormat::Binary { "postgres_binary" } else { "text" },
+    }))
+}
+
+fn write_serving_binary_price_set_atoms_copy_from_reader<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+) -> io::Result<Value> {
+    let mut line = Vec::new();
+    write_serving_binary_price_set_atoms_copy_from_rows(
+        || {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(None);
+            }
+            let fields = serving_copy_fields(&line);
+            serving_binary_price_set_atom_row_from_text_fields(&fields).map(Some)
+        },
+        writer,
+        target_format,
+        "text",
+    )
+}
+
+fn write_serving_binary_price_set_atoms_copy_from_pg_binary_reader<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut CountingWriter<W>,
+    target_format: ServingBinaryTargetCopyFormat,
+) -> io::Result<Value> {
+    read_pg_binary_copy_header(reader)?;
+    write_serving_binary_price_set_atoms_copy_from_rows(
+        || read_pg_binary_price_set_atom_row(reader),
+        writer,
+        target_format,
+        "postgres_binary",
     )
 }
 
@@ -8731,10 +9037,24 @@ fn write_serving_binary_copy_from_key_copy_stdio(kind: &str) -> io::Result<()> {
             None,
             target_format,
         )?,
+        PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND => {
+            write_serving_binary_price_set_atoms_copy_from_reader(
+                &mut reader,
+                &mut writer,
+                target_format,
+            )?
+        }
+        "price_set_atoms_by_id_v2_pg_binary" => {
+            write_serving_binary_price_set_atoms_copy_from_pg_binary_reader(
+                &mut reader,
+                &mut writer,
+                target_format,
+            )?
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "serving binary kind must be by_code, by_code_pg_binary, by_provider_set, by_provider_set_pg_binary, combined, or combined_pg_binary",
+                "serving binary kind must be by_code, by_code_pg_binary, by_provider_set, by_provider_set_pg_binary, combined, combined_pg_binary, price_set_atoms_by_id_v2, or price_set_atoms_by_id_v2_pg_binary",
             ));
         }
     };
@@ -10020,6 +10340,33 @@ mod tests {
         payload
     }
 
+    fn pg_binary_price_set_atom_copy(
+        rows: &[([u8; GLOBAL_ID_BYTES], [u8; GLOBAL_ID_BYTES])],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        payload.extend_from_slice(&0i32.to_be_bytes());
+        payload.extend_from_slice(&0i32.to_be_bytes());
+        for (price_set_id, price_atom_id) in rows {
+            payload.extend_from_slice(&2i16.to_be_bytes());
+            append_pg_binary_field(&mut payload, price_set_id);
+            append_pg_binary_field(&mut payload, price_atom_id);
+        }
+        payload.extend_from_slice(&(-1i16).to_be_bytes());
+        payload
+    }
+
+    fn prefixed_test_id(prefix: u16, last_byte: u8) -> [u8; GLOBAL_ID_BYTES] {
+        let mut value = [0u8; GLOBAL_ID_BYTES];
+        value[..2].copy_from_slice(&prefix.to_be_bytes());
+        value[GLOBAL_ID_BYTES - 1] = last_byte;
+        value
+    }
+
+    fn test_id_hex(value: &[u8; GLOBAL_ID_BYTES]) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     #[test]
     fn serving_binary_by_code_pg_binary_copy_matches_text_shape() {
         let input = pg_binary_serving_copy(&[
@@ -10131,6 +10478,220 @@ mod tests {
         assert!(kinds.contains(&PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND));
         assert!(kinds.contains(&PTG2_SERVING_BINARY_BY_PROVIDER_SET_KIND));
         assert!(kinds.contains(&PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND));
+    }
+
+    #[test]
+    fn serving_binary_price_set_atoms_copy_matches_v2_payload_records() {
+        let price_set_a = "123400000000000000000000000000a1";
+        let price_set_b = "123400000000000000000000000000a2";
+        let price_set_c = "123500000000000000000000000000a3";
+        let atom_a = "000000000000000000000000000000c1";
+        let atom_b = "000000000000000000000000000000c2";
+        let atom_c = "000000000000000000000000000000c3";
+        let input = format!(
+            "{price_set_a}\t{atom_a}\n{price_set_a}\t{atom_b}\n{price_set_b}\t{atom_c}\n{price_set_c}\t{atom_c}\n"
+        );
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = CountingWriter::new(Vec::new());
+
+        let summary = write_serving_binary_price_set_atoms_copy_from_reader(
+            &mut reader,
+            &mut writer,
+            ServingBinaryTargetCopyFormat::Text,
+        )
+        .unwrap();
+        let output_bytes = writer.inner;
+        let output = String::from_utf8(output_bytes.clone()).unwrap();
+        let rows: Vec<Vec<&str>> = output
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            vec![
+                "price_set_atoms_by_id_v2".to_string(),
+                "4660".to_string(),
+                "0".to_string(),
+                "2".to_string(),
+                format!("\\\\x{price_set_a}02{atom_a}{atom_b}{price_set_b}01{atom_c}"),
+                "none".to_string(),
+                "0".to_string(),
+            ]
+        );
+        assert_eq!(rows[1][0], "price_set_atoms_by_id_v2");
+        assert_eq!(rows[1][1], "4661");
+        assert_eq!(rows[1][2], "0");
+        assert_eq!(rows[1][3], "1");
+        assert_eq!(rows[1][4], format!("\\\\x{price_set_c}01{atom_c}"));
+        assert_eq!(summary["format"], "price_set_atoms_by_id_v2");
+        assert_eq!(summary["artifact_kind"], "price_set_atoms_by_id_v2");
+        assert_eq!(summary["id_prefix_bytes"], 2);
+        assert_eq!(summary["id_bucket_count"], 65536);
+        assert_eq!(summary["id_block_count"], 2);
+        assert_eq!(summary["price_set_count"], 3);
+        assert_eq!(summary["atom_ref_count"], 4);
+        assert_eq!(summary["copied_records"], 2);
+        assert_eq!(summary["byte_count"], output_bytes.len());
+    }
+
+    #[test]
+    fn serving_binary_price_set_atoms_pg_binary_matches_text_payload() {
+        let rows = [
+            (prefixed_test_id(0x1234, 0xa1), test_price_id(0xc1)),
+            (prefixed_test_id(0x1234, 0xa1), test_price_id(0xc2)),
+            (prefixed_test_id(0x1234, 0xa2), test_price_id(0xc3)),
+        ];
+        let text_input = rows
+            .iter()
+            .map(|(price_set_id, price_atom_id)| {
+                format!(
+                    "{}\t{}\n",
+                    test_id_hex(price_set_id),
+                    test_id_hex(price_atom_id)
+                )
+            })
+            .collect::<String>();
+        let mut text_reader = BufReader::new(text_input.as_bytes());
+        let mut text_writer = CountingWriter::new(Vec::new());
+        write_serving_binary_price_set_atoms_copy_from_reader(
+            &mut text_reader,
+            &mut text_writer,
+            ServingBinaryTargetCopyFormat::Text,
+        )
+        .unwrap();
+        let binary_input = pg_binary_price_set_atom_copy(&rows);
+        let mut binary_reader = Cursor::new(binary_input);
+        let mut binary_writer = CountingWriter::new(Vec::new());
+
+        let summary = write_serving_binary_price_set_atoms_copy_from_pg_binary_reader(
+            &mut binary_reader,
+            &mut binary_writer,
+            ServingBinaryTargetCopyFormat::Text,
+        )
+        .unwrap();
+
+        assert_eq!(binary_writer.inner, text_writer.inner);
+        assert_eq!(summary["source_copy_format"], "postgres_binary");
+        assert_eq!(summary["price_set_count"], 2);
+        assert_eq!(summary["atom_ref_count"], 3);
+    }
+
+    #[test]
+    fn serving_binary_price_set_atoms_emits_exact_pg_binary_record() {
+        let price_set_id = prefixed_test_id(0x1234, 0xa1);
+        let price_atom_id = test_price_id(0xc1);
+        let input = format!(
+            "{}\t{}\n",
+            test_id_hex(&price_set_id),
+            test_id_hex(&price_atom_id)
+        );
+        let mut input_reader = BufReader::new(input.as_bytes());
+        let mut output_writer = CountingWriter::new(Vec::new());
+
+        let summary = write_serving_binary_price_set_atoms_copy_from_reader(
+            &mut input_reader,
+            &mut output_writer,
+            ServingBinaryTargetCopyFormat::Binary,
+        )
+        .unwrap();
+        let mut output_reader = Cursor::new(output_writer.inner);
+        read_pg_binary_copy_header(&mut output_reader).unwrap();
+
+        assert_eq!(read_i16_be(&mut output_reader).unwrap(), Some(7));
+        assert_eq!(
+            read_pg_binary_field(&mut output_reader).unwrap(),
+            PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND.as_bytes()
+        );
+        assert_eq!(
+            pg_binary_i32(
+                &read_pg_binary_field(&mut output_reader).unwrap(),
+                "block_key"
+            )
+            .unwrap(),
+            0x1234
+        );
+        assert_eq!(
+            pg_binary_i32(
+                &read_pg_binary_field(&mut output_reader).unwrap(),
+                "block_no"
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            pg_binary_i32(
+                &read_pg_binary_field(&mut output_reader).unwrap(),
+                "entry_count"
+            )
+            .unwrap(),
+            1
+        );
+        let mut expected_payload = Vec::from(price_set_id);
+        expected_payload.push(1);
+        expected_payload.extend_from_slice(&price_atom_id);
+        assert_eq!(
+            read_pg_binary_field(&mut output_reader).unwrap(),
+            expected_payload
+        );
+        assert_eq!(read_pg_binary_field(&mut output_reader).unwrap(), b"none");
+        assert_eq!(
+            pg_binary_i32(
+                &read_pg_binary_field(&mut output_reader).unwrap(),
+                "raw_payload_bytes"
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(read_i16_be(&mut output_reader).unwrap(), Some(-1));
+        assert_eq!(summary["target_copy_format"], "postgres_binary");
+    }
+
+    #[test]
+    fn serving_binary_price_set_atoms_rejects_oversized_membership() {
+        let mut state = ServingBinaryPriceSetAtomState::new(32);
+        let mut writer = Vec::new();
+        let error = state
+            .push_row(
+                &mut writer,
+                ServingBinaryTargetCopyFormat::Text,
+                ServingBinaryPriceSetAtomInputRow {
+                    price_set_id: prefixed_test_id(0x1234, 0xa1),
+                    price_atom_id: test_price_id(0xc1),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("maximum single-membership size of 32 bytes"));
+        assert!(state.current_atom_ids.is_empty());
+    }
+
+    #[test]
+    fn serving_binary_price_set_atoms_rejects_unordered_rows() {
+        let price_set_id = prefixed_test_id(0x1234, 0xa1);
+        let input = format!(
+            "{}\t{}\n{}\t{}\n",
+            test_id_hex(&price_set_id),
+            test_id_hex(&test_price_id(0xc2)),
+            test_id_hex(&price_set_id),
+            test_id_hex(&test_price_id(0xc1)),
+        );
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = CountingWriter::new(Vec::new());
+
+        let error = write_serving_binary_price_set_atoms_copy_from_reader(
+            &mut reader,
+            &mut writer,
+            ServingBinaryTargetCopyFormat::Text,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ordered by price_atom_global_id_128"));
     }
 
     #[test]
@@ -10745,13 +11306,13 @@ fn main() -> io::Result<()> {
         let kind = args.next().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: ptg2_scanner --serving-binary-copy-from-key-copy-stdio <by_code|by_code_pg_binary|by_provider_set|by_provider_set_pg_binary|combined|combined_pg_binary>",
+                "usage: ptg2_scanner --serving-binary-copy-from-key-copy-stdio <by_code|by_code_pg_binary|by_provider_set|by_provider_set_pg_binary|combined|combined_pg_binary|price_set_atoms_by_id_v2|price_set_atoms_by_id_v2_pg_binary>",
             )
         })?;
         if args.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: ptg2_scanner --serving-binary-copy-from-key-copy-stdio <by_code|by_code_pg_binary|by_provider_set|by_provider_set_pg_binary|combined|combined_pg_binary>",
+                "usage: ptg2_scanner --serving-binary-copy-from-key-copy-stdio <by_code|by_code_pg_binary|by_provider_set|by_provider_set_pg_binary|combined|combined_pg_binary|price_set_atoms_by_id_v2|price_set_atoms_by_id_v2_pg_binary>",
             ));
         }
         return write_serving_binary_copy_from_key_copy_stdio(&kind);

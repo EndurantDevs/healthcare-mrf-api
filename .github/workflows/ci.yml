@@ -70,6 +70,8 @@ jobs:
           tests/test_process_pharmacy_license_unit.py
           tests/test_pharmacy_license_run_failure_unit.py
           tests/test_process_ptg_unit.py
+          tests/test_ptg2_db_serving_binary.py
+          tests/test_ptg2_serving_binary_writer.py
           tests/test_ptg_control_unit.py
 
   api-contract:

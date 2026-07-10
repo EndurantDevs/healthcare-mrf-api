@@ -57,6 +57,7 @@ PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLO
 PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_LEVEL_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_LEVEL"
 PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES_ENV = "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES"
 PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV = "HLTHPRT_PTG2_SERVING_BINARY_COPY_WORK_MEM"
+DB_POOL_MAX_SIZE_ENV = "HLTHPRT_DB_POOL_MAX_SIZE"
 PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED = "keyed"
 PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN = "natural_lean"
 PTG2_SERVING_BINARY_COLUMNS = [
@@ -70,9 +71,10 @@ PTG2_SERVING_BINARY_COLUMNS = [
 ]
 _DEFAULT_BLOCK_BYTES = 2 * 1024 * 1024
 _DEFAULT_COPY_RECORDS = 2048
-_DEFAULT_STREAM_TASKS = 2
+_DEFAULT_STREAM_TASKS = 3
 _DEFAULT_COMPRESSION_MIN_BYTES = 128
 _DEFAULT_COPY_WORK_MEM = "128MB"
+_DEFAULT_DB_POOL_MAX_SIZE = 5
 _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
 _PRICE_SET_ATOM_ID_V2_BUCKETS = 1 << (_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES * 8)
 _MEMBERSHIP_HEADER = struct.Struct("<8sIQ")
@@ -143,11 +145,24 @@ def _use_serving_binary_combined_stream() -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _serving_binary_stream_tasks() -> int:
+def _configured_serving_binary_stream_tasks() -> int:
     try:
         return max(int(os.getenv(PTG2_SERVING_BINARY_STREAM_TASKS_ENV, str(_DEFAULT_STREAM_TASKS))), 1)
     except ValueError:
         return _DEFAULT_STREAM_TASKS
+
+
+def _serving_binary_stream_tasks() -> int:
+    """Limit two-connection COPY pipelines to the configured DB pool."""
+    requested_tasks = _configured_serving_binary_stream_tasks()
+    try:
+        pool_max_size = max(int(os.getenv(DB_POOL_MAX_SIZE_ENV, str(_DEFAULT_DB_POOL_MAX_SIZE))), 1)
+    except ValueError:
+        pool_max_size = _DEFAULT_DB_POOL_MAX_SIZE
+    if pool_max_size < 2:
+        raise RuntimeError("PTG2 Rust serving streams require at least two database connections")
+    concurrent_pair_capacity = max((pool_max_size - 1) // 2, 1)
+    return min(requested_tasks, concurrent_pair_capacity)
 
 
 def _serving_binary_source_copy_format() -> str:
@@ -268,6 +283,27 @@ def _price_set_atom_by_id_payload(price_set_id: bytes, atom_ids: tuple[bytes, ..
     return bytes(payload)
 
 
+def _price_set_atom_membership_payload_bytes(atom_count: int) -> int:
+    """Return the exact uncompressed bytes required by one v2 membership."""
+    encoded_count_bytes = 1
+    remaining_count = int(atom_count)
+    while remaining_count >= 0x80:
+        remaining_count >>= 7
+        encoded_count_bytes += 1
+    return 16 + encoded_count_bytes + int(atom_count) * 16
+
+
+def _assert_price_set_atom_membership_fits(atom_count: int, max_payload_bytes: int) -> None:
+    """Reject one membership before it can exceed the bounded block buffer."""
+    membership_bytes = _price_set_atom_membership_payload_bytes(atom_count)
+    if membership_bytes > max_payload_bytes:
+        raise RuntimeError(
+            "price-set atom membership requires "
+            f"{membership_bytes} bytes, exceeding the maximum single-membership size of "
+            f"{max_payload_bytes} bytes"
+        )
+
+
 def _provider_count_dictionary_payload(provider_count_by_key: dict[int, int]) -> bytes:
     payload = bytearray()
     previous_provider_set_key = 0
@@ -349,7 +385,7 @@ async def create_ptg2_serving_binary_table(*, schema_name: str, target_table: st
     await db.status(f"DROP TABLE IF EXISTS {qualified_target} CASCADE;")
     await db.status(
         f"""
-        CREATE UNLOGGED TABLE {qualified_target} (
+        CREATE TABLE {qualified_target} (
             artifact_kind varchar(64) NOT NULL,
             block_key integer NOT NULL,
             block_no integer NOT NULL,
@@ -360,6 +396,11 @@ async def create_ptg2_serving_binary_table(*, schema_name: str, target_table: st
         );
         """
     )
+
+
+async def _drop_ptg2_serving_binary_table(*, schema_name: str, target_table: str) -> None:
+    qualified_target = f"{_quote_ident(schema_name)}.{_quote_ident(target_table)}"
+    await db.status(f"DROP TABLE IF EXISTS {qualified_target} CASCADE;")
 
 
 async def copy_ptg2_serving_binary_file_to_table(
@@ -411,7 +452,17 @@ async def finalize_ptg2_serving_binary_table(*, schema_name: str, target_table: 
             COALESCE(
                 SUM(CASE WHEN payload_compression <> 'none' THEN raw_payload_bytes - octet_length(payload) ELSE 0 END),
                 0
-            ) AS compressed_saved_bytes
+            ) AS compressed_saved_bytes,
+            CASE (
+                SELECT relation.relpersistence
+                FROM pg_class relation
+                WHERE relation.oid = CAST(:qualified_target AS regclass)
+            )
+                WHEN 'p' THEN 'logged'
+                WHEN 'u' THEN 'unlogged'
+                WHEN 't' THEN 'temporary'
+                ELSE 'unknown'
+            END AS relation_persistence
         FROM {qualified_target}
         """,
         qualified_target=f"{schema_name}.{target_table}",
@@ -615,163 +666,156 @@ async def _copy_pg_query_to_rust(
         await _close_rust_stdin(process)
 
 
-async def _stream_serving_binary_copy(
+async def _cancel_rust_copy_tasks(copy_tasks: list[asyncio.Task[Any]]) -> None:
+    """Cancel and drain both sides of a Rust COPY pipeline."""
+    for task in copy_tasks:
+        task.cancel()
+    await asyncio.gather(*copy_tasks, return_exceptions=True)
+
+
+async def _stop_rust_stream_process(process: Any, stderr_task: asyncio.Task[bytes]) -> bytes:
+    """Close stdin, kill a live encoder, and drain its process tasks."""
+    if getattr(process, "returncode", None) is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            logger.debug("PTG2 Rust stream process exited before cancellation")
+    await _close_rust_stdin(process)
+    await process.wait()
+    return await stderr_task
+
+
+async def _copy_through_rust_process(
     *,
-    kind: str,
+    process: Any,
     sql: str,
     schema_name: str,
     target_table: str,
-    source_copy_format: str = "text",
-    target_copy_format: str = "text",
-) -> dict[str, Any]:
-    """Pipe PostgreSQL COPY rows through Rust and into the binary block table."""
-    binary = _ptg2_rust_scanner_binary()
-    if binary is None:
-        raise RuntimeError("PTG2 Rust serving binary streaming encoder is enabled but no scanner binary was found")
-    process = await asyncio.create_subprocess_exec(
-        str(binary),
-        "--serving-binary-copy-from-key-copy-stdio",
-        f"{kind}_pg_binary" if source_copy_format == "binary" else kind,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        raise RuntimeError("PTG2 Rust streaming COPY process did not expose stdio pipes")
-    stderr_task = asyncio.create_task(process.stderr.read())
-    stream_started_at = time.monotonic()
-    stream_metrics_by_name: dict[str, Any] = {}
-
-    try:
-        async with db.acquire() as source_conn, db.acquire() as target_conn:
-            source_raw = source_conn.raw_connection
-            target_raw = target_conn.raw_connection
-            source_driver = getattr(source_raw, "driver_connection", source_raw)
-            target_driver = getattr(target_raw, "driver_connection", target_raw)
-
-            target_copy_kwargs = (
-                {"format": "binary"}
-                if target_copy_format == "binary"
-                else {"format": "text", "delimiter": "\t", "null": "\\N"}
-            )
-            await asyncio.gather(
-                _copy_pg_query_to_rust(
-                    source_driver,
-                    sql,
-                    process,
-                    source_copy_format=source_copy_format,
-                    metrics=stream_metrics_by_name,
-                    started_at=stream_started_at,
-                ),
-                target_driver.copy_to_table(
-                    target_table,
-                    source=_rust_stdout_chunks(
-                        process,
-                        metrics=stream_metrics_by_name,
-                        started_at=stream_started_at,
-                    ),
-                    schema_name=schema_name,
-                    columns=PTG2_SERVING_BINARY_COLUMNS,
-                    **target_copy_kwargs,
-                ),
-            )
-    except Exception:
-        process.kill()
-        await _close_rust_stdin(process)
-        await process.wait()
-        await stderr_task
-        raise
-    await _close_rust_stdin(process)
-    returncode = await process.wait()
-    stderr = await stderr_task
-    if returncode != 0:
-        raise RuntimeError(
-            "PTG2 Rust streaming serving binary COPY encoder failed "
-            f"for {kind}: stderr={stderr.decode('utf-8', errors='replace')[-2000:]}"
+    source_copy_format: str,
+    target_copy_format: str,
+    metrics: dict[str, Any],
+    started_at: float,
+) -> None:
+    """Run the database source and target COPY tasks for one encoder."""
+    async with db.acquire() as source_conn, db.acquire() as target_conn:
+        source_raw = source_conn.raw_connection
+        target_raw = target_conn.raw_connection
+        source_driver = getattr(source_raw, "driver_connection", source_raw)
+        target_driver = getattr(target_raw, "driver_connection", target_raw)
+        target_copy_kwargs = (
+            {"format": "binary"}
+            if target_copy_format == "binary"
+            else {"format": "text", "delimiter": "\t", "null": "\\N"}
         )
-    summary = _parse_serving_binary_stream_summary(stderr)
-    summary.update(stream_metrics_by_name)
-    summary["pipeline_seconds"] = time.monotonic() - stream_started_at
-    return summary
+        copy_tasks: list[asyncio.Task[Any]] = []
+        try:
+            copy_tasks.append(
+                asyncio.create_task(
+                    _copy_pg_query_to_rust(
+                        source_driver,
+                        sql,
+                        process,
+                        source_copy_format=source_copy_format,
+                        metrics=metrics,
+                        started_at=started_at,
+                    )
+                )
+            )
+            copy_tasks.append(
+                asyncio.create_task(
+                    target_driver.copy_to_table(
+                        target_table,
+                        source=_rust_stdout_chunks(process, metrics=metrics, started_at=started_at),
+                        schema_name=schema_name,
+                        columns=PTG2_SERVING_BINARY_COLUMNS,
+                        **target_copy_kwargs,
+                    )
+                )
+            )
+            await asyncio.gather(*copy_tasks)
+        except (Exception, asyncio.CancelledError):
+            await _cancel_rust_copy_tasks(copy_tasks)
+            raise
 
 
-async def _stream_serving_binary_combined_copy(
+async def _run_rust_stream_copy(
     *,
+    encoder_kind: str,
+    failure_label: str,
     sql: str,
     schema_name: str,
     target_table: str,
-    source_copy_format: str = "text",
-    target_copy_format: str = "text",
+    source_copy_format: str,
+    target_copy_format: str,
 ) -> dict[str, Any]:
-    """Pipe one by-code PostgreSQL stream through Rust to build forward and reverse blocks."""
+    """Launch one Rust encoder and return its summary with pipeline metrics."""
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
-        raise RuntimeError("PTG2 Rust combined serving binary encoder is enabled but no scanner binary was found")
+        raise RuntimeError(f"PTG2 Rust {failure_label} encoder is enabled but no scanner binary was found")
+    process_kind = f"{encoder_kind}_pg_binary" if source_copy_format == "binary" else encoder_kind
     process = await asyncio.create_subprocess_exec(
         str(binary),
         "--serving-binary-copy-from-key-copy-stdio",
-        "combined_pg_binary" if source_copy_format == "binary" else "combined",
+        process_kind,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
-        raise RuntimeError("PTG2 Rust combined COPY process did not expose stdio pipes")
+        try:
+            process.kill()
+        except ProcessLookupError:
+            logger.debug("PTG2 Rust stream process exited without complete stdio pipes")
+        await process.wait()
+        raise RuntimeError(f"PTG2 Rust {failure_label} process did not expose stdio pipes")
     stderr_task = asyncio.create_task(process.stderr.read())
     stream_started_at = time.monotonic()
     stream_metrics_by_name: dict[str, Any] = {}
-
     try:
-        async with db.acquire() as source_conn, db.acquire() as target_conn:
-            source_raw = source_conn.raw_connection
-            target_raw = target_conn.raw_connection
-            source_driver = getattr(source_raw, "driver_connection", source_raw)
-            target_driver = getattr(target_raw, "driver_connection", target_raw)
-
-            target_copy_kwargs = (
-                {"format": "binary"}
-                if target_copy_format == "binary"
-                else {"format": "text", "delimiter": "\t", "null": "\\N"}
-            )
-            await asyncio.gather(
-                _copy_pg_query_to_rust(
-                    source_driver,
-                    sql,
-                    process,
-                    source_copy_format=source_copy_format,
-                    metrics=stream_metrics_by_name,
-                    started_at=stream_started_at,
-                ),
-                target_driver.copy_to_table(
-                    target_table,
-                    source=_rust_stdout_chunks(
-                        process,
-                        metrics=stream_metrics_by_name,
-                        started_at=stream_started_at,
-                    ),
-                    schema_name=schema_name,
-                    columns=PTG2_SERVING_BINARY_COLUMNS,
-                    **target_copy_kwargs,
-                ),
-            )
-    except Exception:
-        process.kill()
+        await _copy_through_rust_process(
+            process=process, sql=sql, schema_name=schema_name, target_table=target_table,
+            source_copy_format=source_copy_format, target_copy_format=target_copy_format,
+            metrics=stream_metrics_by_name, started_at=stream_started_at,
+        )
         await _close_rust_stdin(process)
-        await process.wait()
-        await stderr_task
+        returncode = await process.wait()
+        stderr = await stderr_task
+    except (Exception, asyncio.CancelledError):
+        await _stop_rust_stream_process(process, stderr_task)
         raise
-    await _close_rust_stdin(process)
-    returncode = await process.wait()
-    stderr = await stderr_task
     if returncode != 0:
         raise RuntimeError(
-            "PTG2 Rust combined serving binary COPY encoder failed "
+            f"PTG2 Rust {failure_label} encoder failed: "
             f"stderr={stderr.decode('utf-8', errors='replace')[-2000:]}"
         )
     summary = _parse_serving_binary_stream_summary(stderr)
     summary.update(stream_metrics_by_name)
     summary["pipeline_seconds"] = time.monotonic() - stream_started_at
     return summary
+
+
+async def _stream_serving_binary_copy(
+    *, kind: str, sql: str, schema_name: str, target_table: str,
+    source_copy_format: str = "text", target_copy_format: str = "text",
+) -> dict[str, Any]:
+    """Pipe one ordered PostgreSQL stream through a Rust block encoder."""
+    return await _run_rust_stream_copy(
+        encoder_kind=kind, failure_label=f"streaming serving binary COPY for {kind}",
+        sql=sql, schema_name=schema_name, target_table=target_table,
+        source_copy_format=source_copy_format, target_copy_format=target_copy_format,
+    )
+
+
+async def _stream_serving_binary_combined_copy(
+    *, sql: str, schema_name: str, target_table: str,
+    source_copy_format: str = "text", target_copy_format: str = "text",
+) -> dict[str, Any]:
+    """Pipe one by-code stream through the combined forward/reverse encoder."""
+    return await _run_rust_stream_copy(
+        encoder_kind="combined", failure_label="combined serving binary COPY",
+        sql=sql, schema_name=schema_name, target_table=target_table,
+        source_copy_format=source_copy_format, target_copy_format=target_copy_format,
+    )
 
 
 async def _copy_serving_binary_record_batches(
@@ -976,6 +1020,7 @@ class _PriceSetAtomPrefixBlockWriter:
         bucket_key = _price_set_atom_prefix_bucket(price_set_id)
         if self.current_bucket_key is not None and bucket_key < self.current_bucket_key:
             raise RuntimeError("price-set atom rows must be ordered by price_set_global_id_128")
+        _assert_price_set_atom_membership_fits(len(atom_ids), self.max_payload_bytes)
         entry_payload = _price_set_atom_by_id_payload(price_set_id, atom_ids)
         if self.current_bucket_key != bucket_key:
             await self.flush_block()
@@ -1020,14 +1065,12 @@ async def _write_price_set_atom_blocks(
     """Encode the price_forward sidecar as PostgreSQL serving-binary blocks."""
 
     if price_set_atom_table:
-        table_summary = await _write_atom_map_blocks_from_table(
+        return await _write_atom_map_blocks_from_table(
             schema_name=schema_name,
             table_name=table_name,
             price_set_atom_table=price_set_atom_table,
             max_payload_bytes=max_payload_bytes,
         )
-        if int(table_summary.get("price_set_count") or 0) > 0 or not _price_forward_artifact_path(price_forward_artifact):
-            return table_summary
 
     sidecar_path = _price_forward_artifact_path(price_forward_artifact)
     if sidecar_path is None:
@@ -1088,6 +1131,7 @@ async def _write_atom_map_blocks_from_table(
                 await flush_current_price_set()
                 current_price_set_id = price_set_id
                 current_atom_ids = []
+            _assert_price_set_atom_membership_fits(len(current_atom_ids) + 1, max_payload_bytes)
             current_atom_ids.append(price_atom_id)
     await flush_current_price_set()
     await block_writer.finish()
@@ -1680,6 +1724,38 @@ def _serving_binary_stream_sql(
     raise ValueError(f"unsupported serving binary stream kind: {kind}")
 
 
+def _price_set_atom_stream_sql(*, qualified_source: str) -> str:
+    """Return the authoritative ordered price-set atom pair query."""
+    return f"""
+    SELECT price_set_global_id_128, price_atom_global_id_128
+    FROM {qualified_source}
+    ORDER BY price_set_global_id_128, price_atom_global_id_128
+    """
+
+
+def _stream_stage_sql(
+    *,
+    config: _StreamStageConfig,
+    qualified_source: str,
+    source_layout: str,
+    qualified_code_count_table: str | None,
+    qualified_provider_set_dictionary_table: str | None,
+    qualified_price_set_atom_table: str | None,
+) -> str:
+    """Resolve the ordered PostgreSQL source query for one Rust stream."""
+    if config.kind == PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND:
+        if qualified_price_set_atom_table is None:
+            raise ValueError("price-set atom stream requires an authoritative PostgreSQL table")
+        return _price_set_atom_stream_sql(qualified_source=qualified_price_set_atom_table)
+    return _serving_binary_stream_sql(
+        qualified_source=qualified_source,
+        kind=config.kind,
+        source_layout=source_layout,
+        qualified_code_count_table=qualified_code_count_table,
+        qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+    )
+
+
 async def _stream_serving_binary_stage(
     *,
     config: _StreamStageConfig,
@@ -1689,6 +1765,7 @@ async def _stream_serving_binary_stage(
     source_layout: str,
     qualified_code_count_table: str | None,
     qualified_provider_set_dictionary_table: str | None,
+    qualified_price_set_atom_table: str | None,
     schema_name: str,
     target_table: str,
     source_copy_format: str,
@@ -1696,41 +1773,59 @@ async def _stream_serving_binary_stage(
     timing_by_stage: dict[str, float],
 ) -> dict[str, Any]:
     """Run one ordered PostgreSQL-to-Rust-to-PostgreSQL streaming stage."""
+    stage_expected_row_count = (
+        None if config.kind == PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND else expected_row_count
+    )
     _emit_progress(
         progress_callback,
         config.progress_step,
         done=config.progress_done,
         total=config.progress_total,
         message=config.progress_message,
-        expected_row_count=expected_row_count,
+        expected_row_count=stage_expected_row_count,
     )
     stage_started_at = time.monotonic()
     stage_result = await _stream_serving_binary_copy(
         kind=config.kind,
-        sql=_serving_binary_stream_sql(
+        sql=_stream_stage_sql(
+            config=config,
             qualified_source=qualified_source,
-            kind=config.kind,
             source_layout=source_layout,
             qualified_code_count_table=qualified_code_count_table,
             qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+            qualified_price_set_atom_table=qualified_price_set_atom_table,
         ),
         schema_name=schema_name,
         target_table=target_table,
         source_copy_format=source_copy_format,
         target_copy_format=target_copy_format,
     )
+    if config.kind == PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND:
+        stage_result["source"] = "price_set_atom_table"
     timing_by_stage[config.timing_key] = _elapsed_seconds(stage_started_at)
     return stage_result
 
 
-def _serving_binary_stream_stage_configs() -> tuple[_StreamStageConfig, ...]:
-    """Return the two Rust streaming stages needed for bidirectional serving."""
-    return (
+def _price_set_atom_stream_stage_config() -> _StreamStageConfig:
+    """Return the Rust stream definition for the v2 atom lookup blocks."""
+    return _StreamStageConfig(
+        kind=PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND,
+        progress_step="serving binary stream price atoms",
+        progress_done=2,
+        progress_total=6,
+        progress_message="streaming PostgreSQL price-set atom COPY through Rust",
+        timing_key="price_set_atoms_stream_seconds",
+    )
+
+
+def _serving_binary_stream_stage_configs(*, include_price_set_atoms: bool) -> tuple[_StreamStageConfig, ...]:
+    """Return the Rust stages for bidirectional serving and optional atom lookup."""
+    stage_configs = [
         _StreamStageConfig(
             kind="by_code",
             progress_step="serving binary stream by code",
             progress_done=1,
-            progress_total=5,
+            progress_total=6,
             progress_message="streaming PostgreSQL by-code COPY through Rust",
             timing_key="by_code_stream_seconds",
         ),
@@ -1738,11 +1833,14 @@ def _serving_binary_stream_stage_configs() -> tuple[_StreamStageConfig, ...]:
             kind="by_provider_set",
             progress_step="serving binary stream reverse",
             progress_done=3,
-            progress_total=5,
+            progress_total=6,
             progress_message="streaming PostgreSQL reverse COPY through Rust",
             timing_key="reverse_stream_seconds",
         ),
-    )
+    ]
+    if include_price_set_atoms:
+        stage_configs.insert(1, _price_set_atom_stream_stage_config())
+    return tuple(stage_configs)
 
 
 def _validate_stream_row_count(
@@ -1793,13 +1891,14 @@ async def _run_serving_binary_stream_stages(
     source_layout: str,
     qualified_code_count_table: str | None,
     qualified_provider_set_dictionary_table: str | None,
+    qualified_price_set_atom_table: str | None,
     schema_name: str,
     target_table: str,
     source_copy_format: str,
     target_copy_format: str,
     timing_by_stage: dict[str, float],
 ) -> dict[str, dict[str, Any]]:
-    """Run the forward and reverse binary encoders, parallelizing when allowed."""
+    """Run serving-binary encoders with the configured concurrency limit."""
     if stream_tasks <= 1:
         stage_result_by_kind: dict[str, dict[str, Any]] = {}
         for config in stage_configs:
@@ -1811,6 +1910,7 @@ async def _run_serving_binary_stream_stages(
                 source_layout=source_layout,
                 qualified_code_count_table=qualified_code_count_table,
                 qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+                qualified_price_set_atom_table=qualified_price_set_atom_table,
                 schema_name=schema_name,
                 target_table=target_table,
                 source_copy_format=source_copy_format,
@@ -1819,9 +1919,12 @@ async def _run_serving_binary_stream_stages(
             )
         return stage_result_by_kind
 
-    stage_task_by_kind = {
-        config.kind: asyncio.create_task(
-            _stream_serving_binary_stage(
+    stream_semaphore = asyncio.Semaphore(stream_tasks)
+
+    async def run_stage(config: _StreamStageConfig) -> dict[str, Any]:
+        """Run one stage after acquiring a stream concurrency slot."""
+        async with stream_semaphore:
+            return await _stream_serving_binary_stage(
                 config=config,
                 progress_callback=progress_callback,
                 expected_row_count=expected_row_count,
@@ -1829,18 +1932,18 @@ async def _run_serving_binary_stream_stages(
                 source_layout=source_layout,
                 qualified_code_count_table=qualified_code_count_table,
                 qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+                qualified_price_set_atom_table=qualified_price_set_atom_table,
                 schema_name=schema_name,
                 target_table=target_table,
                 source_copy_format=source_copy_format,
                 target_copy_format=target_copy_format,
                 timing_by_stage=timing_by_stage,
             )
-        )
-        for config in stage_configs
-    }
+
+    stage_task_by_kind = {config.kind: asyncio.create_task(run_stage(config)) for config in stage_configs}
     try:
         stage_results = await asyncio.gather(*stage_task_by_kind.values())
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         for task in stage_task_by_kind.values():
             task.cancel()
         await asyncio.gather(*stage_task_by_kind.values(), return_exceptions=True)
@@ -1872,31 +1975,69 @@ async def _write_serving_binary_rust_stream(
         if provider_set_dictionary_table
         else None
     )
+    qualified_price_set_atom_table = (
+        f"{_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)}" if price_set_atom_table else None
+    )
     await create_ptg2_serving_binary_table(schema_name=schema_name, target_table=target_table)
     if _use_serving_binary_combined_stream():
         _emit_progress(
             progress_callback,
             "serving binary stream combined",
             done=1,
-            total=5,
+            total=6,
             message="streaming PostgreSQL by-code COPY through combined Rust encoder",
             expected_row_count=expected_row_count,
         )
         stage_started_at = time.monotonic()
-        combined = await _stream_serving_binary_combined_copy(
-            sql=_serving_binary_stream_sql(
-                qualified_source=qualified_source,
-                kind="by_code",
-                source_layout=source_layout,
-                qualified_code_count_table=qualified_code_count_table,
-                qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
-            ),
-            schema_name=schema_name,
-            target_table=target_table,
-            source_copy_format=source_copy_format,
-            target_copy_format=target_copy_format,
+        combined_stream_limit = _serving_binary_stream_tasks()
+        combined_task = asyncio.create_task(
+            _stream_serving_binary_combined_copy(
+                sql=_serving_binary_stream_sql(
+                    qualified_source=qualified_source,
+                    kind="by_code",
+                    source_layout=source_layout,
+                    qualified_code_count_table=qualified_code_count_table,
+                    qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+                ),
+                schema_name=schema_name,
+                target_table=target_table,
+                source_copy_format=source_copy_format,
+                target_copy_format=target_copy_format,
+            )
         )
-        timing_by_stage["combined_stream_seconds"] = _elapsed_seconds(stage_started_at)
+        combined_tasks = [combined_task]
+        atom_stream_options_by_name = {
+            "config": _price_set_atom_stream_stage_config(),
+            "progress_callback": progress_callback,
+            "expected_row_count": None,
+            "qualified_source": qualified_source,
+            "source_layout": source_layout,
+            "qualified_code_count_table": qualified_code_count_table,
+            "qualified_provider_set_dictionary_table": qualified_provider_set_dictionary_table,
+            "qualified_price_set_atom_table": qualified_price_set_atom_table,
+            "schema_name": schema_name,
+            "target_table": target_table,
+            "source_copy_format": source_copy_format,
+            "target_copy_format": target_copy_format,
+            "timing_by_stage": timing_by_stage,
+        }
+        if qualified_price_set_atom_table is not None and combined_stream_limit >= 2:
+            combined_tasks.append(
+                asyncio.create_task(_stream_serving_binary_stage(**atom_stream_options_by_name))
+            )
+        try:
+            combined_results = await asyncio.gather(*combined_tasks)
+        except (Exception, asyncio.CancelledError):
+            for task in combined_tasks:
+                task.cancel()
+            await asyncio.gather(*combined_tasks, return_exceptions=True)
+            raise
+        if qualified_price_set_atom_table is not None and combined_stream_limit < 2:
+            combined_results.append(await _stream_serving_binary_stage(**atom_stream_options_by_name))
+        combined = combined_results[0]
+        timing_by_stage["combined_stream_seconds"] = round(
+            float(combined.get("pipeline_seconds") or _elapsed_seconds(stage_started_at)), 3
+        )
         by_code = dict(combined.get("by_code") or {})
         by_provider_set = dict(combined.get("by_provider_set") or {})
         _validate_stream_row_count(label="combined by-code", expected_row_count=expected_row_count, stream_result=by_code)
@@ -1905,21 +2046,25 @@ async def _write_serving_binary_rust_stream(
             expected_row_count=expected_row_count,
             stream_result=by_provider_set,
         )
-        price_set_atoms = await _write_atom_map_stage(
-            schema_name=schema_name,
-            target_table=target_table,
-            price_forward_artifact=price_forward_artifact,
-            price_set_atom_table=price_set_atom_table,
-            max_payload_bytes=max_payload_bytes,
-            progress_callback=progress_callback,
-            stage_progress=_AtomMapStageProgress(
-                progress_step="serving binary stream price atoms",
-                done=4,
-                total=6,
-                message="streaming PostgreSQL binary price-set atom blocks",
-            ),
-            timing_by_stage=timing_by_stage,
-        )
+        if price_set_atom_table is not None:
+            price_set_atoms = combined_results[1]
+            price_set_atoms["stage_table"] = f"{schema_name}.{price_set_atom_table}"
+        else:
+            price_set_atoms = await _write_atom_map_stage(
+                schema_name=schema_name,
+                target_table=target_table,
+                price_forward_artifact=price_forward_artifact,
+                price_set_atom_table=None,
+                max_payload_bytes=max_payload_bytes,
+                progress_callback=progress_callback,
+                stage_progress=_AtomMapStageProgress(
+                    progress_step="serving binary stream price atoms",
+                    done=4,
+                    total=6,
+                    message="streaming PostgreSQL binary price-set atom blocks",
+                ),
+                timing_by_stage=timing_by_stage,
+            )
         storage_data = await _finalize_stream_binary_table(
             schema_name=schema_name,
             target_table=target_table,
@@ -1931,7 +2076,7 @@ async def _write_serving_binary_rust_stream(
         timing_by_stage["target_copy_format"] = target_copy_format
         return dict(
             format=PTG2_SERVING_BINARY_TABLE_FORMAT, table=f"{schema_name}.{target_table}", writer="rust_stream",
-            stream_mode="combined", stream_tasks=1, source_copy_format=source_copy_format,
+            stream_mode="combined", stream_tasks=len(combined_tasks), source_copy_format=source_copy_format,
             target_copy_format=target_copy_format, block_bytes=max_payload_bytes,
             row_count=int(by_code.get("row_count") or 0), by_code=by_code,
             by_provider_set=by_provider_set, price_set_atoms=price_set_atoms,
@@ -1939,8 +2084,8 @@ async def _write_serving_binary_rust_stream(
             storage=storage_data,
         )
 
-    stage_configs = _serving_binary_stream_stage_configs()
-    stream_tasks = _serving_binary_stream_tasks()
+    stage_configs = _serving_binary_stream_stage_configs(include_price_set_atoms=price_set_atom_table is not None)
+    stream_tasks = min(_serving_binary_stream_tasks(), len(stage_configs))
     stage_result_by_kind = await _run_serving_binary_stream_stages(
         stage_configs=stage_configs,
         stream_tasks=stream_tasks,
@@ -1950,6 +2095,7 @@ async def _write_serving_binary_rust_stream(
         source_layout=source_layout,
         qualified_code_count_table=qualified_code_count_table,
         qualified_provider_set_dictionary_table=qualified_provider_set_dictionary_table,
+        qualified_price_set_atom_table=qualified_price_set_atom_table,
         schema_name=schema_name,
         target_table=target_table,
         source_copy_format=source_copy_format,
@@ -1961,21 +2107,25 @@ async def _write_serving_binary_rust_stream(
     by_provider_set = stage_result_by_kind["by_provider_set"]
     _validate_stream_row_count(label="by-code", expected_row_count=expected_row_count, stream_result=by_code)
     _validate_stream_row_count(label="reverse", expected_row_count=expected_row_count, stream_result=by_provider_set)
-    price_set_atoms = await _write_atom_map_stage(
-        schema_name=schema_name,
-        target_table=target_table,
-        price_forward_artifact=price_forward_artifact,
-        price_set_atom_table=price_set_atom_table,
-        max_payload_bytes=max_payload_bytes,
-        progress_callback=progress_callback,
-        stage_progress=_AtomMapStageProgress(
-            progress_step="serving binary stream price atoms",
-            done=4,
-            total=6,
-            message="streaming PostgreSQL binary price-set atom blocks",
-        ),
-        timing_by_stage=timing_by_stage,
-    )
+    if price_set_atom_table is not None:
+        price_set_atoms = stage_result_by_kind[PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND]
+        price_set_atoms["stage_table"] = f"{schema_name}.{price_set_atom_table}"
+    else:
+        price_set_atoms = await _write_atom_map_stage(
+            schema_name=schema_name,
+            target_table=target_table,
+            price_forward_artifact=price_forward_artifact,
+            price_set_atom_table=None,
+            max_payload_bytes=max_payload_bytes,
+            progress_callback=progress_callback,
+            stage_progress=_AtomMapStageProgress(
+                progress_step="serving binary stream price atoms",
+                done=4,
+                total=6,
+                message="streaming PostgreSQL binary price-set atom blocks",
+            ),
+            timing_by_stage=timing_by_stage,
+        )
     storage_data = await _finalize_stream_binary_table(
         schema_name=schema_name,
         target_table=target_table,
@@ -2220,6 +2370,11 @@ async def write_ptg2_serving_binary_table(
                     provider_set_dictionary_table=provider_set_dictionary_table,
                     progress_callback=progress_callback,
                 )
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    _drop_ptg2_serving_binary_table(schema_name=schema_name, target_table=target_table)
+                )
+                raise
             except Exception:
                 logger.warning("PTG2 Rust streaming serving binary generation failed; falling back to Rust files", exc_info=True)
         try:
@@ -2235,17 +2390,26 @@ async def write_ptg2_serving_binary_table(
                 provider_set_dictionary_table=provider_set_dictionary_table,
                 progress_callback=progress_callback,
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                _drop_ptg2_serving_binary_table(schema_name=schema_name, target_table=target_table)
+            )
+            raise
         except Exception:
             logger.warning("PTG2 Rust serving binary generation failed; falling back to Python", exc_info=True)
-    return await _write_ptg2_serving_binary_table_python(
-        schema_name=schema_name,
-        source_table=source_table,
-        target_table=target_table,
-        expected_row_count=expected_row_count,
-        price_set_atom_table=price_set_atom_table,
-        price_forward_artifact=price_forward_artifact,
-        source_layout=source_layout,
-        code_count_table=code_count_table,
-        provider_set_dictionary_table=provider_set_dictionary_table,
-        progress_callback=progress_callback,
-    )
+    try:
+        return await _write_ptg2_serving_binary_table_python(
+            schema_name=schema_name,
+            source_table=source_table,
+            target_table=target_table,
+            expected_row_count=expected_row_count,
+            price_set_atom_table=price_set_atom_table,
+            price_forward_artifact=price_forward_artifact,
+            source_layout=source_layout,
+            code_count_table=code_count_table,
+            provider_set_dictionary_table=provider_set_dictionary_table,
+            progress_callback=progress_callback,
+        )
+    except (Exception, asyncio.CancelledError):
+        await asyncio.shield(_drop_ptg2_serving_binary_table(schema_name=schema_name, target_table=target_table))
+        raise

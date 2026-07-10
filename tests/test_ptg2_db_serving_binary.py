@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import time
 import zlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -251,6 +253,66 @@ async def test_rust_stdout_chunks_records_target_copy_metrics():
     assert metrics_by_name["target_copy_bytes"] == len(b"firstsecond")
     assert metrics_by_name["target_first_byte_seconds"] >= 0
     assert metrics_by_name["target_copy_complete_seconds"] >= metrics_by_name["target_first_byte_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_rust_stream_cancellation_kills_and_drains_process(monkeypatch):
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class CancelledRustProcess:
+        def __init__(self):
+            self.stdin = FakeProcessStdin()
+            self.stdout = object()
+            self.stderr = FakeStderr()
+            self.returncode = None
+            self.killed = False
+            self.waited = False
+            self.wait_started = asyncio.Event()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            if self.returncode is None:
+                self.wait_started.set()
+                await asyncio.Event().wait()
+            return self.returncode
+
+    process = CancelledRustProcess()
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return process
+
+    async def fake_copy_through_rust_process(**_kwargs):
+        return None
+
+    monkeypatch.setattr(serving_binary_writer, "_ptg2_rust_scanner_binary", lambda: Path("scanner"))
+    monkeypatch.setattr(serving_binary_writer.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(serving_binary_writer, "_copy_through_rust_process", fake_copy_through_rust_process)
+    stream_task = asyncio.create_task(
+        serving_binary_writer._run_rust_stream_copy(
+            encoder_kind="by_code",
+            failure_label="test",
+            sql="SELECT 1",
+            schema_name="mrf",
+            target_table="serving",
+            source_copy_format="text",
+            target_copy_format="text",
+        )
+    )
+    await process.wait_started.wait()
+
+    stream_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stream_task
+
+    assert process.killed is True
+    assert process.waited is True
+    assert process.stdin.closed is True
 
 
 @pytest.mark.asyncio
