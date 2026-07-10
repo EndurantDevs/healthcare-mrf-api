@@ -77,12 +77,36 @@ def _serving_index(row: dict[str, Any]) -> dict[str, Any]:
     return serving_index if isinstance(serving_index, dict) else {}
 
 
+def _protected_snapshot_lineage_ids(
+    snapshot_rows: Iterable[Any],
+    current_snapshot_ids: tuple[str, ...],
+    retain_current_lineage: int,
+) -> set[str]:
+    """Return current snapshot IDs plus their bounded previous-snapshot lineage."""
+    previous_snapshot_by_id = {
+        str(_row_mapping(raw_row).get("snapshot_id") or ""): str(
+            _row_mapping(raw_row).get("previous_snapshot_id") or ""
+        )
+        for raw_row in snapshot_rows
+    }
+    protected_snapshot_ids = set(current_snapshot_ids)
+    for current_snapshot_id in current_snapshot_ids:
+        lineage_snapshot_id = current_snapshot_id
+        for _lineage_depth in range(1, max(int(retain_current_lineage), 1)):
+            lineage_snapshot_id = previous_snapshot_by_id.get(lineage_snapshot_id, "")
+            if not lineage_snapshot_id or lineage_snapshot_id in protected_snapshot_ids:
+                break
+            protected_snapshot_ids.add(lineage_snapshot_id)
+    return protected_snapshot_ids
+
+
 async def build_ptg2_source_snapshot_gc_plan(
     *,
     schema_name: str | None = None,
     executor: Any | None = None,
+    retain_current_lineage: int = 3,
 ) -> PTG2SourceSnapshotGCPlan:
-    """Build a plan for published, manifest-backed snapshots no current pointer uses."""
+    """Build a plan while retaining recent lineage behind every current pointer."""
 
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     executor = executor or db
@@ -100,10 +124,10 @@ async def build_ptg2_source_snapshot_gc_plan(
         """
     )
     current_snapshot_ids = tuple(str(_row_mapping(row).get("snapshot_id")) for row in current_rows)
-    current_snapshot_set = set(current_snapshot_ids)
     snapshot_rows = await executor.all(
         f"""
         SELECT snapshot_id,
+               previous_snapshot_id,
                manifest,
                manifest->'serving_index' AS serving_index,
                manifest->'serving_index'->>'source_key' AS source_key
@@ -114,6 +138,11 @@ async def build_ptg2_source_snapshot_gc_plan(
         """
     )
     current_table_refs: set[str] = set()
+    protected_snapshot_ids = _protected_snapshot_lineage_ids(
+        snapshot_rows,
+        current_snapshot_ids,
+        retain_current_lineage,
+    )
     candidate_table_rows: list[tuple[str, str, str]] = []
     candidate_snapshot_ids: list[str] = []
     for raw_row in snapshot_rows:
@@ -121,7 +150,7 @@ async def build_ptg2_source_snapshot_gc_plan(
         snapshot_id = str(row.get("snapshot_id") or "")
         serving_index = _serving_index(row)
         table_names = _snapshot_manifest_table_names(serving_index)
-        if snapshot_id in current_snapshot_set:
+        if snapshot_id in protected_snapshot_ids:
             current_table_refs.update(table_names)
             continue
         candidate_snapshot_ids.append(snapshot_id)
@@ -194,6 +223,7 @@ async def execute_ptg2_source_snapshot_gc_plan(
     max_tables: int = 2000,
     max_bytes: int = 80 * 1024 * 1024 * 1024,
     lock_timeout: str = "5s",
+    retain_current_lineage: int = 3,
 ) -> PTG2SourceSnapshotGCPlan:
     """Recompute and execute a bounded cleanup plan in one transaction."""
 
@@ -201,7 +231,11 @@ async def execute_ptg2_source_snapshot_gc_plan(
     await ensure_ptg2_artifact_blob_table(schema_name)
     async with db.acquire() as connection:
         await connection.status("SELECT set_config('lock_timeout', :lock_timeout, true)", lock_timeout=lock_timeout)
-        plan = await build_ptg2_source_snapshot_gc_plan(schema_name=schema_name, executor=connection)
+        plan = await build_ptg2_source_snapshot_gc_plan(
+            schema_name=schema_name,
+            executor=connection,
+            retain_current_lineage=retain_current_lineage,
+        )
         validate_ptg2_source_snapshot_gc_plan(
             plan,
             max_snapshots=max_snapshots,
@@ -275,6 +309,7 @@ async def _amain(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--max-tables", type=_positive_int, default=2000)
     parser.add_argument("--max-bytes-gb", type=_positive_int, default=80)
     parser.add_argument("--lock-timeout", default="5s")
+    parser.add_argument("--retain-current-lineage", type=_positive_int, default=3)
     args = parser.parse_args(list(argv) if argv is not None else None)
     max_bytes = args.max_bytes_gb * 1024 * 1024 * 1024
     if args.execute:
@@ -284,11 +319,15 @@ async def _amain(argv: Iterable[str] | None = None) -> None:
             max_tables=args.max_tables,
             max_bytes=max_bytes,
             lock_timeout=args.lock_timeout,
+            retain_current_lineage=args.retain_current_lineage,
         )
         _print_plan(plan)
         print("cleanup_executed=true")
     else:
-        plan = await build_ptg2_source_snapshot_gc_plan(schema_name=args.schema)
+        plan = await build_ptg2_source_snapshot_gc_plan(
+            schema_name=args.schema,
+            retain_current_lineage=args.retain_current_lineage,
+        )
         validate_ptg2_source_snapshot_gc_plan(
             plan,
             max_snapshots=args.max_snapshots,

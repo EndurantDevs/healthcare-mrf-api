@@ -97,6 +97,51 @@ def test_build_ptg2_source_snapshot_gc_plan_targets_only_non_current_manifest_ta
     assert plan.total_bytes == 150
 
 
+def test_build_ptg2_source_snapshot_gc_plan_retains_three_snapshot_lineage():
+    class LineageExecutor(_FakeExecutor):
+        async def all(self, statement, **params):
+            if "SELECT DISTINCT snapshot_id" in statement:
+                return [{"snapshot_id": "snap_current"}]
+            if 'FROM "mrf".ptg2_snapshot' in statement:
+                return [
+                    {
+                        "snapshot_id": "snap_current",
+                        "previous_snapshot_id": "snap_previous",
+                        "source_key": "source_a",
+                        "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_current"},
+                    },
+                    {
+                        "snapshot_id": "snap_previous",
+                        "previous_snapshot_id": "snap_third",
+                        "source_key": "source_a",
+                        "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_previous"},
+                    },
+                    {
+                        "snapshot_id": "snap_third",
+                        "previous_snapshot_id": "snap_fourth",
+                        "source_key": "source_a",
+                        "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_third"},
+                    },
+                    {
+                        "snapshot_id": "snap_fourth",
+                        "previous_snapshot_id": None,
+                        "source_key": "source_a",
+                        "serving_index": {"storage": "manifest_snapshot", "table": "mrf.ptg2_serving_fourth"},
+                    },
+                ]
+            if "FROM pg_class c" in statement:
+                assert params["table_names"] == ["ptg2_serving_fourth"]
+                return [{"table_name": "ptg2_serving_fourth", "bytes": 100}]
+            raise AssertionError(statement)
+
+    plan = asyncio.run(snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=LineageExecutor()))
+
+    assert plan.candidate_snapshot_ids == ("snap_fourth",)
+    assert [(table.snapshot_id, table.table_name) for table in plan.tables] == [
+        ("snap_fourth", "ptg2_serving_fourth")
+    ]
+
+
 def test_validate_ptg2_source_snapshot_gc_plan_enforces_bounds():
     plan = snapshot_gc.PTG2SourceSnapshotGCPlan(
         current_snapshot_ids=(),
