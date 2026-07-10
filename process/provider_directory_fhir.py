@@ -9981,21 +9981,19 @@ def _is_trusted_fhir_pagination_url(
     )
 
 
-def _resolved_idaho_medicaid_next_url(
-    current_url: str,
-    next_url: str,
-) -> str:
-    """Accept Idaho Medicaid's exact alternate-host continuation URLs."""
-    parsed_base = urllib.parse.urlsplit(IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE)
-    parsed_current = urllib.parse.urlsplit(current_url)
-    parsed_next = urllib.parse.urlsplit(next_url)
-    base_path = parsed_base.path.rstrip("/")
-    current_path = parsed_current.path.rstrip("/")
-    resource_type = current_path[len(base_path) :].strip("/")
+def _is_idaho_medicaid_query_valid(
+    parsed_next: urllib.parse.SplitResult,
+    resource_type: str,
+) -> bool:
+    """Validate Idaho's opaque cursor and optional bounded query context."""
+
     query_items = urllib.parse.parse_qsl(
         parsed_next.query,
         keep_blank_values=True,
     )
+    allowed_names = {"ct", "_count", "_profile"}
+    if any(query_name.lower() not in allowed_names for query_name, _value in query_items):
+        return False
     cursor_values = [
         query_value
         for query_name, query_value in query_items
@@ -10011,45 +10009,58 @@ def _resolved_idaho_medicaid_next_url(
         for query_name, query_value in query_items
         if query_name.lower() == "_profile"
     ]
-    try:
-        current_port = parsed_current.port or 443
-        next_port = parsed_next.port or 443
-    except ValueError:
-        current_port = 0
-        next_port = 0
-    is_count_valid = not count_values or (
-        len(count_values) == 1
-        and count_values[0].isdigit()
-        and int(count_values[0]) > 0
-    )
+    if len(cursor_values) != 1 or not cursor_values[0]:
+        return False
+    if count_values and (
+        len(count_values) != 1
+        or not count_values[0].isdigit()
+        or int(count_values[0]) <= 0
+    ):
+        return False
     expected_profiles = IDAHO_MEDICAID_RESOURCE_PROFILES.get(resource_type)
-    is_profile_valid = not profile_values or (
+    return not profile_values or (
         len(profile_values) == 1
         and frozenset(profile_values[0].split(",")) == expected_profiles
     )
+
+
+def _url_https_port(parsed_url: urllib.parse.SplitResult) -> int:
+    """Return the effective HTTPS port, or zero for an invalid port."""
+
+    try:
+        return parsed_url.port or 443
+    except ValueError:
+        return 0
+
+
+def _resolved_idaho_medicaid_next_url(
+    current_url: str,
+    next_url: str,
+) -> str:
+    """Accept Idaho Medicaid's exact alternate-host continuation URLs."""
+
+    parsed_base = urllib.parse.urlsplit(IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE)
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    base_path = parsed_base.path.rstrip("/")
+    current_path = parsed_current.path.rstrip("/")
+    resource_type = current_path[len(base_path) :].strip("/")
     is_allowlisted = (
         parsed_current.scheme.lower() == "https"
         and (parsed_current.hostname or "").lower() == parsed_base.hostname
-        and current_port == 443
+        and _url_https_port(parsed_current) == 443
         and parsed_current.username is None
         and parsed_current.password is None
         and current_path == f"{base_path}/{resource_type}"
         and resource_type in DEFAULT_RESOURCES
         and parsed_next.scheme.lower() == "https"
         and (parsed_next.hostname or "").lower() == IDAHO_MEDICAID_PAGINATION_HOST
-        and next_port == 443
+        and _url_https_port(parsed_next) == 443
         and parsed_next.username is None
         and parsed_next.password is None
         and not parsed_next.fragment
         and parsed_next.path.rstrip("/") == current_path
-        and len(cursor_values) == 1
-        and bool(cursor_values[0])
-        and is_count_valid
-        and is_profile_valid
-        and all(
-            query_name.lower() in {"ct", "_count", "_profile"}
-            for query_name, _value in query_items
-        )
+        and _is_idaho_medicaid_query_valid(parsed_next, resource_type)
     )
     if not is_allowlisted:
         raise ValueError("untrusted_idaho_medicaid_pagination_link")
