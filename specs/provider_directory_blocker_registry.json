@@ -38,7 +38,7 @@
       "source_detail": "CMS SMA Endpoint Directory Provider Directory status TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
       "reason": "CMS SMA Endpoint Directory lists Provider Directory as not yet started/TBD.",
-      "note": "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known."
+      "note": "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory status as TBD and provides no production base, capability statement, FHIR version, or resource list."
     }
   ]
 }
