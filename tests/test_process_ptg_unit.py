@@ -5449,6 +5449,38 @@ def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
     assert framed_records == [("scanner_summary", {"x": 1})]
 
 
+def test_ptg2_rust_compact_reports_truncated_frame_process_status(monkeypatch, tmp_path):
+    class FakeProcess:
+        stdout = io.BytesIO(b'scanner_summary\t7\n{"x"')
+        stderr = None
+
+        def poll(self):
+            return -9
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    with pytest.raises(RuntimeError) as error:
+        list(
+            process_ptg._iter_compact_serving_records_rust(
+                tmp_path / "rates.json.gz",
+                snapshot_id="snap",
+                plan_id="plan",
+                plan_month_id="month",
+                source_trace_set_hash="trace",
+                manifest_only=True,
+            )
+        )
+
+    message = str(error.value)
+    assert "kind=scanner_summary" in message
+    assert "expected_bytes=7 received_bytes=4" in message
+    assert "signal 9 (SIGKILL)" in message
+
+
 def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
     captured_env = {}
 

@@ -459,6 +459,7 @@ def _iter_compact_serving_records_rust(
         )
         stderr_thread.start()
     terminated_by_consumer = False
+    has_frame_stream_failure = False
     try:
         while True:
             header = process.stdout.readline()
@@ -471,7 +472,21 @@ def _iter_compact_serving_records_rust(
                 raise RuntimeError(f"Invalid PTG2 Rust compact frame header: {header!r}") from exc
             payload = _read_exactly(process.stdout, payload_len)
             if len(payload) != payload_len:
-                raise RuntimeError("PTG2 Rust compact scanner ended mid-frame")
+                has_frame_stream_failure = True
+                try:
+                    frame_return_code = process.wait(timeout=2)
+                    frame_process_status = _scanner_return_code_label(frame_return_code)
+                except subprocess.TimeoutExpired:
+                    frame_process_status = "still running after stdout closed"
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=2)
+                stderr_detail = chr(10).join(stderr_tail)[-1000:]
+                raise RuntimeError(
+                    "PTG2 Rust compact scanner ended mid-frame "
+                    f"kind={name_bytes.decode('utf-8', errors='replace')} "
+                    f"expected_bytes={payload_len} received_bytes={len(payload)} "
+                    f"process={frame_process_status}: {stderr_detail}"
+                )
             trailer = process.stdout.read(1)
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
@@ -487,7 +502,12 @@ def _iter_compact_serving_records_rust(
         return_code = process.wait()
         if stderr_thread is not None:
             stderr_thread.join(timeout=2)
-        if return_code != 0 and not terminated_by_consumer and not _is_scanner_sigterm_after_dedupe(return_code, stderr_tail):
+        if (
+            return_code != 0
+            and not terminated_by_consumer
+            and not has_frame_stream_failure
+            and not _is_scanner_sigterm_after_dedupe(return_code, stderr_tail)
+        ):
             raise RuntimeError(_scanner_error_message("PTG2 Rust compact scanner", return_code, stderr_tail))
 
 
