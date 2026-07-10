@@ -5417,6 +5417,38 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
     assert captured_env["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
 
 
+def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
+    class ShortReader(io.BytesIO):
+        def read(self, size=-1):
+            return super().read(min(size, 2))
+
+    class FakeProcess:
+        stdout = ShortReader(b'scanner_summary\t7\n{"x":1}\n')
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    framed_records = list(
+        process_ptg._iter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            snapshot_id="snap",
+            plan_id="plan",
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+            manifest_only=True,
+        )
+    )
+
+    assert framed_records == [("scanner_summary", {"x": 1})]
+
+
 def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
     captured_env = {}
 

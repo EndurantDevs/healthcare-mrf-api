@@ -469,7 +469,7 @@ def _iter_compact_serving_records_rust(
                 payload_len = int(length_bytes)
             except Exception as exc:
                 raise RuntimeError(f"Invalid PTG2 Rust compact frame header: {header!r}") from exc
-            payload = process.stdout.read(payload_len)
+            payload = _read_exactly(process.stdout, payload_len)
             if len(payload) != payload_len:
                 raise RuntimeError("PTG2 Rust compact scanner ended mid-frame")
             trailer = process.stdout.read(1)
