@@ -21,7 +21,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered
     assert "Sequential REST pagination preserves Plan-Net network extensions; no Bulk." in rendered
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered
-    assert "Horizon NJ (`horizon-nj`) | Probe-only | Unknown | Probe | None configured" in rendered
+    assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered
     assert "does not claim that a live probe succeeded" in rendered
     assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered
     assert "selected `--report` path; the report is not tracked" in rendered
