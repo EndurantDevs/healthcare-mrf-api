@@ -1125,6 +1125,9 @@ struct ManifestPairSpool {
     row_count: u64,
 }
 
+const MANIFEST_PAIR_RECORD_BYTES: usize = GLOBAL_ID_BYTES * 2;
+const DEFAULT_MANIFEST_PAIR_SORT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
 impl ManifestPairSpool {
     fn new(kind: &str) -> io::Result<Self> {
         let base_dir = env::var_os("HLTHPRT_PTG2_MANIFEST_SPILL_DIR")
@@ -1222,6 +1225,29 @@ impl ManifestPairSpool {
     }
 
     fn write_dense_sidecar(&mut self, path: &str) -> io::Result<(u64, u64)> {
+        let chunk_bytes = env_usize(
+            "HLTHPRT_PTG2_MANIFEST_SIDECAR_SORT_CHUNK_BYTES",
+            DEFAULT_MANIFEST_PAIR_SORT_CHUNK_BYTES,
+        )
+        .max(MANIFEST_PAIR_RECORD_BYTES);
+        self.write_dense_sidecar_with_chunk_bytes(path, chunk_bytes)
+    }
+
+    fn write_dense_sidecar_with_chunk_bytes(
+        &mut self,
+        path: &str,
+        chunk_bytes: usize,
+    ) -> io::Result<(u64, u64)> {
+        let spool_bytes = self
+            .row_count
+            .saturating_mul(MANIFEST_PAIR_RECORD_BYTES as u64);
+        if spool_bytes <= chunk_bytes as u64 {
+            return self.write_dense_sidecar_in_memory(path);
+        }
+        self.write_dense_sidecar_external(path, chunk_bytes)
+    }
+
+    fn write_dense_sidecar_in_memory(&mut self, path: &str) -> io::Result<(u64, u64)> {
         let pairs = self.sorted_unique_pairs()?;
         let entry_count = count_pair_owners(&pairs);
         let member_count = pairs.len() as u64;
@@ -1280,6 +1306,55 @@ impl ManifestPairSpool {
         Ok((entry_count, member_count))
     }
 
+    fn write_dense_sidecar_external(
+        &mut self,
+        path: &str,
+        chunk_bytes: usize,
+    ) -> io::Result<(u64, u64)> {
+        self.writer.flush()?;
+        let mut temporary_files = ManifestPairTemporaryFiles::default();
+        let chunk_paths = self.write_sorted_pair_chunks(chunk_bytes, &mut temporary_files)?;
+        let merged = merge_sorted_pair_chunks(&self.path, &chunk_paths, &mut temporary_files)?;
+        for chunk_path in &chunk_paths {
+            let _ = std::fs::remove_file(chunk_path);
+        }
+        write_dense_sidecar_from_sorted_pairs(path, &merged)
+    }
+
+    fn write_sorted_pair_chunks(
+        &self,
+        chunk_bytes: usize,
+        temporary_files: &mut ManifestPairTemporaryFiles,
+    ) -> io::Result<Vec<PathBuf>> {
+        let records_per_chunk = (chunk_bytes / MANIFEST_PAIR_RECORD_BYTES).max(1);
+        let mut reader = BufReader::new(File::open(&self.path)?);
+        let mut chunk_paths = Vec::new();
+        loop {
+            let mut pairs = Vec::with_capacity(records_per_chunk);
+            while pairs.len() < records_per_chunk {
+                let Some(pair) = read_manifest_pair(&mut reader)? else {
+                    break;
+                };
+                pairs.push(pair);
+            }
+            if pairs.is_empty() {
+                break;
+            }
+            pairs.sort_unstable();
+            pairs.dedup();
+            let chunk_path =
+                manifest_pair_temporary_path(&self.path, "sorted-chunk", chunk_paths.len());
+            let mut writer = BufWriter::new(File::create(&chunk_path)?);
+            for pair in pairs {
+                writer.write_all(&pair)?;
+            }
+            writer.flush()?;
+            temporary_files.track(chunk_path.clone());
+            chunk_paths.push(chunk_path);
+        }
+        Ok(chunk_paths)
+    }
+
     fn sorted_unique_pairs(&mut self) -> io::Result<Vec<[u8; GLOBAL_ID_BYTES * 2]>> {
         self.writer.flush()?;
         let file = File::open(&self.path)?;
@@ -1298,6 +1373,242 @@ impl ManifestPairSpool {
         pairs.dedup();
         Ok(pairs)
     }
+}
+
+#[derive(Default)]
+struct ManifestPairTemporaryFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl ManifestPairTemporaryFiles {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for ManifestPairTemporaryFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+struct MergedManifestPairs {
+    path: PathBuf,
+    entry_count: u64,
+    member_count: u64,
+    member_ids: Vec<[u8; GLOBAL_ID_BYTES]>,
+}
+
+#[derive(Eq)]
+struct ManifestPairMergeItem {
+    pair: [u8; MANIFEST_PAIR_RECORD_BYTES],
+    reader_index: usize,
+}
+
+impl Ord for ManifestPairMergeItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .pair
+            .cmp(&self.pair)
+            .then_with(|| other.reader_index.cmp(&self.reader_index))
+    }
+}
+
+impl PartialOrd for ManifestPairMergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ManifestPairMergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.pair == other.pair && self.reader_index == other.reader_index
+    }
+}
+
+fn manifest_pair_temporary_path(source_path: &Path, kind: &str, index: usize) -> PathBuf {
+    let source_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ptg2-manifest-pairs");
+    source_path.with_file_name(format!("{source_name}.{kind}.{index}"))
+}
+
+fn read_manifest_pair<R: Read>(
+    reader: &mut R,
+) -> io::Result<Option<[u8; MANIFEST_PAIR_RECORD_BYTES]>> {
+    let mut pair = [0u8; MANIFEST_PAIR_RECORD_BYTES];
+    let mut offset = 0usize;
+    while offset < pair.len() {
+        let bytes_read = reader.read(&mut pair[offset..])?;
+        if bytes_read == 0 {
+            if offset == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "manifest pair spool ended with a partial record",
+            ));
+        }
+        offset += bytes_read;
+    }
+    Ok(Some(pair))
+}
+
+fn merge_sorted_pair_chunks(
+    source_path: &Path,
+    chunk_paths: &[PathBuf],
+    temporary_files: &mut ManifestPairTemporaryFiles,
+) -> io::Result<MergedManifestPairs> {
+    let merged_path = manifest_pair_temporary_path(source_path, "sorted-unique", 0);
+    let mut output = BufWriter::new(File::create(&merged_path)?);
+    temporary_files.track(merged_path.clone());
+    let mut readers = Vec::with_capacity(chunk_paths.len());
+    for chunk_path in chunk_paths {
+        readers.push(BufReader::new(File::open(chunk_path)?));
+    }
+    let mut heap = BinaryHeap::new();
+    for (reader_index, reader) in readers.iter_mut().enumerate() {
+        if let Some(pair) = read_manifest_pair(reader)? {
+            heap.push(ManifestPairMergeItem { pair, reader_index });
+        }
+    }
+
+    let mut previous_pair = None;
+    let mut previous_owner = None;
+    let mut member_ids = HashSet::new();
+    let mut entry_count = 0u64;
+    let mut member_count = 0u64;
+    while let Some(item) = heap.pop() {
+        if previous_pair != Some(item.pair) {
+            let mut owner = [0u8; GLOBAL_ID_BYTES];
+            owner.copy_from_slice(&item.pair[..GLOBAL_ID_BYTES]);
+            if previous_owner != Some(owner) {
+                entry_count = entry_count.saturating_add(1);
+                previous_owner = Some(owner);
+            }
+            let mut member = [0u8; GLOBAL_ID_BYTES];
+            member.copy_from_slice(&item.pair[GLOBAL_ID_BYTES..]);
+            member_ids.insert(member);
+            output.write_all(&item.pair)?;
+            member_count = member_count.saturating_add(1);
+            previous_pair = Some(item.pair);
+        }
+        if let Some(pair) = read_manifest_pair(&mut readers[item.reader_index])? {
+            heap.push(ManifestPairMergeItem {
+                pair,
+                reader_index: item.reader_index,
+            });
+        }
+    }
+    output.flush()?;
+    let mut member_ids: Vec<[u8; GLOBAL_ID_BYTES]> = member_ids.into_iter().collect();
+    member_ids.sort_unstable();
+    Ok(MergedManifestPairs {
+        path: merged_path,
+        entry_count,
+        member_count,
+        member_ids,
+    })
+}
+
+fn write_dense_sidecar_from_sorted_pairs(
+    output_path: &str,
+    merged: &MergedManifestPairs,
+) -> io::Result<(u64, u64)> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(output_path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(b"PTG2MNDS")?;
+    writer.write_all(&1u32.to_le_bytes())?;
+    writer.write_all(&merged.entry_count.to_le_bytes())?;
+    writer.write_all(&(merged.member_ids.len() as u64).to_le_bytes())?;
+    write_dense_sidecar_owner_index(&mut writer, &merged.path, merged.entry_count)?;
+    for member_id in &merged.member_ids {
+        writer.write_all(member_id)?;
+    }
+    let mut local_ids = HashMap::with_capacity(merged.member_ids.len());
+    for (index, member_id) in merged.member_ids.iter().copied().enumerate() {
+        let local_id = u32::try_from(index).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dense sidecar member dictionary exceeds u32 capacity",
+            )
+        })?;
+        local_ids.insert(member_id, local_id);
+    }
+    let mut reader = BufReader::new(File::open(&merged.path)?);
+    while let Some(pair) = read_manifest_pair(&mut reader)? {
+        let mut member = [0u8; GLOBAL_ID_BYTES];
+        member.copy_from_slice(&pair[GLOBAL_ID_BYTES..]);
+        let local_id = local_ids.get(&member).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dense sidecar member is missing from local dictionary",
+            )
+        })?;
+        writer.write_all(&local_id.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok((merged.entry_count, merged.member_count))
+}
+
+fn write_dense_sidecar_owner_index<W: Write>(
+    writer: &mut W,
+    pair_path: &Path,
+    expected_entry_count: u64,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(pair_path)?);
+    let mut current_owner = None;
+    let mut current_count = 0u32;
+    let mut offset = 0u64;
+    let mut written_entries = 0u64;
+    while let Some(pair) = read_manifest_pair(&mut reader)? {
+        let mut owner = [0u8; GLOBAL_ID_BYTES];
+        owner.copy_from_slice(&pair[..GLOBAL_ID_BYTES]);
+        if current_owner == Some(owner) {
+            current_count = current_count.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dense sidecar owner exceeds u32 member capacity",
+                )
+            })?;
+            continue;
+        }
+        if let Some(previous_owner) = current_owner.replace(owner) {
+            write_dense_sidecar_owner(writer, &previous_owner, offset, current_count)?;
+            offset = offset.saturating_add(u64::from(current_count));
+            written_entries = written_entries.saturating_add(1);
+        }
+        current_count = 1;
+    }
+    if let Some(owner) = current_owner {
+        write_dense_sidecar_owner(writer, &owner, offset, current_count)?;
+        written_entries = written_entries.saturating_add(1);
+    }
+    if written_entries != expected_entry_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dense sidecar owner count changed during external sort",
+        ));
+    }
+    Ok(())
+}
+
+fn write_dense_sidecar_owner<W: Write>(
+    writer: &mut W,
+    owner: &[u8; GLOBAL_ID_BYTES],
+    offset: u64,
+    count: u32,
+) -> io::Result<()> {
+    writer.write_all(owner)?;
+    writer.write_all(&offset.to_le_bytes())?;
+    writer.write_all(&count.to_le_bytes())
 }
 
 fn count_pair_owners(pairs: &[[u8; GLOBAL_ID_BYTES * 2]]) -> u64 {
@@ -9666,6 +9977,54 @@ mod tests {
         assert!(inverted
             .iter()
             .all(|entry| entry.members == vec![provider_set_id]));
+    }
+
+    #[test]
+    fn manifest_dense_sidecar_external_sort_matches_in_memory_format() {
+        let output_prefix = std::env::temp_dir().join(format!(
+            "ptg2-dense-sidecar-sort-test-{}",
+            std::process::id()
+        ));
+        let in_memory_path = output_prefix.with_extension("memory.ptg2sc");
+        let external_path = output_prefix.with_extension("external.ptg2sc");
+        let owner_a = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let owner_b = GlobalId128([2; GLOBAL_ID_BYTES]);
+        let member_a = GlobalId128([7; GLOBAL_ID_BYTES]);
+        let member_b = GlobalId128([8; GLOBAL_ID_BYTES]);
+        let member_c = GlobalId128([9; GLOBAL_ID_BYTES]);
+        let pairs = [
+            (owner_b, member_c),
+            (owner_a, member_b),
+            (owner_a, member_a),
+            (owner_b, member_a),
+            (owner_a, member_b),
+            (owner_b, member_b),
+        ];
+        let mut in_memory_spool = ManifestPairSpool::new("dense_parity_memory").unwrap();
+        let mut external_spool = ManifestPairSpool::new("dense_parity_external").unwrap();
+        for (owner, member) in pairs {
+            in_memory_spool.push(owner, member).unwrap();
+            external_spool.push(owner, member).unwrap();
+        }
+
+        let in_memory_metrics = in_memory_spool
+            .write_dense_sidecar_with_chunk_bytes(in_memory_path.to_str().unwrap(), usize::MAX)
+            .unwrap();
+        let external_metrics = external_spool
+            .write_dense_sidecar_with_chunk_bytes(
+                external_path.to_str().unwrap(),
+                MANIFEST_PAIR_RECORD_BYTES * 2,
+            )
+            .unwrap();
+
+        assert_eq!(external_metrics, in_memory_metrics);
+        assert_eq!(external_metrics, (2, 5));
+        assert_eq!(
+            std::fs::read(&external_path).unwrap(),
+            std::fs::read(&in_memory_path).unwrap()
+        );
+        let _ = std::fs::remove_file(in_memory_path);
+        let _ = std::fs::remove_file(external_path);
     }
 
     #[test]
