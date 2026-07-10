@@ -120,6 +120,77 @@ The suite also includes a TIN-only v2 case. It verifies that a valid rate file
 with zero NPIs still publishes all unique prices, creates an empty indexed NPI
 scope, returns no reverse-NPI items, and leaves no scope stage tables behind.
 
+### Real-scale dev findings
+
+A 2026-07-10 dev run measured a 13.80 GiB compressed dental source with
+513,262,462 unique serving rows. The source and plan names are intentionally
+omitted here; the persisted snapshot/report ids remain the operational source
+of truth.
+
+| Stage | Actual | Measured floor or current dependency floor | Interpretation |
+| --- | ---: | ---: | --- |
+| Raw file read, warm page cache | 6.19 s | 6.19 s | 2.23 GiB/s; storage was not the scanner constraint |
+| Clean single-core `gzip -dc` | 541.51 s | 541.51 s | 26.10 compressed MiB/s; hard floor for the current single gzip member |
+| Rust scanner | 876.70 s | 541.51 s | 1.62x the gzip floor; at most 335.19 s is removable without changing the container format |
+| Complete data phase | 931.58 s | 541.51 s | Includes about 54.88 s after scanner completion |
+| Parallel staging COPY | 85.76 s | Not isolated in this run | 650,988,716 rows, or 7.59M rows/s |
+| By-code binary stream | 452.89 s | Runs concurrently with reverse | 513.26M rows and 1.679 GB output |
+| Reverse binary stream | 566.51 s | 566.51 s pair wall floor | 513.26M rows and 2.656 GB output |
+| Price-set/atom stream | 746.28 s | Not isolated in this run | 29.12M price sets, 127.33M atom refs, and 2.521 GB payload |
+| Binary build | 1,312.92 s | 1,312.79 s with current dependencies | `max(452.89, 566.51) + 746.28`; wrapper overhead is only 0.13 s |
+| Remaining serving publish | 73.79 s | Stage-specific | Mostly the 66.27 s lean price-atom rewrite; artifact upload was 2.96 s |
+| Full durable snapshot | 2,404.13 s | See scenario bounds below | 40m04.13s including PostgreSQL publication |
+
+The scanner captured 272.64 GiB of raw negotiated-rate JSON and sustained
+318.44 MiB/s across its workers. The producer was blocked on worker queues for
+175.32 s, exactly 20.0% of scanner time and 52.3% of the scanner headroom above
+clean gzip. Removing all observed queue blocking would still leave the scanner
+159.87 s above the gzip floor, so worker throughput and producer scanning both
+matter.
+
+The stage arithmetic gives useful scenario bounds:
+
+- Bringing only the scanner to the measured gzip floor changes 40m04s to about
+  34m29s. Scanner tuning cannot produce the largest remaining gain.
+- Running the existing price-set/atom work concurrently with the two serving
+  streams changes the binary-build wall from 21m53s to at most 12m26s before
+  contention, changing the full run to about 30m38s.
+- Combining both optimistic changes gives about 25m02s. This is a scheduling
+  bound, not a benchmark promise; three ordered PostgreSQL streams may contend.
+- Moving the atom encoder from Python row iteration to bounded-memory Rust can
+  lower the 12m26s atom branch further, but cannot remove PostgreSQL's ordered
+  scan or sort.
+
+Commit `b60129f` adds the missing diagnostics for subsequent runs: per-kind
+staging input bytes and elapsed throughput, plus PostgreSQL source bytes,
+target bytes, time-to-first-byte, and completion time for each Rust stream.
+These counters let the next comparison separate database sort/export, Rust
+encoding, and target COPY instead of treating each stream as one opaque timer.
+
+The real storage A/B also constrains the architecture claim:
+
+| Shape | Compatibility layout | Normalized v2 | Change |
+| --- | ---: | ---: | ---: |
+| 513M serving rows | 8.017 GiB | 7.783 GiB | 239.6 MiB smaller, 2.9% |
+| 520M serving rows | 7.989 GiB | 7.809 GiB | 183.8 MiB smaller, 2.2% |
+
+For both shapes, the 7.2 GiB serving binary and roughly 0.9 GiB price-atom
+table dominate; v2 changes provider membership, not those components. A
+different dense source exposed the opposite extreme: its two provider-set/group
+directions alone occupied 3.766 GiB stored because they represented about
+1.12B edges. Replacing one direction with a request-time inversion would save
+space but make one API direction scan the complete edge set. Any next storage
+version therefore needs compact bidirectional integer-key blocks and a shared
+price dictionary, not ordinary one-edge-per-row PostgreSQL tables.
+
+After taxonomy filtering was moved ahead of the v2 location candidate limit,
+the warmed PostgreSQL-only API p95 values were 20.48 ms for code-to-provider,
+8.94 ms for one NPI/code, 36.94 ms for all prices of one NPI, and 22.66 ms for
+radius geo. Reverse result digests matched v1 exactly. Geo-forward returns more
+providers because v1 applies another limit after provider-group fan-out, which
+can discard already selected NPIs; do not force v2 to reproduce that
+under-coverage.
+
 Reports are written to:
 
 ```text

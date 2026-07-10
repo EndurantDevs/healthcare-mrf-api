@@ -104,7 +104,11 @@ Supported import modes:
   Forward provider expansion follows set -> group -> NPI; reverse price lookup
   follows NPI -> group -> set -> price set; geo lookup combines the same graph
   with current unified addresses. Updating unified addresses therefore improves
-  every snapshot without rewriting price artifacts.
+  every snapshot without rewriting price artifacts. Both set/group directions
+  are physical indexes, not redundant cache copies: dropping either makes one
+  API direction invert the complete edge set at request time. On sources with
+  hundreds of millions of set/group edges these maps can dominate storage, so
+  require a real-source size and API pilot before assuming v2 is smaller.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v1` is the compatibility
   storage-saving layout. It omits `provider_set_component` and
   `provider_group_rate_scope`,
@@ -167,12 +171,11 @@ manifest tables:
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
 - `HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true` rejects `target/debug/ptg2_scanner` when the Rust scanner is selected. Keep this enabled in deployed environments; local development can disable it to use a debug binary.
 - `HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS=true` is the default worker-side parser path. The producer transfers bounded raw negotiated-rate chunks to worker threads so `RateLite` construction, normalization, hashing, dedupe, and COPY row writing happen off the producer thread. It still honors `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` for giant `in_network` objects. Set it to `false` to roll back to the previous producer-side parser path for A/B checks.
-- `HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES` defaults to 16 MiB. In worker-side parser mode, the producer flushes a raw negotiated-rate worker chunk when either this byte cap or `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` is reached. Lower it for memory-sensitive huge-file lanes; raise it only after comparing peak RSS and scanner elapsed time.
-- For a scanner-throughput experiment on large dev imports, keep the default code path and set `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES=8192` plus `HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES=33554432` in the runner environment, or pass `_scanner_split_negotiated_rates=8192` and `_scanner_raw_chunk_bytes=33554432` for one controlled run. Do not promote this to deployed defaults until elapsed time, producer blocked microseconds, raw chunk counts, and peak RSS are compared against the 4096/16 MiB baseline.
+- `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` defaults to `8192` and `HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES` defaults to 32 MiB. In worker-side parser mode, the producer flushes a raw negotiated-rate worker chunk when either bound is reached. Lower one or both values for memory-sensitive lanes only after comparing peak RSS, scanner elapsed time, producer blocked microseconds, and chunk counts.
 - Rust scanner progress defaults to every 256 MiB or 2,000,000 parsed objects. Override with `HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES` or `HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS` when interactive visibility needs to change.
 - Rust scanner stdout includes `scanner_config` and `scanner_summary` frames. The serving-only summary stores them under `summary.scanner` so A/B runs can compare worker count, queue sizes, parse mode, raw chunk count/bytes, elapsed seconds, and producer blocked microseconds.
 - `PTG2_COPY_SHARD_START` and `PTG2_COPY_SHARD_DONE` should appear while `PTG2_SCANNER_PROGRESS` is still advancing. A growing `.ready` backlog without active PostgreSQL `COPY` means the scanner/COPY handoff is unhealthy.
-- Successful imports print a final `PTG2_IMPORT_DONE` line with processed/failed file counts, serving row count, total seconds, data seconds, publish seconds, index seconds, and analyze seconds. The same timing data is stored in `ptg2_import_run.report.timings`.
+- Successful imports print a final `PTG2_IMPORT_DONE` line with processed/failed file counts, serving row count, total seconds, data seconds, publish seconds, index seconds, and analyze seconds. The same timing data is stored in `ptg2_import_run.report.timings`. Direct staging COPY metrics also persist per-kind input bytes, rows, elapsed time, and throughput. Rust serving-stream summaries persist source/target COPY bytes plus first-byte and completion offsets so PostgreSQL sorting, encoding, and target COPY can be profiled separately.
 - Parallel serving-only imports can still batch top-level `in_network` objects per worker via `HLTHPRT_PTG2_WORKER_CHUNK_ITEMS` for the Python parser path.
 - PTG2 legacy semantic key hashing mode is configurable via `HLTHPRT_PTG2_HASH_MODE`:
   - `checksum64` (default, compact 16-hex keys),
