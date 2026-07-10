@@ -474,6 +474,7 @@ CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
+CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS = (15.0, 30.0, 60.0, 120.0)
 EXPECTED_NONEMPTY_RESOURCE_ERROR = (
     "provider_directory_expected_nonempty_resource_returned_zero_rows"
 )
@@ -9351,6 +9352,49 @@ def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
     return min(2.0, 0.25 * (2**max(0, attempt_index)))
 
 
+def _cigna_empty_collection_retry_delays(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> tuple[float, ...]:
+    """Return cooldowns for Cigna's transient HTTP-200 empty search sets."""
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    resource_type = _fhir_collection_search_resource_type(
+        source_record,
+        request_url,
+    )
+    query_names = {
+        name.lower()
+        for name, _value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(request_url).query,
+            keep_blank_values=True,
+        )
+    }
+    if (
+        api_base != CIGNA_PROVIDER_DIRECTORY_BASE
+        or resource_type not in CIGNA_EXPECTED_NONEMPTY_RESOURCES
+        or FHIR_CONTINUATION_QUERY_NAMES.intersection(query_names)
+    ):
+        return ()
+    return CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS
+
+
+def _is_empty_fhir_search_set(
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+    fetch_error: str | None,
+) -> bool:
+    return bool(
+        status_code == 200
+        and fetch_error is None
+        and isinstance(fhir_payload, dict)
+        and fhir_payload.get("resourceType") == "Bundle"
+        and fhir_payload.get("type") == "searchset"
+        and not (fhir_payload.get("entry") or [])
+    )
+
+
 def _source_fetch_candidate_urls(url: str) -> list[str]:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -9470,12 +9514,131 @@ def _source_fetch_result_with_payload_error(
     return status_code, fhir_payload, payload_error, elapsed_ms
 
 
+def _source_fetch_attempt_delay(
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+    attempt_index: int,
+    empty_collection_retry_delays: tuple[float, ...],
+    should_retry_empty_collection: bool,
+) -> float:
+    if should_retry_empty_collection:
+        return empty_collection_retry_delays[
+            min(attempt_index, len(empty_collection_retry_delays) - 1)
+        ]
+    retry_after_seconds = (
+        _source_retry_after_seconds(fhir_payload)
+        if status_code == 429
+        else None
+    )
+    return (
+        retry_after_seconds
+        if retry_after_seconds is not None
+        else _source_fetch_retry_delay_seconds(attempt_index)
+    )
+
+
+async def _fetch_source_json_attempt(
+    source_record: dict[str, Any],
+    candidate_url: str,
+    *,
+    timeout: int,
+    empty_collection_retry_delays: tuple[float, ...],
+) -> tuple[
+    tuple[int | None, dict[str, Any] | None, str | None, int],
+    bool,
+    bool,
+    bool,
+]:
+    fetch_result = _source_fetch_result_with_payload_error(
+        source_record,
+        candidate_url,
+        await _fetch_source_json_once(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+        ),
+    )
+    status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
+    should_retry_empty_collection = bool(
+        empty_collection_retry_delays
+        and _is_empty_fhir_search_set(
+            status_code,
+            fhir_payload,
+            fetch_error,
+        )
+    )
+    should_retry_fetch = should_retry_empty_collection or (
+        _is_transient_source_fetch_failure(status_code, fetch_error)
+    )
+    return (
+        fetch_result,
+        _should_reduce_source_page_size(status_code, fetch_error),
+        should_retry_fetch,
+        should_retry_empty_collection,
+    )
+
+
+async def _fetch_source_json_candidate(
+    source_record: dict[str, Any],
+    candidate_url: str,
+    *,
+    timeout: int,
+    is_last_candidate: bool,
+) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool]:
+    """Fetch one page-size candidate and report whether to try a smaller page."""
+    empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
+        source_record,
+        candidate_url,
+    )
+    attempt_count = max(
+        _source_fetch_retry_attempts(),
+        len(empty_collection_retry_delays) + 1,
+    )
+    total_elapsed_ms = 0
+    fetch_result = (None, None, "request_not_attempted", 0)
+    for attempt_index in range(attempt_count):
+        (
+            fetch_result,
+            should_try_smaller_page,
+            should_retry_fetch,
+            should_retry_empty_collection,
+        ) = await _fetch_source_json_attempt(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+            empty_collection_retry_delays=empty_collection_retry_delays,
+        )
+        status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
+        total_elapsed_ms += elapsed_ms
+        if should_try_smaller_page and not is_last_candidate:
+            return (
+                (status_code, fhir_payload, fetch_error, total_elapsed_ms),
+                True,
+            )
+        if not should_retry_fetch or attempt_index + 1 >= attempt_count:
+            break
+        await asyncio.sleep(
+            _source_fetch_attempt_delay(
+                status_code,
+                fhir_payload,
+                attempt_index,
+                empty_collection_retry_delays,
+                should_retry_empty_collection,
+            )
+        )
+    return (
+        (fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms),
+        False,
+    )
+
+
 async def _fetch_source_json(
     source_record: dict[str, Any],
     url: str,
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Fetch FHIR JSON with source retries and page-size fallback."""
     total_elapsed_ms = 0
     fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int] = (
         None,
@@ -9485,43 +9648,22 @@ async def _fetch_source_json(
     )
     candidate_urls = _source_fetch_candidate_urls(url)
     for candidate_index, candidate_url in enumerate(candidate_urls):
-        is_last_candidate = candidate_index == len(candidate_urls) - 1
-        should_try_smaller_page = False
-        attempt_count = _source_fetch_retry_attempts()
-        for attempt_index in range(attempt_count):
-            fetch_result = _source_fetch_result_with_payload_error(
-                source_record,
-                candidate_url,
-                await _fetch_source_json_once(
-                    source_record,
-                    candidate_url,
-                    timeout=timeout,
-                ),
-            )
-            status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
-            total_elapsed_ms += elapsed_ms
-            should_try_smaller_page = _should_reduce_source_page_size(
-                status_code,
-                fetch_error,
-            )
-            if should_try_smaller_page and not is_last_candidate:
-                break
-            if not _is_transient_source_fetch_failure(status_code, fetch_error):
-                return status_code, fhir_payload, fetch_error, total_elapsed_ms
-            if attempt_index + 1 < attempt_count:
-                retry_delay = (
-                    _source_retry_after_seconds(fhir_payload)
-                    if status_code == 429
-                    else None
-                )
-                await asyncio.sleep(
-                    retry_delay
-                    if retry_delay is not None
-                    else _source_fetch_retry_delay_seconds(attempt_index)
-                )
+        fetch_result, should_try_smaller_page = await _fetch_source_json_candidate(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+            is_last_candidate=candidate_index == len(candidate_urls) - 1,
+        )
+        total_elapsed_ms += fetch_result[3]
+        fetch_result = (
+            fetch_result[0],
+            fetch_result[1],
+            fetch_result[2],
+            total_elapsed_ms,
+        )
         if not should_try_smaller_page:
-            return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
-    return fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms
+            return fetch_result
+    return fetch_result
 
 
 RESOURCE_ACCESS_PROBE_ORDER = (

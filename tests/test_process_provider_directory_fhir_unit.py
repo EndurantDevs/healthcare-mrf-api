@@ -3738,6 +3738,87 @@ async def test_source_fetch_retries_transient_get_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cigna_source_fetch_cools_down_after_empty_search_sets(monkeypatch):
+    responses = [
+        (200, {"resourceType": "Bundle", "type": "searchset", "entry": []}, None, 5),
+        (200, {"resourceType": "Bundle", "type": "searchset", "entry": []}, None, 7),
+        (
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [{"resource": {"resourceType": "Location", "id": "loc-1"}}],
+            },
+            None,
+            11,
+        ),
+    ]
+    fetch_source_json_once = AsyncMock(side_effect=responses)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        importer,
+        "CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS",
+        (2.0, 4.0),
+    )
+
+    fetch_result = await importer._fetch_source_json(
+        {
+            "source_id": "cigna",
+            "api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        },
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100",
+        timeout=3,
+    )
+
+    assert fetch_result[0] == 200
+    assert fetch_result[1]["entry"][0]["resource"]["id"] == "loc-1"
+    assert fetch_result[3] == 23
+    assert fetch_source_json_once.await_count == 3
+    assert [sleep_call.args[0] for sleep_call in sleep_mock.await_args_list] == [2.0, 4.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_url",
+    [
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Endpoint?_count=100",
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100&ct=opaque",
+    ],
+)
+async def test_cigna_empty_search_retry_excludes_empty_or_continuation_queries(
+    monkeypatch,
+    resource_url,
+):
+    fetch_source_json_once = AsyncMock(
+        return_value=(
+            200,
+            {"resourceType": "Bundle", "type": "searchset", "entry": []},
+            None,
+            5,
+        )
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    result = await importer._fetch_source_json(
+        {
+            "source_id": "cigna",
+            "api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+        },
+        resource_url,
+        timeout=3,
+    )
+
+    assert result[0] == 200
+    assert result[1]["entry"] == []
+    fetch_source_json_once.assert_awaited_once()
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_aetna_http_200_operation_outcome_is_resource_error(monkeypatch):
     fetch_json = AsyncMock(
         return_value=(
