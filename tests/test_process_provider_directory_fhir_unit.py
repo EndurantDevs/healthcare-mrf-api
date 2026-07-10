@@ -4558,20 +4558,81 @@ def test_provider_directory_address_corroboration_select_sql_returns_query_body(
     assert "provider_directory_network_names" in sql
 
 
+def _artifact_publish_scalar(row_count: int, statements: list[str] | None = None):
+    async def fake_scalar(sql, **params):
+        sql_text = str(sql)
+        if statements is not None:
+            statements.append(sql_text)
+        if "pg_try_advisory_xact_lock" in sql_text:
+            return True
+        if "cls.relpersistence" in sql_text:
+            return "p"
+        if "cls.relkind" in sql_text:
+            relation_name = params["relation_name"]
+            return None if relation_name.endswith("_old") else "r"
+        return row_count
+
+    return fake_scalar
+
+
+def _stub_artifact_build_guard(monkeypatch):
+    @contextlib.asynccontextmanager
+    async def unlocked_guard(*_args, **_kwargs):
+        yield
+
+    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", unlocked_guard)
+
+
+def _artifact_stage_table(status_calls: list[tuple[str, dict[str, Any]]], prefix: str) -> str:
+    """Return the unique stage identifier recorded by a publisher test."""
+
+    marker = f'CREATE UNLOGGED TABLE "mrf"."{prefix}'
+    create_sql = next(sql for sql, _params in status_calls if marker in sql)
+    return create_sql.split('"')[3]
+
+
+class _ArtifactPublishTransaction:
+    """Minimal transaction context for staged publisher unit tests."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+def _stub_staged_publish_db(
+    monkeypatch,
+    *,
+    row_count: int,
+    status_responses: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Install SQL-recording DB doubles for one staged publication."""
+
+    status_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_status(sql, **params):
+        sql_text = str(sql)
+        status_calls.append((sql_text, params))
+        return next((value for marker, value in status_responses.items() if marker in sql_text), "OK")
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+    monkeypatch.setattr(importer.db, "scalar", _artifact_publish_scalar(row_count))
+    monkeypatch.setattr(importer.db, "transaction", lambda: _ArtifactPublishTransaction())
+    return status_calls
+
+
 @pytest.mark.asyncio
 async def test_publish_provider_directory_address_corroboration_table_swaps_indexed_table(monkeypatch):
     statements: list[str] = []
+    _stub_artifact_build_guard(monkeypatch)
 
     async def fake_status(sql, **_params):
         statements.append(sql)
         return 0
 
-    async def fake_scalar(sql, **_params):
-        statements.append(sql)
-        return 7
-
     monkeypatch.setattr(importer.db, "status", fake_status)
-    monkeypatch.setattr(importer.db, "scalar", fake_scalar)
+    monkeypatch.setattr(importer.db, "scalar", _artifact_publish_scalar(7, statements))
     monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_corrob")
     publish_catalog = AsyncMock(return_value={"published": True, "rows": 3})
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", publish_catalog)
@@ -4591,8 +4652,10 @@ async def test_publish_provider_directory_address_corroboration_table_swaps_inde
     assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_corrob" AS' in joined
     assert 'FROM "mrf"."provider_directory_address_overlay" overlay' in joined
     assert 'FROM "mrf"."entity_address_unified" e' not in joined
-    assert 'DROP VIEW "mrf"."provider_directory_address_corroboration"' in joined
+    assert 'DROP VIEW "mrf"."provider_directory_address_corroboration"' not in joined
     assert 'DROP TABLE "mrf"."provider_directory_address_corroboration";' not in joined
+    assert 'ALTER TABLE "mrf"."pd_stage_corrob" SET LOGGED' in joined
+    assert 'ACCESS EXCLUSIVE MODE NOWAIT' in joined
     assert (
         'ALTER TABLE "mrf"."provider_directory_address_corroboration" '
         'RENAME TO "provider_directory_address_corroboration_old"'
@@ -11815,28 +11878,18 @@ def test_network_catalog_stage_index_names_are_hash_safe():
 
 @pytest.mark.asyncio
 async def test_network_catalog_publish_uses_staged_swap(monkeypatch):
+    """A scoped network publication swaps its fully built stage atomically."""
+
+    _stub_artifact_build_guard(monkeypatch)
     monkeypatch.setattr(importer, "_network_catalog_missing_requirement", AsyncMock(return_value=None))
-    status_calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def fake_status(sql, **params):
-        sql_text = str(sql)
-        status_calls.append((sql_text, params))
-        if "WHERE NOT (source_id = ANY" in sql_text:
-            return "INSERT 0 4"
-        if "WITH refs_raw AS MATERIALIZED" in sql_text:
-            return "INSERT 0 9"
-        return "OK"
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(importer.db, "status", fake_status)
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=13))
-    monkeypatch.setattr(importer.db, "transaction", lambda: FakeTransaction())
+    status_calls = _stub_staged_publish_db(
+        monkeypatch,
+        row_count=13,
+        status_responses={
+            "WHERE NOT (source_id = ANY": "INSERT 0 4",
+            "WITH refs_raw AS MATERIALIZED": "INSERT 0 9",
+        },
+    )
 
     metrics = await importer.publish_provider_directory_network_catalog(
         "mrf",
@@ -11846,7 +11899,7 @@ async def test_network_catalog_publish_uses_staged_swap(monkeypatch):
 
     sql_calls = [sql for sql, _params in status_calls]
     joined_sql = "\n".join(sql_calls)
-    stage_table = importer._network_catalog_stage_table_name("run_1")
+    stage_table = _artifact_stage_table(status_calls, importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX)
     stage_source_network_idx = importer._network_catalog_index_name(stage_table, "source_network_idx")
 
     assert metrics == {
@@ -11897,34 +11950,19 @@ async def test_network_catalog_publish_skips_run_scope_without_sources(monkeypat
 
 @pytest.mark.asyncio
 async def test_overlay_publish_uses_staged_swap(monkeypatch):
+    _stub_artifact_build_guard(monkeypatch)
     monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
-    status_calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def fake_status(sql, **params):
-        sql_text = str(sql)
-        status_calls.append((sql_text, params))
-        if "WHERE NOT (source_id = ANY" in sql_text:
-            return "INSERT 0 4"
-        if "provider_directory_fhir:organization_address:" in sql_text:
-            return "INSERT 0 6"
-        if "provider_directory_fhir:practitioner_role:" in sql_text:
-            return "INSERT 0 7"
-        if "provider_directory_fhir:organization_affiliation:" in sql_text:
-            return "INSERT 0 8"
-        if "duplicate_rank > 1" in sql_text:
-            return "DELETE 2"
-        return "OK"
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(importer.db, "status", fake_status)
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=10))
-    monkeypatch.setattr(importer.db, "transaction", lambda: FakeTransaction())
+    status_calls = _stub_staged_publish_db(
+        monkeypatch,
+        row_count=10,
+        status_responses={
+            "WHERE NOT (source_id = ANY": "INSERT 0 4",
+            "provider_directory_fhir:organization_address:": "INSERT 0 6",
+            "provider_directory_fhir:practitioner_role:": "INSERT 0 7",
+            "provider_directory_fhir:organization_affiliation:": "INSERT 0 8",
+            "duplicate_rank > 1": "DELETE 2",
+        },
+    )
 
     metrics = await importer.publish_provider_directory_address_overlay(
         "mrf",
@@ -11934,7 +11972,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
 
     sql_calls = [sql for sql, _params in status_calls]
     joined_sql = "\n".join(sql_calls)
-    stage_table = importer._address_overlay_stage_table_name("run_1")
+    stage_table = _artifact_stage_table(status_calls, importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX)
 
     assert metrics["published"] is True
     assert metrics["rows"] == 10
@@ -11969,30 +12007,17 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_overlay_publish_can_refresh_practitioner_component_only(monkeypatch):
+    _stub_artifact_build_guard(monkeypatch)
     monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
-    status_calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def fake_status(sql, **params):
-        sql_text = str(sql)
-        status_calls.append((sql_text, params))
-        if "WHERE NOT" in sql_text and "refresh_resource_types" in sql_text:
-            return "INSERT 0 11"
-        if "provider_directory_fhir:practitioner_role:" in sql_text:
-            return "INSERT 0 7"
-        if "duplicate_rank > 1" in sql_text:
-            return "DELETE 0"
-        return "OK"
-
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(importer.db, "status", fake_status)
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=18))
-    monkeypatch.setattr(importer.db, "transaction", lambda: FakeTransaction())
+    status_calls = _stub_staged_publish_db(
+        monkeypatch,
+        row_count=18,
+        status_responses={
+            "refresh_resource_types": "INSERT 0 11",
+            "provider_directory_fhir:practitioner_role:": "INSERT 0 7",
+            "duplicate_rank > 1": "DELETE 0",
+        },
+    )
 
     metrics = await importer.publish_provider_directory_address_overlay(
         "mrf",

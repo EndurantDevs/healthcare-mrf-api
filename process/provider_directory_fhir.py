@@ -36,7 +36,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import aiohttp
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, func, or_, text as sa_text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -157,6 +157,13 @@ PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
     "pd_price_addr_corrob_pd_source_idx",
     "pd_price_addr_corrob_network_names_gin",
 )
+PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS = 3
+PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_ATTEMPTS = 3
+PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_BACKOFF_SECONDS = 0.5
+PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT = "500ms"
+PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT = "1000ms"
+PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS = 2.0
+PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS = 0.2
 PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
     "source_network_idx",
     "source_idx",
@@ -5024,44 +5031,293 @@ async def _rename_address_corroboration_stage_indexes(schema: str, stage_table: 
         )
 
 
+class ProviderDirectoryArtifactCutoverConflict(RuntimeError):
+    """Raised when a Provider Directory artifact cutover cannot acquire its lock."""
+
+
+class ProviderDirectoryArtifactBuildStale(RuntimeError):
+    """Raised when the live artifact changed after a stage copied from it."""
+
+
+@dataclass(frozen=True)
+class ProviderDirectoryArtifactBuildFence:
+    """Identity of the live relation from which an artifact stage was built."""
+
+    target_oid: int | None
+
+
+async def _try_provider_directory_artifact_build_lock(engine: Any, build_lock_key: str) -> Any | None:
+    """Acquire one session advisory lock attempt on a dedicated connection."""
+
+    connection = await engine.connect()
+    try:
+        lock_result = await connection.execute(
+            sa_text("SELECT pg_try_advisory_lock(hashtextextended(:build_lock_key, 0));"),
+            {"build_lock_key": build_lock_key},
+        )
+        acquired = bool(lock_result.scalar())
+        await connection.commit()
+    except Exception:
+        await connection.close()
+        raise
+    if acquired:
+        return connection
+    await connection.close()
+    return None
+
+
+async def _acquire_provider_directory_artifact_build_lock(engine: Any, build_lock_key: str) -> Any | None:
+    """Retry bounded acquisition of the artifact build guard."""
+
+    for attempt_index in range(PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_ATTEMPTS):
+        connection = await _try_provider_directory_artifact_build_lock(engine, build_lock_key)
+        if connection is not None:
+            return connection
+        if attempt_index + 1 < PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_ATTEMPTS:
+            await asyncio.sleep(PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_BACKOFF_SECONDS * (attempt_index + 1))
+    return None
+
+
+async def _release_provider_directory_artifact_build_lock(connection: Any, build_lock_key: str) -> None:
+    """Release and close the dedicated artifact build-lock connection."""
+
+    try:
+        unlock_result = await connection.execute(
+            sa_text("SELECT pg_advisory_unlock(hashtextextended(:build_lock_key, 0));"),
+            {"build_lock_key": build_lock_key},
+        )
+        unlocked = bool(unlock_result.scalar())
+        await connection.commit()
+        if not unlocked:
+            LOGGER.error("Provider Directory artifact build lock was lost: %s", build_lock_key)
+    except Exception:
+        LOGGER.exception("Failed to release Provider Directory artifact build lock: %s", build_lock_key)
+        with contextlib.suppress(Exception):
+            await connection.invalidate()
+    finally:
+        await connection.close()
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_artifact_build_guard(
+    schema: str,
+    target_relation: str,
+) -> AsyncIterator[ProviderDirectoryArtifactBuildFence]:
+    """Serialize the complete staged read-modify-write cycle without a long transaction."""
+
+    if db.engine is None:
+        await db.connect()
+    assert db.engine is not None
+    build_lock_key = f"provider-directory-artifact-build:{schema}.{target_relation}"
+    connection = await _acquire_provider_directory_artifact_build_lock(db.engine, build_lock_key)
+    if connection is None:
+        raise ProviderDirectoryArtifactCutoverConflict(target_relation)
+    try:
+        target_oid = await _provider_directory_relation_oid(schema, target_relation)
+        yield ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
+    finally:
+        await _release_provider_directory_artifact_build_lock(connection, build_lock_key)
+
+
+async def _provider_directory_relation_oid(schema: str, relation: str) -> int | None:
+    """Return the PostgreSQL relation identity used to fence stale builds."""
+
+    relation_oid = await db.scalar(
+        """
+        SELECT cls.oid::bigint
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = :schema_name
+           AND cls.relname = :relation_name;
+        """,
+        schema_name=schema,
+        relation_name=relation,
+    )
+    return int(relation_oid) if relation_oid is not None else None
+
+
+async def _provider_directory_relation_attribute(
+    schema: str,
+    relation: str,
+    attribute: str,
+) -> str | None:
+    if attribute not in {"relkind", "relpersistence"}:
+        raise ValueError(f"unsupported PostgreSQL relation attribute: {attribute}")
+    value = await db.scalar(
+        f"""
+        SELECT cls.{attribute}::text
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = :schema_name
+           AND cls.relname = :relation_name;
+        """,
+        schema_name=schema,
+        relation_name=relation,
+    )
+    return str(value) if value is not None else None
+
+
+async def _assert_provider_directory_logged_relation(schema: str, relation: str) -> None:
+    persistence = await _provider_directory_relation_attribute(schema, relation, "relpersistence")
+    if persistence != "p":
+        raise RuntimeError(
+            f"Provider Directory artifact relation {schema}.{relation} is not LOGGED: {persistence!r}"
+        )
+
+
+def _is_provider_directory_artifact_cutover_retryable(exc: Exception) -> bool:
+    if isinstance(exc, ProviderDirectoryArtifactCutoverConflict):
+        return True
+    error_values = (exc, getattr(exc, "orig", None), getattr(exc, "__cause__", None))
+    return any(
+        getattr(error, "pgcode", None) == "55P03" or getattr(error, "sqlstate", None) == "55P03"
+        for error in error_values
+        if error is not None
+    )
+
+
+async def _lock_provider_directory_artifact_tables(
+    schema: str,
+    relations: tuple[str, ...],
+) -> None:
+    for relation in relations:
+        if await _provider_directory_relation_attribute(schema, relation, "relkind") in {"r", "p"}:
+            await db.status(f"LOCK TABLE {_qt(schema, relation)} IN ACCESS EXCLUSIVE MODE NOWAIT;")
+
+
+async def _prepare_provider_directory_artifact_stage(schema: str, stage_table: str) -> None:
+    await db.status(f"ALTER TABLE {_qt(schema, stage_table)} SET LOGGED;")
+    await _assert_provider_directory_logged_relation(schema, stage_table)
+
+
+async def _promote_provider_directory_artifact_stage_transaction(
+    schema: str,
+    stage_table: str,
+    target_relation: str,
+    rename_stage_indexes: Callable[[str, str], Awaitable[None]],
+    build_fence: ProviderDirectoryArtifactBuildFence | None,
+) -> None:
+    """Run only the bounded metadata swap inside one database transaction."""
+
+    stage_ref = _qt(schema, stage_table)
+    target_ref = _qt(schema, target_relation)
+    old_relation = f"{target_relation}_old"
+    async with db.transaction():
+        await db.status(f"SET LOCAL lock_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';")
+        await db.status(f"SET LOCAL statement_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';")
+        acquired = await db.scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(:target_lock_key, 0));",
+            target_lock_key=f"provider-directory-artifact-cutover:{schema}.{target_relation}",
+        )
+        if not acquired:
+            raise ProviderDirectoryArtifactCutoverConflict(target_relation)
+        if build_fence is not None:
+            current_target_oid = await _provider_directory_relation_oid(schema, target_relation)
+            if current_target_oid != build_fence.target_oid:
+                raise ProviderDirectoryArtifactBuildStale(target_relation)
+        await _lock_provider_directory_artifact_tables(schema, (stage_table, target_relation, old_relation))
+        target_kind = await _provider_directory_relation_attribute(schema, target_relation, "relkind")
+        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
+        if target_kind in {"r", "p"}:
+            await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_relation)};")
+        elif target_kind in {"v", "m"}:
+            await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, target_relation))
+        elif target_kind is not None:
+            raise RuntimeError(f"Unsupported Provider Directory artifact target relation kind: {target_kind!r}")
+        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(target_relation)};")
+        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
+        await rename_stage_indexes(schema, stage_table)
+        await _assert_provider_directory_logged_relation(schema, target_relation)
+
+
+async def _promote_provider_directory_artifact_stage(
+    schema: str,
+    stage_table: str,
+    target_relation: str,
+    rename_stage_indexes: Callable[[str, str], Awaitable[None]],
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None,
+) -> None:
+    """Apply a hard wall-clock deadline to the live artifact cutover."""
+
+    async with asyncio.timeout(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS):
+        await _promote_provider_directory_artifact_stage_transaction(
+            schema,
+            stage_table,
+            target_relation,
+            rename_stage_indexes,
+            build_fence,
+        )
+
+
+async def _retry_provider_directory_artifact_promotion(
+    schema: str,
+    stage_table: str,
+    target_relation: str,
+    rename_stage_indexes: Callable[[str, str], Awaitable[None]],
+    build_fence: ProviderDirectoryArtifactBuildFence | None,
+) -> None:
+    for attempt_index in range(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS):
+        try:
+            await _promote_provider_directory_artifact_stage(
+                schema,
+                stage_table,
+                target_relation,
+                rename_stage_indexes,
+                build_fence,
+            )
+            return
+        except Exception as exc:
+            if not _is_provider_directory_artifact_cutover_retryable(exc):
+                raise
+            if attempt_index + 1 >= PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS:
+                raise
+            await asyncio.sleep(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS * (attempt_index + 1))
+
+
+async def _cutover_provider_directory_artifact_stage(
+    *,
+    schema: str,
+    stage_table: str,
+    target_relation: str,
+    rename_stage_indexes: Callable[[str, str], Awaitable[None]],
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None,
+) -> None:
+    """Promote a prepared stage without ever changing a live table's persistence."""
+
+    stage_ref = _qt(schema, stage_table)
+    try:
+        await _prepare_provider_directory_artifact_stage(schema, stage_table)
+        await _retry_provider_directory_artifact_promotion(
+            schema,
+            stage_table,
+            target_relation,
+            rename_stage_indexes,
+            build_fence,
+        )
+        await _assert_provider_directory_logged_relation(schema, target_relation)
+    except Exception:
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        except Exception:  # pragma: no cover - cleanup best effort
+            LOGGER.warning("Failed to clean Provider Directory artifact stage %s", stage_ref, exc_info=True)
+        raise
+
+
 async def _swap_address_corroboration_stage(
     schema: str,
     stage_table: str,
     stage_ref: str,
     target_relation: str,
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None,
 ) -> None:
-    target_ref = _qt(schema, target_relation)
-    old_relation = f"{target_relation}_old"
-    old_ref = _qt(schema, old_relation)
-    async with db.transaction():
-        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
-        await db.status(
-            f"""
-            DO $$
-            DECLARE relkind_value "char";
-            BEGIN
-                SELECT cls.relkind
-                  INTO relkind_value
-                  FROM pg_class cls
-                  JOIN pg_namespace ns ON ns.oid = cls.relnamespace
-                 WHERE ns.nspname = {_sql_string_literal(schema)}
-                   AND cls.relname = {_sql_string_literal(target_relation)};
-
-                IF relkind_value = 'v' THEN
-                    EXECUTE 'DROP VIEW {target_ref}';
-                ELSIF relkind_value = 'm' THEN
-                    EXECUTE 'DROP MATERIALIZED VIEW {target_ref}';
-                ELSIF relkind_value IN ('r', 'p') THEN
-                    EXECUTE 'ALTER TABLE {target_ref} RENAME TO {_q(old_relation)}';
-                END IF;
-            END $$;
-            """
-        )
-        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(target_relation)};")
-    await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
-    await _rename_address_corroboration_stage_indexes(schema, stage_table)
-    await _create_provider_directory_address_corroboration_indexes(schema, target_relation)
-    await db.status(f"DROP TABLE IF EXISTS {old_ref};")
+    del stage_ref
+    await _cutover_provider_directory_artifact_stage(
+        schema=schema,
+        stage_table=stage_table,
+        target_relation=target_relation,
+        rename_stage_indexes=_rename_address_corroboration_stage_indexes,
+        build_fence=build_fence,
+    )
 
 
 async def publish_provider_directory_address_corroboration_table(
@@ -5071,39 +5327,46 @@ async def publish_provider_directory_address_corroboration_table(
 ) -> dict[str, Any]:
     schema = db_schema or _schema()
     relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
-    stage_table = _stage_table_name()
-    stage_ref = _qt(schema, stage_table)
     network_catalog_metrics = (
         await publish_provider_directory_network_catalog(schema)
         if refresh_network_catalog
         else await _ensure_provider_directory_network_catalog_populated(schema)
     )
-    select_sql = provider_directory_address_corroboration_select_sql(schema)
-    try:
-        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
-        row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-        await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
-        await db.status(f"ANALYZE {stage_ref};")
-        await _swap_address_corroboration_stage(schema, stage_table, stage_ref, relation)
-        await db.status(f"ANALYZE {_qt(schema, relation)};")
-        return {
-            "published": True,
-            "relation": _qt(schema, relation),
-            "rows": row_count,
-            "storage": "table",
-            "network_catalog": network_catalog_metrics,
-        }
-    except Exception:
+    async with _provider_directory_artifact_build_guard(schema, relation) as build_fence:
+        stage_table = _stage_table_name()
+        stage_ref = _qt(schema, stage_table)
+        select_sql = provider_directory_address_corroboration_select_sql(schema)
         try:
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        except Exception:  # pragma: no cover - cleanup best effort
-            LOGGER.warning(
-                "Failed to clean provider directory address stage table %s",
+            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
+            row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+            await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
+            await db.status(f"ANALYZE {stage_ref};")
+            await _swap_address_corroboration_stage(
+                schema,
+                stage_table,
                 stage_ref,
-                exc_info=True,
+                relation,
+                build_fence,
             )
-        raise
+            await db.status(f"ANALYZE {_qt(schema, relation)};")
+            return {
+                "published": True,
+                "relation": _qt(schema, relation),
+                "rows": row_count,
+                "storage": "table",
+                "network_catalog": network_catalog_metrics,
+            }
+        except Exception:
+            try:
+                await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+            except Exception:  # pragma: no cover - cleanup best effort
+                LOGGER.warning(
+                    "Failed to clean provider directory address stage table %s",
+                    stage_ref,
+                    exc_info=True,
+                )
+            raise
 
 
 def _provider_directory_location_coordinate_sql_map(source_alias: str) -> dict[str, str]:
@@ -6159,7 +6422,7 @@ async def publish_provider_directory_location_archive(
 
 
 def _network_catalog_stage_table_name(run_id: str | None = None) -> str:
-    raw_identifier = run_id if run_id else f"{os.getpid()}_{time.time_ns()}"
+    raw_identifier = f"{run_id or 'full'}:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
     digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX}_{digest}"
 
@@ -6583,15 +6846,21 @@ async def _copy_existing_network_catalog(
     )
 
 
-async def _swap_network_catalog_stage(schema: str, stage_table: str, stage_ref: str, target_ref: str) -> None:
-    old_table = f"{PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE}_old"
-    async with db.transaction():
-        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
-        await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_table)};")
-        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)};")
-    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
-    await _rename_network_catalog_stage_indexes(schema, stage_table)
-    await _create_provider_directory_network_catalog_indexes(schema, PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+async def _swap_network_catalog_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    target_ref: str,
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None,
+) -> None:
+    del stage_ref, target_ref
+    await _cutover_provider_directory_artifact_stage(
+        schema=schema,
+        stage_table=stage_table,
+        target_relation=PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+        rename_stage_indexes=_rename_network_catalog_stage_indexes,
+        build_fence=build_fence,
+    )
 
 
 async def publish_provider_directory_network_catalog(
@@ -6619,53 +6888,57 @@ async def publish_provider_directory_network_catalog(
             "source_ids": [],
             "relation": target_ref,
         }
-    stage_table = _network_catalog_stage_table_name(run_id)
-    stage_ref = _qt(schema, stage_table)
-    columns = ", ".join(_provider_directory_network_catalog_columns())
-    query_param_dict: dict[str, Any] = {}
-    if run_id is not None:
-        query_param_dict["run_id"] = run_id
-    if effective_source_ids:
-        query_param_dict["source_ids"] = effective_source_ids
+    async with _provider_directory_artifact_build_guard(
+        schema,
+        PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+    ) as build_fence:
+        stage_table = _network_catalog_stage_table_name(run_id)
+        stage_ref = _qt(schema, stage_table)
+        columns = ", ".join(_provider_directory_network_catalog_columns())
+        query_param_dict: dict[str, Any] = {}
+        if run_id is not None:
+            query_param_dict["run_id"] = run_id
+        if effective_source_ids:
+            query_param_dict["source_ids"] = effective_source_ids
 
-    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-    try:
-        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
-        copied_existing = await _copy_existing_network_catalog(
-            stage_ref,
-            target_ref,
-            columns,
-            effective_source_ids,
-        )
-        inserted = _coerce_rowcount(
-            await db.status(
-                provider_directory_network_catalog_insert_sql(
-                    schema,
-                    stage_table,
-                    run_id=run_id,
-                    source_ids=effective_source_ids,
-                ),
-                **query_param_dict,
-            )
-        )
-        stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-        await _create_provider_directory_network_catalog_indexes(schema, stage_table)
-        await db.status(f"ANALYZE {stage_ref};")
-        await _swap_network_catalog_stage(schema, stage_table, stage_ref, target_ref)
-        return {
-            "published": True,
-            "rows": stage_rows,
-            "inserted": inserted,
-            "copied_existing": copied_existing,
-            "source_ids": effective_source_ids,
-            "relation": target_ref,
-        }
-    except Exception:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         try:
-            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        except Exception:  # pragma: no cover - cleanup best effort
-            LOGGER.warning("Failed to clean Provider Directory network catalog stage %s", stage_ref, exc_info=True)
-        raise
+            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
+            copied_existing = await _copy_existing_network_catalog(
+                stage_ref,
+                target_ref,
+                columns,
+                effective_source_ids,
+            )
+            inserted = _coerce_rowcount(
+                await db.status(
+                    provider_directory_network_catalog_insert_sql(
+                        schema,
+                        stage_table,
+                        run_id=run_id,
+                        source_ids=effective_source_ids,
+                    ),
+                    **query_param_dict,
+                )
+            )
+            stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+            await _create_provider_directory_network_catalog_indexes(schema, stage_table)
+            await db.status(f"ANALYZE {stage_ref};")
+            await _swap_network_catalog_stage(schema, stage_table, stage_ref, target_ref, build_fence)
+            return {
+                "published": True,
+                "rows": stage_rows,
+                "inserted": inserted,
+                "copied_existing": copied_existing,
+                "source_ids": effective_source_ids,
+                "relation": target_ref,
+            }
+        except Exception:
+            try:
+                await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+            except Exception:  # pragma: no cover - cleanup best effort
+                LOGGER.warning("Failed to clean Provider Directory network catalog stage %s", stage_ref, exc_info=True)
+            raise
 
 
 async def publish_provider_directory_address_corroboration_if_available(
@@ -18220,7 +18493,7 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
 
 
 def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
-    raw_identifier = run_id if run_id else f"{os.getpid()}_{time.time_ns()}"
+    raw_identifier = f"{run_id or 'full'}:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
     digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_{digest}"
 
@@ -19172,15 +19445,21 @@ async def _copy_existing_address_overlay(
     )
 
 
-async def _swap_address_overlay_stage(schema: str, stage_table: str, stage_ref: str, target_ref: str) -> None:
-    old_table = f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE}_old"
-    async with db.transaction():
-        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
-        await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_table)};")
-        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)};")
-    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, old_table)};")
-    await _rename_address_overlay_stage_indexes(schema, stage_table)
-    await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+async def _swap_address_overlay_stage(
+    schema: str,
+    stage_table: str,
+    stage_ref: str,
+    target_ref: str,
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None,
+) -> None:
+    del stage_ref, target_ref
+    await _cutover_provider_directory_artifact_stage(
+        schema=schema,
+        stage_table=stage_table,
+        target_relation=PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        rename_stage_indexes=_rename_address_overlay_stage_indexes,
+        build_fence=build_fence,
+    )
 
 
 async def _populate_address_overlay_stage(
@@ -19388,33 +19667,37 @@ async def publish_provider_directory_address_overlay(
     )
     if run_id is not None and not effective_source_ids:
         return _no_scoped_address_overlay_sources_result(schema)
-    stage_table = _address_overlay_stage_table_name(run_id)
-    stage_ref = _qt(schema, stage_table)
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    query_param_dict: dict[str, Any] = {}
-    if run_id is not None:
-        query_param_dict["run_id"] = run_id
-    if effective_source_ids:
-        query_param_dict["source_ids"] = effective_source_ids
+    async with _provider_directory_artifact_build_guard(
+        schema,
+        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+    ) as build_fence:
+        stage_table = _address_overlay_stage_table_name(run_id)
+        stage_ref = _qt(schema, stage_table)
+        query_param_dict: dict[str, Any] = {}
+        if run_id is not None:
+            query_param_dict["run_id"] = run_id
+        if effective_source_ids:
+            query_param_dict["source_ids"] = effective_source_ids
 
-    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-    try:
-        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
-        stage_metric_dict = await _populate_address_overlay_stage(
-            schema,
-            stage_table,
-            stage_ref,
-            run_id,
-            effective_source_ids,
-            query_param_dict,
-            components=_clean_address_overlay_components(components),
-        )
-        await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref)
-        return _address_overlay_publish_result(
-            stage_metric_dict,
-            source_ids=effective_source_ids,
-            target_ref=target_ref,
-        )
-    except Exception:
-        await _drop_address_overlay_stage_best_effort(stage_ref)
-        raise
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        try:
+            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
+            stage_metric_dict = await _populate_address_overlay_stage(
+                schema,
+                stage_table,
+                stage_ref,
+                run_id,
+                effective_source_ids,
+                query_param_dict,
+                components=_clean_address_overlay_components(components),
+            )
+            await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref, build_fence)
+            return _address_overlay_publish_result(
+                stage_metric_dict,
+                source_ids=effective_source_ids,
+                target_ref=target_ref,
+            )
+        except Exception:
+            await _drop_address_overlay_stage_best_effort(stage_ref)
+            raise
