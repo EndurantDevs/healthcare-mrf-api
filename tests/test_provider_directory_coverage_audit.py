@@ -2578,6 +2578,7 @@ def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and
             "provider_directory_practitioner_role",
             "provider_directory_insurance_plan",
             "provider_directory_healthcare_service",
+            "provider_directory_organization_affiliation",
             "provider_directory_address_overlay",
             "provider_directory_network_catalog",
         },
@@ -2598,10 +2599,14 @@ def test_provider_directory_coverage_audit_semantic_readiness_sql_is_bounded_and
     assert "network_catalog.distinct_ref_count > 0::bigint" in sql
     assert "role_plan_network.insurance_plan_ref_count > 0::bigint" in sql
     assert "role_plan_network.practitioner_role_ref_count > 0::bigint" in sql
+    assert "affiliation_plan_network.insurance_plan_ref_count > 0::bigint" in sql
+    assert "affiliation_plan_network.organization_affiliation_ref_count > 0::bigint" in sql
+    assert "source_probes AS MATERIALIZED" in sql
     assert "AS has_usable_coordinates" in sql
     assert "AS has_resolved_network_evidence" in sql
+    assert "AS has_resolved_provider_network_plan" in sql
     assert "AS has_resolved_provider_plan_association" in sql
-    assert ")::boolean\n                   AS has_valid_npi" in sql
+    assert "AS has_valid_npi" in sql
 
 
 def test_provider_directory_coverage_audit_semantic_readiness_sql_accepts_exact_scope():
@@ -2647,6 +2652,8 @@ def _semantic_readiness_probe_rows():
             "has_role_plan_refs": False,
             "has_resolved_role_plan": False,
             "has_resolved_role_network_plan": True,
+            "has_resolved_affiliation_network_plan": False,
+            "has_resolved_provider_network_plan": True,
             "has_resolved_provider_plan_association": True,
             "has_network_refs": True,
             "has_canonical_address": True,
@@ -2667,6 +2674,8 @@ def _semantic_readiness_probe_rows():
             "has_role_plan_refs": True,
             "has_resolved_role_plan": False,
             "has_resolved_role_network_plan": False,
+            "has_resolved_affiliation_network_plan": False,
+            "has_resolved_provider_network_plan": False,
             "has_resolved_provider_plan_association": False,
             "has_network_refs": True,
             "has_canonical_address": False,
@@ -2721,6 +2730,7 @@ def _assert_semantic_readiness_markdown(summary):
     )
     assert "## Per-Source Semantic Readiness" in markdown
     assert "`True/True`" in markdown
+    assert "Affiliation-network plan" in markdown
     assert "resolved_network_evidence" in markdown
 
 
@@ -2739,6 +2749,8 @@ def _assert_semantic_readiness_summary(summary):
     assert summary["sources_with_resolved_role_locations"] == 1
     assert summary["sources_with_resolved_role_plans"] == 0
     assert summary["sources_with_resolved_role_network_plans"] == 1
+    assert summary["sources_with_resolved_affiliation_network_plans"] == 0
+    assert summary["sources_with_resolved_provider_network_plans"] == 1
     assert summary["sources_with_resolved_provider_plan_associations"] == 1
     assert summary["sources_with_resolved_network_evidence"] == 1
     assert summary["semantic_ready_source_count"] == 1
@@ -2752,6 +2764,43 @@ def _assert_semantic_readiness_summary(summary):
         "resolved_provider_plan_association",
         "resolved_network_evidence",
     ]
+
+
+def test_provider_directory_coverage_audit_affiliation_network_is_provider_plan_ready():
+    """A standard Plan-Net affiliation bridge counts without direct role plan refs."""
+    source_samples = [
+        {
+            "source_id": "pdfhir_affiliation_plan_net",
+            "has_provider_rows": True,
+            "has_valid_npi": True,
+            "has_location_rows": True,
+            "has_raw_phone": True,
+            "has_role_rows": True,
+            "has_insurance_plan_rows": True,
+            "has_role_location_refs": True,
+            "has_resolved_role_location": True,
+            "has_role_plan_refs": False,
+            "has_resolved_role_plan": False,
+            "has_resolved_role_network_plan": False,
+            "has_resolved_affiliation_network_plan": True,
+            "has_resolved_provider_network_plan": True,
+            "has_resolved_provider_plan_association": True,
+            "has_network_refs": True,
+            "has_canonical_address": True,
+            "has_usable_phone": True,
+            "has_usable_coordinates": True,
+            "has_resolved_network_evidence": True,
+        }
+    ]
+
+    audit._annotate_semantic_source_samples(source_samples)
+    source_counts = audit._semantic_source_counts_by_metric(source_samples)
+
+    assert source_samples[0]["semantic_ready"] is True
+    assert source_counts["sources_with_resolved_role_network_plans"] == 0
+    assert source_counts["sources_with_resolved_affiliation_network_plans"] == 1
+    assert source_counts["sources_with_resolved_provider_network_plans"] == 1
+    assert source_counts["sources_with_resolved_provider_plan_associations"] == 1
 
 
 @pytest.mark.asyncio

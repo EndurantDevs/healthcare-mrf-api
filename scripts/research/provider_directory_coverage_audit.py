@@ -3203,6 +3203,16 @@ def _source_network_probe_sql_by_name(
             "AND role_plan_network.provider_directory_network_name IS NOT NULL "
             "AND role_plan_network.provider_directory_issuer_network_match_key IS NOT NULL",
         ),
+        "affiliation_network_plan_bridge": exists_sql(
+            db_schema,
+            available_table_names,
+            "provider_directory_network_catalog",
+            "affiliation_plan_network",
+            "affiliation_plan_network.insurance_plan_ref_count > 0::bigint "
+            "AND affiliation_plan_network.organization_affiliation_ref_count > 0::bigint "
+            "AND affiliation_plan_network.provider_directory_network_name IS NOT NULL "
+            "AND affiliation_plan_network.provider_directory_issuer_network_match_key IS NOT NULL",
+        ),
     }
 
 
@@ -3286,6 +3296,35 @@ def _semantic_source_selection_sql(schema: str, *, maintained_source_scope: bool
     """
 
 
+def _semantic_source_probe_select_sql(probe_sql_by_name: dict[str, str]) -> str:
+    """Select each bounded source readiness signal exactly once."""
+    return f"""
+        SELECT src.*,
+               ({probe_sql_by_name['practitioner']} OR {probe_sql_by_name['organization']})::boolean
+                   AS has_provider_rows,
+               ({probe_sql_by_name['practitioner_npi']} OR {probe_sql_by_name['organization_npi']})::boolean
+                   AS has_valid_npi,
+               ({probe_sql_by_name['location']})::boolean AS has_location_rows,
+               ({probe_sql_by_name['raw_phone']})::boolean AS has_raw_phone,
+               ({probe_sql_by_name['role']})::boolean AS has_role_rows,
+               ({probe_sql_by_name['plan']})::boolean AS has_insurance_plan_rows,
+               ({probe_sql_by_name['role_location_refs']})::boolean AS has_role_location_refs,
+               ({probe_sql_by_name['resolved_role_location']})::boolean AS has_resolved_role_location,
+               ({probe_sql_by_name['role_plan_refs']})::boolean AS has_role_plan_refs,
+               ({probe_sql_by_name['resolved_role_plan']})::boolean AS has_resolved_role_plan,
+               ({probe_sql_by_name['role_network_plan_bridge']})::boolean
+                   AS has_resolved_role_network_plan,
+               ({probe_sql_by_name['affiliation_network_plan_bridge']})::boolean
+                   AS has_resolved_affiliation_network_plan,
+               ({probe_sql_by_name['network_refs']})::boolean AS has_network_refs,
+               ({probe_sql_by_name['canonical_address']})::boolean AS has_canonical_address,
+               ({probe_sql_by_name['usable_phone']})::boolean AS has_usable_phone,
+               ({probe_sql_by_name['usable_coordinates']})::boolean AS has_usable_coordinates,
+               ({probe_sql_by_name['resolved_network']})::boolean AS has_resolved_network_evidence
+          FROM selected_sources AS src
+    """
+
+
 def _source_semantic_readiness_sql(
     schema: str,
     *,
@@ -3309,35 +3348,22 @@ def _source_semantic_readiness_sql(
         schema,
         maintained_source_scope=maintained_source_scope,
     )
+    source_probe_select_sql = _semantic_source_probe_select_sql(probe_sql_by_name)
     return f"""
         WITH selected_sources AS (
             {selected_sources_sql}
+        ), source_probes AS MATERIALIZED (
+            {source_probe_select_sql}
         )
-        SELECT src.*,
-               ({probe_sql_by_name['practitioner']} OR {probe_sql_by_name['organization']})::boolean
-                   AS has_provider_rows,
-               ({probe_sql_by_name['practitioner_npi']} OR {probe_sql_by_name['organization_npi']})::boolean
-                   AS has_valid_npi,
-               ({probe_sql_by_name['location']})::boolean AS has_location_rows,
-               ({probe_sql_by_name['raw_phone']})::boolean AS has_raw_phone,
-               ({probe_sql_by_name['role']})::boolean AS has_role_rows,
-               ({probe_sql_by_name['plan']})::boolean AS has_insurance_plan_rows,
-               ({probe_sql_by_name['role_location_refs']})::boolean AS has_role_location_refs,
-               ({probe_sql_by_name['resolved_role_location']})::boolean AS has_resolved_role_location,
-               ({probe_sql_by_name['role_plan_refs']})::boolean AS has_role_plan_refs,
-               ({probe_sql_by_name['resolved_role_plan']})::boolean AS has_resolved_role_plan,
-               ({probe_sql_by_name['role_network_plan_bridge']})::boolean
-                   AS has_resolved_role_network_plan,
-               ({probe_sql_by_name['resolved_role_plan']}
-                    OR {probe_sql_by_name['role_network_plan_bridge']})::boolean
-                   AS has_resolved_provider_plan_association,
-               ({probe_sql_by_name['network_refs']})::boolean AS has_network_refs,
-               ({probe_sql_by_name['canonical_address']})::boolean AS has_canonical_address,
-               ({probe_sql_by_name['usable_phone']})::boolean AS has_usable_phone,
-               ({probe_sql_by_name['usable_coordinates']})::boolean AS has_usable_coordinates,
-               ({probe_sql_by_name['resolved_network']})::boolean AS has_resolved_network_evidence
-          FROM selected_sources AS src
-         ORDER BY src.source_id
+        SELECT source_probes.*,
+               (has_resolved_role_network_plan OR has_resolved_affiliation_network_plan)::boolean
+                   AS has_resolved_provider_network_plan,
+               (has_resolved_role_plan
+                    OR has_resolved_role_network_plan
+                    OR has_resolved_affiliation_network_plan)::boolean
+                   AS has_resolved_provider_plan_association
+          FROM source_probes
+         ORDER BY source_probes.source_id
     """
 
 
@@ -3392,6 +3418,10 @@ def _semantic_source_counts_by_metric(source_samples: list[dict[str, Any]]) -> d
         "sources_with_role_plan_refs": "has_role_plan_refs",
         "sources_with_resolved_role_plans": "has_resolved_role_plan",
         "sources_with_resolved_role_network_plans": "has_resolved_role_network_plan",
+        "sources_with_resolved_affiliation_network_plans": (
+            "has_resolved_affiliation_network_plan"
+        ),
+        "sources_with_resolved_provider_network_plans": "has_resolved_provider_network_plan",
         "sources_with_resolved_provider_plan_associations": (
             "has_resolved_provider_plan_association"
         ),
@@ -5513,7 +5543,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"provider/plan association "
                 f"`{semantic_readiness.get('sources_with_resolved_provider_plan_associations')}` "
                 f"(direct `{semantic_readiness.get('sources_with_resolved_role_plans')}`, "
-                f"network-derived `{semantic_readiness.get('sources_with_resolved_role_network_plans')}`), "
+                f"network-derived `{semantic_readiness.get('sources_with_resolved_provider_network_plans')}`: "
+                f"role `{semantic_readiness.get('sources_with_resolved_role_network_plans')}`, "
+                f"affiliation `{semantic_readiness.get('sources_with_resolved_affiliation_network_plans')}`), "
                 f"resolved network `{semantic_readiness.get('sources_with_resolved_network_evidence')}`"
             )
         if source_coverage.get("sources_with_valid_npi_organization_address_rows") is not None:
@@ -5838,8 +5870,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Per-Source Semantic Readiness",
                 "",
-                "| Source | Raw | NPI | Canonical address | Phone | Coordinates | Role/location | Role/plan direct | Network-derived plan | Provider/plan | Network | Gaps |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Source | Raw | NPI | Canonical address | Phone | Coordinates | Role/location | Role/plan direct | Role-network plan | Affiliation-network plan | Provider-network plan | Provider/plan | Network | Gaps |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for item in semantic_readiness["samples"]:
@@ -5848,7 +5880,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{bool(item.get('has_role_location_refs'))}/{bool(item.get('has_resolved_role_location'))}"
             )
             role_plan = f"{bool(item.get('has_role_plan_refs'))}/{bool(item.get('has_resolved_role_plan'))}"
-            network_plan = bool(item.get("has_resolved_role_network_plan"))
+            role_network_plan = bool(item.get("has_resolved_role_network_plan"))
+            affiliation_network_plan = bool(item.get("has_resolved_affiliation_network_plan"))
+            provider_network_plan = bool(item.get("has_resolved_provider_network_plan"))
             provider_plan = bool(item.get("has_resolved_provider_plan_association"))
             network_evidence = (
                 f"{bool(item.get('has_network_refs'))}/{bool(item.get('has_resolved_network_evidence'))}"
@@ -5860,7 +5894,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"`{bool(item.get('has_canonical_address'))}` | "
                 f"`{bool(item.get('has_usable_phone'))}` | "
                 f"`{bool(item.get('has_usable_coordinates'))}` | "
-                f"`{role_location}` | `{role_plan}` | `{network_plan}` | `{provider_plan}` | "
+                f"`{role_location}` | `{role_plan}` | `{role_network_plan}` | "
+                f"`{affiliation_network_plan}` | `{provider_network_plan}` | `{provider_plan}` | "
                 f"`{network_evidence}` | "
                 f"`{_markdown_cell(gaps)}` |"
             )
