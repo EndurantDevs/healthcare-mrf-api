@@ -590,6 +590,28 @@ def test_aetna_commercial_checkpoint_scope_includes_strategy_version():
     ).hexdigest()
 
 
+def test_idaho_medicaid_supports_durable_pagination_checkpoints():
+    source_lookup = {
+        "source_id": "idaho-medicaid",
+        "api_base": importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
+    }
+
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["idaho-medicaid"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+
+    assert importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE in (
+        importer.PAGINATION_CHECKPOINT_API_BASES
+    )
+    assert checkpoint_context is not None
+    assert checkpoint_context.canonical_api_base == (
+        importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE
+    )
+
+
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
     rows = importer._contra_costa_seed_rows_from_developer_html(
         """
@@ -1238,6 +1260,50 @@ def test_generic_pagination_normalizes_default_https_port():
         "https://payer.example/fhir/Practitioner?_count=25",
         next_url,
     ) == next_url
+
+
+def test_idaho_medicaid_accepts_exact_alternate_ct_pagination_link():
+    current_url = (
+        f"{importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    )
+    next_url = (
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?"
+        "_count=100&"
+        "_profile=http%3A%2F%2Fhl7.org%2Ffhir%2Fus%2Fdavinci-pdex-plan-net%2F"
+        "StructureDefinition%2Fplannet-Practitioner&ct=opaque-cursor"
+    )
+
+    assert importer._resolved_fhir_next_url(
+        {"api_base": importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE},
+        current_url,
+        next_url,
+    ) == next_url
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        "http://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?ct=opaque",
+        "https://api-ida-prd.safhir.io.evil.example/v1/api/provider-directory/Practitioner?ct=opaque",
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Location?ct=opaque",
+        "https://api-ida-prd.safhir.io/v1/api/other-directory/Practitioner?ct=opaque",
+        "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?page=2",
+        (
+            "https://api-ida-prd.safhir.io/v1/api/provider-directory/Practitioner?"
+            "ct=opaque&_profile=https%3A%2F%2Fevil.example%2Fprofile"
+        ),
+    ],
+)
+def test_idaho_medicaid_rejects_untrusted_alternate_pagination_link(next_url):
+    with pytest.raises(ValueError, match="untrusted_idaho_medicaid_pagination_link"):
+        importer._resolved_fhir_next_url(
+            {"api_base": importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE},
+            (
+                f"{importer.IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+                "_count=100"
+            ),
+            next_url,
+        )
 
 
 def test_aetna_commercial_accepts_same_resource_page_token_continuation():

@@ -531,6 +531,26 @@ NEBRASKA_DHHS_PAGINATION_HOST = "dhhs-uat-api.ne.gov"
 ARKANSAS_PROVIDER_DIRECTORY_BASE = (
     "https://fite.ar-prd.gw02.abacusinsights.ai/provider-directory"
 )
+IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE = (
+    "https://api-idmedicaid.safhir.io/v1/api/provider-directory"
+)
+IDAHO_MEDICAID_PAGINATION_HOST = "api-ida-prd.safhir.io"
+IDAHO_MEDICAID_RESOURCE_PROFILES = {
+    resource_type: frozenset(
+        f"http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/{profile_name}"
+        for profile_name in profile_names
+    )
+    for resource_type, profile_names in {
+        "Endpoint": ("plannet-Endpoint",),
+        "HealthcareService": ("plannet-HealthcareService",),
+        "InsurancePlan": ("plannet-InsurancePlan",),
+        "Location": ("plannet-Location",),
+        "Organization": ("plannet-Network", "plannet-Organization"),
+        "OrganizationAffiliation": ("plannet-OrganizationAffiliation",),
+        "Practitioner": ("plannet-Practitioner",),
+        "PractitionerRole": ("plannet-PractitionerRole",),
+    }.items()
+}
 FHIR_OFFSET_PAGINATION_BASES = frozenset(
     {TMHP_PROVIDER_DIRECTORY_BASE, NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}
 )
@@ -609,6 +629,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CIGNA_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
+        IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
         MAINE_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
@@ -9960,6 +9981,81 @@ def _is_trusted_fhir_pagination_url(
     )
 
 
+def _resolved_idaho_medicaid_next_url(
+    current_url: str,
+    next_url: str,
+) -> str:
+    """Accept Idaho Medicaid's exact alternate-host continuation URLs."""
+    parsed_base = urllib.parse.urlsplit(IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE)
+    parsed_current = urllib.parse.urlsplit(current_url)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    base_path = parsed_base.path.rstrip("/")
+    current_path = parsed_current.path.rstrip("/")
+    resource_type = current_path[len(base_path) :].strip("/")
+    query_items = urllib.parse.parse_qsl(
+        parsed_next.query,
+        keep_blank_values=True,
+    )
+    cursor_values = [
+        query_value
+        for query_name, query_value in query_items
+        if query_name.lower() == "ct"
+    ]
+    count_values = [
+        query_value
+        for query_name, query_value in query_items
+        if query_name.lower() == "_count"
+    ]
+    profile_values = [
+        query_value
+        for query_name, query_value in query_items
+        if query_name.lower() == "_profile"
+    ]
+    try:
+        current_port = parsed_current.port or 443
+        next_port = parsed_next.port or 443
+    except ValueError:
+        current_port = 0
+        next_port = 0
+    is_count_valid = not count_values or (
+        len(count_values) == 1
+        and count_values[0].isdigit()
+        and int(count_values[0]) > 0
+    )
+    expected_profiles = IDAHO_MEDICAID_RESOURCE_PROFILES.get(resource_type)
+    is_profile_valid = not profile_values or (
+        len(profile_values) == 1
+        and frozenset(profile_values[0].split(",")) == expected_profiles
+    )
+    is_allowlisted = (
+        parsed_current.scheme.lower() == "https"
+        and (parsed_current.hostname or "").lower() == parsed_base.hostname
+        and current_port == 443
+        and parsed_current.username is None
+        and parsed_current.password is None
+        and current_path == f"{base_path}/{resource_type}"
+        and resource_type in DEFAULT_RESOURCES
+        and parsed_next.scheme.lower() == "https"
+        and (parsed_next.hostname or "").lower() == IDAHO_MEDICAID_PAGINATION_HOST
+        and next_port == 443
+        and parsed_next.username is None
+        and parsed_next.password is None
+        and not parsed_next.fragment
+        and parsed_next.path.rstrip("/") == current_path
+        and len(cursor_values) == 1
+        and bool(cursor_values[0])
+        and is_count_valid
+        and is_profile_valid
+        and all(
+            query_name.lower() in {"ct", "_count", "_profile"}
+            for query_name, _value in query_items
+        )
+    )
+    if not is_allowlisted:
+        raise ValueError("untrusted_idaho_medicaid_pagination_link")
+    return next_url
+
+
 def _resolved_fhir_next_url(
     source_record: dict[str, Any],
     current_url: str,
@@ -9978,6 +10074,8 @@ def _resolved_fhir_next_url(
         return _resolved_aetna_commercial_next_url(current_url, next_url)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
         return _resolved_molina_next_url(current_url, next_url)
+    if api_base == IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE:
+        return _resolved_idaho_medicaid_next_url(current_url, next_url)
     if (
         api_base == HAP_PROVIDER_DIRECTORY_BASE
         and (parsed_next.hostname or "").lower() == HAP_BLOCKED_PAGINATION_HOST
