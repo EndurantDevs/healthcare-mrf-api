@@ -12,6 +12,7 @@
   "support_documentation": {
     "schema_version": 1,
     "runtime_status_report": "reports/provider-directory-endpoint-acquisition/report.json",
+    "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},

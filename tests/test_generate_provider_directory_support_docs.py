@@ -26,7 +26,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered
     assert "selected `--report` path; the report is not tracked" in rendered
     assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered
-    assert "campaign report is the authority for per-endpoint live verification" in rendered
+    assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered
+    assert "## Observed Live Verification" in rendered
+    assert "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded |" in rendered
     assert "## Known Not Importable" in rendered
     assert "Chorus Community Health Plans" in rendered
     assert "First Medical Health Plan, Inc." in rendered
@@ -146,3 +148,23 @@ def test_check_reports_generated_documentation_drift(tmp_path):
     output_path.write_text("stale\n", encoding="utf-8")
 
     assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path), "--check"]) == 1
+
+
+def test_verification_snapshot_rejects_terminal_record_without_timestamp():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    snapshot = copy.deepcopy(
+        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    )
+    snapshot["entries"]["idaho"] = {
+        "terminal_status": "succeeded",
+        "run_id": "run_idaho",
+        "access_verification": "verified",
+        "checked_at": None,
+    }
+
+    with pytest.raises(generator.SupportDocumentationError, match="terminal entries need"):
+        generator.validate_verification_snapshot(
+            snapshot,
+            [entry["entry_id"] for entry in manifest["entries"]],
+            manifest["campaign_id"],
+        )

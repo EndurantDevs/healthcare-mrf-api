@@ -2,7 +2,7 @@
 
 This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Runtime and import status are written locally or on dev by the endpoint-acquisition harness to `reports/provider-directory-endpoint-acquisition/report.json`, or to its selected `--report` path; the report is not tracked.
 
-Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_directory_source` at `2026-07-10T09:33:00Z`. This timestamp confirms catalog coverage only; the campaign report is the authority for per-endpoint live verification.
+Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_directory_source` at `2026-07-10T09:33:00Z`. This timestamp confirms catalog coverage only; the tracked verification snapshot is the authority for terminal per-endpoint live status.
 
 `None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.
 
@@ -46,5 +46,42 @@ These sources are intentionally retained as blocked catalog evidence. They are n
 | Chorus Community Health Plans (fka Children's Community Health Plan) (`provider-directory-blocked-chorus-community-health-plans`) | Medicaid MCO | Not supported | None | Not required | https://appconnect.chorushealthplans.org/developers/providerapi | Official Chorus developer page exposes Provider Directory documentation through a JavaScript app, but no importable public FHIR base has been confirmed. |
 | First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Medicaid MCO | Not supported | User token | Required | https://devportal.firstmedicalpr.com/ApiLibrary | Official First Medical developer portal lists Practitioner and Location APIs under a user-token security model; no open importable Provider Directory FHIR base has been confirmed. |
 | Territory of Puerto Rico (`provider-directory-blocked-territory-of-puerto-rico`) | Medicaid FFS | Not supported | None | Not required | https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv | CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known. |
+
+## Observed Live Verification
+
+This tracked snapshot is separate from configured support. It records only terminal, credential-safe fields accepted from an endpoint-acquisition report; active, partial, and absent entries remain `Not recorded`.
+
+Verification environment: `not recorded`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `not recorded`.
+
+| Source | Terminal status | Run ID | Access verification | Checked at |
+| --- | --- | --- | --- | --- |
+| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Michigan (`michigan`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Cigna (`cigna`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Humana (`humana`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| IEHP (`iehp`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Arkansas (`arkansas`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| HAP (`hap`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Washington (`washington`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Wyoming (`wyoming`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Health Partners Plans (`health-partners-plans`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas NH (`amerihealth-nh`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas DE (`amerihealth-de`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas Louisiana (`amerihealth-la`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas North Carolina (`amerihealth-nc`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas DC (`amerihealth-dc`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas PA (`amerihealth-pa`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Horizon NJ (`horizon-nj`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Texas TMHP (`texas-tmhp`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Nebraska (`nebraska`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| UHC (`uhc`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Missouri (`missouri`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Maine (`maine`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| SCAN (`scan`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Centene (`centene`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Contra Costa (`contra-costa`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.
