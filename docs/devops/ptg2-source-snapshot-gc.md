@@ -117,6 +117,8 @@ WITH current_refs AS (
         (s.manifest->'serving_index'->>'table'),
         (s.manifest->'serving_index'->>'price_atom_table'),
         (s.manifest->'serving_index'->>'provider_group_member_table'),
+        (s.manifest->'serving_index'->>'provider_npi_scope_table'),
+        (s.manifest->'serving_index'->>'serving_binary_table'),
         (s.manifest->'serving_index'->>'provider_group_location_table'),
         (s.manifest->'serving_index'->>'provider_set_component_table'),
         (s.manifest->'serving_index'->>'code_count_table')

@@ -5564,7 +5564,10 @@ async def group_plan_providers(request):
     member_tables: list[str] = []
     for pair_source_key, pair_snapshot_id in snapshot_pairs:
         pair_tables = await snapshot_serving_tables(session, pair_snapshot_id)
-        pair_member_table = _safe_table_name(pair_tables.provider_group_member_table)
+        pair_member_table = _safe_table_name(
+            getattr(pair_tables, "provider_group_member_table", None)
+            or getattr(pair_tables, "provider_npi_scope_table", None)
+        )
         snapshots.append({
             "source_key": pair_source_key,
             "snapshot_id": pair_snapshot_id,
@@ -5577,7 +5580,7 @@ async def group_plan_providers(request):
         return response.json({
             "ok": False, "error_type": "unsupported_storage",
             "plan_id": plan_id, "market_type": market_type, "snapshot_id": snapshot_id,
-            "reason": "serving snapshot does not expose a provider_group_member table",
+            "reason": "serving snapshot does not expose a provider NPI scope",
             "serving_table": _safe_table_name(serving_tables.serving_table),
         }, status=501)
     if len(member_tables) == 1:
@@ -5589,13 +5592,12 @@ async def group_plan_providers(request):
     # current_source_snapshot_ids_for_plan resolves the plan's per-SOURCE serving
     # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
     # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
-    # the snapshot's provider_group_member table holds exactly this plan's
-    # in-network provider NPIs (group_global_id -> npi). Enumerate them DISTINCT,
+    # the snapshot's provider membership index holds exactly this plan's
+    # in-network provider NPIs. Enumerate them DISTINCT,
     # keyset-paginated by NPI -- an index on npi keeps the cursor scan cheap even
     # at national-network scale (e.g. HealthJoy/UMR ~2.08M distinct NPIs). The
-    # in-DB group_member table is used instead of the binary set->group sidecars,
-    # which is both correct (single-plan snapshot) and the only tractable way to
-    # page millions of providers.
+    # Compact NPI scope tables keep keyset pagination relational while the
+    # high-cardinality membership graph remains compressed in PostgreSQL artifacts.
     params = {
         "cursor_npi": max(cursor_npi, 0),
         "limit": limit,

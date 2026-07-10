@@ -140,7 +140,7 @@ def _serving_index_arch_version(serving_index: dict[str, Any]) -> str:
 
 
 def _is_postgres_binary_serving_index(serving_index: dict[str, Any]) -> bool:
-    if _serving_index_arch_version(serving_index) == "postgres_binary_v1":
+    if _serving_index_arch_version(serving_index) in {"postgres_binary_v1", "postgres_binary_v2"}:
         return True
     if _safe_table_name(serving_index.get("serving_binary_table")):
         return True
@@ -282,6 +282,14 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         provider_set_entry_table=_safe_table_name(serving_index.get("provider_set_entry_table")),
         provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
+        provider_npi_scope_table=_safe_table_name(
+            serving_index.get("provider_npi_scope_table")
+            or (
+                serving_index.get("materialized_tables", {}).get("provider_npi_scope")
+                if isinstance(serving_index.get("materialized_tables"), dict)
+                else None
+            )
+        ),
         provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
         provider_group_rate_scope_table=_safe_table_name(serving_index.get("provider_group_rate_scope_table")),
         provider_set_dictionary_table=_safe_table_name(serving_index.get("provider_set_dictionary_table")),

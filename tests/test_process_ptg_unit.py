@@ -16,7 +16,7 @@ import zipfile
 from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp import web
@@ -770,6 +770,7 @@ def test_snapshot_cleanup_collects_tables_for_any_storage():
             "price_atom_table": "ptg2_price_atom_future",
             "provider_set_table": "mrf.plan",
             "provider_group_member_table": "ptg2_provider_group_member_future",
+            "provider_npi_scope_table": "mrf.ptg2_provider_npi_scope_future",
         }
     )
 
@@ -777,6 +778,7 @@ def test_snapshot_cleanup_collects_tables_for_any_storage():
         "ptg2_serving_future",
         "ptg2_price_atom_future",
         "ptg2_provider_group_member_future",
+        "ptg2_provider_npi_scope_future",
     ]
 
 
@@ -5025,6 +5027,139 @@ sys.stdout.buffer.write(payload + b"\\n")
     assert metrics["dropped_rows"] == 1
 
 
+def test_ptg2_provider_membership_sidecar_builder_contract(tmp_path, monkeypatch):
+    member_copy = tmp_path / "provider-group-member.copy"
+    member_copy.write_text("00000000000000000000000000000001\t1003002106\n")
+    group_npi = tmp_path / "provider-group-npi.ptg2sc"
+    npi_group = tmp_path / "provider-npi-group.ptg2sc"
+    npi_scope = tmp_path / "provider-npi-scope.copy"
+    summary_json = json.dumps(
+        {
+            "input_rows": 1,
+            "membership_count": 1,
+            "provider_group_count": 1,
+            "npi_count": 1,
+            "npi_scope_count": 1,
+        }
+    ).encode()
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=b"provider_membership_sidecars\t"
+        + str(len(summary_json)).encode()
+        + b"\n"
+        + summary_json
+        + b"\n",
+        stderr=b"",
+    )
+    run_mock = Mock(return_value=completed)
+
+    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner"))
+    monkeypatch.setattr(process_ptg.subprocess, "run", run_mock)
+
+    summary = asyncio.run(
+        process_ptg._build_ptg2_provider_membership_sidecars(
+            provider_group_npi_path=group_npi,
+            provider_npi_group_path=npi_group,
+            provider_npi_scope_copy_path=npi_scope,
+            input_paths=[member_copy],
+        )
+    )
+
+    assert summary["membership_count"] == 1
+    run_mock.assert_called_once_with(
+        [
+            "/opt/ptg2_scanner",
+            "--provider-membership-sidecars",
+            str(group_npi),
+            str(npi_group),
+            str(npi_scope),
+            str(member_copy),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_ptg2_provider_membership_builder_allows_empty_scope(tmp_path, monkeypatch):
+    summary_json = json.dumps({"membership_count": 0, "npi_scope_count": 0}).encode()
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=b"provider_membership_sidecars\t"
+        + str(len(summary_json)).encode()
+        + b"\n"
+        + summary_json
+        + b"\n",
+        stderr=b"",
+    )
+    run_mock = Mock(return_value=completed)
+    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner"))
+    monkeypatch.setattr(process_ptg.subprocess, "run", run_mock)
+
+    summary = asyncio.run(
+        process_ptg._build_ptg2_provider_membership_sidecars(
+            provider_group_npi_path=tmp_path / "provider-group-npi.ptg2sc",
+            provider_npi_group_path=tmp_path / "provider-npi-group.ptg2sc",
+            provider_npi_scope_copy_path=tmp_path / "provider-npi-scope.copy",
+            input_paths=[],
+        )
+    )
+
+    assert summary == {"membership_count": 0, "npi_scope_count": 0}
+    assert run_mock.call_args.args[0] == [
+        "/opt/ptg2_scanner",
+        "--provider-membership-sidecars",
+        str(tmp_path / "provider-group-npi.ptg2sc"),
+        str(tmp_path / "provider-npi-group.ptg2sc"),
+        str(tmp_path / "provider-npi-scope.copy"),
+    ]
+
+
+def test_ptg2_provider_membership_sidecars_round_trip_through_python_reader(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact_helpers = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
+    member_copy = tmp_path / "provider-group-member.copy"
+    member_copy.write_text(
+        "00000000000000000000000000000001\t1003002106\n"
+        "00000000000000000000000000000001\t1003007311\n"
+        "00000000000000000000000000000002\t1003002106\n"
+    )
+    group_npi = tmp_path / "provider-group-npi.ptg2sc"
+    npi_group = tmp_path / "provider-npi-group.ptg2sc"
+    npi_scope = tmp_path / "provider-npi-scope.copy"
+
+    subprocess.run(
+        [
+            str(binary),
+            "--provider-membership-sidecars",
+            str(group_npi),
+            str(npi_group),
+            str(npi_scope),
+            str(member_copy),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    npi_1003002106 = b"\x00" * 8 + (1003002106).to_bytes(8, "big")
+    npi_1003007311 = b"\x00" * 8 + (1003007311).to_bytes(8, "big")
+    assert artifact_helpers.lookup_global_sidecar_members(
+        group_npi,
+        "00000000000000000000000000000001",
+    ) == (npi_1003002106, npi_1003007311)
+    assert artifact_helpers.lookup_global_sidecar_members(
+        npi_group,
+        npi_1003002106.hex(),
+    ) == (
+        bytes.fromhex("00000000000000000000000000000001"),
+        bytes.fromhex("00000000000000000000000000000002"),
+    )
+    assert npi_scope.read_text() == "1003002106\n1003007311\n"
+
+
 def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
@@ -5949,6 +6084,67 @@ def test_ptg2_manifest_snapshot_publish_postgres_binary_skips_serving_sidecars(m
     assert any("DROP TABLE \"mrf\".\"ptg2_serving_" in statement for statement in status_calls)
 
 
+def test_ptg2_manifest_snapshot_publish_v2_uses_membership_graph(monkeypatch):
+    """V2 publishes the graph scope even when the snapshot contains no NPIs."""
+    status_calls = []
+    expected_scope_table = ptg_manifest_publish._ptg2_snapshot_table_name(
+        "provider_npi_scope",
+        "example_dental",
+        "ptg2:202604:snap",
+    )
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+    async def is_fake_table_present(_schema, table):
+        return table in {
+            "ptg2_manifest_stage_serving_abc",
+            "ptg2_manifest_stage_provider_npi_scope_abc",
+            expected_scope_table,
+        }
+
+    async def fake_all(statement, **_params):
+        assert "GROUP BY source_trace_set_hash, network_names" in statement
+        return [{"source_trace_set_hash": "trace-set-hash", "network_names": ["C2"]}]
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v2")
+    monkeypatch.setenv(
+        "HLTHPRT_PTG2_MANIFEST_SERVING_LAYOUT",
+        ptg_manifest_publish.PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_LEAN_DIRECT_COPY", "false")
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", is_fake_table_present)
+    empty_scope_tables = {"ptg2_manifest_stage_provider_npi_scope_abc", expected_scope_table}
+    monkeypatch.setattr(
+        ptg_manifest_publish,
+        "_table_has_rows",
+        AsyncMock(side_effect=lambda _schema, table: table not in empty_scope_tables),
+    )
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(
+        ptg_manifest_publish,
+        "_write_ptg2_manifest_serving_sidecars",
+        AsyncMock(side_effect=AssertionError("postgres_binary_v2 must not build serving sidecar files")),
+    )
+    monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", _fake_postgres_binary_write_result)
+
+    publish_manifest = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="example_dental",
+        )
+    )
+
+    assert publish_manifest["arch_version"] == "postgres_binary_v2"
+    assert publish_manifest["provider_group_member_table"] is None
+    assert publish_manifest["provider_npi_scope_table"] == f"mrf.{expected_scope_table}"
+    assert publish_manifest["materialized_tables"]["provider_npi_scope"] == publish_manifest["provider_npi_scope_table"]
+    assert "provider_group_member" not in publish_manifest["materialized_tables"]
+    assert any("DROP TABLE IF EXISTS \"mrf\".\"ptg2_manifest_stage_provider_group_member_abc\"" in statement for statement in status_calls)
+
+
 def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkeypatch):
     status_calls = []
 
@@ -6226,6 +6422,13 @@ def test_ptg2_snapshot_arch_accepts_postgres_binary_alias(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "db_binary")
 
     assert ptg_config._ptg2_snapshot_arch_from_env() == "postgres_binary_v1"
+
+
+def test_ptg2_snapshot_arch_accepts_postgres_binary_v2_alias(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "binary_v2")
+
+    assert ptg_config._ptg2_snapshot_arch_from_env() == "postgres_binary_v2"
+    assert ptg_config._is_postgres_binary_snapshot_arch("postgres_binary_v2") is True
 
 
 def test_ptg2_manifest_snapshot_publish_materialized_arch_forces_scope_tables(monkeypatch):
@@ -6897,7 +7100,23 @@ def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     assert "network_names varchar[] NOT NULL DEFAULT '{}'" in joined
     assert "price_atom_global_id_128 uuid NOT NULL" in joined
     assert "provider_group_global_id_128 uuid NOT NULL" in joined
+    assert "provider_npi_scope" not in joined
     assert ptg_manifest_publish.PTG2_MANIFEST_SERVING_COLUMNS[-1] == "network_names"
+
+
+def test_ptg2_manifest_v2_stage_creates_npi_scope(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v2")
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+
+    asyncio.run(process_ptg._create_ptg2_manifest_serving_stage_table("abc"))
+
+    joined = "\n".join(status_calls)
+    assert 'CREATE UNLOGGED TABLE "mrf"."ptg2_manifest_stage_provider_npi_scope_abc"' in joined
 
 
 def test_ptg2_manifest_stage_uses_direct_lean_source_columns(monkeypatch):

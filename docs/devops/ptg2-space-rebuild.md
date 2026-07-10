@@ -16,9 +16,9 @@ compared, repointed by the importer, and only then removed.
 - Rebuild from stored `mrf.ptg2_import_run.options`; do not hand-copy payer URLs
   into tickets or chat.
 - Compare old and new snapshots before removal.
-- Treat row samples and retained serving artifacts as required checks. For
-  `postgres_binary_v1`, the retained serving artifacts are PostgreSQL rows, not
-  pod-local files.
+- Treat row samples and retained serving artifacts as required checks. For both
+  PostgreSQL binary architectures, retained serving and relationship artifacts
+  are PostgreSQL rows, not pod-local files.
 - Remove one old source snapshot at a time.
 - Keep the job output JSON and post-cleanup metrics in the incident/report
   folder.
@@ -96,15 +96,19 @@ The compare must pass all of these checks:
 - processed-file count matches
 - sampled serving rows have zero misses
 - sampled price atoms have zero misses
-- sampled provider group members have zero misses
+- sampled provider membership has zero misses, using provider-group members for
+  v1 or graph edge/NPI-scope checks for v2
 - retained serving artifact counts and sha256 hashes match when both snapshots
   use sidecar-backed layouts
-- PostgreSQL binary serving artifact rows exist and local serving sidecar files
-  are absent when the new snapshot uses `postgres_binary_v1`
+- PostgreSQL binary serving artifact rows exist and local materialized artifact
+  caches are absent for both PostgreSQL binary architectures
+- `postgres_binary_v2` publishes `provider_npi_scope`, omits
+  `provider_group_member`, and stores provider-forward, provider-inverted,
+  provider-group-NPI, and provider-NPI-group artifacts in PostgreSQL
 
 The `--benchmark-*` options are non-gating. They add warm-cache,
 snapshot-scoped serving timings for sampled plan/code pairs so storage changes
-can be reviewed next to real query latency. For `postgres_binary_v1`, also
+can be reviewed next to real query latency. For either PostgreSQL binary architecture, also
 include one forward lookup, one reverse NPI lookup, and one geo-filtered
 plan/code lookup so both binary relationship directions are exercised.
 

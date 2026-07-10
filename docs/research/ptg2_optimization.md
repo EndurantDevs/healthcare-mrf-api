@@ -83,6 +83,43 @@ HLTHPRT_TEST_DATABASE_SUFFIX=_test \
   --case local-full-file-verify
 ```
 
+### Normalized Membership Graph A/B
+
+Run the PostgreSQL-only v1/v2 membership comparison with:
+
+```bash
+HLTHPRT_DB_HOST=127.0.0.1 \
+HLTHPRT_DB_PORT=5440 \
+HLTHPRT_DB_USER=nick \
+HLTHPRT_DB_DATABASE=healthporta \
+HLTHPRT_TEST_DATABASE_SUFFIX=_test \
+./venv314/bin/python scripts/research/ptg2_experiment.py run \
+  --suite docs/research/ptg2_membership_graph_local_suite.json
+```
+
+The 2026-07-10 64K-rate control run validated every source price and NPI in both
+architectures with API caches disabled:
+
+| Metric | `postgres_binary_v1` | `postgres_binary_v2` |
+| --- | ---: | ---: |
+| Snapshot bytes | 396,480 | 372,984 |
+| Import seconds | 0.80 | 0.66 |
+| Code lookup p95 | 14.08 ms | 12.66 ms |
+| NPI reverse p95 | 17.38 ms | 14.69 ms |
+| ZIP + 100-price-set response p95 | 51.17 ms | 55.22 ms |
+
+The small fixture has one NPI per provider set, so v2 is only about 6% smaller
+there. It intentionally does not model the expensive payer shape that motivated
+v2: many provider sets containing large shared groups. In that shape, v1 stores
+the provider-group membership table plus a direct set-to-NPI expansion; v2
+stores each group/NPI edge once in each direction and keeps only a distinct-NPI
+scope table. Use a real high-fan-out source comparison before estimating fleet
+storage savings from the control fixture.
+
+The suite also includes a TIN-only v2 case. It verifies that a valid rate file
+with zero NPIs still publishes all unique prices, creates an empty indexed NPI
+scope, returns no reverse-NPI items, and leaves no scope stage tables behind.
+
 Reports are written to:
 
 ```text

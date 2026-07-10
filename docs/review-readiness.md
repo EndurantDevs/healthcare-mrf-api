@@ -6,8 +6,8 @@ This note records the checks used before sharing the repository for external rev
 
 This section is historical local evidence for the first manifest-backed storage
 reduction work. Current storage reviews should prefer live snapshot manifests
-and deployment smoke output, because new imports default to
-`postgres_binary_v1`.
+and deployment smoke output. PostgreSQL binary snapshots can use either the v1
+direct provider-membership layout or the v2 normalized membership graph.
 
 Measured on the local PostgreSQL instance at `127.0.0.1:5440`, database
 `healthporta`, schema `mrf`.
@@ -19,10 +19,12 @@ Current source snapshots:
 | `asr_1208` | `ptg2:202605:2e95465b2025` | 41 GB | ~4.5 GB |
 | `asr_1236` | `ptg2:202605:79060d12dfcf` | 41 GB | ~4.5 GB |
 
-Support tables are `price_atom`, `provider_group_member`, and `code_count`.
-This was the hot database footprint for the earlier manifest layout. In the
-current `postgres_binary_v1` layout, review the PostgreSQL binary artifact table
-and confirm that pod-local forward/reverse serving sidecar files are absent.
+Support tables in this historical evidence are `price_atom`,
+`provider_group_member`, and `code_count`. This was the hot database footprint
+for the earlier manifest layout. For `postgres_binary_v2`, expect `price_atom`,
+`code_count`, `provider_npi_scope`, the provider-set dictionary, and the binary
+serving table. Review PostgreSQL artifact chunks for all four membership graph
+directions and confirm that pod-local materialized artifact caches are absent.
 
 Import timing records available locally:
 
@@ -75,6 +77,10 @@ Last local results:
 - compile checks passed
 - `git diff --check` passed
 - guarded ASR 1236 UUID smoke import passed in `healthporta_test`: 2,641,583 serving rows, `id_storage=uuid`, 51.34 seconds
+- guarded `postgres_binary_v2` full-file smoke passed in `healthporta_test`:
+  65,536 serving rows and all original price/provider counts matched; forward
+  p95 was 12.66 ms and reverse NPI p95 was 14.69 ms with in-process binary and
+  sidecar caches disabled
 
 ## Security Hygiene
 

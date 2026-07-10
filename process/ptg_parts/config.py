@@ -115,7 +115,14 @@ PTG2_SNAPSHOT_ARCH_VARIANT_ENV = "HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT"
 PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1 = "materialized_v1"
 PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 = "sidecar_scope_v1"
 PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 = "postgres_binary_v1"
+PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2 = "postgres_binary_v2"
 PTG2_SNAPSHOT_ARCH_LEGACY_MIXED_V1 = "legacy_mixed_v1"
+PTG2_POSTGRES_BINARY_SNAPSHOT_ARCHES = frozenset(
+    {
+        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+        PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+    }
+)
 PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE = "materialized_rate_scope"
 PTG2_PROVIDER_SCOPE_STRATEGY_COMPONENT_TABLE = "component_table"
 PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR = "sidecar_provider_scope"
@@ -181,19 +188,26 @@ def _ptg2_snapshot_arch_from_env() -> str | None:
         "sidecar_scope_v1": PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
         "postgres_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "postgres_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+        "postgres_binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
         "db_binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "db_binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "binary": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
         "binary_v1": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+        "binary_v2": PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
     }
     if normalized not in arch_alias_map:
         raise ValueError(
             f"Unsupported {PTG2_SNAPSHOT_ARCH_ENV}={raw!r}; "
             f"expected {PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1!r}, "
             f"{PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1!r}, "
-            f"or {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1!r}"
+            f"{PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1!r}, "
+            f"or {PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2!r}"
         )
     return arch_alias_map[normalized]
+
+
+def _is_postgres_binary_snapshot_arch(arch_version: str | None) -> bool:
+    return arch_version in PTG2_POSTGRES_BINARY_SNAPSHOT_ARCHES
 
 
 def _ptg2_snapshot_arch_variant(arch_version: str | None = None) -> str | None:

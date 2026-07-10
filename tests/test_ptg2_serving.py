@@ -1185,6 +1185,242 @@ async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_mi
 
 
 @pytest.mark.asyncio
+async def test_manifest_membership_graph_resolves_provider_sets_in_both_directions(monkeypatch):
+    provider_set_id = "00000000000000000000000000000011"
+    group_id = "00000000000000000000000000000021"
+    npi = 1234567890
+    npi_member_id = ptg2_serving._ptg2_npi_member_id(npi)
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v2",
+        artifacts={
+            "provider_forward": {"name": "provider_forward"},
+            "provider_inverted": {"name": "provider_inverted"},
+            "provider_group_npi": {"name": "provider_group_npi"},
+            "provider_npi_group": {"name": "provider_npi_group"},
+        }
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **_kwargs):
+        members_by_sidecar = {
+            "provider_forward": {provider_set_id: (group_id,)},
+            "provider_inverted": {group_id: (provider_set_id,)},
+            "provider_group_npi": {group_id: (npi_member_id,)},
+            "provider_npi_group": {npi_member_id: (group_id,)},
+        }
+        return {owner_id: members_by_sidecar[sidecar_name].get(owner_id, ()) for owner_id in owner_ids}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    npis_by_set = await ptg2_serving._ptg2_manifest_provider_npis_for_provider_sets(
+        object(),
+        tables,
+        (provider_set_id,),
+    )
+    provider_sets = await ptg2_serving._ptg2_manifest_provider_sets_for_npi(
+        object(),
+        tables,
+        npi,
+    )
+
+    assert npis_by_set == {provider_set_id: (npi,)}
+    assert provider_sets == (provider_set_id,)
+
+
+@pytest.mark.asyncio
+async def test_manifest_membership_graph_bounds_provider_expansion(monkeypatch):
+    provider_set_id = "00000000000000000000000000000011"
+    group_ids = tuple(f"{group_index:032x}" for group_index in range(1, 601))
+    group_batches = []
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v2",
+        artifacts={
+            "provider_forward": {"name": "provider_forward"},
+            "provider_group_npi": {"name": "provider_group_npi"},
+        },
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **kwargs):
+        if sidecar_name == "provider_forward":
+            return {provider_set_id: group_ids}
+        group_batches.append((tuple(owner_ids), kwargs.get("max_members")))
+        return {
+            group_id: (ptg2_serving._ptg2_npi_member_id(1234567890 + int(group_id, 16) - 1),)
+            for group_id in owner_ids
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    npis_by_set = await ptg2_serving._ptg2_manifest_provider_npis_for_provider_sets(
+        object(),
+        tables,
+        (provider_set_id,),
+        limit_per_set=2,
+    )
+
+    assert npis_by_set == {provider_set_id: (1234567890, 1234567891)}
+    assert [(len(owner_ids), max_members) for owner_ids, max_members in group_batches] == [(256, 2)]
+
+
+@pytest.mark.asyncio
+async def test_membership_graph_uses_address_first_for_broad_codes(monkeypatch):
+    matching_group_id = "00000000000000000000000000000021"
+    unrelated_group_id = "00000000000000000000000000000099"
+    rate_scope = ptg2_serving._ptg2_build_rate_scope(
+        tuple([matching_group_id] + [f"{group_index:032x}" for group_index in range(1000, 3000)])
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test",
+        artifacts={"provider_npi_group": {"name": "provider_npi_group"}},
+    )
+    candidate_locations = [_sample_graph_location(1234567890), _sample_graph_location(1234567891)]
+
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **_kwargs):
+        assert sidecar_name == "provider_npi_group"
+        return {
+            owner_ids[0]: (matching_group_id,),
+            owner_ids[1]: (unrelated_group_id,),
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", AsyncMock(return_value=candidate_locations))
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    candidates = await ptg2_serving._graph_location_candidates(
+        object(),
+        tables,
+        {"zip5": "49015"},
+        rate_scope,
+        1,
+    )
+
+    assert [location["npi"] for location in candidates.location_rows] == [1234567890]
+    assert candidates.group_ids_by_npi == {1234567890: {matching_group_id}}
+
+
+@pytest.mark.asyncio
+async def test_membership_location_query_keeps_site_addresses(monkeypatch):
+    tables = ptg2_serving.PTG2ServingTables(provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test")
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    location_query = await ptg2_serving._membership_location_query(
+        object(),
+        tables,
+        {"zip5": "49015"},
+        candidate_npis=(1234567890,),
+        limit=10,
+    )
+    invalid_radius_query = await ptg2_serving._membership_location_query(
+        object(),
+        tables,
+        {"radius_miles": "10"},
+        candidate_npis=(1234567890,),
+        limit=10,
+    )
+
+    assert "site" in location_query.parameter_map["address_types"]
+    assert invalid_radius_query is None
+
+
+def test_graph_provider_data_preserves_street_fallback():
+    enriched_address = json.dumps({"first_line": "100 Test Street", "city": "BATTLE CREEK"})
+    matched_address = json.dumps({"first_line": None, "city": "BATTLE CREEK"})
+
+    provider_data = ptg2_serving._graph_provider_data(
+        {
+            "npi": 1234567890,
+            "state": "MI",
+            "city": "BATTLE CREEK",
+            "zip5": "49015",
+            "distance_miles": 2.5,
+            "location_hash": "unified-location",
+            "address_payload": matched_address,
+        },
+        {
+            "npi": 1234567890,
+            "state": "MI",
+            "city": "BATTLE CREEK",
+            "zip5": "49015",
+            "address_payload": enriched_address,
+        },
+        "entity_address_unified",
+    )
+
+    assert provider_data["address_payload"] == enriched_address
+    assert provider_data["distance_miles"] == 2.5
+    assert provider_data["location_hash"] == "unified-location"
+
+
+def _sample_graph_location(npi):
+    return {
+        "npi": npi,
+        "state": "MI",
+        "city": "BATTLE CREEK",
+        "zip5": "49015",
+        "distance_miles": None,
+        "location_hash": "location-1",
+        "address_payload": "{}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_membership_graph_resolves_geo_provider_sets(monkeypatch):
+    """Graph geo traversal preserves provider-set membership and enrichment."""
+    provider_set_id = "00000000000000000000000000000011"
+    group_id = "00000000000000000000000000000021"
+    npi = 1234567890
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v2",
+        source_key="ptg_graph",
+        provider_npi_scope_table="mrf.ptg2_provider_npi_scope_graph",
+        artifacts={
+            "provider_forward": {"name": "provider_forward"},
+            "provider_inverted": {"name": "provider_inverted"},
+            "provider_group_npi": {"name": "provider_group_npi"},
+            "provider_npi_group": {"name": "provider_npi_group"},
+        },
+    )
+    location_rows = [_sample_graph_location(npi)]
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **_kwargs):
+        members_by_sidecar = {
+            "provider_group_npi": {group_id: (ptg2_serving._ptg2_npi_member_id(npi),)},
+            "provider_inverted": {group_id: (provider_set_id,)},
+        }
+        return {owner_id: members_by_sidecar[sidecar_name].get(owner_id, ()) for owner_id in owner_ids}
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_manifest_rate_scope_from_sidecar",
+        AsyncMock(return_value=ptg2_serving._ptg2_build_rate_scope((group_id,))),
+    )
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", AsyncMock(return_value=location_rows))
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_filter_npis_by_provider_taxonomy",
+        AsyncMock(return_value=(npi,)),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_enriched_provider_rows_for_npis",
+        AsyncMock(return_value=[{"npi": npi, "provider_name": "Example Provider"}]),
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.entity_address_unified"))
+    provider_set_ids, providers_by_set = await ptg2_serving._graph_location_matches(
+        object(),
+        tables,
+        {"code": "S4011", "code_system": "HCPCS", "zip5": "49015"},
+        candidate_limit=10,
+        plan_id="382418014",
+    )
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == npi
+    assert providers_by_set[provider_set_id][0]["provider_name"] == "Example Provider"
+    assert providers_by_set[provider_set_id][0]["zip5"] == "49015"
+
+
+@pytest.mark.asyncio
 async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
     provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
     price_sets = [f"{idx:032x}" for idx in range(101, 106)]
@@ -3462,10 +3698,10 @@ async def test_broad_npi_postgres_binary_reverse_avoids_local_sidecars(monkeypat
     ]
 
 
-def _malformed_postgres_binary_tables():
+def _malformed_postgres_binary_tables(arch_version="postgres_binary_v1"):
     return ptg2_serving.PTG2ServingTables(
         storage="manifest_snapshot",
-        arch_version="postgres_binary_v1",
+        arch_version=arch_version,
         artifacts={
             "serving_by_code": {"path": "/missing/local/cache/serving_by_code.ptg2sbc"},
             "serving_by_provider_set": {"path": "/missing/local/cache/serving_by_provider_set.ptg2sbp"},
@@ -3475,8 +3711,9 @@ def _malformed_postgres_binary_tables():
 
 
 @pytest.mark.asyncio
-async def test_postgres_binary_lookup_fails_closed_without_binary_table(monkeypatch):
-    """postgres_binary_v1 must not fall back to serving sidecar artifacts."""
+@pytest.mark.parametrize("arch_version", ["postgres_binary_v1", "postgres_binary_v2"])
+async def test_postgres_binary_lookup_fails_closed_without_binary_table(monkeypatch, arch_version):
+    """PostgreSQL binary snapshots must not fall back to serving sidecar files."""
     monkeypatch.setattr(
         ptg2_serving,
         "_resolve_ptg2_manifest_sidecar_path",
@@ -3486,14 +3723,15 @@ async def test_postgres_binary_lookup_fails_closed_without_binary_table(monkeypa
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="missing serving_binary_table"):
         await ptg2_serving._ptg2_manifest_lookup_serving_by_code_sidecar(
             FakeSession([]),
-            _malformed_postgres_binary_tables(),
+            _malformed_postgres_binary_tables(arch_version),
             7,
         )
 
 
 @pytest.mark.asyncio
-async def test_postgres_binary_reverse_fails_closed_without_binary_table(monkeypatch):
-    """postgres_binary_v1 reverse lookup must not fall back to provider-set sidecars."""
+@pytest.mark.parametrize("arch_version", ["postgres_binary_v1", "postgres_binary_v2"])
+async def test_postgres_binary_reverse_fails_closed_without_binary_table(monkeypatch, arch_version):
+    """PostgreSQL binary reverse lookup must not fall back to provider-set files."""
     monkeypatch.setattr(
         ptg2_serving,
         "_resolve_ptg2_manifest_sidecar_path",
@@ -3503,13 +3741,14 @@ async def test_postgres_binary_reverse_fails_closed_without_binary_table(monkeyp
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="missing serving_binary_table"):
         await ptg2_serving._ptg2_manifest_lookup_serving_by_provider_set_patterns(
             FakeSession([]),
-            _malformed_postgres_binary_tables(),
+            _malformed_postgres_binary_tables(arch_version),
             3,
         )
 
 
-def test_postgres_binary_sync_membership_fails_closed_without_db_storage(monkeypatch):
-    """postgres_binary_v1 sync membership reads must not resolve local artifacts."""
+@pytest.mark.parametrize("arch_version", ["postgres_binary_v1", "postgres_binary_v2"])
+def test_postgres_binary_sync_membership_fails_closed_without_db_storage(monkeypatch, arch_version):
+    """PostgreSQL binary membership reads must not resolve local artifacts."""
     monkeypatch.setattr(
         ptg2_serving,
         "_resolve_ptg2_manifest_sidecar_path",
@@ -3518,15 +3757,16 @@ def test_postgres_binary_sync_membership_fails_closed_without_db_storage(monkeyp
 
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="requires PostgreSQL artifact storage"):
         ptg2_serving._ptg2_manifest_sidecar_members(
-            _malformed_postgres_binary_tables(),
+            _malformed_postgres_binary_tables(arch_version),
             "provider_forward",
             "0000000000000000000000000000000a",
         )
 
 
 @pytest.mark.asyncio
-async def test_postgres_binary_async_membership_fails_closed_without_db_storage(monkeypatch):
-    """postgres_binary_v1 async membership reads must not resolve local artifacts."""
+@pytest.mark.parametrize("arch_version", ["postgres_binary_v1", "postgres_binary_v2"])
+async def test_postgres_binary_async_membership_fails_closed_without_db_storage(monkeypatch, arch_version):
+    """PostgreSQL binary async membership reads must not resolve local artifacts."""
     monkeypatch.setattr(
         ptg2_serving,
         "_resolve_ptg2_manifest_sidecar_path",
@@ -3536,7 +3776,7 @@ async def test_postgres_binary_async_membership_fails_closed_without_db_storage(
     with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="requires PostgreSQL artifact storage"):
         await ptg2_serving._ptg2_manifest_sidecar_members_many_async(
             FakeSession([]),
-            _malformed_postgres_binary_tables(),
+            _malformed_postgres_binary_tables(arch_version),
             "provider_forward",
             ("0000000000000000000000000000000a",),
         )

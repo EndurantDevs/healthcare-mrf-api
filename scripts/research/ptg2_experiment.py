@@ -462,7 +462,7 @@ def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
                     "provider_group_id": 7 + provider_index,
                     "provider_groups": [
                         {
-                            "npi": [1234567890 + provider_index],
+                            "npi": [] if case.get("omit_provider_npis") else [1234567890 + provider_index],
                             "tin": {"type": "ein", "value": f"12-34567{provider_index % 10}"},
                         }
                     ],
@@ -772,6 +772,7 @@ def serving_index_table(serving_index: dict[str, Any], *keys: str) -> str:
         "serving_table": "serving",
         "price_atom_table": "price_atom",
         "provider_group_member_table": "provider_group_member",
+        "provider_npi_scope_table": "provider_npi_scope",
     }
     for key in keys:
         value = serving_index.get(key)
@@ -1224,7 +1225,11 @@ def verify_local_import_against_original(
         else str(int((binary_manifest or {}).get("row_count") or 0))
     )
     price_atom_table = serving_index_table(serving_index, "price_atom_table")
-    provider_group_member_table = serving_index_table(serving_index, "provider_group_member_table")
+    provider_group_member_table = serving_index_table(
+        serving_index,
+        "provider_group_member_table",
+        "provider_npi_scope_table",
+    )
     price_atom_schema, price_atom_name = price_atom_table.split(".", 1)
     price_atom_columns_payload = psql_json(
         env_overrides,

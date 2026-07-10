@@ -50,6 +50,7 @@ class PTG2ServingTables:
     provider_set_entry_table: str | None = None
     provider_entry_component_table: str | None = None
     provider_group_member_table: str | None = None
+    provider_npi_scope_table: str | None = None
     provider_group_location_table: str | None = None
     provider_group_rate_scope_table: str | None = None
     provider_set_dictionary_table: str | None = None
@@ -99,4 +100,5 @@ class PTG2ServingTables:
         return strategy == "sidecar_provider_scope" or self.effective_arch_version in {
             "sidecar_scope_v1",
             "postgres_binary_v1",
+            "postgres_binary_v2",
         }

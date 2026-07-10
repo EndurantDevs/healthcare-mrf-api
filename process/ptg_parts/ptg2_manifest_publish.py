@@ -22,9 +22,10 @@ from process.ptg_parts.config import (
     PTG2_PROVIDER_SCOPE_STRATEGY_MATERIALIZED_RATE_SCOPE,
     PTG2_PROVIDER_SCOPE_STRATEGY_SIDECAR,
     PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1,
-    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
     PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1,
-    PTG2_UNLOGGED_STAGE_ENV, _env_bool, _ptg2_snapshot_arch_from_env)
+    PTG2_UNLOGGED_STAGE_ENV, _env_bool, _is_postgres_binary_snapshot_arch,
+    _ptg2_snapshot_arch_from_env)
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
 from process.ptg_parts.ptg2_artifact_blobs import (
     ptg2_artifact_db_store_enabled,
@@ -215,6 +216,7 @@ PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS = [
     "provider_group_global_id_128",
     "npi",
 ]
+PTG2_MANIFEST_PROVIDER_NPI_SCOPE_COLUMNS = ["npi"]
 PTG2_MANIFEST_CODE_COUNT_COLUMNS = [
     "plan_id",
     "reported_code_system",
@@ -380,20 +382,20 @@ def _ptg2_manifest_snapshot_arch() -> str:
 def _ptg2_manifest_lean_rewrite_parallel_dictionaries() -> bool:
     if os.getenv(PTG2_MANIFEST_LEAN_REWRITE_PARALLEL_DICTS_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_LEAN_REWRITE_PARALLEL_DICTS_ENV, True)
-    return _ptg2_manifest_snapshot_arch() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+    return _is_postgres_binary_snapshot_arch(_ptg2_manifest_snapshot_arch())
 
 
 def _ptg2_manifest_postgres_binary_natural_lean_stream_enabled() -> bool:
     if os.getenv(PTG2_MANIFEST_POSTGRES_BINARY_NATURAL_LEAN_STREAM_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_POSTGRES_BINARY_NATURAL_LEAN_STREAM_ENV, True)
-    return _ptg2_manifest_snapshot_arch() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+    return _is_postgres_binary_snapshot_arch(_ptg2_manifest_snapshot_arch())
 
 
 def _ptg2_manifest_provider_set_component_enabled() -> bool:
     arch_version = _ptg2_manifest_snapshot_arch()
     if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
         return True
-    if arch_version in {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1, PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1}:
+    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 or _is_postgres_binary_snapshot_arch(arch_version):
         return False
     if os.getenv(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_PROVIDER_SET_COMPONENT_TABLE_ENV, True)
@@ -406,7 +408,7 @@ def _ptg2_manifest_provider_group_rate_scope_enabled() -> bool:
     arch_version = _ptg2_manifest_snapshot_arch()
     if arch_version == PTG2_SNAPSHOT_ARCH_MATERIALIZED_V1:
         return True
-    if arch_version in {PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1, PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1}:
+    if arch_version == PTG2_SNAPSHOT_ARCH_SIDECAR_SCOPE_V1 or _is_postgres_binary_snapshot_arch(arch_version):
         return False
     return _env_bool(PTG2_MANIFEST_PROVIDER_GROUP_RATE_SCOPE_TABLE_ENV, False)
 
@@ -471,6 +473,8 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     await _create_ptg2_manifest_price_atom_stage_table(stage_table)
     await _create_price_atom_member_stage_table(stage_table)
     await _create_ptg2_manifest_provider_group_member_stage_table(stage_table)
+    if _ptg2_manifest_snapshot_arch() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2:
+        await _create_provider_npi_scope_stage(stage_table)
     await _create_ptg2_manifest_code_count_stage_table(stage_table)
     await _create_ptg2_manifest_provider_set_dictionary_stage_table(stage_table)
     return stage_table
@@ -534,6 +538,21 @@ async def _create_ptg2_manifest_provider_group_member_stage_table(serving_stage_
     return stage_table
 
 
+async def _create_provider_npi_scope_stage(serving_stage_table: str) -> str:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_npi_scope")
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
+            npi bigint NOT NULL
+        );
+        """
+    )
+    return stage_table
+
+
 async def _create_ptg2_manifest_code_count_stage_table(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "code_count")
@@ -590,6 +609,14 @@ async def _copy_price_atom_member_file(copy_path: Path, *, target_table: str) ->
 
 async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
     await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
+
+
+async def _copy_provider_npi_scope_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(
+        copy_path,
+        target_table=target_table,
+        columns=PTG2_MANIFEST_PROVIDER_NPI_SCOPE_COLUMNS,
+    )
 
 
 async def _copy_ptg2_manifest_code_count_file(copy_path: Path, *, target_table: str) -> None:
@@ -2460,11 +2487,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
     price_atom_stage = _ptg2_manifest_support_stage_table(stage_table, "price_atom")
     price_set_atom_stage = _ptg2_manifest_support_stage_table(stage_table, "price_set_atom")
     provider_group_member_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_group_member")
+    provider_npi_scope_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_npi_scope")
     code_count_stage = _ptg2_manifest_support_stage_table(stage_table, "code_count")
     provider_set_dictionary_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_set_dictionary")
     price_atom_table = _ptg2_snapshot_table_name("price_atom", source_key, snapshot_id)
     price_set_atom_table = _ptg2_snapshot_table_name("price_set_atom", source_key, snapshot_id)
     provider_group_member_table = _ptg2_snapshot_table_name("provider_group_member", source_key, snapshot_id)
+    provider_npi_scope_table = _ptg2_snapshot_table_name("provider_npi_scope", source_key, snapshot_id)
     provider_group_location_table = _ptg2_snapshot_table_name("provider_group_location", source_key, snapshot_id)
     provider_set_component_table = _ptg2_snapshot_table_name("provider_set_component", source_key, snapshot_id)
     provider_group_rate_scope_table = _ptg2_snapshot_table_name("provider_group_rate_scope", source_key, snapshot_id)
@@ -2473,6 +2502,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     serving_binary_table = _ptg2_snapshot_table_name("serving_binary", source_key, snapshot_id)
     arch_version = _ptg2_manifest_snapshot_arch()
+    use_provider_membership_graph = arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
     started_at = time.monotonic()
     publish_stage_timings: dict[str, float] = {}
 
@@ -2486,6 +2516,9 @@ async def _publish_ptg2_manifest_serving_snapshot(
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)} CASCADE;")
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)} CASCADE;"
+    )
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_npi_scope_table)} CASCADE;"
     )
     await db.status(
         f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} CASCADE;"
@@ -2508,12 +2541,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
     skip_final_serving_table = (
         use_lean_source_stage
         and _ptg2_manifest_serving_layout() == PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY
-        and (_ptg2_manifest_serving_sidecars_enabled() or arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1)
+        and (_ptg2_manifest_serving_sidecars_enabled() or _is_postgres_binary_snapshot_arch(arch_version))
         and _ptg2_manifest_drop_serving_table_after_sidecars()
     )
     natural_lean_binary_source = (
         use_lean_source_stage
-        and arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+        and _is_postgres_binary_snapshot_arch(arch_version)
         and skip_final_serving_table
         and _ptg2_manifest_postgres_binary_natural_lean_stream_enabled()
     )
@@ -2541,11 +2574,22 @@ async def _publish_ptg2_manifest_serving_snapshot(
             RENAME TO {_quote_ident(price_set_atom_table)};
             """
         )
-    if await _table_exists(schema_name, provider_group_member_stage):
+    if not use_provider_membership_graph and await _table_exists(schema_name, provider_group_member_stage):
         await db.status(
             f"""
             ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_stage)}
             RENAME TO {_quote_ident(provider_group_member_table)};
+            """
+        )
+    elif use_provider_membership_graph:
+        await db.status(
+            f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_stage)};"
+        )
+    if use_provider_membership_graph and await _table_exists(schema_name, provider_npi_scope_stage):
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_npi_scope_stage)}
+            RENAME TO {_quote_ident(provider_npi_scope_table)};
             """
         )
     use_db_dedupe = (
@@ -2782,6 +2826,20 @@ async def _publish_ptg2_manifest_serving_snapshot(
             """
         )
         mark_stage("provider_group_member_indexes", stage_started_at)
+    elif use_provider_membership_graph:
+        dedupe_metrics["provider_group_member"] = {"skipped": "postgres_binary_v2_membership_graph"}
+    if use_provider_membership_graph:
+        if not await _table_exists(schema_name, provider_npi_scope_table):
+            raise RuntimeError("PTG2 provider membership graph did not publish an NPI scope table")
+        stage_started_at = time.monotonic()
+        provider_npi_scope_index = _ptg2_snapshot_index_name(provider_npi_scope_table, "npi_uidx")
+        await db.status(
+            f"""
+            CREATE UNIQUE INDEX {_quote_ident(provider_npi_scope_index)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(provider_npi_scope_table)} (npi);
+            """
+        )
+        mark_stage("provider_npi_scope_index", stage_started_at)
     materialized_provider_set_component_table = None
     if _ptg2_manifest_provider_set_component_enabled():
         stage_started_at = time.monotonic()
@@ -2844,10 +2902,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
     if await _table_exists(schema_name, price_atom_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
     has_price_set_atom_table = await _table_exists(schema_name, price_set_atom_table)
-    if has_price_set_atom_table and arch_version != PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1:
+    if has_price_set_atom_table and not _is_postgres_binary_snapshot_arch(arch_version):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};")
     if await _table_exists(schema_name, provider_group_member_table):
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
+    if await _table_exists(schema_name, provider_npi_scope_table):
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_npi_scope_table)};")
     if materialized_provider_set_component_table:
         await db.status(
             f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(materialized_provider_set_component_table)};"
@@ -2874,7 +2934,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     serving_sidecar_artifacts: dict[str, Any] = {}
     serving_binary_manifest: dict[str, Any] | None = None
     if lean_serving_manifest is not None:
-        if arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1:
+        if _is_postgres_binary_snapshot_arch(arch_version):
             _emit_ptg2_manifest_publish_progress(
                 "serving binary start",
                 done=0,
@@ -2982,9 +3042,12 @@ async def _publish_ptg2_manifest_serving_snapshot(
     )
     materialized_table_map = {
         "price_atom": f"{schema_name}.{price_atom_table}",
-        "provider_group_member": f"{schema_name}.{provider_group_member_table}",
         "code_count": f"{schema_name}.{code_count_table}",
     }
+    if await _table_exists(schema_name, provider_group_member_table):
+        materialized_table_map["provider_group_member"] = f"{schema_name}.{provider_group_member_table}"
+    if await _table_exists(schema_name, provider_npi_scope_table):
+        materialized_table_map["provider_npi_scope"] = f"{schema_name}.{provider_npi_scope_table}"
     if serving_table_retained:
         materialized_table_map["serving"] = f"{schema_name}.{final_table}"
     if (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"):
@@ -3041,7 +3104,16 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "price_atom_dictionary_table": (lean_price_atom_manifest or {}).get("price_atom_dictionary_table"),
         "price_atom_constant_keys": (lean_price_atom_manifest or {}).get("price_atom_constant_keys"),
         "price_atom_constant_values": (lean_price_atom_manifest or {}).get("price_atom_constant_values"),
-        "provider_group_member_table": f"{schema_name}.{provider_group_member_table}",
+        "provider_group_member_table": (
+            f"{schema_name}.{provider_group_member_table}"
+            if await _table_exists(schema_name, provider_group_member_table)
+            else None
+        ),
+        "provider_npi_scope_table": (
+            f"{schema_name}.{provider_npi_scope_table}"
+            if await _table_exists(schema_name, provider_npi_scope_table)
+            else None
+        ),
         "provider_group_location_table": (
             f"{schema_name}.{materialized_provider_group_location_table}"
             if materialized_provider_group_location_table
@@ -3110,6 +3182,6 @@ def should_use_lean_source_guard(*, arch_version: str, skip_final_serving_table:
     """Return whether publish should build the transient lean-source uniqueness guard."""
     if os.getenv(PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV) is not None:
         return _env_bool(PTG2_MANIFEST_LEAN_SOURCE_UNIQUE_GUARD_ENV, True)
-    if arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 and skip_final_serving_table:
+    if _is_postgres_binary_snapshot_arch(arch_version) and skip_final_serving_table:
         return False
     return True

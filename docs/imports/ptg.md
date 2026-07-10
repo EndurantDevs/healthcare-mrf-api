@@ -82,8 +82,8 @@ python main.py worker process.EntityAddressUnified --burst
 ## Main Outputs
 - PTG2 control tables such as `ptg2_import_run`, `ptg2_snapshot`, `ptg2_current_snapshot`, `ptg2_current_source_snapshot`, `ptg2_current_plan_source`, and `ptg2_artifact_manifest`
 - One manifest-backed snapshot serving representation for the imported source/month: either a retained compact serving table or a transient table that is dropped after PostgreSQL binary serving artifacts are published
-- Snapshot support tables for price atoms, provider group members, and precomputed plan/code counts
-- PostgreSQL-owned binary serving artifacts for `postgres_binary_v1` snapshots; these replace pod-local forward/reverse serving sidecar files and are rebuildable only through PostgreSQL state
+- Snapshot support tables for price atoms and precomputed plan/code counts. `postgres_binary_v1` also retains provider-group members; `postgres_binary_v2` replaces that table with a distinct-NPI scope used for directory paging and address joins.
+- PostgreSQL-owned binary serving and relationship artifacts for `postgres_binary_v1` and `postgres_binary_v2` snapshots; these replace pod-local serving caches and are rebuildable only through PostgreSQL state
 - Legacy or research snapshots may still reference provider-set, provider-NPI, provider reverse, and price-set sidecars
 
 ## Snapshot Architecture
@@ -94,13 +94,27 @@ deployment can serve both old and new snapshots while operators compare them.
 
 Supported import modes:
 
-- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v1` is the deployed storage-saving
-  layout. It omits `provider_set_component` and `provider_group_rate_scope`,
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v2` is the normalized membership
+  layout for high-fan-out group plans. It retains four compressed graph
+  directions in PostgreSQL: provider set to group, group to provider set, group
+  to NPI, and NPI to group. It does not publish `provider_group_member` or the
+  direct provider-set-to-NPI cross-product. A small indexed
+  `provider_npi_scope` table contains one row per distinct snapshot NPI for
+  keyset directory paging and indexable joins to `entity_address_unified`.
+  Forward provider expansion follows set -> group -> NPI; reverse price lookup
+  follows NPI -> group -> set -> price set; geo lookup combines the same graph
+  with current unified addresses. Updating unified addresses therefore improves
+  every snapshot without rewriting price artifacts.
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v1` is the compatibility
+  storage-saving layout. It omits `provider_set_component` and
+  `provider_group_rate_scope`,
   writes grouped forward/reverse serving relationships into compressed binary
   payloads stored in PostgreSQL, and can drop the transient lean serving table
   after publish. API pods must not materialize those artifacts into local disk
   caches; the durable source of truth is PostgreSQL so multiple API pods and a
-  separate PostgreSQL host remain safe.
+  separate PostgreSQL host remain safe. It retains the direct provider-set-to-NPI
+  artifact and relational provider-group membership table, which can be much
+  larger than v2 when sets contain many large provider groups.
   Price atoms remain the canonical rate payload rows; the binary artifacts store
   compact relationship maps from plan/code/provider-group searches to price atom
   ids, and reverse maps from NPI/provider-group searches back to the same price
@@ -123,7 +137,8 @@ need a stable, human-readable A/B label such as `heartland_sidecar_v1`.
 Snapshots without explicit architecture metadata are inferred from their
 manifest tables:
 
-- manifest snapshot with `serving_binary_table` -> `postgres_binary_v1`
+- explicit `arch_version=postgres_binary_v2` with `provider_npi_scope_table` -> `postgres_binary_v2`
+- manifest snapshot with `serving_binary_table` and no explicit architecture -> `postgres_binary_v1`
 - both scope tables present -> `materialized_v1`
 - manifest snapshot with both scope tables absent and no `serving_binary_table` -> `sidecar_scope_v1`
 - any mixed legacy shape -> `legacy_mixed_v1`
@@ -142,10 +157,10 @@ manifest tables:
 - `HLTHPRT_PTG2_BINARY_IDS=true` is the default for new manifest snapshots. It stores content ids as PostgreSQL `uuid` values instead of 32-character text, shrinking hot tables and indexes while preserving 32-hex API output.
 - `HLTHPRT_PTG2_MANIFEST_SIDECAR_SPILL=true` is the Rust scanner default. Provider and price sidecar pairs are written to temporary spill files during scanning, then normalized into the retained binary sidecars at the end of each file.
 - `HLTHPRT_PTG2_MANIFEST_SPILL_DIR` optionally pins those temporary sidecar spill files to a fast local volume. If unset, the system temp directory is used.
-- `HLTHPRT_PTG2_MANIFEST_PRECOPY_MERGE=true` is the default for manifest imports. Python defers scanner COPY shards, then the Rust scanner binary externally sort-merges serving, price atom, and provider group member files before PostgreSQL COPY.
+- `HLTHPRT_PTG2_MANIFEST_PRECOPY_MERGE=true` is the default for manifest imports. Python defers scanner COPY shards, then the Rust scanner binary externally sort-merges serving and price-atom files before PostgreSQL COPY. In `postgres_binary_v2`, provider-group member shards are normalized into the two group/NPI graph artifacts plus the distinct-NPI scope COPY; the member shards are never published as a PostgreSQL table.
 - `HLTHPRT_PTG2_MANIFEST_MERGE_DIR` and `HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES` control temporary files and chunk size for the Rust pre-COPY merge.
-- `HLTHPRT_PTG2_HOT_ARTIFACT_DIR` should point at node-local scratch for scanner COPY shards, `.ready` files, spill, and pre-COPY merge work. Shared `/work` remains for retained raw/logical artifacts. In `postgres_binary_v1`, final forward/reverse serving artifacts are copied into PostgreSQL and must not be served from node-local files.
-- `HLTHPRT_PTG2_ARTIFACT_DB_STORE=true` stores retained artifact payloads in PostgreSQL. In deployed `postgres_binary_v1`, keep `HLTHPRT_PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE=false`, `HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ=false`, and leave `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` unset so API pods do not create hidden per-pod disk caches.
+- `HLTHPRT_PTG2_HOT_ARTIFACT_DIR` should point at node-local scratch for scanner COPY shards, `.ready` files, spill, and pre-COPY merge work. Scratch is deleted after publish. In both PostgreSQL binary architectures, retained serving and relationship artifacts are copied into PostgreSQL and must not be served from node-local files.
+- `HLTHPRT_PTG2_ARTIFACT_DB_STORE=true` stores retained artifact payloads in PostgreSQL. For both PostgreSQL binary architectures, keep `HLTHPRT_PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE=false`, `HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ=false`, and leave `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` unset so API pods do not create hidden per-pod disk caches.
 - Import-control resource lanes route PTG runs to `small`, `normal`, `large`, or `huge` worker classes. The selected lane is recorded under `metrics.ptg_resource`; queue/class guards reject mismatched payloads.
 - `HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK=true` is the publish-time safety guard for manifest imports. Normal PTG runs keep the DB `DISTINCT ON` dedupe backstop even after Rust pre-COPY merge because live payer files can still contain duplicate serving identities. If a direct helper path disables the guard and PostgreSQL reports duplicate keys while creating a manifest unique index, publish runs a one-shot DB dedupe rescue and retries the index instead of leaving a half-published snapshot.
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
@@ -206,12 +221,14 @@ Healthy import behavior:
 
 Full-import validation should include the final `PTG2_IMPORT_DONE` line, API
 smoke checks for the imported source, and a size report for the snapshot support
-tables plus PostgreSQL artifact tables. For `postgres_binary_v1`, confirm
+tables plus PostgreSQL artifact tables. For either PostgreSQL binary architecture, confirm
 `serving_row_strategy=postgres_binary`, `serving_table_exists=false` when
 dropping the transient serving table, `serving_binary_table_exists=true`,
 `serving_sidecar_artifacts=false`, and that API pods did not create
 `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` or any pod-local materialized artifact
-cache.
+cache. For `postgres_binary_v2`, also confirm that `provider_npi_scope_table`
+exists with a unique NPI index, `provider_group_member_table` is absent, and the
+manifest has all four provider graph artifacts in PostgreSQL storage.
 
 ## Cleanup After Stopped Runs
 

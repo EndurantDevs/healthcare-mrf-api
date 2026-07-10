@@ -5,10 +5,11 @@ from __future__ import annotations
 import math
 import gc
 import hashlib
+import json
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -2099,16 +2100,19 @@ def _ptg2_manifest_sidecar_metadata(entry: dict[str, Any], sidecar_path: Path, r
 
 
 def _raise_missing_postgres_binary_table(serving_tables: PTG2ServingTables) -> None:
-    if serving_tables.effective_arch_version != "postgres_binary_v1":
+    if serving_tables.effective_arch_version not in {"postgres_binary_v1", "postgres_binary_v2"}:
         return
-    raise PTG2ManifestArtifactError("PTG2 postgres_binary_v1 snapshot is missing serving_binary_table")
+    raise PTG2ManifestArtifactError(
+        f"PTG2 {serving_tables.effective_arch_version} snapshot is missing serving_binary_table"
+    )
 
 
 def _raise_local_sidecar_disallowed(serving_tables: PTG2ServingTables, artifact_name: str) -> None:
-    if serving_tables.effective_arch_version != "postgres_binary_v1":
+    if serving_tables.effective_arch_version not in {"postgres_binary_v1", "postgres_binary_v2"}:
         return
     raise PTG2ManifestArtifactError(
-        f"PTG2 postgres_binary_v1 snapshot requires PostgreSQL artifact storage for {artifact_name}"
+        f"PTG2 {serving_tables.effective_arch_version} snapshot requires PostgreSQL artifact storage "
+        f"for {artifact_name}"
     )
 
 
@@ -3505,25 +3509,31 @@ async def _ptg2_manifest_provider_npis_for_provider_set(
     session,
     serving_tables: PTG2ServingTables,
     provider_set_global_id: str,
+    *,
+    limit: int | None = None,
 ) -> tuple[int, ...]:
-    members = await _ptg2_manifest_sidecar_members_async(
+    npis_by_set = await _ptg2_manifest_provider_npis_for_provider_sets(
         session,
         serving_tables,
-        "provider_npi",
-        provider_set_global_id,
+        (provider_set_global_id,),
+        limit_per_set=limit,
     )
-    npis: list[int] = []
-    for member in members:
-        try:
-            raw = bytes.fromhex(member)
-        except ValueError:
-            continue
-        if len(raw) != 16:
-            continue
-        npi = int.from_bytes(raw[8:16], "big", signed=False)
-        if npi > 0:
-            npis.append(npi)
-    return tuple(sorted(set(npis)))
+    return npis_by_set.get(_ptg2_manifest_id(provider_set_global_id), ())
+
+
+def _ptg2_npi_from_member_id(member_id: str) -> int | None:
+    try:
+        raw = bytes.fromhex(member_id)
+    except ValueError:
+        return None
+    if len(raw) != 16:
+        return None
+    npi = int.from_bytes(raw[8:16], "big", signed=False)
+    return npi if npi > 0 else None
+
+
+def _ptg2_npi_member_id(npi: int) -> str:
+    return (b"\x00" * 8 + int(npi).to_bytes(8, "big", signed=False)).hex()
 
 
 async def _ptg2_manifest_provider_npis_for_provider_sets(
@@ -3534,29 +3544,141 @@ async def _ptg2_manifest_provider_npis_for_provider_sets(
     limit_per_set: int | None = None,
 ) -> dict[str, tuple[int, ...]]:
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
-    members_by_set = await _ptg2_manifest_sidecar_members_many_async(
+    member_ids_by_set = await _provider_npi_member_ids_by_set(
         session,
         serving_tables,
-        "provider_npi",
         provider_set_ids,
-        max_members=limit_per_set,
+        limit_per_set=limit_per_set,
     )
-    result: dict[str, tuple[int, ...]] = {}
+    npis_by_set: dict[str, tuple[int, ...]] = {}
     for provider_set_id in provider_set_ids:
-        npis: list[int] = []
-        for member in members_by_set.get(provider_set_id, ()):
-            try:
-                raw = bytes.fromhex(member)
-            except ValueError:
-                continue
-            if len(raw) != 16:
-                continue
-            npi = int.from_bytes(raw[8:16], "big", signed=False)
-            if npi > 0:
-                npis.append(npi)
+        npis = [
+            npi
+            for member_id in member_ids_by_set.get(provider_set_id, ())
+            if (npi := _ptg2_npi_from_member_id(member_id)) is not None
+        ]
         sorted_npis = tuple(sorted(set(npis)))
-        result[provider_set_id] = sorted_npis[:limit_per_set] if limit_per_set is not None else sorted_npis
-    return result
+        npis_by_set[provider_set_id] = sorted_npis[:limit_per_set] if limit_per_set is not None else sorted_npis
+    return npis_by_set
+
+
+async def _provider_npi_member_ids_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_ids: tuple[str, ...],
+    *,
+    limit_per_set: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve provider-set membership from either v1 or normalized v2 artifacts."""
+    if _ptg2_manifest_artifact_entry(serving_tables, "provider_npi"):
+        return await _ptg2_manifest_sidecar_members_many_async(
+            session,
+            serving_tables,
+            "provider_npi",
+            provider_set_ids,
+            max_members=limit_per_set,
+        )
+    if not (
+        _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
+    ):
+        return {}
+    groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_forward",
+        provider_set_ids,
+    )
+    if limit_per_set is not None:
+        return await _limited_graph_member_ids_by_set(
+            session,
+            serving_tables,
+            groups_by_set,
+            max(int(limit_per_set), 1),
+        )
+    group_ids = tuple(
+        dict.fromkeys(
+            group_id
+            for provider_set_id in provider_set_ids
+            for group_id in groups_by_set.get(provider_set_id, ())
+        )
+    )
+    member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_group_npi",
+        group_ids,
+    )
+    return {
+        provider_set_id: tuple(
+            dict.fromkeys(
+                member_id
+                for group_id in groups_by_set.get(provider_set_id, ())
+                for member_id in member_ids_by_group.get(group_id, ())
+            )
+        )
+        for provider_set_id in provider_set_ids
+    }
+
+
+async def _limited_graph_member_ids_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    groups_by_set: dict[str, tuple[str, ...]],
+    limit_per_set: int,
+) -> dict[str, tuple[str, ...]]:
+    """Read graph groups in bounded batches until every set has enough NPIs."""
+    member_ids_by_set: dict[str, list[str]] = {provider_set_id: [] for provider_set_id in groups_by_set}
+    seen_ids_by_set: dict[str, set[str]] = {provider_set_id: set() for provider_set_id in groups_by_set}
+    provider_sets_by_group: dict[str, list[str]] = defaultdict(list)
+    ordered_group_ids: list[str] = []
+    for provider_set_id, group_ids in groups_by_set.items():
+        for group_id in group_ids:
+            if group_id not in provider_sets_by_group:
+                ordered_group_ids.append(group_id)
+            provider_sets_by_group[group_id].append(provider_set_id)
+    for batch_start in range(0, len(ordered_group_ids), 256):
+        group_batch_ids = tuple(ordered_group_ids[batch_start : batch_start + 256])
+        member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+            session,
+            serving_tables,
+            "provider_group_npi",
+            group_batch_ids,
+            max_members=limit_per_set,
+        )
+        _collect_limited_graph_batch(
+            group_batch_ids,
+            member_ids_by_group,
+            provider_sets_by_group,
+            member_ids_by_set,
+            seen_ids_by_set,
+            limit_per_set,
+        )
+        if all(len(member_ids) >= limit_per_set for member_ids in member_ids_by_set.values()):
+            break
+    return {provider_set_id: tuple(member_ids) for provider_set_id, member_ids in member_ids_by_set.items()}
+
+
+def _collect_limited_graph_batch(
+    group_batch_ids: tuple[str, ...],
+    member_ids_by_group: dict[str, tuple[str, ...]],
+    provider_sets_by_group: dict[str, list[str]],
+    member_ids_by_set: dict[str, list[str]],
+    seen_ids_by_set: dict[str, set[str]],
+    limit_per_set: int,
+) -> None:
+    """Accumulate one graph-owner batch without exceeding per-set limits."""
+    for group_id in group_batch_ids:
+        for provider_set_id in provider_sets_by_group[group_id]:
+            if len(member_ids_by_set[provider_set_id]) >= limit_per_set:
+                continue
+            for member_id in member_ids_by_group.get(group_id, ()):
+                if member_id in seen_ids_by_set[provider_set_id]:
+                    continue
+                seen_ids_by_set[provider_set_id].add(member_id)
+                member_ids_by_set[provider_set_id].append(member_id)
+                if len(member_ids_by_set[provider_set_id]) >= limit_per_set:
+                    break
 
 
 def _ptg2_manifest_price_matches_filter(price: dict[str, Any], args: dict[str, Any]) -> bool:
@@ -5082,6 +5204,535 @@ def _has_rate_scope_group(rate_scope: _ManifestRateScope, value: Any) -> bool:
     return group_id in rate_scope.fallback_group_ids
 
 
+def _has_membership_graph(serving_tables: PTG2ServingTables) -> bool:
+    return bool(
+        serving_tables.provider_npi_scope_table
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_npi_group")
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
+    )
+
+
+@dataclass(frozen=True)
+class _MembershipLocationQuery:
+    address_table: str
+    npi_scope_table: str
+    filter_sql: str
+    parameter_map: dict[str, Any]
+    distance_sql: str
+
+
+_MEMBERSHIP_LOCATION_SQL = """
+WITH matched AS MATERIALIZED (
+    SELECT
+        addr.npi,
+        {location_hash_sql} AS location_hash,
+        addr.state_name AS state,
+        addr.city_name AS city,
+        LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+        {distance_sql} AS distance_miles,
+        addr.type,
+        addr.checksum,
+        addr.telephone_number,
+        addr.fax_number,
+        addr.phone_number,
+        addr.phone_extension,
+        addr.fax_number_digits,
+        addr.fax_extension,
+        jsonb_build_object(
+            'first_line', addr.first_line,
+            'second_line', addr.second_line,
+            'city', addr.city_name,
+            'state', addr.state_name,
+            'postal_code', addr.postal_code,
+            'country_code', addr.country_code,
+            'telephone_number', addr.telephone_number,
+            'fax_number', addr.fax_number,
+            'phone_number', addr.phone_number,
+            'phone_extension', addr.phone_extension,
+            'fax_number_digits', addr.fax_number_digits,
+            'fax_extension', addr.fax_extension,
+            'address_key', addr.address_key::text,
+            'lat', addr.lat,
+            'long', addr.long
+        )::text AS address_payload,
+        ROW_NUMBER() OVER (
+            PARTITION BY addr.npi
+            ORDER BY {distance_sql} ASC NULLS LAST,
+                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                     addr.checksum
+        ) AS address_rank
+    FROM {address_table} addr
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    WHERE {filter_sql}
+)
+SELECT *
+FROM matched
+WHERE address_rank = 1
+ORDER BY distance_miles ASC NULLS LAST, npi
+LIMIT :limit OFFSET :offset
+"""
+
+
+def _membership_geo_sql(
+    args: dict[str, Any],
+    *,
+    uses_unified_addresses: bool,
+    parameter_map: dict[str, Any],
+) -> tuple[str, list[str]] | None:
+    """Build distance projection and indexable geo predicates."""
+    has_geo_filter = args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null")
+    if not has_geo_filter:
+        if args.get("radius_miles") not in (None, "", "null"):
+            return None
+        return "NULL::double precision", []
+    try:
+        geo_lat = float(args.get("lat"))
+        geo_long = float(args.get("long"))
+        geo_radius = max(float(args.get("radius_miles") or 25.0), 0.0)
+    except (TypeError, ValueError):
+        return None
+    parameter_map.update(
+        geo_lat=geo_lat,
+        geo_long=geo_long,
+        geo_radius_miles=geo_radius,
+        geo_min_lat=geo_lat - geo_radius / 69.0,
+        geo_max_lat=geo_lat + geo_radius / 69.0,
+        geo_min_long=geo_long - geo_radius / 69.0,
+        geo_max_long=geo_long + geo_radius / 69.0,
+    )
+    distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
+    if uses_unified_addresses:
+        return distance_sql, [
+            "addr.lat IS NOT NULL",
+            "addr.long IS NOT NULL",
+            "COALESCE(addr.address_precision, '') <> 'city_zip'",
+            _ptg2_geo_dwithin_sql("addr.lat", "addr.long"),
+        ]
+    return distance_sql, [
+        "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat",
+        "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long",
+        f"{distance_sql} <= CAST(:geo_radius_miles AS double precision)",
+    ]
+
+
+def _membership_filter_sql(
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    uses_unified_addresses: bool,
+    address_zip5_sql: str,
+    parameter_map: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Build address filters while preserving ZIP-or-radius semantics."""
+    filter_clauses = ["addr.npi IS NOT NULL", "addr.type = ANY(CAST(:address_types AS varchar[]))"]
+    if candidate_npis is not None:
+        if not candidate_npis:
+            return None
+        filter_clauses.append("addr.npi = ANY(CAST(:candidate_npis AS bigint[]))")
+        parameter_map["candidate_npis"] = list(candidate_npis)
+    state_code = str(args.get("state") or "").strip().upper()
+    city_name = str(args.get("city") or "").strip().upper()
+    zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))
+    if state_code:
+        filter_clauses.append("UPPER(COALESCE(addr.state_name, '')) = :state_value")
+        parameter_map["state_value"] = state_code
+    if city_name:
+        filter_clauses.append("UPPER(COALESCE(addr.city_name, '')) = :city_value")
+        parameter_map["city_value"] = city_name
+    geo_sql_parts = _membership_geo_sql(
+        args,
+        uses_unified_addresses=uses_unified_addresses,
+        parameter_map=parameter_map,
+    )
+    if geo_sql_parts is None:
+        return None
+    distance_sql, geo_clauses = geo_sql_parts
+    if zip5:
+        parameter_map["zip5"] = zip5
+        zip_clause = f"{address_zip5_sql} = :zip5"
+        filter_clauses.append(f"({zip_clause} OR ({' AND '.join(geo_clauses)}))" if geo_clauses else zip_clause)
+    elif geo_clauses:
+        filter_clauses.extend(geo_clauses)
+    if args.get("npi") not in (None, "", "null"):
+        try:
+            parameter_map["provider_npi"] = int(args["npi"])
+        except (TypeError, ValueError):
+            return None
+        filter_clauses.append("addr.npi = :provider_npi")
+    return " AND ".join(filter_clauses), distance_sql
+
+
+async def _membership_location_query(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+    offset: int = 0,
+) -> _MembershipLocationQuery | None:
+    provider_npi_scope_table = _safe_table_name(serving_tables.provider_npi_scope_table)
+    if not provider_npi_scope_table:
+        return None
+    has_geo_filter = args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null")
+    address_table = await _ptg2_address_serving_table(
+        session,
+        _PTG2_UNIFIED_ADDRESS_COLUMNS if has_geo_filter else _PTG2_LEGACY_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
+    if not address_table:
+        return None
+    uses_unified_addresses = _is_unified_address_table(address_table)
+    parameter_map: dict[str, Any] = {
+        "limit": max(int(limit), 1),
+        "offset": max(int(offset), 0),
+        "address_types": ["practice", "primary", "secondary", "site"]
+        if uses_unified_addresses
+        else ["primary", "secondary"],
+    }
+    filter_sql_parts = _membership_filter_sql(
+        args,
+        candidate_npis=candidate_npis,
+        uses_unified_addresses=uses_unified_addresses,
+        address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
+        parameter_map=parameter_map,
+    )
+    if filter_sql_parts is None:
+        return None
+    filter_sql, distance_sql = filter_sql_parts
+    return _MembershipLocationQuery(
+        address_table=address_table,
+        npi_scope_table=provider_npi_scope_table,
+        filter_sql=filter_sql,
+        parameter_map=parameter_map,
+        distance_sql=distance_sql,
+    )
+
+
+async def _membership_location_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """Read address candidates scoped to NPIs represented by the snapshot."""
+    if candidate_npis == ():
+        return []
+    query_context = await _membership_location_query(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=candidate_npis,
+        limit=limit,
+        offset=offset,
+    )
+    if query_context is None:
+        return None
+    location_statement = text(
+        _MEMBERSHIP_LOCATION_SQL.format(
+            location_hash_sql=_ptg2_address_location_hash_sql("addr", query_context.address_table),
+            distance_sql=query_context.distance_sql,
+            address_table=query_context.address_table,
+            npi_scope_table=query_context.npi_scope_table,
+            filter_sql=query_context.filter_sql,
+        )
+    )
+    query_result = await session.execute(location_statement, query_context.parameter_map)
+    return [_row_mapping(query_row) for query_row in query_result]
+
+
+@dataclass
+class _GraphLocationCandidates:
+    location_rows: list[dict[str, Any]]
+    group_ids_by_npi: dict[int, set[str]]
+
+
+async def _direct_group_ids_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    rate_scope: _ManifestRateScope,
+) -> dict[int, set[str]] | None:
+    """Expand a bounded rate group scope directly into its member NPIs."""
+    if not rate_scope.group_ids or len(rate_scope.group_ids) > 1024:
+        return None
+    member_ids_by_group = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_group_npi",
+        rate_scope.group_ids,
+    )
+    group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
+    for group_id, member_ids in member_ids_by_group.items():
+        for member_id in member_ids:
+            npi = _ptg2_npi_from_member_id(member_id)
+            if npi is not None:
+                group_ids_by_npi[npi].add(group_id)
+    return group_ids_by_npi if len(group_ids_by_npi) <= 200_000 else None
+
+
+async def _paged_graph_candidates(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    rate_scope: _ManifestRateScope,
+    candidate_limit: int,
+) -> _GraphLocationCandidates | None:
+    """Scan indexed addresses in bounded pages and reverse-check graph membership."""
+    batch_size = min(max(candidate_limit * 20, 1000), 10_000)
+    max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
+    candidate_offset = 0
+    matched_location_rows: list[dict[str, Any]] = []
+    group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
+    while candidate_offset < max_candidates and len(matched_location_rows) < candidate_limit:
+        candidate_location_rows = await _membership_location_rows(
+            session,
+            serving_tables,
+            args,
+            candidate_npis=None,
+            limit=batch_size,
+            offset=candidate_offset,
+        )
+        if candidate_location_rows is None:
+            return None
+        if not candidate_location_rows:
+            break
+        candidate_offset += len(candidate_location_rows)
+        owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in candidate_location_rows)
+        group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+            session,
+            serving_tables,
+            "provider_npi_group",
+            owner_ids,
+        )
+        for location_data, owner_id in zip(candidate_location_rows, owner_ids):
+            npi = int(location_data["npi"])
+            matching_group_ids = {
+                group_id
+                for group_id in group_ids_by_owner.get(owner_id, ())
+                if _has_rate_scope_group(rate_scope, group_id)
+            }
+            if matching_group_ids:
+                group_ids_by_npi[npi].update(matching_group_ids)
+                matched_location_rows.append(location_data)
+        if len(candidate_location_rows) < batch_size:
+            break
+    return _GraphLocationCandidates(matched_location_rows, group_ids_by_npi)
+
+
+async def _graph_location_candidates(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    rate_scope: _ManifestRateScope,
+    candidate_limit: int,
+) -> _GraphLocationCandidates | None:
+    """Choose direct or address-first traversal based on rate-scope cardinality."""
+    direct_groups_by_npi = await _direct_group_ids_by_npi(session, serving_tables, rate_scope)
+    if direct_groups_by_npi is None:
+        return await _paged_graph_candidates(session, serving_tables, args, rate_scope, candidate_limit)
+    location_rows = await _membership_location_rows(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=tuple(direct_groups_by_npi),
+        limit=max(candidate_limit * 20, 1000),
+    )
+    if location_rows is None:
+        return None
+    return _GraphLocationCandidates(location_rows, direct_groups_by_npi)
+
+
+async def _taxonomy_filtered_candidates(
+    session,
+    args: dict[str, Any],
+    candidates: _GraphLocationCandidates,
+    candidate_limit: int,
+) -> _GraphLocationCandidates:
+    """Apply provider taxonomy filters after graph membership resolution."""
+    if not candidates.location_rows:
+        return candidates
+    matching_npis = set(
+        await _ptg2_manifest_filter_npis_by_provider_taxonomy(
+            session,
+            args,
+            tuple(int(location["npi"]) for location in candidates.location_rows),
+            limit=len(candidates.location_rows),
+        )
+    )
+    filtered_location_rows = [
+        location
+        for location in candidates.location_rows
+        if int(location["npi"]) in matching_npis
+    ][:candidate_limit]
+    filtered_groups_by_npi = {
+        int(location["npi"]): candidates.group_ids_by_npi.get(int(location["npi"]), set())
+        for location in filtered_location_rows
+    }
+    return _GraphLocationCandidates(filtered_location_rows, filtered_groups_by_npi)
+
+
+def _graph_provider_data(
+    location_data: dict[str, Any],
+    enriched_data: dict[str, Any] | None,
+    location_source: str,
+) -> dict[str, Any]:
+    """Overlay the matched location without erasing richer contact values."""
+    npi = int(location_data["npi"])
+    provider_data_map = dict(enriched_data or {"npi": npi, "provider_name": "TiC provider"})
+    location_fields = ("distance_miles", "location_hash")
+    if _has_street_address_payload(location_data.get("address_payload")) or not _has_street_address_payload(
+        provider_data_map.get("address_payload")
+    ):
+        location_fields += ("state", "city", "zip5", "address_payload")
+    provider_data_map.update({field: location_data.get(field) for field in location_fields})
+    contact_fields = (
+        "telephone_number",
+        "fax_number",
+        "phone_number",
+        "phone_extension",
+        "fax_number_digits",
+        "fax_extension",
+    )
+    provider_data_map.update(
+        {field: location_data.get(field) for field in contact_fields if location_data.get(field) is not None}
+    )
+    provider_data_map["location_source"] = location_source
+    provider_data_map["location_confidence_code"] = location_source
+    return provider_data_map
+
+
+def _has_street_address_payload(address_payload: Any) -> bool:
+    if not address_payload:
+        return False
+    try:
+        address_data = json.loads(address_payload) if isinstance(address_payload, str) else address_payload
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(address_data, dict):
+        return False
+    return bool(str(address_data.get("first_line") or "").strip())
+
+
+def _graph_providers_by_set(
+    candidates: _GraphLocationCandidates,
+    provider_data_by_npi: dict[int, dict[str, Any]],
+    provider_sets_by_group: dict[str, tuple[str, ...]],
+    location_source: str,
+) -> tuple[set[str], dict[str, list[dict[str, Any]]]]:
+    """Project matched graph groups back onto priced provider sets."""
+    provider_set_ids: set[str] = set()
+    providers_by_set: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_npis_by_set: dict[str, set[int]] = defaultdict(set)
+    for location_data in candidates.location_rows:
+        npi = int(location_data["npi"])
+        provider_data = _graph_provider_data(location_data, provider_data_by_npi.get(npi), location_source)
+        for group_id in candidates.group_ids_by_npi.get(npi, ()):
+            for provider_set_id in provider_sets_by_group.get(group_id, ()):
+                if npi in seen_npis_by_set[provider_set_id]:
+                    continue
+                seen_npis_by_set[provider_set_id].add(npi)
+                provider_set_ids.add(provider_set_id)
+                providers_by_set[provider_set_id].append(provider_data)
+    return provider_set_ids, dict(providers_by_set)
+
+
+async def _project_graph_candidates(
+    session,
+    serving_tables: PTG2ServingTables,
+    candidates: _GraphLocationCandidates,
+    *,
+    plan_id: str,
+    snapshot_id: str | None,
+    source_key: str | None,
+) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
+    """Enrich candidate NPIs and map their groups to provider sets."""
+    group_ids = tuple(
+        dict.fromkeys(
+            group_id
+            for matching_group_ids in candidates.group_ids_by_npi.values()
+            for group_id in matching_group_ids
+        )
+    )
+    provider_sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
+    if provider_sets_by_group is None:
+        return None
+    enriched_provider_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=tuple(int(location["npi"]) for location in candidates.location_rows),
+        limit=len(candidates.location_rows),
+        plan_id=plan_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key or serving_tables.source_key,
+    )
+    provider_data_by_npi = {
+        int(provider_data["npi"]): provider_data
+        for provider_data in enriched_provider_rows or []
+    }
+    address_table = await _ptg2_address_serving_table(
+        session,
+        _PTG2_LEGACY_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
+    location_source = _ptg2_address_location_source(address_table or f"{PTG2_SCHEMA}.npi_address")
+    return _graph_providers_by_set(candidates, provider_data_by_npi, provider_sets_by_group, location_source)
+
+
+async def _graph_location_matches(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    candidate_limit: int,
+    plan_id: str,
+    snapshot_id: str | None = None,
+    source_key: str | None = None,
+) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
+    """Resolve geo-filtered provider sets through normalized membership artifacts."""
+    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_code = (
+        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
+        if requested_system
+        else str(args.get("code") or args.get("reported_code") or "").strip()
+    )
+    if not plan_id or not requested_code:
+        return None
+    rate_scope = await _manifest_rate_scope_from_sidecar(
+        session,
+        serving_tables,
+        serving_table=_safe_table_name(serving_tables.serving_table),
+        plan_id=plan_id,
+        reported_code=requested_code,
+        code_system=requested_system,
+    )
+    if rate_scope.id_count == 0:
+        return set(), {}
+    candidates = await _graph_location_candidates(
+        session,
+        serving_tables,
+        args,
+        rate_scope,
+        candidate_limit,
+    )
+    if candidates is None:
+        return None
+    filtered_candidates = await _taxonomy_filtered_candidates(session, args, candidates, candidate_limit)
+    if not filtered_candidates.location_rows:
+        return set(), {}
+    return await _project_graph_candidates(
+        session,
+        serving_tables,
+        filtered_candidates,
+        plan_id=plan_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
+
+
 async def _ptg2_manifest_location_provider_matches(
     session,
     serving_tables: PTG2ServingTables,
@@ -5092,6 +5743,21 @@ async def _ptg2_manifest_location_provider_matches(
     snapshot_id: str | None = None,
     source_key: str | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
+    if _has_membership_graph(serving_tables):
+        graph_candidate_limit = _ptg2_manifest_location_match_limit()
+        if candidate_limit is not None:
+            graph_candidate_limit = min(graph_candidate_limit, max(int(candidate_limit), 1))
+        graph_result = await _graph_location_matches(
+            session,
+            serving_tables,
+            args,
+            candidate_limit=graph_candidate_limit,
+            plan_id=str(plan_id or args.get("plan_id") or args.get("plan_external_id") or "").strip(),
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+        )
+        if graph_result is not None:
+            return graph_result
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if (
         not provider_group_member_table
@@ -6163,6 +6829,7 @@ async def _ptg2_manifest_provider_rows_for_provider_set(
         session,
         serving_tables,
         provider_set_global_id,
+        limit=limit,
     )
     if provider_npis:
         return await _ptg2_manifest_enriched_provider_rows_for_npis(session, npis=provider_npis, limit=limit)
@@ -6309,6 +6976,9 @@ async def _ptg2_manifest_provider_sets_for_npi(
     serving_tables: PTG2ServingTables,
     npi: int,
 ) -> tuple[str, ...] | None:
+    graph_provider_sets = await _provider_sets_from_membership_graph(session, serving_tables, npi)
+    if graph_provider_sets is not None:
+        return graph_provider_sets
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if (
         not provider_group_member_table
@@ -6343,6 +7013,39 @@ async def _ptg2_manifest_provider_sets_for_npi(
         sorted({provider_set_id for provider_set_ids in sets_by_group.values() for provider_set_id in provider_set_ids})
     )
     return provider_set_ids
+
+
+async def _provider_sets_from_membership_graph(
+    session,
+    serving_tables: PTG2ServingTables,
+    npi: int,
+) -> tuple[str, ...] | None:
+    """Resolve reverse NPI membership when a normalized graph is available."""
+    if not (
+        _ptg2_manifest_artifact_entry(serving_tables, "provider_npi_group")
+        and _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
+    ):
+        return None
+    group_ids = await _ptg2_manifest_sidecar_members_async(
+        session,
+        serving_tables,
+        "provider_npi_group",
+        _ptg2_npi_member_id(npi),
+    )
+    if not group_ids:
+        return ()
+    provider_sets_by_group = await _manifest_sets_by_group(session, serving_tables, group_ids)
+    if provider_sets_by_group is None:
+        return None
+    return tuple(
+        sorted(
+            {
+                provider_set_id
+                for provider_set_ids in provider_sets_by_group.values()
+                for provider_set_id in provider_set_ids
+            }
+        )
+    )
 
 
 async def _ptg2_manifest_procedure_details_for_rows(
@@ -6432,7 +7135,13 @@ async def _search_ptg2_manifest_db_serving_table(
     unsupported_filters = args.get("q")
     if unsupported_filters or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
-    has_provider_npi_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_npi"))
+    has_provider_npi_sidecar = bool(
+        _ptg2_manifest_artifact_entry(serving_tables, "provider_npi")
+        or (
+            _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
+            and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
+        )
+    )
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
         return None
 

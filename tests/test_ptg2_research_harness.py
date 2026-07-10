@@ -769,6 +769,24 @@ def test_large_fixture_can_add_bulky_rate_payload():
     assert len(price["additional_information"]) == 128
 
 
+def test_large_fixture_can_omit_npi_members(tmp_path):
+    fixture_map = {
+        "id": "tin-only",
+        "fixture": "large_in_network",
+        "negotiated_rates": 4,
+        "provider_sets": 2,
+        "omit_provider_npis": True,
+    }
+    fixture_dir = tmp_path / "fixture"
+    harness.write_ptg_toc_fixture(fixture_map, fixture_dir, base_url="http://127.0.0.1:1")
+
+    summary = harness.expected_original_file_summary(fixture_dir / "rates.json.gz")
+
+    assert summary["negotiated_prices"] == 4
+    assert summary["unique_serving_rates"] == 4
+    assert summary["unique_provider_npis"] == 0
+
+
 def test_large_fixture_can_shape_codes_and_reused_prices(tmp_path):
     payload = harness.build_fixture_payload(
         {
@@ -820,6 +838,20 @@ def test_serving_index_table_reads_materialized_table_names():
     assert harness.serving_index_table(serving_index, "table", "serving_table") == "mrf.ptg2_serving_snap"
     assert harness.serving_index_table(serving_index, "price_atom_table") == "mrf.ptg2_price_atom_snap"
     assert harness.serving_index_table(serving_index, "provider_group_member_table") == "mrf.ptg2_provider_group_member_snap"
+
+
+def test_serving_index_table_reads_v2_provider_scope():
+    serving_index = {
+        "materialized_tables": {
+            "provider_npi_scope": "mrf.ptg2_provider_npi_scope_snap",
+        }
+    }
+
+    assert harness.serving_index_table(
+        serving_index,
+        "provider_group_member_table",
+        "provider_npi_scope_table",
+    ) == "mrf.ptg2_provider_npi_scope_snap"
 
 
 def test_serving_index_expectations_check_tableless_postgres_binary(monkeypatch):

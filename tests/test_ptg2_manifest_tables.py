@@ -140,6 +140,33 @@ async def test_snapshot_serving_tables_reads_postgres_binary_serving_table():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_serving_tables_reads_v2_membership_scope():
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "arch_version": "postgres_binary_v2",
+                    "provider_scope_strategy": "sidecar_provider_scope",
+                    "serving_binary_table": "mrf.ptg2_serving_binary_snap",
+                    "provider_npi_scope_table": "mrf.ptg2_provider_npi_scope_snap",
+                    "materialized_tables": {
+                        "serving_binary": "mrf.ptg2_serving_binary_snap",
+                        "provider_npi_scope": "mrf.ptg2_provider_npi_scope_snap",
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-binary-v2")
+
+    assert tables.effective_arch_version == "postgres_binary_v2"
+    assert tables.uses_sidecar_provider_scope is True
+    assert tables.provider_npi_scope_table == "mrf.ptg2_provider_npi_scope_snap"
+
+
+@pytest.mark.asyncio
 async def test_snapshot_serving_tables_does_not_resolve_manifest_snapshot_to_fallback_table():
     session = FakeSession(
         [

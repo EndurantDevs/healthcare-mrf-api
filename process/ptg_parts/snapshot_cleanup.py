@@ -39,6 +39,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         serving_index.get("provider_set_entry_table"),
         serving_index.get("provider_entry_component_table"),
         serving_index.get("provider_group_member_table"),
+        serving_index.get("provider_npi_scope_table"),
         serving_index.get("provider_group_location_table"),
         serving_index.get("provider_group_rate_scope_table"),
         serving_index.get("code_count_table"),
@@ -55,6 +56,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         "ptg2_provider_set_entry_",
         "ptg2_provider_entry_component_",
         "ptg2_provider_group_member_",
+        "ptg2_provider_npi_scope_",
         "ptg2_provider_group_location_",
         "ptg2_provider_group_rate_scope_",
     )

@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +128,8 @@ from process.ptg_parts.config import (
     PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
     TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
     TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
-    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1,
+    PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2,
+    _is_postgres_binary_snapshot_arch,
     _ptg2_snapshot_arch_from_env, _ptg2_snapshot_arch_variant,
     _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
     _use_rust_compact_serving, _use_serving_only_import,
@@ -211,6 +212,7 @@ from process.ptg_parts.ptg2_manifest_publish import (
     _copy_ptg2_manifest_code_count_file,
     _copy_ptg2_manifest_price_atom_file,
     _copy_ptg2_manifest_provider_group_member_file,
+    _copy_provider_npi_scope_file,
     _copy_ptg2_manifest_provider_set_dictionary_file,
     _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
@@ -557,6 +559,60 @@ def _ptg2_manifest_copy_merge_command(kind: str, output_path: Path, input_paths:
         str(output_path),
         *[str(path) for path in input_paths],
     ]
+
+
+def _ptg2_provider_membership_sidecar_command(
+    *,
+    provider_group_npi_path: Path,
+    provider_npi_group_path: Path,
+    provider_npi_scope_copy_path: Path,
+    input_paths: list[Path],
+) -> list[str]:
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
+        raise RuntimeError(
+            "PTG2 provider membership sidecars require the Rust scanner binary; "
+            "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
+        )
+    return [
+        str(binary),
+        "--provider-membership-sidecars",
+        str(provider_group_npi_path),
+        str(provider_npi_group_path),
+        str(provider_npi_scope_copy_path),
+        *[str(path) for path in input_paths],
+    ]
+
+
+async def _build_ptg2_provider_membership_sidecars(
+    *,
+    provider_group_npi_path: Path,
+    provider_npi_group_path: Path,
+    provider_npi_scope_copy_path: Path,
+    input_paths: list[Path],
+) -> dict[str, Any]:
+    existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
+    command = _ptg2_provider_membership_sidecar_command(
+        provider_group_npi_path=provider_group_npi_path,
+        provider_npi_group_path=provider_npi_group_path,
+        provider_npi_scope_copy_path=provider_npi_scope_copy_path,
+        input_paths=existing_paths,
+    )
+
+    def _invoke_scanner() -> subprocess.CompletedProcess[bytes]:
+        """Run the scanner without blocking the import event loop."""
+        return subprocess.run(command, check=True, capture_output=True)
+
+    completed = await asyncio.to_thread(_invoke_scanner)
+    try:
+        header, rest = completed.stdout.split(b"\n", 1)
+        record_kind, length_bytes = header.split(b"\t", 1)
+        summary_json = rest[: int(length_bytes)]
+        if record_kind != b"provider_membership_sidecars":
+            raise ValueError(f"unexpected record kind: {record_kind!r}")
+        return json.loads(summary_json)
+    except Exception as exc:
+        raise RuntimeError("PTG2 provider membership sidecar builder returned invalid output") from exc
 
 
 def _manifest_merge_summary_from_stdout(
@@ -1015,6 +1071,7 @@ async def _merge_and_copy_ptg2_manifest_files(
         "price_atom",
         "price_set_atom",
         "provider_group_member",
+        "provider_npi_scope",
         "code_count",
         "provider_set_dictionary",
     ]
@@ -1032,15 +1089,17 @@ async def _merge_and_copy_ptg2_manifest_files(
     price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
     price_set_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_set_atom")
     provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
+    provider_npi_scope_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_npi_scope")
     code_count_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "code_count")
     provider_set_dictionary_table = _ptg2_manifest_support_stage_table(
         manifest_stage_table,
         "provider_set_dictionary",
     )
     has_price_set_atom_files = bool(copy_files_by_kind.get("price_set_atom"))
-    binary_snapshot_arch = _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+    binary_snapshot_arch = _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
     direct_copy_default = binary_snapshot_arch
-    if _env_bool(PTG2_MANIFEST_DIRECT_COPY_FILES_ENV, direct_copy_default):
+    use_provider_membership_graph = _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
+    if use_provider_membership_graph or _env_bool(PTG2_MANIFEST_DIRECT_COPY_FILES_ENV, direct_copy_default):
         merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
         progress_total = 6 if has_price_set_atom_files else 5
         try:
@@ -1073,15 +1132,28 @@ async def _merge_and_copy_ptg2_manifest_files(
                     total_steps=progress_total,
                     emitted_rows=emitted_rows_by_kind.get("price_set_atom"),
                 )
-            provider_group_member_metrics = await _copy_manifest_files_direct_with_progress(
-                "provider_group_member",
-                target_table=provider_group_member_table,
-                input_paths=copy_files_by_kind["provider_group_member"],
-                copy_func=_copy_ptg2_manifest_provider_group_member_file,
-                completed_steps_before_copy=3 if has_price_set_atom_files else 2,
-                total_steps=progress_total,
-                emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
-            )
+            if use_provider_membership_graph:
+                provider_group_member_metrics_map = {"skipped": "postgres_binary_v2_membership_graph"}
+                provider_scope_metrics_map = await _copy_manifest_files_direct_with_progress(
+                    "provider_npi_scope",
+                    target_table=provider_npi_scope_table,
+                    input_paths=copy_files_by_kind["provider_npi_scope"],
+                    copy_func=_copy_provider_npi_scope_file,
+                    completed_steps_before_copy=3 if has_price_set_atom_files else 2,
+                    total_steps=progress_total,
+                    emitted_rows=emitted_rows_by_kind.get("provider_npi_scope"),
+                )
+            else:
+                provider_group_member_metrics_map = await _copy_manifest_files_direct_with_progress(
+                    "provider_group_member",
+                    target_table=provider_group_member_table,
+                    input_paths=copy_files_by_kind["provider_group_member"],
+                    copy_func=_copy_ptg2_manifest_provider_group_member_file,
+                    completed_steps_before_copy=3 if has_price_set_atom_files else 2,
+                    total_steps=progress_total,
+                    emitted_rows=emitted_rows_by_kind.get("provider_group_member"),
+                )
+                provider_scope_metrics_map = None
             code_count_metrics = await _copy_manifest_files_direct_with_progress(
                 "code_count",
                 target_table=code_count_table,
@@ -1103,10 +1175,12 @@ async def _merge_and_copy_ptg2_manifest_files(
             merge_metrics["kinds"] = {
                 manifest_serving_copy_kind: serving_metrics,
                 "price_atom": price_atom_metrics,
-                "provider_group_member": provider_group_member_metrics,
+                "provider_group_member": provider_group_member_metrics_map,
                 "code_count": code_count_metrics,
                 "provider_set_dictionary": provider_set_dictionary_metrics,
             }
+            if provider_scope_metrics_map is not None:
+                merge_metrics["kinds"]["provider_npi_scope"] = provider_scope_metrics_map
             if price_set_atom_metrics is not None:
                 merge_metrics["kinds"]["price_set_atom"] = price_set_atom_metrics
             merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
@@ -1300,7 +1374,7 @@ async def _parse_in_network_file_serving_only(
     plan_fields = _derive_plan_fields(meta, plan_info)
     source_network_name_values = _normalize_source_network_names(source_network_names)
     arch_version = _ptg2_snapshot_arch_from_env()
-    use_postgres_binary_arch = arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+    use_postgres_binary_arch = _is_postgres_binary_snapshot_arch(arch_version)
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
     source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
@@ -1318,7 +1392,8 @@ async def _parse_in_network_file_serving_only(
     rust_scanner_config: dict[str, Any] = {}
     rust_scanner_summary: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
-    defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True)
+    use_provider_membership_graph = arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V2
+    defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True) or use_provider_membership_graph
     use_direct_lean_copy = _use_direct_lean_manifest_copy()
     manifest_serving_copy_kind = "manifest_lean_serving" if use_direct_lean_copy else "manifest_serving"
     manifest_serving_record_kind = (
@@ -1332,6 +1407,7 @@ async def _parse_in_network_file_serving_only(
         "price_atom": [],
         "price_set_atom": [],
         "provider_group_member": [],
+        "provider_npi_scope": [],
         "code_count": [],
         "provider_set_dictionary": [],
     }
@@ -1391,13 +1467,26 @@ async def _parse_in_network_file_serving_only(
     )
     manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
-    provider_npi_sidecar_enabled = _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
+    provider_npi_sidecar_enabled = (
+        not use_provider_membership_graph
+        and _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
+    )
     manifest_sidecar_paths = {
         "provider_forward": manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
         "provider_inverted": manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
         "provider_npi": (
             manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc"
             if provider_npi_sidecar_enabled
+            else None
+        ),
+        "provider_group_npi": (
+            manifest_artifact_dir / f"provider_group_npi_{manifest_file_token}.ptg2sc"
+            if use_provider_membership_graph
+            else None
+        ),
+        "provider_npi_group": (
+            manifest_artifact_dir / f"provider_npi_group_{manifest_file_token}.ptg2sc"
+            if use_provider_membership_graph
             else None
         ),
         "price_forward": (
@@ -1597,6 +1686,27 @@ async def _parse_in_network_file_serving_only(
                     logger.debug("Failed to remove PTG2 manifest copy file %s", copy_path, exc_info=True)
                 _cleanup_empty_manifest_copy_siblings(copy_path)
 
+    membership_graph_metrics_map: dict[str, Any] = {}
+    if use_provider_membership_graph:
+        provider_npi_scope_copy_path = _new_copy_path("ptg2_manifest_provider_npi_scope_")
+        provider_group_member_paths = [
+            Path(copy_metadata["path"])
+            for copy_metadata in deferred_copy_files["provider_group_member"]
+            if copy_metadata.get("path")
+        ]
+        membership_graph_metrics_map = await _build_ptg2_provider_membership_sidecars(
+            provider_group_npi_path=manifest_sidecar_paths["provider_group_npi"],
+            provider_npi_group_path=manifest_sidecar_paths["provider_npi_group"],
+            provider_npi_scope_copy_path=provider_npi_scope_copy_path,
+            input_paths=provider_group_member_paths,
+        )
+        deferred_copy_files["provider_npi_scope"].append(
+            {
+                "path": str(provider_npi_scope_copy_path),
+                "row_count": int(membership_graph_metrics_map.get("npi_scope_count") or 0),
+            }
+        )
+
     await flush_error_log(import_log_cls)
     manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(manifest_sidecar_paths)
     summary = {
@@ -1620,6 +1730,7 @@ async def _parse_in_network_file_serving_only(
             },
             "copy_files": deferred_copy_files if defer_manifest_copy else {},
             "precopy_merge_deferred": defer_manifest_copy,
+            "membership_graph": membership_graph_metrics_map,
         },
     }
     if rust_dedupe_summary:
@@ -1632,6 +1743,18 @@ async def _parse_in_network_file_serving_only(
     _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
     logger.info("PTG2 serving-only import summary: %s", summary)
     return summary
+
+
+@dataclass
+class _StageTimer:
+    durations_by_stage: dict[str, float]
+    started_monotonic: float
+
+    def mark(self, stage_name: str) -> None:
+        """Record elapsed time and advance the stage boundary."""
+        now_monotonic = time.monotonic()
+        self.durations_by_stage[stage_name] = now_monotonic - self.started_monotonic
+        self.started_monotonic = now_monotonic
 
 
 async def _parse_in_network_items(
@@ -3096,13 +3219,7 @@ async def main(
         import_run_id=import_run_id,
     )
     setup_stage_timings: dict[str, float] = {}
-    setup_stage_started_monotonic = import_started_monotonic
-
-    def mark_setup_stage(stage_name: str) -> None:
-        nonlocal setup_stage_started_monotonic
-        now_monotonic = time.monotonic()
-        setup_stage_timings[stage_name] = now_monotonic - setup_stage_started_monotonic
-        setup_stage_started_monotonic = now_monotonic
+    setup_stage_timer = _StageTimer(setup_stage_timings, import_started_monotonic)
 
     source_network_name_values = _normalize_source_network_names(source_network_names)
     # Enforce a streaming size cap on every caller-supplied URL (never None for
@@ -3117,9 +3234,9 @@ async def main(
                 logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
     write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
     await ensure_database(test_mode)
-    mark_setup_stage("ensure_database")
+    setup_stage_timer.mark("ensure_database")
     await ensure_ptg2_tables()
-    mark_setup_stage("ensure_ptg2_tables")
+    setup_stage_timer.mark("ensure_ptg2_tables")
     compact_import = True
     source_scoped_compact = True
     if source_key_val is None:
@@ -3190,7 +3307,7 @@ async def main(
         PTG2Snapshot,
         rewrite=True,
     )
-    mark_setup_stage("initial_status_rows")
+    setup_stage_timer.mark("initial_status_rows")
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
     ptg2_manifest_stage_table: str | None = None
     current_pointer_published = False
@@ -3215,6 +3332,7 @@ async def main(
                             ptg2_manifest_stage_table,
                             _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
                             _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
+                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_npi_scope"),
                         ]
                     )
             except Exception:
@@ -3234,9 +3352,9 @@ async def main(
         write_live_progress(phase="planning", pct=3, message="planning PTG files")
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
         ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
-        mark_setup_stage("manifest_stage_table")
+        setup_stage_timer.mark("manifest_stage_table")
         initial_dynamic_table_names: set[str] | None = None
-        if snapshot_arch_version == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1 and compact_import:
+        if _is_postgres_binary_snapshot_arch(snapshot_arch_version) and compact_import:
             initial_dynamic_table_names = set(PTG_CONTROL_TABLE_CLASS_NAMES)
         classes = await _prepare_ptg_tables(
             import_id_val,
@@ -3247,7 +3365,7 @@ async def main(
             prepared_dynamic_table_names = set(classes)
         else:
             prepared_dynamic_table_names = set(initial_dynamic_table_names)
-        mark_setup_stage("legacy_dynamic_tables")
+        setup_stage_timer.mark("legacy_dynamic_tables")
 
         async def ensure_dynamic_tables(class_names: set[str] | frozenset[str]) -> None:
             missing_names = set(class_names) - prepared_dynamic_table_names
@@ -3638,7 +3756,7 @@ async def main(
         ]
         scanner_dedupe_guarded = (
             len(serving_successful_files) == 1
-            and _ptg2_snapshot_arch_from_env() == PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V1
+            and _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
         )
         assert source_key_val is not None
         if has_serving_files:
@@ -3701,13 +3819,10 @@ async def main(
         publish_seconds = time.monotonic() - publish_started_monotonic
         post_publish_prepare_started_monotonic = time.monotonic()
         post_publish_stage_timings: dict[str, float] = {}
-        post_publish_stage_started_monotonic = post_publish_prepare_started_monotonic
-
-        def mark_post_publish_stage(stage_name: str) -> None:
-            nonlocal post_publish_stage_started_monotonic
-            now_monotonic = time.monotonic()
-            post_publish_stage_timings[stage_name] = now_monotonic - post_publish_stage_started_monotonic
-            post_publish_stage_started_monotonic = now_monotonic
+        post_publish_stage_timer = _StageTimer(
+            post_publish_stage_timings,
+            post_publish_prepare_started_monotonic,
+        )
 
         finished = _utcnow()
         previous_snapshot_id = None
@@ -3722,12 +3837,12 @@ async def main(
                 global_previous_snapshot_id = row[0]
         except Exception as exc:
             logger.debug("No PTG2 current snapshot found before publish: %s", exc)
-        mark_post_publish_stage("current_snapshot_lookup")
+        post_publish_stage_timer.mark("current_snapshot_lookup")
         if source_scoped_compact and source_key_val:
             previous_snapshot_id = await _current_source_snapshot_id(source_key_val)
         else:
             previous_snapshot_id = global_previous_snapshot_id
-        mark_post_publish_stage("source_snapshot_lookup")
+        post_publish_stage_timer.mark("source_snapshot_lookup")
         serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
         setup_seconds = data_started_monotonic - import_started_monotonic
         post_publish_prepare_seconds = time.monotonic() - post_publish_prepare_started_monotonic

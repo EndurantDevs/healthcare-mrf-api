@@ -8631,6 +8631,117 @@ fn write_serving_sidecar_from_key_copy(
     emit_json_record(&mut io::stdout().lock(), "serving_sidecar_file", &payload)
 }
 
+fn global_id_from_hex_bytes(value: &[u8]) -> io::Result<GlobalId128> {
+    if value.len() != GLOBAL_ID_BYTES * 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider group global id must contain 32 hex characters",
+        ));
+    }
+    let mut decoded = [0u8; GLOBAL_ID_BYTES];
+    for (index, pair) in value.chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid provider group global id",
+            )
+        })? as u8;
+        let low = (pair[1] as char).to_digit(16).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid provider group global id",
+            )
+        })? as u8;
+        decoded[index] = (high << 4) | low;
+    }
+    Ok(GlobalId128(decoded))
+}
+
+fn write_provider_membership_sidecars(
+    group_npi_path: &Path,
+    npi_group_path: &Path,
+    npi_scope_copy_path: &Path,
+    input_paths: &[String],
+) -> io::Result<()> {
+    let mut group_npi_pairs = ManifestPairSpool::new("provider_group_npi")?;
+    let mut npi_group_pairs = ManifestPairSpool::new("provider_npi_group")?;
+    let mut npis = HashSet::new();
+    let mut input_rows = 0u64;
+    for input_path in input_paths {
+        let file = match File::open(input_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line)? > 0 {
+            while matches!(line.last().copied(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            let mut fields = line.splitn(3, |byte| *byte == b'\t');
+            let group_value = fields.next().unwrap_or_default();
+            let npi_value = fields.next().unwrap_or_default();
+            if group_value.is_empty() || npi_value.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider membership COPY row must contain group id and NPI",
+                ));
+            }
+            let provider_group_id = global_id_from_hex_bytes(group_value)?;
+            let npi_text = std::str::from_utf8(npi_value).map_err(to_io_error)?;
+            let npi = npi_text.parse::<i64>().map_err(to_io_error)?;
+            if npi > 0 {
+                let provider_npi_id = npi_member_id(npi);
+                group_npi_pairs.push(provider_group_id, provider_npi_id)?;
+                npi_group_pairs.push(provider_npi_id, provider_group_id)?;
+                npis.insert(npi);
+            }
+            input_rows = input_rows.saturating_add(1);
+            line.clear();
+        }
+    }
+
+    let group_npi_text = group_npi_path.to_string_lossy();
+    let npi_group_text = npi_group_path.to_string_lossy();
+    let (group_count, membership_count) =
+        group_npi_pairs.write_dense_sidecar(group_npi_text.as_ref())?;
+    let (npi_count, reverse_membership_count) =
+        npi_group_pairs.write_dense_sidecar(npi_group_text.as_ref())?;
+    if membership_count != reverse_membership_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider membership sidecars contain different edge counts",
+        ));
+    }
+
+    let mut sorted_npis: Vec<i64> = npis.into_iter().collect();
+    sorted_npis.sort_unstable();
+    let mut npi_scope_writer = BufWriter::new(File::create(npi_scope_copy_path)?);
+    for npi in &sorted_npis {
+        writeln!(npi_scope_writer, "{npi}")?;
+    }
+    npi_scope_writer.flush()?;
+
+    emit_json_record(
+        &mut io::stdout().lock(),
+        "provider_membership_sidecars",
+        &json!({
+            "input_files": input_paths.len(),
+            "input_rows": input_rows,
+            "membership_count": membership_count,
+            "provider_group_count": group_count,
+            "provider_npi_count": npi_count,
+            "npi_scope_count": sorted_npis.len(),
+            "provider_group_npi_path": group_npi_path.display().to_string(),
+            "provider_group_npi_bytes": group_npi_path.metadata()?.len(),
+            "provider_npi_group_path": npi_group_path.display().to_string(),
+            "provider_npi_group_bytes": npi_group_path.metadata()?.len(),
+            "provider_npi_scope_copy_path": npi_scope_copy_path.display().to_string(),
+        }),
+    )
+}
+
 fn merge_manifest_copy_files(
     kind: &str,
     output_path: &Path,
@@ -8880,6 +8991,81 @@ mod tests {
         assert_eq!(summary["provider_group_member_attempted"], 2);
         assert_eq!(summary["provider_group_member_unique"], 2);
         assert_eq!(summary["provider_group_member_duplicate"], 0);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn provider_membership_sidecars_preserve_both_edge_directions() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-provider-membership-sidecar-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let input_path = base.join("members.copy");
+        let group_npi_path = base.join("group-npi.ptg2sc");
+        let npi_group_path = base.join("npi-group.ptg2sc");
+        let npi_scope_path = base.join("npi-scope.copy");
+        std::fs::write(
+            &input_path,
+            b"00000000000000000000000000000001\t1003002106\n\
+              00000000000000000000000000000001\t1003007311\n\
+              00000000000000000000000000000002\t1003002106\n\
+              00000000000000000000000000000002\t1003002106\n",
+        )
+        .unwrap();
+
+        write_provider_membership_sidecars(
+            &group_npi_path,
+            &npi_group_path,
+            &npi_scope_path,
+            &[input_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let group_payload = std::fs::read(&group_npi_path).unwrap();
+        let npi_payload = std::fs::read(&npi_group_path).unwrap();
+        assert_eq!(&group_payload[..8], b"PTG2MNDS");
+        assert_eq!(&npi_payload[..8], b"PTG2MNDS");
+        assert_eq!(
+            u64::from_le_bytes(group_payload[12..20].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(npi_payload[12..20].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(&npi_scope_path).unwrap(),
+            "1003002106\n1003007311\n"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn provider_membership_sidecars_allow_empty_npi_scope() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-empty-provider-membership-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let group_npi_path = base.join("group-npi.ptg2sc");
+        let npi_group_path = base.join("npi-group.ptg2sc");
+        let npi_scope_path = base.join("npi-scope.copy");
+
+        write_provider_membership_sidecars(&group_npi_path, &npi_group_path, &npi_scope_path, &[])
+            .unwrap();
+
+        for sidecar_path in [&group_npi_path, &npi_group_path] {
+            let sidecar_payload = std::fs::read(sidecar_path).unwrap();
+            assert_eq!(&sidecar_payload[..8], b"PTG2MNDS");
+            assert_eq!(
+                u64::from_le_bytes(sidecar_payload[12..20].try_into().unwrap()),
+                0
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&npi_scope_path).unwrap(), "");
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -9842,6 +10028,33 @@ fn main() -> io::Result<()> {
         })?;
         let input_paths: Vec<String> = args.collect();
         return merge_manifest_copy_files(&kind, Path::new(&output_path), &input_paths);
+    }
+    if first_arg == "--provider-membership-sidecars" {
+        let group_npi_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --provider-membership-sidecars <group_npi_path> <npi_group_path> <npi_scope_copy_path> <member_copy_path>...",
+            )
+        })?;
+        let npi_group_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --provider-membership-sidecars <group_npi_path> <npi_group_path> <npi_scope_copy_path> <member_copy_path>...",
+            )
+        })?;
+        let npi_scope_copy_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --provider-membership-sidecars <group_npi_path> <npi_group_path> <npi_scope_copy_path> <member_copy_path>...",
+            )
+        })?;
+        let input_paths: Vec<String> = args.collect();
+        return write_provider_membership_sidecars(
+            Path::new(&group_npi_path),
+            Path::new(&npi_group_path),
+            Path::new(&npi_scope_copy_path),
+            &input_paths,
+        );
     }
     if first_arg == "--serving-sidecar-from-key-copy" {
         let kind = args.next().ok_or_else(|| {
