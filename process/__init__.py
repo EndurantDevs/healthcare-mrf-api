@@ -1203,6 +1203,11 @@ def provider_enrichment(test: bool):
     help="Refresh derived Provider Directory address/search artifacts. Defaults on only for full default resource imports.",
 )
 @click.option(
+    "--publish-after-acquisition/--no-publish-after-acquisition",
+    default=False,
+    help="Publish the accumulated typed dataset only after checkpointed acquisition completes.",
+)
+@click.option(
     "--open-only/--include-credentialed",
     default=True,
     show_default=True,
@@ -1254,6 +1259,7 @@ def provider_directory_fhir(
     full_refresh: bool,
     stale_cleanup: bool | None,
     publish_artifacts: bool | None,
+    publish_after_acquisition: bool,
     open_only: bool,
     include_auth_required: bool,
     resources: str | None,
@@ -1293,6 +1299,7 @@ def provider_directory_fhir(
             full_refresh=full_refresh,
             stale_cleanup=stale_cleanup,
             publish_artifacts=publish_artifacts,
+            publish_after_acquisition=publish_after_acquisition,
             open_only=open_only,
             include_auth_required=include_auth_required,
             resources=resources,

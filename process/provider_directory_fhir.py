@@ -13222,6 +13222,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("publish_artifacts"),
         import_resources and set(resources) == set(DEFAULT_RESOURCES),
     )
+    publish_after_acquisition = bool(task.get("publish_after_acquisition", False))
     is_pagination_checkpointing_enabled = _is_pagination_checkpoint_mode_enabled(
         run_id=run_id,
         full_refresh=full_refresh,
@@ -13369,6 +13370,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "source_concurrency": source_concurrency,
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
+            "publish_after_acquisition": publish_after_acquisition,
             "publish_corroboration": publish_corroboration,
             "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
             "retry_of_run_id": retry_of_run_id,
@@ -13493,7 +13495,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 for resource_type, source_ids in sorted(completed_source_ids_by_resource.items())
             }
             metrics["sources_import_attempted"] = len(importable)
-            if publish_artifacts:
+            if publish_artifacts or publish_after_acquisition:
+                is_acquisition_publish = publish_after_acquisition and not publish_artifacts
                 artifact_source_ids = requested_source_ids
                 if not artifact_source_ids:
                     artifact_source_ids = [
@@ -13545,9 +13548,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     metrics = await _publish_provider_directory_artifacts(
                         run_id=run_id,
                         metrics=metrics,
-                        seen_table=seen_stage_table_for_publish,
-                        address_key_run_id=run_id,
-                        publish_scope_run_id=run_id,
+                        seen_table=(
+                            None if is_acquisition_publish else seen_stage_table_for_publish
+                        ),
+                        address_key_run_id=None if is_acquisition_publish else run_id,
+                        publish_scope_run_id=None if is_acquisition_publish else run_id,
                         source_ids=publishable_artifact_source_ids,
                         publish_corroboration=publish_corroboration,
                         publish_artifacts_targets=publish_artifacts_targets,
@@ -13623,6 +13628,7 @@ async def main(
     full_refresh: bool = False,
     stale_cleanup: bool | None = None,
     publish_artifacts: bool | None = None,
+    publish_after_acquisition: bool = False,
     open_only: bool = True,
     include_auth_required: bool = False,
     credential_config_file: str | None = None,
@@ -13665,6 +13671,7 @@ async def main(
         "full_refresh": full_refresh,
         "stale_cleanup": stale_cleanup,
         "publish_artifacts": publish_artifacts,
+        "publish_after_acquisition": publish_after_acquisition,
         "open_only": open_only,
         "include_auth_required": include_auth_required,
         "credential_config_file": credential_config_file,

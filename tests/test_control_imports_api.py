@@ -76,6 +76,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_after_acquisition" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "canonical_backfill_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])

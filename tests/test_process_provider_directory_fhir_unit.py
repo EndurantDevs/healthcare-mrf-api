@@ -2364,6 +2364,7 @@ def test_provider_directory_cli_refresh_preset_leaves_defaults_unset_for_preset(
     assert calls[0]["refresh_preset"] == "monthly-full"
     assert calls[0]["import_resources"] is None
     assert calls[0]["full_refresh"] is None
+    assert calls[0]["publish_after_acquisition"] is False
     assert calls[0]["seed_only"] is True
     assert calls[0]["probe"] is False
 
