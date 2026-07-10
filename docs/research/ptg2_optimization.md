@@ -139,7 +139,7 @@ of truth.
 | Price-set/atom stream | 746.28 s | Not isolated in this run | 29.12M price sets, 127.33M atom refs, and 2.521 GB payload |
 | Binary build | 1,312.92 s | 1,312.79 s with current dependencies | `max(452.89, 566.51) + 746.28`; wrapper overhead is only 0.13 s |
 | Remaining serving publish | 73.79 s | Stage-specific | Mostly the 66.27 s lean price-atom rewrite; artifact upload was 2.96 s |
-| Full durable snapshot | 2,404.13 s | See scenario bounds below | 40m04.13s including PostgreSQL publication |
+| Full PostgreSQL publish | 2,404.13 s | See scenario bounds below | 40m04.13s; this measured snapshot predated the logged-relation durability fix |
 
 The scanner captured 272.64 GiB of raw negotiated-rate JSON and sustained
 318.44 MiB/s across its workers. The producer was blocked on worker queues for
@@ -148,24 +148,35 @@ clean gzip. Removing all observed queue blocking would still leave the scanner
 159.87 s above the gzip floor, so worker throughput and producer scanning both
 matter.
 
+The measured snapshot tables were later found to be `UNLOGGED`. PostgreSQL can
+truncate unlogged relations after an unclean restart, so the 40-minute run was
+PostgreSQL-resident but not a valid durability benchmark. New binary snapshots
+create retained relations as logged tables and verify every table in the
+published `materialized_tables` map before cutover. The first post-deploy import
+must therefore remeasure publish time and WAL cost rather than treating the old
+40-minute number as the logged baseline.
+
 The stage arithmetic gives useful scenario bounds:
 
 - Bringing only the scanner to the measured gzip floor changes 40m04s to about
   34m29s. Scanner tuning cannot produce the largest remaining gain.
-- Running the existing price-set/atom work concurrently with the two serving
-  streams changes the binary-build wall from 21m53s to at most 12m26s before
-  contention, changing the full run to about 30m38s.
+- The new writer runs the price-set/atom work concurrently with the two serving
+  streams and moves its row encoding into bounded-memory Rust. Dependency
+  arithmetic lowers the uncontended binary-build bound from 21m53s to at most
+  12m26s, changing the old full-run arithmetic to about 30m38s. This remains a
+  projection until a logged production-scale publish measures PostgreSQL sort,
+  COPY, WAL, and table-extension contention.
 - Combining both optimistic changes gives about 25m02s. This is a scheduling
   bound, not a benchmark promise; three ordered PostgreSQL streams may contend.
-- Moving the atom encoder from Python row iteration to bounded-memory Rust can
-  lower the 12m26s atom branch further, but cannot remove PostgreSQL's ordered
-  scan or sort.
+- The bounded Rust atom encoder removes Python row iteration but cannot remove
+  PostgreSQL's ordered scan or sort.
 
-Commit `b60129f` adds the missing diagnostics for subsequent runs: per-kind
-staging input bytes and elapsed throughput, plus PostgreSQL source bytes,
-target bytes, time-to-first-byte, and completion time for each Rust stream.
-These counters let the next comparison separate database sort/export, Rust
-encoding, and target COPY instead of treating each stream as one opaque timer.
+The writer persists per-kind staging input bytes and elapsed throughput, plus
+PostgreSQL source bytes, target bytes, time-to-first-byte, and completion time
+for each Rust stream. These counters let the next comparison separate database
+sort/export, Rust encoding, and target COPY instead of treating each stream as
+one opaque timer. It also records the final relation persistence so an unlogged
+snapshot cannot be mistaken for a durable result again.
 
 The real storage A/B also constrains the architecture claim:
 
@@ -182,6 +193,36 @@ directions alone occupied 3.766 GiB stored because they represented about
 space but make one API direction scan the complete edge set. Any next storage
 version therefore needs compact bidirectional integer-key blocks and a shared
 price dictionary, not ordinary one-edge-per-row PostgreSQL tables.
+
+### Candidate 2-3 GB architecture
+
+The measured cardinalities support a separate, immutable
+`postgres_binary_v3` experiment rather than another in-place v2 rewrite. For
+the 513M-row source, only 952,060 code/provider groups have more than one price
+set. A v3 layout can therefore keep one sharded forward projection, replace the
+full reverse projection with provider/code bitmaps plus a sparse multiplicity
+stream, store the 29.12M price-set ids once, and encode 127.33M atom references
+with 24-bit dense atom keys. The key width must be snapshot-adaptive: use 24
+bits only below 16,777,216 unique atoms, switch automatically to 32 bits above
+that boundary, and record the selected width in every block header and manifest.
+Binary atom payloads can then replace the UUID-heavy relational atom heap and
+index without imposing a 24-bit limit on larger imports.
+
+The current measured estimate is 2.63-2.99 GB decimal, or 2.45-2.78 GiB:
+
+| Candidate v3 component | Estimated bytes |
+| --- | ---: |
+| Sharded forward projection | 1.15-1.35 GB |
+| Shared price-set dictionary | 0.48-0.50 GB |
+| Reverse provider/code bitmap and overflow | 0.17-0.18 GB |
+| Dense price-set/atom membership | 0.40-0.43 GB |
+| Binary atom payloads | 0.14-0.18 GB |
+| Provider graph, NPI scope, support, and allowance | 0.29-0.36 GB |
+
+This is a design budget, not a delivered storage result. V3 needs a reader
+deployed before its writer, side-by-side immutable snapshots, logical tuple
+checksums against v2, forward/reverse/geo API parity, and a real import before
+becoming the default architecture.
 
 After taxonomy filtering was moved ahead of the v2 location candidate limit,
 the warmed PostgreSQL-only API p95 values were 20.48 ms for code-to-provider,
