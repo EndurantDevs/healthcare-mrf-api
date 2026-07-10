@@ -1022,6 +1022,14 @@ def test_rust_scanner_split_keeps_facade_helpers_stable():
     assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
 
 
+def test_rust_scanner_frame_reader_retries_short_pipe_reads():
+    class ShortReader(io.BytesIO):
+        def read(self, size=-1):
+            return super().read(min(size, 2))
+
+    assert ptg_rust_scanner._read_exactly(ShortReader(b"abcdef"), 6) == b"abcdef"
+
+
 def test_ptg2_rust_scanner_release_requirement_skips_debug_binary(monkeypatch, tmp_path):
     debug_binary = tmp_path / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner"
     debug_binary.parent.mkdir(parents=True)

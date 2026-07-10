@@ -11,7 +11,7 @@ import queue
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 try:
     import orjson
@@ -67,6 +67,18 @@ def _json_loads(value: str | bytes | bytearray) -> Any:
     if orjson is not None and _env_bool(PTG2_FAST_JSON_LOADS_ENV, True):
         return orjson.loads(value)
     return json.loads(value)
+
+
+def _read_exactly(stream: BinaryIO, byte_count: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = byte_count
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _ptg2_rust_scanner_binary() -> Path | None:
@@ -277,7 +289,7 @@ def _iter_top_level_object_bytes_rust(
                 payload_len = int(length_bytes)
             except Exception as exc:
                 raise RuntimeError(f"Invalid PTG2 Rust scanner frame header: {header!r}") from exc
-            payload = process.stdout.read(payload_len)
+            payload = _read_exactly(process.stdout, payload_len)
             if len(payload) != payload_len:
                 raise RuntimeError("PTG2 Rust scanner ended mid-frame")
             trailer = process.stdout.read(1)
