@@ -173,7 +173,7 @@ class ChunkedDictionarySession:
 
 
 @pytest.mark.asyncio
-async def test_chunked_dictionary_uses_server_substring_across_block_boundaries():
+async def test_chunked_dictionary_fetches_selected_blocks_once_across_boundaries():
     session = ChunkedDictionarySession(
         [
             _dictionary_block(0, (0, 1)),
@@ -190,15 +190,12 @@ async def test_chunked_dictionary_uses_server_substring_across_block_boundaries(
     )
 
     assert values_by_key == {item_key: _dictionary_id(item_key).hex() for item_key in (1, 2, 4)}
-    assert session.substring_item_keys == [(1, 2, 4)]
-    assert session.payload_block_requests == []
+    assert session.substring_item_keys == []
+    assert session.payload_block_requests == [(0, 1, 2)]
     assert len(session.calls) == 2
-    substring_query = session.calls[1][0]
-    assert "substring(" in substring_query
-    assert "requested_key.item_key / CAST(:entries_per_block AS integer)" in substring_query
-    assert "requested_key.item_key % CAST(:entries_per_block AS integer)" in substring_query
-    assert "binary_block.block_no = requested.block_no" in substring_query
-    assert "FOR 16" in substring_query
+    block_query = session.calls[1][0]
+    assert "block_no = ANY(CAST(:block_nos AS integer[]))" in block_query
+    assert "binary_block.payload" in block_query
 
 
 @pytest.mark.asyncio
@@ -225,10 +222,51 @@ async def test_chunked_dictionary_fetches_only_selected_compressed_blocks(monkey
     )
 
     assert values_by_key == {item_key: _dictionary_id(item_key).hex() for item_key in (0, 2, 4)}
-    assert session.substring_item_keys == [(2,)]
-    assert session.payload_block_requests == [(0, 2)]
+    assert session.substring_item_keys == []
+    assert session.payload_block_requests == [(0, 1, 2)]
     assert decompressed_payloads == [dictionary_blocks[0]["payload"], dictionary_blocks[2]["payload"]]
-    assert len(session.calls) == 3
+    assert len(session.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_chunked_dictionary_batches_sparse_block_reads():
+    dictionary_blocks = [
+        _dictionary_block(block_no, (block_no,)) for block_no in range(65)
+    ]
+    session = ChunkedDictionarySession(dictionary_blocks)
+
+    values_by_key = await db_sidecars._serving_binary_dictionary_values_for_keys(
+        session,
+        "mrf.ptg2_v3_dictionary_sparse_blocks",
+        artifact_kind="by_code_price_dictionary",
+        item_keys=range(65),
+    )
+
+    assert values_by_key == {
+        item_key: _dictionary_id(item_key).hex() for item_key in range(65)
+    }
+    assert session.payload_block_requests == [tuple(range(64)), (64,)]
+
+
+@pytest.mark.asyncio
+async def test_chunked_dictionary_hint_accepts_full_uncompressed_raw_byte_count():
+    dictionary_block = _dictionary_block(0, (0, 1))
+    dictionary_block["raw_payload_bytes"] = len(dictionary_block["payload"])
+    session = ChunkedDictionarySession([dictionary_block])
+
+    values_by_key = await db_sidecars._serving_binary_dictionary_values_for_keys(
+        session,
+        "mrf.ptg2_v3_dictionary_hint_raw_bytes",
+        artifact_kind="by_code_price_dictionary",
+        item_keys=(1,),
+        item_count_hint=2,
+        block_bytes_hint=32,
+        compressed_records_hint=0,
+    )
+
+    assert values_by_key == {1: _dictionary_id(1).hex()}
+    assert session.payload_block_requests == [(0,)]
+    assert len(session.calls) == 1
 
 
 @pytest.mark.asyncio

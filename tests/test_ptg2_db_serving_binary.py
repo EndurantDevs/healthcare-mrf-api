@@ -362,8 +362,8 @@ async def test_db_serving_binary_by_code_reads_matching_provider_sets():
         (serving_row.code_key, serving_row.provider_set_key, serving_row.provider_count, serving_row.price_set_global_id_128)
         for serving_row in matched_serving_rows
     ] == [(7, 5, 20, second_price_set_id.hex())]
-    assert any(call.get("item_keys") == [1] for call in session.calls)
-    assert any("substring(" in statement for statement in session.statements)
+    assert any(call.get("block_nos") == [0] for call in session.calls)
+    assert not any("substring(" in statement for statement in session.statements)
 
 
 @pytest.mark.asyncio
@@ -389,7 +389,8 @@ async def test_db_serving_binary_uses_uncompressed_manifest_dictionary_hint():
 
     assert rows[0].price_set_global_id_128 == price_set_id.hex()
     assert not any("octet_length(binary_block.payload)" in statement for statement in session.statements)
-    assert any("substring(" in statement for statement in session.statements)
+    assert any(call.get("block_nos") == [0] for call in session.calls)
+    assert not any("substring(" in statement for statement in session.statements)
 
 
 @pytest.mark.asyncio

@@ -110,6 +110,7 @@ _SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_diction
 _SERVING_BINARY_PRICE_SET_ATOMS_KIND = "price_set_atoms"
 _SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND = "price_set_atoms_by_id"
 _SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND = "price_set_atoms_by_id_v2"
+_DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE = 64
 _PRICE_SET_ATOM_BLOCK_SIZE = 1024
 _PRICE_SET_ATOM_ID_BUCKETS = 256
 _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
@@ -859,23 +860,6 @@ def _cached_dictionary_values_for_keys(
     return values_by_key, tuple(missing_keys)
 
 
-def _dictionary_keys_by_compression(
-    metadata: _DictionaryMetadata,
-    item_keys: Iterable[int],
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Partition dictionary keys according to their physical block storage."""
-
-    uncompressed_keys: list[int] = []
-    compressed_keys: list[int] = []
-    for item_key in item_keys:
-        block_no = item_key // metadata.entries_per_block
-        if _dictionary_metadata_block(metadata, block_no).payload_compression == "none":
-            uncompressed_keys.append(item_key)
-        else:
-            compressed_keys.append(item_key)
-    return tuple(uncompressed_keys), tuple(compressed_keys)
-
-
 async def _uncached_dictionary_values_for_keys(
     session: Any,
     qualified_table: str,
@@ -884,38 +868,35 @@ async def _uncached_dictionary_values_for_keys(
     metadata: _DictionaryMetadata,
     item_keys: Iterable[int],
 ) -> dict[int, str]:
-    """Resolve uncached keys without materializing unrelated dictionary blocks."""
+    """Fetch every referenced block once, then slice selected fixed-width ids."""
 
-    uncompressed_keys, compressed_keys = _dictionary_keys_by_compression(metadata, item_keys)
+    requested_keys = tuple(item_keys)
+    _validate_dictionary_keys(requested_keys, metadata.item_count)
+    item_keys_by_block_no: dict[int, list[int]] = {}
+    for item_key in requested_keys:
+        block_no = item_key // metadata.entries_per_block
+        item_keys_by_block_no.setdefault(block_no, []).append(item_key)
+    block_nos = sorted(item_keys_by_block_no)
     values_by_key: dict[int, str] = {}
-
-    if uncompressed_keys:
-        values_by_key.update(
-            await _uncompressed_dictionary_values_for_keys(
-                session,
-                qualified_table,
-                artifact_kind=artifact_kind,
-                item_keys=uncompressed_keys,
-                metadata=metadata,
-            )
-        )
-    if compressed_keys:
-        compressed_block_nos = {
-            item_key // metadata.entries_per_block for item_key in compressed_keys
-        }
+    for batch_start in range(0, len(block_nos), _DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE):
+        block_batch = block_nos[
+            batch_start : batch_start + _DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE
+        ]
         payload_by_block_no = await _serving_binary_dictionary_blocks(
             session,
             qualified_table,
             artifact_kind=artifact_kind,
             metadata=metadata,
-            block_nos=compressed_block_nos,
+            block_nos=block_batch,
         )
-        for item_key in compressed_keys:
-            block_no = item_key // metadata.entries_per_block
-            block_item_key = item_key % metadata.entries_per_block
+        for block_no in block_batch:
             block_payload = payload_by_block_no[block_no]
-            value_offset = block_item_key * 16
-            values_by_key[item_key] = _id_text(block_payload[value_offset : value_offset + 16])
+            for item_key in item_keys_by_block_no[block_no]:
+                block_item_key = item_key % metadata.entries_per_block
+                value_offset = block_item_key * 16
+                values_by_key[item_key] = _id_text(
+                    block_payload[value_offset : value_offset + 16]
+                )
     return values_by_key
 
 
@@ -1173,10 +1154,17 @@ def _validated_dictionary_block_payload(
         "raw_payload_bytes",
     )
     stored_payload = bytes(block_record.get("payload") or b"")
+    has_matching_raw_payload_bytes = raw_payload_bytes == expected_block.raw_payload_bytes
+    if payload_compression == "none":
+        equivalent_raw_byte_counts = {0, entry_count * 16}
+        has_matching_raw_payload_bytes = {
+            raw_payload_bytes,
+            expected_block.raw_payload_bytes,
+        }.issubset(equivalent_raw_byte_counts)
     if (
         entry_count != expected_block.entry_count
         or payload_compression != expected_block.payload_compression
-        or raw_payload_bytes != expected_block.raw_payload_bytes
+        or not has_matching_raw_payload_bytes
         or len(stored_payload) != expected_block.payload_bytes
     ):
         raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block metadata changed")
@@ -1192,78 +1180,6 @@ def _validated_dictionary_block_payload(
             "PTG2 serving binary dictionary decoded payload byte count mismatch"
         )
     return decoded_payload
-
-
-async def _uncompressed_dictionary_values_for_keys(
-    session: Any,
-    qualified_table: str,
-    *,
-    artifact_kind: str,
-    item_keys: Iterable[int],
-    metadata: _DictionaryMetadata,
-) -> dict[int, str]:
-    """Read selected fixed-width values directly from an uncompressed PostgreSQL bytea."""
-
-    requested_keys = _validated_uncompressed_dictionary_keys(metadata, item_keys)
-    values_result = await session.execute(
-        text(
-            f"""
-            WITH requested AS (
-                SELECT
-                    requested_key.item_key,
-                    requested_key.item_key / CAST(:entries_per_block AS integer) AS block_no,
-                    requested_key.item_key % CAST(:entries_per_block AS integer) AS item_offset
-                  FROM unnest(CAST(:item_keys AS integer[])) requested_key(item_key)
-            )
-            SELECT
-                requested.item_key,
-                substring(
-                    binary_block.payload
-                    FROM requested.item_offset * 16 + 1
-                    FOR 16
-                ) AS item_value
-              FROM requested
-              JOIN {qualified_table} binary_block
-                ON binary_block.artifact_kind = :artifact_kind
-               AND binary_block.block_key = 0
-               AND binary_block.block_no = requested.block_no
-             ORDER BY requested.item_key
-            """
-        ),
-        {
-            "artifact_kind": artifact_kind,
-            "entries_per_block": metadata.entries_per_block,
-            "item_keys": list(requested_keys),
-        },
-    )
-    value_records = [
-        _row_mapping(dictionary_value_record)
-        for dictionary_value_record in _result_rows(values_result)
-    ]
-    values_by_key = {
-        int(value_row.get("item_key") or 0): _id_text(value_row.get("item_value") or b"")
-        for value_row in value_records
-    }
-    if len(value_records) != len(requested_keys) or set(values_by_key) != set(requested_keys):
-        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary values are missing")
-    return values_by_key
-
-
-def _validated_uncompressed_dictionary_keys(
-    metadata: _DictionaryMetadata,
-    item_keys: Iterable[int],
-) -> tuple[int, ...]:
-    """Validate that requested dictionary keys are stored in uncompressed blocks."""
-
-    requested_keys = tuple(item_keys)
-    _validate_dictionary_keys(requested_keys, metadata.item_count)
-    if any(
-        _dictionary_metadata_block(metadata, item_key // metadata.entries_per_block).payload_compression
-        != "none"
-        for item_key in requested_keys
-    ):
-        raise PTG2ManifestArtifactError("compressed PTG2 dictionary block requires a payload fetch")
-    return requested_keys
 
 
 def _dictionary_value_lookup_hints(
