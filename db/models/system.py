@@ -1073,10 +1073,20 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_pagination_checkpoint"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint("canonical_api_base", "resource_type", "source_scope_hash"),
+        PrimaryKeyConstraint(
+            "canonical_api_base",
+            "resource_type",
+            "source_scope_hash",
+            "acquisition_root_run_id",
+        ),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ["canonical_api_base", "resource_type", "source_scope_hash"]
+    __my_index_elements__ = [
+        "canonical_api_base",
+        "resource_type",
+        "source_scope_hash",
+        "acquisition_root_run_id",
+    ]
     __my_additional_indexes__ = [
         {
             "index_elements": ("owner_run_id",),
@@ -1089,6 +1099,10 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
         {
             "index_elements": ("dataset_id",),
             "name": "provider_directory_pagination_checkpoint_dataset_idx",
+        },
+        {
+            "index_elements": ("acquisition_root_run_id", "updated_at"),
+            "name": "provider_directory_pagination_checkpoint_root_updated_idx",
         },
     ]
 

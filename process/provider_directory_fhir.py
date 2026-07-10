@@ -727,11 +727,15 @@ class PaginationCheckpointContext:
     source_scope_hash: str
     source_ids: tuple[str, ...]
     owner_run_id: str
+    acquisition_root_run_id: str
     retry_of_run_id: str | None = None
     endpoint_id: str | None = None
     dataset_id: str | None = None
-    acquisition_root_run_id: str | None = None
     lineage_verified: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.acquisition_root_run_id.strip():
+            raise ValueError("provider_directory_pagination_root_missing")
 
 
 @dataclass(frozen=True)
@@ -15744,10 +15748,15 @@ async def _ensure_endpoint_dataset_candidate(
         if not candidate.reused_from_checkpoint:
             await connection.status(
                 f"""
-                DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-                 WHERE dataset_id = :dataset_id;
+                DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+                 USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+                 WHERE resource.dataset_id = :dataset_id
+                   AND dataset.dataset_id = resource.dataset_id
+                   AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+                       :acquisition_root_run_id;
                 """,
                 dataset_id=candidate.dataset_id,
+                acquisition_root_run_id=candidate.acquisition_root_run_id,
             )
 
 
@@ -15763,10 +15772,13 @@ async def _clear_uncheckpointed_endpoint_dataset_candidate(
          WHERE resource.dataset_id = :dataset_id
            AND dataset.dataset_id = resource.dataset_id
            AND dataset.endpoint_id = :endpoint_id
+           AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM
+               :acquisition_root_run_id
            AND dataset.is_current = false;
         """,
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
     )
 
 
@@ -16002,11 +16014,13 @@ async def _fetch_pagination_checkpoint(
           FROM {_pagination_checkpoint_table_ref()}
          WHERE canonical_api_base = :canonical_api_base
            AND resource_type = :resource_type
-           AND source_scope_hash = :source_scope_hash;
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id;
         """,
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
         source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
     )
     return _pagination_checkpoint_row_mapping(checkpoint_row)
 
@@ -16087,9 +16101,12 @@ async def _adopt_pagination_checkpoint_owner(
 def _pagination_checkpoint_reset_sql() -> str:
     return f"""
     WITH cleared_dataset_resources AS (
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-         WHERE dataset_id = :dataset_id
-           AND resource_type = :resource_type
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+         WHERE resource.dataset_id = :dataset_id
+           AND resource.resource_type = :resource_type
+           AND dataset.dataset_id = resource.dataset_id
+           AND dataset.acquisition_root_run_id = :acquisition_root_run_id
     )
     INSERT INTO {_pagination_checkpoint_table_ref()} (
         canonical_api_base, resource_type, source_scope_hash, dataset_id,
@@ -16104,7 +16121,10 @@ def _pagination_checkpoint_reset_sql() -> str:
         :start_url_hash, :next_url, :state, 0, 0,
         '[]'::jsonb, now(), now(), NULL
     )
-    ON CONFLICT (canonical_api_base, resource_type, source_scope_hash)
+    ON CONFLICT (
+        canonical_api_base, resource_type, source_scope_hash,
+        acquisition_root_run_id
+    )
     DO UPDATE SET
         dataset_id = EXCLUDED.dataset_id,
         source_ids = EXCLUDED.source_ids,
@@ -16131,12 +16151,16 @@ async def _clear_checkpoint_dataset_resource_type(
         return
     await db.status(
         f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-         WHERE dataset_id = :dataset_id
-           AND resource_type = :resource_type;
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+         USING {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+         WHERE resource.dataset_id = :dataset_id
+           AND resource.resource_type = :resource_type
+           AND dataset.dataset_id = resource.dataset_id
+           AND dataset.acquisition_root_run_id = :acquisition_root_run_id;
         """,
         dataset_id=context.dataset_id,
         resource_type=resource_type,
+        acquisition_root_run_id=context.acquisition_root_run_id,
     )
 
 

@@ -52,7 +52,7 @@ class _OpRecorder:
         self.dropped_tables.append({"name": name, **kwargs})
 
 
-def test_pagination_checkpoint_model_has_source_scoped_stream_identity():
+def test_pagination_checkpoint_model_has_root_scoped_stream_identity():
     table = ProviderDirectoryPaginationCheckpoint.__table__
 
     assert table.name == "provider_directory_pagination_checkpoint"
@@ -60,6 +60,7 @@ def test_pagination_checkpoint_model_has_source_scoped_stream_identity():
         "canonical_api_base",
         "resource_type",
         "source_scope_hash",
+        "acquisition_root_run_id",
     )
     assert all(
         not table.c[name].nullable
@@ -104,6 +105,10 @@ def test_pagination_checkpoint_model_keeps_only_bounded_resume_metadata():
         "index_elements": ("dataset_id",),
         "name": "provider_directory_pagination_checkpoint_dataset_idx",
     } in ProviderDirectoryPaginationCheckpoint.__my_additional_indexes__
+    assert {
+        "index_elements": ("acquisition_root_run_id", "updated_at"),
+        "name": "provider_directory_pagination_checkpoint_root_updated_idx",
+    } in ProviderDirectoryPaginationCheckpoint.__my_additional_indexes__
 
 
 def test_pagination_checkpoint_model_compiles_for_postgresql_without_bounded_url_or_counters():
@@ -116,7 +121,10 @@ def test_pagination_checkpoint_model_compiles_for_postgresql_without_bounded_url
     assert "next_url TEXT" in ddl
     assert "pages_processed BIGINT NOT NULL" in ddl
     assert "rows_processed BIGINT NOT NULL" in ddl
-    assert "PRIMARY KEY (canonical_api_base, resource_type, source_scope_hash)" in ddl
+    assert (
+        "PRIMARY KEY (canonical_api_base, resource_type, source_scope_hash, "
+        "acquisition_root_run_id)"
+    ) in ddl
 
 
 def test_pagination_checkpoint_migration_matches_model_and_parent(monkeypatch):

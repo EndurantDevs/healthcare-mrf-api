@@ -3094,6 +3094,7 @@ def _alohr_checkpoint_context(
         source_scope_hash="scope",
         source_ids=("source_alohr",),
         owner_run_id=owner_run_id,
+        acquisition_root_run_id=retry_of_run_id or owner_run_id,
         retry_of_run_id=retry_of_run_id,
     )
 
@@ -5332,6 +5333,41 @@ async def test_endpoint_dataset_retry_reuses_checkpoint_candidate(monkeypatch):
     assert candidate.checkpoint_context.lineage_verified is True
     current_dataset.assert_not_awaited()
     ensure_candidate.assert_awaited_once_with(candidate)
+
+
+def test_pagination_checkpoint_context_requires_nonempty_root():
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_pagination_root_missing",
+    ):
+        importer.PaginationCheckpointContext(
+            canonical_api_base="https://shared.example/fhir",
+            source_scope_hash="scope_1",
+            source_ids=("source_a",),
+            owner_run_id="run_1",
+            acquisition_root_run_id="",
+        )
+
+
+@pytest.mark.asyncio
+async def test_uncheckpointed_candidate_cleanup_is_root_fenced(monkeypatch):
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_1",
+        dataset_id="dataset_1",
+        acquisition_root_run_id="run_root",
+        source_ids=("source_a",),
+        selected_resources=("Practitioner",),
+        import_run_id="run_root",
+        previous_dataset_id=None,
+    )
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    await importer._clear_uncheckpointed_endpoint_dataset_candidate(candidate)
+
+    cleanup_sql = status_mock.await_args.args[0]
+    assert "acquisition_root_run_id IS NOT DISTINCT FROM" in cleanup_sql
+    assert status_mock.await_args.kwargs["acquisition_root_run_id"] == "run_root"
 
 
 def _aetna_candidate_retry_context() -> importer.PaginationCheckpointContext:
@@ -10656,34 +10692,28 @@ async def test_pagination_checkpoint_retry_adopts_direct_predecessor(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_pagination_checkpoint_new_schedule_rejects_stale_owner(monkeypatch):
+async def test_pagination_checkpoint_new_root_does_not_load_stale_owner(monkeypatch):
     start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
-    checkpoint_by_name = {
-        "source_ids": ["source_a"],
-        "acquisition_root_run_id": "run_unrelated",
-        "owner_run_id": "run_unrelated",
-        "start_url_hash": hashlib.sha256(start_url.encode("utf-8")).hexdigest(),
-        "next_url": start_url + "&_getpages=stale",
-        "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
-        "pages_processed": 5,
-        "rows_processed": 500,
-        "recent_cursor_hashes": ["stale_hash"],
-    }
     status_mock = AsyncMock(return_value=1)
-    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint_by_name))
+    first_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "first", first_mock)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
-    with pytest.raises(
-        RuntimeError,
-        match="provider_directory_pagination_checkpoint_lineage_conflict",
-    ):
-        await importer._load_or_initialize_pagination_checkpoint(
-            _cigna_checkpoint_context("run_new_schedule"),
-            "Practitioner",
-            start_url,
-        )
+    resume_state = await importer._load_or_initialize_pagination_checkpoint(
+        _cigna_checkpoint_context("run_new_schedule"),
+        "Practitioner",
+        start_url,
+    )
 
-    status_mock.assert_not_awaited()
+    assert resume_state.resumed is False
+    assert resume_state.next_url == start_url
+    assert first_mock.await_args.kwargs["acquisition_root_run_id"] == (
+        "run_new_schedule"
+    )
+    assert "acquisition_root_run_id = :acquisition_root_run_id" in (
+        first_mock.await_args.args[0]
+    )
+    assert "acquisition_root_run_id" in status_mock.await_args.args[0]
 
 
 def test_pagination_retry_context_requires_explicit_root():

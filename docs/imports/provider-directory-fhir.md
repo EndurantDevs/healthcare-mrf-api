@@ -180,6 +180,14 @@ emits the same required-resume signal as an incomplete paginated scan, even
 though its partition state lives in
 `provider_directory_reverse_lookup_checkpoint`.
 
+REST pagination checkpoints are keyed by canonical API base, resource type,
+source scope, and acquisition root. A direct retry may adopt only its immediate
+predecessor's row within the same root and candidate; a guarded fresh root gets
+an independent row while failed-root evidence remains available for audit.
+Failed-root checkpoint retention is intentionally conservative: cleanup must
+first prove that the endpoint candidate is neither current nor
+active/incomplete and that no import-control run in the root lineage is live.
+
 Bulk acquisition checkpoints use the same endpoint candidate and acquisition
 root. Their identity additionally binds the canonical API base, resource type,
 source scope, Bulk strategy version, endpoint id, candidate `dataset_id`, and
