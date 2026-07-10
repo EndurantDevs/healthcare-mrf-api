@@ -41,11 +41,11 @@ Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_
 
 These sources are intentionally retained as blocked catalog evidence. They are not probe-only entries and have no runnable acquisition base.
 
-| Source | Plan | Support | Required access | Registration | Primary evidence | Blocker |
-| --- | --- | --- | --- | --- | --- | --- |
-| Chorus Community Health Plans (fka Children's Community Health Plan) (`provider-directory-blocked-chorus-community-health-plans`) | Medicaid MCO | Not supported | None | Not required | https://appconnect.chorushealthplans.org/developers/providerapi | Official Chorus developer page exposes Provider Directory documentation through a JavaScript app, but no importable public FHIR base has been confirmed. |
-| First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Medicaid MCO | Not supported | User token | Required | https://devportal.firstmedicalpr.com/ApiLibrary | Official First Medical developer portal lists Practitioner and Location APIs under a user-token security model; no open importable Provider Directory FHIR base has been confirmed. |
-| Territory of Puerto Rico (`provider-directory-blocked-territory-of-puerto-rico`) | Medicaid FFS | Not supported | None | Not required | https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv | CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known. |
+| Source | Plan | Support | Required access | Registration | Operational state | Reviewed at | Primary evidence | Blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Chorus Community Health Plans (fka Children's Community Health Plan) (`provider-directory-blocked-chorus-community-health-plans`) | Medicaid MCO | Not supported | None | Not required | Unreachable | 2026-07-10 | https://appconnect.chorushealthplans.org/developers/providerapi | Official client code identifies https://cchp.healthlx.com:9091/fhir, but its capability endpoint returned no usable response and the portal proxy returned HTTP 502 at review time. |
+| First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Medicaid MCO | Not supported | User token | Required | Auth Gated | 2026-07-10 | https://devportal.firstmedicalpr.com/ApiLibrary | Official First Medical developer portal lists Practitioner, PractitionerRole, and Location APIs, but registration, client credentials, user-token access, and production approval are required. |
+| Territory of Puerto Rico (`provider-directory-blocked-territory-of-puerto-rico`) | Medicaid FFS | Not supported | None | Not required | Not Published | 2026-07-10 | https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv | CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known. |
 
 ## Observed Live Verification
 

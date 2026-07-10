@@ -75,6 +75,8 @@ def test_blocker_registry_is_complete_and_shared_with_generated_docs():
 
     assert len(entries) == 3
     assert all(entry["id"] in rendered for entry in entries)
+    assert "Operational state" in rendered
+    assert "2026-07-10" in rendered
 
 
 def test_validate_blocker_registry_rejects_unknown_access_requirement():
@@ -82,6 +84,21 @@ def test_validate_blocker_registry_rejects_unknown_access_requirement():
     registry["entries"][0]["access_requirement"] = "portal-maybe"
 
     with pytest.raises(generator.SupportDocumentationError, match="invalid access requirement"):
+        generator.validate_blocker_registry(registry)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("operational_status", "maybe", "invalid operational status"),
+        ("reviewed_at", "10 July", "reviewed_at must be an ISO date"),
+    ],
+)
+def test_validate_blocker_registry_rejects_uncontrolled_freshness(field_name, value, message):
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    registry["entries"][0][field_name] = value
+
+    with pytest.raises(generator.SupportDocumentationError, match=message):
         generator.validate_blocker_registry(registry)
 
 

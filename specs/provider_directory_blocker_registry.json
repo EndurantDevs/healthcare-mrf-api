@@ -7,10 +7,12 @@
       "plan_name": "Medicaid MCO",
       "access_requirement": "none",
       "requires_registration": false,
+      "operational_status": "unreachable",
+      "reviewed_at": "2026-07-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
-      "reason": "Official portal present but no importable public FHIR base confirmed.",
-      "note": "Official Chorus developer page exposes Provider Directory documentation through a JavaScript app, but no importable public FHIR base has been confirmed."
+      "reason": "Official public base is documented but not reachable as an importable FHIR service.",
+      "note": "Official client code identifies https://cchp.healthlx.com:9091/fhir, but its capability endpoint returned no usable response and the portal proxy returned HTTP 502 at review time."
     },
     {
       "id": "provider-directory-blocked-first-medical-pr",
@@ -18,10 +20,12 @@
       "plan_name": "Medicaid MCO",
       "access_requirement": "user-token",
       "requires_registration": true,
+      "operational_status": "auth-gated",
+      "reviewed_at": "2026-07-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
       "reason": "Official portal requires a user token and no open public FHIR base is confirmed.",
-      "note": "Official First Medical developer portal lists Practitioner and Location APIs under a user-token security model; no open importable Provider Directory FHIR base has been confirmed."
+      "note": "Official First Medical developer portal lists Practitioner, PractitionerRole, and Location APIs, but registration, client credentials, user-token access, and production approval are required."
     },
     {
       "id": "provider-directory-blocked-territory-of-puerto-rico",
@@ -29,7 +33,9 @@
       "plan_name": "Medicaid FFS",
       "access_requirement": "none",
       "requires_registration": false,
-      "source_detail": "CMS SMA Endpoint Directory Provider Directory status not yet started",
+      "operational_status": "not-published",
+      "reviewed_at": "2026-07-10",
+      "source_detail": "CMS SMA Endpoint Directory Provider Directory status TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",
       "reason": "CMS SMA Endpoint Directory lists Provider Directory as not yet started/TBD.",
       "note": "CMS SMA Endpoint Directory lists Puerto Rico Provider Directory implementation as not yet started/TBD, so no importable public FHIR base is currently known."

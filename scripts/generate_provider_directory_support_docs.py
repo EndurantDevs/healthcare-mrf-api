@@ -75,6 +75,7 @@ VERIFICATION_STATUSES = {
 ACCESS_VERIFICATION_VALUES = {"verified", "not_verified", "not_recorded"}
 PROOF_STATES = {"current", "superseded", "not_recorded"}
 ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
+BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published"}
 SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
@@ -169,6 +170,8 @@ def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
         "plan_name",
         "access_requirement",
         "requires_registration",
+        "operational_status",
+        "reviewed_at",
         "source_detail",
         "source_url",
         "reason",
@@ -186,6 +189,12 @@ def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
             raise SupportDocumentationError(f"{entry_id}: invalid access requirement")
         if not isinstance(entry.get("requires_registration"), bool):
             raise SupportDocumentationError(f"{entry_id}: requires_registration must be boolean")
+        if entry.get("operational_status") not in BLOCKER_OPERATIONAL_STATUSES:
+            raise SupportDocumentationError(f"{entry_id}: invalid operational status")
+        try:
+            dt.date.fromisoformat(str(entry.get("reviewed_at") or ""))
+        except ValueError as exc:
+            raise SupportDocumentationError(f"{entry_id}: reviewed_at must be an ISO date") from exc
         for field_name in required_fields - {"requires_registration"}:
             if not isinstance(entry.get(field_name), str) or not entry[field_name].strip():
                 raise SupportDocumentationError(f"{entry_id}: {field_name} must be non-empty text")
@@ -366,8 +375,8 @@ def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
         "",
         "These sources are intentionally retained as blocked catalog evidence. They are not probe-only entries and have no runnable acquisition base.",
         "",
-        "| Source | Plan | Support | Required access | Registration | Primary evidence | Blocker |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Source | Plan | Support | Required access | Registration | Operational state | Reviewed at | Primary evidence | Blocker |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for blocker in blockers:
         cells = [
@@ -376,6 +385,8 @@ def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
             _display("not-supported"),
             _display(blocker["access_requirement"]),
             "Required" if blocker["requires_registration"] else "Not required",
+            blocker["operational_status"].replace("-", " ").title(),
+            blocker["reviewed_at"],
             blocker["source_url"],
             blocker["note"],
         ]
