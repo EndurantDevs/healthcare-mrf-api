@@ -875,13 +875,22 @@ network refs:
 
 The full report keeps exact aggregate coverage under
 `source_resource_coverage_summary` and separately emits bounded per-source
-checks under `source_semantic_readiness_summary`. The semantic section verifies
-that downloaded resources produce valid NPIs, canonical addresses, usable
-phones and coordinates, resolved direct or HealthcareService-mediated
-role/location links, resolved role/plan links, and named network evidence.
-These checks use source-keyed `EXISTS` probes that inspect at most 1,000 rows
-per source and resource table; increase `--sample-limit` to cover more catalog
-sources without turning the audit into a full-table aggregate scan.
+checks under `source_semantic_readiness_summary`. By default, the semantic
+section checks every source ID in the validated endpoint-acquisition manifest;
+`--semantic-source-manifest` can select another validated manifest. The report
+retains maintained IDs that are missing from `provider_directory_source`
+instead of silently replacing them with unrelated catalog rows.
+
+Semantic readiness verifies that downloaded resources produce valid NPIs,
+canonical addresses, usable phones and coordinates, resolved direct or
+HealthcareService-mediated role/location links, named network evidence, and a
+provider/plan association. A provider/plan association can be either a direct
+vendor `PractitionerRole.insurancePlan` reference or the standard Plan-Net path
+`PractitionerRole.network -> Organization <- InsurancePlan.network`. Direct
+and network-derived associations remain separate diagnostics so derived plans
+do not masquerade as raw FHIR references. Each source-keyed `EXISTS` probe
+inspects at most 1,000 rows per source and resource table, including the
+network catalog bridge check.
 
 When `--retest-results-path` is present, the audit checks that every
 `valid`, `valid_non_fhir`, and `auth_required` retest endpoint is covered by
