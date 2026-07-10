@@ -15974,30 +15974,29 @@ def _endpoint_dataset_candidate_id(
     return f"pdds_{_identity_hash(identity_payload_map)}"
 
 
-async def _checkpoint_candidate_dataset_id(
-    context: PaginationCheckpointContext | None,
-    endpoint_id: str,
-    selected_resources: tuple[str, ...],
-) -> str | None:
-    if context is None or not context.acquisition_root_run_id:
-        return None
-    expected_owner_run_id = context.retry_of_run_id or context.owner_run_id
-    checkpoint_row = await db.first(
-        f"""
+def _checkpoint_candidate_dataset_sql() -> str:
+    """Return the root-fenced checkpoint candidate lookup."""
+    return f"""
         WITH checkpoint AS (
-            SELECT dataset_id, updated_at
+            SELECT dataset_id, owner_run_id, updated_at
               FROM {_qt(_schema(), ProviderDirectoryPaginationCheckpoint.__tablename__)}
              WHERE canonical_api_base = :canonical_api_base
                AND source_scope_hash = :source_scope_hash
                AND acquisition_root_run_id = :acquisition_root_run_id
-               AND owner_run_id = :expected_owner_run_id
+               AND (
+                    owner_run_id = :expected_owner_run_id
+                    OR CAST(:allow_ancestor_owner AS boolean)
+                   )
             UNION ALL
-            SELECT dataset_id, updated_at
+            SELECT dataset_id, owner_run_id, updated_at
               FROM {_bulk_acquisition_checkpoint_table_ref()}
              WHERE canonical_api_base = :canonical_api_base
                AND source_scope_hash = :source_scope_hash
                AND acquisition_root_run_id = :acquisition_root_run_id
-               AND owner_run_id = :expected_owner_run_id
+               AND (
+                    owner_run_id = :expected_owner_run_id
+                    OR CAST(:allow_ancestor_owner AS boolean)
+                   )
         )
         SELECT checkpoint.dataset_id
           FROM checkpoint
@@ -16011,13 +16010,28 @@ async def _checkpoint_candidate_dataset_id(
                 dataset.publication_metadata_json::jsonb -> 'selected_resources',
                 '[]'::jsonb
                ) = CAST(:selected_resources AS jsonb)
-         ORDER BY checkpoint.updated_at DESC
+         ORDER BY (checkpoint.owner_run_id = :expected_owner_run_id) DESC,
+                  checkpoint.updated_at DESC
          LIMIT 1;
-        """,
+        """
+
+
+async def _checkpoint_candidate_dataset_id(
+    context: PaginationCheckpointContext | None,
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+) -> str | None:
+    """Resolve the resumable dataset proven by this root and source scope."""
+    if context is None or not context.acquisition_root_run_id:
+        return None
+    expected_owner_run_id = context.retry_of_run_id or context.owner_run_id
+    checkpoint_row = await db.first(
+        _checkpoint_candidate_dataset_sql(),
         canonical_api_base=context.canonical_api_base,
         source_scope_hash=context.source_scope_hash,
         acquisition_root_run_id=context.acquisition_root_run_id,
         expected_owner_run_id=expected_owner_run_id,
+        allow_ancestor_owner=context.retry_of_run_id is not None,
         endpoint_id=endpoint_id,
         resumable_statuses=[
             ENDPOINT_DATASET_ACQUIRING,

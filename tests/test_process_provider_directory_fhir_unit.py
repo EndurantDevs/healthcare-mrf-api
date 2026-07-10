@@ -5643,6 +5643,35 @@ async def test_endpoint_dataset_retry_reuses_checkpoint_candidate(monkeypatch):
     ensure_candidate.assert_awaited_once_with(candidate)
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_candidate_lookup_falls_back_to_same_root_ancestor(
+    monkeypatch,
+):
+    checkpoint_lookup = AsyncMock(return_value={"dataset_id": "dataset_a"})
+    monkeypatch.setattr(importer.db, "first", checkpoint_lookup)
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base="https://shared.example/fhir",
+        source_scope_hash="scope_1",
+        source_ids=("source_a",),
+        owner_run_id="run_retry_3",
+        retry_of_run_id="run_retry_2",
+        acquisition_root_run_id="run_root",
+    )
+
+    dataset_id = await importer._checkpoint_candidate_dataset_id(
+        checkpoint_context,
+        "endpoint_1",
+        ("Practitioner",),
+    )
+
+    assert dataset_id == "dataset_a"
+    lookup_sql = checkpoint_lookup.await_args.args[0]
+    assert "OR CAST(:allow_ancestor_owner AS boolean)" in lookup_sql
+    assert "checkpoint.owner_run_id = :expected_owner_run_id" in lookup_sql
+    assert checkpoint_lookup.await_args.kwargs["allow_ancestor_owner"] is True
+    assert checkpoint_lookup.await_args.kwargs["acquisition_root_run_id"] == "run_root"
+
+
 def test_pagination_checkpoint_context_requires_nonempty_root():
     with pytest.raises(
         ValueError,
