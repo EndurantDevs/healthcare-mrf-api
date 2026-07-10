@@ -72,12 +72,35 @@ def test_provider_directory_role_evidence_sql_is_keyed_and_bounded():
 
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
+    assert "'role'::varchar AS evidence_type" in sql
+    assert "FROM roles AS role" in sql
     assert "insurance_plan.source_id = role.source_id" in sql
     assert "insurance_plan.resource_id = NULLIF(BTRIM(CASE" in sql
     assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
     assert "network_catalog.network_resource_id = network.resource_id" in sql
     assert "network_organization.resource_id = network.resource_id" in sql
     assert f"LIMIT {npi_module.MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS}" in sql
+
+
+def test_provider_directory_role_marker_retains_roles_without_plan_or_network_refs():
+    evidence_map = npi_module._map_provider_directory_role_evidence(
+        [
+            {
+                "source_id": "pdfhir_example",
+                "role_id": "role-100",
+                "evidence_type": "role",
+                "resource_id": "role-100",
+                "identifier": None,
+                "name": None,
+                "reference": None,
+                "provenance": "provider_directory_practitioner_role",
+            }
+        ]
+    )
+
+    assert evidence_map == {
+        ("pdfhir_example", "role-100"): {"insurance_plans": [], "networks": []}
+    }
 
 
 def test_provider_directory_role_evidence_keys_do_not_require_existing_aca_arrays():

@@ -1017,6 +1017,12 @@ def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> st
         has_catalog,
     )
     return f"""
+        SELECT role.source_id, role.role_id, 'role'::varchar AS evidence_type,
+               role.role_id::varchar AS resource_id, NULL::varchar AS identifier,
+               NULL::varchar AS name, NULL::varchar AS reference,
+               'provider_directory_practitioner_role'::varchar AS provenance
+          FROM roles AS role
+        UNION ALL
         SELECT plan.source_id, plan.role_id, 'insurance_plan'::varchar AS evidence_type,
                plan.resource_id, plan.identifier, NULL::varchar AS name,
                NULL::varchar AS reference, 'provider_directory_insurance_plan'::varchar AS provenance
