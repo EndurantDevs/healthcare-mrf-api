@@ -563,6 +563,24 @@ MAINE_PROVIDER_DIRECTORY_BASE = "https://maineproviderdirectory.verityanalytics.
 MISSOURI_PROVIDER_DIRECTORY_BASE = (
     "https://iox.mohealthnet.conduent.com/providerDirectory/api/R4"
 )
+PUBLIC_DIRECTORY_SEVEN_RESOURCES = tuple(
+    resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
+)
+UHC_SUPPORTED_RESOURCES = (
+    "InsurancePlan",
+    "Location",
+    "Organization",
+    "OrganizationAffiliation",
+    "Practitioner",
+    "PractitionerRole",
+)
+MAINE_SUPPORTED_RESOURCES = (
+    "Location",
+    "Organization",
+    "OrganizationAffiliation",
+    "Practitioner",
+    "PractitionerRole",
+)
 SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 SCAN_PROVIDER_DIRECTORY_DOC_URL = (
@@ -620,8 +638,12 @@ STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
 )
 EXPECTED_NONEMPTY_RESOURCES_BY_BASE = {
     ARKANSAS_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    CONTRA_COSTA_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
     MAINE_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
     MISSOURI_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    TMHP_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
+    UHC_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
     WASHINGTON_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
     WYOMING_PROVIDER_DIRECTORY_BASE: STATE_EXPECTED_NONEMPTY_RESOURCES,
 }
@@ -641,6 +663,9 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         MAINE_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
+        NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+        CONTRA_COSTA_PROVIDER_DIRECTORY_BASE,
+        TMHP_PROVIDER_DIRECTORY_BASE,
         UHC_PROVIDER_DIRECTORY_BASE,
         WASHINGTON_PROVIDER_DIRECTORY_BASE,
         WYOMING_PROVIDER_DIRECTORY_BASE,
@@ -3517,6 +3542,10 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
             "provider_directory_resource_page_count_caps": {
                 "InsurancePlan": 1,
             },
+            "provider_directory_supported_resources": list(UHC_SUPPORTED_RESOURCES),
+            "provider_directory_expected_nonempty_resources": sorted(
+                STATE_EXPECTED_NONEMPTY_RESOURCES
+            ),
         },
     }
 
@@ -3539,6 +3568,12 @@ def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, 
                 "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
                 "provider_directory_confirmed_base": TMHP_PROVIDER_DIRECTORY_BASE,
                 "provider_directory_confirmed_metadata_url": TMHP_PROVIDER_DIRECTORY_METADATA_URL,
+                "provider_directory_supported_resources": list(
+                    PUBLIC_DIRECTORY_SEVEN_RESOURCES
+                ),
+                "provider_directory_expected_nonempty_resources": sorted(
+                    STATE_EXPECTED_NONEMPTY_RESOURCES
+                ),
             },
         }
     if api_base == NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE:
@@ -3557,9 +3592,49 @@ def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, 
                 "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
                 "provider_directory_confirmed_base": NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
                 "provider_directory_confirmed_metadata_url": NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL,
+                "provider_directory_supported_resources": list(
+                    PUBLIC_DIRECTORY_SEVEN_RESOURCES
+                ),
+                "provider_directory_expected_nonempty_resources": sorted(
+                    STATE_EXPECTED_NONEMPTY_RESOURCES
+                ),
             },
         }
     return None
+
+
+def _maine_provider_directory_override(seed_row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(seed_row.get("api_base"))
+    if api_base != MAINE_PROVIDER_DIRECTORY_BASE:
+        return None
+    return {
+        "api_base": MAINE_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": MAINE_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(MAINE_PROVIDER_DIRECTORY_BASE),
+        "metadata": {
+            "provider_directory_override": "maine_public_resource_subset",
+            "provider_directory_override_reason": (
+                "Maine exposes five Provider Directory collections anonymously while "
+                "InsurancePlan, HealthcareService, and Endpoint remain access-gated."
+            ),
+            "provider_directory_previous_api_base": _clean_text(seed_row.get("api_base")),
+            "provider_directory_confirmed_base": MAINE_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_metadata_url": (
+                f"{MAINE_PROVIDER_DIRECTORY_BASE}/metadata"
+            ),
+            "provider_directory_supported_resources": list(MAINE_SUPPORTED_RESOURCES),
+            "provider_directory_expected_nonempty_resources": sorted(
+                STATE_EXPECTED_NONEMPTY_RESOURCES
+            ),
+            "provider_directory_resource_probe_caveat": (
+                "Capability metadata advertises OAuth, but the configured five-resource "
+                "subset is publicly readable; excluded collections return HTTP 403."
+            ),
+        },
+    }
 
 
 def _hap_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -3755,6 +3830,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         or _molina_provider_directory_override(row)
         or _uhc_provider_directory_override(row)
         or _state_public_provider_directory_override(row)
+        or _maine_provider_directory_override(row)
         or _hap_provider_directory_override(row)
         or _humana_provider_directory_override(row)
         or _iehp_provider_directory_override(row)
@@ -8642,6 +8718,16 @@ def _contra_costa_seed_row(
         "source_url": source_url,
         "source_date": source_date,
         "note": note,
+        "metadata_json": {
+            "provider_directory_confirmed_base": provider_base,
+            "provider_directory_supported_resources": list(
+                PUBLIC_DIRECTORY_SEVEN_RESOURCES
+            ),
+            "provider_directory_expected_nonempty_resources": sorted(
+                STATE_EXPECTED_NONEMPTY_RESOURCES
+            ),
+            "provider_directory_pagination_mode": "opaque_next_link_token",
+        },
     }
 
 

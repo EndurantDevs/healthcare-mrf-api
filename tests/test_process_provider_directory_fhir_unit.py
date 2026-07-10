@@ -630,6 +630,9 @@ def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_exter
     assert rows[0]["api_base"] == "https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod"
     assert rows[0]["source"] == "contra-costa-health-developer-page"
     assert rows[0]["is_medicaid_mco"] is True
+    assert rows[0]["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.PUBLIC_DIRECTORY_SEVEN_RESOURCES
+    )
 
 
 def test_contra_costa_catalog_uses_confirmed_fallback_when_page_fetch_fails(monkeypatch):
@@ -921,6 +924,11 @@ def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
     assert row["metadata_json"]["provider_directory_resource_page_count_caps"] == {
         "InsurancePlan": 1,
     }
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.UHC_SUPPORTED_RESOURCES
+    )
+    assert importer._resource_start_url(row, "HealthcareService", page_count=100) is None
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
 def test_source_row_from_seed_overrides_uhc_dead_fhir_host():
@@ -1048,14 +1056,18 @@ def test_source_row_from_seed_overrides_tmhp_stale_oauth_label():
     assert row["auth_type"] == "none"
     assert row["metadata_json"]["provider_directory_override"] == "tmhp_public_providerdirectory"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.TMHP_PROVIDER_DIRECTORY_METADATA_URL
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.PUBLIC_DIRECTORY_SEVEN_RESOURCES
+    )
     assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
         f"{importer.TMHP_PROVIDER_DIRECTORY_BASE}/Practitioner?"
         "_count=100&_sort=_id&_offset=0"
     )
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
 def test_source_row_from_seed_overrides_nebraska_dhhs_stale_oauth_label():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "ne-dhhs-1",
             "org_name": "State of Nebraska",
@@ -1067,19 +1079,50 @@ def test_source_row_from_seed_overrides_nebraska_dhhs_stale_oauth_label():
         }
     )
 
-    assert row["api_base"] == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["metadata_json"]["provider_directory_override"] == "nebraska_dhhs_public_providerdirectory"
+    assert source_row["api_base"] == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE
+    assert source_row["canonical_api_base"] == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE
+    assert source_row["requires_registration"] is False
+    assert source_row["auth_type"] == "none"
+    assert source_row["metadata_json"]["provider_directory_override"] == "nebraska_dhhs_public_providerdirectory"
     assert (
-        row["metadata_json"]["provider_directory_confirmed_metadata_url"]
+        source_row["metadata_json"]["provider_directory_confirmed_metadata_url"]
         == importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_METADATA_URL
     )
-    assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
+    assert source_row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.PUBLIC_DIRECTORY_SEVEN_RESOURCES
+    )
+    assert importer._resource_start_url(source_row, "Practitioner", page_count=100) == (
         f"{importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
         "_count=100&_sort=_id&_offset=0"
     )
+    assert importer._resource_start_url(source_row, "Endpoint", page_count=100) is None
+
+
+def test_source_row_from_seed_restricts_maine_to_public_resource_subset():
+    row = importer._source_row_from_seed(
+        {
+            "id": "maine-1",
+            "org_name": "State of Maine",
+            "plan_name": "Maine Medicaid Provider Directory",
+            "api_base": importer.MAINE_PROVIDER_DIRECTORY_BASE,
+            "auth_type": "OAuth2/SMART",
+            "requires_registration": "true",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["requires_registration"] is False
+    assert row["auth_type"] == "none"
+    assert row["last_validated_status"] == "valid"
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.MAINE_SUPPORTED_RESOURCES
+    )
+    assert importer._resource_start_url(row, "PractitionerRole", page_count=100) == (
+        f"{importer.MAINE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=100"
+    )
+    assert importer._resource_start_url(row, "InsurancePlan", page_count=100) is None
+    assert importer._resource_start_url(row, "HealthcareService", page_count=100) is None
+    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
 
 def test_arkansas_uses_stable_synthetic_skip_pagination():
@@ -3922,8 +3965,12 @@ def test_cigna_empty_endpoint_remains_complete():
     "api_base",
     [
         importer.ARKANSAS_PROVIDER_DIRECTORY_BASE,
+        importer.CONTRA_COSTA_PROVIDER_DIRECTORY_BASE,
         importer.MAINE_PROVIDER_DIRECTORY_BASE,
         importer.MISSOURI_PROVIDER_DIRECTORY_BASE,
+        importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+        importer.TMHP_PROVIDER_DIRECTORY_BASE,
+        importer.UHC_PROVIDER_DIRECTORY_BASE,
         importer.WASHINGTON_PROVIDER_DIRECTORY_BASE,
         importer.WYOMING_PROVIDER_DIRECTORY_BASE,
     ],
