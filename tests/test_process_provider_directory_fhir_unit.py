@@ -4380,6 +4380,15 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
             "identifier": [{"system": "https://example.test/plan-id", "value": "H1234-001"}],
             "name": "Example HMO",
             "network": [{"reference": "Organization/network-1"}],
+            "extension": [
+                {
+                    "url": (
+                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/network-reference"
+                    ),
+                    "valueReference": {"reference": "Organization/ignored-plan-extension"},
+                }
+            ],
         },
         run_id="run_1",
     )
@@ -4417,8 +4426,43 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
             "practitioner": {"reference": "Practitioner/prac-1"},
             "organization": {"reference": "Organization/org-1"},
             "location": [{"reference": "Location/loc-1"}],
+            "network": [{"reference": "Organization/network-1"}],
             "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
             "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+            "extension": [
+                {
+                    "url": (
+                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/network-reference"
+                    ),
+                    "valueReference": {
+                        "reference": "https://example.test/fhir/Organization/network-1"
+                    },
+                },
+                {
+                    "url": "https://example.test/wrapper",
+                    "extension": [
+                        {
+                            "url": (
+                                "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                                "StructureDefinition/network-reference|1.2.0"
+                            ),
+                            "valueReference": {"reference": "Organization/network-2"},
+                        }
+                    ],
+                },
+                {
+                    "url": "https://example.test/StructureDefinition/network-reference",
+                    "valueReference": {"reference": "Organization/wrong-namespace"},
+                },
+                {
+                    "url": (
+                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/network-reference"
+                    ),
+                    "valueReference": {"reference": "Practitioner/not-a-network"},
+                },
+            ],
         },
     )
     endpoint_model, endpoint_row = importer.parse_fhir_resource(
@@ -4459,6 +4503,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert role_model is ProviderDirectoryPractitionerRole
     assert role_row["npi"] == 1234567893
     assert role_row["location_refs"] == ["Location/loc-1"]
+    assert role_row["network_refs"] == ["Organization/network-1", "Organization/network-2"]
     assert role_row["insurance_plan_refs"] == ["InsurancePlan/plan-1"]
     assert role_row["endpoint_refs"] == ["Endpoint/endpoint-1"]
     assert endpoint_model is ProviderDirectoryEndpoint

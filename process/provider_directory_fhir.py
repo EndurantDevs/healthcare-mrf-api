@@ -89,6 +89,18 @@ DEFAULT_RESOURCES = (
     "OrganizationAffiliation",
     "Endpoint",
 )
+PLAN_NET_NETWORK_REFERENCE_EXTENSION_URLS = frozenset(
+    {
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/network-reference"
+        ),
+        (
+            "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/network-reference"
+        ),
+    }
+)
 _PUBLISH_SCOPE_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
     resource_type.lower() for resource_type in DEFAULT_RESOURCES
@@ -3880,6 +3892,73 @@ def _references(values: Any) -> list[str]:
     return refs
 
 
+def _extension_references(resource: dict[str, Any], *extension_urls: str) -> list[str]:
+    """Collect references from matching FHIR extensions, including nested extensions."""
+
+    expected_urls = {
+        url.strip().rstrip("/").lower()
+        for url in extension_urls
+        if url.strip()
+    }
+    references: list[str] = []
+
+    def visit(raw_extensions: Any) -> None:
+        """Append matching references while recursively traversing extensions."""
+
+        extensions = [raw_extensions] if isinstance(raw_extensions, dict) else raw_extensions
+        if not isinstance(extensions, list):
+            return
+        for extension in extensions:
+            if not isinstance(extension, dict):
+                continue
+            extension_url = (_clean_text(extension.get("url")) or "").split("|", 1)[0]
+            if extension_url.rstrip("/").lower() in expected_urls:
+                references.extend(_references(extension.get("valueReference")))
+            visit(extension.get("extension"))
+
+    visit(resource.get("extension"))
+    return list(dict.fromkeys(references))
+
+
+def _organization_reference_identity(reference: str) -> str | None:
+    """Return a stable identity for relative or absolute Organization references."""
+
+    path_segments = [
+        urllib.parse.unquote(segment)
+        for segment in urllib.parse.urlsplit(reference).path.split("/")
+        if segment
+    ]
+    for index, segment in enumerate(path_segments[:-1]):
+        if segment.lower() != "organization":
+            continue
+        resource_id = path_segments[index + 1]
+        if re.fullmatch(r"[A-Za-z0-9\-.]{1,64}", resource_id):
+            return f"organization/{resource_id}"
+    return None
+
+
+def _network_references(resource: dict[str, Any]) -> list[str]:
+    """Read and logically deduplicate PractitionerRole Plan-Net networks."""
+
+    extension_references = [
+        reference
+        for reference in _extension_references(
+            resource,
+            *PLAN_NET_NETWORK_REFERENCE_EXTENSION_URLS,
+        )
+        if _organization_reference_identity(reference) is not None
+    ]
+    references: list[str] = []
+    seen_identities: set[str] = set()
+    for reference in _references(resource.get("network")) + extension_references:
+        identity = _organization_reference_identity(reference) or f"raw:{reference}"
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        references.append(reference)
+    return references
+
+
 def _first_reference(value: Any) -> str | None:
     refs = _references(value)
     return refs[0] if refs else None
@@ -4256,7 +4335,7 @@ def parse_fhir_resource(
             "organization_ref": _first_reference(resource.get("organization")),
             "location_refs": _references(resource.get("location")),
             "healthcare_service_refs": _references(resource.get("healthcareService")),
-            "network_refs": _references(resource.get("network")),
+            "network_refs": _network_references(resource),
             "insurance_plan_refs": _references(resource.get("insurancePlan")),
             "endpoint_refs": _references(resource.get("endpoint")),
             "specialty_codes": _codings(resource.get("specialty")),
