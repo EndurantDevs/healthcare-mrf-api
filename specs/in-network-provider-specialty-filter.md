@@ -10,16 +10,16 @@ This spec is self-contained: a coding agent can pick it up cold. Every "current 
 
 ## 1. Problem & motivation
 
-When a member of a group plan (e.g. HealthJoy, EIN `465722012`) asks "find me a covered doctor for X near me, and what will it cost," the system can return a provider of the **wrong specialty** with a real negotiated price — e.g. for a routine flu visit it surfaced:
+When a member of a group plan asks "find me a covered doctor for X near me, and what will it cost," the system can return a provider of the **wrong specialty** with a real negotiated price. In a production-like minimal-layout case, a routine flu visit surfaced:
 
-- NPI `1003179466` GILLIAN MUNITZ, M.D. → NPPES primary taxonomy `207P00000X` = **Emergency Medicine**
-- NPI `1003141920` MEGEN TOWNSEND, PA-C → `363A00000X` = **Physician Assistant** (no specialty)
+- a provider whose NPPES primary taxonomy was `207P00000X` = **Emergency Medicine**
+- a provider whose taxonomy was `363A00000X` = **Physician Assistant** (no specialty)
 
 Neither is a primary-care provider. Proposing them for a flu is wrong and erodes trust. The system must never hand a member an anesthesiologist, ER physician, or allergist for a primary-care need.
 
 ## 2. Background — why the plan data alone cannot answer "who is a PCP"
 
-Transparency-in-Coverage (TiC) in-network files — the source of a group plan's coverage — contain only **NPI + TIN + negotiated rate per billing code**. They carry **no specialty**. Verified against HealthJoy's imported serving snapshot (`ptg2:202606:11480f93b1b8`):
+Transparency-in-Coverage (TiC) in-network files — the source of a group plan's coverage — contain only **NPI + TIN + negotiated rate per billing code**. They carry **no specialty**. Verified against an imported dense minimal-layout snapshot:
 
 - serving table columns: `serving_content_hash_128, plan_id, procedure_global_id_128, reported_code_system, reported_code, provider_set_global_id_128, provider_count, price_set_global_id_128, source_trace_set_hash` — procedures + rates, **no taxonomy**.
 - provider membership table columns: `provider_group_global_id_128, npi` — **just the NPI**.
@@ -30,7 +30,7 @@ Transparency-in-Coverage (TiC) in-network files — the source of a group plan's
 
 ## 3. Current behavior (what's broken) — evidence
 
-1. **The serving-search `specialty` filter is a no-op for minimal-layout snapshots.** In `api/ptg2_serving.py` the specialty predicate (`nucc.display_name LIKE :specialty_like`, ~L1601–1610 and L1654–1658) is only emitted inside two branches: one gated on `serving_tables.provider_group_location_table` (~L1583) and one built `FROM {provider_set_component_table} … JOIN {provider_group_member_table}` (~L1633–1660). HealthJoy's snapshot has **neither** `provider_group_location_table` **nor** `provider_set_component_table` (only `provider_group_member_table`), so no specialty predicate is applied. Live proof: `searchPricingProvidersByProcedure?plan_id=465722012&market_type=group&code=99214&include_providers=true&specialty=Family%20Medicine` returns the **same** NPI `1003141920` (a PA) as the unfiltered call.
+1. **The serving-search `specialty` filter is a no-op for minimal-layout snapshots.** In `api/ptg2_serving.py` the specialty predicate (`nucc.display_name LIKE :specialty_like`, ~L1601–1610 and L1654–1658) is only emitted inside two branches: one gated on `serving_tables.provider_group_location_table` (~L1583) and one built `FROM {provider_set_component_table} … JOIN {provider_group_member_table}` (~L1633–1660). The affected layout has **neither** `provider_group_location_table` **nor** `provider_set_component_table` (only `provider_group_member_table`), so no specialty predicate is applied. A synthetic regression request for `plan_id=TESTPLAN001` must return a strict subset when `specialty=Family%20Medicine` is added.
 2. **`classification` is ignored by the serving search** — only `specialty` is read (`api/ptg2_serving.py` ~L1551). (`searchPricingProvidersByProcedure` advertises `classification`/`taxonomy_codes` at the api-layer edge, but the serving engine drops them.)
 3. **The group-plan enumeration endpoint has no specialty filter at all** — `api/endpoint/pricing.py::group_plan_providers` enumerates every in-network NPI with no taxonomy constraint.
 4. **api-mcp `find_group_plan_providers` cannot scope by specialty** — no param.
@@ -46,7 +46,7 @@ Transparency-in-Coverage (TiC) in-network files — the source of a group plan's
 **Non-goals**
 - Importing specialty into plan/MRF data (it isn't in TiC; out of scope).
 - Provider quality/cost ranking changes.
-- Fixing the malformed 9-digit NPIs in the HealthJoy import (tracked separately).
+- Fixing malformed 9-digit NPIs in legacy source data (tracked separately).
 
 ## 5. Design overview
 
@@ -114,11 +114,11 @@ Resolution rules:
 
 ## 8. Acceptance criteria
 
-1. `GET /api/v1/pricing/group-plan-providers?plan_id=465722012&market_type=group&specialty=Family%20Medicine` returns NPIs whose NPPES **primary** taxonomy is in the Family-Medicine/General-Practice set — verified by re-querying `getProviderByNpi` for every returned NPI. No Emergency Medicine, no Cardiology, no bare PA.
-2. `searchPricingProvidersByProcedure?plan_id=465722012&market_type=group&code=99214&include_providers=true&specialty=Family%20Medicine` returns **only** family-medicine in-network providers near the location, each with the negotiated rate. The result set is a **strict subset** of the unfiltered call (proving the filter is applied, not ignored).
+1. `GET /api/v1/pricing/group-plan-providers?plan_id=TESTPLAN001&market_type=group&specialty=Family%20Medicine` returns NPIs whose NPPES **primary** taxonomy is in the Family-Medicine/General-Practice set — verified by re-querying `getProviderByNpi` for every returned NPI. No Emergency Medicine, no Cardiology, no bare PA.
+2. `searchPricingProvidersByProcedure?plan_id=TESTPLAN001&market_type=group&code=99214&include_providers=true&specialty=Family%20Medicine` returns **only** family-medicine in-network providers near the location, each with the negotiated rate. The result set is a **strict subset** of the unfiltered call (proving the filter is applied, not ignored).
 3. `classification=Internal%20Medicine` (without `include_subspecialties=true`) returns general internists and **excludes** cardiologists (`207RC0000X`) and other IM subspecialists.
-4. Works for the minimal layout (HealthJoy) **and** a fuller-layout snapshot (e.g. Y Combinator, EIN `471081183`).
-5. api-mcp `find_group_plan_providers(org_name="HealthJoy", specialty="primary care")` returns only PCPs.
+4. Works for both synthetic minimal-layout and fuller-layout snapshots.
+5. api-mcp `find_group_plan_providers(org_name="Example Group Plan", specialty="primary care")` returns only PCPs.
 
 ## 9. Testing
 

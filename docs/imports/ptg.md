@@ -18,7 +18,7 @@ HLTHPRT_PTG2_ARTIFACT_DIR="/Volumes/Data/data" \
 HLTHPRT_PTG2_KEEP_PARTIAL_ARTIFACTS=true \
 python main.py start ptg \
   --toc-url "<SIGNED_UHC_EXAMPLE_GROUP_INDEX_URL>" \
-  --plan-id 010854205 \
+  --plan-id TESTPLAN001 \
   --plan-market-type group \
   --import-month 2026-05-01 \
   --import-id example_group_202605_full \
@@ -82,8 +82,8 @@ python main.py worker process.EntityAddressUnified --burst
 ## Main Outputs
 - PTG2 control tables such as `ptg2_import_run`, `ptg2_snapshot`, `ptg2_current_snapshot`, `ptg2_current_source_snapshot`, `ptg2_current_plan_source`, and `ptg2_artifact_manifest`
 - One manifest-backed snapshot serving representation for the imported source/month: either a retained compact serving table or a transient table that is dropped after PostgreSQL binary serving artifacts are published
-- Snapshot support tables for price atoms and precomputed plan/code counts. `postgres_binary_v1` also retains provider-group members; `postgres_binary_v2` replaces that table with a distinct-NPI scope used for directory paging and address joins.
-- PostgreSQL-owned binary serving and relationship artifacts for `postgres_binary_v1` and `postgres_binary_v2` snapshots; these replace pod-local serving caches and are rebuildable only through PostgreSQL state
+- Snapshot support tables for precomputed plan/code counts and provider scope. V1 retains relational price atoms and provider-group members; v2 replaces the member table with a distinct-NPI scope; v3 encodes price atoms into the serving-binary relation and retains only the small dictionaries and NPI scope needed for serving.
+- PostgreSQL-owned binary serving and relationship artifacts for all `postgres_binary_v1`, `postgres_binary_v2`, and `postgres_binary_v3` snapshots; these replace pod-local serving caches and are rebuildable only through PostgreSQL state
 - Every relation listed in `manifest.serving_index.materialized_tables` for a PostgreSQL binary snapshot is `LOGGED` before the manifest is published. Unlogged relations are limited to disposable scanner, merge, dedupe, and lean-rewrite stages.
 - Legacy or research snapshots may still reference provider-set, provider-NPI, provider reverse, and price-set sidecars
 
@@ -95,6 +95,20 @@ deployment can serve both old and new snapshots while operators compare them.
 
 Supported import modes:
 
+- `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v3` is the dense-key serving
+  layout. It stores forward code/provider-set/price relationships, the reverse
+  provider-set/code projection, price-set membership, price atoms, price-set
+  ids, and provider counts as independently addressable blocks in one logged
+  PostgreSQL serving-binary relation. Price-set keys are always unsigned
+  32-bit values. Atom keys use 24 bits only when the complete snapshot has at
+  most 16,777,216 unique atoms and otherwise switch to 32 bits; the selected
+  width is recorded and validated in both block headers and the manifest.
+  Provider/code pairs spill to bounded sorted runs before their final streaming
+  merge, so dense reverse indexes do not require one import-sized in-memory
+  vector. API readers dispatch from the explicit manifest architecture, read
+  only the required blocks, and raise an artifact-integrity error when a
+  referenced code, provider set, price set, atom, or dictionary value is
+  missing. No request path materializes a filesystem cache.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v2` is the normalized membership
   layout for high-fan-out group plans. It retains four compressed graph
   directions in PostgreSQL: provider set to group, group to provider set, group
@@ -135,23 +149,34 @@ Supported import modes:
   PostgreSQL space on high-cardinality files.
 
 The default import-id fingerprint includes the effective snapshot architecture.
-That lets the same carrier/source/month be imported in both architectures
+That lets the same carrier/source/month be imported in multiple architectures
 without table-name collisions. Use `HLTHPRT_PTG2_SNAPSHOT_ARCH_VARIANT` when you
-need a stable, human-readable A/B label such as `heartland_sidecar_v1`.
+need a stable, human-readable A/B label such as `dense_dental_sidecar_v1`.
+Repeating an already-published fingerprint is idempotent and returns the existing
+snapshot without recreating or dropping tables. Only one worker can claim a
+building fingerprint; a concurrent delivery fails with an explicit
+snapshot-in-progress conflict. A failed fingerprint may be claimed again.
 
-Snapshots without explicit architecture metadata are inferred from their
-manifest tables:
+Architecture resolution uses explicit manifest metadata first, then legacy
+table-shape inference:
 
+- explicit `arch_version=postgres_binary_v3` -> `postgres_binary_v3`
 - explicit `arch_version=postgres_binary_v2` with `provider_npi_scope_table` -> `postgres_binary_v2`
 - manifest snapshot with `serving_binary_table` and no explicit architecture -> `postgres_binary_v1`
 - both scope tables present -> `materialized_v1`
 - manifest snapshot with both scope tables absent and no `serving_binary_table` -> `sidecar_scope_v1`
 - any mixed legacy shape -> `legacy_mixed_v1`
 
+When `HLTHPRT_PTG2_SNAPSHOT_ARCH` is unset, new imports default to
+`postgres_binary_v2`. Promote v3 per environment only after its reader is
+deployed and a real-source correctness, storage, latency, and memory pilot has
+passed.
+
 ## Notes
 - Raw artifacts are retained under `HLTHPRT_PTG2_ARTIFACT_DIR` when set, otherwise under the system temp directory. Files are stored by SHA-256 prefix.
 - Before downloading, PTG2 checks server metadata. Strong ETag plus content length allows reuse; length plus last-modified is allowed for metadata reuse; otherwise the local SHA-256 is verified before reuse.
 - Gzip and ZIP inputs are streamed to logical JSON files; decompressed members are not loaded into memory.
+- `HLTHPRT_PTG2_MAX_DECOMPRESSED_BYTES` limits one logical gzip/ZIP member and defaults to 1 TiB. Deflate64 members must reach decoder EOF and match their declared size and CRC-32 before an import can succeed.
 - Full UHC-scale serving imports use the Rust scanner. It writes rotating COPY shard files under the PTG2 temp directory and Python streams those shards into unlogged stage tables.
 - Serving-rate Rust worker shards are routed to separate PostgreSQL stage tables (`worker0000` -> base stage table, `worker0001+` -> lane stage tables). This allows parallel COPY across tables without multiple COPY sessions extending the same large heap.
 - `HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES` defaults to 128 MiB. Shards are deleted after successful COPY.
@@ -173,9 +198,14 @@ manifest tables:
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
 - `HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true` rejects `target/debug/ptg2_scanner` when the Rust scanner is selected. Keep this enabled in deployed environments; local development can disable it to use a debug binary.
 - `HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS=true` is the default worker-side parser path. The producer transfers bounded raw negotiated-rate chunks to worker threads so `RateLite` construction, normalization, hashing, dedupe, and COPY row writing happen off the producer thread. It still honors `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` for giant `in_network` objects. Set it to `false` to roll back to the previous producer-side parser path for A/B checks.
+- `HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN=true` is the default fast framing path. When `provider_references` follows `in_network` and rapidgzip is enabled, the scanner discovers both uncompressed array ranges while exporting a temporary seek index, then presents the indexed ranges to the existing parallel scanner in dependency order. It uses the checked parser when rapidgzip is disabled, input is not gzip, file outputs are unavailable, or provider-reference worker parsing is explicitly disabled. An enabled rapidgzip/index setup failure aborts the import before output publication instead of silently changing execution mode.
+- `HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED=true` uses the verified parallel `rapidgzip` decoder for full and indexed byte-scan passes. Set `HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS` for the rate-processing pass and `HLTHPRT_PTG2_RUST_RAPIDGZIP_INDEX_THREADS` for the worker-free index pass; defaults are `4` and `8`. Use `HLTHPRT_PTG2_RUST_RAPIDGZIP_BIN` only when the executable is not on `PATH`. Reversed top-level input creates one private ephemeral `gztool` seek index in the system temp directory; it is deleted at scanner exit and is never a retained sidecar or serving cache. Scanner metrics expose `full_decompression_passes`, `order_probe_partial_pass`, `rapidgzip_index_threads`, and `rapidgzip_index_bytes` for this path.
+- Rust worker parsing accepts both top-level `provider_references` and inline `provider_groups`. A rate that names any unresolved provider-reference id fails the file with `InvalidData`; it is never silently omitted. Reversed top-level files use the same provider-reference and rate worker pools after indexed reordering, so input field order no longer forces single-worker processing when rapidgzip is available.
 - `HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES` defaults to `8192` and `HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES` defaults to 32 MiB. In worker-side parser mode, the producer flushes a raw negotiated-rate worker chunk when either bound is reached. Lower one or both values for memory-sensitive lanes only after comparing peak RSS, scanner elapsed time, producer blocked microseconds, and chunk counts.
 - Rust scanner progress defaults to every 256 MiB or 2,000,000 parsed objects. Override with `HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES` or `HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS` when interactive visibility needs to change.
 - Rust scanner stdout includes `scanner_config` and `scanner_summary` frames. The serving-only summary stores them under `summary.scanner` so A/B runs can compare worker count, queue sizes, parse mode, raw chunk count/bytes, elapsed seconds, and producer blocked microseconds.
+- `HLTHPRT_PTG2_SERVING_BINARY_DICTIONARY_BLOCK_BYTES` defaults to 64 KiB for v3 price-set dictionary blocks. `HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT` defaults to 2 percent so incompressible blocks remain sparse-readable instead of paying decompression overhead for negligible savings.
+- `HLTHPRT_PTG2_SERVING_BINARY_V3_PROVIDER_CODE_SORT_CHUNK_BYTES` defaults to 128 MiB and bounds each provider/code sort run before the streaming k-way merge.
 - `PTG2_COPY_SHARD_START` and `PTG2_COPY_SHARD_DONE` should appear while `PTG2_SCANNER_PROGRESS` is still advancing. A growing `.ready` backlog without active PostgreSQL `COPY` means the scanner/COPY handoff is unhealthy.
 - Successful imports print a final `PTG2_IMPORT_DONE` line with processed/failed file counts, serving row count, total seconds, data seconds, publish seconds, index seconds, and analyze seconds. The same timing data is stored in `ptg2_import_run.report.timings`. Direct staging COPY metrics also persist per-kind input bytes, rows, elapsed time, and throughput. Rust serving-stream summaries persist source/target COPY bytes plus first-byte and completion offsets so PostgreSQL sorting, encoding, and target COPY can be profiled separately. Serving-binary storage metrics also record `relation_persistence=logged`.
 - Parallel serving-only imports can still batch top-level `in_network` objects per worker via `HLTHPRT_PTG2_WORKER_CHUNK_ITEMS` for the Python parser path.
@@ -184,7 +214,9 @@ manifest tables:
   - `sha256` (64-hex keys),
   - `blake2_128` (32-hex keys).
 - Snapshot publish and rollback are pointer operations through `ptg2_current_snapshot`.
-- Source-scoped PTG2 serving publishes snapshot-specific tables and updates current pointers. This preserves the NPI/claims-style rollback property: a bad import should not replace the current source snapshot until publish completes.
+- Source-scoped publication compares the source pointer with the value observed when the snapshot build was claimed. Snapshot status, source pointer, and plan pointers are promoted in one transaction; a stale concurrent candidate cannot overwrite a newer source snapshot. GC takes the same publication lock and rebuilds its candidate plan inside the destructive transaction.
+- Source-scoped PTG2 serving publishes snapshot-specific tables and updates current pointers. A bad import does not replace the current source snapshot or downgrade an already-published snapshot. Pre-pointer failures remove candidate tables; post-pointer failures preserve the live snapshot and its tables.
+- Snapshot cleanup reads every known table field plus every value in `manifest.serving_index.materialized_tables`. This includes `serving_binary_table`, location/component tables, dictionaries, and future materialized table families that use the guarded PTG2 prefixes.
 - Plan-filtered `/pricing/providers/by-procedure` requests route to the PTG2 snapshot index when `plan_id`, `plan_external_id`, or `snapshot_id` is provided. No-plan requests keep the existing claims-pricing behavior.
 - Warm-cache fixture benchmark coverage lives in `tests/test_ptg2_serving.py`; default p95 threshold is 50 ms (`HLTHPRT_PTG2_WARM_P95_MAX_MS`).
 - This pipeline is payer-file oriented and structurally different from CMS Medicare claims imports.

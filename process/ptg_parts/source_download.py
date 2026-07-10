@@ -20,6 +20,7 @@ import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
@@ -28,6 +29,7 @@ from process.ptg_parts.artifact_streams import logical_artifact_identity, stream
 from process.ptg_parts.artifacts import (
     PTG2ArtifactStore,
     _hash_existing_file_into,
+    _is_strong_etag,
     _load_completed_ranges,
     _range_sidecar_path,
     _safe_url_suffix,
@@ -80,12 +82,82 @@ _GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES
 _GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 INCOMPLETE_TLS_CHAIN_HOSTS_ENV = "HLTHPRT_INCOMPLETE_TLS_CHAIN_HOSTS"
 DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS = frozenset({"api.midlandschoice.com"})
+_CONTENT_RANGE_PATTERN = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)$", re.IGNORECASE)
 
 
 @dataclass
 class RangeDownloadProgress:
     completed_bytes: int
     next_progress_bytes: int
+
+
+class _UnsafeRangeResponseError(RuntimeError):
+    pass
+
+
+def _validate_content_range(
+    response: aiohttp.ClientResponse,
+    *,
+    url: str,
+    expected_start: int,
+    expected_end: int,
+    expected_total: int,
+) -> None:
+    content_range = (response.headers.get("Content-Range") or "").strip()
+    match = _CONTENT_RANGE_PATTERN.fullmatch(content_range)
+    actual = tuple(int(value) for value in match.groups()) if match else None
+    expected = (expected_start, expected_end, expected_total)
+    if actual != expected:
+        raise _UnsafeRangeResponseError(
+            f"Range download for {url} returned Content-Range {content_range!r}, "
+            f"expected 'bytes {expected_start}-{expected_end}/{expected_total}'"
+        )
+
+
+def _validate_range_response(
+    response: aiohttp.ClientResponse,
+    *,
+    url: str,
+    expected_start: int,
+    expected_end: int,
+    expected_total: int,
+    expected_etag: str,
+) -> None:
+    if response.status != 206:
+        raise _UnsafeRangeResponseError(
+            f"Range download not supported for {url}: status {response.status}"
+        )
+    _validate_content_range(
+        response,
+        url=url,
+        expected_start=expected_start,
+        expected_end=expected_end,
+        expected_total=expected_total,
+    )
+    response_etag = response.headers.get("ETag")
+    if response_etag and response_etag != expected_etag:
+        raise _UnsafeRangeResponseError(
+            f"Range download for {url} changed ETag from {expected_etag!r} to {response_etag!r}"
+        )
+
+
+def _reset_partial_download(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    _range_sidecar_path(path).unlink(missing_ok=True)
+
+
+def _validated_resume_offset(path: Path, *, total_bytes: int | None, etag: str | None) -> int:
+    if not path.exists() or not total_bytes or not _is_strong_etag(etag):
+        return 0
+    completed = _load_completed_ranges(
+        _range_sidecar_path(path),
+        total_bytes=total_bytes,
+        etag=etag,
+    )
+    size = path.stat().st_size
+    if 0 < size < total_bytes and completed == {(0, size - 1)}:
+        return size
+    return 0
 
 
 def _incomplete_tls_chain_hosts() -> set[str]:
@@ -312,20 +384,35 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
         return PTG2HeadMetadata(url=url, supports_head=False)
 
 
-async def _probe_http_range_support(url: str) -> tuple[bool, int | None, str | None, str | None]:
+async def _probe_http_range_support(
+    url: str,
+    etag: str | None = None,
+) -> tuple[bool, int | None, str | None, str | None]:
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+    validator = etag if _is_strong_etag(etag) else None
+    headers_by_name = {"Range": "bytes=0-0"}
+    if validator:
+        headers_by_name["If-Match"] = validator
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with _validated_request(session, "GET", url, headers={"Range": "bytes=0-0"}) as response:
+            async with _validated_request(session, "GET", url, headers=headers_by_name) as response:
                 if response.status != 206:
                     return False, None, None, None
                 content_range = response.headers.get("Content-Range") or ""
-                match = re.match(r"bytes\s+0-0/(\d+)$", content_range.strip())
+                match = _CONTENT_RANGE_PATTERN.fullmatch(content_range.strip())
                 if not match:
                     return False, None, None, None
-                await response.content.read()
-                return True, int(match.group(1)), response.headers.get("ETag"), str(response.url)
+                range_start = int(match.group(1))
+                range_end = int(match.group(2))
+                range_total = int(match.group(3))
+                if (range_start, range_end) != (0, 0) or len(await response.content.read()) != 1:
+                    return False, None, None, None
+                response_etag = response.headers.get("ETag")
+                if validator and response_etag and response_etag != validator:
+                    return False, None, None, None
+                strong_validator = validator or (response_etag if _is_strong_etag(response_etag) else None)
+                return True, range_total, strong_validator, str(response.url)
     except Exception:
         return False, None, None, None
 
@@ -339,6 +426,8 @@ async def _download_raw_artifact_ranges(
     max_bytes: int | None,
     started_at: float,
 ) -> bool:
+    if not _is_strong_etag(etag):
+        raise RuntimeError(f"Range download for {url} requires a strong ETag")
     if max_bytes is not None and total_bytes > max_bytes:
         raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
     chunk_size = _range_download_chunk_bytes()
@@ -374,8 +463,14 @@ async def _download_raw_artifact_ranges(
         completed_ok = False
         try:
             async with _validated_request(session, "GET", url, headers=headers) as response:
-                if response.status != 206:
-                    raise RuntimeError(f"Range download not supported for {url}: status {response.status}")
+                _validate_range_response(
+                    response,
+                    url=url,
+                    expected_start=start,
+                    expected_end=end,
+                    expected_total=total_bytes,
+                    expected_etag=str(etag),
+                )
                 offset = start
                 fd = os.open(partial_path, os.O_WRONLY)
                 try:
@@ -441,7 +536,14 @@ async def _download_raw_artifact_ranges(
                         await asyncio.sleep(delay)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        await asyncio.gather(*(bounded_fetch(session, item) for item in pending_ranges))
+        range_tasks = [asyncio.create_task(bounded_fetch(session, item)) for item in pending_ranges]
+        try:
+            await asyncio.gather(*range_tasks)
+        except BaseException:
+            for range_task in range_tasks:
+                range_task.cancel()
+            await asyncio.gather(*range_tasks, return_exceptions=True)
+            raise
     sidecar_path.unlink(missing_ok=True)
     _emit_download_progress(
         url=url,
@@ -451,6 +553,236 @@ async def _download_raw_artifact_ranges(
         done=False,
     )
     return True
+
+
+@dataclass
+class _SingleGetDownloadState:
+    path: Path
+    digest: Any
+    byte_count: int
+    total_bytes: int | None
+    validator: str | None
+    last_modified: str | None
+    next_progress_bytes: int
+
+
+class _DownloadSizeLimitError(RuntimeError):
+    pass
+
+
+def _single_get_download_state(path: Path, head: PTG2HeadMetadata) -> _SingleGetDownloadState:
+    validator = head.etag if _is_strong_etag(head.etag) else None
+    resume_offset = _validated_resume_offset(
+        path,
+        total_bytes=head.content_length,
+        etag=validator,
+    )
+    if resume_offset == 0:
+        _reset_partial_download(path)
+    digest = hashlib.sha256()
+    byte_count = _hash_existing_file_into(path, digest) if resume_offset else 0
+    next_progress_bytes = _download_progress_interval_bytes()
+    while byte_count >= next_progress_bytes:
+        next_progress_bytes += _download_progress_interval_bytes()
+    return _SingleGetDownloadState(
+        path=path,
+        digest=digest,
+        byte_count=byte_count,
+        total_bytes=head.content_length,
+        validator=validator,
+        last_modified=head.last_modified if resume_offset else None,
+        next_progress_bytes=next_progress_bytes,
+    )
+
+
+def _can_resume_single_get_download(state: _SingleGetDownloadState) -> bool:
+    return bool(
+        state.byte_count
+        and state.total_bytes
+        and state.byte_count < state.total_bytes
+        and _is_strong_etag(state.validator)
+    )
+
+
+def _prepare_single_get_response(
+    response: aiohttp.ClientResponse,
+    *,
+    state: _SingleGetDownloadState,
+    url: str,
+    is_resume_request: bool,
+) -> str:
+    if is_resume_request:
+        if response.status != 206:
+            raise _UnsafeRangeResponseError(
+                f"Resume download not supported for {url}: status {response.status}"
+            )
+        _validate_content_range(
+            response,
+            url=url,
+            expected_start=state.byte_count,
+            expected_end=int(state.total_bytes) - 1,
+            expected_total=int(state.total_bytes),
+        )
+        returned_etag = response.headers.get("ETag")
+        if returned_etag and returned_etag != state.validator:
+            raise _UnsafeRangeResponseError(
+                f"Resume download for {url} changed ETag from {state.validator!r} to {returned_etag!r}"
+            )
+        return "ab"
+
+    if response.status == 206:
+        raise _UnsafeRangeResponseError(f"Full download for {url} unexpectedly returned partial content")
+    content_length = response.headers.get("Content-Length")
+    state.total_bytes = int(content_length) if content_length and content_length.isdigit() else None
+    returned_etag = response.headers.get("ETag")
+    state.validator = returned_etag if _is_strong_etag(returned_etag) else None
+    state.last_modified = response.headers.get("Last-Modified")
+    state.digest = hashlib.sha256()
+    state.byte_count = 0
+    state.next_progress_bytes = _download_progress_interval_bytes()
+    return "wb"
+
+
+async def _stream_single_get_response(
+    response: aiohttp.ClientResponse,
+    *,
+    state: _SingleGetDownloadState,
+    url: str,
+    file_mode: str,
+    max_bytes: int | None,
+    started_at: float,
+) -> None:
+    if max_bytes is not None and state.total_bytes is not None and state.total_bytes > max_bytes:
+        raise _DownloadSizeLimitError(f"PTG2 max-bytes guard exceeded for {url}")
+    with open(state.path, file_mode) as output_fp:
+        async for chunk in response.content.iter_chunked(1024 * 1024):
+            if not chunk:
+                continue
+            state.byte_count += len(chunk)
+            if max_bytes is not None and state.byte_count > max_bytes:
+                raise _DownloadSizeLimitError(f"PTG2 max-bytes guard exceeded for {url}")
+            state.digest.update(chunk)
+            output_fp.write(chunk)
+            if state.byte_count >= state.next_progress_bytes:
+                _emit_download_progress(
+                    url=url,
+                    bytes_read=state.byte_count,
+                    total_bytes=state.total_bytes,
+                    started_at=started_at,
+                    done=False,
+                )
+                while state.byte_count >= state.next_progress_bytes:
+                    state.next_progress_bytes += _download_progress_interval_bytes()
+
+
+async def _run_single_get_attempt(
+    *,
+    url: str,
+    state: _SingleGetDownloadState,
+    max_bytes: int | None,
+    started_at: float,
+    timeout: aiohttp.ClientTimeout,
+) -> None:
+    is_resume_request = _can_resume_single_get_download(state)
+    request_headers_by_name = None
+    if is_resume_request:
+        request_headers_by_name = {
+            "Range": f"bytes={state.byte_count}-",
+            "If-Match": str(state.validator),
+        }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with _validated_request(session, "GET", url, headers=request_headers_by_name) as response:
+            response.raise_for_status()
+            file_mode = _prepare_single_get_response(
+                response,
+                state=state,
+                url=url,
+                is_resume_request=is_resume_request,
+            )
+            await _stream_single_get_response(
+                response,
+                state=state,
+                url=url,
+                file_mode=file_mode,
+                max_bytes=max_bytes,
+                started_at=started_at,
+            )
+    if state.total_bytes is not None and state.byte_count != state.total_bytes:
+        raise RuntimeError(
+            f"Download for {url} ended at {state.byte_count} bytes, expected {state.total_bytes}"
+        )
+    _range_sidecar_path(state.path).unlink(missing_ok=True)
+
+
+def _preserve_single_get_partial(state: _SingleGetDownloadState, error: Exception) -> None:
+    invalid_range = isinstance(error, _UnsafeRangeResponseError)
+    rejected_validator = isinstance(error, aiohttp.ClientResponseError) and error.status in {412, 416}
+    has_complete_prefix = bool(
+        state.byte_count
+        and state.total_bytes
+        and state.byte_count < state.total_bytes
+        and _is_strong_etag(state.validator)
+        and state.path.exists()
+        and state.path.stat().st_size == state.byte_count
+    )
+    if has_complete_prefix and not invalid_range and not rejected_validator and not isinstance(error, _DownloadSizeLimitError):
+        _write_completed_ranges(
+            _range_sidecar_path(state.path),
+            total_bytes=int(state.total_bytes),
+            etag=state.validator,
+            completed={(0, state.byte_count - 1)},
+        )
+        return
+    _reset_partial_download(state.path)
+    state.digest = hashlib.sha256()
+    state.byte_count = 0
+    state.total_bytes = None
+    state.validator = None
+    state.last_modified = None
+    state.next_progress_bytes = _download_progress_interval_bytes()
+
+
+async def _download_raw_artifact_single_get(
+    *,
+    url: str,
+    path: Path,
+    head: PTG2HeadMetadata,
+    max_bytes: int | None,
+    started_at: float,
+) -> tuple[Any, int, str | None, int | None, str | None]:
+    state = _single_get_download_state(path, head)
+    timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
+    retries = _download_retry_count()
+    for attempt in range(retries + 1):
+        try:
+            await _run_single_get_attempt(
+                url=url,
+                state=state,
+                max_bytes=max_bytes,
+                started_at=started_at,
+                timeout=timeout,
+            )
+            return state.digest, state.byte_count, state.validator, state.total_bytes, state.last_modified
+        except UnsafeUrlError:
+            raise
+        except _DownloadSizeLimitError as exc:
+            _preserve_single_get_partial(state, exc)
+            raise
+        except Exception as exc:
+            _preserve_single_get_partial(state, exc)
+            if attempt >= retries:
+                raise
+            delay = _download_retry_delay_seconds() * (2 ** attempt)
+            message = (
+                f"PTG2_DOWNLOAD_RETRY url={url} bytes={state.byte_count} "
+                f"attempt={attempt + 1} next_attempt={attempt + 2} "
+                f"delay_seconds={delay:.2f} error={exc}"
+            )
+            _emit_screen_line(message, stderr=True)
+            logger.debug(message)
+            if delay > 0:
+                await asyncio.sleep(delay)
+    raise RuntimeError(f"Download retries exhausted for {url}")
 
 
 async def download_raw_artifact(
@@ -474,7 +806,7 @@ async def download_raw_artifact(
         if candidate is not None and mode is not None:
             raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
             raw_path = store.path_from_uri(raw_uri)
-            expected = candidate.get("raw_sha256") or candidate.get("sha256")
+            expected = str(candidate["raw_sha256"]).lower()
             actual, byte_count = sha256_file(raw_path)
             gzip_error = _gzip_integrity_error(
                 url,
@@ -531,6 +863,9 @@ async def download_raw_artifact(
     tmp_path = partial_path if keep_partials else store.tmp_dir / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
     digest = hashlib.sha256()
     byte_count = 0
+    download_etag = head.etag
+    download_content_length = head.content_length
+    download_last_modified = head.last_modified
     _emit_download_progress(
         url=url,
         bytes_read=0,
@@ -542,6 +877,7 @@ async def download_raw_artifact(
         if str(url).startswith("file://") or (not str(url).lower().startswith(("http://", "https://")) and Path(url).exists()):
             source_path = Path(urlsplit(url).path if str(url).startswith("file://") else url)
             total_bytes = source_path.stat().st_size if source_path.exists() else None
+            download_content_length = total_bytes
             with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
                 for chunk in iter(lambda: src.read(1024 * 1024), b""):
                     byte_count += len(chunk)
@@ -560,7 +896,6 @@ async def download_raw_artifact(
                         while byte_count >= next_progress_bytes:
                             next_progress_bytes += progress_interval_bytes
         else:
-            timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
             used_range_download = False
             range_total = head.content_length if head and head.content_length else None
             if (
@@ -568,93 +903,53 @@ async def download_raw_artifact(
                 and range_total
                 and range_total >= _range_download_min_bytes()
             ):
-                range_supported, probed_total, probed_etag, _range_url = await _probe_http_range_support(url)
-                if range_supported and probed_total:
-                    await _download_raw_artifact_ranges(
-                        url=url,
-                        partial_path=partial_path,
-                        total_bytes=probed_total,
-                        etag=probed_etag or (head.etag if head else None),
-                        max_bytes=max_bytes,
-                        started_at=progress_started_at,
-                    )
-                    byte_count = _hash_existing_file_into(partial_path, digest)
-                    used_range_download = True
-            if not used_range_download:
-                resume_from = partial_path.stat().st_size if partial_path.exists() else 0
-                if head.content_length and resume_from == head.content_length:
-                    byte_count = _hash_existing_file_into(partial_path, digest)
-                elif head.content_length and resume_from > head.content_length:
-                    partial_path.unlink(missing_ok=True)
-                    resume_from = 0
-                if byte_count == 0 and resume_from > 0:
-                    byte_count = _hash_existing_file_into(partial_path, digest)
-                    while byte_count >= next_progress_bytes:
-                        next_progress_bytes += progress_interval_bytes
-            if not used_range_download and not (head.content_length and byte_count == head.content_length):
-                retries = _download_retry_count()
-                attempt = 0
-                while not (head.content_length and byte_count == head.content_length):
+                head_etag = head.etag if _is_strong_etag(head.etag) else None
+                range_supported, probed_total, probed_etag, _range_url = await _probe_http_range_support(
+                    url,
+                    head_etag,
+                )
+                if range_supported and probed_total and _is_strong_etag(probed_etag):
+                    if max_bytes is not None and probed_total > max_bytes:
+                        raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
                     try:
-                        async with aiohttp.ClientSession(timeout=timeout) as session:
-                            resume_from = partial_path.stat().st_size if partial_path.exists() else 0
-                            if resume_from != byte_count:
-                                digest = hashlib.sha256()
-                                byte_count = _hash_existing_file_into(partial_path, digest) if resume_from > 0 else 0
-                            headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 and byte_count == resume_from else None
-                            async with _validated_request(session, "GET", url, headers=headers) as response:
-                                response.raise_for_status()
-                                length = response.headers.get("Content-Length")
-                                if resume_from > 0 and response.status != 206:
-                                    digest = hashlib.sha256()
-                                    byte_count = 0
-                                    resume_from = 0
-                                    while next_progress_bytes > progress_interval_bytes:
-                                        next_progress_bytes -= progress_interval_bytes
-                                response_total = (
-                                    head.content_length
-                                    if head and head.content_length
-                                    else (resume_from + int(length) if length and length.isdigit() else None)
-                                )
-                                mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
-                                with open(tmp_path, mode) as dst:
-                                    async for chunk in response.content.iter_chunked(1024 * 1024):
-                                        byte_count += len(chunk)
-                                        if max_bytes is not None and byte_count > max_bytes:
-                                            raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
-                                        digest.update(chunk)
-                                        dst.write(chunk)
-                                        if byte_count >= next_progress_bytes:
-                                            _emit_download_progress(
-                                                url=url,
-                                                bytes_read=byte_count,
-                                                total_bytes=response_total,
-                                                started_at=progress_started_at,
-                                                done=False,
-                                            )
-                                            while byte_count >= next_progress_bytes:
-                                                next_progress_bytes += progress_interval_bytes
-                        if head.content_length and byte_count != head.content_length:
-                            raise RuntimeError(
-                                f"Download for {url} ended at {byte_count} bytes, expected {head.content_length}"
-                            )
-                        break
+                        await _download_raw_artifact_ranges(
+                            url=url,
+                            partial_path=tmp_path,
+                            total_bytes=probed_total,
+                            etag=probed_etag,
+                            max_bytes=max_bytes,
+                            started_at=progress_started_at,
+                        )
                     except UnsafeUrlError:
                         raise
                     except Exception as exc:
-                        if attempt >= retries:
-                            raise
-                        delay = _download_retry_delay_seconds() * (2 ** attempt)
-                        message = (
-                            f"PTG2_DOWNLOAD_RETRY url={url} bytes={byte_count} "
-                            f"attempt={attempt + 1} next_attempt={attempt + 2} "
-                            f"delay_seconds={delay:.2f} error={exc}"
+                        logger.warning(
+                            "Falling back to a full PTG2 download after unsafe or failed ranges for %s: %s",
+                            url,
+                            exc,
                         )
-                        _emit_screen_line(message, stderr=True)
-                        logger.debug(message)
-                        attempt += 1
-                        if delay > 0:
-                            await asyncio.sleep(delay)
+                        _reset_partial_download(tmp_path)
+                    else:
+                        digest = hashlib.sha256()
+                        byte_count = _hash_existing_file_into(tmp_path, digest)
+                        download_etag = probed_etag
+                        download_content_length = probed_total
+                        download_last_modified = head.last_modified if probed_etag == head.etag else None
+                        used_range_download = True
+            if not used_range_download:
+                (
+                    digest,
+                    byte_count,
+                    download_etag,
+                    download_content_length,
+                    download_last_modified,
+                ) = await _download_raw_artifact_single_get(
+                    url=url,
+                    path=tmp_path,
+                    head=head,
+                    max_bytes=max_bytes,
+                    started_at=progress_started_at,
+                )
         raw_sha = digest.hexdigest()
         final_path = store.artifact_path(raw_sha, kind=PTG2_ARTIFACT_RAW, suffix=_safe_url_suffix(url))
         final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,7 +984,7 @@ async def download_raw_artifact(
         _emit_download_progress(
             url=url,
             bytes_read=actual_size,
-            total_bytes=head.content_length if head and head.content_length else actual_size,
+            total_bytes=download_content_length or actual_size,
             started_at=progress_started_at,
             done=True,
         )
@@ -701,13 +996,23 @@ async def download_raw_artifact(
             "raw_storage_uri": raw_uri,
             "raw_sha256": actual_sha,
             "sha256": actual_sha,
-            "content_length": head.content_length if head else actual_size,
+            "content_length": download_content_length or actual_size,
             "byte_count": actual_size,
-            "etag": head.etag if head else None,
-            "last_modified": head.last_modified if head else None,
+            "etag": download_etag,
+            "last_modified": download_last_modified,
             "status": "available",
         }
         store.record_manifest(manifest_payload)
+        verified_head = PTG2HeadMetadata(
+            url=head.url,
+            status=head.status,
+            etag=download_etag,
+            content_length=download_content_length or actual_size,
+            last_modified=download_last_modified,
+            content_encoding=head.content_encoding,
+            content_type=head.content_type,
+            supports_head=head.supports_head,
+        )
         return PTG2RawArtifact(
             original_url=url,
             canonical_url=canonical_url,
@@ -715,7 +1020,7 @@ async def download_raw_artifact(
             raw_storage_uri=raw_uri,
             raw_sha256=actual_sha,
             byte_count=actual_size,
-            head=head,
+            head=verified_head,
             reused=False,
             verification_mode="downloaded",
         )

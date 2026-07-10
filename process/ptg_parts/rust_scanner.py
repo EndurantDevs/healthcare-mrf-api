@@ -52,6 +52,7 @@ _SCANNER_PROGRESS_BASE_KEYS = {
     "objects",
     "done",
 }
+_SCANNER_METRIC_RECORD_KINDS = {"scanner_config", "scanner_summary"}
 
 
 def _ptg2_scanner_binary_profile(path: Path) -> str:
@@ -225,6 +226,66 @@ def _emit_scanner_live_progress(
         write_live_progress(**payload)
     except Exception:
         logger.debug("Failed to write PTG2 scanner live progress", exc_info=True)
+
+
+def _scanner_metric_message(record_kind: str, payload: dict[str, Any]) -> str:
+    mode = str(payload.get("execution_mode") or "unknown")
+    if record_kind == "scanner_config":
+        order = str(payload.get("provider_reference_order") or "unknown")
+        selected = bool(payload.get("top_level_byte_scan_selected"))
+        message = f"compact-serving scanner mode={mode}, provider_order={order}, byte_scan={selected}"
+        fallback_reason = payload.get("top_level_byte_scan_fallback_reason")
+        if fallback_reason:
+            message += f", fallback={fallback_reason}"
+        return message
+
+    elapsed = _coerce_progress_float(payload.get("elapsed_seconds"))
+    nonblocked = _coerce_progress_float(payload.get("producer_nonblocked_seconds"))
+    blocked = _coerce_progress_float(payload.get("producer_blocked_seconds"))
+    raw_mib_s = _coerce_progress_float(payload.get("producer_nonblocked_raw_mib_s"))
+    parts = [f"compact-serving scanner complete mode={mode}"]
+    if elapsed is not None:
+        parts.append(f"elapsed={elapsed:.3f}s")
+    if nonblocked is not None:
+        parts.append(f"producer_nonblocked={nonblocked:.3f}s")
+    if blocked is not None:
+        parts.append(f"queue_blocked={blocked:.3f}s")
+    if raw_mib_s is not None:
+        parts.append(f"producer_raw={raw_mib_s:.2f} MiB/s")
+    return ", ".join(parts)
+
+
+def _emit_scanner_metric_progress(
+    record_kind: str,
+    metric_fields: dict[str, Any],
+    *,
+    live_progress_context: dict[str, Any] | None = None,
+) -> None:
+    if record_kind not in _SCANNER_METRIC_RECORD_KINDS:
+        return
+    message = _scanner_metric_message(record_kind, metric_fields)
+    metric_line = f"PTG2_SCANNER_METRICS\tkind={record_kind}\t{message}"
+    _emit_screen_line(metric_line)
+    logger.info(metric_line)
+    progress_context_map = {
+        context_key: context_value
+        for context_key, context_value in (live_progress_context or {}).items()
+        if context_value not in (None, "")
+    }
+    try:
+        write_live_progress(
+            **progress_context_map,
+            phase="compact-serving scanner",
+            message=message,
+            detail=message,
+            source="ptg2-scanner-metrics",
+            confidence="live",
+            scanner_record_kind=record_kind,
+            scanner_execution_mode=metric_fields.get("execution_mode"),
+            scanner_fallback_reason=metric_fields.get("top_level_byte_scan_fallback_reason"),
+        )
+    except Exception:
+        logger.debug("Failed to write PTG2 scanner metric progress", exc_info=True)
 
 
 def _iter_top_level_object_bytes_rust(
@@ -490,7 +551,15 @@ def _iter_compact_serving_records_rust(
             trailer = process.stdout.read(1)
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
-            yield name_bytes.decode("utf-8"), _json_loads(payload)
+            record_kind = name_bytes.decode("utf-8")
+            record_payload = _json_loads(payload)
+            if record_kind in _SCANNER_METRIC_RECORD_KINDS and isinstance(record_payload, dict):
+                _emit_scanner_metric_progress(
+                    record_kind,
+                    record_payload,
+                    live_progress_context=live_progress_context,
+                )
+            yield record_kind, record_payload
     finally:
         if process.poll() is None:
             terminated_by_consumer = True

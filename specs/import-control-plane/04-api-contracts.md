@@ -144,7 +144,7 @@ Public API exposes only public sources and aggregate/imported coverage metrics.
 
 ```json
 {
-  "plan_id": "823166837",
+  "plan_id": "TESTPLAN001",
   "plan_id_type": "ein",
   "market_type": "group",
   "source_key": "optional",
@@ -161,7 +161,7 @@ Response:
   "node_id": "mrf-east-1",
   "base_url": "https://mrf-east-1.internal",
   "snapshot_id": "snapshot",
-  "source_key": "asr_1208",
+  "source_key": "example_source_a",
   "cache_ttl_seconds": 60
 }
 ```

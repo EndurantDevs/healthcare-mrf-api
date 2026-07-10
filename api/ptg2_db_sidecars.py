@@ -49,6 +49,44 @@ class PTG2ServingBinaryRow(PTG2ServingSidecarRow):
     price_key: int | None = None
 
 
+@dataclass(frozen=True)
+class _DictionaryBlockMetadata:
+    block_no: int
+    entry_count: int
+    payload_compression: str
+    raw_payload_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True)
+class _DictionaryMetadata:
+    blocks: tuple[_DictionaryBlockMetadata, ...] | None
+    block_count: int
+    entries_per_block: int
+    item_count: int
+
+
+def _dictionary_metadata_block(
+    metadata: _DictionaryMetadata,
+    block_no: int,
+) -> _DictionaryBlockMetadata:
+    if block_no < 0 or block_no >= metadata.block_count:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block is out of range")
+    if metadata.blocks is not None:
+        return metadata.blocks[block_no]
+    block_start = block_no * metadata.entries_per_block
+    entry_count = min(metadata.entries_per_block, metadata.item_count - block_start)
+    if entry_count <= 0:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block is empty")
+    return _DictionaryBlockMetadata(
+        block_no=block_no,
+        entry_count=entry_count,
+        payload_compression="none",
+        raw_payload_bytes=0,
+        payload_bytes=entry_count * 16,
+    )
+
+
 _DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
 _MEMBERSHIP_HEADER = struct.Struct("<8sIQ")
 _DENSE_MEMBERSHIP_HEADER = struct.Struct("<8sIQQ")
@@ -72,6 +110,7 @@ _SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_diction
 _SERVING_BINARY_PRICE_SET_ATOMS_KIND = "price_set_atoms"
 _SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_KIND = "price_set_atoms_by_id"
 _SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND = "price_set_atoms_by_id_v2"
+_DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE = 64
 _PRICE_SET_ATOM_BLOCK_SIZE = 1024
 _PRICE_SET_ATOM_ID_BUCKETS = 256
 _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
@@ -733,29 +772,19 @@ async def _serving_binary_dictionary_payload(
     """Return a raw binary dictionary payload without expanding every id."""
 
     qualified_table = _safe_qualified_table_name(table_name)
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                payload,
-                COALESCE(binary_block.payload_compression, 'none') AS payload_compression,
-                binary_block.raw_payload_bytes
-              FROM {qualified_table} binary_block
-             WHERE artifact_kind = :artifact_kind
-               AND block_key = 0
-               AND block_no = 0
-             LIMIT 1
-            """
-        ),
-        {"artifact_kind": artifact_kind},
+    metadata = await _serving_binary_dictionary_metadata(
+        session,
+        table_name,
+        artifact_kind=artifact_kind,
     )
-    dictionary_records = _result_rows(query_result)
-    if not dictionary_records:
-        raise PTG2ManifestArtifactError(f"PTG2 serving binary dictionary is missing: {artifact_kind}")
-    dictionary_payload = _decode_serving_binary_payload(_row_mapping(dictionary_records[0]))
-    if len(dictionary_payload) % 16:
-        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
-    return dictionary_payload
+    payload_by_block_no = await _serving_binary_dictionary_blocks(
+        session,
+        qualified_table,
+        artifact_kind=artifact_kind,
+        metadata=metadata,
+        block_nos=range(metadata.block_count),
+    )
+    return b"".join(payload_by_block_no[block_no] for block_no in range(metadata.block_count))
 
 
 async def _serving_binary_dictionary_values_for_keys(
@@ -764,6 +793,9 @@ async def _serving_binary_dictionary_values_for_keys(
     *,
     artifact_kind: str,
     item_keys: Iterable[int],
+    item_count_hint: int | None = None,
+    block_bytes_hint: int | None = None,
+    compressed_records_hint: int | None = None,
 ) -> dict[int, str]:
     """Return selected 128-bit ids from a binary dictionary payload."""
 
@@ -771,44 +803,34 @@ async def _serving_binary_dictionary_values_for_keys(
     if not requested_keys:
         return {}
     qualified_table = _safe_qualified_table_name(table_name)
-    values_by_key: dict[int, str] = {}
-    missing_keys: list[int] = []
-    for item_key in requested_keys:
-        cached_value = _binary_dictionary_cache_get(
-            (qualified_table, f"{artifact_kind}:item:{item_key}")
-        )
-        if cached_value is _CACHE_MISS:
-            missing_keys.append(item_key)
-        else:
-            values_by_key[item_key] = cached_value
+    values_by_key, missing_keys = _cached_dictionary_values_for_keys(
+        qualified_table,
+        artifact_kind,
+        requested_keys,
+    )
     if not missing_keys:
         return values_by_key
 
-    metadata = await _serving_binary_dictionary_metadata(
-        session,
-        table_name,
-        artifact_kind=artifact_kind,
+    metadata = _uncompressed_dictionary_metadata_hint(
+        item_count=item_count_hint,
+        block_bytes=block_bytes_hint,
+        compressed_records=compressed_records_hint,
     )
-    compression = str(metadata.get("payload_compression") or "none").strip().lower()
-    if compression in {"", "none"}:
-        missing_values = await _uncompressed_dictionary_values_for_keys(
-            session,
-            qualified_table,
-            artifact_kind=artifact_kind,
-            item_keys=missing_keys,
-            payload_bytes=int(metadata.get("payload_bytes") or 0),
-        )
-    else:
-        dictionary_payload = await _serving_binary_dictionary_payload(
+    if metadata is None:
+        metadata = await _serving_binary_dictionary_metadata(
             session,
             table_name,
             artifact_kind=artifact_kind,
         )
-        missing_values = _dictionary_values_from_payload(
-            dictionary_payload,
-            missing_keys,
-        )
-    for item_key, item_value in missing_values.items():
+    _validate_dictionary_keys(missing_keys, metadata.item_count)
+    missing_values_by_key = await _uncached_dictionary_values_for_keys(
+        session,
+        qualified_table,
+        artifact_kind=artifact_kind,
+        metadata=metadata,
+        item_keys=missing_keys,
+    )
+    for item_key, item_value in missing_values_by_key.items():
         values_by_key[item_key] = item_value
         _binary_dictionary_cache_set(
             (qualified_table, f"{artifact_kind}:item:{item_key}"),
@@ -818,31 +840,92 @@ async def _serving_binary_dictionary_values_for_keys(
     return values_by_key
 
 
+def _cached_dictionary_values_for_keys(
+    qualified_table: str,
+    artifact_kind: str,
+    item_keys: Iterable[int],
+) -> tuple[dict[int, str], tuple[int, ...]]:
+    """Split requested dictionary keys into cached values and cache misses."""
+
+    values_by_key: dict[int, str] = {}
+    missing_keys: list[int] = []
+    for item_key in item_keys:
+        cached_value = _binary_dictionary_cache_get(
+            (qualified_table, f"{artifact_kind}:item:{item_key}")
+        )
+        if cached_value is _CACHE_MISS:
+            missing_keys.append(item_key)
+        else:
+            values_by_key[item_key] = cached_value
+    return values_by_key, tuple(missing_keys)
+
+
+async def _uncached_dictionary_values_for_keys(
+    session: Any,
+    qualified_table: str,
+    *,
+    artifact_kind: str,
+    metadata: _DictionaryMetadata,
+    item_keys: Iterable[int],
+) -> dict[int, str]:
+    """Fetch every referenced block once, then slice selected fixed-width ids."""
+
+    requested_keys = tuple(item_keys)
+    _validate_dictionary_keys(requested_keys, metadata.item_count)
+    item_keys_by_block_no: dict[int, list[int]] = {}
+    for item_key in requested_keys:
+        block_no = item_key // metadata.entries_per_block
+        item_keys_by_block_no.setdefault(block_no, []).append(item_key)
+    block_nos = sorted(item_keys_by_block_no)
+    values_by_key: dict[int, str] = {}
+    for batch_start in range(0, len(block_nos), _DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE):
+        block_batch = block_nos[
+            batch_start : batch_start + _DICTIONARY_LOOKUP_BLOCK_BATCH_SIZE
+        ]
+        payload_by_block_no = await _serving_binary_dictionary_blocks(
+            session,
+            qualified_table,
+            artifact_kind=artifact_kind,
+            metadata=metadata,
+            block_nos=block_batch,
+        )
+        for block_no in block_batch:
+            block_payload = payload_by_block_no[block_no]
+            for item_key in item_keys_by_block_no[block_no]:
+                block_item_key = item_key % metadata.entries_per_block
+                value_offset = block_item_key * 16
+                values_by_key[item_key] = _id_text(
+                    block_payload[value_offset : value_offset + 16]
+                )
+    return values_by_key
+
+
 async def _serving_binary_dictionary_metadata(
     session: Any,
     table_name: str,
     *,
     artifact_kind: str,
-) -> dict[str, Any]:
+) -> _DictionaryMetadata:
     """Return small dictionary metadata without reading its potentially huge payload."""
 
     qualified_table = _safe_qualified_table_name(table_name)
     cache_key = (qualified_table, f"{artifact_kind}:metadata")
     cached_metadata = _binary_dictionary_cache_get(cache_key)
     if cached_metadata is not _CACHE_MISS:
-        return dict(cached_metadata)
+        return cached_metadata
     metadata_result = await session.execute(
         text(
             f"""
             SELECT
+                binary_block.block_no,
+                binary_block.entry_count,
                 COALESCE(binary_block.payload_compression, 'none') AS payload_compression,
                 binary_block.raw_payload_bytes,
                 octet_length(binary_block.payload) AS payload_bytes
               FROM {qualified_table} binary_block
              WHERE artifact_kind = :artifact_kind
                AND block_key = 0
-               AND block_no = 0
-             LIMIT 1
+             ORDER BY binary_block.block_no
             """
         ),
         {"artifact_kind": artifact_kind},
@@ -850,55 +933,269 @@ async def _serving_binary_dictionary_metadata(
     metadata_rows = _result_rows(metadata_result)
     if not metadata_rows:
         raise PTG2ManifestArtifactError(f"PTG2 serving binary dictionary is missing: {artifact_kind}")
-    metadata = _row_mapping(metadata_rows[0])
-    _binary_dictionary_cache_set(cache_key, dict(metadata), 128)
+    metadata = _validated_dictionary_metadata(
+        _row_mapping(metadata_row) for metadata_row in metadata_rows
+    )
+    _binary_dictionary_cache_set(cache_key, metadata, max(metadata.block_count * 64, 1))
     return metadata
 
 
-async def _uncompressed_dictionary_values_for_keys(
+def _uncompressed_dictionary_metadata_hint(
+    *,
+    item_count: int | None,
+    block_bytes: int | None,
+    compressed_records: int | None,
+) -> _DictionaryMetadata | None:
+    if item_count is None or block_bytes is None or compressed_records != 0:
+        return None
+    normalized_item_count = int(item_count)
+    normalized_block_bytes = int(block_bytes)
+    if normalized_item_count <= 0 or normalized_block_bytes < 16 or normalized_block_bytes % 16:
+        return None
+    entries_per_block = normalized_block_bytes // 16
+    block_count = (normalized_item_count + entries_per_block - 1) // entries_per_block
+    return _DictionaryMetadata(
+        blocks=None,
+        block_count=block_count,
+        entries_per_block=entries_per_block,
+        item_count=normalized_item_count,
+    )
+
+
+def _validated_dictionary_metadata(
+    metadata_records: Iterable[Mapping[str, Any]],
+) -> _DictionaryMetadata:
+    """Validate ordered fixed-width dictionary block metadata."""
+
+    blocks = [
+        _dictionary_block_metadata(metadata_record, expected_block_no)
+        for expected_block_no, metadata_record in enumerate(metadata_records)
+    ]
+
+    entries_per_block = blocks[0].entry_count
+    if len(blocks) > 1:
+        if entries_per_block <= 0:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block 0 is empty")
+        if any(block.entry_count != entries_per_block for block in blocks[:-1]):
+            raise PTG2ManifestArtifactError(
+                "PTG2 serving binary dictionary has a short non-final block"
+            )
+        if blocks[-1].entry_count <= 0 or blocks[-1].entry_count > entries_per_block:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary final block size is invalid")
+    return _DictionaryMetadata(
+        blocks=tuple(blocks),
+        block_count=len(blocks),
+        entries_per_block=entries_per_block,
+        item_count=sum(block.entry_count for block in blocks),
+    )
+
+
+def _dictionary_metadata_integer(raw_value: Any, field_name: str) -> int:
+    """Parse one non-negative dictionary metadata integer."""
+
+    try:
+        parsed_value = int(raw_value or 0)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            f"PTG2 serving binary dictionary {field_name} is invalid"
+        ) from exc
+    if parsed_value < 0:
+        raise PTG2ManifestArtifactError(
+            f"PTG2 serving binary dictionary {field_name} is invalid"
+        )
+    return parsed_value
+
+
+def _dictionary_payload_compression(raw_compression: Any) -> str:
+    """Normalize and validate a dictionary block's compression label."""
+
+    payload_compression = str(raw_compression or "none").strip().lower()
+    if payload_compression not in {"", "none", "zlib"}:
+        raise PTG2ManifestArtifactError(
+            f"unsupported PTG2 serving binary dictionary compression: {payload_compression}"
+        )
+    return payload_compression or "none"
+
+
+def _dictionary_block_metadata(
+    metadata_record: Mapping[str, Any],
+    expected_block_no: int,
+) -> _DictionaryBlockMetadata:
+    """Validate metadata for one block in dictionary order."""
+
+    payload_compression = _dictionary_payload_compression(metadata_record.get("payload_compression"))
+    payload_bytes = _dictionary_metadata_integer(metadata_record.get("payload_bytes"), "payload_bytes")
+    raw_payload_bytes = _dictionary_metadata_integer(
+        metadata_record.get("raw_payload_bytes"),
+        "raw_payload_bytes",
+    )
+    raw_block_no = metadata_record.get("block_no")
+    block_no = (
+        expected_block_no
+        if raw_block_no is None
+        else _dictionary_metadata_integer(raw_block_no, "block_no")
+    )
+    raw_entry_count = metadata_record.get("entry_count")
+    if raw_entry_count is None:
+        decoded_payload_bytes = raw_payload_bytes if payload_compression == "zlib" else payload_bytes
+        if decoded_payload_bytes % 16:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
+        entry_count = decoded_payload_bytes // 16
+    else:
+        entry_count = _dictionary_metadata_integer(raw_entry_count, "entry_count")
+    if block_no != expected_block_no:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block numbers are non-contiguous")
+
+    expected_raw_bytes = entry_count * 16
+    if payload_compression == "none":
+        if payload_bytes != expected_raw_bytes or raw_payload_bytes not in {0, expected_raw_bytes}:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload byte count mismatch")
+    elif raw_payload_bytes != expected_raw_bytes or entry_count == 0 or payload_bytes == 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 serving binary dictionary raw payload byte count mismatch"
+        )
+    return _DictionaryBlockMetadata(
+        block_no=block_no,
+        entry_count=entry_count,
+        payload_compression=payload_compression,
+        raw_payload_bytes=raw_payload_bytes,
+        payload_bytes=payload_bytes,
+    )
+
+
+async def _serving_binary_dictionary_blocks(
     session: Any,
     qualified_table: str,
     *,
     artifact_kind: str,
-    item_keys: Iterable[int],
-    payload_bytes: int,
-) -> dict[int, str]:
-    """Read selected fixed-width values directly from an uncompressed PostgreSQL bytea."""
+    metadata: _DictionaryMetadata,
+    block_nos: Iterable[int],
+) -> dict[int, bytes]:
+    """Fetch and decode only the selected dictionary blocks in one query."""
 
-    requested_keys = tuple(item_keys)
-    if payload_bytes % 16:
-        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary payload has invalid length")
-    _validate_dictionary_keys(requested_keys, payload_bytes // 16)
-    values_result = await session.execute(
-        text(
-            f"""
-            SELECT
-                requested.item_key,
-                substring(
-                    binary_block.payload
-                    FROM requested.item_key * 16 + 1
-                    FOR 16
-                ) AS item_value
-              FROM {qualified_table} binary_block
-              CROSS JOIN unnest(CAST(:item_keys AS integer[])) requested(item_key)
-             WHERE artifact_kind = :artifact_kind
-               AND block_key = 0
-               AND block_no = 0
-             ORDER BY requested.item_key
-            """
-        ),
-        {"artifact_kind": artifact_kind, "item_keys": list(requested_keys)},
+    requested_block_nos = tuple(sorted({int(block_no) for block_no in block_nos}))
+    if not requested_block_nos:
+        return {}
+    if requested_block_nos[0] < 0 or requested_block_nos[-1] >= metadata.block_count:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block is out of range")
+    block_result = await session.execute(
+        _dictionary_blocks_statement(qualified_table),
+        {"artifact_kind": artifact_kind, "block_nos": list(requested_block_nos)},
     )
-    values_by_key = {
-        int(value_row.get("item_key") or 0): _id_text(value_row.get("item_value") or b"")
-        for value_row in (
-            _row_mapping(dictionary_value_record)
-            for dictionary_value_record in _result_rows(values_result)
+    block_records = [_row_mapping(block_record) for block_record in _result_rows(block_result)]
+    payload_by_block_no: dict[int, bytes] = {}
+    for block_record in block_records:
+        block_no = _dictionary_record_block_no(
+            block_record,
+            requested_block_nos,
+            len(block_records),
         )
+        if block_no not in requested_block_nos or block_no in payload_by_block_no:
+            raise PTG2ManifestArtifactError("PTG2 serving binary dictionary returned unexpected blocks")
+        payload_by_block_no[block_no] = _validated_dictionary_block_payload(
+            block_record,
+            _dictionary_metadata_block(metadata, block_no),
+        )
+    if set(payload_by_block_no) != set(requested_block_nos):
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary blocks are missing")
+    return payload_by_block_no
+
+
+def _dictionary_blocks_statement(qualified_table: str) -> Any:
+    """Build the selected-block payload query for a validated table name."""
+
+    return text(
+        f"""
+        SELECT
+            binary_block.block_no,
+            binary_block.entry_count,
+            binary_block.payload,
+            COALESCE(binary_block.payload_compression, 'none') AS payload_compression,
+            binary_block.raw_payload_bytes
+          FROM {qualified_table} binary_block
+         WHERE artifact_kind = :artifact_kind
+           AND block_key = 0
+           AND block_no = ANY(CAST(:block_nos AS integer[]))
+         ORDER BY binary_block.block_no
+        """
+    )
+
+
+def _dictionary_record_block_no(
+    block_record: Mapping[str, Any],
+    requested_block_nos: tuple[int, ...],
+    returned_record_count: int,
+) -> int:
+    """Read a selected row's block number with single-row legacy fallback."""
+
+    raw_block_no = block_record.get("block_no")
+    if raw_block_no is not None:
+        return _dictionary_metadata_integer(raw_block_no, "block_no")
+    if len(requested_block_nos) == 1 and returned_record_count == 1:
+        return requested_block_nos[0]
+    raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block number is missing")
+
+
+def _validated_dictionary_block_payload(
+    block_record: Mapping[str, Any],
+    expected_block: _DictionaryBlockMetadata,
+) -> bytes:
+    """Validate and decode one fetched dictionary block."""
+
+    entry_count = _dictionary_metadata_integer(
+        block_record.get("entry_count", expected_block.entry_count),
+        "entry_count",
+    )
+    payload_compression = _dictionary_payload_compression(
+        block_record.get("payload_compression", expected_block.payload_compression)
+    )
+    raw_payload_bytes = _dictionary_metadata_integer(
+        block_record.get("raw_payload_bytes", expected_block.raw_payload_bytes),
+        "raw_payload_bytes",
+    )
+    stored_payload = bytes(block_record.get("payload") or b"")
+    has_matching_raw_payload_bytes = raw_payload_bytes == expected_block.raw_payload_bytes
+    if payload_compression == "none":
+        equivalent_raw_byte_counts = {0, entry_count * 16}
+        has_matching_raw_payload_bytes = {
+            raw_payload_bytes,
+            expected_block.raw_payload_bytes,
+        }.issubset(equivalent_raw_byte_counts)
+    if (
+        entry_count != expected_block.entry_count
+        or payload_compression != expected_block.payload_compression
+        or not has_matching_raw_payload_bytes
+        or len(stored_payload) != expected_block.payload_bytes
+    ):
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary block metadata changed")
+    try:
+        decoding_fields_by_name = dict(block_record)
+        decoding_fields_by_name["payload_compression"] = payload_compression
+        decoding_fields_by_name["raw_payload_bytes"] = raw_payload_bytes
+        decoded_payload = _decode_serving_binary_payload(decoding_fields_by_name)
+    except zlib.error as exc:
+        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary compressed payload is corrupt") from exc
+    if len(decoded_payload) != expected_block.entry_count * 16:
+        raise PTG2ManifestArtifactError(
+            "PTG2 serving binary dictionary decoded payload byte count mismatch"
+        )
+    return decoded_payload
+
+
+def _dictionary_value_lookup_hints(
+    item_count: int | None,
+    block_bytes: int | None,
+    compressed_records: int | None,
+) -> dict[str, int | None]:
+    """Build optional metadata hints for fixed-width dictionary lookups."""
+
+    if item_count is None:
+        return {}
+    return {
+        "item_count_hint": item_count,
+        "block_bytes_hint": block_bytes,
+        "compressed_records_hint": compressed_records,
     }
-    if set(values_by_key) != set(requested_keys):
-        raise PTG2ManifestArtifactError("PTG2 serving binary dictionary values are missing")
-    return values_by_key
 
 
 def _validate_dictionary_keys(item_keys: Iterable[int], item_count: int) -> None:
@@ -906,21 +1203,6 @@ def _validate_dictionary_keys(item_keys: Iterable[int], item_count: int) -> None
 
     if any(item_key < 0 or item_key >= item_count for item_key in item_keys):
         raise PTG2ManifestArtifactError("PTG2 serving binary dictionary key is out of range")
-
-
-def _dictionary_values_from_payload(
-    dictionary_payload: bytes,
-    item_keys: Iterable[int],
-) -> dict[int, str]:
-    """Resolve selected keys from a decompressed legacy dictionary payload."""
-
-    requested_keys = tuple(item_keys)
-    item_count = len(dictionary_payload) // 16
-    _validate_dictionary_keys(requested_keys, item_count)
-    return {
-        item_key: _id_text(dictionary_payload[item_key * 16 : item_key * 16 + 16])
-        for item_key in requested_keys
-    }
 
 
 async def _binary_price_key_map_for_sets(
@@ -1183,7 +1465,12 @@ async def lookup_serving_binary_by_code_from_db(
     code_key: int,
     *,
     provider_set_keys: Iterable[int] | None = None,
+    price_dictionary_item_count: int | None = None,
+    price_dictionary_block_bytes: int | None = None,
+    price_dictionary_compressed_records: int | None = None,
 ) -> tuple[PTG2ServingSidecarRow, ...]:
+    """Return decoded serving rows for one code block from PostgreSQL artifacts."""
+
     records = await _serving_binary_payload_rows(
         session,
         table_name,
@@ -1201,25 +1488,23 @@ async def lookup_serving_binary_by_code_from_db(
     if not records:
         return ()
     provider_count_map = await _serving_binary_provider_counts(session, table_name)
-    provider_filter = {int(value) for value in provider_set_keys} if provider_set_keys is not None else None
-    provider_filter_max = max(provider_filter) if provider_filter else None
-    decoded_keys: list[tuple[int, int | None, int]] = []
-    for record in records:
-        decoded_keys.extend(
-            _decode_serving_binary_by_code_record(
-                record,
-                provider_count_map=provider_count_map,
-                grouped_payload=grouped_payload,
-                provider_filter=provider_filter,
-                provider_filter_max=provider_filter_max,
-            )
-        )
+    decoded_keys = _decode_serving_binary_code_records(
+        records,
+        provider_count_map=provider_count_map,
+        grouped_payload=grouped_payload,
+        provider_set_keys=provider_set_keys,
+    )
     needed_price_keys = {price_key for _provider_set_key, _provider_count, price_key in decoded_keys}
     price_ids_by_key = await _serving_binary_dictionary_values_for_keys(
         session,
         table_name,
         artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
         item_keys=needed_price_keys,
+        **_dictionary_value_lookup_hints(
+            price_dictionary_item_count,
+            price_dictionary_block_bytes,
+            price_dictionary_compressed_records,
+        ),
     )
     if set(price_ids_by_key) != needed_price_keys:
         raise PTG2ManifestArtifactError("PTG2 serving binary price key is out of range")
@@ -1233,6 +1518,199 @@ async def lookup_serving_binary_by_code_from_db(
         )
         for provider_set_key, provider_count, price_key in decoded_keys
     )
+
+
+def _decode_serving_binary_code_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    provider_count_map: dict[int, int] | None,
+    grouped_payload: bool,
+    provider_set_keys: Iterable[int] | None,
+) -> list[tuple[int, int | None, int]]:
+    """Decode code records and apply an optional provider-set filter."""
+
+    provider_filter = {int(key) for key in provider_set_keys} if provider_set_keys is not None else None
+    provider_filter_max = max(provider_filter) if provider_filter else None
+    decoded_keys: list[tuple[int, int | None, int]] = []
+    for binary_record in records:
+        decoded_keys.extend(
+            _decode_serving_binary_by_code_record(
+                binary_record,
+                provider_count_map=provider_count_map,
+                grouped_payload=grouped_payload,
+                provider_filter=provider_filter,
+                provider_filter_max=provider_filter_max,
+            )
+        )
+    return decoded_keys
+
+
+async def has_serving_binary_code_block(
+    session: Any,
+    table_name: str,
+    code_key: int,
+) -> bool:
+    """Return whether either supported forward artifact contains this code block."""
+
+    grouped_records = await _serving_binary_payload_rows(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+        block_key=int(code_key),
+    )
+    if grouped_records:
+        return True
+    legacy_records = await _serving_binary_payload_rows(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_KIND,
+        block_key=int(code_key),
+    )
+    return bool(legacy_records)
+
+
+serving_binary_code_block_exists = has_serving_binary_code_block
+
+
+async def _serving_binary_forward_blocks_by_code(
+    session: Any,
+    table_name: str,
+    code_keys: Iterable[int],
+) -> tuple[dict[int, list[dict[str, Any]]], set[int]]:
+    """Load grouped forward blocks, falling back to legacy blocks by code."""
+
+    normalized_code_keys = tuple(sorted({int(code_key) for code_key in code_keys}))
+    if not normalized_code_keys:
+        return {}, set()
+    grouped_block_rows = await _serving_binary_payload_rows_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+        block_keys=normalized_code_keys,
+    )
+    grouped_blocks_by_code: dict[int, list[dict[str, Any]]] = {
+        code_key: [] for code_key in normalized_code_keys
+    }
+    for block_row in grouped_block_rows:
+        code_key = int(block_row.get("block_key") or 0)
+        if code_key in grouped_blocks_by_code:
+            grouped_blocks_by_code[code_key].append(block_row)
+    missing_grouped_code_keys = [
+        code_key for code_key, block_rows in grouped_blocks_by_code.items() if not block_rows
+    ]
+    legacy_blocks_by_code: dict[int, list[dict[str, Any]]] = {
+        code_key: [] for code_key in missing_grouped_code_keys
+    }
+    if missing_grouped_code_keys:
+        legacy_block_rows = await _serving_binary_payload_rows_for_keys(
+            session,
+            table_name,
+            artifact_kind=_SERVING_BINARY_BY_CODE_KIND,
+            block_keys=missing_grouped_code_keys,
+        )
+        for block_row in legacy_block_rows:
+            code_key = int(block_row.get("block_key") or 0)
+            if code_key in legacy_blocks_by_code:
+                legacy_blocks_by_code[code_key].append(block_row)
+    forward_blocks_by_code = {
+        code_key: grouped_blocks_by_code[code_key] or legacy_blocks_by_code.get(code_key, [])
+        for code_key in normalized_code_keys
+    }
+    grouped_code_keys = {
+        code_key for code_key, block_rows in grouped_blocks_by_code.items() if block_rows
+    }
+    return forward_blocks_by_code, grouped_code_keys
+
+
+def _decode_binary_forward_entries_by_code(
+    forward_blocks_by_code: Mapping[int, Iterable[Mapping[str, Any]]],
+    grouped_code_keys: set[int],
+    provider_count_map: dict[int, int] | None,
+    provider_set_keys: Iterable[int] | None,
+) -> tuple[dict[int, list[tuple[int, int | None, int]]], set[int]]:
+    """Decode requested forward block rows without resolving price ids."""
+
+    provider_filter = {int(key) for key in provider_set_keys} if provider_set_keys is not None else None
+    provider_filter_max = max(provider_filter) if provider_filter else None
+    decoded_entries_by_code: dict[int, list[tuple[int, int | None, int]]] = {}
+    needed_price_keys: set[int] = set()
+    for code_key, block_rows in forward_blocks_by_code.items():
+        decoded_entries = []
+        for block_row in block_rows:
+            decoded_entries.extend(
+                _decode_serving_binary_by_code_record(
+                    block_row,
+                    provider_count_map=provider_count_map,
+                    grouped_payload=code_key in grouped_code_keys,
+                    provider_filter=provider_filter,
+                    provider_filter_max=provider_filter_max,
+                )
+            )
+        decoded_entries_by_code[code_key] = decoded_entries
+        needed_price_keys.update(
+            price_key for _provider_set_key, _provider_count, price_key in decoded_entries
+        )
+    return decoded_entries_by_code, needed_price_keys
+
+
+async def lookup_binary_code_batch_from_db(
+    session: Any,
+    table_name: str,
+    code_keys: Iterable[int],
+    *,
+    provider_set_keys: Iterable[int] | None = None,
+    price_dictionary_item_count: int | None = None,
+    price_dictionary_block_bytes: int | None = None,
+    price_dictionary_compressed_records: int | None = None,
+) -> dict[int, tuple[PTG2ServingBinaryRow, ...]]:
+    """Read v2 forward code blocks in one batch for v3 reverse serving."""
+
+    normalized_code_keys = tuple(sorted({int(code_key) for code_key in code_keys}))
+    forward_blocks_by_code, grouped_code_keys = await _serving_binary_forward_blocks_by_code(
+        session,
+        table_name,
+        normalized_code_keys,
+    )
+    missing_code_keys = [
+        code_key for code_key, block_rows in forward_blocks_by_code.items() if not block_rows
+    ]
+    if missing_code_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 forward artifact is missing referenced code blocks"
+        )
+    provider_count_map = await _serving_binary_provider_counts(session, table_name)
+    decoded_entries_by_code, needed_price_keys = _decode_binary_forward_entries_by_code(
+        forward_blocks_by_code,
+        grouped_code_keys,
+        provider_count_map,
+        provider_set_keys,
+    )
+    price_ids_by_key = await _serving_binary_dictionary_values_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        item_keys=needed_price_keys,
+        **_dictionary_value_lookup_hints(
+            price_dictionary_item_count,
+            price_dictionary_block_bytes,
+            price_dictionary_compressed_records,
+        ),
+    )
+    if set(price_ids_by_key) != needed_price_keys:
+        raise PTG2ManifestArtifactError("PTG2 serving binary price key is out of range")
+    return {
+        code_key: tuple(
+            PTG2ServingBinaryRow(
+                code_key=code_key,
+                provider_set_key=provider_set_key,
+                provider_count=provider_count,
+                price_set_global_id_128=price_ids_by_key[price_key],
+                price_key=price_key,
+            )
+            for provider_set_key, provider_count, price_key in decoded_entries_by_code[code_key]
+        )
+        for code_key in normalized_code_keys
+    }
 
 
 def _decode_provider_binary_record(

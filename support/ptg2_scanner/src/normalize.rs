@@ -52,7 +52,7 @@ pub fn int_list(value: Option<&Value>) -> Vec<i64> {
         Some(Value::Array(items)) => {
             for item in items {
                 if let Some(text) = normalize_string(Some(item)) {
-                    if let Ok(number) = text.trim().parse::<i64>() {
+                    if let Some(number) = parse_integer_text(text.trim()) {
                         out.push(number);
                     }
                 }
@@ -60,7 +60,7 @@ pub fn int_list(value: Option<&Value>) -> Vec<i64> {
         }
         Some(item) => {
             if let Some(text) = normalize_string(Some(item)) {
-                if let Ok(number) = text.trim().parse::<i64>() {
+                if let Some(number) = parse_integer_text(text.trim()) {
                     out.push(number);
                 }
             }
@@ -70,6 +70,15 @@ pub fn int_list(value: Option<&Value>) -> Vec<i64> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+fn parse_integer_text(text: &str) -> Option<i64> {
+    text.parse::<i64>().ok().or_else(|| {
+        let canonical = canonical_decimal_text(text)?;
+        (!canonical.contains('.'))
+            .then(|| canonical.parse::<i64>().ok())
+            .flatten()
+    })
 }
 
 pub fn is_valid_npi(value: i64) -> bool {
@@ -86,19 +95,107 @@ pub fn npi_list(value: Option<&Value>) -> Vec<i64> {
     out
 }
 
-pub fn normalize_money_text(mut text: String) -> Option<String> {
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-    }
-    if text.is_empty() {
+pub fn normalize_money_text(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(text)
+        canonical_decimal_text(trimmed).or_else(|| Some(trimmed.to_string()))
+    }
+}
+
+fn canonical_decimal_text(source_text: &str) -> Option<String> {
+    let (is_negative, unsigned_text) = match source_text.as_bytes().first() {
+        Some(b'-') => (true, &source_text[1..]),
+        Some(b'+') => (false, &source_text[1..]),
+        _ => (false, source_text),
+    };
+    let (mantissa, exponent) = decimal_mantissa_and_exponent(unsigned_text)?;
+    let (integer_digits, fractional_digits) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (integer_digits.is_empty() && fractional_digits.is_empty())
+        || !integer_digits.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{integer_digits}{fractional_digits}");
+    let decimal_position = i64::try_from(integer_digits.len())
+        .ok()?
+        .checked_add(exponent)?;
+    let mut expanded = expand_decimal_digits(&digits, decimal_position)?;
+    normalize_expanded_decimal(&mut expanded);
+    if is_negative && expanded != "0" {
+        expanded.insert(0, '-');
+    }
+    Some(expanded)
+}
+
+fn decimal_mantissa_and_exponent(source_text: &str) -> Option<(&str, i64)> {
+    let mut exponent_markers = source_text.match_indices(['e', 'E']);
+    let first_marker = exponent_markers.next();
+    if exponent_markers.next().is_some() {
+        return None;
+    }
+    let Some((marker_offset, _marker)) = first_marker else {
+        return Some((source_text, 0));
+    };
+    let mantissa = &source_text[..marker_offset];
+    let exponent_text = &source_text[marker_offset + 1..];
+    if mantissa.is_empty() || exponent_text.is_empty() {
+        return None;
+    }
+    Some((mantissa, exponent_text.parse::<i64>().ok()?))
+}
+
+fn expand_decimal_digits(digits: &str, decimal_position: i64) -> Option<String> {
+    const MAX_CANONICAL_MONEY_CHARS: usize = 131_072;
+    let digit_count = i64::try_from(digits.len()).ok()?;
+    let output_size = if decimal_position <= 0 {
+        digit_count
+            .checked_add(decimal_position.checked_neg()?)?
+            .checked_add(2)?
+    } else if decimal_position >= digit_count {
+        decimal_position
+    } else {
+        digit_count.checked_add(1)?
+    };
+    if output_size < 0 || usize::try_from(output_size).ok()? > MAX_CANONICAL_MONEY_CHARS {
+        return None;
+    }
+    if decimal_position <= 0 {
+        let zero_count = usize::try_from(decimal_position.checked_neg()?).ok()?;
+        return Some(format!("0.{}{digits}", "0".repeat(zero_count)));
+    }
+    if decimal_position >= digit_count {
+        let zero_count = usize::try_from(decimal_position - digit_count).ok()?;
+        return Some(format!("{digits}{}", "0".repeat(zero_count)));
+    }
+    let split_offset = usize::try_from(decimal_position).ok()?;
+    Some(format!(
+        "{}.{}",
+        &digits[..split_offset],
+        &digits[split_offset..]
+    ))
+}
+
+fn normalize_expanded_decimal(expanded: &mut String) {
+    if let Some(decimal_offset) = expanded.find('.') {
+        while expanded.ends_with('0') {
+            expanded.pop();
+        }
+        if expanded.len() == decimal_offset + 1 {
+            expanded.pop();
+        }
+    }
+    let integer_end = expanded.find('.').unwrap_or(expanded.len());
+    let leading_zero_count = expanded[..integer_end]
+        .bytes()
+        .take_while(|byte| *byte == b'0')
+        .count();
+    if leading_zero_count >= integer_end {
+        expanded.replace_range(..integer_end, "0");
+    } else if leading_zero_count > 0 {
+        expanded.replace_range(..leading_zero_count, "");
     }
 }
 
@@ -227,6 +324,8 @@ mod tests {
             npi_list(Some(&json!([
                 "114911247",
                 "1234567890",
+                1234567890.0,
+                1.23456789e9,
                 9_999_999_999i64,
                 10_000_000_000i64,
                 "bad"
@@ -248,6 +347,26 @@ mod tests {
         assert_eq!(
             normalize_money_text("10".to_string()),
             Some("10".to_string())
+        );
+        assert_eq!(
+            normalize_money_text("1.2300e10".to_string()),
+            Some("12300000000".to_string())
+        );
+        assert_eq!(
+            normalize_money_text("-1.2500E-3".to_string()),
+            Some("-0.00125".to_string())
+        );
+        assert_eq!(
+            normalize_money_text("+001.2300e2".to_string()),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            normalize_money_text("-0e100".to_string()),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            normalize_money_text("1e64".to_string()),
+            Some(format!("1{}", "0".repeat(64)))
         );
         assert_eq!(normalize_money_text("".to_string()), None);
     }

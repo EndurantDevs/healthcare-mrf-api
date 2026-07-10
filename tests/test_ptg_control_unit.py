@@ -28,8 +28,8 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
             "params": {
                 "test_mode": True,
                 "in_network_url": "https://example.com/rates.json.gz",
-                "source_key": "asr_1208",
-                "plan_ids": ["823166837"],
+                "source_key": "example_source_a",
+                "plan_ids": ["TESTPLAN001"],
                 "plan_market_types": ["group"],
                 "max_files": "1",
             },
@@ -39,8 +39,8 @@ async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     assert result == {"status": "succeeded", "run_id": "run_ptg"}
     assert calls[0]["test_mode"] is True
     assert calls[0]["in_network_url"] == "https://example.com/rates.json.gz"
-    assert calls[0]["source_key"] == "asr_1208"
-    assert calls[0]["plan_ids"] == ["823166837"]
+    assert calls[0]["source_key"] == "example_source_a"
+    assert calls[0]["plan_ids"] == ["TESTPLAN001"]
     assert calls[0]["plan_market_types"] == ["group"]
     assert calls[0]["max_files"] == 1
     assert calls[0]["control_run_id"] == "run_ptg"

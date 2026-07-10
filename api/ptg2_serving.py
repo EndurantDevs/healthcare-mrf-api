@@ -11,7 +11,7 @@ import re
 import time
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 from typing import Any, Iterable, Mapping
@@ -119,13 +119,20 @@ from api.ptg2_db_sidecars import (
     lookup_global_sidecar_members_from_db,
     lookup_global_sidecar_members_many_from_db,
     lookup_serving_binary_by_code_from_db,
+    lookup_binary_code_batch_from_db,
     lookup_serving_binary_by_provider_set_from_db,
     lookup_serving_binary_by_provider_set_patterns_from_db,
     lookup_serving_binary_by_provider_sets_patterns_from_db,
+    serving_binary_code_block_exists,
     lookup_binary_price_atoms_from_db,
     lookup_serving_by_code_sidecar_from_db,
     lookup_serving_by_provider_set_patterns_from_db,
     lookup_serving_by_provider_set_sidecar_from_db,
+)
+from api.ptg2_db_serving_v3 import (
+    lookup_price_atom_memberships_from_db,
+    lookup_price_atoms_from_db,
+    lookup_provider_code_keys_from_db,
 )
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -1504,20 +1511,20 @@ def _ptg2_individual_npi_scalar_sql(npi_sql: str) -> str:
     )
 
 
-async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
+async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
     safe_table_name = _safe_table_name(table_name)
     if not safe_table_name:
-        return False
+        return frozenset()
     cache_enabled = hasattr(session, "sync_session")
     if cache_enabled:
         cached = _PTG2_TABLE_COLUMNS_CACHE.get(safe_table_name)
         if cached is not None:
-            cached_at, columns = cached
+            cached_at, cached_columns = cached
             if PTG2_INDEX_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= PTG2_INDEX_CACHE_TTL_SECONDS:
-                return bool(columns) and set(required_columns).issubset(columns)
+                return cached_columns
     schema_name, bare_table_name = safe_table_name.split(".", 1)
     try:
-        result = await session.execute(
+        column_result = await session.execute(
             text(
                 """
                 SELECT column_name
@@ -1528,22 +1535,27 @@ async def _ptg2_table_has_columns(session, table_name: str, required_columns: se
             ),
             {"schema_name": schema_name, "table_name": bare_table_name},
         )
-        columns: set[str] = set()
-        for row in result:
-            mapping = getattr(row, "_mapping", None)
-            if mapping is not None:
-                value = mapping.get("column_name")
+        column_names: set[str] = set()
+        for column_row in column_result:
+            column_mapping = getattr(column_row, "_mapping", None)
+            if column_mapping is not None:
+                column_name = column_mapping.get("column_name")
             else:
-                value = row[0] if row else None
-            if value:
-                columns.add(str(value))
-        frozen_columns = frozenset(columns)
+                column_name = column_row[0] if column_row else None
+            if column_name:
+                column_names.add(str(column_name))
+        frozen_columns = frozenset(column_names)
         if cache_enabled:
             _PTG2_TABLE_COLUMNS_CACHE[safe_table_name] = (time.monotonic(), frozen_columns)
-        return bool(frozen_columns) and set(required_columns).issubset(frozen_columns)
+        return frozen_columns
     except Exception:
         await _rollback_optional_ptg2_query(session)
-        return False
+        return frozenset()
+
+
+async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
+    columns = await _ptg2_table_columns(session, table_name)
+    return bool(columns) and set(required_columns).issubset(columns)
 
 
 async def _rollback_optional_ptg2_query(session) -> None:
@@ -2100,7 +2112,11 @@ def _ptg2_manifest_sidecar_metadata(entry: dict[str, Any], sidecar_path: Path, r
 
 
 def _raise_missing_postgres_binary_table(serving_tables: PTG2ServingTables) -> None:
-    if serving_tables.effective_arch_version not in {"postgres_binary_v1", "postgres_binary_v2"}:
+    if serving_tables.effective_arch_version not in {
+        "postgres_binary_v1",
+        "postgres_binary_v2",
+        "postgres_binary_v3",
+    }:
         return
     raise PTG2ManifestArtifactError(
         f"PTG2 {serving_tables.effective_arch_version} snapshot is missing serving_binary_table"
@@ -2108,7 +2124,11 @@ def _raise_missing_postgres_binary_table(serving_tables: PTG2ServingTables) -> N
 
 
 def _raise_local_sidecar_disallowed(serving_tables: PTG2ServingTables, artifact_name: str) -> None:
-    if serving_tables.effective_arch_version not in {"postgres_binary_v1", "postgres_binary_v2"}:
+    if serving_tables.effective_arch_version not in {
+        "postgres_binary_v1",
+        "postgres_binary_v2",
+        "postgres_binary_v3",
+    }:
         return
     raise PTG2ManifestArtifactError(
         f"PTG2 {serving_tables.effective_arch_version} snapshot requires PostgreSQL artifact storage "
@@ -2224,6 +2244,20 @@ async def _ptg2_manifest_lookup_serving_by_code_sidecar(
     *,
     provider_set_keys: Iterable[int] | None = None,
 ):
+    if serving_tables.effective_arch_version == "postgres_binary_v3":
+        if serving_tables.serving_binary_table:
+            return await lookup_serving_binary_by_code_from_db(
+                session,
+                serving_tables.serving_binary_table,
+                int(code_key),
+                provider_set_keys=provider_set_keys,
+                price_dictionary_item_count=serving_tables.price_dictionary_item_count,
+                price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
+                price_dictionary_compressed_records=(
+                    serving_tables.price_dictionary_compressed_records
+                ),
+            )
+        _raise_missing_postgres_binary_table(serving_tables)
     if serving_tables.serving_binary_table:
         return await lookup_serving_binary_by_code_from_db(
             session,
@@ -2405,43 +2439,90 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
         provider_set_keys=provider_set_keys,
     )
     if not sidecar_rows:
+        await _raise_missing_v3_block(session, serving_tables, int(code_key))
         return []
     provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
         session,
         serving_tables,
         [row.provider_set_key for row in sidecar_rows],
     )
+    if (
+        serving_tables.effective_arch_version == "postgres_binary_v3"
+        and set(provider_set_ids_by_key) != {row.provider_set_key for row in sidecar_rows}
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set dictionary is missing a referenced key"
+        )
     ordered_sidecar_rows = _ptg2_serving_sidecar_window(
         sidecar_rows,
         provider_set_ids_by_key,
         limit=limit,
         offset=offset,
     )
-    rows: list[dict[str, Any]] = []
-    for row in ordered_sidecar_rows:
-        provider_set_id = provider_set_ids_by_key.get(row.provider_set_key)
+    response_rows: list[dict[str, Any]] = []
+    for sidecar_row in ordered_sidecar_rows:
+        provider_set_id = provider_set_ids_by_key.get(sidecar_row.provider_set_key)
         if not provider_set_id:
             continue
-        rows.append(
-            {
-                "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
-                    row.code_key,
-                    row.provider_set_key,
-                    row.price_set_global_id_128,
-                ),
-                "plan_id": code_data.get("plan_id"),
-                "reported_code_system": code_data.get("reported_code_system"),
-                "reported_code": code_data.get("reported_code"),
-                "procedure_global_id_128": None,
-                "provider_set_global_id_128": provider_set_id,
-                "provider_count": row.provider_count,
-                "price_set_global_id_128": row.price_set_global_id_128,
-                "price_key": getattr(row, "price_key", None),
-                "source_trace_set_hash": source_trace_set_hash,
-                "network_names": network_names,
-            }
+        response_rows.append(
+            _ptg2_manifest_sidecar_response_row(
+                sidecar_row,
+                provider_set_id,
+                code_data,
+                source_trace_set_hash,
+                network_names,
+            )
         )
-    return rows
+    return response_rows
+
+
+def _ptg2_manifest_sidecar_response_row(
+    sidecar_row: Any,
+    provider_set_id: str,
+    code_data: Mapping[str, Any],
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+) -> dict[str, Any]:
+    """Shape one decoded sidecar row for the manifest serving response."""
+
+    return {
+        "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+            sidecar_row.code_key,
+            sidecar_row.provider_set_key,
+            sidecar_row.price_set_global_id_128,
+        ),
+        "plan_id": code_data.get("plan_id"),
+        "reported_code_system": code_data.get("reported_code_system"),
+        "reported_code": code_data.get("reported_code"),
+        "procedure_global_id_128": None,
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": sidecar_row.provider_count,
+        "price_set_global_id_128": sidecar_row.price_set_global_id_128,
+        "price_key": getattr(sidecar_row, "price_key", None),
+        "source_trace_set_hash": source_trace_set_hash,
+        "network_names": network_names,
+    }
+
+
+async def _raise_missing_v3_block(
+    session: Any,
+    serving_tables: PTG2ServingTables,
+    code_key: int,
+) -> None:
+    """Raise when a v3 code reference has no persisted forward artifact block."""
+
+    if (
+        serving_tables.effective_arch_version == "postgres_binary_v3"
+        and serving_tables.serving_binary_table
+        and not await serving_binary_code_block_exists(
+            session,
+            serving_tables.serving_binary_table,
+            code_key,
+        )
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 forward artifact is missing a referenced code block"
+        )
 
 
 _PTG2_PROVIDER_REVERSE_TEXT_FILTER_SQL = """
@@ -2880,6 +2961,269 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
     for data in rows:
         data.pop("_code_key", None)
     return rows
+
+
+@dataclass(frozen=True)
+class _VersionThreeReverseQuery:
+    provider_set_ids: Iterable[str]
+    requested_plan: str
+    code_value: str
+    code_system: Any
+    q_text: str
+    code_context: dict[str, Any] | None
+    source_trace_set_hash: str | None
+    network_names: list[str]
+    limit: int | None
+    offset: int
+    apply_window: bool
+
+
+def _version_three_candidate_rows(
+    code_metadata_by_key: Mapping[int, Mapping[str, Any]],
+    forward_entries_by_code: Mapping[int, Iterable[Any]],
+    provider_set_id_by_key: Mapping[int, str],
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+) -> list[list[dict[str, Any]]]:
+    """Build exactly ordered reverse candidates without collapsing duplicates."""
+
+    candidate_row_groups: list[list[dict[str, Any]]] = []
+    for code_key, code_metadata in code_metadata_by_key.items():
+        code_candidates = [
+            {
+                "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                    code_key,
+                    forward_entry.provider_set_key,
+                    forward_entry.price_set_global_id_128,
+                ),
+                "plan_id": code_metadata.get("plan_id"),
+                "reported_code_system": code_metadata.get("reported_code_system"),
+                "reported_code": code_metadata.get("reported_code"),
+                "procedure_global_id_128": None,
+                "provider_set_global_id_128": provider_set_id_by_key.get(forward_entry.provider_set_key),
+                "provider_count": forward_entry.provider_count,
+                "price_set_global_id_128": forward_entry.price_set_global_id_128,
+                "price_key": forward_entry.price_key,
+                "source_trace_set_hash": source_trace_set_hash,
+                "network_names": network_names,
+            }
+            for forward_entry in forward_entries_by_code.get(code_key, ())
+            if provider_set_id_by_key.get(forward_entry.provider_set_key)
+        ]
+        code_candidates.sort(
+            key=lambda candidate: (
+                -(int(candidate.get("provider_count") or 0)),
+                _ptg2_manifest_id(candidate.get("provider_set_global_id_128")),
+                _ptg2_manifest_id(candidate.get("price_set_global_id_128")),
+            )
+        )
+        candidate_row_groups.append(code_candidates)
+    return candidate_row_groups
+
+
+_PTG2_VERSION_THREE_REVERSE_CODE_BATCH_SIZE = 128
+_PTG2_VERSION_THREE_REVERSE_INITIAL_BATCH_SIZE = 1
+
+
+@dataclass(frozen=True)
+class _VersionThreeReverseScope:
+    provider_set_id_by_key: Mapping[int, str]
+    candidate_code_keys: tuple[int, ...]
+
+
+@dataclass
+class _VersionThreeRowWindow:
+    limit: int | None
+    remaining_offset: int
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def is_full(self) -> bool:
+        """Return whether the requested candidate count has been collected."""
+
+        return self.limit is not None and len(self.candidates) >= self.limit
+
+    def add_code_candidates(self, code_candidates: list[dict[str, Any]]) -> None:
+        """Consume one ordered code group while preserving duplicate rows."""
+
+        if self.is_full:
+            return
+        if self.remaining_offset >= len(code_candidates):
+            self.remaining_offset -= len(code_candidates)
+            return
+        local_start = self.remaining_offset
+        self.remaining_offset = 0
+        if self.limit is None:
+            self.candidates.extend(code_candidates[local_start:])
+            return
+        remaining_capacity = self.limit - len(self.candidates)
+        self.candidates.extend(code_candidates[local_start : local_start + remaining_capacity])
+
+
+def _version_three_row_window(reverse_query: _VersionThreeReverseQuery) -> _VersionThreeRowWindow:
+    row_limit = None if reverse_query.limit is None else max(int(reverse_query.limit), 0)
+    row_offset = max(int(reverse_query.offset or 0), 0) if reverse_query.apply_window else 0
+    return _VersionThreeRowWindow(limit=row_limit, remaining_offset=row_offset)
+
+
+async def _version_three_reverse_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _VersionThreeReverseScope | None:
+    """Resolve provider keys and their candidate codes without forward reads."""
+
+    if not serving_tables.serving_binary_table:
+        _raise_missing_postgres_binary_table(serving_tables)
+        return None
+    provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        reverse_query.provider_set_ids,
+    )
+    if not provider_set_key_by_id:
+        return None
+    missing_provider_set_ids = set(_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids))).difference(
+        provider_set_key_by_id
+    )
+    if missing_provider_set_ids:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set dictionary is missing a referenced provider set"
+        )
+    provider_set_id_by_key = {
+        provider_set_key: provider_set_id
+        for provider_set_id, provider_set_key in provider_set_key_by_id.items()
+    }
+    provider_set_code_keys = await lookup_provider_code_keys_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        provider_set_id_by_key,
+    )
+    missing_provider_code_keys = set(provider_set_id_by_key).difference(provider_set_code_keys)
+    empty_provider_code_keys = {
+        provider_set_key
+        for provider_set_key, code_keys in provider_set_code_keys.items()
+        if not code_keys
+    }
+    if missing_provider_code_keys or empty_provider_code_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-code artifact is missing a referenced provider set"
+        )
+    candidate_code_keys = tuple(
+        sorted({code_key for code_keys in provider_set_code_keys.values() for code_key in code_keys})
+    )
+    if not candidate_code_keys:
+        return None
+    return _VersionThreeReverseScope(
+        provider_set_id_by_key=provider_set_id_by_key,
+        candidate_code_keys=candidate_code_keys,
+    )
+
+
+def _version_three_code_batch_size(reverse_query: _VersionThreeReverseQuery) -> int | None:
+    """Start broad scans narrowly while keeping exact-code queries unbounded."""
+
+    if str(reverse_query.code_value or "").strip():
+        return None
+    return _PTG2_VERSION_THREE_REVERSE_INITIAL_BATCH_SIZE
+
+
+def _next_version_three_code_batch_size(metadata_batch_size: int | None) -> int | None:
+    if metadata_batch_size is None:
+        return None
+    return min(metadata_batch_size * 2, _PTG2_VERSION_THREE_REVERSE_CODE_BATCH_SIZE)
+
+
+async def _version_three_candidate_batch(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+    reverse_scope: _VersionThreeReverseScope,
+    metadata_offset: int,
+    metadata_batch_size: int | None,
+) -> tuple[list[list[dict[str, Any]]], int] | None:
+    """Read and materialize one ordered metadata/forward block batch."""
+
+    code_metadata_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        serving_tables,
+        requested_plan=reverse_query.requested_plan,
+        code_value=reverse_query.code_value,
+        code_system=reverse_query.code_system,
+        q_text=reverse_query.q_text,
+        code_context=reverse_query.code_context,
+        code_keys=reverse_scope.candidate_code_keys,
+        limit_rows=metadata_batch_size,
+        offset_rows=metadata_offset,
+    )
+    if code_metadata_rows is None:
+        return None
+    if not code_metadata_rows:
+        return [], 0
+    code_metadata_by_key = {
+        int(code_metadata["code_key"]): code_metadata
+        for code_metadata in code_metadata_rows
+        if code_metadata.get("code_key") is not None
+    }
+    forward_entries_by_code = await lookup_binary_code_batch_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        code_metadata_by_key,
+        provider_set_keys=reverse_scope.provider_set_id_by_key,
+        price_dictionary_item_count=serving_tables.price_dictionary_item_count,
+        price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
+        price_dictionary_compressed_records=(
+            serving_tables.price_dictionary_compressed_records
+        ),
+    )
+    candidate_row_groups = _version_three_candidate_rows(
+        code_metadata_by_key,
+        forward_entries_by_code,
+        reverse_scope.provider_set_id_by_key,
+        reverse_query.source_trace_set_hash,
+        reverse_query.network_names,
+    )
+    return candidate_row_groups, len(code_metadata_rows)
+
+
+async def _version_three_reverse_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> list[dict[str, Any]]:
+    """Serve reverse NPI queries from v3 code memberships and forward blocks."""
+
+    row_window = _version_three_row_window(reverse_query)
+    if row_window.is_full:
+        return []
+    reverse_scope = await _version_three_reverse_scope(session, serving_tables, reverse_query)
+    if reverse_scope is None:
+        return []
+    metadata_batch_size = _version_three_code_batch_size(reverse_query)
+    metadata_offset = 0
+    while not row_window.is_full:
+        candidate_batch = await _version_three_candidate_batch(
+            session,
+            serving_tables,
+            reverse_query,
+            reverse_scope,
+            metadata_offset,
+            metadata_batch_size,
+        )
+        if candidate_batch is None:
+            return []
+        candidate_row_groups, code_metadata_count = candidate_batch
+        if code_metadata_count == 0:
+            break
+        for code_candidates in candidate_row_groups:
+            row_window.add_code_candidates(code_candidates)
+            if row_window.is_full:
+                break
+        if metadata_batch_size is None or code_metadata_count < metadata_batch_size:
+            break
+        metadata_offset += code_metadata_count
+        metadata_batch_size = _next_version_three_code_batch_size(metadata_batch_size)
+    return row_window.candidates
 
 
 async def _ptg2_manifest_provider_procedure_rows_from_lean_table(
@@ -3562,6 +3906,39 @@ async def _ptg2_manifest_provider_npis_for_provider_sets(
     return npis_by_set
 
 
+def _has_ptg2_artifact_reader(
+    serving_tables: PTG2ServingTables,
+    name: str,
+) -> bool:
+    """Return whether an artifact has a source the serving reader can use."""
+    for entry in _ptg2_manifest_artifact_entries(serving_tables, name):
+        if db_artifact_entry_available(entry):
+            return True
+        raw_path = str(entry.get("path") or "").strip()
+        if not raw_path or serving_tables.effective_arch_version in {
+            "postgres_binary_v1",
+            "postgres_binary_v2",
+            "postgres_binary_v3",
+        }:
+            continue
+        sidecar_path = _resolve_ptg2_manifest_sidecar_path(raw_path)
+        if sidecar_path.is_file() and os.access(sidecar_path, os.R_OK):
+            return True
+    return False
+
+
+def _has_authoritative_provider_membership(
+    serving_tables: PTG2ServingTables,
+) -> bool:
+    return bool(
+        _has_ptg2_artifact_reader(serving_tables, "provider_npi")
+        or (
+            _has_ptg2_artifact_reader(serving_tables, "provider_forward")
+            and _has_ptg2_artifact_reader(serving_tables, "provider_group_npi")
+        )
+    )
+
+
 async def _provider_npi_member_ids_by_set(
     session,
     serving_tables: PTG2ServingTables,
@@ -3570,7 +3947,7 @@ async def _provider_npi_member_ids_by_set(
     limit_per_set: int | None,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve provider-set membership from either v1 or normalized v2 artifacts."""
-    if _ptg2_manifest_artifact_entry(serving_tables, "provider_npi"):
+    if _has_ptg2_artifact_reader(serving_tables, "provider_npi"):
         return await _ptg2_manifest_sidecar_members_many_async(
             session,
             serving_tables,
@@ -3578,10 +3955,7 @@ async def _provider_npi_member_ids_by_set(
             provider_set_ids,
             max_members=limit_per_set,
         )
-    if not (
-        _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
-    ):
+    if not _has_authoritative_provider_membership(serving_tables):
         return {}
     groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
         session,
@@ -3886,6 +4260,193 @@ def _ptg2_manifest_price_payload(price_atom_row: Mapping[str, Any]) -> dict[str,
     }
 
 
+def _version_three_atom_key_bits(serving_tables: PTG2ServingTables) -> int:
+    """Return the manifest-declared dense atom width for a v3 snapshot."""
+
+    try:
+        atom_key_bits = int(serving_tables.atom_key_bits)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError("PTG2 postgres_binary_v3 snapshot is missing atom_key_bits") from exc
+    if atom_key_bits not in {24, 32}:
+        raise PTG2ManifestArtifactError("PTG2 postgres_binary_v3 atom_key_bits must be 24 or 32")
+    return atom_key_bits
+
+
+async def _version_three_dictionary_values(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_atoms_by_key: Mapping[int, Any],
+) -> dict[tuple[str, int], Any]:
+    """Read only dictionary values referenced by the requested dense atoms."""
+
+    attribute_specs = _ptg2_price_atom_attr_specs()
+    constant_values = (
+        serving_tables.price_atom_constant_values
+        if isinstance(serving_tables.price_atom_constant_values, dict)
+        else {}
+    )
+    required_keys: set[tuple[str, int]] = set()
+    for price_atom in price_atoms_by_key.values():
+        if len(price_atom.attribute_keys) != len(attribute_specs):
+            raise PTG2ManifestArtifactError("PTG2 v3 price atom has an invalid attribute-key count")
+        for (attr_kind, _key_column, _value_kind, _select_sql), attr_key in zip(
+            attribute_specs,
+            price_atom.attribute_keys,
+        ):
+            if attr_kind not in constant_values and attr_key is not None:
+                required_keys.add((attr_kind, int(attr_key)))
+    if not required_keys:
+        return {}
+    dictionary_table = _safe_table_name(serving_tables.price_atom_dictionary_table)
+    if not dictionary_table:
+        raise PTG2ManifestArtifactError("PTG2 v3 snapshot is missing price_atom_dictionary_table")
+    dictionary_result = await session.execute(
+        text(
+            f"""
+            SELECT attr_kind, attr_key, text_value, text_array
+            FROM {dictionary_table}
+            WHERE attr_kind = ANY(CAST(:attr_kinds AS varchar[]))
+              AND attr_key = ANY(CAST(:attr_keys AS integer[]))
+            """
+        ),
+        {
+            "attr_kinds": sorted({attr_kind for attr_kind, _attr_key in required_keys}),
+            "attr_keys": sorted({attr_key for _attr_kind, attr_key in required_keys}),
+        },
+    )
+    values_by_key = {
+        (str(dictionary_entry.get("attr_kind") or ""), int(dictionary_entry.get("attr_key"))): (
+            dictionary_entry.get("text_array")
+            if str(dictionary_entry.get("attr_kind") or "") in {"service_code", "billing_code_modifier"}
+            else dictionary_entry.get("text_value")
+        )
+        for dictionary_entry in (_row_mapping(dictionary_record) for dictionary_record in dictionary_result)
+        if dictionary_entry.get("attr_kind") is not None and dictionary_entry.get("attr_key") is not None
+    }
+    missing_keys = required_keys.difference(values_by_key)
+    if missing_keys:
+        raise PTG2ManifestArtifactError("PTG2 v3 price atom dictionary key is missing")
+    return values_by_key
+
+
+def _version_three_price_payload(
+    price_atom: Any,
+    dictionary_values: Mapping[tuple[str, int], Any],
+    constant_values: Mapping[str, Any],
+) -> dict[str, Any]:
+    attribute_specs = _ptg2_price_atom_attr_specs()
+    if len(price_atom.attribute_keys) != len(attribute_specs):
+        raise PTG2ManifestArtifactError("PTG2 v3 price atom has an invalid attribute-key count")
+    payload: dict[str, Any] = {"negotiated_rate": price_atom.negotiated_rate}
+    for (attr_kind, _key_column, value_kind, _select_sql), attr_key in zip(
+        attribute_specs,
+        price_atom.attribute_keys,
+    ):
+        if attr_kind in constant_values:
+            value = constant_values[attr_kind]
+        elif attr_key is None:
+            value = [] if value_kind == "array" else None
+        else:
+            value = dictionary_values[(attr_kind, int(attr_key))]
+        payload[attr_kind] = value or [] if value_kind == "array" else value
+    return payload
+
+
+async def _version_three_prices_by_key(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_keys: Iterable[int],
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate v3 price keys from compact memberships and dense atoms only."""
+
+    if not serving_tables.serving_binary_table:
+        _raise_missing_postgres_binary_table(serving_tables)
+        return {}
+    normalized_price_keys = tuple(sorted({int(price_key) for price_key in price_keys}))
+    if not normalized_price_keys:
+        return {}
+    atom_key_bits = _version_three_atom_key_bits(serving_tables)
+    atom_keys_by_price_key = await lookup_price_atom_memberships_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        normalized_price_keys,
+        atom_key_bits=atom_key_bits,
+        block_span=serving_tables.price_key_block_span,
+    )
+    _validate_version_three_price_memberships(normalized_price_keys, atom_keys_by_price_key)
+    requested_atom_keys = tuple(
+        dict.fromkeys(
+            atom_key
+            for price_key in normalized_price_keys
+            for atom_key in atom_keys_by_price_key.get(price_key, ())
+        )
+    )
+    price_atoms_by_key = await lookup_price_atoms_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        requested_atom_keys,
+        atom_key_bits=atom_key_bits,
+        block_span=serving_tables.atom_key_block_span,
+    )
+    missing_atom_keys = set(requested_atom_keys).difference(price_atoms_by_key)
+    if missing_atom_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price-atom artifact is missing a referenced atom key"
+        )
+    dictionary_values = await _version_three_dictionary_values(
+        session,
+        serving_tables,
+        price_atoms_by_key,
+    )
+    constant_values = (
+        serving_tables.price_atom_constant_values
+        if isinstance(serving_tables.price_atom_constant_values, dict)
+        else {}
+    )
+    return _version_three_price_rows(
+        normalized_price_keys,
+        atom_keys_by_price_key,
+        price_atoms_by_key,
+        dictionary_values,
+        constant_values,
+    )
+
+
+def _validate_version_three_price_memberships(
+    price_keys: tuple[int, ...],
+    atom_keys_by_price_key: Mapping[int, tuple[int, ...]],
+) -> None:
+    """Reject missing or empty v3 price memberships."""
+
+    missing_price_keys = set(price_keys).difference(atom_keys_by_price_key)
+    empty_price_keys = {
+        price_key for price_key, atom_keys in atom_keys_by_price_key.items() if not atom_keys
+    }
+    if missing_price_keys or empty_price_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price-membership artifact is missing a referenced price key"
+        )
+
+
+def _version_three_price_rows(
+    price_keys: tuple[int, ...],
+    atom_keys_by_price_key: Mapping[int, tuple[int, ...]],
+    price_atoms_by_key: Mapping[int, Any],
+    dictionary_values: Mapping[tuple[str, int], str],
+    constant_values: Mapping[str, Any],
+) -> dict[int, list[dict[str, Any]]]:
+    """Build response price payloads in requested dense-key order."""
+
+    return {
+        price_key: [
+            _version_three_price_payload(price_atoms_by_key[atom_key], dictionary_values, constant_values)
+            for atom_key in atom_keys_by_price_key.get(price_key, ())
+            if atom_key in price_atoms_by_key
+        ]
+        for price_key in price_keys
+    }
+
+
 async def _ptg2_price_rows_by_id(
     session,
     serving_tables: PTG2ServingTables,
@@ -4079,9 +4640,27 @@ async def _ptg2_manifest_prices_for_price_sets(
 ) -> dict[str, list[dict[str, Any]]]:
     """Return hydrated prices for each requested price set, preserving atom order."""
 
-    price_atom_table = _safe_table_name(serving_tables.price_atom_table)
     price_set_ids = _ptg2_manifest_ids(tuple(price_set_global_ids))
-    if not price_atom_table or not price_set_ids:
+    if not price_set_ids:
+        return {price_set_id: [] for price_set_id in price_set_ids}
+    if serving_tables.effective_arch_version == "postgres_binary_v3":
+        price_key_by_set_id = price_key_by_set_id or {}
+        missing_price_key_ids = set(price_set_ids).difference(price_key_by_set_id)
+        if missing_price_key_ids:
+            raise PTG2ManifestArtifactError(
+                "PTG2 v3 forward row is missing a referenced price key"
+            )
+        prices_by_price_key = await _version_three_prices_by_key(
+            session,
+            serving_tables,
+            [price_key_by_set_id[price_set_id] for price_set_id in price_set_ids if price_set_id in price_key_by_set_id],
+        )
+        return {
+            price_set_id: prices_by_price_key.get(price_key_by_set_id.get(price_set_id), [])
+            for price_set_id in price_set_ids
+        }
+    price_atom_table = _safe_table_name(serving_tables.price_atom_table)
+    if not price_atom_table:
         return {price_set_id: [] for price_set_id in price_set_ids}
     members_by_set = await _ptg2_price_members_by_set(
         session,
@@ -4185,22 +4764,9 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     # Same street-fill as the location search: when the unified row has no
     # first_line (or no row at all), fall back to the NPPES npi_address row.
     if using_unified_enrich:
-        fallback_column_result = await session.execute(
-            text(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = :schema_name
-                  AND table_name = 'npi_address'
-                """
-            ),
-            {"schema_name": PTG2_SCHEMA},
+        fallback_columns = set(
+            await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address")
         )
-        fallback_columns = {
-            str(data.get("column_name"))
-            for data in (_row_mapping(row) for row in fallback_column_result)
-            if data.get("column_name")
-        }
 
         def _fallback_column(column: str, sql_type: str = "varchar") -> str:
             return f"na.{column}" if column in fallback_columns else f"NULL::{sql_type} AS {column}"
@@ -6868,6 +7434,8 @@ async def _ptg2_manifest_provider_rows_for_provider_set(
     )
     if provider_npis:
         return await _ptg2_manifest_enriched_provider_rows_for_npis(session, npis=provider_npis, limit=limit)
+    if _has_authoritative_provider_membership(serving_tables):
+        return []
 
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if not provider_group_member_table:
@@ -6920,7 +7488,14 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         provider_set_ids,
         limit_per_set=candidate_limit_per_set,
     )
-    missing_provider_set_ids = [provider_set_id for provider_set_id in provider_set_ids if not npis_by_set.get(provider_set_id)]
+    has_authoritative_membership = _has_authoritative_provider_membership(
+        serving_tables
+    )
+    missing_provider_set_ids = (
+        []
+        if has_authoritative_membership
+        else [provider_set_id for provider_set_id in provider_set_ids if not npis_by_set.get(provider_set_id)]
+    )
     if missing_provider_set_ids:
         provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
         if not provider_group_member_table:
@@ -7057,8 +7632,8 @@ async def _provider_sets_from_membership_graph(
 ) -> tuple[str, ...] | None:
     """Resolve reverse NPI membership when a normalized graph is available."""
     if not (
-        _ptg2_manifest_artifact_entry(serving_tables, "provider_npi_group")
-        and _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted")
+        _has_ptg2_artifact_reader(serving_tables, "provider_npi_group")
+        and _has_ptg2_artifact_reader(serving_tables, "provider_inverted")
     ):
         return None
     group_ids = await _ptg2_manifest_sidecar_members_async(
@@ -7563,7 +8138,17 @@ async def _search_ptg2_manifest_db_serving_table(
         if not expand_providers:
             items.append(base_item)
             continue
-        for provider in providers_by_set.get(_ptg2_manifest_id(data.get("provider_set_global_id_128")), []):
+        provider_rows = providers_by_set.get(
+            _ptg2_manifest_id(data.get("provider_set_global_id_128")),
+            [],
+        )
+        if not provider_rows and not location_filter_requested and not _ptg2_provider_taxonomy_filter_requested(args):
+            item = dict(base_item)
+            item["npi"] = None
+            item["provider_expansion_status"] = "no_npi_members"
+            items.append(item)
+            continue
+        for provider in provider_rows:
             item = dict(base_item)
             address_payload = _coerce_json_payload(provider.get("address_payload"), {})
             item.update(
@@ -8748,21 +9333,41 @@ async def _search_ptg2_manifest_provider_procedures(
     where_sql = " AND ".join(filters)
     row_data: list[dict[str, Any]] | None = None
     if has_reverse_sidecar and _ptg2_manifest_uses_lean_provider_key_layout(serving_tables):
-        sidecar_rows = await _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
-            session,
-            serving_tables,
-            provider_set_ids=provider_set_ids,
-            requested_plan=requested_plan,
-            code_value=code_value,
-            code_system=args.get("code_system"),
-            q_text=q_text,
-            code_context=code_context,
-            source_trace_set_hash=serving_tables.source_trace_set_hash or None,
-            network_names=serving_tables.network_names or [],
-            limit=None if has_price_filter else int(pagination.limit),
-            offset=0 if has_price_filter else int(pagination.offset),
-            apply_window=not has_price_filter,
-        )
+        if serving_tables.effective_arch_version == "postgres_binary_v3":
+            reverse_query = _VersionThreeReverseQuery(
+                provider_set_ids=provider_set_ids,
+                requested_plan=requested_plan,
+                code_value=code_value,
+                code_system=args.get("code_system"),
+                q_text=q_text,
+                code_context=code_context,
+                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
+                network_names=serving_tables.network_names or [],
+                limit=int(params["candidate_limit"]) if has_price_filter else int(pagination.limit),
+                offset=0 if has_price_filter else int(pagination.offset),
+                apply_window=not has_price_filter,
+            )
+            sidecar_rows = await _version_three_reverse_rows(
+                session,
+                serving_tables,
+                reverse_query,
+            )
+        else:
+            sidecar_rows = await _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+                session,
+                serving_tables,
+                provider_set_ids=provider_set_ids,
+                requested_plan=requested_plan,
+                code_value=code_value,
+                code_system=args.get("code_system"),
+                q_text=q_text,
+                code_context=code_context,
+                source_trace_set_hash=serving_tables.source_trace_set_hash or None,
+                network_names=serving_tables.network_names or [],
+                limit=None if has_price_filter else int(pagination.limit),
+                offset=0 if has_price_filter else int(pagination.offset),
+                apply_window=not has_price_filter,
+            )
         if sidecar_rows is not None:
             if has_price_filter:
                 row_data = sidecar_rows[: int(params["candidate_limit"])]
@@ -8817,10 +9422,16 @@ async def _search_ptg2_manifest_provider_procedures(
         session,
         [data.get("source_trace_set_hash") for data in row_data],
     )
+    price_key_by_set_id = {
+        _ptg2_manifest_id(data.get("price_set_global_id_128")): int(data.get("price_key"))
+        for data in row_data
+        if data.get("price_key") is not None and _ptg2_manifest_id(data.get("price_set_global_id_128"))
+    }
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
         serving_tables,
         [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
+        price_key_by_set_id=price_key_by_set_id,
     )
     procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
     provider_context_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
@@ -9348,7 +9959,9 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
             return await _search_one_ptg2_snapshot(
                 session, network_snapshots[0][1], args, pagination
             )
-        # No per-network snapshot resolved -> fall through to global current.
+        # A plan without a published plan/source pointer has no safe snapshot.
+        # Falling through to the global pointer can return another plan's rates.
+        return None
     snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
     if not snapshot_id:
         return None

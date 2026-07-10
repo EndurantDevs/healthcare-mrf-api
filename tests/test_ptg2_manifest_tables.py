@@ -31,6 +31,30 @@ class FakeSession:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_serving_tables_requires_published_and_does_not_cache_empty_manifest():
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    snapshot_id = "snap-building-then-published"
+    ptg2_tables._PTG2_SNAPSHOT_TABLES_CACHE.pop(snapshot_id, None)
+    session = RealishFakeSession(
+        [
+            None,
+            {"serving_index": {"table": "mrf.ptg2_serving_rate_compact_published"}},
+        ]
+    )
+
+    building = await ptg2_tables.snapshot_serving_tables(session, snapshot_id)
+    published = await ptg2_tables.snapshot_serving_tables(session, snapshot_id)
+
+    assert building.serving_table is None
+    assert published.serving_table == "mrf.ptg2_serving_rate_compact_published"
+    assert len(session.calls) == 2
+    assert "status = 'published'" in str(session.calls[0][0][0])
+    ptg2_tables._PTG2_SNAPSHOT_TABLES_CACHE.pop(snapshot_id, None)
+
+
+@pytest.mark.asyncio
 async def test_snapshot_serving_tables_rejects_non_manifest_storage():
     session = FakeSession(
         [
@@ -164,6 +188,42 @@ async def test_snapshot_serving_tables_reads_v2_membership_scope():
     assert tables.effective_arch_version == "postgres_binary_v2"
     assert tables.uses_sidecar_provider_scope is True
     assert tables.provider_npi_scope_table == "mrf.ptg2_provider_npi_scope_snap"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_reads_nested_v3_atom_key_width():
+    session = FakeSession(
+        [
+            {
+                "serving_index": {
+                    "storage": "manifest_snapshot",
+                    "arch_version": "postgres_binary_v3",
+                    "serving_binary_table": "mrf.ptg2_serving_binary_snap",
+                    "serving_binary": {
+                        "arch_version": "postgres_binary_v3",
+                        "dense_atom_keys": {"atom_count": 7, "atom_key_bits": 24},
+                        "price_set_atom_memberships_v3": {"block_span": 512},
+                        "price_atoms_v3": {"block_span": 512},
+                        "price_dictionary": {
+                            "price_set_count": 29_000_000,
+                            "block_bytes": 65_536,
+                            "storage": {"compressed_records": 0},
+                        },
+                    },
+                }
+            }
+        ]
+    )
+
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-binary-v3")
+
+    assert tables.effective_arch_version == "postgres_binary_v3"
+    assert tables.atom_key_bits == 24
+    assert tables.price_key_block_span == 512
+    assert tables.atom_key_block_span == 512
+    assert tables.price_dictionary_item_count == 29_000_000
+    assert tables.price_dictionary_block_bytes == 65_536
+    assert tables.price_dictionary_compressed_records == 0
 
 
 @pytest.mark.asyncio

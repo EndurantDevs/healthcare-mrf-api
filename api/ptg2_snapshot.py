@@ -42,19 +42,66 @@ def _snapshot_cache_set(key: tuple[object, ...], value: str | None) -> str | Non
 
 
 async def current_snapshot_id(session, requested_snapshot_id: str | None = None) -> str | None:
+    """Return the requested published snapshot or the current published snapshot."""
     if requested_snapshot_id:
-        return str(requested_snapshot_id)
+        snapshot_result = await session.execute(
+            text(
+                f"""
+                SELECT snapshot_id
+                  FROM {PTG2_SCHEMA}.ptg2_snapshot
+                 WHERE snapshot_id = :snapshot_id
+                   AND status = 'published'
+                 LIMIT 1
+                """
+            ),
+            {"snapshot_id": str(requested_snapshot_id)},
+        )
+        snapshot_value = snapshot_result.scalar()
+        return str(snapshot_value) if snapshot_value else None
     cache_key = ("current",)
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
             return cached
+    snapshot_result = await session.execute(
+        text(
+            f"""
+            SELECT pointer.snapshot_id
+              FROM {PTG2_SCHEMA}.ptg2_current_snapshot pointer
+              JOIN {PTG2_SCHEMA}.ptg2_snapshot published_snapshot
+                ON published_snapshot.snapshot_id = pointer.snapshot_id
+             WHERE pointer.slot = 'current'
+               AND published_snapshot.status = 'published'
+            """
+        )
+    )
+    snapshot_value = snapshot_result.scalar()
+    snapshot_value = str(snapshot_value) if snapshot_value else None
+    return _snapshot_cache_set(cache_key, snapshot_value) if _snapshot_cache_enabled(session) else snapshot_value
+
+
+async def current_source_snapshot_id(session, source_key: str) -> str | None:
+    """Return the published serving snapshot currently selected for one source."""
+    normalized_source_key = str(source_key or "").strip().lower()
+    if not normalized_source_key:
+        return None
     result = await session.execute(
-        text(f"SELECT snapshot_id FROM {PTG2_SCHEMA}.ptg2_current_snapshot WHERE slot = 'current'")
+        text(
+            f"""
+            SELECT pointer.snapshot_id
+              FROM {PTG2_SCHEMA}.ptg2_current_source_snapshot pointer
+              JOIN {PTG2_SCHEMA}.ptg2_snapshot published_snapshot
+                ON published_snapshot.snapshot_id = pointer.snapshot_id
+             WHERE pointer.source_key = :source_key
+               AND published_snapshot.status = 'published'
+               AND published_snapshot.manifest->'serving_index'->>'table' IS NOT NULL
+             LIMIT 1
+            """
+        ),
+        {"source_key": normalized_source_key},
     )
     value = result.scalar()
-    value = str(value) if value else None
-    return _snapshot_cache_set(cache_key, value) if _snapshot_cache_enabled(session) else value
+    return str(value) if value else None
 
 
 async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) -> str | None:
@@ -187,10 +234,13 @@ async def current_source_snapshot_ids_for_plan(
 
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:
     if args.get("snapshot_id"):
+        # Serving callers immediately load snapshot_serving_tables(), whose
+        # query is published-only. Avoid issuing the same status check twice.
         return str(args["snapshot_id"])
-    source_snapshot_id = await current_source_snapshot_id_for_plan(session, args)
-    if source_snapshot_id:
-        return source_snapshot_id
+    if args.get("plan_id") or args.get("plan_external_id"):
+        return await current_source_snapshot_id_for_plan(session, args)
+    if args.get("source_key"):
+        return await current_source_snapshot_id(session, str(args["source_key"]))
     return await current_snapshot_id(session)
 
 

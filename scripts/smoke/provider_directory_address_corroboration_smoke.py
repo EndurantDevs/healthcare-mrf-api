@@ -208,7 +208,7 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
         INSERT INTO "{schema}".provider_directory_source VALUES
             ('pdfhir_1', 'Example Payer', 'Example Directory');
         INSERT INTO "{schema}".provider_directory_insurance_plan VALUES
-            ('pdfhir_1', 'plan-1', '010854205', 'Example Group POS Choice Plus',
+            ('pdfhir_1', 'plan-1', 'TESTPLAN001', 'Example Group POS Choice Plus',
              '["https://fhir.example.test/base/Organization/network-c2"]'::jsonb);
         INSERT INTO "{schema}".entity_address_unified (
             npi, inferred_npi, location_key, address_key, zip5, state_code, city_norm, type

@@ -8,6 +8,14 @@ import pytest
 from process.ptg_parts import ptg2_serving_binary as serving_binary_writer
 
 
+def test_serving_binary_copy_formats_default_to_postgres_binary(monkeypatch):
+    monkeypatch.delenv(serving_binary_writer.PTG2_SERVING_BINARY_SOURCE_COPY_FORMAT_ENV, raising=False)
+    monkeypatch.delenv(serving_binary_writer.PTG2_SERVING_BINARY_TARGET_COPY_FORMAT_ENV, raising=False)
+
+    assert serving_binary_writer._serving_binary_source_copy_format() == "binary"
+    assert serving_binary_writer._serving_binary_target_copy_format() == "binary"
+
+
 def test_natural_lean_stream_sql_joins_dictionary_tables():
     by_code_sql = serving_binary_writer._serving_binary_stream_sql(
         qualified_source='"mrf"."ptg2_manifest_stage_serving_token"',

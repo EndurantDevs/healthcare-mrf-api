@@ -6,9 +6,9 @@ from scripts.research import provider_directory_coverage_audit as audit
 
 
 def test_provider_directory_coverage_audit_parse_args_accepts_ptg_plan_filter():
-    args = audit.parse_args(["--ptg-plan-id", "010854205"])
+    args = audit.parse_args(["--ptg-plan-id", "TESTPLAN001"])
 
-    assert args.ptg_plan_id == "010854205"
+    assert args.ptg_plan_id == "TESTPLAN001"
 
 
 def test_provider_directory_coverage_audit_defaults_to_maintained_source_manifest():
@@ -1896,7 +1896,7 @@ def test_provider_directory_coverage_audit_markdown_includes_network_catalog():
 
 def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_rows():
     report = {
-        "ptg_plan_filter": "010854205",
+        "ptg_plan_filter": "TESTPLAN001",
         "ptg_summary": {
             "ptg_unified_address": {"available": True, "ptg_unified_address_rows": 0},
             "ptg_corroboration": {"available": True, "corroboration_rows": 0},
@@ -1904,7 +1904,7 @@ def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_r
     }
 
     assert audit._derive_gaps(report) == [
-        "Requested PTG plan `010854205` has no PTG-associated unified address rows."
+        "Requested PTG plan `TESTPLAN001` has no PTG-associated unified address rows."
     ]
 
 

@@ -36,6 +36,7 @@ python-dotenv>=1.2.2
 python-socks==2.8.1
 pytz
 PyYAML>=6.0.3
+rapidgzip==0.16.0
 redis[hiredis]>=5.0.0,<6
 ruamel.ext.msgpack
 sanic>=25.12.1

@@ -604,11 +604,11 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
         snapshot_id="ptg2:202606:test",
         source_uri="file:///tmp/manifest.json",
         manifest={},
-        plans={"010854205": {"plan_name": "Example Group"}},
+        plans={"TESTPLAN001": {"plan_name": "Example Group"}},
         procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
         rows=(
             {
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "reported_code": "29888",
                 "reported_code_system": "CPT",
                 "provider_set_hash": "provider-set",
@@ -647,7 +647,7 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
     payload = serving_manifest.search_ptg2_manifest_snapshot(
         snapshot,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "29888",
             "code_system": "CPT",
             "include_providers": "true",
@@ -675,7 +675,7 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
     opt_out_payload = serving_manifest.search_ptg2_manifest_snapshot(
         snapshot,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "29888",
             "code_system": "CPT",
             "include_providers": "true",
@@ -708,11 +708,11 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
         snapshot_id="ptg2:202606:test",
         source_uri="file:///tmp/manifest.json",
         manifest={},
-        plans={"010854205": {"plan_name": "Example Group"}},
+        plans={"TESTPLAN001": {"plan_name": "Example Group"}},
         procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
         rows=(
             {
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "reported_code": "29888",
                 "reported_code_system": "CPT",
                 "provider_set_hash": "provider-set",
@@ -748,7 +748,7 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
     payload = serving_manifest.search_ptg2_manifest_snapshot(
         snapshot,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "29888",
             "code_system": "CPT",
             "include_providers": "true",

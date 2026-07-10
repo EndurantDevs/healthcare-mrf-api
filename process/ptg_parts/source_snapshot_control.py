@@ -11,8 +11,15 @@ from typing import Any
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blobs import ensure_ptg2_artifact_blob_table
-from process.ptg_parts.snapshot_cleanup import _drop_ptg2_snapshot_table_names, _snapshot_manifest_table_names
-from process.ptg_parts.source_pointers import _source_plan_rows
+from process.ptg_parts.snapshot_cleanup import (
+    _all_snapshot_manifest_rows,
+    _drop_ptg2_snapshot_table_names,
+    _exclusively_owned_snapshot_table_names,
+    _is_ptg2_snapshot_in_flight,
+    _missing_snapshot_serving_resources,
+    _snapshot_manifest_table_names,
+)
+from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY, _source_plan_rows
 
 
 class SourceSnapshotConflict(ValueError):
@@ -51,6 +58,59 @@ def _date_value(value: Any) -> datetime.date:
     return datetime.date.today()
 
 
+def _snapshot_remove_reasons(
+    *,
+    source_key: str | None,
+    manifest_source_key: str | None,
+    snapshot_status: str,
+    references: dict[str, list[str]],
+) -> list[str]:
+    """Describe every current or rollback reference that prevents removal."""
+
+    reasons: list[str] = []
+    if source_key and manifest_source_key and source_key != manifest_source_key:
+        reasons.append("snapshot source_key does not match requested source_key")
+    if _is_ptg2_snapshot_in_flight(snapshot_status):
+        reasons.append(f"snapshot is in-flight (status: {snapshot_status})")
+    label_by_reference_name = {
+        "global_slots": "current global",
+        "source_keys": "current source",
+        "plan_source_keys": "current plan",
+        "previous_global_slots": "previous global",
+        "previous_source_keys": "previous source",
+        "previous_plan_source_keys": "previous plan",
+    }
+    reasons.extend(
+        f"snapshot is referenced by {label} pointer"
+        for reference_name, label in label_by_reference_name.items()
+        if references.get(reference_name)
+    )
+    return reasons
+
+
+def _retirement_manifest_source_key(
+    snapshot: dict[str, Any],
+    requested_source_key: str | None,
+) -> str | None:
+    """Validate a snapshot's immutable identity before retiring its pointers."""
+
+    if not snapshot:
+        return None
+    manifest_map = _manifest_dict(snapshot.get("manifest"))
+    serving_index_map = (
+        manifest_map.get("serving_index")
+        if isinstance(manifest_map.get("serving_index"), dict)
+        else {}
+    )
+    manifest_source_key = str(serving_index_map.get("source_key") or "").strip() or None
+    snapshot_status = str(snapshot.get("status") or "").strip().lower()
+    if _is_ptg2_snapshot_in_flight(snapshot_status):
+        raise ValueError(f"snapshot is in-flight (status: {snapshot_status})")
+    if requested_source_key and manifest_source_key and requested_source_key != manifest_source_key:
+        raise ValueError("snapshot source_key does not match requested source_key")
+    return manifest_source_key
+
+
 async def promote_ptg2_source_snapshot(
     *,
     source_key: str,
@@ -62,32 +122,44 @@ async def promote_ptg2_source_snapshot(
     if not source_key or not snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
     schema = _schema_name()
-    snapshot = await _snapshot_row(schema, snapshot_id)
-    if not snapshot:
-        raise ValueError("snapshot not found")
-    if str(snapshot.get("status") or "").strip().lower() != "published":
-        raise ValueError("snapshot is not published")
-    manifest = _manifest_dict(snapshot.get("manifest"))
-    serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
-    manifest_source_key = str(serving_index.get("source_key") or "").strip()
-    if manifest_source_key and manifest_source_key != source_key:
-        raise ValueError("snapshot source_key does not match requested source_key")
-    previous_snapshot_id = await _current_source_snapshot(schema, source_key)
-    if expected_current_snapshot_id is not None and str(expected_current_snapshot_id or "") != str(previous_snapshot_id or ""):
-        raise SourceSnapshotConflict("current source snapshot changed")
-    import_month = _date_value(snapshot.get("import_month"))
-    updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    plan_rows = await _source_plan_rows(
-        snapshot_id=snapshot_id,
-        source_key=source_key,
-        import_month=import_month,
-        previous_snapshot_id=previous_snapshot_id,
-        updated_at=updated_at,
-        serving_index=serving_index,
-    )
-    if not plan_rows:
-        raise ValueError("snapshot has no plan source rows")
     async with db.transaction() as session:
+        await _lock_source_pointer_gc(session)
+        snapshot = await _snapshot_row(schema, snapshot_id)
+        if not snapshot:
+            raise ValueError("snapshot not found")
+        if str(snapshot.get("status") or "").strip().lower() != "published":
+            raise ValueError("snapshot is not published")
+        manifest = _manifest_dict(snapshot.get("manifest"))
+        serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
+        manifest_source_key = str(serving_index.get("source_key") or "").strip()
+        if manifest_source_key and manifest_source_key != source_key:
+            raise ValueError("snapshot source_key does not match requested source_key")
+        missing_tables, missing_artifacts = await _missing_snapshot_serving_resources(
+            schema,
+            snapshot_id,
+            serving_index,
+        )
+        if missing_tables:
+            raise ValueError(f"snapshot serving tables are missing: {', '.join(missing_tables)}")
+        if missing_artifacts:
+            raise ValueError(f"snapshot serving artifacts are missing: {', '.join(missing_artifacts)}")
+        previous_snapshot_id = await _current_source_snapshot(schema, source_key)
+        if expected_current_snapshot_id is not None and str(expected_current_snapshot_id or "") != str(
+            previous_snapshot_id or ""
+        ):
+            raise SourceSnapshotConflict("current source snapshot changed")
+        import_month = _date_value(snapshot.get("import_month"))
+        updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        plan_rows = await _source_plan_rows(
+            snapshot_id=snapshot_id,
+            source_key=source_key,
+            import_month=import_month,
+            previous_snapshot_id=previous_snapshot_id,
+            updated_at=updated_at,
+            serving_index=serving_index,
+        )
+        if not plan_rows:
+            raise ValueError("snapshot has no plan source rows")
         await session.execute(
             _text(
                 f"""
@@ -168,17 +240,21 @@ async def build_ptg2_source_snapshot_remove_plan(
     serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
     manifest_source_key = str(serving_index.get("source_key") or "").strip() or None
     references = await _current_references(schema, snapshot_id)
-    tables = _snapshot_manifest_table_names(serving_index)
+    manifest_tables = _snapshot_manifest_table_names(serving_index)
+    all_snapshot_rows = await _all_snapshot_manifest_rows(db, schema_name=schema)
+    tables = _exclusively_owned_snapshot_table_names(
+        snapshot_id,
+        manifest_tables,
+        all_snapshot_rows,
+    )
     artifact_ids = await _artifact_manifest_ids(schema, snapshot_id)
-    reasons: list[str] = []
-    if source_key and manifest_source_key and source_key != manifest_source_key:
-        reasons.append("snapshot source_key does not match requested source_key")
-    if references.get("global_slots"):
-        reasons.append("snapshot is referenced by current global pointer")
-    if references.get("source_keys"):
-        reasons.append("snapshot is referenced by current source pointer")
-    if references.get("plan_source_keys"):
-        reasons.append("snapshot is referenced by current plan pointer")
+    snapshot_status = str(snapshot.get("status") or "").strip().lower()
+    reasons = _snapshot_remove_reasons(
+        source_key=source_key,
+        manifest_source_key=manifest_source_key,
+        snapshot_status=snapshot_status,
+        references=references,
+    )
     return {
         "snapshot_id": snapshot_id,
         "source_key": source_key or manifest_source_key,
@@ -199,30 +275,38 @@ async def remove_ptg2_source_snapshot(
     snapshot_id: str,
     source_key: str | None = None,
 ) -> dict[str, Any]:
-    plan = await build_ptg2_source_snapshot_remove_plan(snapshot_id=snapshot_id, source_key=source_key)
-    if not plan.get("removable"):
-        raise ValueError(str(plan.get("reason") or "snapshot is not removable"))
-    if not plan.get("exists"):
-        return {**plan, "executed": True, "deleted_tables": 0, "deleted_artifact_manifests": 0, "deleted_snapshots": 0}
     schema = _schema_name()
-    tables = [str(value) for value in plan.get("tables") or []]
-    await _drop_ptg2_snapshot_table_names(tables)
-    artifact_ids = [str(value) for value in plan.get("artifact_manifest_ids") or []]
-    deleted_artifact_chunks = 0
-    if artifact_ids:
-        await ensure_ptg2_artifact_blob_table(schema)
-        deleted_artifact_chunks = await db.status(
-            f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk WHERE artifact_id = ANY(:artifact_ids)",
-            artifact_ids=artifact_ids,
+    async with db.transaction() as session:
+        await _lock_source_pointer_gc(session)
+        plan = await build_ptg2_source_snapshot_remove_plan(snapshot_id=snapshot_id, source_key=source_key)
+        if not plan.get("removable"):
+            raise ValueError(str(plan.get("reason") or "snapshot is not removable"))
+        if not plan.get("exists"):
+            return {
+                **plan,
+                "executed": True,
+                "deleted_tables": 0,
+                "deleted_artifact_manifests": 0,
+                "deleted_snapshots": 0,
+            }
+        tables = [str(value) for value in plan.get("tables") or []]
+        await _drop_ptg2_snapshot_table_names(tables)
+        artifact_ids = [str(value) for value in plan.get("artifact_manifest_ids") or []]
+        deleted_artifact_chunks = 0
+        if artifact_ids:
+            await ensure_ptg2_artifact_blob_table(schema)
+            deleted_artifact_chunks = await db.status(
+                f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk WHERE artifact_id = ANY(:artifact_ids)",
+                artifact_ids=artifact_ids,
+            )
+        deleted_artifacts = await db.status(
+            f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_manifest WHERE snapshot_id = :snapshot_id",
+            snapshot_id=snapshot_id,
         )
-    deleted_artifacts = await db.status(
-        f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_manifest WHERE snapshot_id = :snapshot_id",
-        snapshot_id=snapshot_id,
-    )
-    deleted_snapshots = await db.status(
-        f"DELETE FROM {_quote_ident(schema)}.ptg2_snapshot WHERE snapshot_id = :snapshot_id",
-        snapshot_id=snapshot_id,
-    )
+        deleted_snapshots = await db.status(
+            f"DELETE FROM {_quote_ident(schema)}.ptg2_snapshot WHERE snapshot_id = :snapshot_id",
+            snapshot_id=snapshot_id,
+        )
     return {
         **plan,
         "executed": True,
@@ -244,40 +328,43 @@ async def retire_ptg2_source_snapshot(
     if not snapshot_id:
         raise ValueError("snapshot_id is required")
     schema = _schema_name()
-    snapshot = await _snapshot_row(schema, snapshot_id)
-    manifest_source_key = None
-    if snapshot:
-        manifest_map = _manifest_dict(snapshot.get("manifest"))
-        serving_index_map = (
-            manifest_map.get("serving_index") if isinstance(manifest_map.get("serving_index"), dict) else {}
+    async with db.transaction() as session:
+        await _lock_source_pointer_gc(session)
+        snapshot = await _snapshot_row(schema, snapshot_id)
+        manifest_source_key = _retirement_manifest_source_key(snapshot, source_key)
+        before = await _current_references(schema, snapshot_id)
+        if before.get("global_slots"):
+            raise ValueError("snapshot is referenced by current global pointer")
+        if any(
+            before.get(reference_name)
+            for reference_name in (
+                "previous_global_slots",
+                "previous_source_keys",
+                "previous_plan_source_keys",
+            )
+        ):
+            raise ValueError("snapshot is referenced by a previous snapshot pointer")
+        query_param_map: dict[str, Any] = {"snapshot_id": snapshot_id}
+        source_filter = ""
+        if source_key:
+            query_param_map["source_key"] = source_key
+            source_filter = " AND source_key = :source_key"
+        deleted_plan_pointers = await db.status(
+            f"""
+            DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source
+             WHERE snapshot_id = :snapshot_id{source_filter}
+            """,
+            **query_param_map,
         )
-        manifest_source_key = str(serving_index_map.get("source_key") or "").strip() or None
-    if source_key and manifest_source_key and source_key != manifest_source_key:
-        raise ValueError("snapshot source_key does not match requested source_key")
-    before = await _current_references(schema, snapshot_id)
-    if before.get("global_slots"):
-        raise ValueError("snapshot is referenced by current global pointer")
-    query_param_map: dict[str, Any] = {"snapshot_id": snapshot_id}
-    source_filter = ""
-    if source_key:
-        query_param_map["source_key"] = source_key
-        source_filter = " AND source_key = :source_key"
-    deleted_plan_pointers = await db.status(
-        f"""
-        DELETE FROM {_quote_ident(schema)}.ptg2_current_plan_source
-         WHERE snapshot_id = :snapshot_id{source_filter}
-        """,
-        **query_param_map,
-    )
-    deleted_source_pointers = await db.status(
-        f"""
-        DELETE FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
-         WHERE snapshot_id = :snapshot_id{source_filter}
-        """,
-        **query_param_map,
-    )
+        deleted_source_pointers = await db.status(
+            f"""
+            DELETE FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
+             WHERE snapshot_id = :snapshot_id{source_filter}
+            """,
+            **query_param_map,
+        )
+        after = await _current_references(schema, snapshot_id)
     _clear_ptg2_snapshot_cache()
-    after = await _current_references(schema, snapshot_id)
     return {
         "snapshot_id": snapshot_id,
         "source_key": source_key or manifest_source_key,
@@ -332,10 +419,43 @@ async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[s
         f"SELECT plan_source_key FROM {_quote_ident(schema)}.ptg2_current_plan_source WHERE snapshot_id = :snapshot_id ORDER BY plan_source_key",
         snapshot_id=snapshot_id,
     )
+    previous_global_rows = await db.all(
+        f"SELECT slot FROM {_quote_ident(schema)}.ptg2_current_snapshot WHERE previous_snapshot_id = :snapshot_id ORDER BY slot",
+        snapshot_id=snapshot_id,
+    )
+    previous_source_rows = await db.all(
+        f"SELECT source_key FROM {_quote_ident(schema)}.ptg2_current_source_snapshot WHERE previous_snapshot_id = :snapshot_id ORDER BY source_key",
+        snapshot_id=snapshot_id,
+    )
+    previous_plan_rows = await db.all(
+        f"SELECT plan_source_key FROM {_quote_ident(schema)}.ptg2_current_plan_source WHERE previous_snapshot_id = :snapshot_id ORDER BY plan_source_key",
+        snapshot_id=snapshot_id,
+    )
     return {
-        "global_slots": [str(_row_mapping(row).get("slot")) for row in global_rows],
-        "source_keys": [str(_row_mapping(row).get("source_key")) for row in source_rows],
-        "plan_source_keys": [str(_row_mapping(row).get("plan_source_key")) for row in plan_rows],
+        "global_slots": [
+            str(_row_mapping(reference_row).get("slot"))
+            for reference_row in global_rows
+        ],
+        "source_keys": [
+            str(_row_mapping(reference_row).get("source_key"))
+            for reference_row in source_rows
+        ],
+        "plan_source_keys": [
+            str(_row_mapping(reference_row).get("plan_source_key"))
+            for reference_row in plan_rows
+        ],
+        "previous_global_slots": [
+            str(_row_mapping(reference_row).get("slot"))
+            for reference_row in previous_global_rows
+        ],
+        "previous_source_keys": [
+            str(_row_mapping(reference_row).get("source_key"))
+            for reference_row in previous_source_rows
+        ],
+        "previous_plan_source_keys": [
+            str(_row_mapping(reference_row).get("plan_source_key"))
+            for reference_row in previous_plan_rows
+        ],
     }
 
 
@@ -364,3 +484,10 @@ def _text(statement: str):
     from sqlalchemy import text
 
     return text(statement)
+
+
+async def _lock_source_pointer_gc(session: Any) -> None:
+    await session.execute(
+        _text("SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))"),
+        {"publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
+    )

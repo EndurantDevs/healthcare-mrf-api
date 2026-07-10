@@ -586,6 +586,7 @@ def expected_original_file_summary(path: Path) -> dict[str, Any]:
                 serving_keys.add("\t".join([code_key, ",".join(provider_refs), price_key]))
 
     unique_price_keys = sorted(set(price_keys))
+    declared_npis = set().union(*provider_npis_by_ref.values()) if provider_npis_by_ref else set()
     return {
         "provider_references": len(provider_npis_by_ref),
         "in_network_items": len(in_network_items),
@@ -593,7 +594,8 @@ def expected_original_file_summary(path: Path) -> dict[str, Any]:
         "negotiated_prices": len(price_keys),
         "unique_serving_rates": len(serving_keys),
         "unique_price_atoms": len(unique_price_keys),
-        "unique_provider_npis": len(used_npis),
+        "unique_provider_npis": len(declared_npis),
+        "used_provider_npis": len(used_npis),
         "price_atom_digest": digest_text_lines(unique_price_keys),
     }
 
@@ -1099,12 +1101,36 @@ def _is_serving_storage_probe_enabled(case: dict[str, Any], variant: dict[str, A
     return bool(case.get("analyze_serving_sidecar"))
 
 
+def _api_probe_setting(
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    key: str,
+    default: Any,
+) -> Any:
+    """Return a probe setting while preserving explicit zero and false values."""
+
+    if key in case and case[key] is not None:
+        return case[key]
+    if key in variant and variant[key] is not None:
+        return variant[key]
+    return default
+
+
 def _api_latency_probe_config(
     *,
     snapshot_id: str,
     case: dict[str, Any],
     variant: dict[str, Any],
 ) -> dict[str, Any]:
+    sample_max_ms = float(_api_probe_setting(case, variant, "api_latency_max_ms", 100.0))
+    p95_max_ms = float(
+        _api_probe_setting(
+            case,
+            variant,
+            "api_latency_p95_max_ms",
+            min(sample_max_ms, 40.0),
+        )
+    )
     return {
         "snapshot_id": snapshot_id,
         "plan_id": str(case.get("plan_id") or "LOCAL-PTG2-SMOKE"),
@@ -1112,9 +1138,10 @@ def _api_latency_probe_config(
         "code_system": str(case.get("api_probe_code_system") or "CPT"),
         "npi": int(case.get("api_probe_npi") or 1234567890),
         "limit": int(case.get("api_probe_limit") or 25),
-        "iterations": int(case.get("api_probe_iterations") or variant.get("api_probe_iterations") or 8),
-        "warmup": int(case.get("api_probe_warmup") or variant.get("api_probe_warmup") or 2),
-        "max_ms": float(case.get("api_latency_max_ms") or variant.get("api_latency_max_ms") or 40.0),
+        "iterations": int(_api_probe_setting(case, variant, "api_probe_iterations", 8)),
+        "warmup": int(_api_probe_setting(case, variant, "api_probe_warmup", 2)),
+        "max_ms": sample_max_ms,
+        "p95_max_ms": p95_max_ms,
     }
 
 
@@ -1133,14 +1160,19 @@ def _api_latency_probe_env(
     return probe_env_map
 
 
-def _failed_api_latency_probes(probes_by_name: dict[str, Any], max_latency_ms: float) -> list[str]:
+def _failed_api_latency_probes(
+    probes_by_name: dict[str, Any],
+    max_latency_ms: float,
+    p95_latency_ms: float | None = None,
+) -> list[str]:
+    p95_limit_ms = float(max_latency_ms if p95_latency_ms is None else p95_latency_ms)
     failed_probes = []
     for name, probe in probes_by_name.items():
         if not probe.get("payload"):
             failed_probes.append(f"{name}:no_payload")
             continue
         p95_latency = probe.get("p95_ms")
-        if p95_latency is None or float(p95_latency) > float(max_latency_ms):
+        if p95_latency is None or float(p95_latency) > p95_limit_ms:
             failed_probes.append(f"{name}:p95_ms")
             continue
         max_latency = probe.get("max_ms")
@@ -1176,6 +1208,7 @@ def run_api_latency_probe(
             "error": completed.stderr[-2000:],
             "stdout": completed.stdout[-1000:],
             "max_ms": probe_config_dict["max_ms"],
+            "p95_max_ms": probe_config_dict["p95_max_ms"],
             "probes": {},
         }
     try:
@@ -1186,13 +1219,19 @@ def run_api_latency_probe(
             "error": f"failed to parse API latency probe output: {exc}",
             "stdout": completed.stdout[-1000:],
             "max_ms": probe_config_dict["max_ms"],
+            "p95_max_ms": probe_config_dict["p95_max_ms"],
             "probes": {},
         }
     probes_by_name = raw_result.get("probes") if isinstance(raw_result.get("probes"), dict) else {}
-    failed_probes = _failed_api_latency_probes(probes_by_name, float(probe_config_dict["max_ms"]))
+    failed_probes = _failed_api_latency_probes(
+        probes_by_name,
+        float(probe_config_dict["max_ms"]),
+        float(probe_config_dict["p95_max_ms"]),
+    )
     return {
         "status": "failed" if failed_probes else "passed",
         "max_ms": probe_config_dict["max_ms"],
+        "p95_max_ms": probe_config_dict["p95_max_ms"],
         "failed": failed_probes,
         "probes": probes_by_name,
     }
@@ -1224,21 +1263,23 @@ def verify_local_import_against_original(
         if serving_table_exists
         else str(int((binary_manifest or {}).get("row_count") or 0))
     )
-    price_atom_table = serving_index_table(serving_index, "price_atom_table")
+    price_atom_table = _serving_index_table_or_none(serving_index, "price_atom_table")
     provider_group_member_table = serving_index_table(
         serving_index,
         "provider_group_member_table",
         "provider_npi_scope_table",
     )
-    price_atom_schema, price_atom_name = price_atom_table.split(".", 1)
-    price_atom_columns_payload = psql_json(
-        env_overrides,
-        "SELECT json_build_object('columns', COALESCE(array_agg(column_name ORDER BY ordinal_position), ARRAY[]::text[])) "
-        "FROM information_schema.columns "
-        f"WHERE table_schema = '{sql_literal(price_atom_schema)}' "
-        f"AND table_name = '{sql_literal(price_atom_name)}';",
-    )
-    price_atom_columns = set(price_atom_columns_payload.get("columns") or [])
+    price_atom_columns: set[str] = set()
+    if price_atom_table:
+        price_atom_schema, price_atom_name = price_atom_table.split(".", 1)
+        price_atom_columns_payload = psql_json(
+            env_overrides,
+            "SELECT json_build_object('columns', COALESCE(array_agg(column_name ORDER BY ordinal_position), ARRAY[]::text[])) "
+            "FROM information_schema.columns "
+            f"WHERE table_schema = '{sql_literal(price_atom_schema)}' "
+            f"AND table_name = '{sql_literal(price_atom_name)}';",
+        )
+        price_atom_columns = set(price_atom_columns_payload.get("columns") or [])
     digest_columns = {
         "negotiated_type",
         "negotiated_rate",
@@ -1249,7 +1290,14 @@ def verify_local_import_against_original(
         "billing_code_modifier",
         "additional_information",
     }
-    can_digest_price_atoms = digest_columns.issubset(price_atom_columns)
+    can_digest_price_atoms = bool(price_atom_table) and digest_columns.issubset(price_atom_columns)
+    price_atoms_v3 = binary_manifest.get("price_atoms_v3") if isinstance(binary_manifest, dict) else {}
+    price_atoms_v3 = price_atoms_v3 if isinstance(price_atoms_v3, dict) else {}
+    price_atom_rows_sql = (
+        f"(SELECT count(*) FROM {price_atom_table})"
+        if price_atom_table
+        else str(int(price_atoms_v3.get("atom_count") or 0))
+    )
     price_atom_digest_sql = (
         "'price_atom_digest', (SELECT md5(COALESCE(string_agg(line, E'\\n' ORDER BY line) || E'\\n', '')) "
         "FROM (SELECT "
@@ -1269,7 +1317,7 @@ def verify_local_import_against_original(
         env_overrides,
         "SELECT json_build_object("
         f"'serving_rows', {serving_rows_sql}, "
-        f"'price_atom_rows', (SELECT count(*) FROM {price_atom_table}), "
+        f"'price_atom_rows', {price_atom_rows_sql}, "
         f"'provider_group_member_rows', (SELECT count(*) FROM {provider_group_member_table}), "
         f"'provider_npis', (SELECT count(DISTINCT npi) FROM {provider_group_member_table}), "
         f"{price_atom_digest_sql}"

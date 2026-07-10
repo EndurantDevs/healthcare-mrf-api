@@ -2584,7 +2584,7 @@ class PTG2PriceAtom(Base, JSONOutputMixin):
 
     price_atom_hash = Column(String(64))
     negotiated_type = Column(String(64))
-    negotiated_rate = Column(String(64))
+    negotiated_rate = Column(String)
     expiration_date = Column(DATE)
     service_code_set_hash = Column(String(64))
     billing_class = Column(String(32))

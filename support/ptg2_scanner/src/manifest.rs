@@ -96,16 +96,16 @@ pub fn procedure_global_id(procedure_payload: &Value) -> GlobalId128 {
     GlobalId128::from_domain_payload("procedure_manifest", procedure_payload)
 }
 
-pub fn provider_set_global_id_from_entry_hashes(provider_entry_hashes: &[i64]) -> GlobalId128 {
-    let mut sorted_entry_hashes = provider_entry_hashes.to_vec();
-    sorted_entry_hashes.sort_unstable();
-    sorted_entry_hashes.dedup();
+pub fn provider_set_global_id_from_group_hashes(provider_group_hashes: &[i64]) -> GlobalId128 {
+    let mut sorted_group_hashes = provider_group_hashes.to_vec();
+    sorted_group_hashes.sort_unstable();
+    sorted_group_hashes.dedup();
 
     let mut hasher = Xxh3::new();
     hasher.update(b"provider_set_manifest");
-    for provider_entry_hash in sorted_entry_hashes {
+    for provider_group_hash in sorted_group_hashes {
         hasher.update(b"\x1f");
-        hasher.update(&provider_entry_hash.to_le_bytes());
+        hasher.update(&provider_group_hash.to_le_bytes());
     }
     GlobalId128(hasher.digest128().to_le_bytes())
 }
@@ -301,9 +301,9 @@ mod tests {
 
     #[test]
     fn provider_set_global_id_sorts_and_dedupes_members() {
-        let first = provider_set_global_id_from_entry_hashes(&[1, 2, 3]);
-        let second = provider_set_global_id_from_entry_hashes(&[3, 2, 1, 3]);
-        let different_members = provider_set_global_id_from_entry_hashes(&[1, 2, 4]);
+        let first = provider_set_global_id_from_group_hashes(&[1, 2, 3]);
+        let second = provider_set_global_id_from_group_hashes(&[3, 2, 1, 3]);
+        let different_members = provider_set_global_id_from_group_hashes(&[1, 2, 4]);
 
         assert_eq!(first, second);
         assert_eq!(first.to_hex().len(), 32);

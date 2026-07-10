@@ -129,7 +129,7 @@ def _write_manifest_snapshot(tmp_path):
         [
             {
                 "serving_rate_id": "rate-1",
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "procedure_code": 123456,
                 "reported_code_system": "CPT",
                 "reported_code": "70551",
@@ -169,8 +169,8 @@ def _write_manifest_snapshot(tmp_path):
         "artifact_type": "ptg2_manifest_snapshot",
         "snapshot_id": "snap-manifest",
         "plans": {
-            "010854205": {
-                "plan_id": "010854205",
+            "TESTPLAN001": {
+                "plan_id": "TESTPLAN001",
                 "plan_name": "Example Plan",
             }
         },
@@ -203,7 +203,7 @@ def _write_manifest_snapshot_with_binary_sidecars(tmp_path):
         [
             {
                 "serving_rate_id": "rate-1",
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "procedure_global_id_128": "0000000000000000000000000000000e",
                 "reported_code_system": "CPT",
                 "reported_code": "70551",
@@ -230,7 +230,7 @@ def _write_manifest_snapshot_with_binary_sidecars(tmp_path):
         "version": 3,
         "artifact_type": "ptg2_manifest_snapshot",
         "snapshot_id": "snap-manifest-sidecars",
-        "plans": {"010854205": {"plan_name": "Example Plan"}},
+        "plans": {"TESTPLAN001": {"plan_name": "Example Plan"}},
         "procedures": {"CPT:70551": {"name": "MRI brain without contrast"}},
         "providers": {
             provider_id.hex(): {
@@ -273,7 +273,7 @@ def test_ptg2_manifest_reader_loads_manifest_backed_snapshot_sidecars(tmp_path):
 def test_ptg2_manifest_reader_rejects_oversized_manifest_rows(tmp_path, monkeypatch):
     rows_sidecar = _write_sidecar(
         tmp_path / "serving_rows.jsonl",
-        [{"plan_id": "010854205"}, {"plan_id": "010854206"}],
+        [{"plan_id": "TESTPLAN001"}, {"plan_id": "010854206"}],
         jsonl=True,
     )
     manifest = {
@@ -303,7 +303,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_ex
                     "snapshot_scoped": True,
                     "artifact_uri": manifest_path.resolve().as_uri(),
                 }
-            }
+            },
         ]
     )
 
@@ -311,7 +311,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_ex
         session,
         {
             "snapshot_id": "snap-manifest",
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "false",
@@ -320,6 +320,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_ex
     )
 
     assert len(session.calls) == 1
+    assert "status = 'published'" in str(session.calls[0][0][0])
     assert "source" not in payload["query"]
     assert "serving_table" not in payload["query"]
     assert "procedure_consolidation" not in payload["query"]
@@ -349,7 +350,7 @@ async def test_ptg2_manifest_snapshot_returns_none_for_provider_expansion(tmp_pa
         FakeSession([]),
         "snap-manifest",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "true",
@@ -373,7 +374,7 @@ async def test_ptg2_manifest_snapshot_expands_provider_and_price_sidecars(tmp_pa
         FakeSession([]),
         "snap-manifest-sidecars",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "true",
@@ -410,7 +411,7 @@ async def test_ptg2_manifest_db_snapshot_serves_exact_plan_code_lookup():
                 rows=[
                     {
                         "serving_content_hash_128": UUID(serving_hash),
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "procedure_global_id_128": UUID(procedure_id),
@@ -428,7 +429,7 @@ async def test_ptg2_manifest_db_snapshot_serves_exact_plan_code_lookup():
         session,
         "snap-manifest",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "false",
@@ -469,7 +470,7 @@ async def test_ptg2_manifest_db_snapshot_serves_lean_provider_key_layout():
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 123,
@@ -480,7 +481,7 @@ async def test_ptg2_manifest_db_snapshot_serves_lean_provider_key_layout():
                 rows=[
                     {
                         "serving_content_hash_128": UUID("00000000000000000000000000000009"),
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "procedure_global_id_128": None,
@@ -499,7 +500,7 @@ async def test_ptg2_manifest_db_snapshot_serves_lean_provider_key_layout():
         session,
         "snap-manifest",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "false",
@@ -531,7 +532,7 @@ async def test_ptg2_manifest_db_snapshot_defers_provider_expansion():
         FakeSession([True]),
         "snap-manifest",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_providers": "true",
@@ -568,7 +569,7 @@ async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
                 rows=[
                     {
                         "serving_content_hash_128": "serving-hash",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "99214",
                         "procedure_global_id_128": "procedure-hash",
@@ -587,7 +588,7 @@ async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
         session,
         "snap-manifest",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "99214",
             "code_system": "CPT",
             "include_providers": "true",
@@ -767,7 +768,7 @@ async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(
                 rows=[
                     {
                         "serving_content_hash_128": UUID("00000000000000000000000000000015"),
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "procedure_global_id_128": UUID("00000000000000000000000000000016"),
@@ -801,7 +802,7 @@ async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(
         session,
         1234567890,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "include_details": "true",

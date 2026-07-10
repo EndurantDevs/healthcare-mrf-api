@@ -11,6 +11,7 @@ pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
 pub const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_RAW_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_PARSE_IN_WORKERS: bool = true;
+pub const DEFAULT_TOP_LEVEL_BYTE_SCAN: bool = true;
 
 pub fn split_interval(name: &str, default_value: usize) -> usize {
     env::var(name)
@@ -104,6 +105,26 @@ mod tests {
                 DEFAULT_PARSE_IN_WORKERS
             ));
         });
+    }
+
+    #[test]
+    fn top_level_byte_scan_defaults_on_but_can_be_disabled() {
+        scoped_env("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", None, || {
+            assert!(env_bool(
+                "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
+                DEFAULT_TOP_LEVEL_BYTE_SCAN
+            ));
+        });
+        scoped_env(
+            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
+            Some("false"),
+            || {
+                assert!(!env_bool(
+                    "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
+                    DEFAULT_TOP_LEVEL_BYTE_SCAN
+                ));
+            },
+        );
     }
 
     #[test]

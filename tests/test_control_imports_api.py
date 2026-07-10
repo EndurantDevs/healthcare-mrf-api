@@ -579,7 +579,7 @@ def test_ptg_import_file_payload_maps_contract_to_ptg_import():
             "run_id": "run_ptg",
             "source_file_import_id": "source_file_import_1",
             "source_file_id": "file_1",
-            "source_key": "asr_1208",
+            "source_key": "example_source_a",
             "in_network_url": "https://example.com/rates.json.gz",
             "import_month": "2026-06",
             "idempotency_key": "ptg:file_1:2026-06",
@@ -592,7 +592,7 @@ def test_ptg_import_file_payload_maps_contract_to_ptg_import():
     assert payload["triggered_by"] == "source_file_import"
     assert payload["source_file_import_id"] == "source_file_import_1"
     assert payload["params"]["source_file_id"] == "file_1"
-    assert payload["params"]["source_key"] == "asr_1208"
+    assert payload["params"]["source_key"] == "example_source_a"
     assert payload["params"]["in_network_url"] == "https://example.com/rates.json.gz"
 
 
@@ -689,7 +689,7 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
         "run_id": "run_ptg",
         "importer": "ptg",
         "source_file_import_id": "source_file_import_1",
-        "params": {"source_key": "asr_1208", "in_network_url": "https://example.com/rates.json.gz"},
+        "params": {"source_key": "example_source_a", "in_network_url": "https://example.com/rates.json.gz"},
     }
 
     result = await _enqueue_import_start(row)
@@ -700,7 +700,7 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
     assert args[0] == "ptg_control_start"
     assert args[1]["run_id"] == "run_ptg"
     assert args[1]["source_file_import_id"] == "source_file_import_1"
-    assert args[1]["params"]["source_key"] == "asr_1208"
+    assert args[1]["params"]["source_key"] == "example_source_a"
     assert kwargs["_job_id"] == "ptg_start_run_ptg"
     assert kwargs == {"_queue_name": "arq:PTG", "_job_id": "ptg_start_run_ptg"}
 
@@ -726,7 +726,7 @@ async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
         "importer": "ptg",
         "source_file_import_id": "source_file_import_1",
         "params": {
-            "source_key": "asr_1208",
+            "source_key": "example_source_a",
             "_expected_queue": "arq:PTGSmall",
             "_expected_worker_class": "process.PTGSmall",
             "resource_class": "small",

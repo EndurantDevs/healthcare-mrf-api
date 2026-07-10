@@ -7505,8 +7505,8 @@ MAGNACARE_RESULTS_HTML = """
     <tr class="default">
       <td>EIN</td>
       <td>Group</td>
-      <td>113410766</td>
-      <td><div>Magna Employee Health Benefit Plan - HRA Plan</div></td>
+      <td>TESTPLAN001</td>
+      <td><div>Example Employer Health Benefit Plan - HRA Plan</div></td>
       <td><div>MagnaCare PPO</div></td>
       <td>In-Network</td>
       <td>24 MB</td>
@@ -7519,8 +7519,8 @@ MAGNACARE_RESULTS_HTML = """
     <tr class="default">
       <td>EIN</td>
       <td>Group</td>
-      <td>113410766</td>
-      <td><div>Magna Employee Health Benefit Plan - Standard PPO Plan</div></td>
+      <td>TESTPLAN001</td>
+      <td><div>Example Employer Health Benefit Plan - Standard PPO Plan</div></td>
       <td><div>MagnaCare PPO</div></td>
       <td>In-Network</td>
       <td>24 MB</td>
@@ -7553,8 +7553,8 @@ def test_magnacare_result_rows_extract_download_metadata():
     rows = discovery._magnacare_result_rows(MAGNACARE_RESULTS_HTML)
 
     assert len(rows) == 3
-    assert rows[0]["plan_id"] == "113410766"
-    assert rows[0]["plan_name"] == "Magna Employee Health Benefit Plan - HRA Plan"
+    assert rows[0]["plan_id"] == "TESTPLAN001"
+    assert rows[0]["plan_name"] == "Example Employer Health Benefit Plan - HRA Plan"
     assert rows[0]["network_name"] == "MagnaCare PPO"
     assert rows[0]["file_type_label"] == "In-Network"
     assert rows[0]["run_history_id"] == "339"
@@ -7617,16 +7617,16 @@ async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
     assert target.metadata["size_bytes"] == 24_000_000
     assert target.metadata["plan_info"] == [
         {
-            "plan_id": "113410766",
+            "plan_id": "TESTPLAN001",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
-            "plan_name": "Magna Employee Health Benefit Plan - HRA Plan",
+            "plan_name": "Example Employer Health Benefit Plan - HRA Plan",
         },
         {
-            "plan_id": "113410766",
+            "plan_id": "TESTPLAN001",
             "plan_id_type": "EIN",
             "plan_market_type": "group",
-            "plan_name": "Magna Employee Health Benefit Plan - Standard PPO Plan",
+            "plan_name": "Example Employer Health Benefit Plan - Standard PPO Plan",
         },
     ]
 
@@ -7637,7 +7637,7 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
 
     async def fake_fetch_text(requested_url, *, max_bytes, session):
         fetched_result_urls.append(requested_url)
-        if "filters=search-by%3Aabc+phones+of+north+carolina+inc+dba+victra" in requested_url:
+        if "filters=search-by%3Aexample+employer" in requested_url:
             return MAGNACARE_RESULTS_HTML
         return ""
 
@@ -7657,7 +7657,7 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
             "source_id": "source_abc",
             "payer_id": "payer_abc",
             "metadata_json": {
-                "target_payer_query": "abc_phones_of_north_carolina_inc_dba_victra"
+                "target_payer_query": "example_employer"
             },
         },
         "https://clm.magnacare.com/transparency/",
@@ -7670,7 +7670,7 @@ async def test_magnacare_resolver_uses_target_payer_query(monkeypatch):
         session="session",
     )
 
-    assert "filters=search-by%3Aabc+phones+of+north+carolina+inc+dba+victra" in fetched_result_urls[0]
+    assert "filters=search-by%3Aexample+employer" in fetched_result_urls[0]
     assert len(resolved_targets) == 1
 
 
@@ -8535,10 +8535,10 @@ def test_file_column_plan_info_synthesizes_import_control_plan_shape():
         [
             (
                 "source_1",
-                "391125346",
+                "TESTPLAN002",
                 "ein",
                 "group",
-                "METAL PRODUCTS PPO",
+                "Example Employer PPO",
                 "Meritain Health",
             )
         ]
@@ -8546,18 +8546,18 @@ def test_file_column_plan_info_synthesizes_import_control_plan_shape():
 
     plan_info = discovery._file_column_plan_info(
         source_id="source_1",
-        plan_ids=["391125346"],
-        plan_names=["METAL PRODUCTS PPO"],
+        plan_ids=["TESTPLAN002"],
+        plan_names=["Example Employer PPO"],
         market_types=["group"],
         plan_lookup=plan_lookup,
     )
 
     assert plan_info == [
         {
-            "plan_id": "391125346",
+            "plan_id": "TESTPLAN002",
             "plan_id_type": "ein",
             "plan_market_type": "group",
-            "plan_name": "METAL PRODUCTS PPO",
+            "plan_name": "Example Employer PPO",
             "issuer_name": None,
             "plan_sponsor_name": None,
         }
@@ -8577,7 +8577,7 @@ def test_import_control_context_plan_info_adds_stable_ids_for_label_only_plans()
             "plan_name": "Example Client Medical Plan",
         },
         {
-            "plan_id": "391125346",
+            "plan_id": "TESTPLAN002",
             "plan_id_type": "ein",
             "plan_market_type": "group",
             "plan_name": "Known EIN Plan",
@@ -8600,7 +8600,7 @@ def test_import_control_context_plan_info_adds_stable_ids_for_label_only_plans()
     assert enriched[0]["plan_id"]
     assert enriched[0]["plan_id_type"] == "source_context_hash"
     assert enriched[0]["plan_id"] == repeated[0]["plan_id"]
-    assert enriched[1]["plan_id"] == "391125346"
+    assert enriched[1]["plan_id"] == "TESTPLAN002"
     assert enriched[1]["plan_id_type"] == "ein"
 
 
@@ -15217,19 +15217,19 @@ async def test_push_import_control_catalog_skips_private_context_snapshot_by_def
 
 def test_import_control_private_preview_item_filters_and_stamps_target():
     item = {
-        "canonical_url": "https://example.com/ziprecruiter-oap.json.gz",
-        "description": "ZipRecruiter OAP in-network rates",
-        "plan_info": [{"plan_id": "123", "plan_name": "ZipRecruiter OAP"}],
+        "canonical_url": "https://example.com/example-employer-oap.json.gz",
+        "description": "Example Employer OAP in-network rates",
+        "plan_info": [{"plan_id": "123", "plan_name": "Example Employer OAP"}],
     }
 
     stamped = discovery._import_control_preview_item_with_private_context(
-        item, "ZipRecruiter"
+        item, "Example Employer"
     )
 
     assert stamped is not None
-    assert stamped["company_name"] == "ZipRecruiter"
+    assert stamped["company_name"] == "Example Employer"
     assert stamped["plan_info"][0]["plan_name"] == "OAP"
-    assert stamped["plan_info"][0]["plan_sponsor_name"] == "ZipRecruiter"
+    assert stamped["plan_info"][0]["plan_sponsor_name"] == "Example Employer"
     assert (
         discovery._import_control_preview_item_with_private_context(
             {
@@ -15237,7 +15237,7 @@ def test_import_control_private_preview_item_filters_and_stamps_target():
                 "description": "Other Employer OAP",
                 "plan_info": [{"plan_id": "456", "plan_name": "OAP"}],
             },
-            "ZipRecruiter",
+            "Example Employer",
         )
         is None
     )
@@ -15286,7 +15286,7 @@ async def test_private_context_snapshot_source_ids_use_non_private_same_url(
             "metadata_json": {
                 "source_tier": "mrf_importable",
                 "raw": {
-                    "target_payer_query": "ZipRecruiter",
+                    "target_payer_query": "Example Employer",
                     "query_expansion_source": True,
                 },
             },

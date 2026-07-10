@@ -10,6 +10,13 @@ use std::sync::{
     Arc,
 };
 
+mod rapidgzip;
+
+pub use rapidgzip::{
+    open_full_scan_json_reader, open_full_scan_reader, open_full_scan_reader_exporting_index,
+    open_indexed_ranges_reader, RapidgzipConfig,
+};
+
 struct CountingReader<R: Read> {
     inner: R,
     bytes_read: Arc<AtomicU64>,
@@ -135,7 +142,7 @@ impl<R: Read> Read for LossyUtf8Reader<R> {
     }
 }
 
-fn is_gzip(path: &Path) -> io::Result<bool> {
+pub fn is_gzip(path: &Path) -> io::Result<bool> {
     if path
         .extension()
         .and_then(|value| value.to_str())
@@ -195,6 +202,13 @@ mod tests {
         std::env::temp_dir().join(format!("ptg2_scanner_input_test_{nanos}_{suffix}"))
     }
 
+    fn write_gzip(path: &Path, payload: &[u8]) {
+        let file = File::create(path).expect("create gzip test file");
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(payload).expect("write gzip payload");
+        encoder.finish().expect("finish gzip payload");
+    }
+
     #[test]
     fn open_reader_reads_plain_files_and_counts_bytes() {
         let path = temp_path("plain.json");
@@ -211,12 +225,7 @@ mod tests {
     #[test]
     fn open_reader_decompresses_gzip_files_and_counts_compressed_bytes() {
         let path = temp_path("compressed.json.gz");
-        let file = File::create(&path).expect("create gzip test file");
-        let mut encoder = GzEncoder::new(file, Compression::default());
-        encoder
-            .write_all(b"{\"ok\":true}")
-            .expect("write gzip payload");
-        encoder.finish().expect("finish gzip payload");
+        write_gzip(&path, b"{\"ok\":true}");
 
         let bytes_read = Arc::new(AtomicU64::new(0));
         let mut reader = open_reader(&path, Arc::clone(&bytes_read)).expect("open gzip reader");

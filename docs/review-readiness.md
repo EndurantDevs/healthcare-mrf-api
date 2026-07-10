@@ -16,8 +16,8 @@ Current source snapshots:
 
 | Source | Snapshot | Serving table total | Support tables total |
 | --- | --- | ---: | ---: |
-| `asr_1208` | `ptg2:202605:2e95465b2025` | 41 GB | ~4.5 GB |
-| `asr_1236` | `ptg2:202605:79060d12dfcf` | 41 GB | ~4.5 GB |
+| `example_source_a` | `ptg2:202605:2e95465b2025` | 41 GB | ~4.5 GB |
+| `example_source_b` | `ptg2:202605:79060d12dfcf` | 41 GB | ~4.5 GB |
 
 Support tables in this historical evidence are `price_atom`,
 `provider_group_member`, and `code_count`. This was the hot database footprint
@@ -30,10 +30,10 @@ Import timing records available locally:
 
 | Import run | Status | Serving rows | Duration |
 | --- | --- | ---: | ---: |
-| `ptg2:asr_1208_202605_full_thin2` | `validated` | 301,445,112 | 14,631.8 s |
-| ASR 1236 manifest-backed import | `validated` | 149,971,480 | 10,231.8 s |
+| `ptg2:example_source_a_202605_full_thin2` | `validated` | 301,445,112 | 14,631.8 s |
+| Source B manifest-backed import | `validated` | 149,971,480 | 10,231.8 s |
 
-The `asr_1208` manifest-backed run was validated from salvaged artifacts, so its recorded duration is not useful for throughput comparison.
+The `example_source_a` manifest-backed run was validated from salvaged artifacts, so its recorded duration is not useful for throughput comparison.
 
 ## Artifact Hygiene
 
@@ -76,7 +76,7 @@ Last local results:
 - `743 passed in 21.26s`
 - compile checks passed
 - `git diff --check` passed
-- guarded ASR 1236 UUID smoke import passed in `healthporta_test`: 2,641,583 serving rows, `id_storage=uuid`, 51.34 seconds
+- guarded Source B UUID smoke import passed in `healthporta_test`: 2,641,583 serving rows, `id_storage=uuid`, 51.34 seconds
 - guarded `postgres_binary_v2` full-file smoke passed in `healthporta_test`:
   65,536 serving rows and all original price/provider counts matched; forward
   p95 was 12.66 ms and reverse NPI p95 was 14.69 ms with in-process binary and

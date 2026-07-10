@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import hashlib
 import time
 import zlib
 from pathlib import Path
@@ -26,6 +27,29 @@ def clear_binary_sidecar_caches():
     db_sidecars._BINARY_DICTIONARY_CACHE_STATE["byte_count"] = 0
     db_sidecars._BINARY_BLOCK_CACHE.clear()
     db_sidecars._BINARY_BLOCK_CACHE_STATE["byte_count"] = 0
+
+
+def test_serving_binary_skips_low_value_dictionary_compression(monkeypatch):
+    payload = b"".join(
+        sorted(hashlib.md5(str(item_key).encode("ascii")).digest() for item_key in range(65_536))
+    )
+    monkeypatch.setenv(serving_binary_writer.PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_ENV, "zlib")
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_BYTES_ENV,
+        "0",
+    )
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT_ENV,
+        "2",
+    )
+
+    stored_payload, compression, raw_payload_bytes = (
+        serving_binary_writer._serving_binary_payload_for_storage(payload)
+    )
+
+    assert stored_payload == payload
+    assert compression == "none"
+    assert raw_payload_bytes == 0
 
 
 class FakeResult:
@@ -338,8 +362,35 @@ async def test_db_serving_binary_by_code_reads_matching_provider_sets():
         (serving_row.code_key, serving_row.provider_set_key, serving_row.provider_count, serving_row.price_set_global_id_128)
         for serving_row in matched_serving_rows
     ] == [(7, 5, 20, second_price_set_id.hex())]
-    assert any(call.get("item_keys") == [1] for call in session.calls)
-    assert any("substring(" in statement for statement in session.statements)
+    assert any(call.get("block_nos") == [0] for call in session.calls)
+    assert not any("substring(" in statement for statement in session.statements)
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_uses_uncompressed_manifest_dictionary_hint():
+    price_set_id = bytes.fromhex("00000000000000000000000000000052")
+    by_code_payload = b"".join(_uvarint(payload_part) for payload_part in (5, 20, 0))
+    session = FakeServingBinarySession(
+        {
+            ("by_code", 7): [{"block_no": 0, "entry_count": 1, "payload": by_code_payload}],
+            "by_code_price_dictionary": [{"payload": price_set_id}],
+        }
+    )
+
+    rows = await lookup_serving_binary_by_code_from_db(
+        session,
+        "mrf.ptg2_serving_binary_hint_test",
+        7,
+        provider_set_keys=[5],
+        price_dictionary_item_count=1,
+        price_dictionary_block_bytes=16,
+        price_dictionary_compressed_records=0,
+    )
+
+    assert rows[0].price_set_global_id_128 == price_set_id.hex()
+    assert not any("octet_length(binary_block.payload)" in statement for statement in session.statements)
+    assert any(call.get("block_nos") == [0] for call in session.calls)
+    assert not any("substring(" in statement for statement in session.statements)
 
 
 @pytest.mark.asyncio
