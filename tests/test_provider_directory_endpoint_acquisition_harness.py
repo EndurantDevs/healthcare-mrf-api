@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.research import provider_directory_endpoint_acquisition_harness as harness
+from tests.provider_directory_endpoint_acquisition_test_support import manifest_with_attached_entry
 
 
 class FakeImportControl:
@@ -170,8 +171,8 @@ def test_aetna_bulk_acquisition_payload_is_exact_and_audited():
         "importer": "provider-directory-fhir",
         "engine": "healthcare-mrf-api",
         "params": expected_params_by_name,
-        "idempotency_key": "011ac924c3fe0e68f7073f296e2452cfccfafe609ea32752",
-        "client_id": "provider-directory-canonical-acquisition-2026-07-10:aetna-commercial-medicare",
+        "idempotency_key": "1374e1a4c9ee0440892ed944c80d2039830d70c09bbd8757",
+        "client_id": "provider-directory-canonical-acquisition-2026-07-10-v2:aetna-commercial-medicare",
         "triggered_by": "endpoint_acquisition",
     }
 @pytest.mark.parametrize("output_name", ["state.json", "report.json"])
@@ -214,7 +215,7 @@ def test_aetna_bulk_terminal_validation_requires_effective_bulk_per_resource(tmp
         lambda manifest: manifest["entries"][1].update(source_ids=manifest["entries"][0]["source_ids"]),
         lambda manifest: manifest["entries"][0].update(source_ids=["pdfhir_b6fdc036"]),
         lambda manifest: manifest["entries"][0].update(resources=["InsurancePlan"]),
-        lambda manifest: manifest["entries"][3].update(launch_mode="create"),
+        lambda manifest: manifest["entries"][3].update(launch_mode="attach"),
     ],
 )
 def test_manifest_rejects_unsafe_entries(tmp_path, mutation):
@@ -252,9 +253,8 @@ def test_runs_are_strictly_serial(tmp_path):
 
 
 def test_late_attach_precedes_create(tmp_path):
-    manifest = harness.load_manifest()
+    manifest, cigna = manifest_with_attached_entry(harness, "cigna", "run_cigna_attached")
     idaho = _manifest_entry(manifest, "idaho")
-    cigna = _manifest_entry(manifest, "cigna")
     cigna_active = _run_record(manifest, cigna, cigna["attached_run_id"], "running")
     idaho_queued = _run_record(manifest, idaho, "run_idaho", "queued")
     control = FakeImportControl(
@@ -277,8 +277,7 @@ def test_late_attach_precedes_create(tmp_path):
 
 
 def test_attach_ignores_canceled_alias_state(tmp_path):
-    manifest = harness.load_manifest()
-    cigna = _manifest_entry(manifest, "cigna")
+    manifest, cigna = manifest_with_attached_entry(harness, "cigna", "run_cigna_attached")
     attached_run = _run_record(manifest, cigna, cigna["attached_run_id"])
     alias_run_dict = _run_record(manifest, cigna, "run_canceled_cigna_alias", "canceled")
     alias_run_dict["params"]["source_ids"] = ["pdfhir_6442cb085b35d73b4fed36e7"]
@@ -447,8 +446,7 @@ def test_probe_payload_omits_import_fields(tmp_path):
 
 
 def test_attach_and_external_never_post(tmp_path):
-    manifest = harness.load_manifest()
-    cigna = _manifest_entry(manifest, "cigna")
+    manifest, cigna = manifest_with_attached_entry(harness, "cigna", "run_cigna_attached")
     alohr = _manifest_entry(manifest, "alohr")
     cigna_run = _run_record(manifest, cigna, cigna["attached_run_id"], "running")
     alohr_run_dict = {

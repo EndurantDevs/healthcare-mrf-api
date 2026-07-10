@@ -157,3 +157,12 @@ def test_restart_entry_refuses_dry_run(tmp_path):
     with pytest.raises(SystemExit, match="requires --apply"):
         harness.main(["--restart-entry", "idaho"])
     assert control.created_requests == []
+
+
+def test_cigna_campaign_entry_creates_a_fresh_root():
+    manifest = harness.load_manifest()
+    cigna = next(entry for entry in manifest["entries"] if entry["entry_id"] == "cigna")
+
+    assert manifest["campaign_id"] == "provider-directory-canonical-acquisition-2026-07-10-v2"
+    assert cigna["launch_mode"] == "create"
+    assert "attached_run_id" not in cigna

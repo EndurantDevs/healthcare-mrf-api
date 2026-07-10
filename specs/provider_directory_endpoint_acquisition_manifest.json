@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "campaign_id": "provider-directory-canonical-acquisition-2026-07-10",
+  "campaign_id": "provider-directory-canonical-acquisition-2026-07-10-v2",
   "importer": "provider-directory-fhir",
   "engine": "healthcare-mrf-api",
   "retest_results_url": "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json",
@@ -146,8 +146,7 @@
       "source_ids": ["pdfhir_46bcb068e81b0bc844e327e9"],
       "canonical_base": "https://fhir.cigna.com/ProviderDirectory/v1",
       "classification": "acquisition",
-      "launch_mode": "attach",
-      "attached_run_id": "run_5c338073708242218bcdf775e41ff5ce",
+      "launch_mode": "create",
       "resource_profile": "R8",
       "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
     },
