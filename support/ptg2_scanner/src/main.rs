@@ -404,7 +404,7 @@ impl ManifestGlobalIdCache {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct CopyPathConfig {
     compact: Option<String>,
     manifest_serving: Option<String>,
@@ -1632,21 +1632,47 @@ impl Drop for ManifestPairSpool {
 }
 
 struct ManifestSidecarSpools {
-    provider_forward: ManifestPairSpool,
-    provider_inverted: ManifestPairSpool,
-    provider_npi: ManifestPairSpool,
-    price_forward: ManifestPairSpool,
+    provider_forward: Option<ManifestPairSpool>,
+    provider_inverted: Option<ManifestPairSpool>,
+    provider_npi: Option<ManifestPairSpool>,
+    price_forward: Option<ManifestPairSpool>,
 }
 
 impl ManifestSidecarSpools {
-    fn new() -> io::Result<Self> {
+    fn for_paths(paths: &CopyPathConfig) -> io::Result<Self> {
         Ok(Self {
-            provider_forward: ManifestPairSpool::new("provider_forward")?,
-            provider_inverted: ManifestPairSpool::new("provider_inverted")?,
-            provider_npi: ManifestPairSpool::new("provider_npi")?,
-            price_forward: ManifestPairSpool::new("price_forward")?,
+            provider_forward: manifest_pair_spool_if(
+                paths.manifest_provider_forward_sidecar.is_some(),
+                "provider_forward",
+            )?,
+            provider_inverted: manifest_pair_spool_if(
+                paths.manifest_provider_inverted_sidecar.is_some(),
+                "provider_inverted",
+            )?,
+            provider_npi: manifest_pair_spool_if(
+                paths.manifest_provider_npi_sidecar.is_some(),
+                "provider_npi",
+            )?,
+            price_forward: manifest_pair_spool_if(
+                paths.manifest_price_forward_sidecar.is_some(),
+                "price_forward",
+            )?,
         })
     }
+
+    #[cfg(test)]
+    fn all() -> io::Result<Self> {
+        Ok(Self {
+            provider_forward: Some(ManifestPairSpool::new("provider_forward")?),
+            provider_inverted: Some(ManifestPairSpool::new("provider_inverted")?),
+            provider_npi: Some(ManifestPairSpool::new("provider_npi")?),
+            price_forward: Some(ManifestPairSpool::new("price_forward")?),
+        })
+    }
+}
+
+fn manifest_pair_spool_if(enabled: bool, kind: &str) -> io::Result<Option<ManifestPairSpool>> {
+    enabled.then(|| ManifestPairSpool::new(kind)).transpose()
 }
 
 #[derive(Default)]
@@ -1659,10 +1685,10 @@ struct ManifestSidecarCollector {
 }
 
 impl ManifestSidecarCollector {
-    fn for_import() -> io::Result<Self> {
+    fn for_import(paths: &CopyPathConfig) -> io::Result<Self> {
         if env_bool("HLTHPRT_PTG2_MANIFEST_SIDECAR_SPILL", true) {
             Ok(Self {
-                spools: Some(ManifestSidecarSpools::new()?),
+                spools: Some(ManifestSidecarSpools::for_paths(paths)?),
                 ..Self::default()
             })
         } else {
@@ -1684,12 +1710,12 @@ impl ManifestSidecarCollector {
         provider_group_ids.dedup();
         if let Some(spools) = self.spools.as_mut() {
             for provider_group_id in provider_group_ids.iter().copied() {
-                spools
-                    .provider_forward
-                    .push(provider_set_global_id, provider_group_id)?;
-                spools
-                    .provider_inverted
-                    .push(provider_group_id, provider_set_global_id)?;
+                if let Some(spool) = spools.provider_forward.as_mut() {
+                    spool.push(provider_set_global_id, provider_group_id)?;
+                }
+                if let Some(spool) = spools.provider_inverted.as_mut() {
+                    spool.push(provider_group_id, provider_set_global_id)?;
+                }
             }
         } else {
             self.provider_forward
@@ -1710,10 +1736,10 @@ impl ManifestSidecarCollector {
             .map(npi_member_id)
             .collect::<Vec<_>>();
         if let Some(spools) = self.spools.as_mut() {
-            for provider_npi_id in provider_npi_ids {
-                spools
-                    .provider_npi
-                    .push(provider_set_global_id, provider_npi_id)?;
+            if let Some(spool) = spools.provider_npi.as_mut() {
+                for provider_npi_id in provider_npi_ids {
+                    spool.push(provider_set_global_id, provider_npi_id)?;
+                }
             }
         } else {
             self.provider_npi
@@ -1732,10 +1758,10 @@ impl ManifestSidecarCollector {
             .map(price_atom_global_id)
             .collect::<Vec<_>>();
         if let Some(spools) = self.spools.as_mut() {
-            for price_atom_id in price_atom_ids {
-                spools
-                    .price_forward
-                    .push(price_set_global_id, price_atom_id)?;
+            if let Some(spool) = spools.price_forward.as_mut() {
+                for price_atom_id in price_atom_ids {
+                    spool.push(price_set_global_id, price_atom_id)?;
+                }
             }
         } else {
             self.price_forward
@@ -1747,29 +1773,45 @@ impl ManifestSidecarCollector {
     }
 
     fn provider_forward_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
-        if let Some(spools) = self.spools.as_mut() {
-            return spools.provider_forward.entries();
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.provider_forward.as_mut())
+        {
+            return spool.entries();
         }
         Ok(normalized_sidecar_entries(self.provider_forward.clone()))
     }
 
     fn provider_inverted_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
-        if let Some(spools) = self.spools.as_mut() {
-            return spools.provider_inverted.entries();
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.provider_inverted.as_mut())
+        {
+            return spool.entries();
         }
         Ok(normalized_sidecar_entries(self.provider_inverted.clone()))
     }
 
     fn provider_npi_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
-        if let Some(spools) = self.spools.as_mut() {
-            return spools.provider_npi.entries();
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.provider_npi.as_mut())
+        {
+            return spool.entries();
         }
         Ok(normalized_sidecar_entries(self.provider_npi.clone()))
     }
 
     fn price_forward_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
-        if let Some(spools) = self.spools.as_mut() {
-            return spools.price_forward.entries();
+        if let Some(spool) = self
+            .spools
+            .as_mut()
+            .and_then(|spools| spools.price_forward.as_mut())
+        {
+            return spool.entries();
         }
         Ok(normalized_sidecar_entries(self.price_forward.clone()))
     }
@@ -1784,11 +1826,14 @@ impl ManifestSidecarCollector {
             return Ok(None);
         };
         let spool = match sidecar_name {
-            "provider_forward" => &mut spools.provider_forward,
-            "provider_inverted" => &mut spools.provider_inverted,
-            "provider_npi" => &mut spools.provider_npi,
-            "price_forward" => &mut spools.price_forward,
+            "provider_forward" => spools.provider_forward.as_mut(),
+            "provider_inverted" => spools.provider_inverted.as_mut(),
+            "provider_npi" => spools.provider_npi.as_mut(),
+            "price_forward" => spools.price_forward.as_mut(),
             _ => return Ok(None),
+        };
+        let Some(spool) = spool else {
+            return Ok(None);
         };
         let metrics = if dense_members {
             spool.write_dense_sidecar(path)?
@@ -5457,9 +5502,9 @@ fn scan_compact_byte_top_level_parallel(
     );
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
-        Some(Arc::new(
-            Mutex::new(ManifestSidecarCollector::for_import()?),
-        ))
+        Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
+            &copy_paths,
+        )?)))
     } else {
         None
     };
@@ -6031,9 +6076,9 @@ fn scan_compact_struson_parallel(
     let bounded_queue_size = queue_size.max(worker_count).max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
-        Some(Arc::new(
-            Mutex::new(ManifestSidecarCollector::for_import()?),
-        ))
+        Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
+            &copy_paths,
+        )?)))
     } else {
         None
     };
@@ -6579,7 +6624,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&copy_paths, compact_copy_rotate_bytes)?;
     let mut manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
-        Some(ManifestSidecarCollector::for_import()?)
+        Some(ManifestSidecarCollector::for_import(&copy_paths)?)
     } else {
         None
     };
@@ -9957,7 +10002,7 @@ mod tests {
     fn manifest_sidecar_collector_can_spill_members_before_sidecar_write() {
         let provider_set_id = GlobalId128([5; GLOBAL_ID_BYTES]);
         let mut collector = ManifestSidecarCollector {
-            spools: Some(ManifestSidecarSpools::new().unwrap()),
+            spools: Some(ManifestSidecarSpools::all().unwrap()),
             ..ManifestSidecarCollector::default()
         };
 
@@ -9977,6 +10022,21 @@ mod tests {
         assert!(inverted
             .iter()
             .all(|entry| entry.members == vec![provider_set_id]));
+    }
+
+    #[test]
+    fn manifest_sidecar_spools_only_open_configured_artifacts() {
+        let paths = CopyPathConfig {
+            manifest_provider_forward_sidecar: Some("provider-forward.ptg2sc".to_string()),
+            ..CopyPathConfig::default()
+        };
+
+        let spools = ManifestSidecarSpools::for_paths(&paths).unwrap();
+
+        assert!(spools.provider_forward.is_some());
+        assert!(spools.provider_inverted.is_none());
+        assert!(spools.provider_npi.is_none());
+        assert!(spools.price_forward.is_none());
     }
 
     #[test]
