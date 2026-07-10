@@ -79,14 +79,14 @@ def make_request(results, args=None):
     )
 
 
-SMILE_ALLOWED_TABLE_NAMES = (
-    "mrf.ptg_allowed_item_smile_import",
-    "mrf.ptg_allowed_payment_smile_import",
-    "mrf.ptg_allowed_provider_payment_smile_import",
+FIXTURE_ALLOWED_TABLE_NAMES = (
+    "mrf.ptg_allowed_item_fixture_import",
+    "mrf.ptg_allowed_payment_fixture_import",
+    "mrf.ptg_allowed_provider_payment_fixture_import",
 )
-SMILE_ALLOWED_ROW_BY_FIELD = {
+FIXTURE_ALLOWED_ROW_BY_FIELD = {
     "npi": 1427166008,
-    "plan_id": "911643507",
+    "plan_id": "TESTPLAN001",
     "billing_code_type": "CPT",
     "billing_code": "99214",
     "allowed_amount": 133.0,
@@ -94,9 +94,9 @@ SMILE_ALLOWED_ROW_BY_FIELD = {
     "tin_type": "ein",
     "tin_value": "123456789",
 }
-SMILE_IMPORT_ROW_BY_FIELD = {
-    "source_file_import_id": "smile_import",
-    "source_key": "ptg_smile",
+FIXTURE_IMPORT_ROW_BY_FIELD = {
+    "source_file_import_id": "fixture_import",
+    "source_key": "ptg_fixture",
     "snapshot_id": "ptg2:202607:smile",
     "metrics": {"plan_count": 1},
 }
@@ -176,7 +176,7 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
             FakeResult(rows=[types.SimpleNamespace(npi=1000000000), types.SimpleNamespace(npi=1234567890)]),
             FakeResult(scalar=2),
         ],
-        args={"plan_id": "465722012", "market_type": "group", "count": "true", "limit": "100"},
+        args={"plan_id": "TESTPLAN001", "market_type": "group", "count": "true", "limit": "100"},
     )
 
     response = await group_plan_providers(request)
@@ -209,7 +209,7 @@ async def test_group_plan_providers_pages_v2_npi_scope(monkeypatch):
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
-        args={"plan_id": "465722012", "market_type": "group", "limit": "10"},
+        args={"plan_id": "TESTPLAN001", "market_type": "group", "limit": "10"},
     )
 
     response = await group_plan_providers(request)
@@ -242,7 +242,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
         args={
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "specialty": "Family Medicine",
             "limit": "10",
@@ -287,7 +287,7 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1003000530)])],
         args={
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "classification": "Internal Medicine",
             "limit": "10",
@@ -346,7 +346,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
             ),
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "city": "Chicago",
             "state": "IL",
@@ -424,7 +424,7 @@ async def test_group_plan_providers_widens_zip_filter_to_radius_by_default(monke
             FakeResult(rows=[]),
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "zip5": "60601",
             "enrich": "0",
@@ -463,7 +463,7 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
             FakeResult(rows=[]),
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "specialty": "orthopedic surgeon",
             "zip5": "60601",
@@ -507,7 +507,7 @@ async def test_group_plan_providers_unions_all_published_network_snapshots(monke
     request = make_request(
         [FakeResult(rows=[types.SimpleNamespace(npi=1073913877)])],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "enrich": "0",
             "limit": "10",
@@ -555,7 +555,7 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
             FakeResult(rows=[]),
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "zip5": "60601",
             "enrich": "0",
@@ -634,7 +634,7 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
             ),
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "classification": "Family Medicine",
             "city": "Chicago",
@@ -2208,7 +2208,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     request = make_request(
         [FakeResult(scalar=1)],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "source_key": "example_dental",
             "code": "70551",
@@ -2270,7 +2270,7 @@ async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [],
-        args={"plan_id": "010854205", "market_type": "group", "code": "70551"},
+        args={"plan_id": "TESTPLAN001", "market_type": "group", "code": "70551"},
     )
 
     response = await list_providers_by_procedure(request)
@@ -2310,7 +2310,7 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amount_evidence
     request = make_request(
         [],
         args={
-            "plan_id": "911643507",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "99203",
             "zip5": "60601",
@@ -2360,7 +2360,7 @@ async def test_allowed_amount_empty_ptg_fallback(monkeypatch):
     monkeypatch.setattr(pricing_module, "_search_ptg_allowed_amount_evidence", fake_allowed)
     request = make_request(
         [],
-        args={"plan_id": "911643507", "market_type": "group", "code": "99203", "zip5": "60601"},
+        args={"plan_id": "TESTPLAN001", "market_type": "group", "code": "99203", "zip5": "60601"},
     )
 
     response = await list_providers_by_procedure(request)
@@ -2382,18 +2382,18 @@ async def test_allowed_amount_search_checks_tables_and_allows_single_plan_alias(
 
     async def fake_import_rows(_session, _args, *, plan_id):
         assert plan_id == "7862274fdc01bcc0"
-        return [SMILE_IMPORT_ROW_BY_FIELD]
+        return [FIXTURE_IMPORT_ROW_BY_FIELD]
 
     plan_id_filters = []
 
     async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
-        assert table_names == SMILE_ALLOWED_TABLE_NAMES
+        assert table_names == FIXTURE_ALLOWED_TABLE_NAMES
         assert code == "99214"
         assert code_system == "CPT"
         assert npi is None
         assert limit > 0
         plan_id_filters.append(plan_id)
-        return [] if plan_id else [SMILE_ALLOWED_ROW_BY_FIELD]
+        return [] if plan_id else [FIXTURE_ALLOWED_ROW_BY_FIELD]
 
     async def fake_provider_rows(_session, *, npis, **_kwargs):
         assert npis == (1427166008,)
@@ -2415,7 +2415,7 @@ async def test_allowed_amount_search_checks_tables_and_allows_single_plan_alias(
     assert fallback_payload["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
     assert fallback_payload["items"][0]["prices"][0]["allowed_amount"] == 133.0
     assert plan_id_filters == ["7862274fdc01bcc0", ""]
-    assert checked_tables == ["hp_import_control.source_file_import", *SMILE_ALLOWED_TABLE_NAMES]
+    assert checked_tables == ["hp_import_control.source_file_import", *FIXTURE_ALLOWED_TABLE_NAMES]
 
 
 @pytest.mark.asyncio
@@ -2441,7 +2441,7 @@ async def test_allowed_amount_import_rows_include_file_plan_candidates():
     rows = await pricing_module._allowed_amount_import_rows_for_plan(
         session,
         {"market_type": "group"},
-        plan_id="911643507",
+        plan_id="TESTPLAN001",
     )
 
     assert [row["source_file_import_id"] for row in rows] == ["candidate_import"]
@@ -2454,8 +2454,8 @@ async def test_allowed_amount_rows_cast_optional_npi_bind():
 
     await pricing_module._allowed_amount_rows_from_tables(
         session,
-        table_names=SMILE_ALLOWED_TABLE_NAMES,
-        plan_id="911643507",
+        table_names=FIXTURE_ALLOWED_TABLE_NAMES,
+        plan_id="TESTPLAN001",
         code="99214",
         code_system="CPT",
         npi=None,
@@ -2477,8 +2477,8 @@ async def test_allowed_amount_rows_select_network_columns_when_present():
 
     await pricing_module._allowed_amount_rows_from_tables(
         session,
-        table_names=SMILE_ALLOWED_TABLE_NAMES,
-        plan_id="911643507",
+        table_names=FIXTURE_ALLOWED_TABLE_NAMES,
+        plan_id="TESTPLAN001",
         code="99214",
         code_system="CPT",
         npi=None,
@@ -2497,10 +2497,10 @@ async def test_allowed_amount_search_returns_in_network_allowed_amounts(monkeypa
 
     async def fake_import_rows(_session, _args, *, plan_id):
         assert plan_id == "7862274fdc01bcc0"
-        return [SMILE_IMPORT_ROW_BY_FIELD]
+        return [FIXTURE_IMPORT_ROW_BY_FIELD]
 
     async def fake_allowed_rows(_session, *, table_names, plan_id, code, code_system, npi, limit):
-        assert table_names == SMILE_ALLOWED_TABLE_NAMES
+        assert table_names == FIXTURE_ALLOWED_TABLE_NAMES
         assert plan_id == "7862274fdc01bcc0"
         assert code == "99214"
         assert code_system == "CPT"
@@ -2508,7 +2508,7 @@ async def test_allowed_amount_search_returns_in_network_allowed_amounts(monkeypa
         assert limit > 0
         return [
             {
-                **SMILE_ALLOWED_ROW_BY_FIELD,
+                **FIXTURE_ALLOWED_ROW_BY_FIELD,
                 "network_status": "in_network",
                 "network_semantics": "in_network_historical_allowed_amounts",
             }
@@ -2551,7 +2551,7 @@ async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(m
     request = make_request(
         [],
         args={
-            "plan_id": "911643507",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "99203",
             "include_allowed_amounts": "false",
@@ -2575,7 +2575,7 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
     request = make_request(
         [],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_id_type": "EIN",
             "market_type": "group",
             "code": "99213",
@@ -2612,7 +2612,7 @@ async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_off
     request = make_request(
         [],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "99213",
             "code_system": "CPT",
@@ -2664,7 +2664,7 @@ async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(
             )
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "29888",
             "zip5": "62401",
@@ -2717,7 +2717,7 @@ async def test_list_providers_by_procedure_allows_100_mile_zip_radius_to_ptg2(mo
             )
         ],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "29888",
             "zip5": "62401",
@@ -2743,10 +2743,10 @@ async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_ma
     request = make_request(
         [],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
-            "source_key": "ptg_2627a71e793162ac",
-            "snapshot_id": "ptg2:202606:7ed1678cf1a2",
+            "source_key": "example_source_a",
+            "snapshot_id": "ptg2:202606:fixture_a",
             "code": "29888",
         },
     )
@@ -2771,7 +2771,7 @@ async def test_list_providers_by_procedure_no_ptg_route_reports_reason(monkeypat
     request = make_request(
         [],
         args={
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_id_type": "EIN",
             "market_type": "group",
             "code": "29888",

@@ -2047,12 +2047,12 @@ paths:
                 hospitalBySite:
                   value:
                     candidates:
-                      - npi: 1013995133
-                        organization_name: UMASS MEMORIAL HEALTHALLIANCE CLINTON HOSPITAL INC
+                      - npi: 1234567890
+                        organization_name: Example Hospital
                         entity_type_code: 2
                         entity_kind: organization
-                        address_key: cb329e77-08b7-a9c4-5a2e-34f6ca32b670
-                        address_site_key: 68d0c41a-8871-1b9e-0000-000000000000
+                        address_key: 11111111-1111-1111-1111-111111111111
+                        address_site_key: 22222222-2222-2222-2222-222222222222
                         match_score: 0.94
                         confidence_band: high
                         match_signals:

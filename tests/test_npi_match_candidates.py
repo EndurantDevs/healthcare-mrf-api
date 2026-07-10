@@ -26,11 +26,11 @@ async def test_match_candidate_params_reject_removed_raw_address_locators():
         await npi_module._normalize_match_candidate_params(
             _request(
                 {
-                    "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
-                    "first_line": "326 Nichols Rd",
+                    "address_key": "11111111-1111-1111-1111-111111111111",
+                    "first_line": "100 Example Ave",
                     "line1_norm": "326nicholsrd",
-                    "zip_code": "01420",
-                    "zip5": "01420",
+                    "zip_code": "00000",
+                    "zip5": "00000",
                 }
             )
         )
@@ -82,12 +82,12 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
     )
     request = types.SimpleNamespace(
         args={
-            "address_site_key": "C4147429-6998-8EB4-D3F8-C89EA64AF4CA",
-            "address_key": "CB329E77-08B7-A9C4-5A2E-34F6CA32B670",
-            "lat": "42.59734038",
-            "long": "-71.80791638",
+            "address_site_key": "22222222-2222-2222-2222-222222222222",
+            "address_key": "11111111-1111-1111-1111-111111111111",
+            "lat": "40.0",
+            "long": "-75.0",
             "radius_miles": "0.5",
-            "phone": "(978) 343-5270",
+            "phone": "(555) 010-0000",
             "entity_kind": "organization",
             "entity_type_code": "2",
             "taxonomy_scope": "261Q*, 282N00000X",
@@ -104,12 +104,12 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
 
     params = await npi_module._normalize_match_candidate_params(request)
 
-    assert params["address_site_key"] == "c4147429-6998-8eb4-d3f8-c89ea64af4ca"
-    assert params["address_key"] == "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"
-    assert params["lat"] == 42.59734038
-    assert params["long"] == -71.80791638
+    assert params["address_site_key"] == "22222222-2222-2222-2222-222222222222"
+    assert params["address_key"] == "11111111-1111-1111-1111-111111111111"
+    assert params["lat"] == 40.0
+    assert params["long"] == -75.0
     assert params["radius_miles"] == 0.5
-    assert params["phone_digits"] == "9783435270"
+    assert params["phone_digits"] == "5550100000"
     assert params["entity_type_code"] == 2
     assert params["entity_kind"] == "organization"
     assert params["taxonomy_exact"] == ("282N00000X",)
@@ -125,7 +125,7 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
 @pytest.mark.asyncio
 async def test_match_candidate_params_geo_defaults_radius():
     params = await npi_module._normalize_match_candidate_params(
-        _request({"lat": "42.59734038", "long": "-71.80791638"})
+        _request({"lat": "40.0", "long": "-75.0"})
     )
 
     assert params["radius_miles"] == 1.0
@@ -134,14 +134,14 @@ async def test_match_candidate_params_geo_defaults_radius():
 @pytest.mark.asyncio
 async def test_match_candidate_params_reject_lat_without_long():
     with pytest.raises(sanic.exceptions.InvalidUsage):
-        await npi_module._normalize_match_candidate_params(_request({"lat": "42.59734038"}))
+        await npi_module._normalize_match_candidate_params(_request({"lat": "40.0"}))
 
 
 @pytest.mark.asyncio
 async def test_match_candidate_params_reject_limit_above_maximum():
     with pytest.raises(sanic.exceptions.InvalidUsage):
         await npi_module._normalize_match_candidate_params(
-            _request({"phone": "9783435270", "limit": "51"})
+            _request({"phone": "5550100000", "limit": "51"})
         )
 
 
@@ -154,7 +154,7 @@ def test_taxonomy_scope_tokens_accept_exact_and_prefix():
 
 def test_match_candidate_query_uses_site_key_and_taxonomy_filter():
     params = {
-        "address_site_key": "c4147429-6998-8eb4-d3f8-c89ea64af4ca",
+        "address_site_key": "22222222-2222-2222-2222-222222222222",
         "address_key": None,
         "lat": None,
         "long": None,
@@ -214,8 +214,8 @@ def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator(
     params = {
         "address_site_key": None,
         "address_key": None,
-        "lat": 35.1295378,
-        "long": -89.86039355,
+        "lat": 40.0,
+        "long": -75.0,
         "radius_miles": 0.5,
         "phone_digits": None,
         "entity_type_code": None,
@@ -237,12 +237,12 @@ def test_match_candidate_query_uses_indexable_geo_bbox_when_geo_is_only_locator(
 
 def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
     params = {
-        "address_site_key": "c4147429-6998-8eb4-d3f8-c89ea64af4ca",
-        "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
-        "lat": 35.1295378,
-        "long": -89.86039355,
+        "address_site_key": "22222222-2222-2222-2222-222222222222",
+        "address_key": "11111111-1111-1111-1111-111111111111",
+        "lat": 40.0,
+        "long": -75.0,
         "radius_miles": 0.5,
-        "phone_digits": "9012261309",
+        "phone_digits": "5550100000",
         "entity_type_code": None,
         "taxonomy_exact": (),
         "taxonomy_prefixes": (),
@@ -264,20 +264,20 @@ def test_match_candidate_query_keeps_geo_as_scoring_signal_with_exact_locator():
 
 def test_match_candidate_output_scores_and_hides_internal_fields():
     row = {
-        "npi": 1013995133,
+        "npi": 1234567890,
         "entity_type_code": 2,
-        "provider_organization_name": "UMASS MEMORIAL HEALTHALLIANCE CLINTON HOSPITAL INC",
-        "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
-        "address_site_key": "68d0c41a-8871-1b9e-0000-000000000000",
+        "provider_organization_name": "Example Hospital",
+        "address_key": "11111111-1111-1111-1111-111111111111",
+        "address_site_key": "22222222-2222-2222-2222-222222222222",
         "premise_key": "must-not-leak",
         "address_site_key_matched": True,
         "address_key_matched": False,
         "phone_matched": True,
         "geo_distance_miles": 0.14,
         "address_type": "practice",
-        "first_line": "326 Nichols Rd",
-        "postal_code": "01420",
-        "phone_number": "9783435270",
+        "first_line": "100 Example Ave",
+        "postal_code": "00000",
+        "phone_number": "5550100000",
         "address_sources": ["nppes", "provider_directory_fhir"],
         "source_count": 1,
         "taxonomy_list": [
@@ -307,8 +307,8 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
 
     candidate = npi_module._match_candidate_output(row, params, enrichment)
 
-    assert candidate["npi"] == 1013995133
-    assert candidate["address_site_key"] == "68d0c41a-8871-1b9e-0000-000000000000"
+    assert candidate["npi"] == 1234567890
+    assert candidate["address_site_key"] == "22222222-2222-2222-2222-222222222222"
     assert "premise_key" not in json.dumps(candidate)
     assert candidate["entity_kind"] == "organization"
     assert candidate["match_score"] >= 0.9
@@ -391,14 +391,14 @@ def test_match_candidate_sort_key_orders_ties():
 @pytest.mark.asyncio
 async def test_match_candidates_route_shapes_payload(monkeypatch):
     async def fake_rows(params, *, session=None):
-        assert params["address_key"] == "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"
+        assert params["address_key"] == "11111111-1111-1111-1111-111111111111"
         return [
             {
-                "npi": 1013995133,
+                "npi": 1234567890,
                 "entity_type_code": 2,
                 "provider_organization_name": "Hospital",
-                "address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670",
-                "address_site_key": "68d0c41a-8871-1b9e-0000-000000000000",
+                "address_key": "11111111-1111-1111-1111-111111111111",
+                "address_site_key": "22222222-2222-2222-2222-222222222222",
                 "address_site_key_matched": False,
                 "address_key_matched": True,
                 "phone_matched": False,
@@ -410,19 +410,19 @@ async def test_match_candidates_route_shapes_payload(monkeypatch):
         ]
 
     async def fake_enrichment(npis, *, include_chain=False, session=None):
-        return {1013995133: {"has_any_enrollment": True, "has_ffs_enrollment": True}}
+        return {1234567890: {"has_any_enrollment": True, "has_ffs_enrollment": True}}
 
     monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", fake_rows)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_enrichment)
 
     response = await npi_module.match_candidates(
-        _request({"address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670", "limit": "5"})
+        _request({"address_key": "11111111-1111-1111-1111-111111111111", "limit": "5"})
     )
     payload = json.loads(response.body)
 
     assert payload["total"] == 1
-    assert payload["candidates"][0]["npi"] == 1013995133
-    assert payload["candidates"][0]["address_key"] == "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"
+    assert payload["candidates"][0]["npi"] == 1234567890
+    assert payload["candidates"][0]["address_key"] == "11111111-1111-1111-1111-111111111111"
     assert payload["meta"]["timeout_ms"] == 8000
 
 
@@ -435,7 +435,7 @@ async def test_match_candidates_route_returns_503_on_timeout(monkeypatch):
 
     with pytest.raises(sanic.exceptions.ServiceUnavailable):
         await npi_module.match_candidates(
-            _request({"address_key": "cb329e77-08b7-a9c4-5a2e-34f6ca32b670"})
+            _request({"address_key": "11111111-1111-1111-1111-111111111111"})
         )
 
 

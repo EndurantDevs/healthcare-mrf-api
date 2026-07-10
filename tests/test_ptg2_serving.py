@@ -95,7 +95,7 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
                         "address_key": "00000000-0000-0000-0000-000000000001",
                         "source_key": "ptg_source",
                         "snapshot_id": "ptg2:202606:snap",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "ptg_plan_id": "ptg-plan",
                         "provider_directory_source_id": "pdfhir_1",
                         "provider_directory_org_name": "Example Payer",
@@ -143,7 +143,7 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
                 },
             }
         ],
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         snapshot_id="ptg2:202606:snap",
         source_key="ptg_source",
     )
@@ -188,7 +188,7 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
                         "address_key": "00000000-0000-0000-0000-000000000001",
                         "source_key": "ptg_source",
                         "snapshot_id": "ptg2:202606:snap",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "ptg_plan_id": "ptg-plan",
                         "provider_directory_source_id": "pdfhir_1",
                         "provider_directory_location_resource_id": "loc-1",
@@ -222,7 +222,7 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
                 },
             }
         ],
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         snapshot_id="ptg2:202606:snap",
         source_key="ptg_source",
     )
@@ -254,7 +254,7 @@ async def test_overlay_provider_directory_without_plan_match_downgrades_network_
                         "address_key": "00000000-0000-0000-0000-000000000001",
                         "source_key": "ptg_source",
                         "snapshot_id": "ptg2:202606:snap",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "ptg_plan_id": "ptg-plan",
                         "provider_directory_source_id": "pdfhir_1",
                         "provider_directory_location_resource_id": "loc-1",
@@ -288,7 +288,7 @@ async def test_overlay_provider_directory_without_plan_match_downgrades_network_
                 },
             }
         ],
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         snapshot_id="ptg2:202606:snap",
         source_key="ptg_source",
     )
@@ -535,7 +535,7 @@ async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set()
     filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
         session,
         {"specialty": "Family Medicine"},
-        [1234567890, 1003179466, 1003141920],
+        [1234567890, 1234567891, 1234567892],
         limit=10,
     )
 
@@ -555,7 +555,7 @@ async def test_manifest_filter_npis_by_inferred_taxonomy_requires_individual_npi
     filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
         session,
         {"code": "29888"},
-        [1234567890, 1003179466, 1003141920],
+        [1234567890, 1234567891, 1234567892],
         limit=10,
     )
 
@@ -918,7 +918,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 2,
@@ -958,7 +958,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
     payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202607:group_fixture",
-        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
         tables,
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
@@ -984,7 +984,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 2,
@@ -1059,7 +1059,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
     payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202607:group_fixture",
-        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
         tables,
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
@@ -1424,7 +1424,7 @@ async def test_manifest_serving_preserves_tin_only_rate_during_provider_expansio
     price_set_id = "00000000000000000000000000000101"
     serving_rate_row_by_field = {
         "serving_content_hash_128": "00000000000000000000000000000201",
-        "plan_id": "465722012",
+        "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
         "reported_code": "99214",
         "procedure_global_id_128": "00000000000000000000000000000301",
@@ -1460,7 +1460,7 @@ async def test_manifest_serving_preserves_tin_only_rate_during_provider_expansio
         session,
         "ptg2:202607:test",
         {
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "code": "99214",
             "code_system": "CPT",
             "include_providers": "true",
@@ -1651,7 +1651,7 @@ async def test_membership_location_query_filters_taxonomy_before_candidate_limit
             "taxonomy_codes": ["207Q00000X"],
             "primary_only": True,
         },
-        candidate_npis=(1234567890, 1003179466),
+        candidate_npis=(1234567890, 1234567891),
         limit=200,
     )
 
@@ -1765,7 +1765,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
     rows = [
         {
             "serving_content_hash_128": f"{idx + 201:032x}",
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "reported_code_system": "CPT",
             "reported_code": "99214",
             "procedure_global_id_128": f"{idx + 301:032x}",
@@ -1830,7 +1830,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
         session,
         "ptg2:202606:test",
         {
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "99214",
                 "code_system": "CPT",
@@ -1863,7 +1863,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
     price_set_id = "00000000000000000000000000000101"
     row = {
         "serving_content_hash_128": "00000000000000000000000000000201",
-        "plan_id": "010854205",
+        "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
         "reported_code": "29888",
         "procedure_global_id_128": "00000000000000000000000000000301",
@@ -1902,7 +1902,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         source_key=None,
     ):
         assert args["zip5"] == "62401"
-        assert plan_id == "010854205"
+        assert plan_id == "TESTPLAN001"
         assert snapshot_id == "ptg2:202606:test"
         assert source_key is None
         seen_candidate_limit["value"] = candidate_limit
@@ -1946,7 +1946,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         session,
         "ptg2:202606:test",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "29888",
             "code_system": "CPT",
@@ -2182,7 +2182,7 @@ def _db_serving_session():
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-db",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "plan_name": "Example Plan",
                         "procedure_code": 123456,
                         "reported_code_system": "CPT",
@@ -2223,7 +2223,7 @@ def _fixture_payload():
     return {
         "version": 1,
         "snapshot_id": "snap-fixture",
-        "plans": {"010854205": {"name": "Example Group"}},
+        "plans": {"TESTPLAN001": {"name": "Example Group"}},
         "procedures": {
             "70551": {
                 "code": "70551",
@@ -2253,7 +2253,7 @@ def _fixture_payload():
             }
         },
         "rates": {
-            "010854205": {
+            "TESTPLAN001": {
                 "70551": [
                     {
                         "provider_ordinal": 1,
@@ -2275,7 +2275,7 @@ def _fixture_payload():
 def test_search_ptg2_index_returns_prices_and_source_trace():
     index = ptg2_serving.PTG2ServingIndex.from_payload(_fixture_payload())
 
-    payload = ptg2_serving.search_ptg2_index(index, plan_id="010854205", code="70551", state="IL")
+    payload = ptg2_serving.search_ptg2_index(index, plan_id="TESTPLAN001", code="70551", state="IL")
 
     assert payload["pagination"]["total"] == 1
     item = payload["items"][0]
@@ -2432,7 +2432,7 @@ async def test_ptg2_serving_table_uses_equivalent_cpt_hcpcs_filter_for_compact_s
     await ptg2_serving.search_ptg2_serving_table(
         session,
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "code_system": "CPT"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT"},
         FakePagination(),
         serving_tables=_compact_tables(),
     )
@@ -2458,7 +2458,7 @@ async def test_ptg2_serving_table_uses_equivalent_cdt_hcpcs_filter_for_compact_s
     await ptg2_serving.search_ptg2_serving_table(
         session,
         "snap-token",
-        {"plan_id": "010854205", "code": "D0120", "code_system": "CDT"},
+        {"plan_id": "TESTPLAN001", "code": "D0120", "code_system": "CDT"},
         FakePagination(),
         serving_tables=_compact_tables(),
     )
@@ -2558,7 +2558,7 @@ async def test_load_current_ptg2_index_reads_snapshot_artifact(tmp_path):
 
     assert index is not None
     assert index.snapshot_id == "snap-fixture"
-    assert "010854205" in index.rates
+    assert "TESTPLAN001" in index.rates
 
 
 @pytest.mark.asyncio
@@ -2567,7 +2567,7 @@ async def test_search_current_ptg2_index_reads_db_serving_table():
 
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "code": "70551"},
         FakePagination(),
     )
 
@@ -2597,7 +2597,7 @@ async def test_search_current_ptg2_index_can_include_sources_without_debug_field
 
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
-        {"plan_id": "010854205", "code": "70551", "include_sources": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "include_sources": "true"},
         FakePagination(),
     )
 
@@ -2626,7 +2626,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
     rate_pack_id = "00000000000000000000000000000201"
     row = {
         "serving_content_hash_128": rate_pack_id,
-        "plan_id": "010854205",
+        "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
         "reported_code": "29888",
         "procedure_global_id_128": "00000000000000000000000000000301",
@@ -2682,7 +2682,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
         session,
         "ptg2:202606:test",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "29888",
             "code_system": "CPT",
@@ -2706,7 +2706,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
     price_set_id = "00000000000000000000000000000101"
     row = {
         "serving_content_hash_128": "00000000000000000000000000000201",
-        "plan_id": "010854205",
+        "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
         "reported_code": "29888",
         "procedure_global_id_128": "00000000000000000000000000000301",
@@ -2749,7 +2749,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
         session,
         "ptg2:202606:test",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "market_type": "group",
             "code": "29888",
             "code_system": "CPT",
@@ -2769,7 +2769,7 @@ async def test_search_current_ptg2_index_can_include_full_details():
 
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
-        {"plan_id": "010854205", "code": "70551", "include_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "include_details": "true"},
         FakePagination(),
     )
 
@@ -2814,7 +2814,7 @@ async def test_search_current_ptg2_index_can_include_code_details():
 
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
-        {"plan_id": "010854205", "code": "70551", "include_code_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "include_code_details": "true"},
         FakePagination(),
     )
 
@@ -2872,13 +2872,13 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
     payload["items"][0]["reported_code"] = "mutated"
     cached_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
 
@@ -2906,7 +2906,7 @@ async def test_search_current_ptg2_index_ignores_non_manifest_serving_storage(mo
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "source_key": "example_network", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
 
@@ -2935,7 +2935,7 @@ async def test_search_current_ptg2_index_caches_missing_payload(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
     monkeypatch.setattr(ptg2_serving, "search_ptg2_serving_table", fake_search)
 
-    search_arg_map = {"plan_id": "010854205", "source_key": "example_network"}
+    search_arg_map = {"plan_id": "TESTPLAN001", "source_key": "example_network"}
     assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), search_arg_map, FakePagination()) is None
     assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), search_arg_map, FakePagination()) is None
     assert calls_by_name == {"snapshot": 1, "search": 1}
@@ -2972,7 +2972,7 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "29888", "order_by": "rate", "order": "asc"},
+        {"plan_id": "TESTPLAN001", "code": "29888", "order_by": "rate", "order": "asc"},
         FakePagination(),
     )
 
@@ -3018,7 +3018,7 @@ async def test_search_current_ptg2_index_combined_pagination_reports_has_more(mo
 
     combined_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "29888", "order_by": "rate", "order": "asc"},
+        {"plan_id": "TESTPLAN001", "code": "29888", "order_by": "rate", "order": "asc"},
         FakePagination(),
     )
 
@@ -3054,16 +3054,16 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
-        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        serving_table="mrf.ptg2_serving_fixture_table_a",
         storage="manifest_snapshot",
         id_storage="uuid",
     )
 
     response = await ptg2_serving._search_ptg2_manifest_route_item_table(
         session,
-        "ptg2:202606:3f23541965bf",
+        "ptg2:202606:fixture_a",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "include_providers": "true",
@@ -3077,7 +3077,7 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
         _Pagination(limit=5, offset=0),
         tables,
         "product_search",
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         requested_system="CPT",
         requested_code="90837",
     )
@@ -3093,7 +3093,7 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
     assert response["pagination"]["has_more"] is True
     route_sql = str(session.calls[-1][0][0])
     assert "FROM location_zip_scope zip_scope" not in route_sql
-    assert "FROM mrf.ptg2_route_item_3f764988bc31fee2_010854205_cpt_90837 r" in route_sql
+    assert "FROM mrf.ptg2_route_item_fixture_table_a_testplan001_cpt_90837 r" in route_sql
     assert "COUNT(*) OVER () AS total_matches" in route_sql
     assert "ORDER BY min_rate ASC NULLS LAST" in route_sql
 
@@ -3129,7 +3129,7 @@ def _build_route_item_taxonomy_fake_session() -> FakeSession:
 
 @pytest.mark.asyncio
 async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_filter():
-    """Route-item fast path handles HealthJoy-style page-two taxonomy searches."""
+    """Route-item fast path handles dense-snapshot page-two taxonomy searches."""
     session = _build_route_item_taxonomy_fake_session()
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_7cabb84262c9",
@@ -3141,7 +3141,7 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
         session,
         "ptg2:202607:7cabb84262c9",
         {
-            "plan_id": "465722012",
+            "plan_id": "TESTPLAN001",
             "code": "99213",
             "code_system": "CPT",
             "include_providers": "true",
@@ -3156,7 +3156,7 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
         _Pagination(limit=50, offset=50),
         tables,
         "product_search",
-        requested_plan="465722012",
+        requested_plan="TESTPLAN001",
         requested_system="CPT",
         requested_code="99213",
     )
@@ -3169,7 +3169,7 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
     assert response["pagination"]["has_more"] is False
     route_sql = str(session.calls[-1][0][0])
     route_params = session.calls[-1][0][1]
-    assert "FROM mrf.ptg2_route_item_7cabb84262c9_465722012_cpt_99213 r" in route_sql
+    assert "FROM mrf.ptg2_route_item_7cabb84262c9_testplan001_cpt_99213 r" in route_sql
     assert "r.npi IN (SELECT route_item_specialty_nt.npi" in route_sql
     assert "route_item_specialty_nt.npi = r.npi" not in route_sql
     assert "UPPER(COALESCE(route_item_specialty_nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'" in route_sql
@@ -3184,16 +3184,16 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
 async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_filter():
     session = FakeSession([])
     tables = ptg2_serving.PTG2ServingTables(
-        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        serving_table="mrf.ptg2_serving_fixture_table_a",
         storage="manifest_snapshot",
         id_storage="uuid",
     )
 
     response = await ptg2_serving._search_ptg2_manifest_route_item_table(
         session,
-        "ptg2:202606:3f23541965bf",
+        "ptg2:202606:fixture_a",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "include_providers": "true",
@@ -3206,7 +3206,7 @@ async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_fi
         _Pagination(limit=5, offset=0),
         tables,
         "product_search",
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         requested_system="CPT",
         requested_code="90837",
     )
@@ -3226,16 +3226,16 @@ async def test_manifest_route_item_table_fast_path_falls_back_when_artifact_quer
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
-        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        serving_table="mrf.ptg2_serving_fixture_table_a",
         storage="manifest_snapshot",
         id_storage="uuid",
     )
 
     response = await ptg2_serving._search_ptg2_manifest_route_item_table(
         session,
-        "ptg2:202606:3f23541965bf",
+        "ptg2:202606:fixture_a",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "include_providers": "true",
@@ -3249,7 +3249,7 @@ async def test_manifest_route_item_table_fast_path_falls_back_when_artifact_quer
         _Pagination(limit=5, offset=0),
         tables,
         "product_search",
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         requested_system="CPT",
         requested_code="90837",
     )
@@ -3290,7 +3290,7 @@ async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monke
     payload = await ptg2_serving._search_multi_ptg2_snapshots(
         RealishFakeSession([]),
         [("empty", "snap-empty"), ("c2", "snap-c2")],
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT"},
         FakePagination(),
     )
 
@@ -3317,7 +3317,7 @@ async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(m
     result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
         session,
         "ptg2:test",
-        {"plan_id": "010854205", "code": "99213", "code_system": "CPT"},
+        {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT"},
         serving_tables=tables,
     )
 
@@ -3327,7 +3327,7 @@ async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(m
     assert "FROM mrf.ptg2_code_count_snap" in sql
     assert "FROM mrf.ptg2_serving_snap" not in sql
     assert params == {
-        "plan_id": "010854205",
+        "plan_id": "TESTPLAN001",
         "reported_code": "99213",
         "reported_code_system": "CPT",
     }
@@ -3353,7 +3353,7 @@ async def test_search_current_ptg2_index_single_network_plan_uses_single_path(mo
 
     payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "29888"},
+        {"plan_id": "TESTPLAN001", "code": "29888"},
         FakePagination(),
     )
 
@@ -3390,7 +3390,7 @@ async def test_search_current_ptg2_index_pinned_snapshot_skips_network_combine(m
 
     response_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
-        {"plan_id": "010854205", "code": "29888", "snapshot_id": "snap-pinned"},
+        {"plan_id": "TESTPLAN001", "code": "29888", "snapshot_id": "snap-pinned"},
         FakePagination(),
     )
 
@@ -3406,7 +3406,7 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
 
     snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group", "source_key": "example_dental"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group", "source_key": "example_dental"},
     )
 
     assert snapshot_id == "snap-source"
@@ -3419,7 +3419,7 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     assert "cps.source_key = :source_key" in sql
     assert "s.status = 'published'" in sql
     assert "serving_index" in sql
-    assert params["plan_ids"] == ["010854205", "01-0854205"]
+    assert params["plan_ids"] == ["TESTPLAN001"]
     assert params["source_key"] == "example_dental"
 
 
@@ -3483,7 +3483,7 @@ async def test_current_ptg2_snapshot_prefers_loaded_serving_table():
     session = FakeSession(["snap-loaded"])
     snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
     assert snapshot_id == "snap-loaded"
     sql = str(session.calls[0][0][0])
@@ -3501,11 +3501,11 @@ async def test_current_plan_source_lookup_is_not_memory_cached():
 
     first_snapshot = await ptg2_snapshot.current_source_snapshot_id_for_plan(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
     second_snapshot = await ptg2_snapshot.current_source_snapshot_id_for_plan(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
 
     assert first_snapshot == "snap-before-publish"
@@ -3527,11 +3527,11 @@ async def test_current_plan_source_network_list_is_not_memory_cached():
 
     first_networks = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
     second_networks = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
 
     assert first_networks == [("ppo", "snap-ppo")]
@@ -3559,7 +3559,7 @@ async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fa
 
     snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group"},
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
     )
 
     assert snapshot_id is None
@@ -3591,7 +3591,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-token",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "plan_name": None,
                         "plan_id_type": None,
                         "plan_market_type": None,
@@ -3619,7 +3619,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
         session,
         1083311500,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "plan_market_type": "group",
             "source_key": "example_dental",
             "code": "99213",
@@ -3640,7 +3640,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
     assert "NULL::varchar AS plan_market_type" in row_sql
     assert "r.provider_set_count" not in row_sql
     assert "NULL::integer AS provider_set_count" in row_sql
-    assert row_call[0][1]["plan_id"] == "010854205"
+    assert row_call[0][1]["plan_id"] == "TESTPLAN001"
 
 
 @pytest.mark.asyncio
@@ -3664,7 +3664,7 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-token",
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "plan_name": None,
                         "plan_id_type": None,
                         "plan_market_type": None,
@@ -3699,7 +3699,7 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
         session,
         1235189762,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "93458",
             "code_system": "CPT",
             "pos": "21",
@@ -3759,7 +3759,7 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
     payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
-        {"plan_id": "010854205", "code": "99213", "code_system": "CPT", "include_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
     )
 
@@ -3787,7 +3787,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 1,
@@ -3838,7 +3838,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
     payload = await ptg2_serving._search_ptg2_manifest_provider_procedures(
         session,
         1234567890,
-        {"plan_id": "010854205", "code": "70551", "code_system": "CPT", "include_details": "true"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
         FakePagination(),
         snapshot_id="ptg2:202607:group_fixture",
         serving_tables=tables,
@@ -3878,14 +3878,14 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 2,
                     },
                     {
                         "code_key": 8,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70552",
                         "rate_count": 1,
@@ -3906,7 +3906,7 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
         session,
         tables,
         provider_set_ids=(provider_set_a, provider_set_b),
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         code_value="",
         code_system=None,
         q_text="",
@@ -3943,8 +3943,8 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
             FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set}]),
             FakeResult(
                 rows=[
-                    {"code_key": 7, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
-                    {"code_key": 8, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
+                    {"code_key": 7, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
+                    {"code_key": 8, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
                 ]
             ),
         ]
@@ -3959,7 +3959,7 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
     procedure_matches = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         session, tables,
         provider_set_ids=(provider_set,),
-        requested_plan="010854205", code_value="", code_system=None, q_text="", code_context=None,
+        requested_plan="TESTPLAN001", code_value="", code_system=None, q_text="", code_context=None,
         source_trace_set_hash="trace-set", network_names=["network"], limit=2, offset=0, apply_window=True,
     )
 
@@ -3995,8 +3995,8 @@ def _postgres_binary_reverse_fixture():
             FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
             FakeResult(
                 rows=[
-                    {"code_key": 7, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
-                    {"code_key": 8, "plan_id": "010854205", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
+                    {"code_key": 7, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
+                    {"code_key": 8, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
                 ]
             ),
         ]
@@ -4067,7 +4067,7 @@ async def test_broad_npi_postgres_binary_reverse_avoids_local_sidecars(monkeypat
         session,
         tables,
         provider_set_ids=(provider_set,),
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         code_value="",
         code_system=None,
         q_text="",
@@ -4187,7 +4187,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
                 rows=[
                     {
                         "code_key": 7,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "rate_count": 1,
@@ -4201,7 +4201,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
                         "code_order": 0,
                         "code_key": 7,
                         "provider_set_key": 3,
-                        "plan_id": "010854205",
+                        "plan_id": "TESTPLAN001",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
                         "provider_set_global_id_128": provider_set_id,
@@ -4224,7 +4224,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
         session,
         tables,
         provider_set_ids=(provider_set_id,),
-        requested_plan="010854205",
+        requested_plan="TESTPLAN001",
         code_value="70551",
         code_system="CPT",
         q_text="",
@@ -4242,7 +4242,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
                 3,
                 price_set_id,
             ),
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "reported_code_system": "CPT",
             "reported_code": "70551",
             "procedure_global_id_128": None,
@@ -4283,7 +4283,7 @@ async def test_ptg2_provider_procedures_requires_normalized_provider_membership(
     payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
-        {"plan_id": "010854205", "code": "99213", "code_system": "CPT"},
+        {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT"},
         FakePagination(),
     )
 
@@ -4300,10 +4300,10 @@ async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
         "mrf.ptg2_serving_rate_compact_token",
         tables,
         "snap-token",
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "code": "70551"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4332,10 +4332,10 @@ async def test_compact_serving_requires_normalized_price_tables():
         "mrf.ptg2_serving_rate_compact_token",
         tables,
         "snap-token",
-        {"plan_id": "010854205", "code": "70551"},
+        {"plan_id": "TESTPLAN001", "code": "70551"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4353,10 +4353,10 @@ async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "99213", "zip5": "60601"},
+        {"plan_id": "TESTPLAN001", "code": "99213", "zip5": "60601"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4383,7 +4383,7 @@ async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(mon
         _compact_tables(),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "zip5": "60601",
             "lat": 41.8820,
@@ -4392,7 +4392,7 @@ async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(mon
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4418,7 +4418,7 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
         _compact_tables(),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "lat": 29.7604,
             "long": -95.3698,
@@ -4426,7 +4426,7 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4456,7 +4456,7 @@ async def test_compact_serving_provider_expansion_fallback_projects_address_dist
         _compact_tables(),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "29888",
             "zip5": "62401",
             "lat": 39.11952,
@@ -4466,7 +4466,7 @@ async def test_compact_serving_provider_expansion_fallback_projects_address_dist
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -4651,9 +4651,9 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     populated_sql = str(session.calls[1][0][0])
@@ -4670,7 +4670,7 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     ):
         assert expected_sql in location_sql
     _expect_member_first_manifest_sql(location_sql)
-    assert location_params["location_plan_id"] == "010854205"
+    assert location_params["location_plan_id"] == "TESTPLAN001"
     assert location_params["location_reported_code"] == "90837"
     assert location_params["location_reported_code_system"] == "CPT"
     component_sql = str(session.calls[-1][0][0])
@@ -4716,9 +4716,9 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = str(session.calls[3][0][0])
@@ -4772,7 +4772,7 @@ async def test_manifest_location_classification_filter_scopes_via_semijoin_and_a
         session,
         tables,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "99204",
             "code_system": "CPT",
             "zip5": "60601",
@@ -4780,7 +4780,7 @@ async def test_manifest_location_classification_filter_scopes_via_semijoin_and_a
             "limit": "20",
         },
         candidate_limit=20,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = str(session.calls[3][0][0])
@@ -4837,16 +4837,16 @@ async def test_manifest_location_uses_provider_group_rate_scope_table_when_decla
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     route_scope_sql = str(session.calls[2][0][0])
     route_scope_params = session.calls[2][0][1]
     assert "SELECT EXISTS" in route_scope_sql
     assert "FROM mrf.ptg2_provider_group_rate_scope_snap" in route_scope_sql
-    assert route_scope_params["plan_id"] == "010854205"
+    assert route_scope_params["plan_id"] == "TESTPLAN001"
     assert route_scope_params["reported_code"] == "90837"
     assert route_scope_params["reported_code_system"] == "CPT"
     location_sql = str(session.calls[4][0][0])
@@ -4895,9 +4895,9 @@ async def test_manifest_location_uses_rate_scope_table_without_provider_group_lo
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = _fake_call_sql(session, "raw_location_npis AS")
@@ -4941,7 +4941,7 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
         session,
         tables,
         serving_table=tables.serving_table,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         reported_code="90837",
         code_system="CPT",
     )
@@ -5015,9 +5015,9 @@ async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatc
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     fallback_call = next(
@@ -5070,7 +5070,7 @@ async def test_manifest_location_zip_radius_uses_literal_taxonomy_lateral_fast_p
         session,
         tables,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "zip5": "60601",
@@ -5080,7 +5080,7 @@ async def test_manifest_location_zip_radius_uses_literal_taxonomy_lateral_fast_p
             "limit": "5",
         },
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = _fake_call_sql(session, "raw_location_rows AS")
@@ -5125,9 +5125,9 @@ async def test_manifest_location_rate_scope_table_falls_back_when_pair_uncovered
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = str(session.calls[4][0][0])
@@ -5163,9 +5163,9 @@ async def test_manifest_location_rate_prefilter_allows_missing_code_system(monke
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = str(session.calls[3][0][0])
@@ -5173,7 +5173,7 @@ async def test_manifest_location_rate_prefilter_allows_missing_code_system(monke
     assert "rate_provider_groups AS MATERIALIZED" in location_sql
     assert "rate_scope.reported_code = :location_reported_code" in location_sql
     assert "rate_scope.reported_code_system = :location_reported_code_system" not in location_sql
-    assert location_params["location_plan_id"] == "010854205"
+    assert location_params["location_plan_id"] == "TESTPLAN001"
     assert location_params["location_reported_code"] == "90837"
     assert "location_reported_code_system" not in location_params
     assert provider_set_ids == {provider_set_id}
@@ -5218,9 +5218,9 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT", "lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     rate_set_sql = str(session.calls[1][0][0])
@@ -5230,7 +5230,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     assert "SELECT provider_set_global_id_128" in rate_set_sql
     assert "GROUP BY provider_set_global_id_128" in rate_set_sql
     assert "FROM mrf.ptg2_serving_manifest_snap" in rate_set_sql
-    assert rate_set_params["plan_id"] == "010854205"
+    assert rate_set_params["plan_id"] == "TESTPLAN001"
     assert rate_set_params["reported_code"] == "90837"
     assert rate_set_params["reported_code_system"] == "CPT"
     assert "rate_provider_groups AS MATERIALIZED" not in location_sql
@@ -5644,7 +5644,7 @@ def test_compact_item_can_suppress_unverified_plan_address_when_requested():
             "network_names": ["C2"],
             "prices": [],
         },
-        {"plan_id": "010854205", "include_unverified_addresses": "false"},
+        {"plan_id": "TESTPLAN001", "include_unverified_addresses": "false"},
     )
 
     assert item["address_verification"]["displayed_address_present"] is False
@@ -6659,14 +6659,14 @@ async def test_manifest_location_provider_matches_small_sidecar_scope_uses_plain
         session,
         tables,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "99203",
             "code_system": "CPT",
             "zip5": "60601",
             "npi": 1234567890,
         },
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     sql = str(session.calls[-1][0][0])
@@ -6713,9 +6713,9 @@ async def test_large_sidecar_filters_generic_rows(monkeypatch):
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
         session,
         tables,
-        {"plan_id": "010854205", "code": "99203", "code_system": "CPT", "zip5": "60601"},
+        {"plan_id": "TESTPLAN001", "code": "99203", "code_system": "CPT", "zip5": "60601"},
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     location_sql = str(session.calls[-1][0][0])
@@ -6744,7 +6744,7 @@ async def test_rate_scope_sidecar_cache(monkeypatch):
         session,
         tables,
         serving_table=tables.serving_table,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         reported_code="99203",
         code_system="CPT",
     )
@@ -6752,7 +6752,7 @@ async def test_rate_scope_sidecar_cache(monkeypatch):
         session,
         tables,
         serving_table=tables.serving_table,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
         reported_code="99203",
         code_system="CPT",
     )
@@ -6868,14 +6868,14 @@ async def _location_first_test_context(monkeypatch):
         session,
         tables,
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "99203",
             "code_system": "CPT",
             "zip5": "60601",
             "specialty": "orthopedic surgery",
         },
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
     return session, provider_set_id, provider_set_ids, providers_by_set
 
@@ -6906,20 +6906,21 @@ async def test_manifest_location_sidecar_scope_uses_location_first_python_inters
 
 
 async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
-    """Run the group-plan 010854205 / CPT 90837 reproducer; return (sql, params).
+    """Run the group-plan TESTPLAN001 / CPT 90837 reproducer; return (sql, params).
 
     Mirrors the plan-scoped provider-pricing expansion that 502'd upstream:
     behavioral taxonomy_codes, primary_only=false, zip5 filter, populated
     component table.
     """
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(ptg2_serving, "_PTG2_TAXONOMY_INT_CODE_CACHE", {})
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
             FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(rows=[{"int_code": 101}, {"int_code": 202}]),
             FakeResult(scalar=True),
-            False,
             FakeResult(rows=[]),
         ]
     )
@@ -6946,7 +6947,7 @@ async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
             "primary_only": "false",
         },
         candidate_limit=5,
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
     return str(session.calls[-1][0][0]), session.calls[-1][0][1]
 
@@ -6985,7 +6986,7 @@ async def test_plan_scoped_taxonomy_location_search_stages_entity_and_address_pr
     sql, params_by_name = await _run_plan_scoped_taxonomy_location_search(monkeypatch)
     assert "rate_provider_groups AS MATERIALIZED" in sql
     assert "rate_scope.plan_id = :location_plan_id" in sql
-    assert params_by_name["location_plan_id"] == "010854205"
+    assert params_by_name["location_plan_id"] == "TESTPLAN001"
     assert params_by_name["location_reported_code"] == "90837"
     assert "scoped_taxonomy_member_npis AS MATERIALIZED" in sql
     assert "FROM scoped_taxonomy_member_npis scope_filter" in sql
@@ -7042,14 +7043,14 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
         _compact_tables(),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "450",
             "include_providers": "true",
             "include_unverified_addresses": "true",
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7084,10 +7085,10 @@ async def test_compact_serving_geo_filter_uses_unified_address_table_when_compat
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "lat": "29.7604", "long": "-95.3698", "radius_miles": "10"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "lat": "29.7604", "long": "-95.3698", "radius_miles": "10"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7122,7 +7123,7 @@ async def test_compact_serving_zip_geo_filter_uses_unified_zip_index_expression(
         _compact_tables(),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "zip5": "60601",
             "lat": "41.8820",
@@ -7131,7 +7132,7 @@ async def test_compact_serving_zip_geo_filter_uses_unified_zip_index_expression(
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7162,10 +7163,10 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        {"plan_id": "TESTPLAN001", "code": "450", "include_providers": "true"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7206,10 +7207,10 @@ async def test_compact_serving_provider_expansion_uses_placeholder_without_npi_t
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        {"plan_id": "TESTPLAN001", "code": "450", "include_providers": "true"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7235,10 +7236,10 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        {"plan_id": "TESTPLAN001", "code": "450", "include_providers": "true"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7259,10 +7260,10 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_direct_comp
         "mrf.ptg2_serving_rate_compact_token",
         tables,
         "snap-token",
-        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        {"plan_id": "TESTPLAN001", "code": "450", "include_providers": "true"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7285,10 +7286,10 @@ async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_with
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "specialty": "Family Medicine"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "specialty": "Family Medicine"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7357,14 +7358,14 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
         _compact_tables(provider_set_component_table=None, provider_group_location_table=None),
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "99214",
             "specialty": "primary care",
             "include_providers": "true",
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7401,10 +7402,10 @@ async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_com
         "mrf.ptg2_serving_rate_compact_token",
         tables,
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "zip5": "60601", "specialty": "dentist"},
+        {"plan_id": "TESTPLAN001", "code": "70551", "zip5": "60601", "specialty": "dentist"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7472,7 +7473,7 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
         tables,
         "snap-token",
             {
-                "plan_id": "010854205",
+                "plan_id": "TESTPLAN001",
                 "code": "99213",
                 "city": "Houston",
                 "state": "TX",
@@ -7482,7 +7483,7 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
             },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7541,7 +7542,7 @@ async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_lega
             id_storage="uuid",
         ),
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "zip5": "60601",
@@ -7549,7 +7550,7 @@ async def test_manifest_location_provider_matches_empty_sidecar_scope_skips_lega
             "long": -87.62194,
             "radius_miles": 75,
         },
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     assert match_result == (set(), {})
@@ -7628,7 +7629,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
             id_storage="uuid",
         ),
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "90837",
             "code_system": "CPT",
             "zip5": "60601",
@@ -7636,7 +7637,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
             "long": -87.62194,
             "radius_miles": 75,
         },
-        plan_id="010854205",
+        plan_id="TESTPLAN001",
     )
 
     assert provider_set_ids == {"provider-set-1"}
@@ -7702,7 +7703,7 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
         tables,
         "snap-token",
         {
-            "plan_id": "010854205",
+            "plan_id": "TESTPLAN001",
             "code": "29888",
             "zip5": "62401",
             "lat": "39.11952",
@@ -7712,7 +7713,7 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
         },
         LimitOnePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 1, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 1, "offset": 0},
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
@@ -7782,7 +7783,7 @@ async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_l
         tables,
         "snap-token",
         {
-            "plan_id": "823166837",
+            "plan_id": "TESTPLAN001",
             "code": "70551",
             "code_system": "CPT",
             "city": "Boston",
@@ -7791,7 +7792,7 @@ async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_l
         },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
-        {"snapshot_id": "snap-token", "plan_id": "823166837", "limit": 25, "offset": 0},
+        {"snapshot_id": "snap-token", "plan_id": "TESTPLAN001", "limit": 25, "offset": 0},
         ptg2_serving.PTG2_MODE_EXACT_SOURCE,
     )
 

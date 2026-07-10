@@ -5595,7 +5595,7 @@ async def group_plan_providers(request):
     # the snapshot's provider membership index holds exactly this plan's
     # in-network provider NPIs. Enumerate them DISTINCT,
     # keyset-paginated by NPI -- an index on npi keeps the cursor scan cheap even
-    # at national-network scale (e.g. HealthJoy/UMR ~2.08M distinct NPIs). The
+    # at national-network scale (the dense reference case has ~2.08M distinct NPIs). The
     # Compact NPI scope tables keep keyset pagination relational while the
     # high-cardinality membership graph remains compressed in PostgreSQL artifacts.
     params = {

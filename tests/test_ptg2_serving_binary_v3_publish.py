@@ -332,8 +332,8 @@ async def test_multi_file_scope_dedupes_before_index(monkeypatch, tmp_path, arch
 
     first_scope = tmp_path / "scope-a.copy"
     second_scope = tmp_path / "scope-b.copy"
-    first_scope.write_text("1164525069\n1000000001\n", encoding="ascii")
-    second_scope.write_text("1164525069\n", encoding="ascii")
+    first_scope.write_text("1234567890\n1234567891\n", encoding="ascii")
+    second_scope.write_text("1234567890\n", encoding="ascii")
 
     async def fake_copy(copy_path, *, target_table, columns):
         copied_paths.append(copy_path)
@@ -464,7 +464,7 @@ async def test_v3_manifest_db_graph_resolves_npi_without_local_files(monkeypatch
     from api import ptg2_serving as api_serving
 
     artifact_manifest = await _published_v3_graph_manifest(monkeypatch, tmp_path)
-    npi = 1164525069
+    npi = 1234567890
     group_id = "11" * 16
     provider_set_id = "22" * 16
     lookup_names = []
