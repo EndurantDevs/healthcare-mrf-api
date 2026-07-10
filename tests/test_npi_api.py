@@ -227,6 +227,7 @@ async def test_provider_directory_sources_collapse_uhc_aliases(
     ] == alias_fixture["source_ids"]
     assert set(endpoint_provenance) == {
         "source",
+        "source_ids",
         "endpoint_id",
         "catalog_aliases_verified",
         "catalog_aliases",

@@ -2474,6 +2474,7 @@ async def test_get_npi_include_sources_enriches_provider_directory_source_summar
     assert address['provider_directory_sources'] == [
         {
             'source': 'provider_directory_fhir',
+            'source_ids': ['pdfhir_cigna'],
             'endpoint_id': 'pd_endpoint_cigna',
             'catalog_aliases_verified': False,
             'catalog_aliases': [

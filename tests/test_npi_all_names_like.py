@@ -837,10 +837,11 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     row = json.loads(resp.body)["rows"][0]
 
     assert row["provider_directory_sources"] == [
-        {
-            "source": "provider_directory_fhir",
-            "endpoint_id": "pd_endpoint_alohr",
-            "catalog_aliases_verified": False,
+            {
+                "source": "provider_directory_fhir",
+                "source_ids": ["pdfhir_alohr"],
+                "endpoint_id": "pd_endpoint_alohr",
+                "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
                     "source_id": "pdfhir_alohr",
@@ -1136,10 +1137,11 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     provider_match = json.loads(response.body)["rows"][0]
 
     assert provider_match["provider_directory_sources"] == [
-        {
-            "source": "provider_directory_fhir",
-            "endpoint_id": "pd_endpoint_alohr",
-            "catalog_aliases_verified": False,
+            {
+                "source": "provider_directory_fhir",
+                "source_ids": ["pdfhir_alohr"],
+                "endpoint_id": "pd_endpoint_alohr",
+                "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
                     "source_id": "pdfhir_alohr",

@@ -607,7 +607,8 @@ def _primary_total_cache_set(value: int) -> int:
 
 
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
-MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 4096
+MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE = 512
+MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 8192
 _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR = "_healthporta_provider_directory_role_jit_disabled"
 
 
@@ -972,10 +973,8 @@ def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -
     return f"{catalog_join} {organization_join}", network_name, provenance
 
 
-def _provider_directory_affiliation_network_ctes_sql(
-    schema: str,
-    has_affiliations: bool,
-) -> str:
+def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliations: bool) -> str:
+    """Build active affiliation networks through indexable raw-reference joins."""
     if not has_affiliations:
         return """
     affiliation_networks AS MATERIALIZED (
@@ -991,10 +990,6 @@ def _provider_directory_affiliation_network_ctes_sql(
         "role.organization_ref",
         "Organization",
     )
-    participating_organization_id = _provider_directory_reference_resource_id_sql(
-        "affiliation.participating_organization_ref",
-        "Organization",
-    )
     affiliation_network_id = _provider_directory_reference_resource_id_sql(
         "affiliation_network_ref.value",
         "Organization",
@@ -1002,22 +997,34 @@ def _provider_directory_affiliation_network_ctes_sql(
     return f"""
     role_organizations AS MATERIALIZED (
         SELECT role.source_id, role.role_id,
+               role.organization_ref,
                role_organization.resource_id AS organization_resource_id
           FROM roles AS role
           JOIN {schema}.provider_directory_organization AS role_organization
             ON role_organization.source_id = role.source_id
            AND role_organization.resource_id = {role_organization_id}
            AND role_organization.active IS DISTINCT FROM false
-    ), affiliation_networks AS MATERIALIZED (
+    ), affiliation_organization_candidates AS MATERIALIZED (
         SELECT DISTINCT role_organization.source_id, role_organization.role_id,
+               organization_candidate.reference
+          FROM role_organizations AS role_organization
+         CROSS JOIN LATERAL (
+               VALUES
+                   (role_organization.organization_ref::varchar),
+                   (role_organization.organization_resource_id::varchar),
+                   (('Organization/' || role_organization.organization_resource_id)::varchar)
+         ) AS organization_candidate(reference)
+         WHERE NULLIF(BTRIM(organization_candidate.reference), '') IS NOT NULL
+    ), affiliation_networks AS MATERIALIZED (
+        SELECT DISTINCT organization_candidate.source_id, organization_candidate.role_id,
                affiliation_network_ref.value::varchar AS reference,
                {affiliation_network_id}::varchar AS resource_id,
                'organization-affiliation-network-derived'::varchar AS plan_provenance,
                'provider_directory_organization_affiliation'::varchar AS evidence_provenance
-          FROM role_organizations AS role_organization
+          FROM affiliation_organization_candidates AS organization_candidate
           JOIN {schema}.provider_directory_organization_affiliation AS affiliation
-            ON affiliation.source_id = role_organization.source_id
-           AND {participating_organization_id} = role_organization.organization_resource_id
+            ON affiliation.source_id = organization_candidate.source_id
+           AND affiliation.participating_organization_ref = organization_candidate.reference
            AND affiliation.active IS DISTINCT FROM false
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
@@ -1026,70 +1033,120 @@ def _provider_directory_affiliation_network_ctes_sql(
     """
 
 
-def _network_plan_refs_ctes_sql(
-    schema: str,
-    plan_network_id: str,
-    insurance_plan_active: str,
-) -> str:
-    return f"""
-    network_plan_refs AS MATERIALIZED (
-        SELECT insurance_plan.source_id,
-               insurance_plan.resource_id AS insurance_plan_resource_id,
-               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
-               {plan_network_id}::varchar AS resource_id
-          FROM (SELECT DISTINCT source_id FROM valid_role_networks) AS requested_source
-          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
-            ON insurance_plan.source_id = requested_source.source_id
-           AND {insurance_plan_active}
-         CROSS JOIN LATERAL jsonb_array_elements_text(
-               COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
-         ) AS plan_network_ref(value)
+def _missing_catalog_plan_ctes_sql() -> str:
+    return """
+    role_catalog_status AS MATERIALIZED (
+        SELECT role.source_id, role.role_id,
+               NOT EXISTS (
+                   SELECT 1 FROM role_networks AS role_network
+                    WHERE role_network.source_id = role.source_id
+                      AND role_network.role_id = role.role_id
+               ) AS catalog_complete
+          FROM roles AS role
     ), network_derived_plans AS MATERIALIZED (
-        SELECT role_network.source_id, role_network.role_id,
-               plan_network.insurance_plan_resource_id AS resource_id,
-               plan_network.identifier,
-               CASE WHEN BOOL_OR(role_network.plan_provenance = 'network-derived')
-                    THEN 'network-derived'::varchar
-                    ELSE 'organization-affiliation-network-derived'::varchar
-                END AS provenance
-          FROM valid_role_networks AS role_network
-          JOIN network_plan_refs AS plan_network
-            ON plan_network.source_id = role_network.source_id
-           AND plan_network.resource_id = role_network.resource_id
-         WHERE plan_network.resource_id IS NOT NULL
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM direct_plans AS direct_plan
-                WHERE direct_plan.source_id = role_network.source_id
-                  AND direct_plan.role_id = role_network.role_id
-                  AND direct_plan.resource_id = plan_network.insurance_plan_resource_id
-           )
-      GROUP BY role_network.source_id, role_network.role_id,
-               plan_network.insurance_plan_resource_id, plan_network.identifier
+        SELECT role.source_id, role.role_id, NULL::varchar AS resource_id,
+               NULL::varchar AS identifier, NULL::varchar AS provenance
+          FROM roles AS role
+         WHERE false
     )
     """
 
 
-def _provider_directory_network_plan_ctes_sql(schema: str, has_affiliations: bool) -> str:
+def _catalog_plan_lookup_ctes_sql(schema: str) -> str:
+    return f"""
+    role_network_catalog AS MATERIALIZED (
+        SELECT role_network.source_id, role_network.role_id,
+               role_network.resource_id, role_network.plan_provenance,
+               network_catalog.refs::jsonb
+          FROM valid_role_networks AS role_network
+          JOIN {schema}.provider_directory_network_catalog AS network_catalog
+            ON network_catalog.source_id = role_network.source_id
+           AND network_catalog.network_resource_id = role_network.resource_id
+    ), role_catalog_status AS MATERIALIZED (
+        SELECT role.source_id, role.role_id,
+               BOOL_AND(
+                   role_network.source_id IS NULL OR network_catalog.source_id IS NOT NULL
+               ) AS catalog_complete
+          FROM roles AS role
+          LEFT JOIN role_networks AS role_network
+            ON role_network.source_id = role.source_id
+           AND role_network.role_id = role.role_id
+          LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog
+            ON network_catalog.source_id = role_network.source_id
+           AND network_catalog.network_resource_id = role_network.resource_id
+      GROUP BY role.source_id, role.role_id
+    ), catalog_plan_candidates AS MATERIALIZED (
+        SELECT DISTINCT role_network.source_id, role_network.role_id,
+               NULLIF(BTRIM(catalog_ref.value->>'resource_id'), '')::varchar AS resource_id,
+               role_network.plan_provenance
+          FROM role_network_catalog AS role_network
+          JOIN role_catalog_status AS catalog_status
+            ON catalog_status.source_id = role_network.source_id
+           AND catalog_status.role_id = role_network.role_id
+           AND catalog_status.catalog_complete
+         CROSS JOIN LATERAL jsonb_array_elements(
+               COALESCE(role_network.refs, '[]'::jsonb)
+         ) AS catalog_ref(value)
+         WHERE catalog_ref.value->>'resource_type' = 'InsurancePlan'
+    )
+    """
+
+
+def _catalog_derived_plan_cte_sql(schema: str) -> str:
+    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    return f"""
+    network_derived_plans AS MATERIALIZED (
+        SELECT plan_candidate.source_id, plan_candidate.role_id,
+               insurance_plan.resource_id,
+               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
+               CASE WHEN BOOL_OR(plan_candidate.plan_provenance = 'network-derived')
+                    THEN 'network-derived'::varchar
+                    ELSE 'organization-affiliation-network-derived'::varchar
+                END AS provenance
+          FROM catalog_plan_candidates AS plan_candidate
+          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+            ON insurance_plan.source_id = plan_candidate.source_id
+           AND insurance_plan.resource_id = plan_candidate.resource_id
+           AND {insurance_plan_active}
+         WHERE plan_candidate.resource_id IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM direct_plans AS direct_plan
+                WHERE direct_plan.source_id = plan_candidate.source_id
+                  AND direct_plan.role_id = plan_candidate.role_id
+                  AND direct_plan.resource_id = plan_candidate.resource_id
+           )
+      GROUP BY plan_candidate.source_id, plan_candidate.role_id,
+               insurance_plan.resource_id, insurance_plan.plan_identifier
+    )
+    """
+
+
+def _provider_directory_catalog_plan_ctes_sql(schema: str, has_catalog: bool) -> str:
+    """Build fail-closed catalog reverse lookup CTEs for network-derived plans."""
+    if not has_catalog:
+        return _missing_catalog_plan_ctes_sql()
+    return f"""
+    {_catalog_plan_lookup_ctes_sql(schema)},
+    {_catalog_derived_plan_cte_sql(schema)}
+    """
+
+
+def _provider_directory_network_plan_ctes_sql(
+    schema: str,
+    has_affiliations: bool,
+    has_catalog: bool,
+) -> str:
     """Build same-source network intersection CTEs for role plan evidence."""
     role_network_id = _provider_directory_reference_resource_id_sql(
         "role_network_ref.value",
         "Organization",
     )
-    plan_network_id = _provider_directory_reference_resource_id_sql(
-        "plan_network_ref.value",
-        "Organization",
-    )
-    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
     affiliation_ctes_sql = _provider_directory_affiliation_network_ctes_sql(
         schema,
         has_affiliations,
     )
-    plan_ctes_sql = _network_plan_refs_ctes_sql(
-        schema,
-        plan_network_id,
-        insurance_plan_active,
-    )
+    plan_ctes_sql = _provider_directory_catalog_plan_ctes_sql(schema, has_catalog)
     return f"""
     direct_role_networks AS MATERIALIZED (
         SELECT DISTINCT role.source_id, role.role_id,
@@ -1123,16 +1180,8 @@ def _provider_directory_network_plan_ctes_sql(schema: str, has_affiliations: boo
     """
 
 
-def _provider_directory_role_ctes_sql(schema: str, has_affiliations: bool) -> str:
+def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
     plan_id = _provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan")
-    evidence_network_id = _provider_directory_reference_resource_id_sql(
-        "network_ref.reference",
-        "Organization",
-    )
-    network_plan_ctes_sql = _provider_directory_network_plan_ctes_sql(
-        schema,
-        has_affiliations,
-    )
     insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
     return f"""
     requested_roles AS (
@@ -1158,7 +1207,85 @@ def _provider_directory_role_ctes_sql(schema: str, has_affiliations: bool) -> st
             ON insurance_plan.source_id = role.source_id
            AND insurance_plan.resource_id = {plan_id}
            AND {insurance_plan_active}
-    ), {network_plan_ctes_sql}, network_references AS (
+    )
+    """
+
+
+def _provider_directory_plan_cap_ctes_sql() -> str:
+    return f"""
+    plan_candidates AS MATERIALIZED (
+        SELECT direct_plan.source_id, direct_plan.role_id, direct_plan.resource_id,
+               direct_plan.identifier,
+               'provider_directory_insurance_plan'::varchar AS provenance
+          FROM direct_plans AS direct_plan
+        UNION ALL
+        SELECT derived_plan.source_id, derived_plan.role_id, derived_plan.resource_id,
+               derived_plan.identifier, derived_plan.provenance
+          FROM network_derived_plans AS derived_plan
+    ), unique_plans AS MATERIALIZED (
+        SELECT DISTINCT ON (source_id, role_id, resource_id)
+               source_id, role_id, resource_id, identifier, provenance
+          FROM plan_candidates
+      ORDER BY source_id, role_id, resource_id,
+               CASE WHEN provenance = 'provider_directory_insurance_plan' THEN 0 ELSE 1 END,
+               identifier, provenance
+    ), ranked_plans AS MATERIALIZED (
+        SELECT unique_plan.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY source_id, role_id
+                   ORDER BY
+                       CASE WHEN provenance = 'provider_directory_insurance_plan' THEN 0 ELSE 1 END,
+                       resource_id, identifier NULLS LAST, provenance
+               ) AS plan_rank
+          FROM unique_plans AS unique_plan
+    ), returned_plans AS MATERIALIZED (
+        SELECT source_id, role_id, resource_id, identifier, provenance
+          FROM ranked_plans
+         WHERE plan_rank <= {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+    ), role_plan_metadata AS MATERIALIZED (
+        SELECT role.source_id, role.role_id,
+               LEAST(COUNT(unique_plan.resource_id), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
+                   AS plan_returned,
+               CASE WHEN catalog_status.catalog_complete
+                    THEN COUNT(unique_plan.resource_id)::bigint END AS plan_total,
+               CASE WHEN catalog_status.catalog_complete
+                    THEN COUNT(unique_plan.resource_id) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+                END AS plan_truncated,
+               catalog_status.catalog_complete
+          FROM roles AS role
+          JOIN role_catalog_status AS catalog_status
+            ON catalog_status.source_id = role.source_id
+           AND catalog_status.role_id = role.role_id
+          LEFT JOIN unique_plans AS unique_plan
+            ON unique_plan.source_id = role.source_id
+           AND unique_plan.role_id = role.role_id
+      GROUP BY role.source_id, role.role_id, catalog_status.catalog_complete
+    )
+    """
+
+
+def _provider_directory_role_ctes_sql(
+    schema: str,
+    has_affiliations: bool,
+    has_catalog: bool,
+) -> str:
+    """Compose keyed role, network, capped-plan, and network-evidence CTEs."""
+    requested_role_ctes_sql = _provider_directory_requested_role_ctes_sql(schema)
+    network_plan_ctes_sql = _provider_directory_network_plan_ctes_sql(
+        schema,
+        has_affiliations,
+        has_catalog,
+    )
+    plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
+    evidence_network_id = _provider_directory_reference_resource_id_sql(
+        "network_ref.reference",
+        "Organization",
+    )
+    return f"""
+    {requested_role_ctes_sql},
+    {network_plan_ctes_sql},
+    {plan_cap_ctes_sql},
+    network_references AS (
         SELECT role_network.source_id, role_network.role_id, role_network.reference,
                role_network.evidence_provenance
           FROM valid_role_networks AS role_network
@@ -1185,26 +1312,27 @@ def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> st
         SELECT role.source_id, role.role_id, 'role'::varchar AS evidence_type,
                role.role_id::varchar AS resource_id, NULL::varchar AS identifier,
                NULL::varchar AS name, NULL::varchar AS reference,
-               'provider_directory_practitioner_role'::varchar AS provenance
+               'provider_directory_practitioner_role'::varchar AS provenance,
+               plan_metadata.plan_returned, plan_metadata.plan_total,
+               plan_metadata.plan_truncated, plan_metadata.catalog_complete
           FROM roles AS role
+          JOIN role_plan_metadata AS plan_metadata
+            ON plan_metadata.source_id = role.source_id
+           AND plan_metadata.role_id = role.role_id
         UNION ALL
-        SELECT direct_plan.source_id, direct_plan.role_id,
+        SELECT returned_plan.source_id, returned_plan.role_id,
                'insurance_plan'::varchar AS evidence_type,
-               direct_plan.resource_id, direct_plan.identifier, NULL::varchar AS name,
-               NULL::varchar AS reference, 'provider_directory_insurance_plan'::varchar AS provenance
-          FROM direct_plans AS direct_plan
-        UNION ALL
-        SELECT derived_plan.source_id, derived_plan.role_id,
-               'insurance_plan'::varchar AS evidence_type,
-               derived_plan.resource_id, derived_plan.identifier, NULL::varchar AS name,
-               NULL::varchar AS reference, derived_plan.provenance
-          FROM network_derived_plans AS derived_plan
+               returned_plan.resource_id, returned_plan.identifier, NULL::varchar AS name,
+               NULL::varchar AS reference, returned_plan.provenance,
+               NULL::bigint, NULL::bigint, NULL::boolean, NULL::boolean
+          FROM returned_plans AS returned_plan
         UNION ALL
         SELECT network.source_id, network.role_id, 'network'::varchar AS evidence_type,
                network.resource_id, NULL::varchar AS identifier,
                NULLIF(BTRIM({network_name}), '')::varchar AS name,
                network.reference,
-               COALESCE(network.evidence_provenance, {network_provenance}) AS provenance
+               COALESCE(network.evidence_provenance, {network_provenance}) AS provenance,
+               NULL::bigint, NULL::bigint, NULL::boolean, NULL::boolean
           FROM networks AS network
           {network_joins}
          WHERE network.resource_id IS NOT NULL AND NULLIF(BTRIM({network_name}), '') IS NOT NULL
@@ -1216,58 +1344,128 @@ def _provider_directory_role_evidence_sql(
     has_catalog: bool,
     has_affiliations: bool = True,
 ) -> str:
-    role_ctes_sql = _provider_directory_role_ctes_sql(schema, has_affiliations)
+    role_ctes_sql = _provider_directory_role_ctes_sql(
+        schema,
+        has_affiliations,
+        has_catalog,
+    )
     evidence_union_sql = _provider_directory_evidence_union_sql(schema, has_catalog)
     return f"""
     WITH {role_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
-    SELECT source_id, role_id, evidence_type, resource_id, identifier, name, reference, provenance
+    SELECT source_id, role_id, evidence_type, resource_id, identifier, name, reference, provenance,
+           plan_returned, plan_total, plan_truncated, catalog_complete,
+           COUNT(*) OVER ()::bigint AS evidence_row_total
       FROM evidence
-  ORDER BY source_id, role_id, evidence_type, resource_id
+  ORDER BY CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END,
+           source_id, role_id, evidence_type, resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
     """
 
 
-def _append_unique_mapping(items: list[dict[str, Any]], value: dict[str, Any]) -> None:
-    marker = json.dumps(value, sort_keys=True, default=str)
-    if any(json.dumps(item, sort_keys=True, default=str) == marker for item in items):
-        return
-    items.append(value)
+def _provider_directory_plan_metadata(mapping: Mapping[str, Any]) -> dict[str, Any] | None:
+    has_plan_metadata = (
+        mapping.get("plan_returned") is not None
+        or mapping.get("catalog_complete") is not None
+    )
+    if not has_plan_metadata:
+        return None
+    return {
+        "returned": int(mapping["plan_returned"] or 0),
+        "total": int(mapping["plan_total"]) if mapping.get("plan_total") is not None else None,
+        "truncated": (
+            bool(mapping["plan_truncated"])
+            if mapping.get("plan_truncated") is not None
+            else None
+        ),
+        "catalog_complete": bool(mapping["catalog_complete"]),
+    }
+
+
+def _append_provider_directory_plan_evidence(
+    mapping: Mapping[str, Any],
+    role_evidence: dict[str, Any],
+    plan_keys: set[tuple[Any, ...]],
+) -> None:
+    plan_detail_map = {
+        "resource_type": "InsurancePlan",
+        "resource_id": mapping["resource_id"],
+        "identifier": mapping["identifier"],
+    }
+    if mapping.get("provenance") in {
+        "network-derived",
+        "organization-affiliation-network-derived",
+    }:
+        plan_detail_map["provenance"] = mapping["provenance"]
+    plan_fields = tuple(
+        plan_detail_map.get(key)
+        for key in ("resource_type", "resource_id", "identifier", "provenance")
+    )
+    if plan_fields not in plan_keys:
+        plan_keys.add(plan_fields)
+        role_evidence["insurance_plans"].append(plan_detail_map)
+
+
+def _append_provider_directory_network_evidence(
+    mapping: Mapping[str, Any],
+    role_evidence: dict[str, Any],
+    network_keys: set[tuple[Any, ...]],
+) -> None:
+    network_detail_map = {
+        "resource_type": "Organization",
+        "resource_id": mapping["resource_id"],
+        "name": mapping["name"],
+        "reference": mapping["reference"],
+        "provenance": mapping["provenance"],
+    }
+    network_fields = tuple(
+        network_detail_map.get(key)
+        for key in ("resource_type", "resource_id", "name", "reference", "provenance")
+    )
+    if network_fields not in network_keys:
+        network_keys.add(network_fields)
+        role_evidence["networks"].append(network_detail_map)
 
 
 def _map_provider_directory_role_evidence(
     evidence_rows: Sequence[Any],
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    """Map bounded SQL evidence with stable set-backed per-role deduplication."""
     role_evidence_map: dict[tuple[str, str], dict[str, Any]] = {}
+    plan_keys_by_role: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    network_keys_by_role: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    evidence_row_total: int | None = None
     for evidence_row in evidence_rows:
         mapping = getattr(evidence_row, "_mapping", evidence_row)
+        if mapping.get("evidence_row_total") is not None:
+            evidence_row_total = int(mapping["evidence_row_total"])
         role_key = (str(mapping["source_id"]), str(mapping["role_id"]))
         role_evidence = role_evidence_map.setdefault(
             role_key,
             {"insurance_plans": [], "networks": []},
         )
-        if mapping["evidence_type"] == "insurance_plan":
-            plan_detail_map = {
-                "resource_type": "InsurancePlan",
-                "resource_id": mapping["resource_id"],
-                "identifier": mapping["identifier"],
+        evidence_type = mapping["evidence_type"]
+        if evidence_type == "role":
+            plan_metadata = _provider_directory_plan_metadata(mapping)
+            if plan_metadata is not None:
+                role_evidence["insurance_plan_metadata"] = plan_metadata
+        elif evidence_type == "insurance_plan":
+            plan_keys = plan_keys_by_role.setdefault(role_key, set())
+            _append_provider_directory_plan_evidence(mapping, role_evidence, plan_keys)
+        elif evidence_type == "network":
+            network_keys = network_keys_by_role.setdefault(role_key, set())
+            _append_provider_directory_network_evidence(mapping, role_evidence, network_keys)
+    for role_evidence in role_evidence_map.values():
+        plan_metadata = role_evidence.get("insurance_plan_metadata")
+        if isinstance(plan_metadata, dict) and evidence_row_total is not None:
+            plan_metadata["returned"] = len(role_evidence["insurance_plans"])
+        if evidence_row_total is not None:
+            role_evidence["evidence_metadata"] = {
+                "returned": len(evidence_rows),
+                "total": evidence_row_total,
+                "truncated": evidence_row_total > len(evidence_rows),
             }
-            if mapping.get("provenance") in {
-                "network-derived",
-                "organization-affiliation-network-derived",
-            }:
-                plan_detail_map["provenance"] = mapping["provenance"]
-            _append_unique_mapping(role_evidence["insurance_plans"], plan_detail_map)
-        elif mapping["evidence_type"] == "network":
-            network_detail_map = {
-                "resource_type": "Organization",
-                "resource_id": mapping["resource_id"],
-                "name": mapping["name"],
-                "reference": mapping["reference"],
-                "provenance": mapping["provenance"],
-            }
-            _append_unique_mapping(role_evidence["networks"], network_detail_map)
     return role_evidence_map
 
 
@@ -1428,23 +1626,73 @@ def _provider_directory_catalog_alias(source_detail: Mapping[str, Any]) -> dict[
     }
 
 
+def _merge_provider_directory_role_evidence(
+    matching_role_evidence_list: Sequence[tuple[tuple[str, str], Mapping[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[Mapping[str, Any]]]:
+    insurance_plan_list: list[dict[str, Any]] = []
+    network_list: list[dict[str, Any]] = []
+    plan_keys: set[tuple[Any, ...]] = set()
+    network_keys: set[tuple[Any, ...]] = set()
+    role_plan_metadata_list: list[dict[str, Any]] = []
+    evidence_metadata_list: list[Mapping[str, Any]] = []
+    for role_key, role_evidence in matching_role_evidence_list:
+        for plan_detail in role_evidence.get("insurance_plans") or []:
+            plan_fields = tuple(plan_detail.get(key) for key in (
+                "resource_type", "resource_id", "identifier", "provenance"
+            ))
+            if plan_fields not in plan_keys:
+                plan_keys.add(plan_fields)
+                insurance_plan_list.append(dict(plan_detail))
+        for network_detail in role_evidence.get("networks") or []:
+            network_fields = tuple(network_detail.get(key) for key in (
+                "resource_type", "resource_id", "name", "reference", "provenance"
+            ))
+            if network_fields not in network_keys:
+                network_keys.add(network_fields)
+                network_list.append(dict(network_detail))
+        plan_metadata = role_evidence.get("insurance_plan_metadata")
+        if isinstance(plan_metadata, Mapping):
+            role_plan_metadata_list.append(
+                {
+                    "source_id": role_key[0],
+                    "practitioner_role_id": role_key[1],
+                    **dict(plan_metadata),
+                }
+            )
+        evidence_metadata = role_evidence.get("evidence_metadata")
+        if isinstance(evidence_metadata, Mapping):
+            evidence_metadata_list.append(evidence_metadata)
+    return (
+        insurance_plan_list,
+        network_list,
+        role_plan_metadata_list,
+        evidence_metadata_list,
+    )
+
+
 def _provider_directory_role_evidence_fields(
     source_ids: Sequence[str],
+    role_keys: Sequence[tuple[str, str]],
     detail_by_id: Mapping[str, Mapping[str, Any]],
     endpoint_key: tuple[str, str],
     role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]],
 ) -> dict[str, Any]:
+    """Return evidence limited to exact role keys for one endpoint group."""
     endpoint_source_ids = {
         source_id
         for source_id in source_ids
         if (source_detail := detail_by_id.get(source_id))
         and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
     }
-    matching_role_evidence_list = [
-        (role_key, role_evidence)
-        for role_key, role_evidence in role_evidence_map.items()
-        if role_key[0] in endpoint_source_ids
-    ]
+    matching_role_evidence_list = []
+    seen_role_keys: set[tuple[str, str]] = set()
+    for role_key in role_keys:
+        if role_key in seen_role_keys or role_key[0] not in endpoint_source_ids:
+            continue
+        seen_role_keys.add(role_key)
+        role_evidence = role_evidence_map.get(role_key)
+        if role_evidence is not None:
+            matching_role_evidence_list.append((role_key, role_evidence))
     if not matching_role_evidence_list:
         return {}
     field_map: dict[str, Any] = {
@@ -1453,17 +1701,22 @@ def _provider_directory_role_evidence_fields(
             {role_key[1] for role_key, _role_evidence in matching_role_evidence_list}
         ),
     }
-    insurance_plan_list: list[dict[str, Any]] = []
-    network_list: list[dict[str, Any]] = []
-    for _role_key, role_evidence in matching_role_evidence_list:
-        for plan_detail in role_evidence.get("insurance_plans") or []:
-            _append_unique_mapping(insurance_plan_list, dict(plan_detail))
-        for network_detail in role_evidence.get("networks") or []:
-            _append_unique_mapping(network_list, dict(network_detail))
-    if insurance_plan_list:
-        field_map["insurance_plans"] = insurance_plan_list
+    plan_list, network_list, role_plan_metadata_list, evidence_metadata_list = (
+        _merge_provider_directory_role_evidence(matching_role_evidence_list)
+    )
+    if plan_list:
+        field_map["insurance_plans"] = plan_list
     if network_list:
         field_map["networks"] = network_list
+    if len(role_plan_metadata_list) == 1:
+        field_map["insurance_plan_metadata"] = {
+            key: role_plan_metadata_list[0][key]
+            for key in ("returned", "total", "truncated", "catalog_complete")
+        }
+    elif role_plan_metadata_list:
+        field_map["insurance_plan_metadata_by_role"] = role_plan_metadata_list
+    if evidence_metadata_list:
+        field_map["evidence_metadata"] = dict(evidence_metadata_list[0])
     return field_map
 
 
@@ -1471,15 +1724,19 @@ def _provider_directory_endpoint_provenance(
     source_ids: Sequence[str],
     detail_by_id: Mapping[str, Mapping[str, Any]],
     role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    role_keys: Sequence[tuple[str, str]] = (),
 ) -> list[dict[str, Any]]:
     selected_endpoint_keys: list[tuple[str, str]] = []
+    seen_endpoint_keys: set[tuple[str, str]] = set()
     for source_id in source_ids:
         source_detail = detail_by_id.get(source_id)
         if not source_detail:
             continue
         endpoint_key = _provider_directory_endpoint_group_key(source_detail)
-        if endpoint_key not in selected_endpoint_keys:
-            selected_endpoint_keys.append(endpoint_key)
+        if endpoint_key in seen_endpoint_keys:
+            continue
+        seen_endpoint_keys.add(endpoint_key)
+        selected_endpoint_keys.append(endpoint_key)
 
     endpoint_provenance_items: list[dict[str, Any]] = []
     for endpoint_key in selected_endpoint_keys:
@@ -1494,6 +1751,12 @@ def _provider_directory_endpoint_provenance(
         # Verified plan/network fields require concrete PractitionerRole references.
         endpoint_provenance_map: dict[str, Any] = {
             "source": "provider_directory_fhir",
+            "source_ids": sorted(
+                source_id
+                for source_id in source_ids
+                if (source_detail := detail_by_id.get(source_id))
+                and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
+            ),
             "catalog_aliases_verified": False,
             "catalog_aliases": [
                 _provider_directory_catalog_alias(source_detail)
@@ -1505,6 +1768,7 @@ def _provider_directory_endpoint_provenance(
         endpoint_provenance_map.update(
             _provider_directory_role_evidence_fields(
                 source_ids,
+                role_keys,
                 detail_by_id,
                 endpoint_key,
                 role_evidence_map or {},
@@ -1517,6 +1781,7 @@ def _provider_directory_endpoint_provenance(
 async def _attach_provider_directory_source_details(
     addresses: Sequence[Any],
     *,
+    include_role_evidence: bool = False,
     session: Any = None,
 ) -> None:
     source_ids = _provider_directory_source_ids_from_addresses(addresses)
@@ -1525,21 +1790,25 @@ async def _attach_provider_directory_source_details(
     detail_by_id = await _fetch_provider_directory_source_detail_map(source_ids, session=session)
     if not detail_by_id:
         return
-    role_key_list = _provider_directory_role_keys_from_addresses(addresses)
-    role_evidence_map = await _fetch_provider_directory_role_evidence_map(
-        role_key_list,
-        session=session,
-    )
+    role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] = {}
+    if include_role_evidence:
+        role_key_list = _provider_directory_role_keys_from_addresses(addresses)
+        role_evidence_map = await _fetch_provider_directory_role_evidence_map(
+            role_key_list,
+            session=session,
+        )
     for address in addresses:
         if not isinstance(address, dict):
             continue
         address_source_ids = _provider_directory_source_ids_from_record_ids(
             address.get("source_record_ids")
         )
+        address_role_keys = _directory_role_keys_from_records(address.get("source_record_ids"))
         endpoint_provenance = _provider_directory_endpoint_provenance(
             address_source_ids,
             detail_by_id,
             role_evidence_map,
+            address_role_keys,
         )
         if endpoint_provenance:
             address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = endpoint_provenance
@@ -4037,7 +4306,7 @@ async def match_candidates(request):
             f"match candidate lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
         ) from exc
     if params.get("include_sources") or params.get("include_evidence"):
-        await _attach_provider_directory_source_details(rows, session=request_session)
+        await _attach_provider_directory_source_details(rows, include_role_evidence=bool(params.get("include_evidence")), session=request_session)
     enrichment_map = await _fetch_provider_enrichment_summary_map(
         [row.get("npi") for row in rows],
         session=request_session,
@@ -5235,7 +5504,11 @@ async def get_all(request):
             if summary:
                 row["provider_enrichment_summary"] = summary
     if include_sources or include_evidence:
-        await _attach_provider_directory_source_details(rows, session=request_session)
+        await _attach_provider_directory_source_details(
+            rows,
+            include_role_evidence=include_evidence,
+            session=request_session,
+        )
     if not include_evidence:
         for row in rows:
             if isinstance(row, dict):
@@ -6522,7 +6795,11 @@ async def get_npi(request, npi):
     addresses = _dedupe_addresses_by_key(addresses)
     if addresses:
         if include_sources or include_evidence:
-            await _attach_provider_directory_source_details(addresses, session=request_session)
+            await _attach_provider_directory_source_details(
+                addresses,
+                include_role_evidence=include_evidence,
+                session=request_session,
+            )
         update_address_tasks = [_update_address(a) for a in addresses if a]
         if update_address_tasks:
             data["address_list"] = list(await asyncio.gather(*update_address_tasks))
