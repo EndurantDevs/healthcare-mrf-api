@@ -29,7 +29,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered
     assert "## Observed Live Verification" in rendered
     assert "scripts/update_provider_directory_verification.py" in rendered
-    assert "| Idaho (`idaho`) | Succeeded | run_" in rendered
+    assert "| Idaho (`idaho`) | Current | Succeeded | run_" in rendered
     assert "## Known Not Importable" in rendered
     assert "Chorus Community Health Plans" in rendered
     assert "First Medical Health Plan, Inc." in rendered
@@ -83,6 +83,16 @@ def test_validate_blocker_registry_rejects_unknown_access_requirement():
 
     with pytest.raises(generator.SupportDocumentationError, match="invalid access requirement"):
         generator.validate_blocker_registry(registry)
+
+
+def test_combined_validation_rejects_blocker_manifest_identity_overlap():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    snapshot = generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    registry["entries"][0]["id"] = "idaho"
+
+    with pytest.raises(generator.SupportDocumentationError, match="overlap runnable"):
+        generator.render_markdown(manifest, registry, snapshot)
 
 
 def test_validate_manifest_rejects_unusable_catalog_confirmation():

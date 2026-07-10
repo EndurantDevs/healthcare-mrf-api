@@ -18,7 +18,7 @@
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Accepts molina.sapphirethreesixtyfive.com cursor continuations."},
       "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "PractitionerRole pages are capped at 25."},
-      "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Sequential REST pagination preserves Plan-Net network extensions; no Bulk."},
+      "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Sequential REST pagination preserves Plan-Net network extensions; no Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns."},
       "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint collection is unavailable."},
       "humana": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Overrides portal or stale paths to the public FHIR base."},
       "iehp": {"support_level": "acquisition-configured", "access_requirement": "none", "method": "rest", "limitation": "Normalizes portal and resource paths to the Provider Directory base."},

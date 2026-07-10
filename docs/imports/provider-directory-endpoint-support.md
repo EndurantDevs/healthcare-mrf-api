@@ -11,7 +11,7 @@ Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_
 | Idaho (`idaho`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api-idmedicaid.safhir.io/v1/api/provider-directory | pdfhir_b6fdc036a4686d0ab69f6f3a | Accepts api-ida-prd.safhir.io cursor continuations with checkpoints. |
 | Molina (`molina`) | Acquisition-configured | None | REST | Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole | https://api.interop.molinahealthcare.com/providerdirectory | pdfhir_0661ff143952c214d680d95d | Accepts molina.sapphirethreesixtyfive.com cursor continuations. |
 | Michigan (`michigan`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api.interopstation.com/mdhhs/fhir | pdfhir_75511676b61b2bddb6f94322 | PractitionerRole pages are capped at 25. |
-| Cigna (`cigna`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fhir.cigna.com/ProviderDirectory/v1 | pdfhir_46bcb068e81b0bc844e327e9 | Sequential REST pagination preserves Plan-Net network extensions; no Bulk. |
+| Cigna (`cigna`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fhir.cigna.com/ProviderDirectory/v1 | pdfhir_46bcb068e81b0bc844e327e9 | Sequential REST pagination preserves Plan-Net network extensions; no Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns. |
 | Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Bulk | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://apif1.aetna.com/fhir/v1/providerdirectorydata | pdfhir_d68a896335981928bdbbb80e | OAuth2 client credentials and Bulk; Endpoint collection is unavailable. |
 | Humana (`humana`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, Practitioner, PractitionerRole | https://fhir.humana.com/api | pdfhir_00a3d35311756763d420b0d6 | Overrides portal or stale paths to the public FHIR base. |
 | IEHP (`iehp`) | Acquisition-configured | None | REST | HealthcareService, InsurancePlan, Location, Organization, Practitioner, PractitionerRole | https://fhir.iehp.org/provider-directory | pdfhir_56521fb2d273045f2c3b73dc | Normalizes portal and resource paths to the Provider Directory base. |
@@ -49,41 +49,41 @@ These sources are intentionally retained as blocked catalog evidence. They are n
 
 ## Observed Live Verification
 
-This tracked snapshot is separate from configured support. It records only terminal, credential-safe fields accepted from an endpoint-acquisition report; active, partial, and absent entries remain `Not recorded`.
+This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.
 
-After a terminal campaign, update this section with `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. CI rejects generated-document drift and reports from a different campaign or manifest.
+After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.
 
 Verification environment: `healthporta-dev`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `2026-07-10T17:19:26Z`.
 
-| Source | Terminal status | Run ID | Access verification | Checked at |
-| --- | --- | --- | --- | --- |
-| Idaho (`idaho`) | Succeeded | run_685b1ff3a18c432e8b2333fe349ce69f | Verified | 2026-07-10T17:19:26Z |
-| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Michigan (`michigan`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Cigna (`cigna`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Humana (`humana`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| IEHP (`iehp`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Arkansas (`arkansas`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| HAP (`hap`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Washington (`washington`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Wyoming (`wyoming`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Health Partners Plans (`health-partners-plans`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas NH (`amerihealth-nh`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas DE (`amerihealth-de`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas Louisiana (`amerihealth-la`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas North Carolina (`amerihealth-nc`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas DC (`amerihealth-dc`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| AmeriHealth Caritas PA (`amerihealth-pa`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Horizon NJ (`horizon-nj`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Texas TMHP (`texas-tmhp`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Nebraska (`nebraska`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| UHC (`uhc`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Missouri (`missouri`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Maine (`maine`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| SCAN (`scan`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Centene (`centene`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| Contra Costa (`contra-costa`) | Not recorded | Not recorded | Not recorded | Not recorded |
-| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded |
+| Source | Proof state | Terminal status | Terminal run ID | Current observation | Access verification | Terminal checked at | Terminal evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Idaho (`idaho`) | Current | Succeeded | run_685b1ff3a18c432e8b2333fe349ce69f | Not recorded | Verified | 2026-07-10T17:19:26Z | Not recorded |
+| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Michigan (`michigan`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Cigna (`cigna`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Humana (`humana`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| IEHP (`iehp`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Arkansas (`arkansas`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| HAP (`hap`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Washington (`washington`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Wyoming (`wyoming`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Health Partners Plans (`health-partners-plans`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas NH (`amerihealth-nh`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas DE (`amerihealth-de`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas Louisiana (`amerihealth-la`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas North Carolina (`amerihealth-nc`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas DC (`amerihealth-dc`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| AmeriHealth Caritas PA (`amerihealth-pa`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Horizon NJ (`horizon-nj`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Texas TMHP (`texas-tmhp`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Nebraska (`nebraska`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| UHC (`uhc`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Missouri (`missouri`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Maine (`maine`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| SCAN (`scan`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Centene (`centene`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Contra Costa (`contra-costa`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.

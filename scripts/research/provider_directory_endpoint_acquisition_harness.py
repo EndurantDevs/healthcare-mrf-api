@@ -29,8 +29,12 @@ RETEST_RESULTS_URL = "https://raw.githubusercontent.com/hltiunn/provider-directo
 AUDITED_PROFILE_SHA256 = "cd616fcd2d0d81350b69d76cae088ffd0f4866a1501aacef1c4eae02114afe5e"
 AUDITED_ENTRIES_SHA256 = "cf8cf2a053e340f7669da108f9f9c4419dd9c56779d10f556aeffd0cf99817b3"
 FINISHED_STATE_STATUSES = {"succeeded", "external_completed"}
+VERIFICATION_TERMINAL_STATUSES = {"bounded", "canceled", "cancelled", "dead_letter", "external_completed", "external_incomplete", "external_validation_failed", "failed", "metric_validation_failed", "resume_required", "succeeded", "unknown_terminal"}
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
+)
 PAGINATION_ERROR = "provider_directory_pagination_resume_required"
 RESOURCE_PROFILES = {
     "R8": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"],
@@ -243,16 +247,33 @@ def _has_bounded_metrics(run_record: dict[str, Any]) -> bool:
     metrics = run_record.get("metrics") if isinstance(run_record.get("metrics"), dict) else {}
     stats = metrics.get("resource_fetch_stats") if isinstance(metrics.get("resource_fetch_stats"), dict) else {}
     return any(isinstance(resource_stats, dict) and resource_stats.get("sources_bounded", 0) for resource_stats in stats.values())
+
+def _terminal_error_summary(error: Any) -> dict[str, str] | None:
+    if not isinstance(error, dict):
+        return None
+    safe_field_names = ("code", "type", "status", "reason", "message")
+    terminal_error_by_field = {name: str(error[name])[:500] for name in safe_field_names if isinstance(error.get(name), (str, int, float, bool)) and "..." not in str(error[name]) and not SENSITIVE_TEXT_PATTERN.search(str(error[name]))}
+    return terminal_error_by_field or None
+
+
 def _run_summary(run_record: dict[str, Any]) -> dict[str, Any]:
     metrics = run_record.get("metrics") if isinstance(run_record.get("metrics"), dict) else {}
     params_by_name = run_record.get("params") if isinstance(run_record.get("params"), dict) else {}
-    return {
+    run_summary_dict = {
         "run_id": run_record.get("run_id"), "status": run_record.get("status"), "created_at": run_record.get("created_at"),
         "finished_at": run_record.get("finished_at"), "retry_of_run_id": params_by_name.get("retry_of_run_id"),
         "source_ids": metrics.get("source_ids"), "sources_probed": metrics.get("sources_probed"),
         "selected_sources": metrics.get("source_import_sources_selected"), "selected_groups": metrics.get("source_import_groups_attempted"),
         "pagination_resume_required": metrics.get("pagination_resume_required"),
+        "resource_outcomes": metrics.get("resource_fetch_stats"),
+        "effective_acquisition": {"sources_probed": metrics.get("sources_probed"), "selected_sources": metrics.get("source_import_sources_selected"), "selected_groups": metrics.get("source_import_groups_attempted"), "completed_source_ids": metrics.get("resource_fetch_completed_source_ids"), "bulk_export": metrics.get("bulk_export_mode")},
     }
+    terminal_error = _terminal_error_summary(run_record.get("error"))
+    if terminal_error:
+        run_summary_dict["terminal_error"] = terminal_error
+    return run_summary_dict
+
+
 class AcquisitionHarness:
     def __init__(self, manifest: dict[str, Any], client: Any, config: HarnessConfig, sleeper: Callable[[float], None] = time.sleep):
         self.manifest = manifest
@@ -451,11 +472,19 @@ class AcquisitionHarness:
         entry_state.update({"current_run_id": run_id, "status": str(run_record.get("status") or "unknown"), "last_run": _run_summary(run_record)})
     def _persist(self) -> None:
         self.state["updated_at"] = _utc_now()
+        configured_ids = set(self.config.selected_entry_ids) | set(self.config.restart_entry_ids) | {entry_id for entry_id, _run_id in self.config.adopt_run_ids}
+        selected_ids = sorted(configured_ids or {entry["entry_id"] for entry in self.manifest["entries"]})
+        terminal_ids = sorted(entry_id for entry_id in selected_ids if self.state["entries"][entry_id].get("status") in VERIFICATION_TERMINAL_STATUSES)
         report_dict = {
             "schema_version": 1, "generated_at": self.state["updated_at"],
             "mode": "apply" if self.config.apply else "dry-run",
             "campaign_id": self.manifest["campaign_id"], "manifest_sha256": self.state["manifest_sha256"],
             "entries": self.state["entries"],
+            "verification_update": {
+                "eligible": len(terminal_ids) == len(selected_ids), "selected_entry_ids": selected_ids,
+                "terminal_entry_ids": terminal_ids, "nonterminal_entry_ids": sorted(set(selected_ids) - set(terminal_ids)),
+                "argv": ["python", "scripts/update_provider_directory_verification.py", "--report", str(self.config.report_path), "--environment", "<environment>"],
+            },
         }
         _atomic_write_json(self.config.state_path, self.state)
         _atomic_write_json(self.config.report_path, report_dict)

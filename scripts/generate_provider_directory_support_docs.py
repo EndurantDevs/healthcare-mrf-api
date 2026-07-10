@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Generate the maintained Provider Directory endpoint support matrix."""
-
 from __future__ import annotations
-
 import argparse
 import datetime as dt
 import json
+import re
 from pathlib import Path
 from typing import Any
-
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
@@ -76,46 +73,35 @@ VERIFICATION_STATUSES = {
     "unknown_terminal",
 }
 ACCESS_VERIFICATION_VALUES = {"verified", "not_verified", "not_recorded"}
+PROOF_STATES = {"current", "superseded", "not_recorded"}
+ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
+SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
-
-
 class SupportDocumentationError(ValueError):
     """Raised when generated support documentation cannot be trusted."""
-
-
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
     """Load the endpoint manifest as a JSON object."""
     decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{manifest_path} must contain a JSON object")
     return decoded
-
-
 def load_blocker_registry(registry_path: Path) -> dict[str, Any]:
     """Load the maintained non-importable source registry."""
     decoded = json.loads(registry_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{registry_path} must contain a JSON object")
     return decoded
-
-
 def load_verification_snapshot(snapshot_path: Path) -> dict[str, Any]:
     """Load the tracked terminal live-verification snapshot."""
     decoded = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict):
         raise SupportDocumentationError(f"{snapshot_path} must contain a JSON object")
     return decoded
-
-
 def _display(value: str) -> str:
     return DISPLAY_VALUES[value]
-
-
 def _markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "<br>")
-
-
 def _entry_ids(entries: Any) -> list[str]:
     if not isinstance(entries, list) or not entries:
         raise SupportDocumentationError("entries must be a non-empty list")
@@ -123,8 +109,6 @@ def _entry_ids(entries: Any) -> list[str]:
     if len(entry_ids) != len(entries) or not all(entry_ids) or len(set(entry_ids)) != len(entry_ids):
         raise SupportDocumentationError("entries must have unique non-empty entry_id values")
     return entry_ids
-
-
 def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     entry_id = str(entry["entry_id"])
     required_fields = {"support_level", "access_requirement", "method", "limitation"}
@@ -157,8 +141,6 @@ def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
         raise SupportDocumentationError(f"{entry_id}: bulk_acquisition entries require bulk method")
     if classification == "acquisition" and method != "rest":
         raise SupportDocumentationError(f"{entry_id}: acquisition entries require REST method")
-
-
 def _catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, str]:
     confirmation = manifest.get("catalog_confirmation")
     required_fields = {"environment", "checked_at", "relation"}
@@ -174,8 +156,6 @@ def _catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, str]:
     if checked_at.tzinfo is None:
         raise SupportDocumentationError("catalog_confirmation.checked_at must include a timezone")
     return confirmation_by_field
-
-
 def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate blocked sources that cannot be acquisition manifest entries."""
     if registry.get("schema_version") != 1:
@@ -213,8 +193,6 @@ def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
         if not source_url.startswith("https://"):
             raise SupportDocumentationError(f"{entry_id}: source_url must use HTTPS")
     return entries
-
-
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate complete top-level support metadata without altering run entries."""
     entries = manifest.get("entries")
@@ -257,8 +235,6 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     for entry in entries:
         _validate_entry_support(entry, support_by_entry[str(entry["entry_id"])])
     return support_by_entry
-
-
 def validate_verification_snapshot(
     snapshot: dict[str, Any],
     entry_ids: list[str],
@@ -284,8 +260,6 @@ def validate_verification_snapshot(
     for entry_id in entry_ids:
         _validate_verification_record(entry_id, entries[entry_id])
     return entries
-
-
 def _validate_optional_verification_timestamp(value: Any, label: str) -> None:
     if value is None:
         return
@@ -297,16 +271,19 @@ def _validate_optional_verification_timestamp(value: Any, label: str) -> None:
         raise SupportDocumentationError(f"{label} must be ISO-8601 or null") from exc
     if parsed.tzinfo is None:
         raise SupportDocumentationError(f"{label} must include a timezone")
-
-
-def _validate_verification_record(entry_id: str, record: Any) -> None:
+def _validate_verification_record(entry_id: str, verification_record: Any) -> None:
     required_fields = {"terminal_status", "run_id", "access_verification", "checked_at"}
-    if not isinstance(record, dict) or set(record) != required_fields:
+    optional_fields = {"proof_state", "current_observation", "terminal_evidence"}
+    if (
+        not isinstance(verification_record, dict)
+        or not required_fields.issubset(verification_record)
+        or not set(verification_record).issubset(required_fields | optional_fields)
+    ):
         raise SupportDocumentationError(f"{entry_id}: verification record fields are not controlled")
-    terminal_status = record["terminal_status"]
-    run_id = record["run_id"]
-    access_verification = record["access_verification"]
-    checked_at = record["checked_at"]
+    terminal_status = verification_record["terminal_status"]
+    run_id = verification_record["run_id"]
+    access_verification = verification_record["access_verification"]
+    checked_at = verification_record["checked_at"]
     if terminal_status is not None and terminal_status not in VERIFICATION_STATUSES:
         raise SupportDocumentationError(f"{entry_id}: invalid terminal verification status")
     if run_id is not None and (not isinstance(run_id, str) or not run_id.startswith("run_")):
@@ -322,8 +299,28 @@ def _validate_verification_record(entry_id: str, record: Any) -> None:
         run_id is None or checked_at is None or access_verification == "not_recorded"
     ):
         raise SupportDocumentationError(f"{entry_id}: terminal entries need run_id and access verification")
-
-
+    proof_state = verification_record.get(
+        "proof_state", "current" if terminal_status is not None else "not_recorded"
+    )
+    if proof_state not in PROOF_STATES:
+        raise SupportDocumentationError(f"{entry_id}: invalid proof state")
+    if proof_state == "superseded" and terminal_status is None:
+        raise SupportDocumentationError(f"{entry_id}: superseded proof requires terminal evidence")
+    observation = verification_record.get("current_observation")
+    if observation is not None and (not isinstance(observation, dict) or set(observation) - {"run_id", "state_status", "run_status", "observed_at", "evidence"}):
+        raise SupportDocumentationError(f"{entry_id}: current observation fields are not controlled")
+    if isinstance(observation, dict):
+        _validate_optional_verification_timestamp(observation.get("observed_at"), f"{entry_id}: observed_at")
+        if observation.get("evidence") is not None and SENSITIVE_TEXT_PATTERN.search(json.dumps(observation["evidence"], sort_keys=True)):
+            raise SupportDocumentationError(f"{entry_id}: current observation evidence is not credential-safe")
+    if verification_record.get("terminal_evidence") is not None and (not isinstance(verification_record["terminal_evidence"], dict) or SENSITIVE_TEXT_PATTERN.search(json.dumps(verification_record["terminal_evidence"], sort_keys=True))):
+        raise SupportDocumentationError(f"{entry_id}: verification evidence is invalid")
+    if proof_state == "superseded":
+        if not isinstance(observation, dict):
+            raise SupportDocumentationError(f"{entry_id}: superseded proof requires a current observation")
+        observed_status = observation.get("run_status") or observation.get("state_status")
+        if observed_status not in ACTIVE_RUN_STATUSES or observation.get("run_id") == run_id:
+            raise SupportDocumentationError(f"{entry_id}: superseded proof requires a newer active run")
 def _support_document_header(manifest: dict[str, Any]) -> list[str]:
     report_path = manifest["support_documentation"]["runtime_status_report"]
     confirmation_by_field = _catalog_confirmation_fields(manifest)
@@ -339,8 +336,6 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Known blocker or limitation |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-
-
 def _configured_support_rows(
     manifest: dict[str, Any],
     support_by_entry: dict[str, dict[str, Any]],
@@ -364,8 +359,6 @@ def _configured_support_rows(
         ]
         markdown_rows.append("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |")
     return markdown_rows
-
-
 def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
     markdown_lines = [
         "",
@@ -388,8 +381,6 @@ def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
         ]
         markdown_lines.append("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |")
     return markdown_lines
-
-
 def _display_verification(value: str | None) -> str:
     if value is None or value in {"not_recorded", NOT_RECORDED}:
         return NOT_RECORDED_DISPLAY
@@ -398,8 +389,13 @@ def _display_verification(value: str | None) -> str:
     if value == "verified":
         return "Verified"
     return value.replace("_", " ").title()
-
-
+def _observation_display(record: dict[str, Any]) -> str:
+    observation = record.get("current_observation")
+    if not isinstance(observation, dict):
+        return NOT_RECORDED_DISPLAY
+    status = observation.get("run_status") or observation["state_status"]
+    run_id = observation.get("run_id") or NOT_RECORDED_DISPLAY
+    return f"{_display_verification(str(status))} (`{run_id}`) at `{observation['observed_at']}`"
 def _observed_verification_section(
     manifest: dict[str, Any],
     snapshot: dict[str, Any],
@@ -411,50 +407,50 @@ def _observed_verification_section(
         "",
         "## Observed Live Verification",
         "",
-        "This tracked snapshot is separate from configured support. It records only terminal, credential-safe fields accepted from an endpoint-acquisition report; active, partial, and absent entries remain `Not recorded`.",
+        "This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.",
         "",
-        "After a terminal campaign, update this section with `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. CI rejects generated-document drift and reports from a different campaign or manifest.",
+        "After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.",
         "",
         f"Verification environment: `{snapshot['environment']}`. Campaign: `{snapshot['campaign_id']}`. Snapshot checked at `{checked_at}`.",
         "",
-        "| Source | Terminal status | Run ID | Access verification | Checked at |",
-        "| --- | --- | --- | --- | --- |",
+        "| Source | Proof state | Terminal status | Terminal run ID | Current observation | Access verification | Terminal checked at | Terminal evidence |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in manifest["entries"]:
         verification_record = verification_records[entry["entry_id"]]
         cells = [
             f"{entry['display_name']} (`{entry['entry_id']}`)",
+            _display_verification(verification_record.get("proof_state", "current" if verification_record["terminal_status"] else "not_recorded")),
             _display_verification(verification_record["terminal_status"]),
             verification_record["run_id"] or NOT_RECORDED_DISPLAY,
+            _observation_display(verification_record),
             _display_verification(verification_record["access_verification"]),
             verification_record["checked_at"] or NOT_RECORDED_DISPLAY,
+            json.dumps(verification_record["terminal_evidence"], sort_keys=True) if verification_record.get("terminal_evidence") else NOT_RECORDED_DISPLAY,
         ]
         return_lines.append("| " + " | ".join(_markdown_cell(str(cell)) for cell in cells) + " |")
     return return_lines
-
-
 def render_markdown(
     manifest: dict[str, Any],
     blocker_registry: dict[str, Any] | None = None,
     verification_snapshot: dict[str, Any] | None = None,
 ) -> str:
     """Render stable Markdown from manifest entries and support metadata."""
-    support_by_entry = validate_manifest(manifest)
-    blockers = validate_blocker_registry(
-        blocker_registry if blocker_registry is not None else load_blocker_registry(DEFAULT_BLOCKER_REGISTRY)
-    )
     snapshot = verification_snapshot
     if snapshot is None:
         snapshot_path = ROOT / manifest["support_documentation"]["verification_snapshot"]
         snapshot = load_verification_snapshot(snapshot_path)
+    support_by_entry = validate_manifest(manifest)
+    blockers = validate_blocker_registry(blocker_registry if blocker_registry is not None else load_blocker_registry(DEFAULT_BLOCKER_REGISTRY))
+    overlapping_ids = sorted({entry["entry_id"] for entry in manifest["entries"]} & {blocker["id"] for blocker in blockers})
+    if overlapping_ids:
+        raise SupportDocumentationError("blocker registry IDs overlap runnable manifest entries: " + ", ".join(overlapping_ids))
     markdown_lines = _support_document_header(manifest)
     markdown_lines.extend(_configured_support_rows(manifest, support_by_entry))
     markdown_lines.extend(_blocked_support_section(blockers))
     markdown_lines.extend(_observed_verification_section(manifest, snapshot))
     markdown_lines.extend(["", "Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.", ""])
     return "\n".join(markdown_lines)
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse deterministic generation arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -464,8 +460,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true", help="Fail when the generated document is missing or stale.")
     return parser.parse_args(argv)
-
-
 def main(argv: list[str] | None = None) -> int:
     """Write the support matrix or check it for drift."""
     args = parse_args(argv)
@@ -488,7 +482,5 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(rendered, encoding="utf-8")
     print(f"Wrote Provider Directory support documentation: {args.output}")
     return 0
-
-
 if __name__ == "__main__":
     raise SystemExit(main())
