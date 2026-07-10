@@ -497,6 +497,10 @@ SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
     for resource_type in DEFAULT_RESOURCES
 }
 PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
+    **{
+        (SCAN_PROVIDER_DIRECTORY_BASE, resource_type): 100
+        for resource_type in DEFAULT_RESOURCES
+    },
     # This HAPI proxy returns an empty PractitionerRole Bundle for _count >= 50,
     # even though _count=25 returns rows and a next link.
     (INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
@@ -1690,9 +1694,26 @@ def _letter_prefixes(length: int) -> tuple[str, ...]:
 
 def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
     if resource_type == "Practitioner":
-        return tuple(("family", first + second) for first in SCAN_SEARCH_ALPHABET for second in SCAN_SEARCH_ALPHABET)
+        two_letter_prefixes = tuple(
+            ("family", first + second)
+            for first in SCAN_SEARCH_ALPHABET
+            for second in SCAN_SEARCH_ALPHABET
+        )
+        exact_single_letters = tuple(
+            ("family:exact", letter) for letter in SCAN_SEARCH_ALPHABET
+        )
+        apostrophe_prefixes = tuple(
+            ("family", letter + "'") for letter in SCAN_SEARCH_ALPHABET
+        )
+        return two_letter_prefixes + exact_single_letters + apostrophe_prefixes
     if resource_type == "Organization":
-        return tuple(("name", first + second) for first in SCAN_SEARCH_ALPHABET for second in SCAN_SEARCH_ALPHABET)
+        letter_prefixes = tuple(
+            ("name", first + second)
+            for first in SCAN_SEARCH_ALPHABET
+            for second in SCAN_SEARCH_ALPHABET
+        )
+        numeric_prefixes = tuple(("name", digit) for digit in "0123456789")
+        return letter_prefixes + numeric_prefixes
     if resource_type == "Location":
         return tuple(("name", value) for value in SCAN_SEARCH_ALPHABET)
     return ()

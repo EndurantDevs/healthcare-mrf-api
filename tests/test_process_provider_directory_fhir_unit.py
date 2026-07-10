@@ -6017,6 +6017,11 @@ def test_resource_start_urls_partitions_scan_too_costly_resources():
         "Location",
         page_count=25,
     )
+    organization_urls = importer._resource_start_urls(
+        {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
+        "Organization",
+        page_count=25,
+    )
     plan_urls = importer._resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "InsurancePlan",
@@ -6026,16 +6031,32 @@ def test_resource_start_urls_partitions_scan_too_costly_resources():
     assert practitioner_urls[0] == (
         "https://providerdirectory.scanhealthplan.com/Practitioner?_count=25&family=AA"
     )
-    assert practitioner_urls[-1] == (
+    assert practitioner_urls[(26 * 26) - 1] == (
         "https://providerdirectory.scanhealthplan.com/Practitioner?_count=25&family=ZZ"
     )
-    assert len(practitioner_urls) == 26 * 26
+    assert practitioner_urls[26 * 26].endswith("_count=25&family%3Aexact=A")
+    assert practitioner_urls[-1].endswith("_count=25&family=Z%27")
+    assert len(practitioner_urls) == (26 * 26) + 26 + 26
+    assert organization_urls[(26 * 26) - 1].endswith("_count=25&name=ZZ")
+    assert organization_urls[-10].endswith("_count=25&name=0")
+    assert organization_urls[-1].endswith("_count=25&name=9")
+    assert len(organization_urls) == (26 * 26) + 10
     assert location_urls[:2] == [
         "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
         "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
     ]
     assert len(location_urls) == 26
     assert plan_urls == ["https://providerdirectory.scanhealthplan.com/InsurancePlan?_count=25"]
+
+
+def test_resource_start_url_caps_scan_server_page_size():
+    url = importer._resource_start_url(
+        {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
+        "Practitioner",
+        page_count=1000,
+    )
+
+    assert url == f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
 
 
 def test_resource_start_urls_partitions_aetna_providerdirectorydata_state_searches():
