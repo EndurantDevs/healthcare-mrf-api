@@ -2528,3 +2528,39 @@ async def test_get_npi_address_list_clears_empty_entries(monkeypatch):
     response = await npi_module.get_npi(request, '1518379601')
     payload = json.loads(response.body)
     assert payload['address_list'] == []
+
+
+def test_dedupe_addresses_merges_nondiscriminating_site_key_with_fhir_overlay():
+    address_key = "00000000-0000-0000-0000-000000000001"
+    addresses = [
+        {
+            "address_key": address_key,
+            "address_site_key": address_key,
+            "first_line": "1600 11th St",
+            "type": "practice",
+            "phone_number": "9407647000",
+            "lat": 33.90559,
+            "long": -98.47978,
+            "address_sources": ["nppes"],
+            "source_record_ids": ["npi:1588616783"],
+        },
+        {
+            "address_key": address_key,
+            "first_line": "1600 11th St",
+            "type": "practice",
+            "address_sources": ["provider_directory_fhir"],
+            "source_record_ids": [
+                "provider_directory_fhir:practitioner_role:pdfhir_source:role-1:location-1"
+            ],
+        },
+    ]
+
+    deduped = npi_module._dedupe_addresses_by_key(addresses)
+
+    assert len(deduped) == 1
+    merged_address = deduped[0]
+    assert merged_address["address_site_key"] == address_key
+    assert merged_address["phone_number"] == "9407647000"
+    assert (merged_address["lat"], merged_address["long"]) == (33.90559, -98.47978)
+    assert merged_address["address_sources"] == ["nppes", "provider_directory_fhir"]
+    assert len(merged_address["source_record_ids"]) == 2

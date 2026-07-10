@@ -837,7 +837,7 @@ def _address_dedupe_key(address: Mapping[str, Any]) -> str:
         return ""
     raw_site_key = address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key")
     site_key = str(raw_site_key).strip().lower() if raw_site_key not in (None, "") else ""
-    if site_key:
+    if site_key and site_key != address_key:
         return f"{address_key}:{site_key}"
     return address_key
 
