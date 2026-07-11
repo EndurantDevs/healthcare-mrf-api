@@ -36,7 +36,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "AmeriHealth Caritas NH (`amerihealth-nh`) | Probe-only | None | Probe | None configured" in rendered_document
     assert "worker-pod probes return HTTP 200" in rendered_document
     assert "identical 21,809,233-resource totals" in rendered_document
-    assert "one canonical lane proves full-profile parity" in rendered_document
+    assert "canonical transport identity preserves plan-code provenance" in rendered_document
     assert "## Inventory Summary" in rendered_document
     assert "| Acquisition-configured | 17 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
@@ -339,14 +339,14 @@ def test_freshness_validation_accepts_current_reviews():
         ("hap", "throttles requests to 20 seconds"),
         ("washington", "HealthcareService preflight timed out"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
-        ("amerihealth-nh", "worker-pod probes return HTTP 200"),
+        ("amerihealth-nh", "shared unverified backend"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
         ("uhc", "requires two identical graph snapshots"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "core resource searches return HAPI HTTP 403"),
-        ("missouri", "Location continuation pages changed page size and total semantics"),
-        ("scan", "every shard has a 100-page cap"),
+        ("missouri", "Practitioner response exceeds the 20 MiB cap"),
+        ("scan", "family=MA returns HTTP 413 SearchTooCostly"),
         ("centene", "CloudFront HTTP 403 from dev egress"),
         ("contra-costa", "Seven public collections follow opaque next-link pagination"),
         ("alohr", "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr"),
@@ -384,6 +384,8 @@ def test_amerihealth_plan_code_sources_are_probe_only_and_not_importable():
         assert entry["resources"] == []
         assert support_by_entry[entry_id]["support_level"] == "probe-only"
         assert support_by_entry[entry_id]["method"] == "probe"
+        assert "canonical transport identity" in support_by_entry[entry_id]["limitation"]
+        assert "terminal crawl" in support_by_entry[entry_id]["limitation"]
 
 
 def test_documentation_metadata_does_not_change_entry_execution_fingerprints():

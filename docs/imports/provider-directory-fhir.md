@@ -20,7 +20,13 @@ Keep these authorities separate when reviewing Provider Directory coverage:
   `acquisition-configured` or `externally-supported` means an implementation
   path is maintained; it does not mean that a live endpoint or current dataset
   has been verified. `probe-only` means that no resource acquisition is
-  configured.
+  configured. Cataloged sources marked `shared_backend_unverified`,
+  `provider_directory_coverage_mode=probe_only`, or an explicit empty
+  `provider_directory_fully_enumerable_resources` list are fail-closed before
+  generic resource acquisition, even after a successful capability probe or a
+  caller supplies broad resource names. They remain eligible for cataloging and
+  capability probing. Explicit targeted-query paths retain their own constraints
+  and are not a way to enable a generic crawl.
 - Known non-importable coverage is maintained in the [blocker registry](../../specs/provider_directory_blocker_registry.json).
   Its required access, registration flag, operational state, review date, and
   primary evidence are rendered in the matrix as `Not supported`. The registry
@@ -802,6 +808,12 @@ as a stale generic base replaced by the official plan-specific catalog. The
 audit can therefore count those generic retest failures as recovered without
 guessing which single plan-specific base an ambiguous upstream row should use
 for resource import.
+All six currently cataloged plan-code aliases are treated as aliases of one
+shared unverified backend. They stay probe-only and cannot enter generic
+resource acquisition, including after a successful live probe. Re-enabling
+them requires a canonical transport identity that preserves each plan-code's
+provenance and a terminal crawl of that canonical lane; this importer does not
+implement shared transport identity yet.
 
 Molina seed rows can point at the developer portal
 `https://developer.interop.molinahealthcare.com` or stale retest bases such as
@@ -840,8 +852,10 @@ SCAN Health Plan seed rows can point at the developer portal
 OpenAPI spec advertises `https://providerdirectory.scanhealthplan.com` as the
 FHIR server, and `/metadata` returns an InterSystems FHIR CapabilityStatement.
 The importer maps SCAN portal rows to that FHIR base. Broad unfiltered resource
-searches can return `SearchTooCostly`, so SCAN resource harvesting may require
-source-specific paging/filter tuning even though endpoint discovery is resolved.
+searches can return `SearchTooCostly`; the observed `family=MA` request returns
+HTTP 413 `SearchTooCostly`. The fixed prefix partitions do not adaptively
+subdivide a shard that reaches its limit, so endpoint discovery is resolved but
+full resource harvesting is not yet verified.
 The importer partitions SCAN `Practitioner` and `Organization` searches by
 two-letter name/family prefixes and `Location` searches by one-letter name
 prefixes. `PractitionerRole` is not fetched through the broad paged fallback.

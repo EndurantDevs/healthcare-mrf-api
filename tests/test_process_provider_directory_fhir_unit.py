@@ -476,7 +476,13 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
         include_auth_required=True,
     )
     assert selected_sources == []
-    assert selection_metrics["source_import_skipped_validation_status"] == 1
+    assert selection_metrics["source_import_skipped_blocked_source"] == 1
+    assert (
+        selection_metrics[
+            "source_import_skipped_blocked_source_shared_backend_unverified"
+        ]
+        == 1
+    )
     assert importer._endpoint_dataset_selected_resources(
         [row],
         list(importer.DEFAULT_RESOURCES),
@@ -1905,6 +1911,118 @@ def test_resource_import_source_selection_allows_live_probe_success_over_open_on
     assert metrics["source_import_sources_selected_live_probe_valid"] == 1
     assert metrics["source_import_sources_selected_declared_credentialed"] == 1
     assert metrics["source_import_sources_selected_auth_required_seed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_reason"),
+    [
+        (
+            {
+                "source_id": "shared_backend",
+                "api_base": "https://shared.example/fhir",
+                "last_validated_status": "shared_backend_unverified",
+                "metadata_json": {},
+            },
+            "shared_backend_unverified",
+        ),
+        (
+            {
+                "source_id": "probe_only",
+                "api_base": "https://probe.example/fhir",
+                "last_validated_status": "valid",
+                "metadata_json": {"provider_directory_coverage_mode": "probe_only"},
+            },
+            "coverage_mode_probe_only",
+        ),
+        (
+            {
+                "source_id": "not_enumerable",
+                "api_base": "https://targeted.example/fhir",
+                "last_validated_status": "valid",
+                "metadata_json": {
+                    "provider_directory_coverage_mode": "targeted",
+                    "provider_directory_fully_enumerable_resources": [],
+                },
+            },
+            "fully_enumerable_resources_empty",
+        ),
+    ],
+)
+def test_selection_blocks_non_acquisition_sources_after_live_probe(
+    source,
+    expected_reason,
+):
+    selected, metrics = importer._select_resource_import_sources(
+        [source],
+        valid_source_ids={source["source_id"]},
+        open_only=False,
+        include_auth_required=True,
+        checkpoint_retry_source_ids={source["source_id"]},
+    )
+
+    assert selected == []
+    assert metrics["source_import_skipped_blocked_source"] == 1
+    assert metrics[f"source_import_skipped_blocked_source_{expected_reason}"] == 1
+
+
+@pytest.mark.asyncio
+async def test_process_data_probes_all_amerihealth_aliases_without_resource_acquisition(
+    monkeypatch,
+):
+    amerihealth_plan_codes = ("0900", "7100", "2100", "1200", "5400", "0500")
+    source_ids = [f"amerihealth-{plan_code}" for plan_code in amerihealth_plan_codes]
+
+    def source_row_from_seed(seed_row):
+        plan_code = seed_row["id"].removeprefix("amerihealth-")
+        return {
+            "source_id": seed_row["id"],
+            "org_name": "AmeriHealth Caritas",
+            "api_base": f"https://api-ext.amerihealthcaritas.com/{plan_code}/provider-api",
+            "canonical_api_base": f"https://api-ext.amerihealthcaritas.com/{plan_code}/provider-api",
+            "auth_type": "none",
+            "last_validated_status": "shared_backend_unverified",
+            "metadata_json": {
+                "provider_directory_coverage_mode": "probe_only",
+                "provider_directory_fully_enumerable_resources": [],
+            },
+        }
+
+    probe_sources = AsyncMock(return_value=(6, 6, set(source_ids)))
+    import_resources = AsyncMock(return_value={"Practitioner": 1})
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_resolve_seed_db", lambda *_args, **_kwargs: ("fixture.db", None))
+    monkeypatch.setattr(
+        importer,
+        "_seed_rows_from_sqlite",
+        lambda *_args, **_kwargs: [{"id": source_id} for source_id in source_ids],
+    )
+    monkeypatch.setattr(importer, "_source_row_from_seed", source_row_from_seed)
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=6))
+    monkeypatch.setattr(importer, "_probe_sources", probe_sources)
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "seed_db_path": "fixture.db",
+            "probe": True,
+            "import_resources": True,
+            "resources": ",".join(importer.DEFAULT_RESOURCES),
+            "publish_artifacts": False,
+        },
+    )
+
+    probe_sources.assert_awaited_once()
+    import_resources.assert_not_awaited()
+    assert metrics["sources_probed"] == 6
+    assert metrics["valid_capability_sources"] == 6
+    assert metrics["source_import_sources_selected"] == 0
+    assert metrics["source_import_skipped_blocked_source"] == 6
+    assert metrics[
+        "source_import_skipped_blocked_source_shared_backend_unverified"
+    ] == 6
 
 
 def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):

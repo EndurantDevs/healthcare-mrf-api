@@ -2137,6 +2137,21 @@ def _source_coverage_mode(source: dict[str, Any]) -> str | None:
     )
 
 
+def _resource_acquisition_blocked_reason(source: dict[str, Any]) -> str | None:
+    """Return the catalog safety reason that forbids generic resource import."""
+    validation_status = (_clean_text(source.get("last_validated_status")) or "").lower()
+    if validation_status == "shared_backend_unverified":
+        return "shared_backend_unverified"
+    if _source_coverage_mode(source) == "probe_only":
+        return "coverage_mode_probe_only"
+    fully_enumerable_resources = _source_metadata(source).get(
+        "provider_directory_fully_enumerable_resources"
+    )
+    if isinstance(fully_enumerable_resources, list) and not fully_enumerable_resources:
+        return "fully_enumerable_resources_empty"
+    return None
+
+
 def _is_aetna_medicaid_targeted_source(source: dict[str, Any]) -> bool:
     api_base = _canonical_base(
         source.get("canonical_api_base") or source.get("api_base")
@@ -3424,6 +3439,10 @@ def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
     return {
         "source_import_sources_considered": source_count,
         "source_import_sources_selected": 0,
+        "source_import_skipped_blocked_source": 0,
+        "source_import_skipped_blocked_source_shared_backend_unverified": 0,
+        "source_import_skipped_blocked_source_coverage_mode_probe_only": 0,
+        "source_import_skipped_blocked_source_fully_enumerable_resources_empty": 0,
         "source_import_skipped_missing_api_base": 0,
         "source_import_skipped_probe_not_valid": 0,
         "source_import_skipped_open_only": 0,
@@ -3450,6 +3469,11 @@ def _select_resource_import_sources(
     for source in source_rows:
         if not _canonical_base(source.get("api_base")):
             metrics["source_import_skipped_missing_api_base"] += 1
+            continue
+        blocked_reason = _resource_acquisition_blocked_reason(source)
+        if blocked_reason:
+            metrics["source_import_skipped_blocked_source"] += 1
+            metrics[f"source_import_skipped_blocked_source_{blocked_reason}"] += 1
             continue
         auth_type = (_clean_text(source.get("auth_type")) or "").lower()
         validation = (_clean_text(source.get("last_validated_status")) or "").lower()
@@ -22837,42 +22861,44 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             completed_source_ids_by_resource: dict[str, set[str]] = {}
             retry_not_before_by_resource: dict[str, str] = {}
             pagination_resume_required_entries: set[str] = set()
-            metrics["resource_rows"] = await _import_resources(
-                importable,
-                resources=resources,
-                per_resource_limit=resource_limit,
-                page_limit=page_limit,
-                page_count=page_count,
-                timeout=timeout,
-                run_id=run_id,
-                linked_resource_limit=linked_resource_limit,
-                linked_resource_concurrency=concurrency,
-                linked_resource_deadline_seconds=linked_resource_deadline_seconds,
-                resource_deadline_seconds=resource_deadline_seconds,
-                linked_counts=metrics.setdefault("linked_resource_rows", {}),
-                resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
-                resource_completion=completed_source_ids_by_resource,
-                resource_retry_not_before=retry_not_before_by_resource,
-                stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
-                stale_cleanup=stale_cleanup,
-                stream_batch_size=stream_batch_size,
-                source_concurrency=source_concurrency,
-                bulk_export=bulk_export,
-                cancel_ctx=ctx,
-                cancel_task={**task, "run_id": run_id},
-                progress_callback=resource_progress,
-                preserve_seen_stage=bool(seen_stage_table_for_publish),
-                is_pagination_checkpointing_enabled=is_pagination_checkpointing_enabled,
-                retry_of_run_id=retry_of_run_id,
-                pagination_root_run_id=pagination_root_run_id,
-                pagination_resume_required=pagination_resume_required_entries,
-                provider_directory_endpoint_scope=provider_directory_endpoint_scope,
-                require_complete_resources=(
-                    full_refresh
-                    and resource_limit <= 0
-                    and page_limit <= 0
-                ),
-            )
+            metrics["resource_rows"] = {}
+            if importable:
+                metrics["resource_rows"] = await _import_resources(
+                    importable,
+                    resources=resources,
+                    per_resource_limit=resource_limit,
+                    page_limit=page_limit,
+                    page_count=page_count,
+                    timeout=timeout,
+                    run_id=run_id,
+                    linked_resource_limit=linked_resource_limit,
+                    linked_resource_concurrency=concurrency,
+                    linked_resource_deadline_seconds=linked_resource_deadline_seconds,
+                    resource_deadline_seconds=resource_deadline_seconds,
+                    linked_counts=metrics.setdefault("linked_resource_rows", {}),
+                    resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
+                    resource_completion=completed_source_ids_by_resource,
+                    resource_retry_not_before=retry_not_before_by_resource,
+                    stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
+                    stale_cleanup=stale_cleanup,
+                    stream_batch_size=stream_batch_size,
+                    source_concurrency=source_concurrency,
+                    bulk_export=bulk_export,
+                    cancel_ctx=ctx,
+                    cancel_task={**task, "run_id": run_id},
+                    progress_callback=resource_progress,
+                    preserve_seen_stage=bool(seen_stage_table_for_publish),
+                    is_pagination_checkpointing_enabled=is_pagination_checkpointing_enabled,
+                    retry_of_run_id=retry_of_run_id,
+                    pagination_root_run_id=pagination_root_run_id,
+                    pagination_resume_required=pagination_resume_required_entries,
+                    provider_directory_endpoint_scope=provider_directory_endpoint_scope,
+                    require_complete_resources=(
+                        full_refresh
+                        and resource_limit <= 0
+                        and page_limit <= 0
+                    ),
+                )
             if retry_not_before_by_resource:
                 metrics["provider_directory_retry_not_before_by_resource"] = dict(
                     sorted(retry_not_before_by_resource.items())
