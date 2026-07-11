@@ -314,6 +314,32 @@ def _observation_display(record: dict[str, Any]) -> str:
     return f"{_display_verification(str(status))} (`{run_id}`) at `{observation['observed_at']}`"
 
 
+def _terminal_resource_rows_display(
+    entry: dict[str, Any],
+    verification_record: dict[str, Any],
+) -> str:
+    terminal_evidence = verification_record.get("terminal_evidence")
+    resource_outcomes = (
+        terminal_evidence.get("resource_outcomes")
+        if isinstance(terminal_evidence, dict)
+        else None
+    )
+    if not isinstance(resource_outcomes, dict):
+        return NOT_RECORDED_DISPLAY
+    row_count_labels = []
+    for resource_name in entry["resources"]:
+        resource_outcome = resource_outcomes.get(resource_name)
+        rows_fetched = (
+            resource_outcome.get("rows_fetched")
+            if isinstance(resource_outcome, dict)
+            else None
+        )
+        if not isinstance(rows_fetched, int) or rows_fetched < 0:
+            continue
+        row_count_labels.append(f"{resource_name}: {rows_fetched:,}")
+    return "<br>".join(row_count_labels) or "Evidence recorded"
+
+
 def _observed_verification_section(
     manifest: dict[str, Any],
     snapshot: dict[str, Any],
@@ -334,7 +360,7 @@ def _observed_verification_section(
         "",
         f"Verification environment: `{snapshot['environment']}`. Campaign: `{snapshot['campaign_id']}`. Snapshot checked at `{checked_at}`.",
         "",
-        "| Source | Proof state | Terminal status | Resource completion | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Terminal evidence |",
+        "| Source | Proof state | Terminal status | Resource completion | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Rows by resource |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in manifest["entries"]:
@@ -361,7 +387,7 @@ def _observed_verification_section(
                 if verification_record["checked_at"]
                 else NOT_RECORDED_DISPLAY
             ),
-            json.dumps(verification_record["terminal_evidence"], sort_keys=True) if verification_record.get("terminal_evidence") else NOT_RECORDED_DISPLAY,
+            _terminal_resource_rows_display(entry, verification_record),
         ]
         return_lines.append("| " + " | ".join(_markdown_cell(str(cell)) for cell in cells) + " |")
     return return_lines
