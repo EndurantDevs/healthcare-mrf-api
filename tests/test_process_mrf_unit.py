@@ -22,6 +22,45 @@ process_npi = importlib.import_module("process.npi")
 utils_module = importlib.import_module("process.ext.utils")
 
 
+class RecoveryRedis:
+    def __init__(self, pending_key, attempts_key, work_id, work_payload):
+        self.hashes = {
+            pending_key: {work_id: work_payload},
+            attempts_key: {},
+        }
+        self.work_id = work_id
+        self.enqueued = []
+        self.deleted = []
+
+    async def sdiff(self, _expected_key, _done_key):
+        return {self.work_id.encode()}
+
+    async def hget(self, key, field):
+        return self.hashes.get(key, {}).get(field)
+
+    async def exists(self, *_keys):
+        return 0
+
+    async def zscore(self, _key, _member):
+        return None
+
+    async def delete(self, *keys):
+        self.deleted.extend(keys)
+        return len(keys)
+
+    async def enqueue_job(self, *args, **kwargs):
+        self.enqueued.append((args, kwargs))
+        return SimpleNamespace()
+
+    async def hincrby(self, key, field, amount):
+        values = self.hashes.setdefault(key, {})
+        values[field] = int(values.get(field, 0)) + amount
+        return values[field]
+
+    async def expire(self, *_args, **_kwargs):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_mrf_main_enqueues_init_file(monkeypatch):
     fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
@@ -53,6 +92,7 @@ def test_mrf_worker_configuration():
         "process_formulary",
     ]
     assert process_pkg.MRF.on_startup.__name__ == "startup"
+    assert process_pkg.MRF.on_shutdown.__name__ == "mrf_worker_shutdown"
 
 
 def test_mrf_address_npi_uses_bigint():
@@ -180,6 +220,7 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
             self.calls = []
             self.values = {}
             self.sets = {}
+            self.hashes = {}
 
         async def enqueue_job(self, *args, **kwargs):
             self.calls.append((args, kwargs))
@@ -190,6 +231,16 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
 
         async def expire(self, *_args, **_kwargs):
             return True
+
+        async def hsetnx(self, key, field, value):
+            values = self.hashes.setdefault(key, {})
+            if field in values:
+                return 0
+            values[field] = value
+            return 1
+
+        async def hdel(self, key, field):
+            return int(self.hashes.get(key, {}).pop(field, None) is not None)
 
         async def sadd(self, key, value):
             values = self.sets.setdefault(key, set())
@@ -258,6 +309,7 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
             self.calls = []
             self.values = {}
             self.sets = {}
+            self.hashes = {}
 
         async def enqueue_job(self, *args, **kwargs):
             self.calls.append((args, kwargs))
@@ -268,6 +320,16 @@ async def test_process_json_index_test_limit_counts_unique_registered_jobs(monke
 
         async def expire(self, *_args, **_kwargs):
             return True
+
+        async def hsetnx(self, key, field, value):
+            values = self.hashes.setdefault(key, {})
+            if field in values:
+                return 0
+            values[field] = value
+            return 1
+
+        async def hdel(self, key, field):
+            return int(self.hashes.get(key, {}).pop(field, None) is not None)
 
         async def sadd(self, key, value):
             values = self.sets.setdefault(key, set())
@@ -332,6 +394,9 @@ async def test_register_mrf_work_counts_unique_work_ids_once():
         async def expire(self, *_args, **_kwargs):
             return True
 
+        async def hdel(self, _key, _field):
+            return 0
+
         async def sadd(self, key, value):
             values = self.sets.setdefault(key, set())
             before = len(values)
@@ -349,6 +414,72 @@ async def test_register_mrf_work_counts_unique_work_ids_once():
 
 
 @pytest.mark.asyncio
+async def test_recover_missing_mrf_work_requeues_persisted_payload():
+    """A missing ARQ job is rebuilt from its durable run payload."""
+    work_id = "mrf:provider:run_test:abc123"
+    pending_key = process_initial._mrf_state_key("run_test", "pending_work")
+    attempts_key = process_initial._mrf_state_key("run_test", "recovery_attempts")
+    task_dict = {
+        "url": "https://example.test/providers.json",
+        "issuer_array": [12345],
+        "context": {"control_run_id": "run_test", "import_date": "20260613"},
+        "work_id": work_id,
+    }
+    work_payload = process_initial.serialize_job(
+        {"function": "process_provider", "task": task_dict}
+    )
+    redis = RecoveryRedis(pending_key, attempts_key, work_id, work_payload)
+
+    recovery_by_state = await process_initial._recover_missing_mrf_work(redis, "run_test")
+
+    assert recovery_by_state == {
+        "missing": 1,
+        "recovered": 1,
+        "active": 0,
+        "unrecoverable": [],
+        "exhausted": [],
+    }
+    assert redis.enqueued == [
+        (
+            ("process_provider", task_dict),
+            {"_queue_name": process_initial.MRF_QUEUE_NAME, "_job_id": work_id},
+        )
+    ]
+    assert redis.hashes[attempts_key][work_id] == 1
+    assert redis.deleted == [f"arq:result:{work_id}", f"arq:retry:{work_id}"]
+
+
+@pytest.mark.asyncio
+async def test_mrf_worker_shutdown_marks_drained_queue_for_finalizer(monkeypatch):
+    class FakeRedis:
+        async def zcard(self, queue_name):
+            assert queue_name == process_initial.MRF_QUEUE_NAME
+            return 0
+
+        async def get(self, key):
+            assert key.endswith(":total_work")
+            return b"12"
+
+        async def scard(self, key):
+            assert key.endswith(":done_work")
+            return 11
+
+    mark_run = AsyncMock()
+    monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+    worker_context_dict = {
+        "redis": FakeRedis(),
+        "context": {"control_run_id": "run_test", "import_date": "20260613"},
+    }
+
+    await process_initial.mrf_worker_shutdown(worker_context_dict)
+
+    mark_run.assert_awaited_once()
+    assert mark_run.await_args.kwargs["status"] == "running"
+    assert "finalizing" in mark_run.await_args.kwargs["phase_detail"]
+    assert mark_run.await_args.kwargs["progress"]["done"] == 11
+
+
+@pytest.mark.asyncio
 async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
     class FakeRedis:
         def __init__(self):
@@ -356,6 +487,9 @@ async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
 
         async def expire(self, *_args, **_kwargs):
             return True
+
+        async def hdel(self, _key, _field):
+            return 0
 
         async def sadd(self, key, value):
             values = self.sets.setdefault(key, set())
@@ -456,6 +590,19 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
 
     mark_run = AsyncMock()
     monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+    monkeypatch.setattr(
+        process_initial,
+        "_recover_missing_mrf_work",
+        AsyncMock(
+            return_value={
+                "missing": 1,
+                "recovered": 1,
+                "active": 0,
+                "unrecoverable": [],
+                "exhausted": [],
+            }
+        ),
+    )
 
     ctx = {
         "redis": FakeRedis(),
@@ -476,6 +623,52 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
     assert kwargs["_queue_name"] == process_initial.MRF_FINISH_QUEUE_NAME
     assert kwargs["_defer_by"] == 60
     mark_run.assert_awaited_once()
+    assert mark_run.await_args.kwargs["phase_detail"] == "mrf parser recovery queued"
+
+
+@pytest.mark.asyncio
+async def test_mrf_shutdown_fails_after_unrecoverable_work_wait(monkeypatch):
+    class FakeRedis:
+        async def get(self, key):
+            if key.endswith(":total_work"):
+                return b"3"
+            return None
+
+        async def scard(self, _key):
+            return 2
+
+    recovery_by_state = {
+        "missing": 1,
+        "recovered": 0,
+        "active": 0,
+        "unrecoverable": ["missing-work"],
+        "exhausted": [],
+    }
+    mark_run = AsyncMock()
+    monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+    monkeypatch.setattr(
+        process_initial,
+        "_recover_missing_mrf_work",
+        AsyncMock(return_value=recovery_by_state),
+    )
+    context_dict = {
+        "redis": FakeRedis(),
+        "context": {
+            "import_date": "20260618",
+            "control_run_id": "run_mrf_failed",
+            "test_mode": True,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="MRF parser recovery failed"):
+        await process_initial.shutdown(
+            context_dict,
+            {"context": context_dict["context"], "test_mode": True, "mrf_finalize_waits": 5},
+        )
+
+    mark_run.assert_awaited_once()
+    assert mark_run.await_args.kwargs["status"] == "failed"
+    assert mark_run.await_args.kwargs["error"]["code"] == "mrf_parser_recovery_failed"
 
 
 @pytest.mark.asyncio
@@ -615,6 +808,7 @@ def test_claims_pricing_cli_accepts_test_flag(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mrf_startup_sets_utc_time(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_ID", "run_worker_context")
     monkeypatch.setattr(process_initial, "my_init_db", AsyncMock())
     monkeypatch.setattr(process_initial.db, "status", AsyncMock())
     monkeypatch.setattr(process_initial.db, "create_table", AsyncMock())
@@ -630,6 +824,7 @@ async def test_mrf_startup_sets_utc_time(monkeypatch):
 
     delta = datetime.datetime.utcnow() - ctx["context"]["start"]
     assert delta.total_seconds() < 2
+    assert ctx["context"]["control_run_id"] == "run_worker_context"
 
 
 @pytest.mark.asyncio

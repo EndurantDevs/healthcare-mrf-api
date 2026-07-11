@@ -38,6 +38,7 @@ from process.initial import main as initiate_mrf
 from process.initial import (process_formulary, process_json_index,
                              process_plan, process_provider, save_mrf_data)
 from process.initial import shutdown as shutdown_mrf
+from process.initial import mrf_worker_shutdown
 from process.initial import startup as initial_startup
 from process.npi import main as initiate_npi
 from process.npi import process_data as process_npi_data
@@ -146,6 +147,7 @@ control_single_job_start = arq_func(_control_single_job_start, max_tries=1)
 class MRF:
     functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
+    on_shutdown = mrf_worker_shutdown
     max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
     queue_read_limit = (
         int(os.environ.get("HLTHPRT_MRF_QUEUE_READ_LIMIT"))

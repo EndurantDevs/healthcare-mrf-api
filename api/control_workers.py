@@ -206,6 +206,9 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     import_id = str(payload.get("import_id") or "").strip()
     if import_id:
         env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    run_id = str(payload.get("run_id") or "").strip()
+    if run_id:
+        env["HLTHPRT_CONTROL_RUN_ID"] = run_id
     with log_path.open("ab") as log_handle:
         process = subprocess.Popen(
             cmd,
@@ -567,6 +570,8 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     if import_id:
         env.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
     run_id = str(payload.get("run_id") or "").strip()
+    if run_id:
+        env.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
     if spec.role == "start" and spec.worker_class.startswith("process.PTG") and run_id:
         env.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": f"ptg_start_{run_id}"})
 

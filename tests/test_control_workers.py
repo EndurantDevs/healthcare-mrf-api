@@ -74,7 +74,7 @@ def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
 
     assert result["status"] == "started"
     assert result["items"][0]["worker_class"] == "process.ClaimsPricing"
-    assert captured["cmd"][-2:] == ["process.ClaimsPricing", "--burst"]
+    assert captured["env"]["HLTHPRT_CONTROL_RUN_ID"] == "run_1"
     assert captured["start_new_session"] is True
 
 
@@ -208,7 +208,7 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert job["kind"] == "Job"
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == "ghcr.io/endurantdevs/healthcare-mrf-api:dev"
-    assert container["command"][-2:] == ["process.ClaimsPricing", "--burst"]
+    assert {"name": "HLTHPRT_CONTROL_RUN_ID", "value": "run_123"} in container["env"]
     assert {"configMapRef": {"name": "mrf-api-config"}} in container["envFrom"]
     assert {"secretRef": {"name": "mrf-api-secret"}} in container["envFrom"]
     assert container["volumeMounts"] == [
