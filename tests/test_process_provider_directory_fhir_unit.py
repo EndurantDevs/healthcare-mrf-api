@@ -5791,6 +5791,7 @@ def _artifact_dataset(
     evidence_run_id: str = "acquisition_root",
     selected_resources: tuple[str, ...] = (),
     expected_resources: tuple[str, ...] | None = None,
+    recorded_expected_resources: tuple[str, ...] | None = None,
 ) -> importer.ProviderDirectoryArtifactDataset:
     return importer.ProviderDirectoryArtifactDataset(
         source_id=source_id,
@@ -5803,7 +5804,21 @@ def _artifact_dataset(
             if expected_resources is None
             else expected_resources
         ),
+        recorded_expected_resources=recorded_expected_resources,
     )
+
+
+def _artifact_source_record(
+    source_id: str,
+    resources: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "metadata_json": {
+            "provider_directory_supported_resources": list(resources),
+            "provider_directory_fully_enumerable_resources": list(resources),
+        },
+    }
 
 
 def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
@@ -5828,6 +5843,7 @@ def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
             return_value={
                 "dataset_rows": 1,
                 "projected_rows": 1,
+                "resource_types": ["Location"],
                 "alias_amplification": 1.0,
                 "projected_rows_by_resource": {"Location": 1},
             }
@@ -5849,12 +5865,26 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_a
             {
                 "source_id": "source_a",
                 "endpoint_id": "endpoint_1",
+                "source_record_json": {
+                    "source_id": "source_a",
+                    "metadata_json": {
+                        "provider_directory_supported_resources": ["Location"],
+                        "provider_directory_fully_enumerable_resources": ["Location"],
+                    },
+                },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
             },
             {
                 "source_id": "source_b",
                 "endpoint_id": "endpoint_1",
+                "source_record_json": {
+                    "source_id": "source_b",
+                    "metadata_json": {
+                        "provider_directory_supported_resources": ["Location"],
+                        "provider_directory_fully_enumerable_resources": ["Location"],
+                    },
+                },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
             },
@@ -5886,6 +5916,13 @@ async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source
             {
                 "source_id": "source_a",
                 "endpoint_id": "endpoint_1",
+                "source_record_json": {
+                    "source_id": "source_a",
+                    "metadata_json": {
+                        "provider_directory_supported_resources": ["Location"],
+                        "provider_directory_fully_enumerable_resources": ["Location"],
+                    },
+                },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
                 "selected_resources": ["Location"],
@@ -5893,6 +5930,13 @@ async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source
             {
                 "source_id": "source_b",
                 "endpoint_id": "endpoint_1",
+                "source_record_json": {
+                    "source_id": "source_b",
+                    "metadata_json": {
+                        "provider_directory_supported_resources": ["Location"],
+                        "provider_directory_fully_enumerable_resources": ["Location"],
+                    },
+                },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
                 "selected_resources": ["Location"],
@@ -5939,6 +5983,13 @@ def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
         {
             "source_id": "source_a",
             "endpoint_id": "endpoint_1",
+            "source_record_json": {
+                "source_id": "source_a",
+                "metadata_json": {
+                    "provider_directory_supported_resources": ["Location"],
+                    "provider_directory_fully_enumerable_resources": ["Location"],
+                },
+            },
             "dataset_id": dataset_id,
             "evidence_run_id": "acquisition_root",
         }
@@ -5948,6 +5999,88 @@ def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
         importer._validate_provider_directory_artifact_datasets(
             duplicate_rows,
             ["source_a"],
+        )
+
+
+def test_artifact_dataset_legacy_metadata_uses_current_source_profile():
+    dataset = importer._provider_directory_artifact_dataset_from_row(
+        {
+            "source_id": "source_a",
+            "endpoint_id": "endpoint_1",
+            "source_record_json": _artifact_source_record(
+                "source_a",
+                ("Location",),
+            ),
+            "dataset_id": "dataset_current",
+            "evidence_run_id": "acquisition_root",
+            "selected_resources": ["Location"],
+            "recorded_expected_resources": None,
+        }
+    )
+
+    assert dataset is not None
+    assert dataset.expected_resources == ("Location",)
+    assert dataset.recorded_expected_resources is None
+    importer._assert_provider_directory_artifact_target_dependencies(
+        importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
+        publish_artifacts_targets={"location_archive"},
+        publish_corroboration=False,
+    )
+
+
+def test_artifact_dataset_rejects_current_or_recorded_profile_drift():
+    changed_source_dataset = importer._provider_directory_artifact_dataset_from_row(
+        {
+            "source_id": "source_a",
+            "endpoint_id": "endpoint_1",
+            "source_record_json": _artifact_source_record(
+                "source_a",
+                ("Location", "Organization"),
+            ),
+            "dataset_id": "dataset_current",
+            "evidence_run_id": "acquisition_root",
+            "selected_resources": ["Location"],
+            "recorded_expected_resources": ["Location"],
+        }
+    )
+    assert changed_source_dataset is not None
+    with pytest.raises(RuntimeError, match="dataset_profile:source_a"):
+        importer._assert_provider_directory_artifact_target_dependencies(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (changed_source_dataset,)
+            ),
+            publish_artifacts_targets={"location_archive"},
+            publish_corroboration=False,
+        )
+
+    recorded_drift_dataset = _artifact_dataset(
+        selected_resources=("Location", "Organization"),
+        expected_resources=("Location", "Organization"),
+        recorded_expected_resources=("Location",),
+    )
+    with pytest.raises(RuntimeError, match="dataset_recorded_profile:source_a"):
+        importer._assert_provider_directory_artifact_target_dependencies(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (recorded_drift_dataset,)
+            ),
+            publish_artifacts_targets={"location_archive"},
+            publish_corroboration=False,
+        )
+
+
+def test_endpoint_dataset_expected_resources_rejects_alias_profile_drift():
+    with pytest.raises(
+        RuntimeError,
+        match="endpoint_dataset_alias_profiles_ambiguous",
+    ):
+        importer._endpoint_dataset_expected_resources(
+            [
+                _artifact_source_record("source_a", ("Location",)),
+                _artifact_source_record(
+                    "source_b",
+                    ("Location", "Organization"),
+                ),
+            ]
         )
 
 
@@ -6036,6 +6169,46 @@ async def test_artifact_dataset_scope_drops_private_tables_in_finally(monkeypatc
     assert len(drop_sql_calls) == len(importer.RESOURCE_MODELS) + 1
     assert importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == {}
     assert importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get() is None
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_materialization_cleans_partial_tables(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_artifact_dataset(selected_resources=("Location",)),)
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_scope_table_name",
+        lambda table_name, _run_id: f"{table_name}_scope",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_materialize_provider_directory_artifact_source_scope",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_materialize_provider_directory_artifact_resource_scope",
+        AsyncMock(side_effect=RuntimeError("materialization failed")),
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "_drop_artifact_scope_tables", cleanup)
+
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        await importer._materialize_artifact_scope_tables(
+            "mrf",
+            "run_1",
+            fence,
+            frozenset({"Location"}),
+        )
+
+    cleanup.assert_awaited_once_with(
+        "mrf",
+        [
+            "provider_directory_source_scope",
+            "provider_directory_insurance_plan_scope",
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -6139,13 +6312,29 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
                 {
                     "source_id": "source_a",
                     "endpoint_id": "endpoint_repointed",
+                    "source_record_json": {
+                        "source_id": "source_a",
+                        "metadata_json": {
+                            "provider_directory_supported_resources": [
+                                "Location",
+                                "Organization",
+                            ],
+                            "provider_directory_fully_enumerable_resources": [
+                                "Location",
+                                "Organization",
+                            ],
+                        },
+                    },
                     "dataset_id": "dataset_current",
+                    "evidence_run_id": "acquisition_root",
                     "selected_resources": ["Location", "Organization"],
                 }
             ],
         ]
     )
     monkeypatch.setattr(importer.db, "all", lookup)
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
 
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -6159,8 +6348,9 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
     tuple_lock_sql = lookup.await_args_list[1].args[0]
     assert "FOR SHARE" in endpoint_lock_sql
     assert "provider_directory_api_endpoint" in endpoint_lock_sql
+    assert status.await_args.args[0].startswith("LOCK TABLE")
     assert "FOR SHARE OF source, dataset" in tuple_lock_sql
-    assert "source.source_id = ANY" in tuple_lock_sql
+    assert "source.endpoint_id = ANY" in tuple_lock_sql
     assert "dataset.superseded_at IS NULL" in tuple_lock_sql
 
 
@@ -6239,6 +6429,115 @@ def test_artifact_targets_accept_complete_source_specific_profiles(
         fence,
         publish_artifacts_targets=None,
         publish_corroboration=True,
+    )
+
+
+def test_artifact_resource_types_are_target_specific():
+    assert importer._provider_directory_artifact_resource_types(
+        {"location_contacts"},
+        publish_corroboration=False,
+    ) == frozenset({"Location"})
+    assert importer._provider_directory_artifact_resource_types(
+        {"network_catalog"},
+        publish_corroboration=False,
+    ) == frozenset(
+        {
+            "InsurancePlan",
+            "Organization",
+            "OrganizationAffiliation",
+            "PractitionerRole",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_artifact_resource_scope_does_not_copy_unrequested_model(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            _artifact_dataset(
+                selected_resources=("Location", "Practitioner"),
+            ),
+        )
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._materialize_provider_directory_artifact_resource_scope(
+        "mrf",
+        "practitioner_scope",
+        ProviderDirectoryPractitioner,
+        fence,
+        frozenset({"Location"}),
+    )
+
+    assert len(status.await_args_list) == 2
+    assert status.await_args_list[0].args[0].startswith(
+        'CREATE UNLOGGED TABLE "mrf"."practitioner_scope"'
+    )
+    assert status.await_args_list[1].args[0] == (
+        'ANALYZE "mrf"."practitioner_scope";'
+    )
+
+
+@pytest.mark.asyncio
+async def test_dataset_artifact_generation_guard_wraps_complete_publish(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_artifact_dataset(selected_resources=("Location",)),)
+    )
+    state_by_name = {"guard_active": False}
+    scope_options_by_name: dict[str, Any] = {}
+
+    @contextlib.asynccontextmanager
+    async def dataset_scope(**kwargs):
+        scope_options_by_name.update(kwargs)
+        yield fence
+
+    @contextlib.asynccontextmanager
+    async def generation_guard(received_fence):
+        assert received_fence is fence
+        state_by_name["guard_active"] = True
+        try:
+            yield
+        finally:
+            state_by_name["guard_active"] = False
+
+    async def publish_artifacts(**kwargs):
+        assert state_by_name["guard_active"] is True
+        return kwargs["metrics"]
+
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=fence),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_dataset_scope",
+        dataset_scope,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_generation_guard",
+        generation_guard,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_artifacts",
+        publish_artifacts,
+    )
+
+    metrics = await importer._publish_provider_directory_dataset_artifacts(
+        run_id="run_1",
+        metrics={},
+        source_ids=["source_a"],
+        publish_corroboration=False,
+        publish_artifacts_targets={"location_archive"},
+    )
+
+    assert metrics["artifact_dataset_ids"] == ["dataset_current"]
+    assert state_by_name["guard_active"] is False
+    assert scope_options_by_name["resource_types"] == frozenset(
+        {"Location", "Organization", "Practitioner"}
     )
 
 
@@ -6322,29 +6621,28 @@ async def test_artifact_scope_projection_measures_alias_amplification_and_capaci
                     "resource_type": "Location",
                     "resource_rows": 5,
                 },
-                {
-                    "dataset_id": "dataset_current",
-                    "resource_type": "Practitioner",
-                    "resource_rows": 3,
-                },
             ]
         ),
     )
 
-    projection = await importer._provider_directory_artifact_scope_projection(fence)
+    projection = await importer._provider_directory_artifact_scope_projection(
+        fence,
+        frozenset({"Location"}),
+    )
     monkeypatch.setenv(
         "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS",
-        "15",
+        "9",
     )
 
     assert projection == {
         "dataset_count": 1,
         "alias_count": 2,
-        "dataset_rows": 8,
-        "projected_rows": 16,
+        "dataset_rows": 5,
+        "projected_rows": 10,
+        "resource_types": ["Location"],
         "alias_amplification": 2.0,
         "aliases_by_dataset": {"dataset_current": 2},
-        "projected_rows_by_resource": {"Location": 10, "Practitioner": 6},
+        "projected_rows_by_resource": {"Location": 10},
     }
     artifact_metrics_by_name: dict[str, Any] = {}
     importer._record_artifact_scope_metrics(
@@ -6359,7 +6657,7 @@ async def test_artifact_scope_projection_measures_alias_amplification_and_capaci
     assert artifact_metrics_by_name["artifact_scope_reaped_table_count"] == 1
     with pytest.raises(
         RuntimeError,
-        match="scope_projected_rows_exceeded:projected=16:capacity=15",
+        match="scope_projected_rows_exceeded:projected=10:capacity=9",
     ):
         importer._assert_provider_directory_artifact_scope_capacity(projection)
 

@@ -27,6 +27,15 @@ def _dataset_metadata(resources: list[str]) -> str:
     return json.dumps({"selected_resources": resources})
 
 
+def _source_metadata(resources: list[str]) -> str:
+    return json.dumps(
+        {
+            "provider_directory_supported_resources": resources,
+            "provider_directory_fully_enumerable_resources": resources,
+        }
+    )
+
+
 async def _create_artifact_tables(database: Database, schema: str) -> None:
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_api_endpoint "
@@ -67,7 +76,8 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         )
 
 
-async def _insert_fixture_rows(database: Database, schema: str) -> None:
+async def _insert_fixture_sources(database: Database, schema: str) -> None:
+    """Insert endpoint aliases used by the artifact race harness."""
     endpoints = ("endpoint_shared", "endpoint_unpublished", "endpoint_repoint")
     await database.status(
         f"INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id) "
@@ -76,13 +86,23 @@ async def _insert_fixture_rows(database: Database, schema: str) -> None:
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_source ("
-        "source_id, org_name, endpoint_id, requires_registration, requires_api_key"
+        "source_id, org_name, endpoint_id, requires_registration, "
+        "requires_api_key, metadata_json"
         ") VALUES "
-        "('source_primary', 'Primary', 'endpoint_shared', false, false), "
-        "('source_sibling', 'Sibling', 'endpoint_shared', false, false), "
-        "('source_catalog_only', 'Catalog-only', NULL, false, false), "
-        "('source_no_current', 'No-current', 'endpoint_unpublished', false, false);"
+        "('source_primary', 'Primary', 'endpoint_shared', false, false, "
+        "CAST(:source_metadata AS json)), "
+        "('source_sibling', 'Sibling', 'endpoint_shared', false, false, "
+        "CAST(:source_metadata AS json)), "
+        "('source_catalog_only', 'Catalog-only', NULL, false, false, "
+        "CAST(:source_metadata AS json)), "
+        "('source_no_current', 'No-current', 'endpoint_unpublished', false, false, "
+        "CAST(:source_metadata AS json));",
+        source_metadata=_source_metadata(["Location"]),
     )
+
+
+async def _insert_fixture_datasets(database: Database, schema: str) -> None:
+    """Insert one current and one unpublished endpoint dataset."""
     await database.status(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
         "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
@@ -96,6 +116,10 @@ async def _insert_fixture_rows(database: Database, schema: str) -> None:
         location_metadata=_dataset_metadata(["Location"]),
         empty_metadata=_dataset_metadata([]),
     )
+
+
+async def _insert_fixture_resources(database: Database, schema: str) -> None:
+    """Insert one validated row and one unvalidated linked row."""
     await database.status(
         f"INSERT INTO {schema}.provider_directory_dataset_resource ("
         "dataset_id, resource_type, resource_id, payload_hash, payload_json"
@@ -118,6 +142,28 @@ async def _insert_fixture_rows(database: Database, schema: str) -> None:
             }
         ),
     )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
+        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
+        ") VALUES ("
+        "'dataset_shared', 'Practitioner', 'linked-practitioner-1', "
+        "'c' || repeat('d', 63), CAST(:payload_json AS json)"
+        ");",
+        payload_json=json.dumps(
+            {
+                "npi": 1234567890,
+                "active": True,
+                "full_name": "Unvalidated Linked Practitioner",
+            }
+        ),
+    )
+
+
+async def _insert_fixture_rows(database: Database, schema: str) -> None:
+    """Populate the disposable schema with one immutable dataset family."""
+    await _insert_fixture_sources(database, schema)
+    await _insert_fixture_datasets(database, schema)
+    await _insert_fixture_resources(database, schema)
 
 
 @asynccontextmanager
@@ -212,6 +258,14 @@ async def test_real_postgres_dataset_scope_expands_aliases_materializes_and_clea
             assert {location_row_by_field["last_seen_run_id"] for location_row_by_field in materialized_location_row_list} == {"root-shared"}
             assert all(location_row_by_field["observed_at"] is not None for location_row_by_field in materialized_location_row_list)
             assert all(location_row_by_field["telecom"][0]["value"] == "555-0100" for location_row_by_field in materialized_location_row_list)
+            practitioner_scope_table = (
+                importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
+                    "provider_directory_practitioner"
+                ]
+            )
+            assert await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.{practitioner_scope_table};"
+            ) == 0
 
         assert artifact_scope_metrics_by_name["artifact_scope_dataset_count"] == 1
         assert artifact_scope_metrics_by_name["artifact_scope_alias_count"] == 2
@@ -279,6 +333,26 @@ async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scop
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_dataset_fence_rejects_alias_joined_after_selection(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"]
+        )
+        await database.status(
+            f"UPDATE {schema}.provider_directory_source "
+            "SET endpoint_id = 'endpoint_shared' "
+            "WHERE source_id = 'source_catalog_only';"
+        )
+
+        with pytest.raises(
+            importer.ProviderDirectoryArtifactBuildStale,
+            match="provider_directory_source_endpoint_dataset_changed",
+        ):
+            async with database.transaction():
+                await importer._lock_and_verify_artifact_dataset_fence(fence)
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
@@ -298,8 +372,9 @@ async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monke
                 )
 
         try:
-            async with database.transaction():
-                await importer._lock_and_verify_artifact_dataset_fence(fence)
+            async with importer._provider_directory_artifact_generation_guard(
+                fence
+            ):
                 promotion_task = asyncio.create_task(promote_current_dataset())
                 await asyncio.sleep(0.05)
                 assert not promotion_task.done()
@@ -311,3 +386,36 @@ async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monke
             f"SELECT dataset_id FROM {schema}.provider_directory_endpoint_dataset "
             "WHERE endpoint_id = 'endpoint_shared' AND is_current = true;"
         ) == "dataset_next"
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_generation_guard_blocks_alias_join(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"]
+        )
+        alias_database = Database()
+        await alias_database.connect()
+
+        async def join_endpoint_alias() -> None:
+            await alias_database.status(
+                f"UPDATE {schema}.provider_directory_source "
+                "SET endpoint_id = 'endpoint_shared' "
+                "WHERE source_id = 'source_catalog_only';"
+            )
+
+        try:
+            async with importer._provider_directory_artifact_generation_guard(
+                fence
+            ):
+                alias_task = asyncio.create_task(join_endpoint_alias())
+                await asyncio.sleep(0.05)
+                assert not alias_task.done()
+            await asyncio.wait_for(alias_task, timeout=2)
+        finally:
+            await alias_database.disconnect()
+
+        assert await database.scalar(
+            f"SELECT endpoint_id FROM {schema}.provider_directory_source "
+            "WHERE source_id = 'source_catalog_only';"
+        ) == "endpoint_shared"

@@ -265,6 +265,46 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
         frozenset({"InsurancePlan", "Organization"}),
     ),
 }
+PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
+    "location_contacts": frozenset({"Location"}),
+    "location_coordinates": frozenset({"Location"}),
+    "resource_id_npis": frozenset({"Organization", "Practitioner"}),
+    "location_address_keys": frozenset({"Location"}),
+    "location_archive": frozenset(
+        {"Location", "Organization", "Practitioner"}
+    ),
+    "address_overlay": frozenset(
+        {
+            "HealthcareService",
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        }
+    ),
+    "network_catalog": frozenset(
+        {
+            "InsurancePlan",
+            "Organization",
+            "OrganizationAffiliation",
+            "PractitionerRole",
+        }
+    ),
+    "corroboration": frozenset(
+        {
+            "InsurancePlan",
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        }
+    ),
+}
+PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES = frozenset().union(
+    *PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES.values()
+)
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
@@ -6660,6 +6700,7 @@ class ProviderDirectoryArtifactDataset:
     evidence_run_id: str
     selected_resources: tuple[str, ...] = ()
     expected_resources: tuple[str, ...] = ()
+    recorded_expected_resources: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -6714,6 +6755,7 @@ def _provider_directory_artifact_dataset_selection_sql(
         {selection_sql}
         SELECT selected.source_id,
                selected.endpoint_id,
+               selected.source_record_json,
                dataset.dataset_id,
                COALESCE(
                    dataset.acquisition_root_run_id,
@@ -6723,11 +6765,8 @@ def _provider_directory_artifact_dataset_selection_sql(
                    dataset.publication_metadata_json::jsonb -> 'selected_resources',
                    '[]'::jsonb
                ) AS selected_resources,
-               COALESCE(
-                   dataset.publication_metadata_json::jsonb -> 'expected_resources',
-                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
-                   '[]'::jsonb
-               ) AS expected_resources
+               dataset.publication_metadata_json::jsonb -> 'expected_resources'
+                   AS recorded_expected_resources
           FROM selected_sources AS selected
           LEFT JOIN {dataset_ref} AS dataset
             ON dataset.endpoint_id = selected.endpoint_id
@@ -6741,14 +6780,16 @@ def _provider_directory_artifact_dataset_selection_sql(
 def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
     return f"""
         WITH requested_sources AS MATERIALIZED (
-            SELECT source_id, endpoint_id
-              FROM {source_ref}
+            SELECT source_id, endpoint_id, to_jsonb(source) AS source_record_json
+              FROM {source_ref} AS source
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
         ), selected_sources AS MATERIALIZED (
-            SELECT source_id, endpoint_id
+            SELECT source_id, endpoint_id, source_record_json
               FROM requested_sources
             UNION
-            SELECT sibling.source_id, sibling.endpoint_id
+            SELECT sibling.source_id,
+                   sibling.endpoint_id,
+                   to_jsonb(sibling) AS source_record_json
               FROM {source_ref} AS sibling
               JOIN requested_sources AS requested
                 ON requested.endpoint_id IS NOT NULL
@@ -6771,7 +6812,9 @@ def _artifact_dataset_all_source_selection_sql(
              GROUP BY dataset.endpoint_id
             HAVING COUNT(*) = 1
         ), selected_sources AS MATERIALIZED (
-            SELECT source.source_id, source.endpoint_id
+            SELECT source.source_id,
+                   source.endpoint_id,
+                   to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
               JOIN published_endpoints AS endpoint
                 ON endpoint.endpoint_id = source.endpoint_id
@@ -6789,6 +6832,16 @@ def _provider_directory_artifact_dataset_from_row(
     }
     if not all(value_by_name.values()):
         return None
+    source_record = _json_object(dataset_row_map.get("source_record_json"))
+    expected_resources = _endpoint_dataset_expected_resources([source_record])
+    raw_recorded_expected_resources = dataset_row_map.get(
+        "recorded_expected_resources"
+    )
+    recorded_expected_resources = (
+        tuple(sorted(set(_json_text_list(raw_recorded_expected_resources))))
+        if raw_recorded_expected_resources is not None
+        else None
+    )
     return ProviderDirectoryArtifactDataset(
         source_id=value_by_name["source_id"] or "",
         endpoint_id=value_by_name["endpoint_id"] or "",
@@ -6805,20 +6858,8 @@ def _provider_directory_artifact_dataset_from_row(
                 )
             )
         ),
-        expected_resources=tuple(
-            sorted(
-                set(
-                    _json_text_list(
-                        _pagination_checkpoint_row_mapping(dataset_row).get(
-                            "expected_resources"
-                        )
-                        or _pagination_checkpoint_row_mapping(dataset_row).get(
-                            "selected_resources"
-                        )
-                    )
-                )
-            )
-        ),
+        expected_resources=expected_resources,
+        recorded_expected_resources=recorded_expected_resources,
     )
 
 
@@ -6905,6 +6946,10 @@ def _assert_artifact_endpoint_consistency(
     dataset_id_by_endpoint_id: dict[str, str] = {}
     selected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
     expected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
+    recorded_expected_resources_by_endpoint_id: dict[
+        str,
+        tuple[str, ...] | None,
+    ] = {}
     for dataset in selected_datasets:
         incumbent_dataset_id = dataset_id_by_endpoint_id.setdefault(
             dataset.endpoint_id,
@@ -6931,6 +6976,20 @@ def _assert_artifact_endpoint_consistency(
         if incumbent_expected_resources != dataset.expected_resources:
             raise RuntimeError(
                 "provider_directory_artifact_endpoint_expected_metadata_ambiguous:"
+                + dataset.endpoint_id
+            )
+        incumbent_recorded_expected_resources = (
+            recorded_expected_resources_by_endpoint_id.setdefault(
+                dataset.endpoint_id,
+                dataset.recorded_expected_resources,
+            )
+        )
+        if (
+            incumbent_recorded_expected_resources
+            != dataset.recorded_expected_resources
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_endpoint_recorded_metadata_ambiguous:"
                 + dataset.endpoint_id
             )
 
@@ -7001,20 +7060,56 @@ def _artifact_dataset_profile_violations(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> list[str]:
     """Return current datasets that cover less than their source profile."""
-    return [
-        ":".join(
-            (
-                "dataset_profile",
-                dataset.source_id,
-                dataset.endpoint_id,
-                dataset.dataset_id,
-                ",".join(dataset.selected_resources),
-                ",".join(dataset.expected_resources),
+    violations: list[str] = []
+    for dataset in fence.datasets:
+        if dataset.selected_resources != dataset.expected_resources:
+            violations.append(
+                ":".join(
+                    (
+                        "dataset_profile",
+                        dataset.source_id,
+                        dataset.endpoint_id,
+                        dataset.dataset_id,
+                        ",".join(dataset.selected_resources),
+                        ",".join(dataset.expected_resources),
+                    )
+                )
             )
+        if (
+            dataset.recorded_expected_resources is not None
+            and dataset.recorded_expected_resources != dataset.expected_resources
+        ):
+            violations.append(
+                ":".join(
+                    (
+                        "dataset_recorded_profile",
+                        dataset.source_id,
+                        dataset.endpoint_id,
+                        dataset.dataset_id,
+                        ",".join(dataset.recorded_expected_resources),
+                        ",".join(dataset.expected_resources),
+                    )
+                )
+            )
+    return violations
+
+
+def _provider_directory_artifact_resource_types(
+    publish_artifacts_targets: set[str] | None,
+    *,
+    publish_corroboration: bool,
+) -> frozenset[str]:
+    """Return the immutable resource types read by enabled artifact targets."""
+    enabled_targets = _provider_directory_dataset_artifact_targets(
+        publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+    )
+    return frozenset().union(
+        *(
+            PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES[target]
+            for target in enabled_targets
         )
-        for dataset in fence.datasets
-        if dataset.selected_resources != dataset.expected_resources
-    ]
+    )
 
 
 def _artifact_target_dependency_violations(
@@ -7078,26 +7173,71 @@ def _provider_directory_artifact_scope_row_limit() -> int:
     return configured or DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS
 
 
-async def _provider_directory_artifact_scope_projection(
+def _artifact_scope_alias_counts(
     fence: ProviderDirectoryArtifactDatasetFence,
-) -> dict[str, Any]:
+) -> dict[str, int]:
+    """Count source aliases represented by each immutable dataset."""
     alias_count_by_dataset_id: dict[str, int] = {}
     for dataset in fence.datasets:
         alias_count_by_dataset_id[dataset.dataset_id] = (
             alias_count_by_dataset_id.get(dataset.dataset_id, 0) + 1
         )
-    resource_rows = await db.all(
+    return alias_count_by_dataset_id
+
+
+def _artifact_scope_resource_pairs(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+) -> list[tuple[str, str]]:
+    """Return validated dataset and resource pairs needed by this publish."""
+    return sorted(
+        {
+            (dataset.dataset_id, resource_type)
+            for dataset in fence.datasets
+            for resource_type in dataset.selected_resources
+            if resource_type in resource_types
+        }
+    )
+
+
+async def _artifact_scope_resource_rows(
+    dataset_resource_pairs: list[tuple[str, str]],
+) -> list[Any]:
+    """Count immutable rows for the exact validated dataset profile."""
+    if not dataset_resource_pairs:
+        return []
+    return await db.all(
         f"""
-        SELECT dataset_id,
-               resource_type,
+        WITH selected(dataset_id, resource_type) AS (
+            SELECT *
+              FROM unnest(
+                    CAST(:dataset_ids AS varchar[]),
+                    CAST(:resource_types AS varchar[])
+              )
+        )
+        SELECT resource.dataset_id,
+               resource.resource_type,
                COUNT(*)::bigint AS resource_rows
           FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
-         GROUP BY dataset_id, resource_type
-         ORDER BY dataset_id, resource_type;
+               AS resource
+          JOIN selected
+            ON selected.dataset_id = resource.dataset_id
+           AND selected.resource_type = resource.resource_type
+         GROUP BY resource.dataset_id, resource.resource_type
+         ORDER BY resource.dataset_id, resource.resource_type;
         """,
-        dataset_ids=sorted(alias_count_by_dataset_id),
+        dataset_ids=[pair[0] for pair in dataset_resource_pairs],
+        resource_types=[pair[1] for pair in dataset_resource_pairs],
     )
+
+
+def _artifact_scope_projection_summary(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    alias_count_by_dataset_id: dict[str, int],
+    resource_rows: list[Any],
+) -> dict[str, Any]:
+    """Summarize row and alias amplification before materialization."""
     dataset_rows = 0
     projected_rows = 0
     projected_rows_by_resource: dict[str, int] = {}
@@ -7119,6 +7259,7 @@ async def _provider_directory_artifact_scope_projection(
         "alias_count": len(fence.datasets),
         "dataset_rows": dataset_rows,
         "projected_rows": projected_rows,
+        "resource_types": sorted(resource_types),
         "alias_amplification": (
             projected_rows / dataset_rows if dataset_rows else 0.0
         ),
@@ -7127,6 +7268,28 @@ async def _provider_directory_artifact_scope_projection(
             sorted(projected_rows_by_resource.items())
         ),
     }
+
+
+async def _provider_directory_artifact_scope_projection(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Project bounded immutable scope size for selected artifact targets."""
+    scoped_resource_types = (
+        resource_types
+        if resource_types is not None
+        else PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
+    )
+    alias_count_by_dataset_id = _artifact_scope_alias_counts(fence)
+    resource_rows = await _artifact_scope_resource_rows(
+        _artifact_scope_resource_pairs(fence, scoped_resource_types)
+    )
+    return _artifact_scope_projection_summary(
+        fence,
+        scoped_resource_types,
+        alias_count_by_dataset_id,
+        resource_rows,
+    )
 
 
 def _assert_provider_directory_artifact_scope_capacity(
@@ -7301,17 +7464,32 @@ async def _materialize_provider_directory_artifact_resource_scope(
     table_name: str,
     model: Any,
     fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
 ) -> None:
     await db.status(
         _provider_directory_artifact_scope_table_sql(model, schema, table_name)
     )
-    await db.status(
-        _provider_directory_artifact_resource_insert_sql(model, schema, table_name),
-        source_ids=[dataset.source_id for dataset in fence.datasets],
-        dataset_ids=[dataset.dataset_id for dataset in fence.datasets],
-        evidence_run_ids=[dataset.evidence_run_id for dataset in fence.datasets],
-        resource_type=RESOURCE_TYPES_BY_MODEL[model],
-    )
+    resource_type = RESOURCE_TYPES_BY_MODEL[model]
+    selected_datasets = [
+        dataset
+        for dataset in fence.datasets
+        if resource_type in resource_types
+        and resource_type in dataset.selected_resources
+    ]
+    if selected_datasets:
+        await db.status(
+            _provider_directory_artifact_resource_insert_sql(
+                model,
+                schema,
+                table_name,
+            ),
+            source_ids=[dataset.source_id for dataset in selected_datasets],
+            dataset_ids=[dataset.dataset_id for dataset in selected_datasets],
+            evidence_run_ids=[
+                dataset.evidence_run_id for dataset in selected_datasets
+            ],
+            resource_type=resource_type,
+        )
     await db.status(f"ANALYZE {_qt(schema, table_name)};")
 
 
@@ -7353,24 +7531,30 @@ async def _verify_provider_directory_artifact_dataset_fence(
 
 async def _lock_and_verify_artifact_dataset_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any | None = None,
 ) -> None:
     """Fence alias and dataset identity while an artifact becomes live."""
     if not fence.datasets:
         return
-    await _lock_artifact_fence_endpoints(fence)
-    locked_tuple_rows = await _lock_artifact_fence_tuples(fence)
+    query_executor = executor or db
+    await _lock_artifact_fence_endpoints(fence, query_executor)
+    locked_tuple_rows = await _lock_artifact_fence_tuples(
+        fence,
+        query_executor,
+    )
     _assert_locked_artifact_fence_tuples(fence, locked_tuple_rows)
 
 
 async def _lock_artifact_fence_endpoints(
     fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
 ) -> None:
     """Serialize cutover with endpoint dataset promotion."""
     endpoint_ref = _unscoped_qt(
         _schema(),
         ProviderDirectoryAPIEndpoint.__tablename__,
     )
-    endpoint_rows = await db.all(
+    endpoint_rows = await executor.all(
         f"""
         SELECT endpoint_id
           FROM {endpoint_ref}
@@ -7395,6 +7579,7 @@ async def _lock_artifact_fence_endpoints(
 
 async def _lock_artifact_fence_tuples(
     fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
 ) -> list[Any]:
     """Lock every selected alias and its current published dataset."""
     source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
@@ -7402,31 +7587,34 @@ async def _lock_artifact_fence_tuples(
         _schema(),
         ProviderDirectoryEndpointDataset.__tablename__,
     )
-    return await db.all(
+    await executor.status(f"LOCK TABLE {source_ref} IN SHARE MODE;")
+    return await executor.all(
         f"""
         SELECT source.source_id,
                source.endpoint_id,
+               to_jsonb(source) AS source_record_json,
                dataset.dataset_id,
+               COALESCE(
+                   dataset.acquisition_root_run_id,
+                   dataset.import_run_id
+               ) AS evidence_run_id,
                COALESCE(
                    dataset.publication_metadata_json::jsonb -> 'selected_resources',
                    '[]'::jsonb
                ) AS selected_resources,
-               COALESCE(
-                   dataset.publication_metadata_json::jsonb -> 'expected_resources',
-                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
-                   '[]'::jsonb
-               ) AS expected_resources
+               dataset.publication_metadata_json::jsonb -> 'expected_resources'
+                   AS recorded_expected_resources
           FROM {source_ref} AS source
           JOIN {dataset_ref} AS dataset
             ON dataset.endpoint_id = source.endpoint_id
-         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+         WHERE source.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
            AND dataset.is_current = true
            AND dataset.status = :published_status
            AND dataset.superseded_at IS NULL
          ORDER BY source.source_id, source.endpoint_id, dataset.dataset_id
          FOR SHARE OF source, dataset;
         """,
-        source_ids=fence.source_ids,
+        endpoint_ids=fence.endpoint_ids,
         published_status=ENDPOINT_DATASET_PUBLISHED,
     )
 
@@ -7436,30 +7624,21 @@ def _assert_locked_artifact_fence_tuples(
     locked_tuple_rows: list[Any],
 ) -> None:
     """Ensure the held source, endpoint, and dataset tuples remain exact."""
-    actual_tuples: list[tuple[str, str, str]] = []
-    actual_selected_resources_by_tuple: dict[tuple[str, str, str], tuple[str, ...]] = {}
-    actual_expected_resources_by_tuple: dict[tuple[str, str, str], tuple[str, ...]] = {}
-    for tuple_row in locked_tuple_rows:
-        tuple_row_map = _pagination_checkpoint_row_mapping(tuple_row)
-        source_endpoint_dataset_parts = tuple(
-            _clean_text(tuple_row_map.get(column)) or ""
-            for column in ("source_id", "endpoint_id", "dataset_id")
-        )
-        actual_tuples.append(source_endpoint_dataset_parts)
-        actual_selected_resources_by_tuple[source_endpoint_dataset_parts] = tuple(
-            sorted(set(_json_text_list(tuple_row_map.get("selected_resources"))))
-        )
-        actual_expected_resources_by_tuple[source_endpoint_dataset_parts] = tuple(
-            sorted(
-                set(
-                    _json_text_list(
-                        tuple_row_map.get("expected_resources")
-                        or tuple_row_map.get("selected_resources")
-                    )
-                )
+    actual_datasets = [
+        dataset
+        for tuple_row in locked_tuple_rows
+        if (
+            dataset := _provider_directory_artifact_dataset_from_row(
+                tuple_row
             )
         )
-    if tuple(sorted(actual_tuples)) != fence.source_endpoint_dataset_tuples:
+        is not None
+    ]
+    actual_by_tuple = {
+        (dataset.source_id, dataset.endpoint_id, dataset.dataset_id): dataset
+        for dataset in actual_datasets
+    }
+    if tuple(sorted(actual_by_tuple)) != fence.source_endpoint_dataset_tuples:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_source_endpoint_dataset_changed"
         )
@@ -7470,18 +7649,25 @@ def _assert_locked_artifact_fence_tuples(
             dataset.dataset_id,
         )
         if (
-            actual_selected_resources_by_tuple.get(expected_tuple)
+            actual_by_tuple[expected_tuple].selected_resources
             != dataset.selected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_metadata_changed"
             )
         if (
-            actual_expected_resources_by_tuple.get(expected_tuple)
+            actual_by_tuple[expected_tuple].expected_resources
             != dataset.expected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_expected_metadata_changed"
+            )
+        if (
+            actual_by_tuple[expected_tuple].recorded_expected_resources
+            != dataset.recorded_expected_resources
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_recorded_metadata_changed"
             )
 
 @contextlib.asynccontextmanager
@@ -7497,25 +7683,51 @@ async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIter
 
 
 @contextlib.asynccontextmanager
+async def _provider_directory_artifact_generation_guard(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> AsyncIterator[None]:
+    """Hold source and endpoint identity stable across all artifact cutovers."""
+    if not fence.datasets:
+        yield
+        return
+    async with db.acquire() as guard_connection:
+        await _lock_and_verify_artifact_dataset_fence(
+            fence,
+            guard_connection,
+        )
+        yield
+
+
+@contextlib.asynccontextmanager
 async def _provider_directory_artifact_dataset_scope(
     *,
     run_id: str | None,
     source_ids: list[str] | tuple[str, ...] | None,
     fence: ProviderDirectoryArtifactDatasetFence | None = None,
     metrics: dict[str, Any] | None = None,
+    resource_types: frozenset[str] | None = None,
 ) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
     """Materialize and clean one bounded alias-aware artifact source scope."""
     schema = _schema()
     fence = fence or await _resolve_provider_directory_artifact_datasets(source_ids)
     async with _provider_directory_artifact_scope_guard(schema):
         reaped_tables = await _reap_provider_directory_artifact_scope_tables(schema)
-        projection = await _provider_directory_artifact_scope_projection(fence)
+        scoped_resource_types = (
+            resource_types
+            if resource_types is not None
+            else PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
+        )
+        projection = await _provider_directory_artifact_scope_projection(
+            fence,
+            scoped_resource_types,
+        )
         _assert_provider_directory_artifact_scope_capacity(projection)
         _record_artifact_scope_metrics(metrics, projection, reaped_tables)
         relation_overrides, created_tables = await _materialize_artifact_scope_tables(
             schema,
             run_id,
             fence,
+            scoped_resource_types,
         )
         try:
             relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
@@ -7542,6 +7754,7 @@ def _record_artifact_scope_metrics(
     metrics["artifact_scope_alias_count"] = projection["alias_count"]
     metrics["artifact_scope_dataset_rows"] = projection["dataset_rows"]
     metrics["artifact_scope_projected_rows"] = projection["projected_rows"]
+    metrics["artifact_scope_resource_types"] = projection["resource_types"]
     metrics["artifact_scope_alias_amplification"] = projection[
         "alias_amplification"
     ]
@@ -7558,6 +7771,7 @@ async def _materialize_artifact_scope_tables(
     schema: str,
     run_id: str | None,
     fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
 ) -> tuple[dict[str, str], list[str]]:
     source_table = _provider_directory_artifact_scope_table_name(
         ProviderDirectorySource.__tablename__,
@@ -7565,24 +7779,29 @@ async def _materialize_artifact_scope_tables(
     )
     created_tables = [source_table]
     relation_by_table = {ProviderDirectorySource.__tablename__: source_table}
-    await _materialize_provider_directory_artifact_source_scope(
-        schema,
-        source_table,
-        [dataset.source_id for dataset in fence.datasets],
-    )
-    for model in RESOURCE_MODELS:
-        scope_table = _provider_directory_artifact_scope_table_name(
-            model.__tablename__,
-            run_id,
-        )
-        created_tables.append(scope_table)
-        await _materialize_provider_directory_artifact_resource_scope(
+    try:
+        await _materialize_provider_directory_artifact_source_scope(
             schema,
-            scope_table,
-            model,
-            fence,
+            source_table,
+            [dataset.source_id for dataset in fence.datasets],
         )
-        relation_by_table[model.__tablename__] = scope_table
+        for model in RESOURCE_MODELS:
+            scope_table = _provider_directory_artifact_scope_table_name(
+                model.__tablename__,
+                run_id,
+            )
+            created_tables.append(scope_table)
+            await _materialize_provider_directory_artifact_resource_scope(
+                schema,
+                scope_table,
+                model,
+                fence,
+                resource_types,
+            )
+            relation_by_table[model.__tablename__] = scope_table
+    except BaseException:
+        await _drop_artifact_scope_tables(schema, created_tables)
+        raise
     return relation_by_table, created_tables
 
 
@@ -7722,27 +7941,33 @@ async def _publish_provider_directory_dataset_artifacts(
         publish_artifacts_targets=publish_artifacts_targets,
         publish_corroboration=publish_corroboration,
     )
+    artifact_resource_types = _provider_directory_artifact_resource_types(
+        publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+    )
     async with _provider_directory_artifact_dataset_scope(
         run_id=run_id,
         source_ids=source_ids,
         fence=fence,
         metrics=metrics,
+        resource_types=artifact_resource_types,
     ):
-        metrics["artifact_dataset_ids"] = sorted(
-            {dataset.dataset_id for dataset in fence.datasets}
-        )
-        metrics["artifact_dataset_evidence_run_ids"] = sorted(
-            {dataset.evidence_run_id for dataset in fence.datasets}
-        )
-        return await _publish_provider_directory_artifacts(
-            run_id=run_id,
-            metrics=metrics,
-            address_key_run_id=None,
-            publish_scope_run_id=None,
-            source_ids=[dataset.source_id for dataset in fence.datasets],
-            publish_corroboration=publish_corroboration,
-            publish_artifacts_targets=publish_artifacts_targets,
-        )
+        async with _provider_directory_artifact_generation_guard(fence):
+            metrics["artifact_dataset_ids"] = sorted(
+                {dataset.dataset_id for dataset in fence.datasets}
+            )
+            metrics["artifact_dataset_evidence_run_ids"] = sorted(
+                {dataset.evidence_run_id for dataset in fence.datasets}
+            )
+            return await _publish_provider_directory_artifacts(
+                run_id=run_id,
+                metrics=metrics,
+                address_key_run_id=None,
+                publish_scope_run_id=None,
+                source_ids=[dataset.source_id for dataset in fence.datasets],
+                publish_corroboration=publish_corroboration,
+                publish_artifacts_targets=publish_artifacts_targets,
+            )
 
 
 async def _publish_selected_provider_directory_artifacts(
@@ -19367,16 +19592,26 @@ def _endpoint_dataset_expected_resources(
     source_records: list[dict[str, Any]],
 ) -> tuple[str, ...]:
     """Return the complete enumerable profile required for current publication."""
-    return tuple(
-        sorted(
-            set(
-                _endpoint_dataset_selected_resources(
-                    source_records,
-                    list(DEFAULT_RESOURCES),
+    expected_profiles = {
+        tuple(
+            sorted(
+                set(
+                    _endpoint_dataset_selected_resources(
+                        [source_record],
+                        list(DEFAULT_RESOURCES),
+                    )
                 )
             )
         )
-    )
+        for source_record in source_records
+    }
+    if not expected_profiles:
+        return ()
+    if len(expected_profiles) != 1:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_alias_profiles_ambiguous"
+        )
+    return next(iter(expected_profiles))
 
 
 def _pagination_checkpoint_table_ref() -> str:
