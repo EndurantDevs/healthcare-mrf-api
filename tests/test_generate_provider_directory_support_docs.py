@@ -34,9 +34,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered_document
     assert "AmeriHealth Caritas NH (`amerihealth-nh`) | Probe-only | None | Probe | None configured" in rendered_document
-    assert "Incapsula HTTP 403 from worker egress" in rendered_document
-    assert "identical 21,809,233-resource counts" in rendered_document
-    assert "one canonical-lane proof of whether the dataset is shared" in rendered_document
+    assert "worker-pod probes return HTTP 200" in rendered_document
+    assert "identical 21,809,233-resource totals" in rendered_document
+    assert "one canonical lane proves full-profile parity" in rendered_document
     assert "## Inventory Summary" in rendered_document
     assert "| Acquisition-configured | 17 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
@@ -339,7 +339,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("hap", "throttles requests to 20 seconds"),
         ("washington", "HealthcareService preflight timed out"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
-        ("amerihealth-nh", "Incapsula HTTP 403 from worker egress"),
+        ("amerihealth-nh", "worker-pod probes return HTTP 200"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
         ("uhc", "requires two identical graph snapshots"),

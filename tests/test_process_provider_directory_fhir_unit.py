@@ -457,13 +457,15 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
     assert row["canonical_api_base"] == expected_base
     assert row["requires_registration"] is False
     assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "waf_blocked"
+    assert row["last_validated_status"] == "shared_backend_unverified"
     assert row["endpoint_practitioner"] == f"{expected_base}/Practitioner"
     assert row["endpoint_location"] == f"{expected_base}/Location"
     assert row["metadata_json"]["provider_directory_override"] == "amerihealth_caritas_api_ext_provider_api"
     assert row["metadata_json"]["provider_directory_plan_code"] == "5400"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == f"{expected_base}/metadata"
-    assert row["metadata_json"]["provider_directory_supported_resources"] == []
+    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
+        importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+    )
     assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
     assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
 

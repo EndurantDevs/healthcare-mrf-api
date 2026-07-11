@@ -3815,7 +3815,7 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
         "canonical_api_base": provider_base,
         "requires_registration": False,
         "auth_type": "none",
-        "last_validated_status": "waf_blocked",
+        "last_validated_status": "shared_backend_unverified",
         "endpoints": _source_override_endpoint_fields(provider_base),
         "metadata": {
             "provider_directory_override": "amerihealth_caritas_api_ext_provider_api",
@@ -3829,13 +3829,16 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
             "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
             "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
             "provider_directory_plan_code": plan_code,
-            "provider_directory_supported_resources": [],
+            "provider_directory_supported_resources": list(
+                AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+            ),
             "provider_directory_fully_enumerable_resources": [],
             "provider_directory_coverage_mode": "probe_only",
             "provider_directory_acquisition_blocked_reason": (
-                "Incapsula returns HTTP 403 from worker egress and all configured "
-                "plan-code bases expose identical proxy counts; one canonical lane "
-                "must be proven before acquisition is enabled."
+                "Worker-pod probes can page anonymously, but all configured plan-code "
+                "bases expose the same first Practitioner hash and identical prior "
+                "counts; one canonical lane and shared-backend identity must be proven "
+                "before acquisition is enabled."
             ),
         },
     }
