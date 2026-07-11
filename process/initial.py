@@ -66,6 +66,9 @@ PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 logger = logging.getLogger(__name__)
 MRF_QUEUE_NAME = "arq:MRF"
 MRF_FINISH_QUEUE_NAME = "arq:MRF_finish"
+MRF_RECOVERABLE_FUNCTIONS = frozenset(
+    {"process_json_index", "process_plan", "process_provider", "process_formulary"}
+)
 _POSTGRES_SETTING_RE = re.compile(r"^\d+(?:\.\d+)?\s*[A-Za-z]*$")
 _MRF_ADDRESS_SUMMARY_DEFERRED_INDEX_NAMES = {
     "address_sources",
@@ -227,9 +230,19 @@ async def _init_mrf_run_state(redis, run_id: str) -> None:
     total_key = _mrf_state_key(run_id, "total_work")
     done_key = _mrf_state_key(run_id, "done_work")
     expected_key = _mrf_state_key(run_id, "expected_work")
+    pending_key = _mrf_state_key(run_id, "pending_work")
+    recovery_attempts_key = _mrf_state_key(run_id, "recovery_attempts")
     lock_key = _mrf_state_key(run_id, "finalize_lock")
     finalized_key = _mrf_state_key(run_id, "finalized")
-    await redis.delete(total_key, done_key, expected_key, lock_key, finalized_key)
+    await redis.delete(
+        total_key,
+        done_key,
+        expected_key,
+        pending_key,
+        recovery_attempts_key,
+        lock_key,
+        finalized_key,
+    )
     await redis.set(total_key, "0")
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
 
@@ -242,9 +255,21 @@ async def _increment_mrf_total_work(redis, run_id: str, delta: int) -> None:
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
 
 
-async def _register_mrf_work(redis, run_id: str, work_id: str) -> bool:
+async def _register_mrf_work(
+    redis,
+    run_id: str,
+    work_id: str,
+    *,
+    function_name: str | None = None,
+    task: dict | None = None,
+) -> bool:
     if not redis or not run_id or not work_id:
         return False
+    if function_name and task is not None:
+        pending_key = _mrf_state_key(run_id, "pending_work")
+        payload = serialize_job({"function": function_name, "task": task})
+        await redis.hsetnx(pending_key, work_id, payload)
+        await redis.expire(pending_key, _mrf_run_state_ttl_seconds())
     expected_key = _mrf_state_key(run_id, "expected_work")
     added = await redis.sadd(expected_key, work_id)
     await redis.expire(expected_key, _mrf_run_state_ttl_seconds())
@@ -261,6 +286,7 @@ async def _mark_mrf_work_done(ctx: dict, work_id: str) -> None:
     done_key = _mrf_state_key(run_id, "done_work")
     await redis.sadd(done_key, work_id)
     await redis.expire(done_key, _mrf_run_state_ttl_seconds())
+    await redis.hdel(_mrf_state_key(run_id, "pending_work"), work_id)
 
 
 async def _get_mrf_run_progress(redis, run_id: str) -> tuple[int, int]:
@@ -271,6 +297,97 @@ async def _get_mrf_run_progress(redis, run_id: str) -> tuple[int, int]:
     total_work = _safe_int(await redis.get(total_key), 0)
     done_work = _safe_int(await redis.scard(done_key), 0)
     return total_work, done_work
+
+
+async def _recover_missing_mrf_work(redis, run_id: str) -> dict:
+    expected_key = _mrf_state_key(run_id, "expected_work")
+    done_key = _mrf_state_key(run_id, "done_work")
+    pending_key = _mrf_state_key(run_id, "pending_work")
+    attempts_key = _mrf_state_key(run_id, "recovery_attempts")
+    raw_missing = await redis.sdiff(expected_key, done_key)
+    missing_ids = sorted(_decode_redis_text(raw_work_id) for raw_work_id in raw_missing)
+    batch_size = _env_int("HLTHPRT_MRF_RECOVERY_BATCH_SIZE", 100)
+    max_attempts = _env_int("HLTHPRT_MRF_RECOVERY_MAX_ATTEMPTS", 3)
+    recovery_by_state = {
+        "missing": len(missing_ids),
+        "recovered": 0,
+        "active": 0,
+        "unrecoverable": [],
+        "exhausted": [],
+    }
+
+    for work_id in missing_ids[:batch_size]:
+        raw_payload = await redis.hget(pending_key, work_id)
+        if not raw_payload:
+            recovery_by_state["unrecoverable"].append(work_id)
+            continue
+        if await _is_mrf_arq_job_active(redis, work_id):
+            recovery_by_state["active"] += 1
+            continue
+        attempts = _safe_int(await redis.hget(attempts_key, work_id), 0)
+        if attempts >= max_attempts:
+            recovery_by_state["exhausted"].append(work_id)
+            continue
+        try:
+            work_payload = deserialize_job(raw_payload)
+        except Exception:  # pragma: no cover - corrupt Redis payload
+            recovery_by_state["unrecoverable"].append(work_id)
+            continue
+        function_name = str(work_payload.get("function") or "") if isinstance(work_payload, dict) else ""
+        task = work_payload.get("task") if isinstance(work_payload, dict) else None
+        if function_name not in MRF_RECOVERABLE_FUNCTIONS or not isinstance(task, dict):
+            recovery_by_state["unrecoverable"].append(work_id)
+            continue
+
+        await redis.delete(f"arq:result:{work_id}", f"arq:retry:{work_id}")
+        job = await redis.enqueue_job(
+            function_name,
+            task,
+            _queue_name=MRF_QUEUE_NAME,
+            _job_id=work_id,
+        )
+        if job is None:
+            recovery_by_state["active"] += 1
+            continue
+        await redis.hincrby(attempts_key, work_id, 1)
+        await redis.expire(attempts_key, _mrf_run_state_ttl_seconds())
+        recovery_by_state["recovered"] += 1
+
+    return recovery_by_state
+
+
+async def _is_mrf_arq_job_active(redis, work_id: str) -> bool:
+    if await redis.exists(f"arq:job:{work_id}", f"arq:in-progress:{work_id}"):
+        return True
+    return await redis.zscore(MRF_QUEUE_NAME, work_id) is not None
+
+
+async def mrf_worker_shutdown(ctx: dict) -> None:
+    """Move a drained parser run into the finalizer lane."""
+    redis = ctx.get("redis")
+    run_id = _mrf_run_state_id(ctx)
+    if not redis or not run_id:
+        return
+    if await redis.zcard(MRF_QUEUE_NAME):
+        return
+    total_work, done_work = await _get_mrf_run_progress(redis, run_id)
+    if not total_work:
+        return
+    message = f"parser queue drained at {done_work}/{total_work} work item(s)"
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="mrf finalizing parser queue drained",
+        progress_message=message,
+        progress={
+            "unit": "work_items",
+            "total": total_work,
+            "done": done_work,
+            "pct": min(90, int((done_work / max(total_work, 1)) * 90)),
+            "message": message,
+            "phase": "mrf finalizing parser queue drained",
+        },
+    )
 
 
 async def _claim_mrf_finalize_lock(redis, run_id: str) -> bool:
@@ -457,8 +574,6 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
     run_scope = _mrf_job_scope(ctx)
     for idx, chunk in enumerate(chunks):
         work_id = _mrf_url_job_id(f"{kind}-chunk", run_scope, f"{source_url}:{idx}")
-        if not await _register_mrf_work(redis, run_scope, work_id):
-            continue
         chunk_task = {
             **task,
             "url": source_url,
@@ -468,11 +583,16 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
             "chunk_index": idx,
             "chunk_count": len(chunks),
         }
+        if not await _register_mrf_work(
+            redis,
+            run_scope,
+            work_id,
+            function_name=function_name,
+            task=chunk_task,
+        ):
+            continue
         await redis.enqueue_job(
-            function_name,
-            chunk_task,
-            _queue_name=MRF_QUEUE_NAME,
-            _job_id=work_id,
+            function_name, chunk_task, _queue_name=MRF_QUEUE_NAME, _job_id=work_id
         )
     logger.info(
         "Enqueued %s %s chunk job(s) for %s (%s bytes)",
@@ -2258,11 +2378,23 @@ async def process_json_index(ctx, task):
                 ):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
                     work_id = _mrf_url_job_id("plan", job_scope, str(url))
-                    if not await _register_mrf_work(redis, job_scope, work_id):
+                    plan_task_dict = {
+                        "url": url,
+                        "issuer_array": issuer_array,
+                        "context": ctx["context"],
+                        "work_id": work_id,
+                    }
+                    if not await _register_mrf_work(
+                        redis,
+                        job_scope,
+                        work_id,
+                        function_name="process_plan",
+                        task=plan_task_dict,
+                    ):
                         continue
                     await redis.enqueue_job(
                         "process_plan",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
+                        plan_task_dict,
                         _queue_name=MRF_QUEUE_NAME,
                         _job_id=work_id,
                     )
@@ -2289,11 +2421,23 @@ async def process_json_index(ctx, task):
                 ):
                     print(f"Formulary URL: {url}")
                     work_id = _mrf_url_job_id("formulary", job_scope, str(url))
-                    if not await _register_mrf_work(redis, job_scope, work_id):
+                    formulary_task_dict = {
+                        "url": url,
+                        "issuer_array": issuer_array,
+                        "context": ctx["context"],
+                        "work_id": work_id,
+                    }
+                    if not await _register_mrf_work(
+                        redis,
+                        job_scope,
+                        work_id,
+                        function_name="process_formulary",
+                        task=formulary_task_dict,
+                    ):
                         continue
                     await redis.enqueue_job(
                         "process_formulary",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
+                        formulary_task_dict,
                         _queue_name=MRF_QUEUE_NAME,
                         _job_id=work_id,
                     )
@@ -2337,11 +2481,23 @@ async def process_json_index(ctx, task):
                     seen_provider_urls.add(url)
                     print(f"Provider URL: {url}")
                     work_id = _mrf_url_job_id("provider", job_scope, url)
-                    if not await _register_mrf_work(redis, job_scope, work_id):
+                    provider_task_dict = {
+                        "url": url,
+                        "issuer_array": issuer_array,
+                        "context": ctx["context"],
+                        "work_id": work_id,
+                    }
+                    if not await _register_mrf_work(
+                        redis,
+                        job_scope,
+                        work_id,
+                        function_name="process_provider",
+                        task=provider_task_dict,
+                    ):
                         continue
                     await redis.enqueue_job(
                         "process_provider",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
+                        provider_task_dict,
                         _queue_name=MRF_QUEUE_NAME,
                         _job_id=work_id,
                     )
@@ -2843,16 +2999,23 @@ async def init_file(ctx, task=None):
 
         for idx, url in enumerate(selected_urls):
             work_id = _mrf_url_job_id("index", _mrf_job_scope(ctx), url)
-            if not await _register_mrf_work(redis, state_run_id, work_id):
+            index_task_dict = {
+                "url": url,
+                "issuer_array": url2issuer[url],
+                "context": ctx["context"],
+                "work_id": work_id,
+            }
+            if not await _register_mrf_work(
+                redis,
+                state_run_id,
+                work_id,
+                function_name="process_json_index",
+                task=index_task_dict,
+            ):
                 continue
             await redis.enqueue_job(
                 "process_json_index",
-                {
-                    "url": url,
-                    "issuer_array": url2issuer[url],
-                    "context": ctx["context"],
-                    "work_id": work_id,
-                },
+                index_task_dict,
                 _queue_name=MRF_QUEUE_NAME,
                 _job_id=work_id,
             )
@@ -2882,6 +3045,9 @@ async def startup(ctx):
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
     ctx["context"]["run"] = 0
+    control_run_id = os.environ.get("HLTHPRT_CONTROL_RUN_ID")
+    if control_run_id:
+        ctx["context"]["control_run_id"] = control_run_id
     override_import_id = os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE")
     if override_import_id:
         ctx["context"]["import_date"] = override_import_id
@@ -2917,12 +3083,74 @@ async def shutdown(ctx, task):
             wait_count = _safe_int(task.get("mrf_finalize_waits"), 0)
             max_waits = _env_int("HLTHPRT_MRF_FINISH_MAX_REQUEUES", 360)
             delay_seconds = _env_int("HLTHPRT_MRF_FINISH_REQUEUE_SECONDS", 60)
+            recovery = await _recover_missing_mrf_work(redis, state_run_id)
             pct = min(89, int((done_work / max(total_work, 1)) * 85))
             message = f"waiting for parser jobs {done_work}/{total_work}"
+            if recovery["recovered"]:
+                message += f"; requeued {recovery['recovered']} missing work item(s)"
+            if recovery["active"]:
+                message += f"; {recovery['active']} still active"
+            blocked_ids = [*recovery["unrecoverable"], *recovery["exhausted"]]
+            failure_waits = _env_int("HLTHPRT_MRF_RECOVERY_FAILURE_WAITS", 5)
+            if blocked_ids and wait_count >= failure_waits:
+                error_dict = {
+                    "code": "mrf_parser_recovery_failed",
+                    "message": "MRF parser work could not be recovered",
+                    "done_work": done_work,
+                    "total_work": total_work,
+                    "unrecoverable_work_ids": recovery["unrecoverable"][:20],
+                    "exhausted_work_ids": recovery["exhausted"][:20],
+                }
+                await mark_control_run(
+                    run_id,
+                    status="failed",
+                    phase_detail="mrf parser recovery failed",
+                    progress_message=error_dict["message"],
+                    error=error_dict,
+                    progress={
+                        "unit": "work_items",
+                        "total": total_work,
+                        "done": done_work,
+                        "pct": pct,
+                        "message": error_dict["message"],
+                        "phase": "mrf parser recovery failed",
+                        "recovery": recovery,
+                    },
+                )
+                raise RuntimeError(
+                    f"MRF parser recovery failed: done={done_work} total={total_work}"
+                )
+            if wait_count >= max_waits:
+                error_dict = {
+                    "code": "mrf_parser_jobs_incomplete",
+                    "message": "MRF finalization waited too long for parser jobs",
+                    "done_work": done_work,
+                    "total_work": total_work,
+                }
+                await mark_control_run(
+                    run_id,
+                    status="failed",
+                    phase_detail="mrf parser jobs incomplete",
+                    progress_message=error_dict["message"],
+                    error=error_dict,
+                    progress={
+                        "unit": "work_items",
+                        "total": total_work,
+                        "done": done_work,
+                        "pct": pct,
+                        "message": error_dict["message"],
+                        "phase": "mrf parser jobs incomplete",
+                        "recovery": recovery,
+                    },
+                )
+                raise RuntimeError(
+                    f"MRF finalization waited too long for parser jobs: done={done_work} total={total_work}"
+                )
+            phase = "mrf parser recovery queued" if recovery["recovered"] else "mrf parser jobs running"
             await mark_control_run(
                 run_id,
                 status="running",
-                phase_detail="mrf parser jobs running",
+                phase_detail=phase,
                 progress_message=message,
                 progress={
                     "unit": "work_items",
@@ -2930,13 +3158,10 @@ async def shutdown(ctx, task):
                     "done": done_work,
                     "pct": pct,
                     "message": message,
-                    "phase": "mrf parser jobs running",
+                    "phase": phase,
+                    "recovery": recovery,
                 },
             )
-            if wait_count >= max_waits:
-                raise RuntimeError(
-                    f"MRF finalization waited too long for parser jobs: done={done_work} total={total_work}"
-                )
             await redis.enqueue_job(
                 "shutdown",
                 {
