@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Commit message policy
         run: python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
       - uses: actions/setup-python@v6
@@ -52,7 +54,17 @@ jobs:
       - name: Check Provider Directory support documentation
         run: python scripts/generate_provider_directory_support_docs.py --check
       - name: Readability budget
-        run: python scripts/readability_budget.py
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            git show "$BASE_SHA:readability-baseline.json" > "$RUNNER_TEMP/readability-base.json"
+            python scripts/readability_budget.py \
+              --ratchet-baseline "$RUNNER_TEMP/readability-base.json" \
+              --required-reduction-percent 1
+          else
+            python scripts/readability_budget.py
+          fi
       - name: Guard request-time external calls
         run: python scripts/ci/request_time_external_call_guard.py
       - name: Run control-plane unit tests
