@@ -175,8 +175,11 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     assert "SECRET" not in serialized_docs
     assert '"error"' not in serialized_snapshot
     assert "| Idaho (`idaho`) | Current | Succeeded | Complete | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
-    assert '"InsurancePlan": {' in serialized_docs
-    assert '"sources_bounded": 0' in serialized_docs
+    assert '"InsurancePlan": {' in serialized_snapshot
+    assert '"sources_bounded": 0' in serialized_snapshot
+    assert "| Rows by resource |" in serialized_docs
+    assert "| Evidence recorded |" in serialized_docs
+    assert '"InsurancePlan": {' not in serialized_docs
     assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded" in serialized_docs
 
 
