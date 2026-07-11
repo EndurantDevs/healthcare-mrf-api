@@ -821,6 +821,17 @@ concrete FHIR base. Runtime probes still decide whether the base is reachable
 from the import environment; connection timeouts stay as probe diagnostics
 instead of converting a landing page into a resource import.
 
+Optum caps broad PractitionerRole, Practitioner, Organization,
+OrganizationAffiliation, and Location searches at 10,000 rows and does not
+publish Bulk or an exhaustive residual search. Full-refresh imports therefore
+use an InsurancePlan-anchored graph contract: enumerate every plan network,
+page PractitionerRole and OrganizationAffiliation for each network, validate
+the returned network predicate, and resolve every referenced Practitioner,
+Organization, and Location exactly. The graph must produce the same content
+fingerprint twice before publication. Metrics report `plan_graph_complete`
+separately from `collection_complete`; the latter remains false so clients and
+operators cannot mistake the curated plan graph for exhaustive raw collections.
+
 SCAN Health Plan seed rows can point at the developer portal
 `https://developer.scanhealthplan.com`. The portal's embedded Provider Directory
 OpenAPI spec advertises `https://providerdirectory.scanhealthplan.com` as the

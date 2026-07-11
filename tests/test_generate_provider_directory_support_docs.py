@@ -333,7 +333,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("amerihealth-nh", "Plan code 0900; full-refresh pages target 250 rows"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
-        ("uhc", "full acquisition currently fails closed"),
+        ("uhc", "requires two identical graph snapshots"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "core resource searches return HAPI HTTP 403"),
         ("missouri", "Location continuation pages changed page size and total semantics"),
