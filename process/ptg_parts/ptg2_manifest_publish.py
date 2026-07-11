@@ -1822,6 +1822,24 @@ async def _dedupe_ptg2_manifest_serving_table(schema_name: str, final_table: str
     }
 
 
+def _known_or_deduped_serving_rows(
+    *,
+    known_counts: Mapping[str, int | None] | None,
+    dedupe_metrics: Mapping[str, Any],
+    serving_deduped: bool,
+) -> int | None:
+    """Return a trustworthy row count after any normal serving dedupe."""
+    if dedupe_metrics.get("rescue"):
+        return None
+    if serving_deduped:
+        serving_metrics = dedupe_metrics.get("serving")
+        if not isinstance(serving_metrics, Mapping) or serving_metrics.get("after") is None:
+            return None
+        return max(int(serving_metrics["after"]), 0)
+    known_serving_rows = (known_counts or {}).get("serving_rows")
+    return max(int(known_serving_rows), 0) if known_serving_rows is not None else None
+
+
 async def _dedupe_ptg2_manifest_price_atom_table(schema_name: str, price_atom_table: str) -> dict[str, int]:
     price_atom_rows_before_dedupe = await _exact_table_rows(schema_name, price_atom_table)
     price_atom_dedup_table = _ptg2_snapshot_index_name(price_atom_table, "dedup")
@@ -3151,9 +3169,13 @@ async def _publish_ptg2_manifest_serving_snapshot(
         serving_table=serving_work_table,
     )
     stage_started_at = time.monotonic()
-    known_serving_rows = (known_counts or {}).get("serving_rows")
-    if known_serving_rows is not None and not dedupe_metrics.get("rescue"):
-        row_count = max(int(known_serving_rows), 0)
+    trusted_serving_rows = _known_or_deduped_serving_rows(
+        known_counts=known_counts,
+        dedupe_metrics=dedupe_metrics,
+        serving_deduped=serving_deduped,
+    )
+    if trusted_serving_rows is not None:
+        row_count = trusted_serving_rows
         publish_stage_timings["count_serving_rows"] = 0.0
     else:
         row_count = await _exact_table_rows(schema_name, serving_work_table)

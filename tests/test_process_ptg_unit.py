@@ -7250,6 +7250,37 @@ def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypa
     assert result["dedupe"]["serving"] == {"before": 10, "after": 9, "dropped": 1}
 
 
+def test_manifest_publish_uses_post_dedupe_serving_count():
+    dedupe_metrics_map = {
+        "serving": {"before": 10, "after": 9, "dropped": 1},
+    }
+
+    assert (
+        ptg_manifest_publish._known_or_deduped_serving_rows(
+            known_counts={"serving_rows": 10},
+            dedupe_metrics=dedupe_metrics_map,
+            serving_deduped=True,
+        )
+        == 9
+    )
+    assert (
+        ptg_manifest_publish._known_or_deduped_serving_rows(
+            known_counts={"serving_rows": 10},
+            dedupe_metrics={},
+            serving_deduped=False,
+        )
+        == 10
+    )
+    assert (
+        ptg_manifest_publish._known_or_deduped_serving_rows(
+            known_counts={"serving_rows": 10},
+            dedupe_metrics={**dedupe_metrics_map, "rescue": True},
+            serving_deduped=True,
+        )
+        is None
+    )
+
+
 def _manifest_copy_successful_files(source_files_by_kind):
     return [
         {
