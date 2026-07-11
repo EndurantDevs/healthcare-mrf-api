@@ -10,9 +10,8 @@ import os
 import queue
 import subprocess
 import threading
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NamedTuple
 
 try:
     import orjson
@@ -185,8 +184,7 @@ def _format_object_rate(value: float | None) -> str | None:
     return f"{value:.0f} objects/s"
 
 
-@dataclass(frozen=True)
-class _ScannerProgress:
+class _ScannerProgress(NamedTuple):
     compressed_bytes: int | None
     total_bytes: int | None
     percent: float | None
