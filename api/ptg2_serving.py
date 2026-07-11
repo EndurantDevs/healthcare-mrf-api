@@ -6722,6 +6722,12 @@ async def _membership_location_rows(
         prior_planner_settings = await _enable_serial_knn_planning(session)
     try:
         query_result = await session.execute(location_statement, query_context.parameter_map)
+    except Exception:
+        # PostgreSQL errors abort the transaction; its rollback also restores
+        # transaction-local planner settings. A restore query would only mask
+        # the original failure while the transaction is aborted.
+        raise
+    try:
         return [_row_mapping(query_row) for query_row in query_result]
     finally:
         if prior_planner_settings is not None:

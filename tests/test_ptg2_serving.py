@@ -1911,7 +1911,7 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
 
 
 @pytest.mark.asyncio
-async def test_membership_location_rows_restores_planner_settings_after_query_failure(monkeypatch):
+async def test_membership_location_rows_does_not_mask_query_failure_with_restore(monkeypatch):
     session = FakeSession([RuntimeError("location query failed")])
     tables = ptg2_serving.PTG2ServingTables(
         provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test"
@@ -1931,8 +1931,8 @@ async def test_membership_location_rows_restores_planner_settings_after_query_fa
             limit=100,
         )
 
-    assert len(session.calls) == 3
-    assert "set_config('plan_cache_mode', :plan_cache_mode, true)" in str(session.calls[-1][0][0])
+    assert len(session.calls) == 2
+    assert "set_config('plan_cache_mode', :plan_cache_mode, true)" not in str(session.calls[-1][0][0])
 
 
 @pytest.mark.asyncio
