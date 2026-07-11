@@ -186,6 +186,7 @@ PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT = "500ms"
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT = "1000ms"
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS = 2.0
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS = 0.2
+DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS = 50_000_000
 PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
     "source_network_idx",
     "source_idx",
@@ -236,6 +237,33 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
     "network": ("network_catalog",),
     "networks": ("network_catalog",),
     "ptg_corroboration": ("corroboration",),
+}
+PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
+    "location_contacts": (frozenset({"Location"}),),
+    "location_coordinates": (frozenset({"Location"}),),
+    "resource_id_npis": (
+        frozenset({"Practitioner"}),
+        frozenset({"Organization"}),
+    ),
+    "location_address_keys": (frozenset({"Location"}),),
+    "location_archive": (
+        frozenset({"Location"}),
+        frozenset({"Organization"}),
+    ),
+    "address_overlay": (
+        frozenset({"Location", "Practitioner", "PractitionerRole"}),
+        frozenset({"Location", "Organization", "OrganizationAffiliation"}),
+        frozenset({"Organization"}),
+    ),
+    "network_catalog": (
+        frozenset({"InsurancePlan"}),
+        frozenset({"PractitionerRole"}),
+        frozenset({"OrganizationAffiliation"}),
+    ),
+    "corroboration": (
+        frozenset({"InsurancePlan", "Location", "PractitionerRole"}),
+        frozenset({"InsurancePlan", "Organization"}),
+    ),
 }
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
@@ -346,6 +374,18 @@ PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIAL
 _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "provider_directory_credentials_file_override",
     default=None,
+)
+_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str, str]] = (
+    contextvars.ContextVar(
+        "provider_directory_artifact_relation_overrides",
+        default={},
+    )
+)
+_PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE: contextvars.ContextVar[Any | None] = (
+    contextvars.ContextVar(
+        "provider_directory_artifact_dataset_fence",
+        default=None,
+    )
 )
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
@@ -899,6 +939,7 @@ class EndpointDatasetCandidate:
     selected_resources: tuple[str, ...]
     import_run_id: str | None
     previous_dataset_id: str | None
+    expected_resources: tuple[str, ...] = ()
     checkpoint_context: PaginationCheckpointContext | None = None
     reused_from_checkpoint: bool = False
 
@@ -1557,7 +1598,11 @@ def _q(identifier: str) -> str:
 
 
 def _qt(schema: str, table: str) -> str:
-    return f"{_q(schema)}.{_q(table)}"
+    scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+        table,
+        table,
+    )
+    return f"{_q(schema)}.{_q(scoped_table)}"
 
 
 def _provider_directory_index_elements_sql(model: Any, index: dict[str, Any]) -> str:
@@ -3725,7 +3770,7 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
         "canonical_api_base": provider_base,
         "requires_registration": False,
         "auth_type": "none",
-        "last_validated_status": "valid",
+        "last_validated_status": "waf_blocked",
         "endpoints": _source_override_endpoint_fields(provider_base),
         "metadata": {
             "provider_directory_override": "amerihealth_caritas_api_ext_provider_api",
@@ -3739,8 +3784,13 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
             "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
             "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
             "provider_directory_plan_code": plan_code,
-            "provider_directory_supported_resources": list(
-                AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+            "provider_directory_supported_resources": [],
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_acquisition_blocked_reason": (
+                "Incapsula returns HTTP 403 from worker egress and all configured "
+                "plan-code bases expose identical proxy counts; one canonical lane "
+                "must be proven before acquisition is enabled."
             ),
         },
     }
@@ -5792,6 +5842,11 @@ async def _promote_provider_directory_artifact_stage_transaction(
         )
         if not acquired:
             raise ProviderDirectoryArtifactCutoverConflict(target_relation)
+        active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+        if active_fence is not None:
+            await _lock_and_verify_artifact_dataset_fence(
+                active_fence
+            )
         if build_fence is not None:
             current_target_oid = await _provider_directory_relation_oid(schema, target_relation)
             if current_target_oid != build_fence.target_oid:
@@ -5901,25 +5956,93 @@ async def _swap_address_corroboration_stage(
     )
 
 
+async def _populate_address_corroboration_stage(
+    schema: str,
+    stage_ref: str,
+    target_ref: str,
+    select_sql: str,
+    source_ids: list[str],
+) -> int:
+    """Create a stage while retaining corroboration outside a source scope."""
+    target_kind = await _provider_directory_relation_attribute(
+        schema,
+        PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+        "relkind",
+    )
+    if source_ids and target_kind is not None:
+        await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {stage_ref} AS
+            SELECT *
+              FROM {target_ref}
+             WHERE NOT (
+                 provider_directory_source_id = ANY(
+                     CAST(:source_ids AS varchar[])
+                 )
+             );
+            """,
+            source_ids=source_ids,
+        )
+        copied_existing = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0
+        )
+        await db.status(f"INSERT INTO {stage_ref}\n{select_sql};")
+        return copied_existing
+    await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
+    return 0
+
+
+def _address_corroboration_publication_metrics(
+    target_ref: str,
+    row_count: int,
+    network_catalog_metrics: dict[str, Any],
+    source_ids: list[str],
+    copied_existing: int,
+) -> dict[str, Any]:
+    metrics_by_field = {
+        "published": True,
+        "relation": target_ref,
+        "rows": row_count,
+        "storage": "table",
+        "network_catalog": network_catalog_metrics,
+    }
+    if source_ids:
+        metrics_by_field["copied_existing"] = copied_existing
+        metrics_by_field["source_ids"] = source_ids
+    return metrics_by_field
+
+
 async def publish_provider_directory_address_corroboration_table(
     db_schema: str | None = None,
     *,
     refresh_network_catalog: bool = True,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     schema = db_schema or _schema()
     relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    effective_source_ids = _clean_source_id_list(source_ids)
     network_catalog_metrics = (
-        await publish_provider_directory_network_catalog(schema)
+        await publish_provider_directory_network_catalog(
+            schema,
+            **({"source_ids": effective_source_ids} if effective_source_ids else {}),
+        )
         if refresh_network_catalog
         else await _ensure_provider_directory_network_catalog_populated(schema)
     )
     async with _provider_directory_artifact_build_guard(schema, relation) as build_fence:
         stage_table = _stage_table_name()
         stage_ref = _qt(schema, stage_table)
+        target_ref = _qt(schema, relation)
         select_sql = provider_directory_address_corroboration_select_sql(schema)
         try:
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
+            copied_existing = await _populate_address_corroboration_stage(
+                schema,
+                stage_ref,
+                target_ref,
+                select_sql,
+                effective_source_ids,
+            )
             row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
             await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
             await db.status(f"ANALYZE {stage_ref};")
@@ -5931,13 +6054,13 @@ async def publish_provider_directory_address_corroboration_table(
                 build_fence,
             )
             await db.status(f"ANALYZE {_qt(schema, relation)};")
-            return {
-                "published": True,
-                "relation": _qt(schema, relation),
-                "rows": row_count,
-                "storage": "table",
-                "network_catalog": network_catalog_metrics,
-            }
+            return _address_corroboration_publication_metrics(
+                target_ref,
+                row_count,
+                network_catalog_metrics,
+                effective_source_ids,
+                copied_existing,
+            )
         except Exception:
             try:
                 await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
@@ -6524,6 +6647,949 @@ async def _table_exists(db_schema: str, table_name: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class ProviderDirectoryArtifactDataset:
+    source_id: str
+    endpoint_id: str
+    dataset_id: str
+    evidence_run_id: str
+    selected_resources: tuple[str, ...] = ()
+    expected_resources: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProviderDirectoryArtifactDatasetFence:
+    datasets: tuple[ProviderDirectoryArtifactDataset, ...]
+
+    @property
+    def dataset_id_by_endpoint_id(self) -> dict[str, str]:
+        """Return the immutable dataset expected at each endpoint cutover."""
+        return {
+            dataset.endpoint_id: dataset.dataset_id
+            for dataset in self.datasets
+        }
+
+    @property
+    def source_endpoint_dataset_tuples(self) -> tuple[tuple[str, str, str], ...]:
+        """Return the source alias mapping that must still hold at cutover."""
+        return tuple(
+            sorted(
+                (
+                    dataset.source_id,
+                    dataset.endpoint_id,
+                    dataset.dataset_id,
+                )
+                for dataset in self.datasets
+            )
+        )
+
+    @property
+    def endpoint_ids(self) -> list[str]:
+        """Return the endpoint rows that serialize artifact cutover."""
+        return sorted({dataset.endpoint_id for dataset in self.datasets})
+
+    @property
+    def source_ids(self) -> list[str]:
+        """Return the source alias rows protected by this fence."""
+        return sorted({dataset.source_id for dataset in self.datasets})
+
+
+def _provider_directory_artifact_dataset_selection_sql(
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> str:
+    """Select explicit alias families or the unambiguous published endpoint set."""
+    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    selection_sql = (
+        _artifact_dataset_explicit_selection_sql(source_ref)
+        if source_ids
+        else _artifact_dataset_all_source_selection_sql(source_ref, dataset_ref)
+    )
+    return f"""
+        {selection_sql}
+        SELECT selected.source_id,
+               selected.endpoint_id,
+               dataset.dataset_id,
+               COALESCE(
+                   dataset.acquisition_root_run_id,
+                   dataset.import_run_id
+               ) AS evidence_run_id,
+               COALESCE(
+                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
+                   '[]'::jsonb
+               ) AS selected_resources,
+               COALESCE(
+                   dataset.publication_metadata_json::jsonb -> 'expected_resources',
+                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
+                   '[]'::jsonb
+               ) AS expected_resources
+          FROM selected_sources AS selected
+          LEFT JOIN {dataset_ref} AS dataset
+            ON dataset.endpoint_id = selected.endpoint_id
+           AND dataset.is_current = true
+           AND dataset.status = :published_status
+           AND dataset.superseded_at IS NULL
+         ORDER BY selected.source_id, dataset.dataset_id;
+    """
+
+
+def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
+    return f"""
+        WITH requested_sources AS MATERIALIZED (
+            SELECT source_id, endpoint_id
+              FROM {source_ref}
+             WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+        ), selected_sources AS MATERIALIZED (
+            SELECT source_id, endpoint_id
+              FROM requested_sources
+            UNION
+            SELECT sibling.source_id, sibling.endpoint_id
+              FROM {source_ref} AS sibling
+              JOIN requested_sources AS requested
+                ON requested.endpoint_id IS NOT NULL
+               AND sibling.endpoint_id = requested.endpoint_id
+        )
+    """
+
+
+def _artifact_dataset_all_source_selection_sql(
+    source_ref: str,
+    dataset_ref: str,
+) -> str:
+    return f"""
+        WITH published_endpoints AS MATERIALIZED (
+            SELECT dataset.endpoint_id
+              FROM {dataset_ref} AS dataset
+             WHERE dataset.is_current = true
+               AND dataset.status = :published_status
+               AND dataset.superseded_at IS NULL
+             GROUP BY dataset.endpoint_id
+            HAVING COUNT(*) = 1
+        ), selected_sources AS MATERIALIZED (
+            SELECT source.source_id, source.endpoint_id
+              FROM {source_ref} AS source
+              JOIN published_endpoints AS endpoint
+                ON endpoint.endpoint_id = source.endpoint_id
+        )
+    """
+
+
+def _provider_directory_artifact_dataset_from_row(
+    dataset_row: Any,
+) -> ProviderDirectoryArtifactDataset | None:
+    dataset_row_map = _pagination_checkpoint_row_mapping(dataset_row)
+    value_by_name = {
+        key: _clean_text(dataset_row_map.get(key))
+        for key in ("source_id", "endpoint_id", "dataset_id", "evidence_run_id")
+    }
+    if not all(value_by_name.values()):
+        return None
+    return ProviderDirectoryArtifactDataset(
+        source_id=value_by_name["source_id"] or "",
+        endpoint_id=value_by_name["endpoint_id"] or "",
+        dataset_id=value_by_name["dataset_id"] or "",
+        evidence_run_id=value_by_name["evidence_run_id"] or "",
+        selected_resources=tuple(
+            sorted(
+                set(
+                    _json_text_list(
+                        _pagination_checkpoint_row_mapping(dataset_row).get(
+                            "selected_resources"
+                        )
+                    )
+                )
+            )
+        ),
+        expected_resources=tuple(
+            sorted(
+                set(
+                    _json_text_list(
+                        _pagination_checkpoint_row_mapping(dataset_row).get(
+                            "expected_resources"
+                        )
+                        or _pagination_checkpoint_row_mapping(dataset_row).get(
+                            "selected_resources"
+                        )
+                    )
+                )
+            )
+        ),
+    )
+
+
+def _validate_provider_directory_artifact_datasets(
+    dataset_rows: list[Any],
+    requested_source_ids: list[str],
+) -> ProviderDirectoryArtifactDatasetFence:
+    """Turn a current-dataset query result into one exact alias fence."""
+    rows_by_source_id = _artifact_dataset_rows_by_source(dataset_rows)
+    selected_source_ids = _artifact_dataset_source_ids(
+        rows_by_source_id,
+        requested_source_ids,
+    )
+    selected_datasets = [
+        _artifact_dataset_for_source(source_id, rows_by_source_id[source_id])
+        for source_id in selected_source_ids
+    ]
+    _assert_artifact_endpoint_consistency(selected_datasets)
+    return ProviderDirectoryArtifactDatasetFence(tuple(selected_datasets))
+
+
+def _artifact_dataset_rows_by_source(
+    dataset_rows: list[Any],
+) -> dict[str, list[Any]]:
+    rows_by_source_id: dict[str, list[Any]] = {}
+    for dataset_row in dataset_rows:
+        source_id = _clean_text(
+            _pagination_checkpoint_row_mapping(dataset_row).get("source_id")
+        )
+        if source_id:
+            rows_by_source_id.setdefault(source_id, []).append(dataset_row)
+    return rows_by_source_id
+
+
+def _artifact_dataset_source_ids(
+    rows_by_source_id: dict[str, list[Any]],
+    requested_source_ids: list[str],
+) -> list[str]:
+    missing_requested_aliases = [
+        source_id
+        for source_id in requested_source_ids
+        if source_id not in rows_by_source_id
+    ]
+    if missing_requested_aliases:
+        raise RuntimeError(
+            "provider_directory_artifact_source_alias_missing:"
+            + ",".join(missing_requested_aliases)
+        )
+    selected_source_ids = list(requested_source_ids)
+    selected_source_ids.extend(
+        source_id
+        for source_id in sorted(rows_by_source_id)
+        if source_id not in requested_source_ids
+    )
+    if not selected_source_ids:
+        raise RuntimeError("provider_directory_artifact_source_aliases_empty")
+    return selected_source_ids
+
+
+def _artifact_dataset_for_source(
+    source_id: str,
+    dataset_rows: list[Any],
+) -> ProviderDirectoryArtifactDataset:
+    candidates = [
+        dataset
+        for dataset_row in dataset_rows
+        if (dataset := _provider_directory_artifact_dataset_from_row(dataset_row))
+        is not None
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"provider_directory_artifact_current_dataset_missing:{source_id}"
+        )
+    if len({candidate.dataset_id for candidate in candidates}) != 1 or len(candidates) != 1:
+        raise RuntimeError(
+            f"provider_directory_artifact_current_dataset_ambiguous:{source_id}"
+        )
+    return candidates[0]
+
+
+def _assert_artifact_endpoint_consistency(
+    selected_datasets: list[ProviderDirectoryArtifactDataset],
+) -> None:
+    dataset_id_by_endpoint_id: dict[str, str] = {}
+    selected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
+    expected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
+    for dataset in selected_datasets:
+        incumbent_dataset_id = dataset_id_by_endpoint_id.setdefault(
+            dataset.endpoint_id,
+            dataset.dataset_id,
+        )
+        if incumbent_dataset_id != dataset.dataset_id:
+            raise RuntimeError(
+                "provider_directory_artifact_endpoint_dataset_ambiguous:"
+                + dataset.endpoint_id
+            )
+        incumbent_selected_resources = selected_resources_by_endpoint_id.setdefault(
+            dataset.endpoint_id,
+            dataset.selected_resources,
+        )
+        if incumbent_selected_resources != dataset.selected_resources:
+            raise RuntimeError(
+                "provider_directory_artifact_endpoint_metadata_ambiguous:"
+                + dataset.endpoint_id
+            )
+        incumbent_expected_resources = expected_resources_by_endpoint_id.setdefault(
+            dataset.endpoint_id,
+            dataset.expected_resources,
+        )
+        if incumbent_expected_resources != dataset.expected_resources:
+            raise RuntimeError(
+                "provider_directory_artifact_endpoint_expected_metadata_ambiguous:"
+                + dataset.endpoint_id
+            )
+
+
+async def _resolve_provider_directory_artifact_datasets(
+    source_ids: list[str] | tuple[str, ...] | None,
+) -> ProviderDirectoryArtifactDatasetFence:
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    dataset_rows = await db.all(
+        _provider_directory_artifact_dataset_selection_sql(cleaned_source_ids),
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+        **({"source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
+    )
+    return _validate_provider_directory_artifact_datasets(
+        dataset_rows,
+        cleaned_source_ids,
+    )
+
+
+def _provider_directory_dataset_artifact_targets(
+    publish_artifacts_targets: set[str] | None,
+    *,
+    publish_corroboration: bool,
+) -> tuple[str, ...]:
+    targets = [
+        target
+        for target in PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS
+        if is_provider_directory_publish_target_enabled(publish_artifacts_targets, target)
+        and (target != "corroboration" or publish_corroboration)
+    ]
+    return tuple(targets)
+
+
+def _assert_provider_directory_artifact_target_dependencies(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    publish_artifacts_targets: set[str] | None,
+    publish_corroboration: bool,
+) -> None:
+    """Reject a target before scoped rows could omit its required evidence."""
+    enabled_targets = _provider_directory_dataset_artifact_targets(
+        publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+    )
+    if "corroboration" in enabled_targets:
+        missing_prerequisites = [
+            prerequisite_target
+            for prerequisite_target in ("address_overlay", "network_catalog")
+            if prerequisite_target not in enabled_targets
+        ]
+        if missing_prerequisites:
+            raise RuntimeError(
+                "provider_directory_artifact_corroboration_prerequisites_missing:"
+                + ",".join(missing_prerequisites)
+            )
+    violations = _artifact_dataset_profile_violations(fence)
+    violations.extend(
+        _artifact_target_dependency_violations(fence, enabled_targets)
+    )
+    if violations:
+        raise RuntimeError(
+            "provider_directory_artifact_target_dependencies_missing:"
+            + ";".join(violations)
+        )
+
+
+def _artifact_dataset_profile_violations(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> list[str]:
+    """Return current datasets that cover less than their source profile."""
+    return [
+        ":".join(
+            (
+                "dataset_profile",
+                dataset.source_id,
+                dataset.endpoint_id,
+                dataset.dataset_id,
+                ",".join(dataset.selected_resources),
+                ",".join(dataset.expected_resources),
+            )
+        )
+        for dataset in fence.datasets
+        if dataset.selected_resources != dataset.expected_resources
+    ]
+
+
+def _artifact_target_dependency_violations(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    enabled_targets: tuple[str, ...],
+) -> list[str]:
+    """Return source-specific artifact paths missing a complete alternative."""
+    violations: list[str] = []
+    sorted_datasets = sorted(
+        fence.datasets,
+        key=lambda dataset: (
+            dataset.source_id,
+            dataset.endpoint_id,
+            dataset.dataset_id,
+        ),
+    )
+    for artifact_target in enabled_targets:
+        for dataset in sorted_datasets:
+            violation = _artifact_target_dependency_violation(
+                artifact_target,
+                dataset,
+            )
+            if violation:
+                violations.append(violation)
+    return violations
+
+
+def _artifact_target_dependency_violation(
+    artifact_target: str,
+    dataset: ProviderDirectoryArtifactDataset,
+) -> str | None:
+    """Return one missing artifact dependency or None when not applicable."""
+    alternatives = PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES[
+        artifact_target
+    ]
+    selected_resources = set(dataset.selected_resources)
+    if artifact_target == "corroboration" and "InsurancePlan" not in selected_resources:
+        return None
+    if not selected_resources.intersection(set().union(*alternatives)):
+        return None
+    if any(alternative.issubset(selected_resources) for alternative in alternatives):
+        return None
+    required_alternatives = "|".join(
+        ",".join(sorted(alternative)) for alternative in alternatives
+    )
+    return ":".join(
+        (
+            artifact_target,
+            dataset.source_id,
+            dataset.endpoint_id,
+            dataset.dataset_id,
+            required_alternatives,
+        )
+    )
+
+
+def _provider_directory_artifact_scope_row_limit() -> int:
+    configured = _positive_int(
+        os.getenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS")
+    )
+    return configured or DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS
+
+
+async def _provider_directory_artifact_scope_projection(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> dict[str, Any]:
+    alias_count_by_dataset_id: dict[str, int] = {}
+    for dataset in fence.datasets:
+        alias_count_by_dataset_id[dataset.dataset_id] = (
+            alias_count_by_dataset_id.get(dataset.dataset_id, 0) + 1
+        )
+    resource_rows = await db.all(
+        f"""
+        SELECT dataset_id,
+               resource_type,
+               COUNT(*)::bigint AS resource_rows
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
+         GROUP BY dataset_id, resource_type
+         ORDER BY dataset_id, resource_type;
+        """,
+        dataset_ids=sorted(alias_count_by_dataset_id),
+    )
+    dataset_rows = 0
+    projected_rows = 0
+    projected_rows_by_resource: dict[str, int] = {}
+    for resource_row in resource_rows:
+        resource_row_map = _pagination_checkpoint_row_mapping(resource_row)
+        dataset_id = _clean_text(resource_row_map.get("dataset_id"))
+        resource_type = _clean_text(resource_row_map.get("resource_type"))
+        resource_count = int(resource_row_map.get("resource_rows") or 0)
+        if not dataset_id or not resource_type:
+            continue
+        dataset_rows += resource_count
+        projected_count = resource_count * alias_count_by_dataset_id.get(dataset_id, 0)
+        projected_rows += projected_count
+        projected_rows_by_resource[resource_type] = (
+            projected_rows_by_resource.get(resource_type, 0) + projected_count
+        )
+    return {
+        "dataset_count": len(alias_count_by_dataset_id),
+        "alias_count": len(fence.datasets),
+        "dataset_rows": dataset_rows,
+        "projected_rows": projected_rows,
+        "alias_amplification": (
+            projected_rows / dataset_rows if dataset_rows else 0.0
+        ),
+        "aliases_by_dataset": dict(sorted(alias_count_by_dataset_id.items())),
+        "projected_rows_by_resource": dict(
+            sorted(projected_rows_by_resource.items())
+        ),
+    }
+
+
+def _assert_provider_directory_artifact_scope_capacity(
+    projection: dict[str, Any],
+) -> None:
+    projected_rows = int(projection["projected_rows"])
+    capacity = _provider_directory_artifact_scope_row_limit()
+    if projected_rows > capacity:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_projected_rows_exceeded:"
+            f"projected={projected_rows}:capacity={capacity}"
+        )
+
+
+async def _reap_provider_directory_artifact_scope_tables(schema: str) -> list[str]:
+    prefixes = tuple(
+        sorted(
+            {
+                f"{model.__tablename__}_artifact_scope_"
+                for model in (ProviderDirectorySource, *RESOURCE_MODELS)
+            }
+        )
+    )
+    table_rows = await db.all(
+        """
+        SELECT tablename
+          FROM pg_tables
+         WHERE schemaname = :schema_name
+           AND tablename LIKE ANY(CAST(:scope_patterns AS text[]))
+         ORDER BY tablename;
+        """,
+        schema_name=schema,
+        scope_patterns=[f"{prefix}%" for prefix in prefixes],
+    )
+    table_names = sorted(
+        table_name
+        for table_row in table_rows
+        if (table_name := _clean_text(
+            _pagination_checkpoint_row_mapping(table_row).get("tablename")
+        ))
+        and any(table_name.startswith(prefix) for prefix in prefixes)
+    )
+    for table_name in table_names:
+        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
+    return table_names
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_artifact_scope_guard(schema: str) -> AsyncIterator[None]:
+    """Serialize scoped table ownership so prefix cleanup cannot reap live work."""
+    async with _provider_directory_artifact_build_guard(
+        schema,
+        "provider_directory_artifact_scope",
+    ):
+        yield
+
+
+def _provider_directory_artifact_scope_table_name(
+    table_name: str,
+    run_id: str | None,
+) -> str:
+    identity = (
+        f"{table_name}:{run_id or 'artifact'}:{os.getpid()}:"
+        f"{time.time_ns()}:{os.urandom(8).hex()}"
+    )
+    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:16]
+    return _bounded_identifier(f"{table_name}_artifact_scope_{digest}")
+
+
+def _provider_directory_artifact_scope_table_sql(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> str:
+    dialect = postgresql.dialect()
+    column_definitions = [
+        str(CreateColumn(column).compile(dialect=dialect)).strip()
+        for column in model.__table__.columns
+    ]
+    primary_key_columns = [
+        _q(column.name) for column in model.__table__.primary_key.columns
+    ]
+    if primary_key_columns:
+        column_definitions.append(
+            f"PRIMARY KEY ({', '.join(primary_key_columns)})"
+        )
+    return (
+        f"CREATE UNLOGGED TABLE {_qt(schema, table_name)} (\n    "
+        + ",\n    ".join(column_definitions)
+        + "\n);"
+    )
+
+
+def _provider_directory_artifact_payload_column_sql(column: Any) -> str:
+    column_name = column.name
+    if column_name == "source_id":
+        return "selected.source_id"
+    if column_name == "resource_id":
+        return "resource.resource_id"
+    if column_name == "last_seen_run_id":
+        return "selected.evidence_run_id"
+    if column_name in {"observed_at", "updated_at"}:
+        return (
+            "COALESCE(dataset.published_at, dataset.validated_at, "
+            "dataset.created_at)"
+        )
+    json_key = _sql_string_literal(column_name)
+    payload_expr = f"resource.payload_json::jsonb -> {json_key}"
+    if isinstance(column.type, SQLAlchemyJSON):
+        return f"CAST({payload_expr} AS json)"
+    column_type = column.type.compile(dialect=postgresql.dialect())
+    return (
+        f"CAST(resource.payload_json::jsonb ->> {json_key} AS {column_type})"
+    )
+
+
+def _provider_directory_artifact_resource_insert_sql(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> str:
+    columns = list(model.__table__.columns)
+    column_names = ", ".join(_q(column.name) for column in columns)
+    selected_columns = ",\n            ".join(
+        _provider_directory_artifact_payload_column_sql(column)
+        for column in columns
+    )
+    return f"""
+        INSERT INTO {_qt(schema, table_name)} ({column_names})
+        WITH selected(source_id, dataset_id, evidence_run_id) AS (
+            SELECT *
+              FROM unnest(
+                    CAST(:source_ids AS varchar[]),
+                    CAST(:dataset_ids AS varchar[]),
+                    CAST(:evidence_run_ids AS varchar[])
+              )
+        )
+        SELECT {selected_columns}
+          FROM selected
+          JOIN {_qt(schema, ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+            ON dataset.dataset_id = selected.dataset_id
+          JOIN {_qt(schema, ProviderDirectoryDatasetResource.__tablename__)} AS resource
+            ON resource.dataset_id = selected.dataset_id
+           AND resource.resource_type = :resource_type;
+    """
+
+
+async def _materialize_provider_directory_artifact_source_scope(
+    schema: str,
+    table_name: str,
+    source_ids: list[str],
+) -> None:
+    model = ProviderDirectorySource
+    await db.status(
+        _provider_directory_artifact_scope_table_sql(model, schema, table_name)
+    )
+    columns = ", ".join(_q(column.name) for column in model.__table__.columns)
+    await db.status(
+        f"""
+        INSERT INTO {_qt(schema, table_name)} ({columns})
+        SELECT {columns}
+          FROM {_qt(schema, model.__tablename__)}
+         WHERE source_id = ANY(CAST(:source_ids AS varchar[]));
+        """,
+        source_ids=source_ids,
+    )
+    await db.status(f"ANALYZE {_qt(schema, table_name)};")
+
+
+async def _materialize_provider_directory_artifact_resource_scope(
+    schema: str,
+    table_name: str,
+    model: Any,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    await db.status(
+        _provider_directory_artifact_scope_table_sql(model, schema, table_name)
+    )
+    await db.status(
+        _provider_directory_artifact_resource_insert_sql(model, schema, table_name),
+        source_ids=[dataset.source_id for dataset in fence.datasets],
+        dataset_ids=[dataset.dataset_id for dataset in fence.datasets],
+        evidence_run_ids=[dataset.evidence_run_id for dataset in fence.datasets],
+        resource_type=RESOURCE_TYPES_BY_MODEL[model],
+    )
+    await db.status(f"ANALYZE {_qt(schema, table_name)};")
+
+
+async def _verify_provider_directory_artifact_dataset_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    expected_dataset_id_by_endpoint_id = fence.dataset_id_by_endpoint_id
+    current_dataset_rows = await db.all(
+        f"""
+        SELECT endpoint_id, dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
+           AND is_current = true
+           AND status = :published_status
+           AND superseded_at IS NULL
+         ORDER BY endpoint_id, dataset_id;
+        """,
+        endpoint_ids=sorted(expected_dataset_id_by_endpoint_id),
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+    )
+    current_dataset_row_maps = [
+        _pagination_checkpoint_row_mapping(dataset_row)
+        for dataset_row in current_dataset_rows
+    ]
+    actual_dataset_id_by_endpoint_id = {
+        _clean_text(dataset_row_map.get("endpoint_id")): _clean_text(
+            dataset_row_map.get("dataset_id")
+        )
+        for dataset_row_map in current_dataset_row_maps
+    }
+    if (
+        len(current_dataset_row_maps) != len(expected_dataset_id_by_endpoint_id)
+        or actual_dataset_id_by_endpoint_id != expected_dataset_id_by_endpoint_id
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_current_changed"
+        )
+
+
+async def _lock_and_verify_artifact_dataset_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Fence alias and dataset identity while an artifact becomes live."""
+    if not fence.datasets:
+        return
+    await _lock_artifact_fence_endpoints(fence)
+    locked_tuple_rows = await _lock_artifact_fence_tuples(fence)
+    _assert_locked_artifact_fence_tuples(fence, locked_tuple_rows)
+
+
+async def _lock_artifact_fence_endpoints(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Serialize cutover with endpoint dataset promotion."""
+    endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
+    endpoint_rows = await db.all(
+        f"""
+        SELECT endpoint_id
+          FROM {endpoint_ref}
+         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
+         ORDER BY endpoint_id
+         FOR SHARE;
+        """,
+        endpoint_ids=fence.endpoint_ids,
+    )
+    locked_endpoint_ids = sorted(
+        endpoint_id
+        for endpoint_row in endpoint_rows
+        if (endpoint_id := _clean_text(
+            _pagination_checkpoint_row_mapping(endpoint_row).get("endpoint_id")
+        ))
+    )
+    if locked_endpoint_ids != fence.endpoint_ids:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_api_endpoint_changed"
+        )
+
+
+async def _lock_artifact_fence_tuples(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> list[Any]:
+    """Lock every selected alias and its current published dataset."""
+    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
+    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    return await db.all(
+        f"""
+        SELECT source.source_id,
+               source.endpoint_id,
+               dataset.dataset_id,
+               COALESCE(
+                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
+                   '[]'::jsonb
+               ) AS selected_resources,
+               COALESCE(
+                   dataset.publication_metadata_json::jsonb -> 'expected_resources',
+                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
+                   '[]'::jsonb
+               ) AS expected_resources
+          FROM {source_ref} AS source
+          JOIN {dataset_ref} AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+           AND dataset.is_current = true
+           AND dataset.status = :published_status
+           AND dataset.superseded_at IS NULL
+         ORDER BY source.source_id, source.endpoint_id, dataset.dataset_id
+         FOR SHARE OF source, dataset;
+        """,
+        source_ids=fence.source_ids,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+    )
+
+
+def _assert_locked_artifact_fence_tuples(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    locked_tuple_rows: list[Any],
+) -> None:
+    """Ensure the held source, endpoint, and dataset tuples remain exact."""
+    actual_tuples: list[tuple[str, str, str]] = []
+    actual_selected_resources_by_tuple: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    actual_expected_resources_by_tuple: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    for tuple_row in locked_tuple_rows:
+        tuple_row_map = _pagination_checkpoint_row_mapping(tuple_row)
+        source_endpoint_dataset_parts = tuple(
+            _clean_text(tuple_row_map.get(column)) or ""
+            for column in ("source_id", "endpoint_id", "dataset_id")
+        )
+        actual_tuples.append(source_endpoint_dataset_parts)
+        actual_selected_resources_by_tuple[source_endpoint_dataset_parts] = tuple(
+            sorted(set(_json_text_list(tuple_row_map.get("selected_resources"))))
+        )
+        actual_expected_resources_by_tuple[source_endpoint_dataset_parts] = tuple(
+            sorted(
+                set(
+                    _json_text_list(
+                        tuple_row_map.get("expected_resources")
+                        or tuple_row_map.get("selected_resources")
+                    )
+                )
+            )
+        )
+    if tuple(sorted(actual_tuples)) != fence.source_endpoint_dataset_tuples:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_endpoint_dataset_changed"
+        )
+    for dataset in fence.datasets:
+        expected_tuple = (
+            dataset.source_id,
+            dataset.endpoint_id,
+            dataset.dataset_id,
+        )
+        if (
+            actual_selected_resources_by_tuple.get(expected_tuple)
+            != dataset.selected_resources
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_metadata_changed"
+            )
+        if (
+            actual_expected_resources_by_tuple.get(expected_tuple)
+            != dataset.expected_resources
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_expected_metadata_changed"
+            )
+
+@contextlib.asynccontextmanager
+async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIterator[None]:
+    """Keep the active artifact fence through one non-rename archive mutation."""
+    fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+    if fence is None:
+        yield
+        return
+    async with db.transaction():
+        await _lock_and_verify_artifact_dataset_fence(fence)
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_artifact_dataset_scope(
+    *,
+    run_id: str | None,
+    source_ids: list[str] | tuple[str, ...] | None,
+    fence: ProviderDirectoryArtifactDatasetFence | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
+    """Materialize and clean one bounded alias-aware artifact source scope."""
+    schema = _schema()
+    fence = fence or await _resolve_provider_directory_artifact_datasets(source_ids)
+    async with _provider_directory_artifact_scope_guard(schema):
+        reaped_tables = await _reap_provider_directory_artifact_scope_tables(schema)
+        projection = await _provider_directory_artifact_scope_projection(fence)
+        _assert_provider_directory_artifact_scope_capacity(projection)
+        _record_artifact_scope_metrics(metrics, projection, reaped_tables)
+        relation_overrides, created_tables = await _materialize_artifact_scope_tables(
+            schema,
+            run_id,
+            fence,
+        )
+        try:
+            relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+                relation_overrides
+            )
+            fence_token = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
+            try:
+                yield fence
+            finally:
+                _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
+                _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
+        finally:
+            await _drop_artifact_scope_tables(schema, created_tables)
+
+
+def _record_artifact_scope_metrics(
+    metrics: dict[str, Any] | None,
+    projection: dict[str, Any],
+    reaped_tables: list[str],
+) -> None:
+    if metrics is None:
+        return
+    metrics["artifact_scope_dataset_count"] = projection["dataset_count"]
+    metrics["artifact_scope_alias_count"] = projection["alias_count"]
+    metrics["artifact_scope_dataset_rows"] = projection["dataset_rows"]
+    metrics["artifact_scope_projected_rows"] = projection["projected_rows"]
+    metrics["artifact_scope_alias_amplification"] = projection[
+        "alias_amplification"
+    ]
+    metrics["artifact_scope_projected_rows_by_resource"] = projection[
+        "projected_rows_by_resource"
+    ]
+    metrics["artifact_scope_aliases_by_dataset"] = projection[
+        "aliases_by_dataset"
+    ]
+    metrics["artifact_scope_reaped_table_count"] = len(reaped_tables)
+
+
+async def _materialize_artifact_scope_tables(
+    schema: str,
+    run_id: str | None,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> tuple[dict[str, str], list[str]]:
+    source_table = _provider_directory_artifact_scope_table_name(
+        ProviderDirectorySource.__tablename__,
+        run_id,
+    )
+    created_tables = [source_table]
+    relation_by_table = {ProviderDirectorySource.__tablename__: source_table}
+    await _materialize_provider_directory_artifact_source_scope(
+        schema,
+        source_table,
+        [dataset.source_id for dataset in fence.datasets],
+    )
+    for model in RESOURCE_MODELS:
+        scope_table = _provider_directory_artifact_scope_table_name(
+            model.__tablename__,
+            run_id,
+        )
+        created_tables.append(scope_table)
+        await _materialize_provider_directory_artifact_resource_scope(
+            schema,
+            scope_table,
+            model,
+            fence,
+        )
+        relation_by_table[model.__tablename__] = scope_table
+    return relation_by_table, created_tables
+
+
+async def _drop_artifact_scope_tables(
+    schema: str,
+    table_names: list[str],
+) -> None:
+    for table_name in reversed(table_names):
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
+        except Exception:  # pragma: no cover - cleanup best effort
+            LOGGER.warning(
+                "Failed to clean Provider Directory artifact scope %s",
+                table_name,
+                exc_info=True,
+            )
+
+
 async def publish_provider_directory_location_address_keys(
     db_schema: str | None = None,
     *,
@@ -6629,6 +7695,73 @@ async def backfill_provider_directory_resource_id_npis(
             )
         )
     return updated_counts_by_resource
+
+
+async def _publish_provider_directory_dataset_artifacts(
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    source_ids: list[str] | tuple[str, ...] | None,
+    publish_corroboration: bool,
+    publish_artifacts_targets: set[str] | None,
+) -> dict[str, Any]:
+    fence = await _resolve_provider_directory_artifact_datasets(source_ids)
+    _assert_provider_directory_artifact_target_dependencies(
+        fence,
+        publish_artifacts_targets=publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+    )
+    async with _provider_directory_artifact_dataset_scope(
+        run_id=run_id,
+        source_ids=source_ids,
+        fence=fence,
+        metrics=metrics,
+    ):
+        metrics["artifact_dataset_ids"] = sorted(
+            {dataset.dataset_id for dataset in fence.datasets}
+        )
+        metrics["artifact_dataset_evidence_run_ids"] = sorted(
+            {dataset.evidence_run_id for dataset in fence.datasets}
+        )
+        return await _publish_provider_directory_artifacts(
+            run_id=run_id,
+            metrics=metrics,
+            address_key_run_id=None,
+            publish_scope_run_id=None,
+            source_ids=[dataset.source_id for dataset in fence.datasets],
+            publish_corroboration=publish_corroboration,
+            publish_artifacts_targets=publish_artifacts_targets,
+        )
+
+
+async def _publish_selected_provider_directory_artifacts(
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    source_ids: list[str],
+    seen_table: str | None,
+    publish_after_acquisition: bool,
+    publish_corroboration: bool,
+    publish_artifacts_targets: set[str] | None,
+) -> dict[str, Any]:
+    if publish_after_acquisition:
+        return await _publish_provider_directory_dataset_artifacts(
+            run_id=run_id,
+            metrics=metrics,
+            source_ids=source_ids,
+            publish_corroboration=publish_corroboration,
+            publish_artifacts_targets=publish_artifacts_targets,
+        )
+    return await _publish_provider_directory_artifacts(
+        run_id=run_id,
+        metrics=metrics,
+        seen_table=seen_table,
+        address_key_run_id=run_id,
+        publish_scope_run_id=run_id,
+        source_ids=source_ids,
+        publish_corroboration=publish_corroboration,
+        publish_artifacts_targets=publish_artifacts_targets,
+    )
 
 
 async def _publish_provider_directory_artifacts(
@@ -6784,6 +7917,7 @@ async def _publish_provider_directory_artifacts(
         metrics["ptg_corroboration_view_published"] = (
             await publish_provider_directory_address_corroboration_if_available(
                 refresh_network_catalog=False,
+                source_ids=source_ids,
             )
         )
         message = "published Provider Directory PTG corroboration artifacts"
@@ -7063,27 +8197,28 @@ async def publish_provider_directory_location_archive(
             **(({"run_id": run_id} if run_id is not None else {}) | ({"source_ids": list(source_ids)} if source_ids else {})),
         )
         await db.status(f"ANALYZE {_qt(schema, stage)};")
-        stats = await resolve_into_archive(
-            stage,
-            {
-                "first_line": "first_line",
-                "second_line": "second_line",
-                "city": "city_name",
-                "state": "state_name",
-                "zip": "postal_code",
-                "country": "COALESCE(NULLIF(country_code, ''), 'US')",
-            },
-            source_bit=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
-            priority=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
-            schema=schema,
-        )
-        archive_metric_dict = dict(stats.__dict__)
-        archive_metric_dict["openaddresses_coordinate_backfill_rows"] = (
-            await _backfill_archive_openaddresses_coordinates(
-                schema,
+        async with _provider_directory_active_artifact_dataset_transaction():
+            stats = await resolve_into_archive(
                 stage,
+                {
+                    "first_line": "first_line",
+                    "second_line": "second_line",
+                    "city": "city_name",
+                    "state": "state_name",
+                    "zip": "postal_code",
+                    "country": "COALESCE(NULLIF(country_code, ''), 'US')",
+                },
+                source_bit=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
+                priority=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
+                schema=schema,
             )
-        )
+            archive_metric_dict = dict(stats.__dict__)
+            archive_metric_dict["openaddresses_coordinate_backfill_rows"] = (
+                await _backfill_archive_openaddresses_coordinates(
+                    schema,
+                    stage,
+                )
+            )
         return archive_metric_dict
     finally:
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
@@ -7613,13 +8748,16 @@ async def publish_provider_directory_address_corroboration_if_available(
     db_schema: str | None = None,
     *,
     refresh_network_catalog: bool = True,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
     schema = db_schema or _schema()
     if not await _table_exists(schema, "entity_address_unified"):
         return False
+    cleaned_source_ids = _clean_source_id_list(source_ids)
     await publish_provider_directory_address_corroboration_table(
         schema,
         refresh_network_catalog=refresh_network_catalog,
+        **({"source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
     )
     return True
 
@@ -18138,12 +19276,14 @@ async def _prepare_endpoint_dataset_candidate(
     pagination_root_run_id: str | None,
     checkpoint_context: PaginationCheckpointContext | None,
 ) -> EndpointDatasetCandidate | None:
+    """Create a candidate only for the requested endpoint resource profile."""
     endpoint_id = _endpoint_id_for_source_records(source_records)
     if endpoint_id is None:
         return None
     selected_resources = tuple(sorted(set(resources)))
     if not selected_resources:
         return None
+    expected_resources = _endpoint_dataset_expected_resources(source_records)
     selection = await _select_endpoint_dataset_candidate(
         endpoint_id,
         selected_resources,
@@ -18176,6 +19316,7 @@ async def _prepare_endpoint_dataset_candidate(
         selected_resources=selected_resources,
         import_run_id=run_id,
         previous_dataset_id=selection.previous_dataset_id,
+        expected_resources=expected_resources,
         checkpoint_context=bound_checkpoint_context,
         reused_from_checkpoint=selection.reused_from_checkpoint,
     )
@@ -18209,6 +19350,22 @@ def _endpoint_dataset_selected_resources(
         for resource_type in unique_requested_resources
         if resource_type in eligible_resources
     ]
+
+
+def _endpoint_dataset_expected_resources(
+    source_records: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return the complete enumerable profile required for current publication."""
+    return tuple(
+        sorted(
+            set(
+                _endpoint_dataset_selected_resources(
+                    source_records,
+                    list(DEFAULT_RESOURCES),
+                )
+            )
+        )
+    )
 
 
 def _pagination_checkpoint_table_ref() -> str:
@@ -19375,6 +20532,7 @@ def _endpoint_dataset_publication_metadata(
     return {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
+        "expected_resources": list(candidate.expected_resources),
         "source_ids": list(candidate.source_ids),
         "resource_diagnostics": diagnostics,
         "reused_from_checkpoint": candidate.reused_from_checkpoint,
@@ -19386,6 +20544,11 @@ def _is_endpoint_dataset_publishable(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
 ) -> bool:
+    if (
+        candidate.expected_resources
+        and candidate.selected_resources != candidate.expected_resources
+    ):
+        return False
     selected_diagnostics = [
         diagnostics.get(resource_type)
         for resource_type in candidate.selected_resources
@@ -20793,11 +21956,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "publish_artifacts_only": True,
             "source_ids": requested_source_ids,
         }
-        metrics = await _publish_provider_directory_artifacts(
+        metrics = await _publish_provider_directory_dataset_artifacts(
             run_id=run_id,
             metrics=metrics,
-            address_key_run_id=None,
-            publish_scope_run_id=None,
             source_ids=requested_source_ids,
             publish_corroboration=publish_corroboration,
             publish_artifacts_targets=publish_artifacts_targets,
@@ -21096,7 +22257,6 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             }
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts or publish_after_acquisition:
-                is_acquisition_publish = publish_after_acquisition and not publish_artifacts
                 artifact_source_ids = requested_source_ids
                 if not artifact_source_ids:
                     artifact_source_ids = [
@@ -21145,15 +22305,12 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     metrics["ptg_corroboration_view_published"] = False
                     metrics["ptg_corroboration_view_skipped"] = skip_payload_by_metric
                 else:
-                    metrics = await _publish_provider_directory_artifacts(
+                    metrics = await _publish_selected_provider_directory_artifacts(
                         run_id=run_id,
                         metrics=metrics,
-                        seen_table=(
-                            None if is_acquisition_publish else seen_stage_table_for_publish
-                        ),
-                        address_key_run_id=None if is_acquisition_publish else run_id,
-                        publish_scope_run_id=None if is_acquisition_publish else run_id,
                         source_ids=publishable_artifact_source_ids,
+                        seen_table=seen_stage_table_for_publish,
+                        publish_after_acquisition=publish_after_acquisition,
                         publish_corroboration=publish_corroboration,
                         publish_artifacts_targets=publish_artifacts_targets,
                     )

@@ -457,15 +457,28 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
     assert row["canonical_api_base"] == expected_base
     assert row["requires_registration"] is False
     assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "valid"
+    assert row["last_validated_status"] == "waf_blocked"
     assert row["endpoint_practitioner"] == f"{expected_base}/Practitioner"
     assert row["endpoint_location"] == f"{expected_base}/Location"
     assert row["metadata_json"]["provider_directory_override"] == "amerihealth_caritas_api_ext_provider_api"
     assert row["metadata_json"]["provider_directory_plan_code"] == "5400"
     assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == f"{expected_base}/metadata"
-    assert row["metadata_json"]["provider_directory_supported_resources"] == list(
-        importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
+    assert row["metadata_json"]["provider_directory_supported_resources"] == []
+    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+
+    selected_sources, selection_metrics = importer._select_resource_import_sources(
+        [row],
+        valid_source_ids=None,
+        open_only=False,
+        include_auth_required=True,
     )
+    assert selected_sources == []
+    assert selection_metrics["source_import_skipped_validation_status"] == 1
+    assert importer._endpoint_dataset_selected_resources(
+        [row],
+        list(importer.DEFAULT_RESOURCES),
+    ) == []
 
 
 def test_source_row_from_seed_does_not_guess_ambiguous_amerihealth_caritas_retest_base():
@@ -5451,6 +5464,37 @@ async def test_publish_provider_directory_address_corroboration_table_swaps_inde
 
 
 @pytest.mark.asyncio
+async def test_scoped_corroboration_preserves_unselected_source_evidence(monkeypatch):
+    statements: list[str] = []
+    _stub_artifact_build_guard(monkeypatch)
+
+    async def fake_status(sql, **_params):
+        statements.append(sql)
+        return 0
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+    monkeypatch.setattr(importer.db, "scalar", _artifact_publish_scalar(4, statements))
+    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_scoped_corrob")
+    publish_catalog = AsyncMock(return_value={"published": True, "rows": 3})
+    monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", publish_catalog)
+
+    result = await importer.publish_provider_directory_address_corroboration_table(
+        "mrf",
+        source_ids=["source_current"],
+    )
+    joined = "\n".join(statements)
+
+    assert result["copied_existing"] == 4
+    assert result["source_ids"] == ["source_current"]
+    publish_catalog.assert_awaited_once_with("mrf", source_ids=["source_current"])
+    assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_scoped_corrob" AS' in joined
+    assert 'FROM "mrf"."provider_directory_address_corroboration"' in joined
+    assert "provider_directory_source_id = ANY" in joined
+    assert 'INSERT INTO "mrf"."pd_stage_scoped_corrob"' in joined
+    assert "WITH address_candidates AS" in joined
+
+
+@pytest.mark.asyncio
 async def test_ensure_provider_directory_network_catalog_populated_publishes_empty_catalog(monkeypatch):
     ensure_catalog = AsyncMock()
     publish_catalog = AsyncMock(return_value={"published": True, "rows": 3})
@@ -5737,6 +5781,614 @@ async def test_alias_group_writes_one_compatibility_copy(monkeypatch):
     }
     assert capture.finalized_diagnostics[0]["Practitioner"]["rows_written"] == 1
     assert capture.fetch_sources[0]["_partition_checkpoint_owner_run_id"] == "run_root"
+
+
+def _artifact_dataset(
+    source_id: str = "source_a",
+    *,
+    endpoint_id: str = "endpoint_1",
+    dataset_id: str = "dataset_current",
+    evidence_run_id: str = "acquisition_root",
+    selected_resources: tuple[str, ...] = (),
+    expected_resources: tuple[str, ...] | None = None,
+) -> importer.ProviderDirectoryArtifactDataset:
+    return importer.ProviderDirectoryArtifactDataset(
+        source_id=source_id,
+        endpoint_id=endpoint_id,
+        dataset_id=dataset_id,
+        evidence_run_id=evidence_run_id,
+        selected_resources=selected_resources,
+        expected_resources=(
+            selected_resources
+            if expected_resources is None
+            else expected_resources
+        ),
+    )
+
+
+def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
+    @contextlib.asynccontextmanager
+    async def scope_guard(_schema):
+        yield
+
+    scope_tables = [
+        f"{ProviderDirectorySource.__tablename__}_scope",
+        *[f"{model.__tablename__}_scope" for model in importer.RESOURCE_MODELS],
+    ]
+    monkeypatch.setattr(importer, "_provider_directory_artifact_scope_guard", scope_guard)
+    monkeypatch.setattr(
+        importer,
+        "_reap_provider_directory_artifact_scope_tables",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_scope_projection",
+        AsyncMock(
+            return_value={
+                "dataset_rows": 1,
+                "projected_rows": 1,
+                "alias_amplification": 1.0,
+                "projected_rows_by_resource": {"Location": 1},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_materialize_artifact_scope_tables",
+        AsyncMock(return_value=({}, scope_tables)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_selection_is_current_published_isolates_failed_and_expands_aliases(
+    monkeypatch,
+):
+    lookup = AsyncMock(
+        return_value=[
+            {
+                "source_id": "source_a",
+                "endpoint_id": "endpoint_1",
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+            },
+            {
+                "source_id": "source_b",
+                "endpoint_id": "endpoint_1",
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+            },
+        ]
+    )
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    fence = await importer._resolve_provider_directory_artifact_datasets(
+        ["source_b", "source_a"]
+    )
+
+    sql = lookup.await_args.args[0]
+    assert "dataset.is_current = true" in sql
+    assert "dataset.status = :published_status" in sql
+    assert "dataset.status IN" not in sql
+    assert [dataset.source_id for dataset in fence.datasets] == [
+        "source_b",
+        "source_a",
+    ]
+    assert fence.dataset_id_by_endpoint_id == {"endpoint_1": "dataset_current"}
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source_publish(
+    monkeypatch,
+):
+    lookup = AsyncMock(
+        return_value=[
+            {
+                "source_id": "source_a",
+                "endpoint_id": "endpoint_1",
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+                "selected_resources": ["Location"],
+            },
+            {
+                "source_id": "source_b",
+                "endpoint_id": "endpoint_1",
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+                "selected_resources": ["Location"],
+            },
+        ]
+    )
+    monkeypatch.setattr(importer.db, "all", lookup)
+    explicit_fence = await importer._resolve_provider_directory_artifact_datasets(
+        ["source_a"]
+    )
+    all_fence = await importer._resolve_provider_directory_artifact_datasets(None)
+    explicit_sql = lookup.await_args_list[0].args[0]
+    all_sql = lookup.await_args_list[1].args[0]
+
+    assert [dataset.source_id for dataset in explicit_fence.datasets] == [
+        "source_a",
+        "source_b",
+    ]
+    assert [dataset.source_id for dataset in all_fence.datasets] == [
+        "source_a",
+        "source_b",
+    ]
+    assert "requested_sources AS MATERIALIZED" in explicit_sql
+    assert "sibling.endpoint_id = requested.endpoint_id" in explicit_sql
+    assert "published_endpoints AS MATERIALIZED" in all_sql
+    assert "HAVING COUNT(*) = 1" in all_sql
+    assert "dataset.superseded_at IS NULL" in all_sql
+
+
+def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
+    missing_dataset_row_map = {
+        "source_id": "source_a",
+        "endpoint_id": "endpoint_1",
+        "dataset_id": None,
+        "evidence_run_id": None,
+    }
+    with pytest.raises(RuntimeError, match="current_dataset_missing:source_a"):
+        importer._validate_provider_directory_artifact_datasets(
+            [missing_dataset_row_map],
+            ["source_a"],
+        )
+
+    duplicate_rows = [
+        {
+            "source_id": "source_a",
+            "endpoint_id": "endpoint_1",
+            "dataset_id": dataset_id,
+            "evidence_run_id": "acquisition_root",
+        }
+        for dataset_id in ("dataset_a", "dataset_b")
+    ]
+    with pytest.raises(RuntimeError, match="current_dataset_ambiguous:source_a"):
+        importer._validate_provider_directory_artifact_datasets(
+            duplicate_rows,
+            ["source_a"],
+        )
+
+
+def test_artifact_scope_sql_is_typed_immutable_and_alias_expanding():
+    create_sql = importer._provider_directory_artifact_scope_table_sql(
+        ProviderDirectoryLocation,
+        "mrf",
+        "location_scope_test",
+    )
+    insert_sql = importer._provider_directory_artifact_resource_insert_sql(
+        ProviderDirectoryLocation,
+        "mrf",
+        "location_scope_test",
+    )
+
+    assert 'CREATE UNLOGGED TABLE "mrf"."location_scope_test"' in create_sql
+    assert "resource_id VARCHAR(256) NOT NULL" in create_sql
+    assert "latitude VARCHAR(64)" in create_sql
+    assert 'PRIMARY KEY ("source_id", "resource_id")' in create_sql
+    assert "FROM unnest(" in insert_sql
+    assert "selected.source_id" in insert_sql
+    assert "selected.evidence_run_id" in insert_sql
+    assert 'JOIN "mrf"."provider_directory_dataset_resource" AS resource' in insert_sql
+    assert "resource.resource_type = :resource_type" in insert_sql
+    assert "provider_directory_location AS" not in insert_sql
+
+
+def test_artifact_relation_scope_wires_address_and_network_builders():
+    relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {
+            "provider_directory_source": "source_scope",
+            "provider_directory_location": "location_scope",
+            "provider_directory_organization": "organization_scope",
+            "provider_directory_insurance_plan": "plan_scope",
+            "provider_directory_practitioner_role": "role_scope",
+            "provider_directory_organization_affiliation": "affiliation_scope",
+        }
+    )
+    try:
+        archive_sql = importer.provider_directory_location_archive_stage_sql(
+            "mrf",
+            "archive_stage",
+        )
+        network_sql = importer.provider_directory_network_catalog_insert_sql(
+            "mrf",
+            "network_stage",
+            source_ids=["source_a"],
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
+            relation_token
+        )
+
+    assert 'FROM "mrf"."location_scope" AS loc' in archive_sql
+    assert 'FROM "mrf"."organization_scope" AS organization' in archive_sql
+    assert 'FROM "mrf"."plan_scope" AS insurance_plan' in network_sql
+    assert 'FROM "mrf"."role_scope" AS role' in network_sql
+    assert 'JOIN "mrf"."organization_scope" AS network_org' in network_sql
+    assert 'JOIN "mrf"."source_scope" AS src' in network_sql
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_scope_drops_private_tables_in_finally(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence((_artifact_dataset(),))
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=fence),
+    )
+    _stub_artifact_scope_lifecycle(monkeypatch)
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    with pytest.raises(RuntimeError, match="stop after materialization"):
+        async with importer._provider_directory_artifact_dataset_scope(
+            run_id="progress_run",
+            source_ids=["source_a"],
+        ):
+            raise RuntimeError("stop after materialization")
+
+    drop_sql_calls = [
+        call.args[0]
+        for call in status.await_args_list
+        if call.args[0].startswith("DROP TABLE IF EXISTS")
+    ]
+    assert len(drop_sql_calls) == len(importer.RESOURCE_MODELS) + 1
+    assert importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == {}
+    assert importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get() is None
+
+
+@pytest.mark.asyncio
+async def test_missing_current_dataset_fails_before_artifact_build(monkeypatch):
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {
+                    "source_id": "source_a",
+                    "endpoint_id": "endpoint_1",
+                    "dataset_id": None,
+                    "evidence_run_id": None,
+                }
+            ]
+        ),
+    )
+    artifact_publish = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_artifacts",
+        artifact_publish,
+    )
+
+    with pytest.raises(RuntimeError, match="current_dataset_missing:source_a"):
+        await importer._publish_provider_directory_dataset_artifacts(
+            run_id="artifact_progress_run",
+            metrics={},
+            source_ids=["source_a"],
+            publish_corroboration=False,
+            publish_artifacts_targets=None,
+        )
+
+    artifact_publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_after_acquisition_uses_dataset_artifact_path(monkeypatch):
+    dataset_publish = AsyncMock(return_value={"path": "dataset"})
+    compatibility_publish = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        dataset_publish,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_artifacts",
+        compatibility_publish,
+    )
+
+    metrics = await importer._publish_selected_provider_directory_artifacts(
+        run_id="progress_run",
+        metrics={},
+        source_ids=["source_a"],
+        seen_table="seen_stage",
+        publish_after_acquisition=True,
+        publish_corroboration=False,
+        publish_artifacts_targets={"network_catalog"},
+    )
+
+    assert metrics == {"path": "dataset"}
+    dataset_publish.assert_awaited_once()
+    compatibility_publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_fence_rejects_changed_current_dataset(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence((_artifact_dataset(),))
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {"endpoint_id": "endpoint_1", "dataset_id": "dataset_new"}
+            ]
+        ),
+    )
+
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="endpoint_dataset_current_changed",
+    ):
+        await importer._verify_provider_directory_artifact_dataset_fence(fence)
+
+
+@pytest.mark.asyncio
+async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            _artifact_dataset(
+                selected_resources=("Location", "Organization"),
+            ),
+        )
+    )
+    lookup = AsyncMock(
+        side_effect=[
+            [{"endpoint_id": "endpoint_1"}],
+            [
+                {
+                    "source_id": "source_a",
+                    "endpoint_id": "endpoint_repointed",
+                    "dataset_id": "dataset_current",
+                    "selected_resources": ["Location", "Organization"],
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="source_endpoint_dataset_changed",
+    ):
+        await importer._lock_and_verify_artifact_dataset_fence(
+            fence
+        )
+
+    endpoint_lock_sql = lookup.await_args_list[0].args[0]
+    tuple_lock_sql = lookup.await_args_list[1].args[0]
+    assert "FOR SHARE" in endpoint_lock_sql
+    assert "provider_directory_api_endpoint" in endpoint_lock_sql
+    assert "FOR SHARE OF source, dataset" in tuple_lock_sql
+    assert "source.source_id = ANY" in tuple_lock_sql
+    assert "dataset.superseded_at IS NULL" in tuple_lock_sql
+
+
+def test_artifact_target_dependencies_fail_before_an_unsafe_target_build():
+    incomplete_fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            _artifact_dataset(
+                selected_resources=("Location",),
+                expected_resources=("InsurancePlan", "Location"),
+            ),
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="target_dependencies_missing:dataset_profile:source_a",
+    ):
+        importer._assert_provider_directory_artifact_target_dependencies(
+            incomplete_fence,
+            publish_artifacts_targets={"network_catalog"},
+            publish_corroboration=False,
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="corroboration_prerequisites_missing:address_overlay,network_catalog",
+    ):
+        importer._assert_provider_directory_artifact_target_dependencies(
+            importer.ProviderDirectoryArtifactDatasetFence(
+                (
+                    _artifact_dataset(
+                        selected_resources=(
+                            "InsurancePlan",
+                            "Organization",
+                            "Practitioner",
+                            "Location",
+                            "PractitionerRole",
+                            "HealthcareService",
+                            "OrganizationAffiliation",
+                        ),
+                    ),
+                )
+            ),
+            publish_artifacts_targets={"corroboration"},
+            publish_corroboration=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "selected_resources",
+    (
+        (
+            "InsurancePlan",
+            "Location",
+            "Organization",
+            "Practitioner",
+            "PractitionerRole",
+        ),
+        (
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        ),
+    ),
+)
+def test_artifact_targets_accept_complete_source_specific_profiles(
+    selected_resources,
+):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_artifact_dataset(selected_resources=selected_resources),)
+    )
+
+    importer._assert_provider_directory_artifact_target_dependencies(
+        fence,
+        publish_artifacts_targets=None,
+        publish_corroboration=True,
+    )
+
+
+def test_endpoint_dataset_rejects_unbounded_partial_source_profile():
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint-1",
+        dataset_id="dataset-1",
+        acquisition_root_run_id="run-1",
+        source_ids=("source-1",),
+        selected_resources=("Location",),
+        import_run_id="run-1",
+        previous_dataset_id=None,
+        expected_resources=("Location", "Organization"),
+    )
+
+    assert importer._is_endpoint_dataset_publishable(
+        candidate,
+        {
+            "Location": {
+                "complete": True,
+                "error": None,
+                "bounded": False,
+                "next_url_remaining": False,
+            }
+        },
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_artifact_dataset_publish_fails_before_scope_when_address_dependencies_missing(
+    monkeypatch,
+):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            _artifact_dataset(
+                selected_resources=("Location",),
+                expected_resources=("Location", "Organization"),
+            ),
+        )
+    )
+    scope = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=fence),
+    )
+    monkeypatch.setattr(importer, "_provider_directory_artifact_dataset_scope", scope)
+
+    with pytest.raises(
+        RuntimeError,
+        match="target_dependencies_missing:dataset_profile:source_a",
+    ):
+        await importer._publish_provider_directory_dataset_artifacts(
+            run_id="run_1",
+            metrics={},
+            source_ids=["source_a"],
+            publish_corroboration=False,
+            publish_artifacts_targets={"location_archive"},
+        )
+
+    scope.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_projection_measures_alias_amplification_and_capacity(
+    monkeypatch,
+):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            _artifact_dataset("source_a", selected_resources=("Location",)),
+            _artifact_dataset("source_b", selected_resources=("Location",)),
+        )
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {
+                    "dataset_id": "dataset_current",
+                    "resource_type": "Location",
+                    "resource_rows": 5,
+                },
+                {
+                    "dataset_id": "dataset_current",
+                    "resource_type": "Practitioner",
+                    "resource_rows": 3,
+                },
+            ]
+        ),
+    )
+
+    projection = await importer._provider_directory_artifact_scope_projection(fence)
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS",
+        "15",
+    )
+
+    assert projection == {
+        "dataset_count": 1,
+        "alias_count": 2,
+        "dataset_rows": 8,
+        "projected_rows": 16,
+        "alias_amplification": 2.0,
+        "aliases_by_dataset": {"dataset_current": 2},
+        "projected_rows_by_resource": {"Location": 10, "Practitioner": 6},
+    }
+    artifact_metrics_by_name: dict[str, Any] = {}
+    importer._record_artifact_scope_metrics(
+        artifact_metrics_by_name,
+        projection,
+        ["provider_directory_location_artifact_scope_old"],
+    )
+    assert artifact_metrics_by_name["artifact_scope_alias_count"] == 2
+    assert artifact_metrics_by_name["artifact_scope_aliases_by_dataset"] == {
+        "dataset_current": 2
+    }
+    assert artifact_metrics_by_name["artifact_scope_reaped_table_count"] == 1
+    with pytest.raises(
+        RuntimeError,
+        match="scope_projected_rows_exceeded:projected=16:capacity=15",
+    ):
+        importer._assert_provider_directory_artifact_scope_capacity(projection)
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_reaper_removes_only_sorted_scope_prefixes(monkeypatch):
+    source_prefix = "provider_directory_source_artifact_scope_"
+    location_prefix = "provider_directory_location_artifact_scope_"
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(
+            return_value=[
+                {"tablename": f"{location_prefix}old"},
+                {"tablename": "provider_directory_location_archive_stage_keep"},
+                {"tablename": f"{source_prefix}old"},
+            ]
+        ),
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    reaped = await importer._reap_provider_directory_artifact_scope_tables("mrf")
+
+    assert reaped == [f"{location_prefix}old", f"{source_prefix}old"]
+    assert [call.args[0] for call in status.await_args_list] == [
+        f'DROP TABLE IF EXISTS "mrf"."{location_prefix}old";',
+        f'DROP TABLE IF EXISTS "mrf"."{source_prefix}old";',
+    ]
 
 
 def _endpoint_dataset_candidate() -> importer.EndpointDatasetCandidate:
@@ -6945,6 +7597,62 @@ async def test_publish_provider_directory_location_archive_resolves_and_cleans_s
 
 
 @pytest.mark.asyncio
+async def test_location_archive_holds_active_dataset_fence_through_resolve(monkeypatch):
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_artifact_dataset(selected_resources=("Location", "Organization")),)
+    )
+    state_by_transaction = {"active": False}
+    events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        state_by_transaction["active"] = True
+        try:
+            yield
+        finally:
+            state_by_transaction["active"] = False
+
+    class Stats:
+        inserted = 1
+        provenance_updates = 0
+
+    async def resolve(*_args, **_kwargs):
+        assert state_by_transaction["active"] is True
+        events.append("resolve")
+        return Stats()
+
+    async def lock_and_verify(received_fence):
+        assert state_by_transaction["active"] is True
+        assert received_fence is fence
+        events.append("lock")
+
+    async def backfill(*_args, **_kwargs):
+        assert state_by_transaction["active"] is True
+        events.append("backfill")
+        return 2
+
+    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer, "_lock_and_verify_artifact_dataset_fence", lock_and_verify)
+    monkeypatch.setattr(importer, "resolve_into_archive", resolve)
+    monkeypatch.setattr(importer, "_backfill_archive_openaddresses_coordinates", backfill)
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
+    try:
+        archive_metrics = await importer.publish_provider_directory_location_archive(
+            "mrf",
+            stage_table="provider_directory_location_archive_stage_test",
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
+
+    assert archive_metrics["openaddresses_coordinate_backfill_rows"] == 2
+    assert events == ["lock", "resolve", "backfill"]
+    assert state_by_transaction["active"] is False
+
+
+@pytest.mark.asyncio
 async def test_publish_provider_directory_location_archive_skips_without_archive(monkeypatch):
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
 
@@ -7365,10 +8073,28 @@ async def test_main_forwards_publish_artifact_targets(monkeypatch):
     assert process_data_mock.await_args.args[1]["publish_artifacts_targets"] == "corroboration"
 
 
+def _stub_artifact_dataset_scope(monkeypatch) -> None:
+    @contextlib.asynccontextmanager
+    async def dataset_scope(**_kwargs):
+        yield importer.ProviderDirectoryArtifactDatasetFence(())
+
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_dataset_scope",
+        dataset_scope,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=importer.ProviderDirectoryArtifactDatasetFence(())),
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    _stub_artifact_dataset_scope(monkeypatch)
     artifact_mock_map = {
         "backfill_provider_directory_location_contacts": AsyncMock(
             return_value={"location_contact_rows_updated": 0}
@@ -7437,6 +8163,7 @@ def test_provider_directory_publish_artifact_targets_parse_aliases():
 
 
 def _mock_artifact_only_publishers(monkeypatch) -> dict[str, AsyncMock]:
+    _stub_artifact_dataset_scope(monkeypatch)
     artifact_publish_mocks_by_name = {
         "backfill_provider_directory_location_contacts": AsyncMock(
             return_value={"location_contact_rows_updated": 0}
@@ -13935,6 +14662,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    _stub_artifact_dataset_scope(monkeypatch)
     monkeypatch.setattr(
         importer,
         "backfill_provider_directory_location_contacts",
