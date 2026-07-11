@@ -760,6 +760,32 @@ class ResourceFetchResult:
 
 
 @dataclass(frozen=True)
+class UHCPlanGraphSnapshot:
+    rows_by_resource: dict[str, list[dict[str, Any]]]
+    pages_by_resource: dict[str, int]
+    network_count: int
+    error: str | None = None
+    deadline_reached: bool = False
+
+
+@dataclass(frozen=True)
+class UHCPlanGraphAcquisition:
+    snapshot: UHCPlanGraphSnapshot
+    plan_graph_complete: bool
+    collection_complete: bool = False
+    stability_verified: bool = False
+
+
+@dataclass
+class UHCPlanGraphCollectionState:
+    rows_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fingerprints_by_id: dict[str, str] = field(default_factory=dict)
+    seen_urls: set[str] = field(default_factory=set)
+    pages_fetched: int = 0
+    expected_total: int | None = None
+
+
+@dataclass(frozen=True)
 class PaginationCheckpointContext:
     canonical_api_base: str
     source_scope_hash: str
@@ -2110,6 +2136,10 @@ UHC_CITY_PARTITION_DEFAULT_MAX_PREFIX_LENGTH = 8
 UHC_POSTAL_PARTITION_MAX_PREFIX_LENGTH = 5
 UHC_ROLE_POSTAL_CHECKPOINT_TYPE = "PractitionerRolePostalPrefix"
 UHC_PARTITION_CHECKPOINT_TYPE = "UHCPartition"
+UHC_PLAN_GRAPH_STRATEGY_VERSION = "provider-directory-uhc-plan-graph-v1"
+UHC_PLAN_GRAPH_FETCH_MODE = "plan_graph"
+UHC_PLAN_GRAPH_INCOMPLETE_ERROR = "provider_directory_uhc_plan_graph_incomplete"
+UHC_PLAN_GRAPH_RESOURCE_TYPES = frozenset(UHC_SUPPORTED_RESOURCES)
 
 
 def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
@@ -2187,6 +2217,23 @@ def _uhc_query_prefix(query_by_name: dict[str, str], parameter_name: str) -> str
     """Return a nonempty search prefix without stripping significant spaces."""
     value = query_by_name.get(parameter_name)
     return value if isinstance(value, str) and value else None
+
+
+def _normalized_network_reference(reference: str) -> str | None:
+    identity = _organization_reference_identity(reference)
+    if not identity:
+        return None
+    _resource_type, resource_id = identity.split("/", 1)
+    return f"Organization/{resource_id}"
+
+
+def _insurance_plan_network_references(resource: dict[str, Any]) -> list[str]:
+    """Collect top-level and nested Plan-Net InsurancePlan networks."""
+    references = list(_references(resource.get("network")))
+    for plan_entry in resource.get("plan") or []:
+        if isinstance(plan_entry, dict):
+            references.extend(_references(plan_entry.get("network")))
+    return list(dict.fromkeys(references))
 
 
 def _uhc_adaptive_partition_max_prefix_length(resource_type: str) -> int:
@@ -4636,7 +4683,7 @@ def parse_fhir_resource(
             "type_codes": _codings(resource.get("type")),
             "owned_by_ref": _first_reference(resource.get("ownedBy")),
             "administered_by_ref": _first_reference(resource.get("administeredBy")),
-            "network_refs": _references(resource.get("network")),
+            "network_refs": _insurance_plan_network_references(resource),
             "coverage_area_refs": _references(resource.get("coverageArea")),
             "plan_json": plan or None,
             "period_start": period_start,
@@ -15535,6 +15582,844 @@ async def _import_linked_resource_rows(
     return counts
 
 
+def _uhc_plan_graph_network_predicate_error(
+    resource_type: str,
+    requested_network_reference: str,
+    resource_payloads: list[dict[str, Any]],
+) -> str | None:
+    expected_reference = _normalized_network_reference(requested_network_reference)
+    if not expected_reference:
+        return "uhc_plan_graph_network_reference_invalid"
+    for resource_payload in resource_payloads:
+        if resource_payload.get("resourceType") != resource_type:
+            return "uhc_plan_graph_resource_type_mismatch"
+        returned_references = {
+            normalized_reference
+            for reference in (
+                _network_references(resource_payload)
+                if resource_type == "PractitionerRole"
+                else _references(resource_payload.get("network"))
+            )
+            if (normalized_reference := _normalized_network_reference(reference))
+        }
+        if expected_reference not in returned_references:
+            return f"uhc_plan_graph_{resource_type.lower()}_network_predicate_rejected"
+    return None
+
+
+def _uhc_plan_graph_collection_url(
+    source_record: dict[str, Any],
+    resource_type: str,
+    *,
+    page_count: int,
+    network_reference: str | None = None,
+) -> str | None:
+    if network_reference is None:
+        return _resource_start_url(source_record, resource_type, page_count=page_count)
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    normalized_reference = _normalized_network_reference(network_reference)
+    if api_base != UHC_PROVIDER_DIRECTORY_BASE or not normalized_reference:
+        return None
+    return _url_with_query_params(
+        f"{api_base}/{resource_type}",
+        {
+            "network": normalized_reference,
+            "_count": str(_source_resource_page_count(source_record, resource_type, page_count)),
+        },
+    )
+
+
+def _uhc_plan_graph_row_fingerprint(row: dict[str, Any]) -> str:
+    stable_row_map = {
+        key: value
+        for key, value in row.items()
+        if key not in {"observed_at", "updated_at", "last_seen_run_id"}
+    }
+    payload = json.dumps(
+        stable_row_map,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _uhc_plan_graph_snapshot_fingerprint(snapshot: UHCPlanGraphSnapshot) -> str:
+    identities = sorted(
+        (
+            resource_type,
+            _clean_text(row.get("resource_id")) or "",
+            _uhc_plan_graph_row_fingerprint(row),
+        )
+        for resource_type, resource_rows in snapshot.rows_by_resource.items()
+        for row in resource_rows
+    )
+    payload = json.dumps(identities, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validated_uhc_plan_graph_total(
+    resource_type: str,
+    expected_total: int | None,
+    observed_total: int | None,
+) -> tuple[int | None, str | None]:
+    error_prefix = f"uhc_plan_graph_{resource_type.lower()}"
+    if expected_total is None:
+        if observed_total is None:
+            return None, f"{error_prefix}_total_missing"
+        return observed_total, None
+    if observed_total is not None and observed_total != expected_total:
+        return expected_total, f"{error_prefix}_total_changed"
+    return expected_total, None
+
+
+def _uhc_plan_graph_terminal_count_error(
+    resource_type: str,
+    expected_total: int | None,
+    rows_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    if expected_total is not None and len(rows_by_id) == expected_total:
+        return None
+    return f"uhc_plan_graph_{resource_type.lower()}_row_count_mismatch"
+
+
+def _uhc_plan_graph_collection_result(
+    rows_by_id: dict[str, dict[str, Any]],
+    pages_fetched: int,
+    error: str | None,
+    deadline_reached: bool = False,
+) -> tuple[list[dict[str, Any]], int, str | None, bool]:
+    return list(rows_by_id.values()), pages_fetched, error, deadline_reached
+
+
+async def _advance_uhc_plan_graph_collection(
+    source_record: dict[str, Any],
+    resource_type: str,
+    request_url: str,
+    state: UHCPlanGraphCollectionState,
+    *,
+    timeout: int,
+    run_id: str | None,
+    network_reference: str | None,
+) -> tuple[str | None, str | None]:
+    bundle_payload, fetch_error = await _fetch_uhc_plan_graph_bundle(
+        source_record,
+        request_url,
+        timeout=timeout,
+    )
+    if fetch_error:
+        return None, fetch_error
+    state.pages_fetched += 1
+    state.expected_total, total_error = _validated_uhc_plan_graph_total(
+        resource_type,
+        state.expected_total,
+        _bundle_total(bundle_payload),
+    )
+    if total_error:
+        return None, total_error
+    page_error = _merge_uhc_plan_graph_bundle_rows(
+        source_record,
+        resource_type,
+        bundle_payload,
+        network_reference=network_reference,
+        run_id=run_id,
+        rows_by_id=state.rows_by_id,
+        fingerprints_by_id=state.fingerprints_by_id,
+    )
+    if page_error:
+        return None, page_error
+    try:
+        next_url = _resolved_fhir_next_url(
+            source_record,
+            request_url,
+            _next_link(bundle_payload),
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    return next_url, None
+
+
+async def _fetch_uhc_plan_graph_collection(
+    source_record: dict[str, Any],
+    resource_type: str,
+    *,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+    deadline_at: float | None,
+    network_reference: str | None = None,
+) -> tuple[list[dict[str, Any]], int, str | None, bool]:
+    """Exhaust one UHC graph collection while rejecting caps and drift."""
+    request_url = _uhc_plan_graph_collection_url(
+        source_record,
+        resource_type,
+        page_count=page_count,
+        network_reference=network_reference,
+    )
+    if not request_url:
+        return [], 0, "uhc_plan_graph_start_url_missing", False
+    state = UHCPlanGraphCollectionState()
+    while request_url:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return _uhc_plan_graph_collection_result(
+                state.rows_by_id, state.pages_fetched, "deadline_reached", True
+            )
+        request_identity = _pagination_url_identity(request_url)
+        if request_identity in state.seen_urls:
+            return _uhc_plan_graph_collection_result(
+                state.rows_by_id, state.pages_fetched, "pagination_cursor_repeated"
+            )
+        state.seen_urls.add(request_identity)
+        request_url, page_error = await _advance_uhc_plan_graph_collection(
+            source_record,
+            resource_type,
+            request_url,
+            state,
+            timeout=timeout,
+            run_id=run_id,
+            network_reference=network_reference,
+        )
+        if page_error:
+            return _uhc_plan_graph_collection_result(
+                state.rows_by_id, state.pages_fetched, page_error
+            )
+    terminal_error = _uhc_plan_graph_terminal_count_error(
+        resource_type,
+        state.expected_total,
+        state.rows_by_id,
+    )
+    if terminal_error:
+        return _uhc_plan_graph_collection_result(
+            state.rows_by_id, state.pages_fetched, terminal_error
+        )
+    return _uhc_plan_graph_collection_result(
+        state.rows_by_id,
+        state.pages_fetched,
+        None,
+    )
+
+
+async def _fetch_uhc_plan_graph_bundle(
+    source_record: dict[str, Any],
+    request_url: str,
+    *,
+    timeout: int,
+) -> tuple[dict[str, Any], str | None]:
+    status_code, bundle_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        request_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or fetch_error:
+        return {}, fetch_error or f"http_{status_code}"
+    return bundle_payload, None
+
+
+def _merge_uhc_plan_graph_bundle_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    bundle_payload: dict[str, Any],
+    *,
+    network_reference: str | None,
+    run_id: str | None,
+    rows_by_id: dict[str, dict[str, Any]],
+    fingerprints_by_id: dict[str, str],
+) -> str | None:
+    if not _is_bundle_payload(bundle_payload):
+        return "non_bundle_payload"
+    if (_bundle_total(bundle_payload) or 0) >= UHC_ADAPTIVE_PARTITION_TOTAL_CAP:
+        return f"uhc_plan_graph_{resource_type.lower()}_cap_exhausted"
+    bundle_entries = _bundle_entries(bundle_payload)
+    if network_reference:
+        predicate_error = _uhc_plan_graph_network_predicate_error(
+            resource_type,
+            network_reference,
+            [entry["resource"] for entry in bundle_entries],
+        )
+        if predicate_error:
+            return predicate_error
+    for bundle_entry in bundle_entries:
+        parsed_resource = parse_fhir_resource(
+            source_record["source_id"],
+            bundle_entry["resource"],
+            resource_url=_clean_text(bundle_entry.get("fullUrl")),
+            run_id=run_id,
+        )
+        if (
+            not parsed_resource
+            or RESOURCE_TYPES_BY_MODEL.get(parsed_resource[0]) != resource_type
+        ):
+            return "uhc_plan_graph_resource_type_mismatch"
+        resource_row = parsed_resource[1]
+        resource_id = _clean_text(resource_row.get("resource_id"))
+        if not resource_id:
+            return "uhc_plan_graph_resource_id_missing"
+        row_fingerprint = _uhc_plan_graph_row_fingerprint(resource_row)
+        if (
+            resource_id in fingerprints_by_id
+            and fingerprints_by_id[resource_id] != row_fingerprint
+        ):
+            return "uhc_plan_graph_resource_mutated"
+        fingerprints_by_id[resource_id] = row_fingerprint
+        rows_by_id[resource_id] = resource_row
+    return None
+
+
+def _uhc_plan_graph_network_references(
+    insurance_plan_rows: list[dict[str, Any]],
+) -> list[str]:
+    normalized_references = {
+        normalized_reference
+        for row in insurance_plan_rows
+        for reference in _row_reference_values(row, ("network_refs",))
+        if (normalized_reference := _normalized_network_reference(reference))
+    }
+    return sorted(normalized_references)
+
+
+def _has_invalid_uhc_network_ref(
+    insurance_plan_rows: list[dict[str, Any]],
+) -> bool:
+    return any(
+        not (network_references := _row_reference_values(
+            insurance_plan_row,
+            ("network_refs",),
+        ))
+        or any(
+            _normalized_network_reference(reference) is None
+            for reference in network_references
+        )
+        for insurance_plan_row in insurance_plan_rows
+    )
+
+
+async def _fetch_uhc_plan_graph_linked_rows(
+    source_record: dict[str, Any],
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+    *,
+    timeout: int,
+    run_id: str | None,
+    deadline_at: float | None,
+) -> tuple[dict[str, list[dict[str, Any]]], str | None, bool]:
+    linked_references = [
+        linked_reference
+        for linked_reference in _linked_resource_refs(rows_by_resource)
+        if linked_reference[0] in {"Practitioner", "Organization", "Location"}
+    ]
+    resolved_rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+    for resource_type, resource_id, reference, reference_field in linked_references:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return resolved_rows_by_resource, "deadline_reached", True
+        linked_row = await _fetch_linked_resource_row(
+            source_record,
+            resource_type,
+            resource_id,
+            reference=reference,
+            reference_field=reference_field,
+            timeout=timeout,
+            run_id=run_id,
+        )
+        if not linked_row or RESOURCE_TYPES_BY_MODEL.get(linked_row[0]) != resource_type:
+            return (
+                resolved_rows_by_resource,
+                f"uhc_plan_graph_unresolved_{resource_type.lower()}_reference",
+                False,
+            )
+        resolved_rows_by_resource.setdefault(resource_type, []).append(linked_row[1])
+    return resolved_rows_by_resource, None, False
+
+
+def _dedupe_uhc_plan_graph_rows(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    deduped_rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+    for resource_type, resource_rows in rows_by_resource.items():
+        rows_by_id = {
+            resource_id: row
+            for row in resource_rows
+            if (resource_id := _clean_text(row.get("resource_id")))
+        }
+        deduped_rows_by_resource[resource_type] = [
+            rows_by_id[key] for key in sorted(rows_by_id)
+        ]
+    return deduped_rows_by_resource
+
+
+def _has_uhc_plan_graph_row_conflict(
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+) -> bool:
+    for resource_rows in rows_by_resource.values():
+        fingerprints_by_id: dict[str, str] = {}
+        for resource_row in resource_rows:
+            resource_id = _clean_text(resource_row.get("resource_id"))
+            if not resource_id:
+                continue
+            row_fingerprint = _uhc_plan_graph_row_fingerprint(resource_row)
+            if (
+                resource_id in fingerprints_by_id
+                and fingerprints_by_id[resource_id] != row_fingerprint
+            ):
+                return True
+            fingerprints_by_id[resource_id] = row_fingerprint
+    return False
+
+
+async def _fetch_uhc_plan_graph_network_shards(
+    source_record: dict[str, Any],
+    network_references: list[str],
+    *,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+    deadline_at: float | None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int], str | None, bool]:
+    rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+    pages_by_resource: dict[str, int] = {}
+    for network_reference in network_references:
+        for resource_type in ("PractitionerRole", "OrganizationAffiliation"):
+            resource_rows, pages_fetched, fetch_error, deadline_reached = (
+                await _fetch_uhc_plan_graph_collection(
+                    source_record,
+                    resource_type,
+                    page_count=page_count,
+                    timeout=timeout,
+                    run_id=run_id,
+                    deadline_at=deadline_at,
+                    network_reference=network_reference,
+                )
+            )
+            rows_by_resource.setdefault(resource_type, []).extend(resource_rows)
+            pages_by_resource[resource_type] = pages_by_resource.get(resource_type, 0) + pages_fetched
+            if fetch_error:
+                return rows_by_resource, pages_by_resource, fetch_error, deadline_reached
+            if _has_uhc_plan_graph_row_conflict(rows_by_resource):
+                return (
+                    rows_by_resource,
+                    pages_by_resource,
+                    "uhc_plan_graph_resource_mutated",
+                    False,
+                )
+    return rows_by_resource, pages_by_resource, None, False
+
+
+def _uhc_plan_graph_plan_failure_snapshot(
+    plan_rows: list[dict[str, Any]],
+    plan_pages: int,
+    plan_error: str | None,
+    deadline_reached: bool,
+) -> UHCPlanGraphSnapshot | None:
+    rows_by_resource = {"InsurancePlan": plan_rows}
+    pages_by_resource = {"InsurancePlan": plan_pages}
+    if plan_error:
+        return UHCPlanGraphSnapshot(
+            rows_by_resource,
+            pages_by_resource,
+            0,
+            plan_error,
+            deadline_reached,
+        )
+    error = None
+    if not plan_rows:
+        error = "uhc_plan_graph_insuranceplan_unexpected_empty"
+    elif _has_invalid_uhc_network_ref(plan_rows):
+        error = "uhc_plan_graph_network_reference_invalid"
+    return (
+        UHCPlanGraphSnapshot(rows_by_resource, pages_by_resource, 0, error)
+        if error
+        else None
+    )
+
+
+async def _fetch_uhc_plan_graph_snapshot(
+    source_record: dict[str, Any],
+    *,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+    deadline_at: float | None,
+) -> UHCPlanGraphSnapshot:
+    """Build one exhaustive InsurancePlan-linked UHC graph snapshot."""
+    plan_rows, plan_pages, plan_error, deadline_reached = (
+        await _fetch_uhc_plan_graph_collection(
+            source_record,
+            "InsurancePlan",
+            page_count=page_count,
+            timeout=timeout,
+            run_id=run_id,
+            deadline_at=deadline_at,
+        )
+    )
+    failure_snapshot = _uhc_plan_graph_plan_failure_snapshot(
+        plan_rows,
+        plan_pages,
+        plan_error,
+        deadline_reached,
+    )
+    if failure_snapshot:
+        return failure_snapshot
+    rows_by_resource = {"InsurancePlan": plan_rows}
+    pages_by_resource = {"InsurancePlan": plan_pages}
+    network_references = _uhc_plan_graph_network_references(plan_rows)
+    network_rows, network_pages, network_error, deadline_reached = (
+        await _fetch_uhc_plan_graph_network_shards(
+            source_record,
+            network_references,
+            page_count=page_count,
+            timeout=timeout,
+            run_id=run_id,
+            deadline_at=deadline_at,
+        )
+    )
+    rows_by_resource.update(network_rows)
+    pages_by_resource.update(network_pages)
+    if network_error:
+        return UHCPlanGraphSnapshot(
+            _dedupe_uhc_plan_graph_rows(rows_by_resource),
+            pages_by_resource,
+            len(network_references),
+            network_error,
+            deadline_reached,
+        )
+    return await _resolve_uhc_plan_graph_snapshot_links(
+        source_record,
+        rows_by_resource,
+        pages_by_resource,
+        len(network_references),
+        timeout=timeout,
+        run_id=run_id,
+        deadline_at=deadline_at,
+    )
+
+
+async def _resolve_uhc_plan_graph_snapshot_links(
+    source_record: dict[str, Any],
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+    pages_by_resource: dict[str, int],
+    network_count: int,
+    *,
+    timeout: int,
+    run_id: str | None,
+    deadline_at: float | None,
+) -> UHCPlanGraphSnapshot:
+    linked_rows, linked_error, deadline_reached = await _fetch_uhc_plan_graph_linked_rows(
+        source_record,
+        rows_by_resource,
+        timeout=timeout,
+        run_id=run_id,
+        deadline_at=deadline_at,
+    )
+    for resource_type, resource_rows in linked_rows.items():
+        rows_by_resource.setdefault(resource_type, []).extend(resource_rows)
+    return UHCPlanGraphSnapshot(
+        _dedupe_uhc_plan_graph_rows(rows_by_resource),
+        pages_by_resource,
+        network_count,
+        linked_error,
+        deadline_reached,
+    )
+
+
+async def _acquire_uhc_plan_graph(
+    source_record: dict[str, Any],
+    *,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+    deadline_seconds: int,
+) -> UHCPlanGraphAcquisition:
+    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    first_snapshot = await _fetch_uhc_plan_graph_snapshot(
+        source_record,
+        page_count=page_count,
+        timeout=timeout,
+        run_id=run_id,
+        deadline_at=deadline_at,
+    )
+    if first_snapshot.error:
+        return UHCPlanGraphAcquisition(first_snapshot, False)
+    second_snapshot = await _fetch_uhc_plan_graph_snapshot(
+        source_record,
+        page_count=page_count,
+        timeout=timeout,
+        run_id=run_id,
+        deadline_at=deadline_at,
+    )
+    if second_snapshot.error:
+        return UHCPlanGraphAcquisition(second_snapshot, False)
+    if _uhc_plan_graph_snapshot_fingerprint(first_snapshot) != _uhc_plan_graph_snapshot_fingerprint(
+        second_snapshot
+    ):
+        mutated_snapshot = replace(
+            second_snapshot,
+            error="uhc_plan_graph_snapshot_mutated",
+        )
+        return UHCPlanGraphAcquisition(mutated_snapshot, False)
+    return UHCPlanGraphAcquisition(
+        second_snapshot,
+        True,
+        stability_verified=True,
+    )
+
+
+def _should_use_uhc_plan_graph(
+    source_record: dict[str, Any],
+    resource_types: list[str],
+    *,
+    per_resource_limit: int,
+    page_limit: int,
+) -> bool:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    selected_resources = set(resource_types).intersection(UHC_PLAN_GRAPH_RESOURCE_TYPES)
+    return bool(
+        api_base == UHC_PROVIDER_DIRECTORY_BASE
+        and per_resource_limit <= 0
+        and page_limit <= 0
+        and "InsurancePlan" in selected_resources
+        and {"PractitionerRole", "OrganizationAffiliation"}.issubset(selected_resources)
+    )
+
+
+def _uhc_plan_graph_checkpoint_locator(
+    source_record: dict[str, Any],
+    resource_type: str,
+) -> str:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    return (
+        f"{api_base}/$healthporta-plan-graph"
+        f"?resource={urllib.parse.quote(resource_type)}"
+    )
+
+
+async def _ensure_uhc_plan_graph_checkpoints(
+    source_record: dict[str, Any],
+    resource_types: list[str],
+) -> None:
+    checkpoint_context = source_record.get("_pagination_checkpoint_context")
+    if not isinstance(checkpoint_context, PaginationCheckpointContext):
+        return
+    for resource_type in resource_types:
+        await _load_or_initialize_pagination_checkpoint(
+            checkpoint_context,
+            resource_type,
+            _uhc_plan_graph_checkpoint_locator(source_record, resource_type),
+        )
+
+
+def _uhc_plan_graph_resource_diagnostic(
+    acquisition: UHCPlanGraphAcquisition,
+    resource_type: str,
+    *,
+    rows_written: int,
+) -> dict[str, Any]:
+    snapshot = acquisition.snapshot
+    return {
+        "complete": False,
+        "collection_complete": acquisition.collection_complete,
+        "plan_graph_complete": acquisition.plan_graph_complete,
+        "stability_verified": acquisition.stability_verified,
+        "bounded": False,
+        "error": snapshot.error,
+        "fetch_mode": UHC_PLAN_GRAPH_FETCH_MODE,
+        "pages_fetched": snapshot.pages_by_resource.get(resource_type, 0),
+        "rows_fetched": len(snapshot.rows_by_resource.get(resource_type, [])),
+        "rows_written": rows_written,
+        "network_count": snapshot.network_count,
+        "row_limit_reached": False,
+        "page_limit_reached": False,
+        "hard_page_limit_reached": False,
+        "deadline_reached": snapshot.deadline_reached,
+        "next_url_remaining": bool(snapshot.error),
+    }
+
+
+async def _write_uhc_plan_graph_resources(
+    source_record: dict[str, Any],
+    acquisition: UHCPlanGraphAcquisition,
+    selected_graph_resources: list[str],
+    *,
+    run_id: str | None,
+    stale_cleanup: bool,
+    seen_table: str | None,
+) -> dict[str, int]:
+    written_counts_by_resource = {
+        resource_type: 0 for resource_type in selected_graph_resources
+    }
+    if not acquisition.plan_graph_complete:
+        return written_counts_by_resource
+    for resource_type in selected_graph_resources:
+        resource_rows = acquisition.snapshot.rows_by_resource.get(resource_type, [])
+        written_counts_by_resource[resource_type] = await _upsert_resource_rows(
+            RESOURCE_MODELS_BY_TYPE[resource_type],
+            _rows_for_compatibility_source(resource_rows, source_record["source_id"]),
+            run_id=run_id,
+            track_seen=stale_cleanup,
+            seen_table=seen_table,
+            canonical_api_base=source_record.get("canonical_api_base")
+            or source_record.get("api_base"),
+            source_ids=[source_record["source_id"]],
+            dataset_id=source_record.get("_endpoint_dataset_id"),
+        )
+    return written_counts_by_resource
+
+
+async def _finalize_uhc_plan_graph_stale_rows(
+    source_record: dict[str, Any],
+    acquisition: UHCPlanGraphAcquisition,
+    selected_graph_resources: list[str],
+    *,
+    run_id: str | None,
+    stale_cleanup: bool,
+    seen_table: str | None,
+) -> tuple[dict[str, int], dict[str, list[str]]]:
+    if not stale_cleanup or not acquisition.plan_graph_complete:
+        return {}, {}
+    source_id = source_record["source_id"]
+    if seen_table:
+        return {}, {
+            resource_type: [source_id]
+            for resource_type in selected_graph_resources
+        }
+    stale_counts_by_resource: dict[str, int] = {}
+    for resource_type in selected_graph_resources:
+        deleted_count = await _delete_stale_resource_rows(
+            RESOURCE_MODELS_BY_TYPE[resource_type],
+            source_id,
+            run_id,
+            use_seen_table=True,
+        )
+        if deleted_count:
+            stale_counts_by_resource[resource_type] = deleted_count
+    return stale_counts_by_resource, {}
+
+
+def _uhc_plan_graph_stats(
+    acquisition: UHCPlanGraphAcquisition,
+    resource_type: str,
+) -> dict[str, Any]:
+    resource_stats = _empty_resource_stats()
+    resource_stats["sources_attempted"] = 1
+    resource_stats["pages_fetched"] = acquisition.snapshot.pages_by_resource.get(
+        resource_type,
+        0,
+    )
+    resource_stats["rows_fetched"] = len(
+        acquisition.snapshot.rows_by_resource.get(resource_type, [])
+    )
+    if acquisition.plan_graph_complete:
+        resource_stats["sources_completed"] = 1
+        resource_stats["plan_graph_complete_sources"] = 1
+    if acquisition.collection_complete:
+        resource_stats["collection_complete_sources"] = 1
+    if acquisition.snapshot.error:
+        resource_stats["sources_failed"] = 1
+    return resource_stats
+
+
+def _uhc_plan_graph_result_metadata(
+    acquisition: UHCPlanGraphAcquisition,
+    resource_types: list[str],
+    selected_graph_resources: list[str],
+    written_counts_by_resource: dict[str, int],
+) -> tuple[dict[str, int], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    source_counts_by_resource = {
+        resource_type: written_counts_by_resource.get(resource_type, 0)
+        for resource_type in resource_types
+    }
+    diagnostics_by_resource = {
+        resource_type: _uhc_plan_graph_resource_diagnostic(
+            acquisition,
+            resource_type,
+            rows_written=written_counts_by_resource[resource_type],
+        )
+        for resource_type in selected_graph_resources
+    }
+    stats_by_resource = {
+        resource_type: _uhc_plan_graph_stats(acquisition, resource_type)
+        for resource_type in selected_graph_resources
+    }
+    return source_counts_by_resource, diagnostics_by_resource, stats_by_resource
+
+
+async def _import_uhc_plan_graph_source_group(
+    source_record: dict[str, Any],
+    resource_types: list[str],
+    *,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+    deadline_seconds: int,
+    stale_cleanup: bool,
+    seen_table: str | None,
+) -> ResourceImportGroupResult:
+    """Acquire and persist one stable UHC InsurancePlan-linked graph."""
+    source_ids = list(source_record.get("_partition_checkpoint_source_ids") or ())
+    if not source_ids:
+        source_ids = [source_record["source_id"]]
+    acquisition = await _acquire_uhc_plan_graph(
+        source_record,
+        page_count=page_count,
+        timeout=timeout,
+        run_id=run_id,
+        deadline_seconds=deadline_seconds,
+    )
+    selected_graph_resources = [
+        resource_type
+        for resource_type in resource_types
+        if resource_type in UHC_PLAN_GRAPH_RESOURCE_TYPES
+    ]
+    written_counts_by_resource = await _write_uhc_plan_graph_resources(
+        source_record,
+        acquisition,
+        selected_graph_resources,
+        run_id=run_id,
+        stale_cleanup=stale_cleanup,
+        seen_table=seen_table,
+    )
+    source_counts_by_resource, diagnostics_by_resource, stats_by_resource = (
+        _uhc_plan_graph_result_metadata(
+            acquisition,
+            resource_types,
+            selected_graph_resources,
+            written_counts_by_resource,
+        )
+    )
+    stale_counts, stale_ready_source_ids = await _finalize_uhc_plan_graph_stale_rows(
+        source_record,
+        acquisition,
+        selected_graph_resources,
+        run_id=run_id,
+        stale_cleanup=stale_cleanup,
+        seen_table=seen_table,
+    )
+    return (
+        source_ids,
+        diagnostics_by_resource,
+        source_counts_by_resource,
+        {},
+        stats_by_resource,
+        stale_counts,
+        stale_ready_source_ids,
+    )
+
+
+def _record_uhc_plan_graph_completion(
+    resource_completion: dict[str, set[str]] | None,
+    source_ids: list[str],
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+) -> None:
+    if resource_completion is None:
+        return
+    for resource_type, diagnostic in diagnostics_by_resource.items():
+        if _is_resource_diagnostic_acquisition_complete(diagnostic):
+            resource_completion.setdefault(resource_type, set()).update(source_ids)
+
+
 def _empty_resource_stats() -> dict[str, Any]:
     return {
         "sources_attempted": 0,
@@ -15548,6 +16433,8 @@ def _empty_resource_stats() -> dict[str, Any]:
         "bulk_export_checkpoint_blocked_sources": 0,
         "bulk_export_rest_fallback_sources": 0,
         "bulk_export_sources": 0,
+        "plan_graph_complete_sources": 0,
+        "collection_complete_sources": 0,
         "pages_fetched": 0,
         "rows_fetched": 0,
     }
@@ -15611,6 +16498,7 @@ def _record_resource_fetch_stats(
     resource_stats["rows_fetched"] += fetch_result.rows_fetched
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
+        resource_stats["collection_complete_sources"] += 1
     if fetch_result.bounded:
         resource_stats["sources_bounded"] += 1
     if fetch_result.error:
@@ -15666,6 +16554,8 @@ def _resource_fetch_diagnostic(
 ) -> dict[str, Any]:
     return {
         "complete": result.complete,
+        "collection_complete": result.complete,
+        "plan_graph_complete": False,
         "bounded": result.bounded,
         "error": result.error,
         "fetch_mode": result.fetch_mode,
@@ -16199,6 +17089,31 @@ def _group_resource_import_sources(
     ]
 
 
+def _validate_provider_directory_endpoint_scope(
+    source_records: list[dict[str, Any]],
+    requested_scope: str | None,
+) -> str | None:
+    if not requested_scope:
+        return None
+    canonical_scope = _canonical_base(requested_scope)
+    if not canonical_scope:
+        raise RuntimeError("provider_directory_endpoint_scope_invalid")
+    resolved_base_values = [
+        _canonical_base(
+            source_record.get("canonical_api_base") or source_record.get("api_base")
+        )
+        for source_record in source_records
+    ]
+    if not resolved_base_values or any(not value for value in resolved_base_values):
+        raise RuntimeError("provider_directory_endpoint_scope_unresolved_base")
+    resolved_bases = set(resolved_base_values)
+    if len(resolved_bases) != 1:
+        raise RuntimeError("provider_directory_endpoint_scope_multiple_bases")
+    if canonical_scope not in resolved_bases:
+        raise RuntimeError("provider_directory_endpoint_scope_mismatch")
+    return canonical_scope
+
+
 def _compatibility_storage_source(
     source_group: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -16270,9 +17185,14 @@ def _pagination_checkpoint_context(
         if pagination_root_run_id and pagination_root_run_id != run_id:
             raise ValueError("provider_directory_pagination_fresh_root_mismatch")
         acquisition_root_run_id = run_id
+    strategy_version = (
+        UHC_PLAN_GRAPH_STRATEGY_VERSION
+        if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE
+        else PAGINATION_CHECKPOINT_STRATEGY_VERSION
+    )
     scope_payload = json.dumps(
         {
-            "strategy_version": PAGINATION_CHECKPOINT_STRATEGY_VERSION,
+            "strategy_version": strategy_version,
             "source_ids": sorted(set(source_ids)),
             "resource_group": _resource_import_group_key(source_record),
         },
@@ -17334,30 +18254,61 @@ async def _clear_pagination_checkpoints(
 
 
 async def _finalize_source_pagination_checkpoints(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
     resume_required_entries: set[str] | None,
 ) -> None:
-    context = source.get("_pagination_checkpoint_context")
-    if not isinstance(context, PaginationCheckpointContext):
-        return
     incomplete_resource_types = [
         resource_type
         for resource_type, diagnostic in diagnostics_by_resource.items()
-        if diagnostic.get("complete") is not True
+        if not _is_resource_diagnostic_acquisition_complete(diagnostic)
         or diagnostic.get("error")
         or diagnostic.get("bounded")
     ]
     if incomplete_resource_types:
-        if resume_required_entries is not None:
+        context = source_record.get("_pagination_checkpoint_context")
+        if isinstance(context, PaginationCheckpointContext) and resume_required_entries is not None:
             resume_required_entries.update(
-                f"{source['source_id']}:{resource_type}"
+                f"{source_record['source_id']}:{resource_type}"
                 for resource_type in incomplete_resource_types
             )
+            return
+        graph_failures = [
+            resource_type
+            for resource_type in incomplete_resource_types
+            if diagnostics_by_resource[resource_type].get("fetch_mode")
+            == UHC_PLAN_GRAPH_FETCH_MODE
+        ]
+        if graph_failures:
+            failure_details = ",".join(
+                f"{resource_type}="
+                f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
+                for resource_type in graph_failures
+            )
+            raise RuntimeError(f"{UHC_PLAN_GRAPH_INCOMPLETE_ERROR}:{failure_details}")
+        return
+    context = source_record.get("_pagination_checkpoint_context")
+    if not isinstance(context, PaginationCheckpointContext):
         return
     await _clear_pagination_checkpoints(
         context,
         list(diagnostics_by_resource),
+    )
+
+
+def _is_resource_diagnostic_acquisition_complete(
+    diagnostic: dict[str, Any],
+) -> bool:
+    if diagnostic.get("complete") is True:
+        return True
+    return bool(
+        diagnostic.get("fetch_mode") == UHC_PLAN_GRAPH_FETCH_MODE
+        and diagnostic.get("plan_graph_complete") is True
+        and diagnostic.get("collection_complete") is False
+        and diagnostic.get("stability_verified") is True
+        and not diagnostic.get("error")
+        and not diagnostic.get("bounded")
+        and not diagnostic.get("next_url_remaining")
     )
 
 
@@ -18000,6 +18951,22 @@ def _is_endpoint_dataset_publishable(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
 ) -> bool:
+    selected_diagnostics = [
+        diagnostics.get(resource_type)
+        for resource_type in candidate.selected_resources
+    ]
+    if selected_diagnostics and all(
+        diagnostic
+        and diagnostic.get("fetch_mode") == UHC_PLAN_GRAPH_FETCH_MODE
+        and diagnostic.get("plan_graph_complete") is True
+        and diagnostic.get("collection_complete") is False
+        and diagnostic.get("stability_verified") is True
+        and not diagnostic.get("error")
+        and not diagnostic.get("bounded")
+        and not diagnostic.get("next_url_remaining")
+        for diagnostic in selected_diagnostics
+    ):
+        return True
     for resource_type in candidate.selected_resources:
         diagnostic = diagnostics.get(resource_type)
         if (
@@ -18541,9 +19508,14 @@ async def _import_resources(
     retry_of_run_id: str | None = None,
     pagination_root_run_id: str | None = None,
     pagination_resume_required: set[str] | None = None,
+    provider_directory_endpoint_scope: str | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
+    _validate_provider_directory_endpoint_scope(
+        sources,
+        provider_directory_endpoint_scope,
+    )
     source_groups = _group_resource_import_sources(sources, linked_resource_limit=linked_resource_limit)
     total_groups = len(source_groups)
     completed_groups = 0
@@ -18630,6 +19602,10 @@ async def _import_resources(
             await raise_if_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
         source_ids = sorted(item["source_id"] for item in source_group)
+        _validate_provider_directory_endpoint_scope(
+            source_group,
+            provider_directory_endpoint_scope,
+        )
         source = _scoped_partition_source_record(source_group, source_ids)
         async with progress_lock:
             active_group_details[group_key] = {
@@ -18707,6 +19683,48 @@ async def _import_resources(
                     dataset_id=source.get("_endpoint_dataset_id"),
                 ),
             )
+        if _should_use_uhc_plan_graph(
+            source,
+            resources,
+            per_resource_limit=per_resource_limit,
+            page_limit=page_limit,
+        ):
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = "InsurancePlan graph"
+                active_group_details[group_key]["resource_started_at"] = (
+                    _now().isoformat(timespec="seconds") + "Z"
+                )
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
+            await _ensure_uhc_plan_graph_checkpoints(
+                source,
+                [
+                    resource_type
+                    for resource_type in resources
+                    if resource_type in UHC_PLAN_GRAPH_RESOURCE_TYPES
+                ],
+            )
+            import_summary = await _import_uhc_plan_graph_source_group(
+                source,
+                resources,
+                page_count=page_count,
+                timeout=timeout,
+                run_id=run_id,
+                deadline_seconds=resource_deadline_seconds,
+                stale_cleanup=stale_cleanup,
+                seen_table=seen_stage_table,
+            )
+            await _finalize_source_pagination_checkpoints(
+                source,
+                import_summary[1],
+                pagination_resume_required,
+            )
+            _record_uhc_plan_graph_completion(
+                resource_completion,
+                import_summary[0],
+                import_summary[1],
+            )
+            return import_summary
         for resource_type in _source_resource_fetch_order(source, resources):
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
@@ -19221,6 +20239,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     pagination_root_run_id = _clean_text(
         task.get("provider_directory_pagination_root_run_id")
     )
+    endpoint_scope_input = _clean_text(task.get("provider_directory_endpoint_scope"))
+    provider_directory_endpoint_scope = endpoint_scope_input.rstrip("/") if endpoint_scope_input else None
     requested_source_ids = _clean_source_id_list(
         task.get("source_ids")
         or task.get("source_id")
@@ -19438,6 +20458,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
             "retry_of_run_id": retry_of_run_id,
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
+            "provider_directory_endpoint_scope": provider_directory_endpoint_scope,
             "credential_config_file_configured": bool(credential_config_file),
         }
         await _mark_provider_directory_progress(
@@ -19474,6 +20495,20 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 metrics["requested_source_import_error"] = selection_error
                 ctx["context"]["audit"] = metrics
                 raise RuntimeError(selection_error)
+            try:
+                resolved_endpoint_scope = _validate_provider_directory_endpoint_scope(
+                    importable,
+                    provider_directory_endpoint_scope,
+                )
+            except RuntimeError as endpoint_scope_error:
+                metrics["provider_directory_endpoint_scope_error"] = str(
+                    endpoint_scope_error
+                )
+                ctx["context"]["audit"] = metrics
+                raise
+            metrics["provider_directory_endpoint_scope_resolved"] = (
+                resolved_endpoint_scope
+            )
             source_import_groups = _group_resource_import_sources(
                 importable,
                 linked_resource_limit=linked_resource_limit,
@@ -19554,10 +20589,19 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 retry_of_run_id=retry_of_run_id,
                 pagination_root_run_id=pagination_root_run_id,
                 pagination_resume_required=pagination_resume_required_entries,
+                provider_directory_endpoint_scope=provider_directory_endpoint_scope,
             )
             metrics["bulk_export_mode"] = _bulk_export_mode_metrics(
                 bulk_export,
                 metrics.get("resource_fetch_stats") or {},
+            )
+            metrics["plan_graph_complete_resource_fetches"] = _resource_fetch_metric_total(
+                metrics.get("resource_fetch_stats") or {},
+                "plan_graph_complete_sources",
+            )
+            metrics["collection_complete_resource_fetches"] = _resource_fetch_metric_total(
+                metrics.get("resource_fetch_stats") or {},
+                "collection_complete_sources",
             )
             if pagination_resume_required_entries:
                 required_entries = sorted(pagination_resume_required_entries)

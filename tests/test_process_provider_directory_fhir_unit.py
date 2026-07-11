@@ -8665,6 +8665,591 @@ async def test_uhc_unpartitioned_total_cap_is_incomplete(monkeypatch):
     assert fetch_result.error == "uhc_organizationaffiliation_partition_cap_exhausted"
 
 
+def test_uhc_insurance_plan_collects_top_level_and_nested_networks():
+    parsed = importer.parse_fhir_resource(
+        "uhc",
+        {
+            "resourceType": "InsurancePlan",
+            "id": "plan-1",
+            "network": [{"reference": "Organization/network-top"}],
+            "plan": [
+                {"network": [{"reference": "Organization/network-nested"}]},
+                {"network": [{"reference": "Organization/network-top"}]},
+            ],
+        },
+    )
+
+    assert parsed is not None
+    assert parsed[1]["network_refs"] == [
+        "Organization/network-top",
+        "Organization/network-nested",
+    ]
+
+
+def test_uhc_plan_graph_rejects_unresolvable_plan_network_reference():
+    assert importer._has_invalid_uhc_network_ref(
+        [{"resource_id": "plan-1", "network_refs": ["urn:network:unknown"]}]
+    )
+    assert importer._has_invalid_uhc_network_ref(
+        [{"resource_id": "plan-without-network", "network_refs": []}]
+    )
+
+
+def test_uhc_plan_graph_network_predicate_normalizes_absolute_references():
+    matching_payload_map = {
+        "resourceType": "PractitionerRole",
+        "id": "role-1",
+        "network": [
+            {
+                "reference": (
+                    "https://flex.optum.com/fhirpublic/R4/Organization/network-1"
+                )
+            }
+        ],
+    }
+
+    assert (
+        importer._uhc_plan_graph_network_predicate_error(
+            "PractitionerRole",
+            "Organization/network-1",
+            [matching_payload_map],
+        )
+        is None
+    )
+    assert importer._uhc_plan_graph_network_predicate_error(
+        "PractitionerRole",
+        "Organization/network-2",
+        [matching_payload_map],
+    ) == "uhc_plan_graph_practitionerrole_network_predicate_rejected"
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_network_shard_cap_fails_closed(monkeypatch):
+    async def capped_fetch(_source, _url, *, timeout):
+        del timeout
+        return 200, {"resourceType": "Bundle", "total": 10000}, None, 2
+
+    monkeypatch.setattr(importer, "_fetch_source_json", capped_fetch)
+    rows, pages, fetch_error, deadline_reached = (
+        await importer._fetch_uhc_plan_graph_collection(
+            _uhc_reverse_lookup_source(),
+            "PractitionerRole",
+            page_count=100,
+            timeout=3,
+            run_id="run-1",
+            deadline_at=None,
+            network_reference="Organization/network-1",
+        )
+    )
+
+    assert rows == []
+    assert pages == 1
+    assert fetch_error == "uhc_plan_graph_practitionerrole_cap_exhausted"
+    assert deadline_reached is False
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_requires_search_total(monkeypatch):
+    async def total_omitting_fetch(_source, _url, *, timeout):
+        del timeout
+        return 200, {"resourceType": "Bundle", "entry": []}, None, 2
+
+    monkeypatch.setattr(importer, "_fetch_source_json", total_omitting_fetch)
+
+    rows, pages, fetch_error, deadline_reached = (
+        await importer._fetch_uhc_plan_graph_collection(
+            _uhc_reverse_lookup_source(),
+            "InsurancePlan",
+            page_count=1,
+            timeout=3,
+            run_id="run-1",
+            deadline_at=None,
+        )
+    )
+
+    assert rows == []
+    assert pages == 1
+    assert fetch_error == "uhc_plan_graph_insuranceplan_total_missing"
+    assert deadline_reached is False
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_enumerates_both_role_types_per_plan_network(monkeypatch):
+    collection_calls: list[tuple[str, str | None]] = []
+
+    async def fetch_collection(_source, resource_type, **options):
+        network_reference = options.get("network_reference")
+        collection_calls.append((resource_type, network_reference))
+        if resource_type == "InsurancePlan":
+            return [
+                {
+                    "resource_id": "plan-1",
+                    "network_refs": ["Organization/network-1", "Organization/network-2"],
+                }
+            ], 1, None, False
+        resource_id = f"{resource_type}-{network_reference.rsplit('/', 1)[-1]}"
+        return [{"resource_id": resource_id}], 1, None, False
+
+    monkeypatch.setattr(importer, "_fetch_uhc_plan_graph_collection", fetch_collection)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_uhc_plan_graph_linked_rows",
+        AsyncMock(return_value=({}, None, False)),
+    )
+
+    graph_snapshot = await importer._fetch_uhc_plan_graph_snapshot(
+        _uhc_reverse_lookup_source(),
+        page_count=1,
+        timeout=3,
+        run_id="run-1",
+        deadline_at=None,
+    )
+
+    assert graph_snapshot.error is None
+    assert graph_snapshot.network_count == 2
+    assert collection_calls[1:] == [
+        (resource_type, f"Organization/network-{network_number}")
+        for network_number in (1, 2)
+        for resource_type in ("PractitionerRole", "OrganizationAffiliation")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_rejects_empty_insurance_plan_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_fetch_uhc_plan_graph_collection",
+        AsyncMock(return_value=([], 1, None, False)),
+    )
+
+    graph_snapshot = await importer._fetch_uhc_plan_graph_snapshot(
+        _uhc_reverse_lookup_source(),
+        page_count=1,
+        timeout=3,
+        run_id="run-1",
+        deadline_at=None,
+    )
+
+    assert graph_snapshot.error == "uhc_plan_graph_insuranceplan_unexpected_empty"
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_unresolved_linked_reference_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_fetch_linked_resource_row",
+        AsyncMock(return_value=None),
+    )
+    role_rows_by_resource = {
+        "PractitionerRole": [
+            {
+                "resource_id": "role-1",
+                "practitioner_ref": "Practitioner/practitioner-1",
+            }
+        ]
+    }
+
+    linked_rows, fetch_error, deadline_reached = (
+        await importer._fetch_uhc_plan_graph_linked_rows(
+            _uhc_reverse_lookup_source(),
+            role_rows_by_resource,
+            timeout=3,
+            run_id="run-1",
+            deadline_at=None,
+        )
+    )
+
+    assert linked_rows == {}
+    assert fetch_error == "uhc_plan_graph_unresolved_practitioner_reference"
+    assert deadline_reached is False
+
+
+def test_uhc_plan_graph_rows_dedupe_by_resource_identity():
+    deduped_rows = importer._dedupe_uhc_plan_graph_rows(
+        {
+            "PractitionerRole": [
+                {"resource_id": "role-2", "active": True},
+                {"resource_id": "role-1", "active": True},
+                {"resource_id": "role-2", "active": True},
+            ]
+        }
+    )
+
+    assert [row["resource_id"] for row in deduped_rows["PractitionerRole"]] == [
+        "role-1",
+        "role-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_requires_two_stable_snapshots(monkeypatch):
+    stable_snapshot = importer.UHCPlanGraphSnapshot(
+        rows_by_resource={"InsurancePlan": [{"resource_id": "plan-1"}]},
+        pages_by_resource={"InsurancePlan": 1},
+        network_count=0,
+    )
+    mutated_snapshot = importer.UHCPlanGraphSnapshot(
+        rows_by_resource={"InsurancePlan": [{"resource_id": "plan-2"}]},
+        pages_by_resource={"InsurancePlan": 1},
+        network_count=0,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_uhc_plan_graph_snapshot",
+        AsyncMock(side_effect=[stable_snapshot, mutated_snapshot]),
+    )
+
+    acquisition = await importer._acquire_uhc_plan_graph(
+        _uhc_reverse_lookup_source(),
+        page_count=1,
+        timeout=3,
+        run_id="run-1",
+        deadline_seconds=0,
+    )
+
+    assert acquisition.plan_graph_complete is False
+    assert acquisition.collection_complete is False
+    assert acquisition.stability_verified is False
+    assert acquisition.snapshot.error == "uhc_plan_graph_snapshot_mutated"
+
+
+def test_uhc_plan_graph_diagnostic_separates_completeness_states():
+    acquisition = importer.UHCPlanGraphAcquisition(
+        importer.UHCPlanGraphSnapshot(
+            rows_by_resource={"InsurancePlan": [{"resource_id": "plan-1"}]},
+            pages_by_resource={"InsurancePlan": 2},
+            network_count=1,
+        ),
+        plan_graph_complete=True,
+        stability_verified=True,
+    )
+
+    diagnostic = importer._uhc_plan_graph_resource_diagnostic(
+        acquisition,
+        "InsurancePlan",
+        rows_written=1,
+    )
+
+    assert diagnostic["complete"] is False
+    assert diagnostic["collection_complete"] is False
+    assert diagnostic["plan_graph_complete"] is True
+    assert diagnostic["stability_verified"] is True
+    graph_stats = importer._uhc_plan_graph_stats(acquisition, "InsurancePlan")
+    assert graph_stats["plan_graph_complete_sources"] == 1
+    assert graph_stats["collection_complete_sources"] == 0
+    assert graph_stats["sources_completed"] == 1
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint-1",
+        dataset_id="dataset-1",
+        acquisition_root_run_id="run-1",
+        source_ids=("uhc",),
+        selected_resources=("InsurancePlan",),
+        import_run_id="run-1",
+        previous_dataset_id=None,
+    )
+    assert importer._is_endpoint_dataset_publishable(
+        candidate,
+        {"InsurancePlan": diagnostic},
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_records_strategy_completion(monkeypatch):
+    acquisition = importer.UHCPlanGraphAcquisition(
+        importer.UHCPlanGraphSnapshot(
+            rows_by_resource={
+                "InsurancePlan": [{"resource_id": "plan-1"}],
+                "PractitionerRole": [{"resource_id": "role-1"}],
+                "OrganizationAffiliation": [{"resource_id": "affiliation-1"}],
+            },
+            pages_by_resource={
+                "InsurancePlan": 1,
+                "PractitionerRole": 1,
+                "OrganizationAffiliation": 1,
+            },
+            network_count=1,
+        ),
+        plan_graph_complete=True,
+        stability_verified=True,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_acquire_uhc_plan_graph",
+        AsyncMock(return_value=acquisition),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_write_uhc_plan_graph_resources",
+        AsyncMock(
+            return_value={
+                "InsurancePlan": 1,
+                "PractitionerRole": 1,
+                "OrganizationAffiliation": 1,
+            }
+        ),
+    )
+    completion_by_resource: dict[str, set[str]] = {}
+
+    import_summary = await importer._import_uhc_plan_graph_source_group(
+        _uhc_reverse_lookup_source(),
+        ["InsurancePlan", "PractitionerRole", "OrganizationAffiliation"],
+        page_count=100,
+        timeout=3,
+        run_id="run-1",
+        deadline_seconds=0,
+        stale_cleanup=False,
+        seen_table=None,
+    )
+
+    importer._record_uhc_plan_graph_completion(
+        completion_by_resource,
+        import_summary[0],
+        import_summary[1],
+    )
+
+    assert completion_by_resource == {
+        "InsurancePlan": {"uhc"},
+        "PractitionerRole": {"uhc"},
+        "OrganizationAffiliation": {"uhc"},
+    }
+    assert import_summary[4]["InsurancePlan"]["sources_completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_stale_cleanup_uses_atomic_seen_stage(monkeypatch):
+    acquisition = importer.UHCPlanGraphAcquisition(
+        importer.UHCPlanGraphSnapshot(
+            rows_by_resource={"InsurancePlan": [{"resource_id": "plan-1"}]},
+            pages_by_resource={"InsurancePlan": 1},
+            network_count=1,
+        ),
+        plan_graph_complete=True,
+        stability_verified=True,
+    )
+    delete_stale_rows = AsyncMock(return_value=4)
+    monkeypatch.setattr(importer, "_delete_stale_resource_rows", delete_stale_rows)
+
+    stale_counts, ready_source_ids = await importer._finalize_uhc_plan_graph_stale_rows(
+        _uhc_reverse_lookup_source(),
+        acquisition,
+        ["InsurancePlan"],
+        run_id="run-1",
+        stale_cleanup=True,
+        seen_table="provider_directory_seen_run_1",
+    )
+
+    assert stale_counts == {}
+    assert ready_source_ids == {"InsurancePlan": ["uhc"]}
+    delete_stale_rows.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_stale_cleanup_deletes_without_seen_stage(monkeypatch):
+    acquisition = importer.UHCPlanGraphAcquisition(
+        importer.UHCPlanGraphSnapshot(
+            rows_by_resource={"InsurancePlan": [{"resource_id": "plan-1"}]},
+            pages_by_resource={"InsurancePlan": 1},
+            network_count=1,
+        ),
+        plan_graph_complete=True,
+        stability_verified=True,
+    )
+    delete_stale_rows = AsyncMock(return_value=4)
+    monkeypatch.setattr(importer, "_delete_stale_resource_rows", delete_stale_rows)
+
+    stale_counts, ready_source_ids = await importer._finalize_uhc_plan_graph_stale_rows(
+        _uhc_reverse_lookup_source(),
+        acquisition,
+        ["InsurancePlan"],
+        run_id="run-1",
+        stale_cleanup=True,
+        seen_table=None,
+    )
+
+    assert stale_counts == {"InsurancePlan": 4}
+    assert ready_source_ids == {}
+    delete_stale_rows.assert_awaited_once_with(
+        importer.ProviderDirectoryInsurancePlan,
+        "uhc",
+        "run-1",
+        use_seen_table=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_completion_does_not_request_pagination_retry(monkeypatch):
+    source_lookup = _uhc_reverse_lookup_source()
+    source_lookup["_pagination_checkpoint_context"] = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["uhc"],
+        run_id="run-1",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+    )
+    clear_checkpoints = AsyncMock(return_value=0)
+    monkeypatch.setattr(importer, "_clear_pagination_checkpoints", clear_checkpoints)
+    resume_required_entries: set[str] = set()
+    graph_diagnostic_map = {
+        "complete": False,
+        "collection_complete": False,
+        "plan_graph_complete": True,
+        "stability_verified": True,
+        "fetch_mode": importer.UHC_PLAN_GRAPH_FETCH_MODE,
+        "bounded": False,
+        "error": None,
+        "next_url_remaining": False,
+    }
+
+    await importer._finalize_source_pagination_checkpoints(
+        source_lookup,
+        {"InsurancePlan": graph_diagnostic_map},
+        resume_required_entries,
+    )
+
+    assert resume_required_entries == set()
+    clear_checkpoints.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_initializes_retry_lineage_checkpoints(monkeypatch):
+    source_lookup = _uhc_reverse_lookup_source()
+    source_lookup["_pagination_checkpoint_context"] = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["uhc"],
+        run_id="run-1",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+    )
+    load_checkpoint = AsyncMock()
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", load_checkpoint)
+
+    await importer._ensure_uhc_plan_graph_checkpoints(
+        source_lookup,
+        ["InsurancePlan", "PractitionerRole"],
+    )
+
+    assert load_checkpoint.await_count == 2
+    assert [call.args[1] for call in load_checkpoint.await_args_list] == [
+        "InsurancePlan",
+        "PractitionerRole",
+    ]
+    assert all(
+        "$healthporta-plan-graph" in call.args[2]
+        for call in load_checkpoint.await_args_list
+    )
+
+
+def _failed_uhc_plan_graph_summary(resource_types: list[str]):
+    """Build a failed graph result for branch-integration tests."""
+    failed_diagnostics_by_resource = {
+        resource_type: {
+            "complete": False,
+            "collection_complete": False,
+            "plan_graph_complete": False,
+            "stability_verified": False,
+            "fetch_mode": importer.UHC_PLAN_GRAPH_FETCH_MODE,
+            "bounded": False,
+            "error": "uhc_plan_graph_practitionerrole_cap_exhausted",
+            "next_url_remaining": True,
+        }
+        for resource_type in resource_types
+    }
+    return (
+        ["uhc"],
+        failed_diagnostics_by_resource,
+        {resource_type: 0 for resource_type in resource_types},
+        {},
+        {},
+        {},
+        {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_plan_graph_failure_without_checkpoint_raises(monkeypatch):
+    """A graph failure cannot report success without a durable retry path."""
+    _stub_resource_import_metadata(monkeypatch)
+    selected_resources = [
+        "InsurancePlan",
+        "OrganizationAffiliation",
+        "PractitionerRole",
+    ]
+    failed_summary = _failed_uhc_plan_graph_summary(selected_resources)
+    monkeypatch.setattr(
+        importer,
+        "_prepare_resource_import_source_group",
+        AsyncMock(return_value=([_uhc_reverse_lookup_source()], None)),
+    )
+    monkeypatch.setattr(importer, "_ensure_uhc_plan_graph_checkpoints", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "_import_uhc_plan_graph_source_group",
+        AsyncMock(return_value=failed_summary),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=importer.UHC_PLAN_GRAPH_INCOMPLETE_ERROR,
+    ):
+        await importer._import_resources(
+            [_uhc_reverse_lookup_source()],
+            resources=selected_resources,
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=3,
+            run_id="run-1",
+        )
+
+
+def test_endpoint_scope_rejects_mismatch_and_multiple_bases():
+    uhc_source = _uhc_reverse_lookup_source()
+    other_source_map = {
+        "source_id": "other",
+        "api_base": "https://example.test/fhir",
+        "canonical_api_base": "https://example.test/fhir",
+    }
+
+    with pytest.raises(RuntimeError, match="endpoint_scope_mismatch"):
+        importer._validate_provider_directory_endpoint_scope(
+            [other_source_map],
+            importer.UHC_PROVIDER_DIRECTORY_BASE,
+        )
+    with pytest.raises(RuntimeError, match="endpoint_scope_multiple_bases"):
+        importer._validate_provider_directory_endpoint_scope(
+            [uhc_source, other_source_map],
+            importer.UHC_PROVIDER_DIRECTORY_BASE,
+        )
+    with pytest.raises(RuntimeError, match="endpoint_scope_unresolved_base"):
+        importer._validate_provider_directory_endpoint_scope(
+            [{"source_id": "missing-base"}],
+            importer.UHC_PROVIDER_DIRECTORY_BASE,
+        )
+    assert importer._validate_provider_directory_endpoint_scope(
+        [uhc_source],
+        importer.UHC_PROVIDER_DIRECTORY_BASE + "/",
+    ) == importer.UHC_PROVIDER_DIRECTORY_BASE
+
+
+@pytest.mark.asyncio
+async def test_endpoint_scope_fails_before_resource_acquisition(monkeypatch):
+    fetch_resource_rows = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch_resource_rows)
+
+    with pytest.raises(RuntimeError, match="endpoint_scope_mismatch"):
+        await importer._import_resources(
+            [{"source_id": "other", "api_base": "https://example.test/fhir"}],
+            resources=["InsurancePlan"],
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=1,
+            timeout=3,
+            run_id="run-1",
+            provider_directory_endpoint_scope=importer.UHC_PROVIDER_DIRECTORY_BASE,
+        )
+
+    fetch_resource_rows.assert_not_awaited()
+
+
 def _practitioner_partition_bundle(resource_id: str) -> dict[str, Any]:
     return {
         "resourceType": "Bundle",

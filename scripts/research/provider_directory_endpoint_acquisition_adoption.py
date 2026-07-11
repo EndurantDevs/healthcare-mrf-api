@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 RunParameterValidator = Callable[[dict[str, Any], dict[str, Any]], list[str]]
 RunRememberer = Callable[[dict[str, Any], dict[str, Any]], None]
+RunConflictChecker = Callable[[dict[str, Any], dict[str, Any]], bool]
 
 
 def parse_adopt_runs(raw_values: list[str], entry_pattern: Any) -> tuple[tuple[str, str], ...]:
@@ -41,12 +42,14 @@ class AdoptionManager:
         client: Any,
         validate_run_parameters: RunParameterValidator,
         remember_run: RunRememberer,
+        run_conflicts_with_entry: RunConflictChecker,
     ):
         self.manifest = manifest
         self.state = state
         self.client = client
         self.validate_run_parameters = validate_run_parameters
         self.remember_run = remember_run
+        self.run_conflicts_with_entry = run_conflicts_with_entry
 
     def apply(
         self,
@@ -126,6 +129,7 @@ class AdoptionManager:
             for candidate in run_list
             if candidate.get("status") in ACTIVE_STATUSES
             and not self._is_run_in_root(candidate, root_run_id)
+            and self.run_conflicts_with_entry(entry, candidate)
         ]
         if unrelated_active_ids:
             raise HarnessConflict(
