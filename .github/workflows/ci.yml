@@ -89,6 +89,7 @@ jobs:
           tests/test_provider_directory_schema_sync.py
           tests/test_provider_directory_bulk_checkpoint_schema.py
           tests/test_generate_provider_directory_support_docs.py
+          tests/test_provider_directory_catalog_confirmation.py
           tests/test_update_provider_directory_verification.py
           tests/test_address_canonical_unit.py
           tests/test_address_checksum_schema.py

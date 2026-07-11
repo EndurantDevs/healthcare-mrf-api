@@ -33,12 +33,6 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered_document
-    assert "does not claim that a live probe succeeded" in rendered_document
-    assert "`reports/provider-directory-endpoint-acquisition/report.json`" in rendered_document
-    assert "selected `--report` path; the report is not tracked" in rendered_document
-    assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered_document
-    assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered_document
-    assert "CI rejects expired evidence" in rendered_document
     assert "## Inventory Summary" in rendered_document
     assert "| Acquisition-configured | 23 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
@@ -69,7 +63,6 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
 
 def test_rendered_live_proof_summarizes_resource_rows():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-
     rendered_document = generator.render_markdown(manifest)
 
     assert "| Rows by resource |" in rendered_document
@@ -333,7 +326,7 @@ def test_freshness_validation_accepts_current_reviews():
     [
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
         ("molina", "molina.sapphirethreesixtyfive.com cursor continuations"),
-        ("michigan", "canonical HAPI next-page link returns HTTP 403"),
+        ("michigan", "deterministic _getpagesoffset continuation"),
         ("cigna", "_count=75 returns false-empty search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
         ("humana", "Overrides portal or stale paths to the public FHIR base"),
