@@ -2349,13 +2349,53 @@ async def _ptg2_manifest_provider_set_keys_for_ids(
     }
 
 
+async def _version_three_provider_counts_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    provider_set_keys: Iterable[int] | None,
+) -> dict[int, int] | None:
+    """Read sparse provider counts from existing v3 provider-page blocks."""
+
+    if (
+        serving_tables.effective_arch_version != "postgres_binary_v3"
+        or not serving_tables.serving_binary_table
+        or provider_set_keys is None
+    ):
+        return None
+    normalized_keys = tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
+    if not normalized_keys:
+        return {}
+    if not await has_provider_pages_in_db(
+        session,
+        serving_tables.serving_binary_table,
+    ):
+        return None
+    provider_pages = await lookup_provider_pages_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        normalized_keys,
+    )
+    if provider_pages is None:
+        return None
+    return {
+        provider_set_key: provider_page.provider_count
+        for provider_set_key, provider_page in provider_pages.items()
+    }
+
+
 async def _ptg2_manifest_lookup_serving_by_code_sidecar(
     session,
     serving_tables: PTG2ServingTables,
     code_key: int,
     *,
     provider_set_keys: Iterable[int] | None = None,
+    provider_counts_by_key: Mapping[int, int] | None = None,
 ):
+    sparse_count_kwargs = (
+        {"provider_counts_by_key": provider_counts_by_key}
+        if provider_counts_by_key is not None
+        else {}
+    )
     if serving_tables.effective_arch_version == "postgres_binary_v3":
         if serving_tables.serving_binary_table:
             return await lookup_serving_binary_by_code_from_db(
@@ -2363,6 +2403,7 @@ async def _ptg2_manifest_lookup_serving_by_code_sidecar(
                 serving_tables.serving_binary_table,
                 int(code_key),
                 provider_set_keys=provider_set_keys,
+                **sparse_count_kwargs,
                 price_dictionary_item_count=serving_tables.price_dictionary_item_count,
                 price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
                 price_dictionary_compressed_records=(
@@ -2376,6 +2417,7 @@ async def _ptg2_manifest_lookup_serving_by_code_sidecar(
             serving_tables.serving_binary_table,
             int(code_key),
             provider_set_keys=provider_set_keys,
+            **sparse_count_kwargs,
         )
     _raise_missing_postgres_binary_table(serving_tables)
     entry = _ptg2_manifest_artifact_entry(serving_tables, "serving_by_code")
@@ -3515,6 +3557,33 @@ def _next_version_three_code_batch_size(metadata_batch_size: int | None) -> int 
     return min(metadata_batch_size * 2, _PTG2_VERSION_THREE_REVERSE_CODE_BATCH_SIZE)
 
 
+async def _version_three_forward_entries_for_batch(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_metadata_by_key: Mapping[int, Mapping[str, Any]],
+    provider_set_id_by_key: Mapping[int, str],
+) -> dict[int, tuple[PTG2ServingBinaryRow, ...]]:
+    """Read one sparse v3 forward batch using provider-page count projections."""
+
+    provider_counts_by_key = await _version_three_provider_counts_for_keys(
+        session,
+        serving_tables,
+        provider_set_id_by_key,
+    )
+    return await lookup_binary_code_batch_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        code_metadata_by_key,
+        provider_set_keys=provider_set_id_by_key,
+        provider_counts_by_key=provider_counts_by_key,
+        price_dictionary_item_count=serving_tables.price_dictionary_item_count,
+        price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
+        price_dictionary_compressed_records=(
+            serving_tables.price_dictionary_compressed_records
+        ),
+    )
+
+
 async def _version_three_candidate_batch(
     session,
     serving_tables: PTG2ServingTables,
@@ -3551,16 +3620,11 @@ async def _version_three_candidate_batch(
         for code_metadata in code_metadata_rows
         if code_metadata.get("code_key") is not None
     }
-    forward_entries_by_code = await lookup_binary_code_batch_from_db(
+    forward_entries_by_code = await _version_three_forward_entries_for_batch(
         session,
-        serving_tables.serving_binary_table,
+        serving_tables,
         code_metadata_by_key,
-        provider_set_keys=reverse_scope.provider_set_id_by_key,
-        price_dictionary_item_count=serving_tables.price_dictionary_item_count,
-        price_dictionary_block_bytes=serving_tables.price_dictionary_block_bytes,
-        price_dictionary_compressed_records=(
-            serving_tables.price_dictionary_compressed_records
-        ),
+        reverse_scope.provider_set_id_by_key,
     )
     candidate_row_groups = _version_three_candidate_rows(
         code_metadata_by_key,
@@ -4355,9 +4419,10 @@ async def _manifest_rate_scope_from_sidecar(
     plan_id: str,
     reported_code: str,
     code_system: str | None,
+    provider_set_keys: Iterable[int] | None = None,
 ) -> _ManifestRateScope:
     cache_key = _ptg2_rate_scope_key(serving_tables, serving_table, plan_id, reported_code, code_system)
-    is_cache_enabled = hasattr(session, "sync_session")
+    is_cache_enabled = hasattr(session, "sync_session") and provider_set_keys is None
     if is_cache_enabled:
         cached_scope = _ptg2_rate_scope_get(cache_key)
         if cached_scope is not None:
@@ -4369,6 +4434,7 @@ async def _manifest_rate_scope_from_sidecar(
         plan_id=plan_id,
         reported_code=reported_code,
         code_system=code_system,
+        provider_set_keys=provider_set_keys,
     )
     if not is_cache_enabled:
         return _ptg2_build_rate_scope(group_ids)
@@ -4391,9 +4457,21 @@ async def _manifest_sidecar_entries_for_code_rows(
     session,
     serving_tables: PTG2ServingTables,
     code_rows: Iterable[Mapping[str, Any]],
+    *,
+    provider_set_keys: Iterable[int] | None = None,
 ) -> list[Any]:
     """Load complete forward entries for each compatible code dictionary row."""
 
+    normalized_provider_set_keys = (
+        tuple(sorted({int(provider_set_key) for provider_set_key in provider_set_keys}))
+        if provider_set_keys is not None
+        else None
+    )
+    provider_counts_by_key = await _version_three_provider_counts_for_keys(
+        session,
+        serving_tables,
+        normalized_provider_set_keys,
+    )
     sidecar_entries: list[Any] = []
     for code_row in code_rows:
         code_key = code_row.get("code_key")
@@ -4404,6 +4482,8 @@ async def _manifest_sidecar_entries_for_code_rows(
                 session,
                 serving_tables,
                 int(code_key),
+                provider_set_keys=normalized_provider_set_keys,
+                provider_counts_by_key=provider_counts_by_key,
             )
         )
     return sidecar_entries
@@ -4417,6 +4497,7 @@ async def _manifest_rate_provider_groups_from_sidecar(
     plan_id: str,
     reported_code: str,
     code_system: str | None,
+    provider_set_keys: Iterable[int] | None = None,
 ) -> tuple[str, ...]:
     """Resolve provider groups for one plan and reported code from artifacts."""
 
@@ -4472,6 +4553,7 @@ async def _manifest_rate_provider_groups_from_sidecar(
                     session,
                     serving_tables,
                     code_rows,
+                    provider_set_keys=provider_set_keys,
                 )
                 provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
                     session,
@@ -7373,6 +7455,152 @@ async def _project_graph_candidates(
     return _graph_providers_by_set(candidates, provider_data_by_npi, provider_sets_by_group, location_source)
 
 
+@dataclass(frozen=True)
+class _ExplicitNpiGraphScope:
+    npi: int
+    group_ids: tuple[str, ...]
+    provider_set_keys: tuple[int, ...]
+
+
+async def _version_three_explicit_npi_graph_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: Mapping[str, Any],
+) -> _ExplicitNpiGraphScope | None:
+    """Resolve one NPI to dense provider-set keys before reading a code block."""
+
+    if serving_tables.effective_arch_version != "postgres_binary_v3":
+        return None
+    requested_npi = _normalize_npi(args.get("npi"))
+    if requested_npi is None or not (
+        _has_ptg2_artifact_reader(serving_tables, "provider_npi_group")
+        and _has_ptg2_artifact_reader(serving_tables, "provider_inverted")
+    ):
+        return None
+    group_ids = await _ptg2_manifest_sidecar_members_async(
+        session,
+        serving_tables,
+        "provider_npi_group",
+        _ptg2_npi_member_id(requested_npi),
+    )
+    if not group_ids:
+        return _ExplicitNpiGraphScope(requested_npi, (), ())
+    provider_sets_by_group = await _manifest_sets_by_group(
+        session,
+        serving_tables,
+        group_ids,
+    )
+    if provider_sets_by_group is None:
+        return None
+    provider_set_ids = tuple(
+        sorted(
+            {
+                provider_set_id
+                for group_provider_set_ids in provider_sets_by_group.values()
+                for provider_set_id in group_provider_set_ids
+            }
+        )
+    )
+    provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        provider_set_ids,
+    )
+    if set(provider_set_key_by_id) != set(provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set dictionary is missing an NPI-referenced provider set"
+        )
+    return _ExplicitNpiGraphScope(
+        requested_npi,
+        tuple(group_ids),
+        tuple(sorted(provider_set_key_by_id.values())),
+    )
+
+
+async def _graph_candidates_for_rate_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    rate_scope: _ManifestRateScope,
+    candidate_limit: int,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None,
+) -> _GraphLocationCandidates | None:
+    """Use exact-NPI membership when available, otherwise retain broad traversal."""
+
+    if explicit_npi_scope is None:
+        return await _graph_location_candidates(
+            session,
+            serving_tables,
+            args,
+            rate_scope,
+            candidate_limit,
+        )
+    matching_group_ids = {
+        group_id
+        for group_id in explicit_npi_scope.group_ids
+        if _has_rate_scope_group(rate_scope, group_id)
+    }
+    if not matching_group_ids:
+        return _GraphLocationCandidates([], {})
+    location_rows = await _membership_location_rows(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=(explicit_npi_scope.npi,),
+        limit=max(candidate_limit * 20, 1000),
+    )
+    if location_rows is None:
+        return None
+    return _GraphLocationCandidates(
+        location_rows,
+        {explicit_npi_scope.npi: matching_group_ids},
+    )
+
+
+async def _graph_candidates_for_request(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    requested_code: str,
+    requested_system: str | None,
+    plan_id: str,
+    candidate_limit: int,
+) -> _GraphLocationCandidates | None:
+    """Resolve a code scope, preferring exact-NPI traversal for v3 snapshots."""
+
+    explicit_npi_scope = await _version_three_explicit_npi_graph_scope(
+        session,
+        serving_tables,
+        args,
+    )
+    if explicit_npi_scope is not None and not explicit_npi_scope.provider_set_keys:
+        return _GraphLocationCandidates([], {})
+    rate_scope = await _manifest_rate_scope_from_sidecar(
+        session,
+        serving_tables,
+        serving_table=_safe_table_name(serving_tables.serving_table),
+        plan_id=plan_id,
+        reported_code=requested_code,
+        code_system=requested_system,
+        provider_set_keys=(
+            explicit_npi_scope.provider_set_keys
+            if explicit_npi_scope is not None
+            else None
+        ),
+    )
+    if rate_scope.id_count == 0:
+        return _GraphLocationCandidates([], {})
+    return await _graph_candidates_for_rate_scope(
+        session,
+        serving_tables,
+        args,
+        rate_scope,
+        candidate_limit,
+        explicit_npi_scope,
+    )
+
+
 async def _graph_location_matches(
     session,
     serving_tables: PTG2ServingTables,
@@ -7392,22 +7620,14 @@ async def _graph_location_matches(
     )
     if not plan_id or not requested_code:
         return None
-    rate_scope = await _manifest_rate_scope_from_sidecar(
-        session,
-        serving_tables,
-        serving_table=_safe_table_name(serving_tables.serving_table),
-        plan_id=plan_id,
-        reported_code=requested_code,
-        code_system=requested_system,
-    )
-    if rate_scope.id_count == 0:
-        return set(), {}
-    candidates = await _graph_location_candidates(
+    candidates = await _graph_candidates_for_request(
         session,
         serving_tables,
         args,
-        rate_scope,
-        candidate_limit,
+        requested_code=requested_code,
+        requested_system=requested_system,
+        plan_id=plan_id,
+        candidate_limit=candidate_limit,
     )
     if candidates is None:
         return None

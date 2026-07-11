@@ -40,6 +40,14 @@ class PTG2V3ProviderPage:
     entries: tuple[PTG2V3PageRecord, ...]
     total_row_count: int
 
+    @property
+    def provider_count(self) -> int:
+        """Return the provider count repeated by every projected row."""
+
+        if not self.entries:
+            raise PTG2ManifestArtifactError("PTG2 v3 provider page has no projected rows")
+        return self.entries[0].provider_count
+
 
 def _page_entry_count(block_bytes: bytes, entry_count: int) -> tuple[int, int]:
     if not block_bytes or block_bytes[0] != PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION:

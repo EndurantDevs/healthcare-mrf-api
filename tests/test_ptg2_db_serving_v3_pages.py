@@ -145,6 +145,7 @@ async def test_provider_page_reader_returns_requested_rows_and_total():
     )
 
     assert set(pages) == {provider_set_key}
+    assert pages[provider_set_key].provider_count == 12
     assert pages[provider_set_key].total_row_count == 100
     assert len(pages[provider_set_key].entries) == PTG2_SERVING_BINARY_V3_PAGE_ROWS
     assert pages[provider_set_key].entries[0].code_key == 3
@@ -157,6 +158,7 @@ async def test_page_readers_return_none_when_projection_is_absent():
 
     assert await lookup_code_page_from_db(session, "mrf.ptg2_v3", 3) is None
     assert await lookup_provider_pages_from_db(session, "mrf.ptg2_v3", (4,)) is None
+    assert not db_sidecars._BINARY_BLOCK_CACHE
 
 
 @pytest.mark.asyncio
