@@ -31,7 +31,6 @@ TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
-PROVIDER_DIRECTORY_MAX_ACTIVE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE"
 _IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
 _IMPORT_RUN_ENSURED = False
 _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
@@ -949,7 +948,7 @@ def _provider_directory_blocking_run(
 
 
 def _provider_directory_max_active() -> int:
-    raw_limit = os.getenv(PROVIDER_DIRECTORY_MAX_ACTIVE_ENV, "").strip()
+    raw_limit = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "").strip()
     try:
         configured_limit = int(raw_limit) if raw_limit else None
     except ValueError:
