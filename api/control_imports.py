@@ -31,6 +31,7 @@ TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
 MAX_TRIGGERED_BY_LENGTH = 32
+PROVIDER_DIRECTORY_MAX_ACTIVE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE"
 _IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
 _IMPORT_RUN_ENSURED = False
 _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
@@ -925,7 +926,7 @@ def _provider_directory_blocking_run(
 ) -> dict[str, Any] | None:
     if not active_runs:
         return None
-    if len(active_runs) >= 2:
+    if len(active_runs) >= _provider_directory_max_active():
         return active_runs[0]
     requested_scope = _provider_directory_acquisition_scope(params)
     if requested_scope is None:
@@ -945,6 +946,15 @@ def _provider_directory_blocking_run(
         if not requested_source_ids.isdisjoint(active_source_ids) or requested_endpoint == active_endpoint:
             return active_run
     return None
+
+
+def _provider_directory_max_active() -> int:
+    raw_limit = os.getenv(PROVIDER_DIRECTORY_MAX_ACTIVE_ENV, "").strip()
+    try:
+        configured_limit = int(raw_limit) if raw_limit else None
+    except ValueError:
+        configured_limit = None
+    return configured_limit if configured_limit is not None and configured_limit > 0 else 2
 
 
 def _allows_parallel_active_importer_runs(
