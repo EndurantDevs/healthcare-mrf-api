@@ -181,6 +181,8 @@ Per-import documentation:
 - [Pharmacy economics import](./docs/imports/pharmacy-economics.md)
 - [Entity address unified import](./docs/imports/entity-address-unified.md)
 - [Provider enrichment import](./docs/imports/provider-enrichment.md)
+- [Provider Directory FHIR import](./docs/imports/provider-directory-fhir.md)
+- [Provider Directory endpoint support matrix](./docs/imports/provider-directory-endpoint-support.md)
 - [Part D formulary and pharmacy network import](./docs/imports/partd-formulary-network.md)
 - [Pharmacy license import](./docs/imports/pharmacy-license.md)
 

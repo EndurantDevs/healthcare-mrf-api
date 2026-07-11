@@ -51,6 +51,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - [Provider quality import](./provider-quality.md)
 - [Provider enrichment import](./provider-enrichment.md)
 - [Provider Directory FHIR import](./provider-directory-fhir.md)
+- [Provider Directory endpoint support matrix](./provider-directory-endpoint-support.md)
 - [Part D formulary and pharmacy network import](./partd-formulary-network.md)
 - [Pharmacy license import](./pharmacy-license.md)
 - [LODES workplace demand import](./lodes.md)
