@@ -2,11 +2,29 @@
 
 This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Runtime and import status are written locally or on dev by the endpoint-acquisition harness to `reports/provider-directory-endpoint-acquisition/report.json`, or to its selected `--report` path; the report is not tracked.
 
-Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_directory_source` at `2026-07-10T09:33:00Z`. This timestamp confirms catalog coverage only; the tracked verification snapshot is the authority for terminal per-endpoint live status.
+The live catalog and curated support matrix are distinct: the catalog inventory covers every source in `mrf.provider_directory_source`, while this maintained matrix tracks only sources with curated support records. The tracked verification snapshot remains the authority for terminal per-endpoint live status.
 
 `None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.
 
 Freshness policy: catalog confirmation expires after `45` days, source reviews after `45` days, and current terminal proof after `45` days. CI rejects expired evidence.
+
+## Catalog Inventory Snapshot
+
+This snapshot covers the entire live catalog: `866` sources confirmed in `healthporta-dev` against `mrf.provider_directory_source` at `2026-07-11T15:21:05Z`. It is not the curated support matrix below, which tracks `31` entries, including `23` acquisition-configured entries.
+
+The `103` valid source rows collapse to `25` canonical bases after removing `78` aliases. `24` bases are represented by maintained entries; `1` is not. The only valid canonical base outside the maintained entries is Aetna's credentialed, targeted Medicaid directory. It is documented as an alternate Aetna base rather than a separate fully enumerable carrier directory.
+
+| Probe status | Sources |
+| --- | ---: |
+| `auth_required` | 633 |
+| `valid` | 103 |
+| `valid_non_fhir` | 32 |
+| `dns_failure` | 14 |
+| `timeout` | 8 |
+| `no_api` | 5 |
+| `server_error` | 1 |
+| `unreachable` | 1 |
+| Never probed | 69 |
 
 ## Inventory Summary
 
@@ -32,9 +50,9 @@ Freshness policy: catalog confirmation expires after `45` days, source reviews a
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Idaho (`idaho`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api-idmedicaid.safhir.io/v1/api/provider-directory | pdfhir_b6fdc036a4686d0ab69f6f3a | Not required | 2026-07-10 | 2026-08-24 | Accepts api-ida-prd.safhir.io cursor continuations with checkpoints. |
 | Molina (`molina`) | Acquisition-configured | None | REST | Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole | https://api.interop.molinahealthcare.com/providerdirectory | pdfhir_0661ff143952c214d680d95d | Not required | 2026-07-11 | 2026-08-25 | Fresh dev probes validate all five initial resource searches and rewritten molina.sapphirethreesixtyfive.com cursor continuations; endpoint-wide completion still requires a terminal unbounded run. |
-| Michigan (`michigan`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api.interopstation.com/mdhhs/fhir | pdfhir_75511676b61b2bddb6f94322 | Not required | 2026-07-11 | 2026-08-25 | PractitionerRole pages are capped at 25, but the canonical HAPI next-page link returns HTTP 403; full acquisition currently fails closed pending a proven stateless continuation. |
+| Michigan (`michigan`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api.interopstation.com/mdhhs/fhir | pdfhir_75511676b61b2bddb6f94322 | Not required | 2026-07-11 | 2026-08-25 | PractitionerRole pages are capped at 25. The signed HAPI cursor returns HTTP 403, so the importer validates its shape and advances the endpoint's deterministic _getpagesoffset continuation without replaying the opaque token. |
 | Cigna (`cigna`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fhir.cigna.com/ProviderDirectory/v1 | pdfhir_46bcb068e81b0bc844e327e9 | Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination at _count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets for role, organization, location, service, and affiliation collections. No Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns. |
-| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Bulk | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://apif1.aetna.com/fhir/v1/providerdirectorydata | pdfhir_d68a896335981928bdbbb80e | Required | 2026-07-11 | 2026-08-25 | OAuth2 client credentials and Bulk; Endpoint collection is unavailable. |
+| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Bulk | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://apif1.aetna.com/fhir/v1/providerdirectorydata | pdfhir_d68a896335981928bdbbb80e | Required | 2026-07-11 | 2026-08-25 | OAuth2 client credentials and Bulk; Endpoint collection is unavailable. The separate /providerdirectory Medicaid base has 19 credentialed catalog aliases and only targeted search semantics, so it is not treated as another fully enumerable carrier directory. |
 | Humana (`humana`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, Practitioner, PractitionerRole | https://fhir.humana.com/api | pdfhir_00a3d35311756763d420b0d6 | Not required | 2026-07-11 | 2026-08-25 | Overrides portal or stale paths to the public FHIR base. |
 | IEHP (`iehp`) | Acquisition-configured | None | REST | HealthcareService, InsurancePlan, Location, Organization, Practitioner, PractitionerRole | https://fhir.iehp.org/provider-directory | pdfhir_56521fb2d273045f2c3b73dc | Not required | 2026-07-11 | 2026-08-25 | Normalizes portal and resource paths to the Provider Directory base. The live CapabilityStatement omits HealthcareService and InsurancePlan, but anonymous direct searches and continuations for both are valid. |
 | Arkansas (`arkansas`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fite.ar-prd.gw02.abacusinsights.ai/provider-directory | pdfhir_d6b52e94ddf5ca7b9faafe17 | Not required | 2026-07-11 | 2026-08-25 | Uses synthetic _skip pagination with stable _id sorting. PractitionerRole, Practitioner, Organization, and Location are populated; InsurancePlan, HealthcareService, OrganizationAffiliation, and Endpoint currently return valid empty Bundles. |

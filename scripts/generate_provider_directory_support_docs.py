@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from scripts.provider_directory_catalog_confirmation import (
+        catalog_confirmation_fields as _catalog_confirmation_fields,
+        render_catalog_inventory_snapshot as _catalog_inventory_snapshot,
+    )
     from scripts.provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
         RESOURCE_TYPES,
@@ -35,6 +39,10 @@ try:
         validate_verification_record,
     )
 except ModuleNotFoundError:
+    from provider_directory_catalog_confirmation import (
+        catalog_confirmation_fields as _catalog_confirmation_fields,
+        render_catalog_inventory_snapshot as _catalog_inventory_snapshot,
+    )
     from provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
         RESOURCE_TYPES,
@@ -145,23 +153,6 @@ def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     ):
         raise SupportDocumentationError(f"{entry_id}: documented_resources must contain known resource types")
     validate_configured_endpoint(entry, support)
-
-
-def _catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, str]:
-    confirmation = manifest.get("catalog_confirmation")
-    required_fields = {"environment", "checked_at", "relation"}
-    if not isinstance(confirmation, dict) or set(confirmation) != required_fields:
-        raise SupportDocumentationError(f"catalog_confirmation must contain {sorted(required_fields)}")
-    confirmation_by_field = {field: str(confirmation.get(field) or "").strip() for field in required_fields}
-    if not all(confirmation_by_field.values()):
-        raise SupportDocumentationError("catalog_confirmation fields must be non-empty")
-    try:
-        checked_at = dt.datetime.fromisoformat(confirmation_by_field["checked_at"].replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SupportDocumentationError("catalog_confirmation.checked_at must be ISO-8601") from exc
-    if checked_at.tzinfo is None:
-        raise SupportDocumentationError("catalog_confirmation.checked_at must include a timezone")
-    return confirmation_by_field
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate complete top-level support metadata without altering run entries."""
     entries = manifest.get("entries")
@@ -250,7 +241,7 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "",
         "This matrix describes maintained implementation and campaign configuration. It does not claim that a live probe succeeded, that an import ran, or that a dataset is current. Runtime and import status are written locally or on dev by the endpoint-acquisition harness to `" + report_path + "`, or to its selected `--report` path; the report is not tracked.",
         "",
-        "Catalog inventory was last confirmed in `" + confirmation_by_field["environment"] + "` against `" + confirmation_by_field["relation"] + "` at `" + confirmation_by_field["checked_at"] + "`. This timestamp confirms catalog coverage only; the tracked verification snapshot is the authority for terminal per-endpoint live status.",
+        "The live catalog and curated support matrix are distinct: the catalog inventory covers every source in `" + confirmation_by_field["relation"] + "`, while this maintained matrix tracks only sources with curated support records. The tracked verification snapshot remains the authority for terminal per-endpoint live status.",
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",
@@ -262,6 +253,8 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         + str(policy["terminal_verification_max_age_days"])
         + "` days. CI rejects expired evidence.",
     ]
+
+
 def _configured_support_rows(
     manifest: dict[str, Any],
     support_by_entry: dict[str, dict[str, Any]],
@@ -407,6 +400,7 @@ def render_markdown(
     if overlapping_ids:
         raise SupportDocumentationError("blocker registry IDs overlap runnable manifest entries: " + ", ".join(overlapping_ids))
     markdown_lines = _support_document_header(manifest)
+    markdown_lines.extend(_catalog_inventory_snapshot(manifest, blockers))
     markdown_lines.extend(render_inventory_summary(manifest, support_by_entry, blockers, _display))
     markdown_lines.extend(_configured_support_rows(manifest, support_by_entry))
     markdown_lines.extend(

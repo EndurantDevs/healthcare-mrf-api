@@ -6,8 +6,25 @@
   "retest_results_url": "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json",
   "catalog_confirmation": {
     "environment": "healthporta-dev",
-    "checked_at": "2026-07-10T09:33:00Z",
-    "relation": "mrf.provider_directory_source"
+    "checked_at": "2026-07-11T15:21:05Z",
+    "relation": "mrf.provider_directory_source",
+    "source_count": 866,
+    "probe_status_counts": {
+      "auth_required": 633,
+      "valid": 103,
+      "valid_non_fhir": 32,
+      "dns_failure": 14,
+      "timeout": 8,
+      "no_api": 5,
+      "server_error": 1,
+      "unreachable": 1
+    },
+    "never_probed_source_count": 69,
+    "valid_canonical_base_count": 25,
+    "represented_valid_canonical_base_count": 24,
+    "unrepresented_valid_canonical_base_count": 1,
+    "collapsed_valid_alias_source_count": 78,
+    "coverage_note": "The only valid canonical base outside the maintained entries is Aetna's credentialed, targeted Medicaid directory. It is documented as an alternate Aetna base rather than a separate fully enumerable carrier directory."
   },
   "support_documentation": {
     "schema_version": 1,
@@ -22,9 +39,9 @@
     "entry_support": {
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Fresh dev probes validate all five initial resource searches and rewritten molina.sapphirethreesixtyfive.com cursor continuations; endpoint-wide completion still requires a terminal unbounded run."},
-      "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "PractitionerRole pages are capped at 25, but the canonical HAPI next-page link returns HTTP 403; full acquisition currently fails closed pending a proven stateless continuation."},
+      "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "PractitionerRole pages are capped at 25. The signed HAPI cursor returns HTTP 403, so the importer validates its shape and advances the endpoint's deterministic _getpagesoffset continuation without replaying the opaque token."},
       "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Sequential REST pagination at _count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets for role, organization, location, service, and affiliation collections. No Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns."},
-      "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-07-11", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint collection is unavailable."},
+      "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-07-11", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint collection is unavailable. The separate /providerdirectory Medicaid base has 19 credentialed catalog aliases and only targeted search semantics, so it is not treated as another fully enumerable carrier directory."},
       "humana": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Overrides portal or stale paths to the public FHIR base."},
       "iehp": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Normalizes portal and resource paths to the Provider Directory base. The live CapabilityStatement omits HealthcareService and InsurancePlan, but anonymous direct searches and continuations for both are valid."},
       "arkansas": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Uses synthetic _skip pagination with stable _id sorting. PractitionerRole, Practitioner, Organization, and Location are populated; InsurancePlan, HealthcareService, OrganizationAffiliation, and Endpoint currently return valid empty Bundles."},
