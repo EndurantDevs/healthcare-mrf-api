@@ -14,6 +14,7 @@ import os
 import re
 import struct
 import zlib
+from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -28,10 +29,13 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
     PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
     PTG2_MANIFEST_MEMBERSHIP_FORMAT,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE,
     PTG2_MANIFEST_MEMBERSHIP_MAGIC,
     PTG2_MANIFEST_OLD_DENSE_MEMBERSHIP_MAGIC,
     PTG2_MANIFEST_OLD_MEMBERSHIP_MAGIC,
     PTG2_MANIFEST_VERSION,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES,
     PTG2_SERVING_BY_CODE_FORMAT,
     PTG2_SERVING_BY_CODE_MAGIC,
     PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
@@ -1983,8 +1987,17 @@ async def _index_lookup_many_from_db(
     index_start: int,
     entry_count: int,
     keys: Iterable[bytes],
+    search_ranges: Mapping[bytes, tuple[int, int]] | None = None,
 ) -> dict[bytes, tuple[int, int] | None]:
-    search_range_by_key: dict[bytes, tuple[int, int]] = {bytes(key): (0, int(entry_count) - 1) for key in keys}
+    default_search_range = (0, int(entry_count) - 1)
+    search_range_by_key = {
+        normalized_key: (
+            search_ranges.get(normalized_key, default_search_range)
+            if search_ranges is not None
+            else default_search_range
+        )
+        for normalized_key in (bytes(key) for key in keys)
+    }
     index_match_by_key: dict[bytes, tuple[int, int] | None] = {}
     while search_range_by_key:
         record_numbers_by_key: dict[bytes, int] = {}
@@ -2015,6 +2028,88 @@ async def _index_lookup_many_from_db(
     return index_match_by_key
 
 
+def _membership_index_fence_values(
+    metadata: Mapping[str, Any],
+    entry_count: int,
+    *,
+    required: bool,
+) -> tuple[int, tuple[bytes, ...]] | None:
+    raw_format = metadata.get("owner_index_fence_format")
+    raw_stride = metadata.get("owner_index_fence_stride")
+    raw_owners = metadata.get("owner_index_fence_owners")
+    if raw_format is None and raw_stride is None and raw_owners is None:
+        if required:
+            raise PTG2ManifestArtifactError(
+                "postgres_binary_v3 membership index fences are missing; reimport the snapshot"
+            )
+        return None
+    if raw_format != PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT:
+        raise PTG2ManifestArtifactError("global membership sidecar has an unexpected owner fence format")
+    try:
+        stride = int(raw_stride)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError("global membership sidecar owner fence stride is invalid") from exc
+    if stride != PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE or not isinstance(raw_owners, list):
+        raise PTG2ManifestArtifactError("global membership sidecar owner fences are invalid")
+    try:
+        fence_owners = tuple(_normalize_global_id(owner) for owner in raw_owners)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError("global membership sidecar owner fence is invalid") from exc
+    expected_fence_count = (int(entry_count) + stride - 1) // stride
+    if len(fence_owners) != expected_fence_count:
+        raise PTG2ManifestArtifactError("global membership sidecar owner fence count is invalid")
+    if fence_owners != tuple(sorted(set(fence_owners))):
+        raise PTG2ManifestArtifactError("global membership sidecar owner fences are not ordered")
+    return stride, fence_owners
+
+
+async def _membership_index_search_ranges_from_fences(
+    reader: PTG2DbArtifactReader,
+    *,
+    metadata: Mapping[str, Any],
+    index_start: int,
+    entry_count: int,
+    keys: Iterable[bytes],
+    required: bool,
+) -> dict[bytes, tuple[int, int]] | None:
+    fence_values = _membership_index_fence_values(metadata, entry_count, required=required)
+    if fence_values is None:
+        return None
+    stride, fence_owners = fence_values
+    owner_ids = tuple(dict.fromkeys(bytes(key) for key in keys))
+    search_range_by_owner: dict[bytes, tuple[int, int]] = {}
+    fence_indexes_to_validate_set: set[int] = set()
+    for owner_id in owner_ids:
+        fence_index = bisect_right(fence_owners, owner_id) - 1
+        if fence_index < 0:
+            search_range_by_owner[owner_id] = (0, -1)
+            if fence_owners:
+                fence_indexes_to_validate_set.add(0)
+            continue
+        low = fence_index * stride
+        high = min(low + stride - 1, int(entry_count) - 1)
+        search_range_by_owner[owner_id] = (low, high)
+        fence_indexes_to_validate_set.add(fence_index)
+        if fence_index + 1 < len(fence_owners):
+            fence_indexes_to_validate_set.add(fence_index + 1)
+    expected_owner_by_fence_record_number = {
+        fence_index * stride: fence_owners[fence_index]
+        for fence_index in fence_indexes_to_validate_set
+    }
+    fence_records = await reader.read_fixed_records(
+        base_offset=index_start,
+        record_size=_MEMBERSHIP_INDEX_RECORD.size,
+        record_numbers=expected_owner_by_fence_record_number,
+    )
+    for record_number, expected_owner in expected_owner_by_fence_record_number.items():
+        actual_owner, _member_offset, _member_count = _MEMBERSHIP_INDEX_RECORD.unpack(
+            fence_records[record_number]
+        )
+        if actual_owner != expected_owner:
+            raise PTG2ManifestArtifactError("global membership sidecar owner fence does not match its index")
+    return search_range_by_owner
+
+
 async def _maybe_read_membership_index(
     reader: PTG2DbArtifactReader,
     *,
@@ -2026,6 +2121,97 @@ async def _maybe_read_membership_index(
     return await reader.read_at(index_start, int(index_bytes_len))
 
 
+async def _validate_membership_payload_size(
+    reader: PTG2DbArtifactReader,
+    metadata: Mapping[str, Any],
+    *,
+    member_start: int,
+    member_record_size: int,
+    required: bool,
+) -> None:
+    raw_member_count = metadata.get("member_count")
+    if raw_member_count is None:
+        if required:
+            raise PTG2ManifestArtifactError(
+                "postgres_binary_v3 membership count is missing; reimport the snapshot"
+            )
+        return
+    try:
+        member_count = int(raw_member_count)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError("global membership sidecar member count is invalid") from exc
+    expected_byte_count = int(member_start) + member_count * int(member_record_size)
+    if member_count < 0 or await reader.byte_count() != expected_byte_count:
+        raise PTG2ManifestArtifactError("global membership sidecar byte count does not match its members")
+
+
+def _required_membership_metadata_integer(metadata: Mapping[str, Any], field_name: str) -> int:
+    try:
+        parsed_value = int(metadata.get(field_name))
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            f"postgres_binary_v3 membership {field_name} is missing; reimport the snapshot"
+        ) from exc
+    if parsed_value < 0:
+        raise PTG2ManifestArtifactError(f"global membership sidecar {field_name} is invalid")
+    return parsed_value
+
+
+async def _membership_layout(
+    reader: PTG2DbArtifactReader,
+    metadata: Mapping[str, Any],
+    *,
+    required: bool,
+) -> tuple[bool, int, int | None]:
+    if required:
+        version = _required_membership_metadata_integer(metadata, "membership_version")
+        if version != PTG2_MANIFEST_VERSION:
+            raise PTG2ManifestArtifactError("unsupported postgres_binary_v3 membership version")
+        entry_count = _required_membership_metadata_integer(metadata, "owner_count")
+        record_format = metadata.get("record_format")
+        if record_format == PTG2_MANIFEST_MEMBERSHIP_FORMAT:
+            expected_header = _MEMBERSHIP_HEADER.pack(
+                PTG2_MANIFEST_MEMBERSHIP_MAGIC,
+                version,
+                entry_count,
+            )
+            is_dense_layout = False
+            member_global_count = None
+        elif record_format == PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT:
+            member_global_count = _required_membership_metadata_integer(metadata, "member_global_count")
+            expected_header = _DENSE_MEMBERSHIP_HEADER.pack(
+                PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
+                version,
+                entry_count,
+                member_global_count,
+            )
+            is_dense_layout = True
+        else:
+            raise PTG2ManifestArtifactError("postgres_binary_v3 membership record format is invalid")
+        if metadata.get("membership_header_hex") != expected_header.hex():
+            raise PTG2ManifestArtifactError("postgres_binary_v3 membership header metadata is invalid")
+        return is_dense_layout, entry_count, member_global_count
+
+    magic = await reader.read_at(0, 8)
+    if magic in _STANDARD_MEMBERSHIP_MAGICS:
+        _magic, version, entry_count = _MEMBERSHIP_HEADER.unpack(
+            await reader.read_at(0, _MEMBERSHIP_HEADER.size)
+        )
+        if version != PTG2_MANIFEST_VERSION:
+            raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
+        is_dense_layout = False
+        return is_dense_layout, int(entry_count), None
+    if magic not in _DENSE_MEMBERSHIP_MAGICS:
+        raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
+    _magic, version, entry_count, member_global_count = _DENSE_MEMBERSHIP_HEADER.unpack(
+        await reader.read_at(0, _DENSE_MEMBERSHIP_HEADER.size)
+    )
+    if version != PTG2_MANIFEST_VERSION:
+        raise PTG2ManifestArtifactError(f"unsupported dense global membership sidecar version: {version!r}")
+    is_dense_layout = True
+    return is_dense_layout, int(entry_count), int(member_global_count)
+
+
 async def lookup_global_sidecar_members_many_from_db(
     session: Any,
     entry: Mapping[str, Any],
@@ -2033,36 +2219,59 @@ async def lookup_global_sidecar_members_many_from_db(
     *,
     schema_name: str,
     max_members: int | None = None,
+    require_index_fences: bool = False,
 ) -> dict[bytes, tuple[bytes, ...]]:
     owner_ids = tuple(dict.fromkeys(_normalize_global_id(owner) for owner in owners))
     if not owner_ids:
         return {}
     _validate_membership_record_format(entry)
     reader = PTG2DbArtifactReader(session, entry, schema_name=schema_name)
-    first = await reader.read_at(0, _DENSE_MEMBERSHIP_HEADER.size)
-    magic = first[:8]
-    if magic in _STANDARD_MEMBERSHIP_MAGICS:
-        magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(first[: _MEMBERSHIP_HEADER.size], 0)
-        if version != PTG2_MANIFEST_VERSION:
-            raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
+    if require_index_fences and reader.chunk_bytes != PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES:
+        raise PTG2ManifestArtifactError(
+            "postgres_binary_v3 membership chunk size is obsolete; reimport the snapshot"
+        )
+    is_dense_layout, entry_count, member_global_count = await _membership_layout(
+        reader,
+        entry,
+        required=require_index_fences,
+    )
+    if not is_dense_layout:
         expected_entries = entry.get("entry_count", entry.get("owner_count"))
         if expected_entries is not None and int(expected_entries) != int(entry_count):
             raise PTG2ManifestArtifactError("global membership sidecar entry count mismatch")
         index_start = _MEMBERSHIP_HEADER.size
         index_bytes_len = int(entry_count) * _MEMBERSHIP_INDEX_RECORD.size
         member_start = index_start + index_bytes_len
-        index_bytes = await _maybe_read_membership_index(
+        await _validate_membership_payload_size(
             reader,
-            index_start=index_start,
-            index_bytes_len=index_bytes_len,
+            entry,
+            member_start=member_start,
+            member_record_size=16,
+            required=require_index_fences,
         )
+        search_ranges = await _membership_index_search_ranges_from_fences(
+            reader,
+            metadata=entry,
+            index_start=index_start,
+            entry_count=int(entry_count),
+            keys=owner_ids,
+            required=require_index_fences,
+        )
+        index_bytes = None
         db_matches = None
+        if search_ranges is None:
+            index_bytes = await _maybe_read_membership_index(
+                reader,
+                index_start=index_start,
+                index_bytes_len=index_bytes_len,
+            )
         if index_bytes is None:
             db_matches = await _index_lookup_many_from_db(
                 reader,
                 index_start=index_start,
                 entry_count=int(entry_count),
                 keys=owner_ids,
+                search_ranges=search_ranges,
             )
         result: dict[bytes, tuple[bytes, ...]] = {}
         member_ranges_by_owner: dict[bytes, tuple[int, int]] = {}
@@ -2082,12 +2291,8 @@ async def lookup_global_sidecar_members_many_from_db(
         for owner_id, member_bytes in member_payloads_by_owner.items():
             result[owner_id] = tuple(member_bytes[pos : pos + 16] for pos in range(0, len(member_bytes), 16))
         return result
-    if magic not in _DENSE_MEMBERSHIP_MAGICS:
-        raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
-
-    magic, version, entry_count, member_global_count = _DENSE_MEMBERSHIP_HEADER.unpack_from(first, 0)
-    if version != PTG2_MANIFEST_VERSION:
-        raise PTG2ManifestArtifactError(f"unsupported dense global membership sidecar version: {version!r}")
+    if member_global_count is None:
+        raise PTG2ManifestArtifactError("dense global membership sidecar member dictionary count is missing")
     expected_entries = entry.get("entry_count", entry.get("owner_count"))
     if expected_entries is not None and int(expected_entries) != int(entry_count):
         raise PTG2ManifestArtifactError("dense global membership sidecar entry count mismatch")
@@ -2100,18 +2305,36 @@ async def lookup_global_sidecar_members_many_from_db(
     globals_start = index_start + index_bytes_len
     globals_bytes_len = int(member_global_count) * 16
     members_start = globals_start + globals_bytes_len
-    index_bytes = await _maybe_read_membership_index(
+    await _validate_membership_payload_size(
         reader,
-        index_start=index_start,
-        index_bytes_len=index_bytes_len,
+        entry,
+        member_start=members_start,
+        member_record_size=_DENSE_MEMBER_RECORD.size,
+        required=require_index_fences,
     )
+    search_ranges = await _membership_index_search_ranges_from_fences(
+        reader,
+        metadata=entry,
+        index_start=index_start,
+        entry_count=int(entry_count),
+        keys=owner_ids,
+        required=require_index_fences,
+    )
+    index_bytes = None
     db_matches = None
+    if search_ranges is None:
+        index_bytes = await _maybe_read_membership_index(
+            reader,
+            index_start=index_start,
+            index_bytes_len=index_bytes_len,
+        )
     if index_bytes is None:
         db_matches = await _index_lookup_many_from_db(
             reader,
             index_start=index_start,
             entry_count=int(entry_count),
             keys=owner_ids,
+            search_ranges=search_ranges,
         )
     result: dict[bytes, tuple[bytes, ...]] = {}
     local_ranges_by_owner: dict[bytes, tuple[int, int]] = {}

@@ -130,6 +130,8 @@ async def _resolve_code(session, system: str, code: str, code_type: str | None =
 
 
 async def _list_codes(request, code_type: str):
+    """Return filtered, paginated concepts for one clinical code type."""
+
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
@@ -231,6 +233,8 @@ async def _list_area_concepts_response(
     q: str,
     require_area: bool,
 ):
+    """Return paginated concepts mapped to one clinical area."""
+
     session = _session(request)
     pagination = parse_pagination(request.args, default_limit=25, max_limit=MAX_LIMIT)
     mapping_table, system_col, code_col = _area_mapping_columns(mapping_kind)
@@ -296,6 +300,8 @@ async def _list_area_concepts_response(
 
 @blueprint.get("/concepts")
 async def list_concepts(request):
+    """List filtered clinical concepts with pagination metadata."""
+
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
@@ -343,6 +349,8 @@ async def list_concepts(request):
 
 @blueprint.get("/concepts/<system>/<code>")
 async def get_concept(request, system: str, code: str):
+    """Return one resolved concept with synonyms and outgoing relationships."""
+
     session = _session(request)
     resolved_system, resolved_code = await _resolve_code(session, _normalize_system(system), _normalize_code(code))
     _raise_if_restricted_public(resolved_system)
@@ -413,6 +421,8 @@ async def _get_code(request, code_type: str, system: str, code: str):
 
 @blueprint.get("/relationships")
 async def list_relationships(request):
+    """List filtered concept relationships with pagination metadata."""
+
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
@@ -463,26 +473,36 @@ async def list_relationships(request):
 
 @blueprint.get("/conditions")
 async def list_conditions(request):
+    """List filtered condition concepts with pagination metadata."""
+
     return await _list_codes(request, "condition")
 
 
 @blueprint.get("/conditions/<system>/<code>")
 async def get_condition(request, system: str, code: str):
+    """Return one condition concept after resolving supported crosswalks."""
+
     return await _get_code(request, "condition", system, code)
 
 
 @blueprint.get("/treatments")
 async def list_treatments(request):
+    """List filtered treatment concepts with pagination metadata."""
+
     return await _list_codes(request, "treatment")
 
 
 @blueprint.get("/treatments/<system>/<code>")
 async def get_treatment(request, system: str, code: str):
+    """Return one treatment concept after resolving supported crosswalks."""
+
     return await _get_code(request, "treatment", system, code)
 
 
 @blueprint.get("/clinical-areas")
 async def list_clinical_areas(request):
+    """List searchable clinical areas with mapped concept counts."""
+
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
@@ -523,6 +543,8 @@ async def list_clinical_areas(request):
 
 @blueprint.get("/clinical-areas/<clinical_area_id>")
 async def get_clinical_area(request, clinical_area_id: str):
+    """Return one clinical area with condition and treatment counts."""
+
     session = _session(request)
     clinical_area_id = _decode_path_value(clinical_area_id)
     area_result = await session.execute(
@@ -537,6 +559,8 @@ async def get_clinical_area(request, clinical_area_id: str):
 
 @blueprint.get("/clinical-areas/<clinical_area_id>/conditions")
 async def list_clinical_area_conditions(request, clinical_area_id: str):
+    """List condition concepts mapped to one existing clinical area."""
+
     args = request.args
     return await _list_area_concepts_response(
         request,
@@ -550,6 +574,8 @@ async def list_clinical_area_conditions(request, clinical_area_id: str):
 
 @blueprint.get("/clinical-areas/<clinical_area_id>/treatments")
 async def list_clinical_area_treatments(request, clinical_area_id: str):
+    """List treatment concepts mapped to one existing clinical area."""
+
     args = request.args
     return await _list_area_concepts_response(
         request,
@@ -563,6 +589,8 @@ async def list_clinical_area_treatments(request, clinical_area_id: str):
 
 @blueprint.get("/crosswalk")
 async def list_crosswalk(request):
+    """List filtered code-system crosswalks with pagination metadata."""
+
     session = _session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)

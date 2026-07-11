@@ -92,6 +92,9 @@ python main.py worker process.EntityAddressUnified --burst
 PTG2 snapshots record their serving architecture in
 `manifest.serving_index.arch_version`. Serving code reads that value so one
 deployment can serve both old and new snapshots while operators compare them.
+Format generations within `postgres_binary_v3` are intentionally not
+backward-compatible: changing a binary artifact contract changes deterministic
+snapshot identity, and older v3 snapshots must be reimported.
 
 Supported import modes:
 
@@ -110,7 +113,13 @@ Supported import modes:
   API readers dispatch from the explicit manifest architecture, read only the
   required blocks, and raise an artifact-integrity error when a referenced
   code, provider set, price set, atom, or dictionary value is missing. No
-  request path materializes a filesystem cache.
+  request path materializes a filesystem cache. The provider graph uses the
+  `provider_membership_graph_v3` contract: independently compressed 1 MiB
+  PostgreSQL chunks plus owner-index fences every 32,768 records. A cold graph
+  lookup therefore reads a bounded index window instead of inflating the whole
+  owner index. Missing, malformed, or stale fences, shard identities, and binary
+  headers fail closed and require a reimport. Current v3 also rejects the legacy
+  direct provider-membership artifact; there is no old-v3 fallback.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v2` is the normalized membership
   layout for high-fan-out group plans. It retains four compressed graph
   directions in PostgreSQL: provider set to group, group to provider set, group
@@ -275,9 +284,12 @@ tables plus PostgreSQL artifact tables. For either PostgreSQL binary architectur
 dropping the transient serving table, `serving_binary_table_exists=true`,
 `serving_sidecar_artifacts=false`, and that API pods did not create
 `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` or any pod-local materialized artifact
-cache. For `postgres_binary_v2`, also confirm that `provider_npi_scope_table`
-exists with a unique NPI index, `provider_group_member_table` is absent, and the
-manifest has all four provider graph artifacts in PostgreSQL storage.
+cache. For `postgres_binary_v3`, also confirm graph version
+`provider_membership_graph_v3`, `chunk_bytes=1048576`, and valid owner-index
+fence metadata on all four graph directions. For `postgres_binary_v2`, also
+confirm that `provider_npi_scope_table` exists with a unique NPI index,
+`provider_group_member_table` is absent, and the manifest has all four provider
+graph artifacts in PostgreSQL storage.
 
 ## Cleanup After Stopped Runs
 

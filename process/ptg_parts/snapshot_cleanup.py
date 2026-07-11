@@ -20,6 +20,7 @@ from process.ptg_parts.domain import (
     PTG2_STATUS_VALIDATED,
 )
 from process.ptg_parts.ptg2_artifact_blobs import ptg2_artifact_id_from_db_uri
+from process.ptg_parts.ptg2_manifest_artifacts import v3_graph_contract_errors
 from process.ptg_parts.source_pointers import PTG2_SOURCE_POINTER_GC_LOCK_KEY
 
 
@@ -287,6 +288,7 @@ async def _missing_snapshot_serving_resources(
             if not _is_local_artifact_available(reference)
         )
     )
+    missing_artifacts.extend(v3_graph_contract_errors(serving_index))
     return missing_table_names, missing_artifacts
 
 

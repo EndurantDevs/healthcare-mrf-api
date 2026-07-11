@@ -16,6 +16,7 @@ class JSONOutputMixin:
 
     @staticmethod
     def is_iterable(x):
+        """Return whether iterating over a value succeeds without TypeError."""
         try:
             iter(x)
             return True
@@ -24,6 +25,7 @@ class JSONOutputMixin:
 
     @staticmethod
     def map_anything(x, fn):
+        """Recursively transform values, preserving mappings and listifying iterables."""
         if isinstance(x, str):
             return fn(x)
         if isinstance(x, dict):
@@ -34,6 +36,7 @@ class JSONOutputMixin:
 
     @staticmethod
     def prepare_for_json(value):
+        """Convert dates and UUIDs to strings, leaving other values unchanged."""
         if isinstance(value, (date, datetime)):
             return value.isoformat().split('+')[0] + 'Z'
         if isinstance(value, UUID):
@@ -41,6 +44,7 @@ class JSONOutputMixin:
         return value
 
     def to_json_dict(self):
+        """Return JSON-ready column and computed fields after configured exclusions."""
         res = {
             **dict(self._get_column_items()),
             **self._get_executable_fields()
@@ -49,7 +53,9 @@ class JSONOutputMixin:
         return self.map_anything(data, self.prepare_for_json)
 
     def to_json(self, rel=None):
+        """Serialize ``to_dict()`` as JSON; accept ``rel`` for compatibility."""
         def extended_encoder(x):
+            """Stringify values unsupported by the standard JSON encoder."""
             if isinstance(x, datetime):
                 return x.isoformat()
             if isinstance(x, UUID):

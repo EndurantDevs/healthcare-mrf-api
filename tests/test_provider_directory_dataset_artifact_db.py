@@ -10,6 +10,7 @@ import json
 import uuid
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
 
@@ -18,7 +19,10 @@ importer = importlib.import_module("process.provider_directory_fhir")
 
 
 async def _require_disposable_postgres(database: Database) -> None:
-    database_name = str(await database.scalar("SELECT current_database();") or "")
+    try:
+        database_name = str(await database.scalar("SELECT current_database();") or "")
+    except (OSError, OperationalError):
+        pytest.skip("Provider Directory artifact DB tests require a reachable disposable database")
     if "test" not in database_name.lower():
         pytest.skip("Provider Directory artifact DB tests require a disposable test database")
 

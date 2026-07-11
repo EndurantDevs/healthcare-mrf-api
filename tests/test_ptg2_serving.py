@@ -1813,6 +1813,76 @@ async def test_manifest_membership_graph_resolves_provider_sets_in_both_directio
 
 
 @pytest.mark.asyncio
+async def test_current_v3_ignores_obsolete_direct_provider_membership(monkeypatch):
+    provider_set_id = "00000000000000000000000000000011"
+    group_id = "00000000000000000000000000000021"
+    current_npi = 1234567890
+    stale_npi = 1098765432
+    called_artifacts = []
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v3",
+        artifacts={
+            "provider_npi": {
+                "name": "provider_npi",
+                "storage_uri": "db://ptg2_artifact/obsolete-provider-npi",
+            },
+            "provider_forward": {
+                "name": "provider_forward",
+                "storage_uri": "db://ptg2_artifact/provider-forward-test",
+            },
+            "provider_group_npi": {
+                "name": "provider_group_npi",
+                "storage_uri": "db://ptg2_artifact/provider-group-npi-test",
+            },
+        },
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **_kwargs):
+        called_artifacts.append(sidecar_name)
+        members_by_artifact = {
+            "provider_npi": {provider_set_id: (ptg2_serving._ptg2_npi_member_id(stale_npi),)},
+            "provider_forward": {provider_set_id: (group_id,)},
+            "provider_group_npi": {group_id: (ptg2_serving._ptg2_npi_member_id(current_npi),)},
+        }
+        return {
+            owner_id: members_by_artifact[sidecar_name].get(owner_id, ())
+            for owner_id in owner_ids
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    npis_by_set = await ptg2_serving._ptg2_manifest_provider_npis_for_provider_sets(
+        object(),
+        tables,
+        (provider_set_id,),
+    )
+
+    assert npis_by_set == {provider_set_id: (current_npi,)}
+    assert called_artifacts == ["provider_forward", "provider_group_npi"]
+
+
+@pytest.mark.asyncio
+async def test_current_v3_missing_provider_graphs_fail_closed():
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v3",
+        provider_group_member_table="mrf.ptg2_provider_group_member_legacy",
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="reimport the snapshot"):
+        await ptg2_serving._ptg2_manifest_provider_sets_for_npi(
+            object(),
+            tables,
+            1234567890,
+        )
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="reimport the snapshot"):
+        await ptg2_serving._ptg2_manifest_provider_npis_for_provider_sets(
+            object(),
+            tables,
+            ("00000000000000000000000000000011",),
+        )
+
+
+@pytest.mark.asyncio
 async def test_manifest_membership_graph_bounds_provider_expansion(monkeypatch):
     provider_set_id = "00000000000000000000000000000011"
     group_ids = tuple(f"{group_index:032x}" for group_index in range(1, 601))

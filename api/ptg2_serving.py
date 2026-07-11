@@ -4187,6 +4187,9 @@ async def _ptg2_manifest_sidecar_members_many_async(
                     missing,
                     schema_name=PTG2_SCHEMA,
                     max_members=max_members,
+                    require_index_fences=(
+                        serving_tables.effective_arch_version == "postgres_binary_v3"
+                    ),
                 )
                 for owner_id in missing:
                     try:
@@ -4711,12 +4714,21 @@ def _has_ptg2_artifact_reader(
 def _has_authoritative_provider_membership(
     serving_tables: PTG2ServingTables,
 ) -> bool:
-    return bool(
-        _has_ptg2_artifact_reader(serving_tables, "provider_npi")
-        or (
-            _has_ptg2_artifact_reader(serving_tables, "provider_forward")
-            and _has_ptg2_artifact_reader(serving_tables, "provider_group_npi")
-        )
+    has_current_graph = bool(
+        _has_ptg2_artifact_reader(serving_tables, "provider_forward")
+        and _has_ptg2_artifact_reader(serving_tables, "provider_group_npi")
+    )
+    if serving_tables.effective_arch_version == "postgres_binary_v3":
+        return has_current_graph
+    return bool(_has_ptg2_artifact_reader(serving_tables, "provider_npi") or has_current_graph)
+
+
+def _uses_legacy_direct_provider_membership(serving_tables: PTG2ServingTables) -> bool:
+    """Return whether a pre-v3 snapshot may use its direct membership artifact."""
+
+    return (
+        serving_tables.effective_arch_version != "postgres_binary_v3"
+        and _has_ptg2_artifact_reader(serving_tables, "provider_npi")
     )
 
 
@@ -4727,8 +4739,8 @@ async def _provider_npi_member_ids_by_set(
     *,
     limit_per_set: int | None,
 ) -> dict[str, tuple[str, ...]]:
-    """Resolve provider-set membership from either v1 or normalized v2 artifacts."""
-    if _has_ptg2_artifact_reader(serving_tables, "provider_npi"):
+    """Resolve membership from the current graph or a pre-v3 direct artifact."""
+    if _uses_legacy_direct_provider_membership(serving_tables):
         return await _ptg2_manifest_sidecar_members_many_async(
             session,
             serving_tables,
@@ -4737,6 +4749,10 @@ async def _provider_npi_member_ids_by_set(
             max_members=limit_per_set,
         )
     if not _has_authoritative_provider_membership(serving_tables):
+        if serving_tables.effective_arch_version == "postgres_binary_v3":
+            raise PTG2ManifestArtifactError(
+                "postgres_binary_v3 provider membership graph is missing; reimport the snapshot"
+            )
         return {}
     groups_by_set = await _ptg2_manifest_sidecar_members_many_async(
         session,
@@ -8910,6 +8926,10 @@ async def _ptg2_manifest_provider_sets_for_npi(
     graph_provider_sets = await _provider_sets_from_membership_graph(session, serving_tables, npi)
     if graph_provider_sets is not None:
         return graph_provider_sets
+    if serving_tables.effective_arch_version == "postgres_binary_v3":
+        raise PTG2ManifestArtifactError(
+            "postgres_binary_v3 reverse provider graph is missing; reimport the snapshot"
+        )
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if (
         not provider_group_member_table
@@ -9066,13 +9086,7 @@ async def _search_ptg2_manifest_db_serving_table(
     unsupported_filters = args.get("q")
     if unsupported_filters or not requested_code or (not requested_plan and not explicit_source_scope):
         return None
-    has_provider_npi_sidecar = bool(
-        _ptg2_manifest_artifact_entry(serving_tables, "provider_npi")
-        or (
-            _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
-            and _ptg2_manifest_artifact_entry(serving_tables, "provider_group_npi")
-        )
-    )
+    has_provider_npi_sidecar = _has_authoritative_provider_membership(serving_tables)
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
         return None
 

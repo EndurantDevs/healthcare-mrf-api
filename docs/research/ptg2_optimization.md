@@ -292,8 +292,31 @@ cold report is:
 /tmp/ptg2-v3-cold-4m-report/run-20260710T195429Z/report.json
 ```
 
+A later full-scale fresh-pod sample exposed a different cold-path scale effect.
+After sparse provider-count reads removed the global count dictionary, a cold
+NPI-filtered forward request improved from roughly 2.0-2.1 seconds to
+141.59 ms. The cold NPI reverse request remained 483.64 ms because both graph
+hops still inflated large owner indexes from 8 MiB PostgreSQL chunks.
+
+The next graph contract keeps the membership payload unchanged and adds sparse
+owner fences every 32,768 records. On the largest measured graph, direct
+NPI-to-group-to-set traversal changed from 166.43-180.59 ms without fences, to
+111.63-115.19 ms with fences over the old 8 MiB chunks, and to
+31.78-32.63 ms with independently compressed 1 MiB chunks. Recompressing all
+four graph directions at 1 MiB changed their combined payload by only 7,339
+bytes, about 0.01 percent. Fence metadata for that snapshot contains 99 owner
+ids across all four directions, only a few kilobytes in each authoritative
+manifest copy. End-to-end cold API latency must be remeasured after reimport;
+the direct graph probe is not an API latency claim.
+
+The stronger contract also validates every owner id and member range while
+building fences. On the same four full-scale graph directions, that pass took
+8.98 ms, 68.34 ms, 67.46 ms, and 268.80 ms, about 414 ms total. Adding real
+binary-header validation to each cold lookup kept the direct two-hop samples at
+31.08-37.77 ms.
+
 One production-scale sample was roughly 14.8 GB compressed and 293 GB expanded.
-On the dev PTGHuge lane, verified decode-to-stdout took 124 seconds with four
+On a high-resource dev lane, verified decode-to-stdout took 124 seconds with four
 rapidgzip threads and 111 seconds with eight, versus the 523-second GNU gzip
 floor. Four threads are the initial integrated-scanner choice because parsing
 workers need the remaining CPU; the full scanner and publish phases still need

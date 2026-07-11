@@ -129,7 +129,7 @@ from process.ptg_parts.config import (
     PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
     TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
     TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
-    _is_postgres_binary_snapshot_arch,
+    _is_postgres_binary_snapshot_arch, _is_postgres_binary_v3_arch,
     _ptg2_snapshot_arch_from_env, _ptg2_snapshot_arch_variant,
     _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
     _uses_postgres_binary_provider_membership_graph,
@@ -3301,6 +3301,20 @@ _PTG2_SNAPSHOT_CONTENT_OPTION_KEYS = (
     "manifest_provider_npi_sidecar",
 )
 
+_PTG2_POSTGRES_BINARY_V3_FORMAT_GENERATION = "membership_fences_v1"
+
+
+def _ptg2_snapshot_arch_identity_variant(
+    arch_version: str,
+    arch_variant: str | None,
+) -> str | None:
+    """Include incompatible storage generations in deterministic snapshot identity."""
+
+    if not _is_postgres_binary_v3_arch(arch_version):
+        return arch_variant
+    base_variant = arch_variant or arch_version
+    return f"{base_variant}:{_PTG2_POSTGRES_BINARY_V3_FORMAT_GENERATION}"
+
 
 def _ptg2_effective_hash_mode() -> str:
     raw_mode = str(os.getenv(PTG2_HASH_MODE_ENV, "checksum64")).strip().lower()
@@ -3538,6 +3552,10 @@ async def main(
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     snapshot_arch_version = _ptg2_snapshot_arch_from_env()
     snapshot_arch_variant = _ptg2_snapshot_arch_variant(snapshot_arch_version)
+    snapshot_arch_identity_variant = _ptg2_snapshot_arch_identity_variant(
+        snapshot_arch_version,
+        snapshot_arch_variant,
+    )
     import_id_val = _normalize_import_id(
         import_id
         or _default_ptg2_import_id(
@@ -3548,7 +3566,7 @@ async def main(
             in_network_url=in_network_url,
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
-            arch_variant=snapshot_arch_variant or snapshot_arch_version,
+            arch_variant=snapshot_arch_identity_variant or snapshot_arch_version,
         )
     )
     import_run_id = f"ptg2:{import_id_val}"
@@ -3589,7 +3607,7 @@ async def main(
         "stage_serving_as_final": False,
         "serving_storage": "manifest_snapshot",
         "snapshot_arch": snapshot_arch_version,
-        "snapshot_arch_variant": snapshot_arch_variant,
+        "snapshot_arch_variant": snapshot_arch_identity_variant,
         "test_mode": test_mode,
         "allow_partial_import": _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False),
         "hash_mode": _ptg2_effective_hash_mode(),
@@ -4583,7 +4601,7 @@ def _collect_manifest_artifacts(
     sidecar_entries: list[dict[str, Any]] = []
     source_trace_set_hashes: set[str] = set()
     network_name_sets: set[tuple[str, ...]] = set()
-    for file_summary in successful_files:
+    for file_index, file_summary in enumerate(successful_files):
         summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
         if not isinstance(summary_payload, dict):
             continue
@@ -4598,9 +4616,22 @@ def _collect_manifest_artifacts(
         )
         if network_names:
             network_name_sets.add(network_names)
+        file_id = file_summary.get("file_id")
+        if file_id is not None:
+            source_shard_id = f"file:{file_id}"
+        else:
+            fallback_shard_id = (
+                summary_payload.get("logical_sha256")
+                or summary_payload.get("raw_sha256")
+                or summary_payload.get("engine_source_identity_hash")
+                or file_index
+            )
+            source_shard_id = f"manifest:{fallback_shard_id}"
         existing_sidecars = _manifest_sidecars_list(manifest_payload)
         if existing_sidecars:
-            sidecar_entries.extend(existing_sidecars)
+            for sidecar in existing_sidecars:
+                sidecar["source_shard_id"] = source_shard_id
+                sidecar_entries.append(sidecar)
             continue
         raw_sidecar_path_map = manifest_payload.get("sidecar_paths")
         if not isinstance(raw_sidecar_path_map, dict):
@@ -4610,7 +4641,10 @@ def _collect_manifest_artifacts(
             path = Path(str(raw_path)) if raw_path else None
             sidecar_path_map[str(name)] = path
         fallback_sidecar_map = _collect_ptg2_manifest_sidecar_artifacts(sidecar_path_map)
-        sidecar_entries.extend(dict(sidecar) for sidecar in fallback_sidecar_map.values())
+        for sidecar in fallback_sidecar_map.values():
+            sidecar_map = dict(sidecar)
+            sidecar_map["source_shard_id"] = source_shard_id
+            sidecar_entries.append(sidecar_map)
     artifacts: dict[str, Any] = {"sidecars": sidecar_entries} if sidecar_entries else {}
     if len(source_trace_set_hashes) == 1:
         artifacts["source_trace_set_hash"] = next(iter(source_trace_set_hashes))

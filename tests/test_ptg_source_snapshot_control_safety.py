@@ -2,11 +2,20 @@
 
 import asyncio
 import datetime
+import struct
 from unittest.mock import AsyncMock
 
 import pytest
 
 from process.ptg_parts import snapshot_cleanup, source_snapshot_control
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_MANIFEST_MEMBERSHIP_FORMAT,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE,
+    PTG2_MANIFEST_MEMBERSHIP_MAGIC,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION,
+)
 
 
 class _RecordingTransaction:
@@ -45,6 +54,26 @@ async def _source_plan_pointer_rows(**pointer_fields):
             "updated_at": pointer_fields["updated_at"],
         }
     ]
+
+
+def _empty_v3_graph_entry(artifact_name: str) -> dict:
+    artifact_id = f"graph-{artifact_name.replace('_', '-')}"
+    return {
+        "name": artifact_name,
+        "source_shard_id": "source-shard-a",
+        "storage_uri": f"db://ptg2_artifact/{artifact_id}",
+        "chunk_bytes": 1024 * 1024,
+        "membership_version": 1,
+        "membership_header_hex": struct.pack("<8sIQ", PTG2_MANIFEST_MEMBERSHIP_MAGIC, 1, 0).hex(),
+        "record_format": PTG2_MANIFEST_MEMBERSHIP_FORMAT,
+        "entry_count": 0,
+        "owner_count": 0,
+        "member_count": 0,
+        "byte_count": 20,
+        "owner_index_fence_format": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+        "owner_index_fence_stride": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE,
+        "owner_index_fence_owners": [],
+    }
 
 
 def test_manual_rollback_preserves_displaced_snapshot(monkeypatch):
@@ -162,21 +191,33 @@ def test_manual_promotion_rejects_cleaned_artifact(monkeypatch):
 
 
 def test_postgres_v3_promotion_ignores_local_manifest(monkeypatch):
+    """Promote only a complete PostgreSQL graph while ignoring stale local paths."""
+
     transaction = _RecordingTransaction()
-    artifact_query = AsyncMock(return_value=[{"artifact_id": "provider-forward-a"}])
+    graph_entries = [
+        _empty_v3_graph_entry(artifact_name)
+        for artifact_name in sorted(PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES)
+    ]
+    graph_artifact_ids = [
+        entry["storage_uri"].rsplit("/", 1)[-1]
+        for entry in graph_entries
+    ]
+    artifact_query = AsyncMock(
+        return_value=[{"artifact_id": artifact_id} for artifact_id in graph_artifact_ids]
+    )
     serving_index = {
         "source_key": "source_a",
         "arch_version": "postgres_binary_v3",
-        "materialized_tables": {
-            "serving_binary": "mrf.ptg2_serving_binary_snap_a",
+        "provider_membership_graph": {
+            "artifact_version": PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION,
+            "artifact_names": sorted(PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES),
+            "storage": "postgresql_chunks_v1",
         },
+        "materialized_tables": {"serving_binary": "mrf.ptg2_serving_binary_snap_a"},
         "artifacts": {
             "manifest_uri": "file:///removed-pod-build/snapshot.manifest.json",
             "build_report": {"path": "/removed-pod-build/publish-report.json"},
-            "provider_forward": {
-                "storage_uri": "db://ptg2_artifact/provider-forward-a",
-                "path": "/removed-pod-build/provider_forward.ptg2gsc",
-            },
+            "sidecars": graph_entries,
         },
     }
     monkeypatch.setattr(
@@ -208,7 +249,46 @@ def test_postgres_v3_promotion_ignores_local_manifest(monkeypatch):
     )
 
     assert promotion["snapshot_id"] == "snap_a"
-    assert artifact_query.await_args.kwargs["artifact_ids"] == ["provider-forward-a"]
+    assert artifact_query.await_args.kwargs["artifact_ids"] == sorted(graph_artifact_ids)
+
+
+def test_v3_graph_contract_rejects_duplicate_declared_names():
+    canonical_names = sorted(PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES)
+    serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "provider_membership_graph": {
+            "artifact_version": PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION,
+            "artifact_names": [*canonical_names, canonical_names[0]],
+            "storage": "postgresql_chunks_v1",
+        },
+        "artifacts": {
+            "sidecars": [_empty_v3_graph_entry(artifact_name) for artifact_name in canonical_names],
+        },
+    }
+
+    assert snapshot_cleanup.v3_graph_contract_errors(serving_index) == [
+        PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION
+    ]
+
+
+def test_v3_graph_contract_rejects_obsolete_direct_provider_membership():
+    canonical_names = sorted(PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES)
+    serving_index = {
+        "arch_version": "postgres_binary_v3",
+        "provider_membership_graph": {
+            "artifact_version": PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION,
+            "artifact_names": canonical_names,
+            "storage": "postgresql_chunks_v1",
+        },
+        "artifacts": {
+            "sidecars": [
+                *[_empty_v3_graph_entry(artifact_name) for artifact_name in canonical_names],
+                {"name": "provider_npi", "storage_uri": "db://ptg2_artifact/obsolete-provider-npi"},
+            ],
+        },
+    }
+
+    assert snapshot_cleanup.v3_graph_contract_errors(serving_index) == ["obsolete:provider_npi"]
 
 
 @pytest.mark.parametrize("snapshot_status", ["pending", "running", "building", "validated"])

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -391,6 +392,17 @@ def test_v3_requires_lean_serving_layout(monkeypatch):
         manifest_publish._require_v3_serving_layout("postgres_binary_v3")
 
 
+def test_membership_graph_version_matches_snapshot_architecture():
+    assert (
+        manifest_publish._provider_membership_graph_version("postgres_binary_v2")
+        == "provider_membership_graph_v2"
+    )
+    assert (
+        manifest_publish._provider_membership_graph_version("postgres_binary_v3")
+        == "provider_membership_graph_v3"
+    )
+
+
 _GRAPH_NAMES = ("provider_forward", "provider_inverted", "provider_group_npi", "provider_npi_group")
 
 
@@ -398,15 +410,31 @@ async def _published_v3_graph_manifest(monkeypatch, tmp_path):
     sidecars = []
     for name in (*_GRAPH_NAMES, "price_forward", "serving_by_code", "serving_by_provider_set"):
         path = tmp_path / f"{name}.ptg2sc"
-        path.write_bytes(name.encode("ascii"))
-        sidecars.append(
-            {"name": name, "path": str(path), "sha256": f"sha-{name}", "byte_count": path.stat().st_size}
-        )
+        if name in _GRAPH_NAMES:
+            path.write_bytes(
+                struct.pack("<8sIQQ", b"PTG2MNDS", 1, 1, 0)
+                + struct.pack("<16sQI", b"\0" * 16, 0, 0)
+            )
+        else:
+            path.write_bytes(name.encode("ascii"))
+        metadata = {
+            "name": name,
+            "path": str(path),
+            "sha256": f"sha-{name}",
+            "byte_count": path.stat().st_size,
+            "source_shard_id": "source-shard-a",
+        }
+        sidecars.append(metadata)
     uploaded_names = []
 
     async def fake_store(_path, **kwargs):
         metadata = dict(kwargs["metadata"])
         artifact_name = kwargs["name"]
+        if artifact_name in _GRAPH_NAMES:
+            assert metadata["owner_count"] == 1
+            assert metadata["member_count"] == 0
+            assert metadata["owner_index_fence_owners"] == ["00" * 16]
+            assert metadata["chunk_bytes"] == 1024 * 1024
         uploaded_names.append(artifact_name)
         metadata.update({"artifact_id": f"db-{artifact_name}", "storage_uri": f"db://ptg2_artifact/db-{artifact_name}"})
         return metadata
@@ -441,6 +469,7 @@ async def test_v3_manifest_db_graph_resolves_npi_without_local_files(monkeypatch
 
     async def fake_db_lookup(_session, entry, owners, **_kwargs):
         assert "path" not in entry
+        assert _kwargs["require_index_fences"] is True
         lookup_names.append(entry["name"])
         owner_bytes = tuple(bytes.fromhex(owner) if isinstance(owner, str) else bytes(owner) for owner in owners)
         member_id = group_id if entry["name"] == "provider_npi_group" else provider_set_id

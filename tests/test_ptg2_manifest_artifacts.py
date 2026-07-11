@@ -6,9 +6,12 @@ import hashlib
 import pytest
 
 from api import ptg2_manifest_artifacts as serving_manifest
+from process.ptg_parts import ptg2_manifest_publish as manifest_publish
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
     PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE,
     PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE,
     PTG2_MANIFEST_MEMBERSHIP_MAGIC,
     PTG2_MANIFEST_MAPPING_RECORD_SIZE,
@@ -22,6 +25,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     lookup_serving_by_provider_set_sidecar,
     lookup_global_sidecar_members,
     lookup_global_sidecar_members_many,
+    membership_index_fence_metadata,
     write_serving_by_code_sidecar,
     write_serving_by_provider_set_sidecar,
     write_global_membership_sidecar,
@@ -912,6 +916,38 @@ def test_ptg2_manifest_dense_membership_sidecar_roundtrip_and_lookup(tmp_path):
     assert members == (GLOBAL_B, GLOBAL_C)
 
 
+def test_membership_index_fences_sample_fixed_owner_intervals(tmp_path):
+    sidecar_path = tmp_path / "provider_npi_group.ptg2sc"
+    owner_count = PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE + 1
+    with sidecar_path.open("wb") as sidecar_file:
+        sidecar_file.write(struct.pack("<8sIQ", PTG2_MANIFEST_MEMBERSHIP_MAGIC, 1, owner_count))
+        for owner_ordinal in range(owner_count):
+            sidecar_file.write(struct.pack("<16sQI", owner_ordinal.to_bytes(16, "big"), 0, 0))
+
+    metadata = membership_index_fence_metadata(sidecar_path)
+
+    assert metadata["owner_count"] == owner_count
+    assert metadata["member_count"] == 0
+    assert metadata["membership_version"] == 1
+    assert metadata["owner_index_fence_format"] == PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT
+    assert metadata["owner_index_fence_stride"] == PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE
+    assert metadata["owner_index_fence_owners"] == [
+        (0).to_bytes(16, "big").hex(),
+        PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE.to_bytes(16, "big").hex(),
+    ]
+
+
+def test_membership_index_fences_reject_unordered_owner_index(tmp_path):
+    sidecar_path = tmp_path / "provider_npi_group.ptg2sc"
+    with sidecar_path.open("wb") as sidecar_file:
+        sidecar_file.write(struct.pack("<8sIQ", PTG2_MANIFEST_MEMBERSHIP_MAGIC, 1, 2))
+        sidecar_file.write(struct.pack("<16sQI", (2).to_bytes(16, "big"), 0, 0))
+        sidecar_file.write(struct.pack("<16sQI", (1).to_bytes(16, "big"), 0, 0))
+
+    with pytest.raises(PTG2ManifestArtifactError, match="owner index is not ordered"):
+        membership_index_fence_metadata(sidecar_path)
+
+
 def test_ptg2_manifest_membership_sidecar_writes_deterministic_order(tmp_path):
     left = tmp_path / "left"
     right = tmp_path / "right"
@@ -957,3 +993,24 @@ def test_ptg2_manifest_membership_lookup_infers_format_when_metadata_omits_it(tm
         GLOBAL_A: (GLOBAL_B,),
         GLOBAL_B: (GLOBAL_C,),
     }
+
+
+def test_v3_graph_completeness_is_required_per_source_shard():
+    graph_names = (
+        "provider_forward",
+        "provider_inverted",
+        "provider_group_npi",
+        "provider_npi_group",
+    )
+    sidecars = [
+        {"name": name, "source_shard_id": "source-shard-a"}
+        for name in graph_names
+    ]
+    sidecars.extend(
+        {"name": name, "source_shard_id": "source-shard-b"}
+        for name in graph_names
+        if name != "provider_npi_group"
+    )
+
+    with pytest.raises(RuntimeError, match="source-shard-b.*provider_npi_group"):
+        manifest_publish._retain_v3_provider_graph_artifacts({"sidecars": sidecars})

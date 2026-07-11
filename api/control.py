@@ -35,6 +35,8 @@ blueprint = Blueprint("control", url_prefix="/control/v1")
 
 @blueprint.listener("before_server_start")
 async def control_ensure_import_run_table(_app, _loop):
+    """Ensure control-plane import state exists before the server accepts requests."""
+
     # Safety net only: mrf.import_run is created by the alembic migration
     # 20260610120000_add_import_run_table; this idempotent ensure keeps fresh
     # nodes working before migrations have run, without per-request DDL.
@@ -43,6 +45,8 @@ async def control_ensure_import_run_table(_app, _loop):
 
 @blueprint.exception(SanicException)
 async def control_error(request, exc: SanicException):
+    """Render control-plane exceptions with the stable JSON error contract."""
+
     return response.json(_error_payload(request, exc), status=getattr(exc, "status_code", 500))
 
 
@@ -63,24 +67,32 @@ def _require_control_auth(request) -> None:
 
 @blueprint.get("/importers")
 async def control_importers(request):
+    """List importers available to authenticated control-plane clients."""
+
     _require_control_auth(request)
     return response.json({"items": importer_registry(), "next_cursor": None})
 
 
 @blueprint.get("/health/node")
 async def control_node_health(request):
+    """Return node, database, queue, and worker health for operators."""
+
     _require_control_auth(request)
     return response.json(await node_health(), default=str)
 
 
 @blueprint.get("/workers")
 async def control_workers(request):
+    """List configured control-plane worker definitions and states."""
+
     _require_control_auth(request)
     return response.json({"items": worker_registry(), "next_cursor": None}, default=str)
 
 
 @blueprint.post("/workers/ensure")
 async def control_ensure_worker(request):
+    """Ensure the requested importer worker is running."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     return response.json(ensure_worker(payload), status=202, default=str)
@@ -88,6 +100,8 @@ async def control_ensure_worker(request):
 
 @blueprint.post("/ptg/parse-toc-preview")
 async def control_ptg_parse_toc_preview(request):
+    """Parse a PTG table of contents without dispatching an import."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
@@ -99,6 +113,8 @@ async def control_ptg_parse_toc_preview(request):
 
 @blueprint.post("/ptg/import-file")
 async def control_ptg_import_file(request):
+    """Create one source-file-scoped PTG import run."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     run_payload = _ptg_import_file_payload(payload)
@@ -111,6 +127,8 @@ async def control_ptg_import_file(request):
 
 @blueprint.post("/ptg/source-snapshots/promote")
 async def control_ptg_source_snapshot_promote(request):
+    """Promote a validated source snapshot and optionally refresh addresses."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     source_key = str(payload.get("source_key") or "")
@@ -146,6 +164,8 @@ async def control_ptg_source_snapshot_promote(request):
 
 @blueprint.post("/ptg/source-snapshots/remove-plan")
 async def control_ptg_source_snapshot_remove_plan(request):
+    """Preview the resources affected by removing one source snapshot."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
@@ -160,6 +180,8 @@ async def control_ptg_source_snapshot_remove_plan(request):
 
 @blueprint.post("/ptg/source-snapshots/remove")
 async def control_ptg_source_snapshot_remove(request):
+    """Remove a non-current source snapshot and its owned resources."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
@@ -189,6 +211,8 @@ async def control_ptg_source_snapshot_retire(request):
 
 @blueprint.post("/imports")
 async def control_create_import(request):
+    """Create an authenticated import run from a control payload."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
@@ -201,6 +225,8 @@ async def control_create_import(request):
 
 @blueprint.get("/imports")
 async def control_list_imports(request):
+    """Return one filtered cursor page of import runs."""
+
     _require_control_auth(request)
     args = request.args
     try:
@@ -217,6 +243,8 @@ async def control_list_imports(request):
 
 @blueprint.get("/imports/<run_id>")
 async def control_get_import(request, run_id: str):
+    """Return one import run or a not-found control response."""
+
     _require_control_auth(request)
     run = await get_import_run(run_id)
     if not run:
@@ -226,6 +254,8 @@ async def control_get_import(request, run_id: str):
 
 @blueprint.post("/imports/<run_id>/cancel")
 async def control_cancel_import(request, run_id: str):
+    """Request cooperative cancellation for an active import run."""
+
     _require_control_auth(request)
     try:
         run = await request_cancel(run_id)
@@ -238,6 +268,8 @@ async def control_cancel_import(request, run_id: str):
 
 @blueprint.post("/imports/<run_id>/retry")
 async def control_retry_import(request, run_id: str):
+    """Create a retry run derived from a prior import run."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     result = await retry_import_run(run_id, payload)
@@ -249,6 +281,8 @@ async def control_retry_import(request, run_id: str):
 
 @blueprint.post("/imports/<run_id>/finalize")
 async def control_finalize_import(request, run_id: str):
+    """Dispatch the importer-specific finalization step for a run."""
+
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
