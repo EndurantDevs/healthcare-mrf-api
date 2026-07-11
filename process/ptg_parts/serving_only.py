@@ -137,6 +137,7 @@ def _serving_only_rows_for_payload(
     source_trace_set_hash: str | None = None,
     include_price_set_rows: bool = False,
 ) -> list[dict[str, Any]] | dict[str, list[dict[str, Any]]]:
+    """Build serving-only rows for one parsed PTG negotiated-rate payload."""
     procedure_payload = {
         "billing_code_type": payload.get("billing_code_type"),
         "billing_code": payload.get("billing_code"),

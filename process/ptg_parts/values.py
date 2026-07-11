@@ -30,6 +30,7 @@ def build_provider_set(
     tin_type: str | None = None,
     tin_value: str | None = None,
 ) -> dict[str, Any]:
+    """Build a canonical, hashed provider-set record from NPIs and optional TIN."""
     normalized_npi = tuple(sorted({int(value) for value in npi if value is not None}))
     payload = PTG2ProviderSetValue(npi=normalized_npi, tin_type=tin_type, tin_value=tin_value)
     provider_set_hash = semantic_hash(payload, domain="provider_set")
@@ -45,6 +46,7 @@ def build_provider_set(
 
 
 def provider_hash_bucket(provider_set_hash: str, bucket_count: int = 256) -> str:
+    """Return the fixed-width bucket derived from a provider-set hash."""
     if bucket_count <= 0:
         raise ValueError("bucket_count must be positive")
     bucket = int(str(provider_set_hash)[:8], 16) % bucket_count
@@ -53,10 +55,12 @@ def provider_hash_bucket(provider_set_hash: str, bucket_count: int = 256) -> str
 
 
 def ptg2_provider_bucket_count() -> int:
+    """Return the configured positive count of PTG2 provider hash buckets."""
     return max(_env_int(PTG2_PROVIDER_BUCKET_COUNT_ENV, 64), 1)
 
 
 def build_price_atom(price: PTG2PriceAtomEvent | dict[str, Any]) -> dict[str, Any]:
+    """Build a canonical, hashed record for one negotiated-price event."""
     payload = _canonicalize_for_json(price)
     price_atom_hash = semantic_hash(payload, domain="price_atom")
     return {
@@ -67,6 +71,7 @@ def build_price_atom(price: PTG2PriceAtomEvent | dict[str, Any]) -> dict[str, An
 
 
 def build_price_set(price_atom_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Build a canonical, hashed set of unique price-atom hashes."""
     normalized_hashes = tuple(sorted({str(value) for value in price_atom_hashes if value}))
     payload = PTG2PriceSetValue(price_atom_hashes=normalized_hashes)
     price_set_hash = semantic_hash(payload, domain="price_set")
@@ -79,6 +84,7 @@ def build_price_set(price_atom_hashes: list[str] | tuple[str, ...]) -> dict[str,
 
 
 def build_source_trace_set(source_trace_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Build a canonical, hashed set of unique source-trace hashes."""
     normalized_hashes = tuple(sorted({str(value) for value in source_trace_hashes if value}))
     payload = PTG2SourceTraceSetValue(source_trace_hashes=normalized_hashes)
     source_trace_set_hash = semantic_hash(payload, domain="source_trace_set")
@@ -96,6 +102,7 @@ def build_rate_pack(
     price_set_hash: str,
     source_trace_set_hash: str,
 ) -> dict[str, Any]:
+    """Build a canonical, hashed rate pack for one provider-procedure context."""
     payload = PTG2RatePackValue(
         context_hash=context_hash,
         domain=domain,
@@ -119,6 +126,7 @@ def build_rate_pack(
 
 
 def build_provider_set_collection(provider_set_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Build a canonical, hashed collection of unique provider-set hashes."""
     normalized_hashes = tuple(sorted({str(value) for value in provider_set_hashes if value}))
     payload = {"provider_set_hashes": normalized_hashes}
     collection_hash = semantic_hash(payload, domain="provider_set_collection")
@@ -131,6 +139,7 @@ def build_provider_set_collection(provider_set_hashes: list[str] | tuple[str, ..
 
 
 def build_procedure_collection(procedure_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Build a canonical, hashed collection of unique procedure hashes."""
     normalized_hashes = tuple(sorted({str(value) for value in procedure_hashes if value}))
     payload = {"procedure_hashes": normalized_hashes}
     collection_hash = semantic_hash(payload, domain="procedure_collection")
@@ -150,6 +159,7 @@ def build_rate_pack_group(
     price_set_hash: str,
     source_trace_set_hash: str,
 ) -> dict[str, Any]:
+    """Build a rate pack that groups provider sets for one procedure context."""
     provider_collection = build_provider_set_collection(provider_set_hashes)
     payload = {
         "context_hash": context_hash,
@@ -182,6 +192,7 @@ def build_rate_pack_procedure_group(
     price_set_hash: str,
     source_trace_set_hash: str,
 ) -> dict[str, Any]:
+    """Build a rate pack that groups procedures and provider sets by context."""
     provider_collection = build_provider_set_collection(provider_set_hashes)
     procedure_collection = build_procedure_collection(procedure_hashes)
     payload = {
@@ -215,6 +226,7 @@ def build_fact_chunk(
     provider_bucket: str,
     rate_pack_hashes: list[str] | tuple[str, ...],
 ) -> dict[str, Any]:
+    """Build a canonical, hashed chunk of rate packs for one provider bucket."""
     normalized_hashes = tuple(sorted({str(value) for value in rate_pack_hashes if value}))
     payload = {
         "context_hash": context_hash,
@@ -237,6 +249,7 @@ def build_fact_chunk(
 
 
 def build_rate_set(context_hash: str, chunk_hashes: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    """Build a canonical, hashed set of fact-chunk hashes for a context."""
     normalized_hashes = tuple(sorted({str(value) for value in chunk_hashes if value}))
     payload = {"context_hash": context_hash, "chunk_hashes": normalized_hashes}
     rate_set_hash = semantic_hash(payload, domain="rate_set")

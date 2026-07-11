@@ -22,6 +22,7 @@ def _utcnow() -> datetime.datetime:
 
 
 def resolve_ptg2_artifact_dir() -> Path:
+    """Return the configured artifact directory, creating it when needed."""
     configured = os.getenv("HLTHPRT_PTG2_ARTIFACT_DIR")
     root = Path(configured) if configured else Path(tempfile.gettempdir()) / "healthporta-ptg2-artifacts"
     root.mkdir(parents=True, exist_ok=True)
@@ -29,12 +30,14 @@ def resolve_ptg2_artifact_dir() -> Path:
 
 
 def content_addressed_path(root: str | Path, digest: str, kind: str = PTG2_ARTIFACT_RAW, suffix: str = "") -> Path:
+    """Build the sharded path for an artifact digest and optional suffix."""
     digest_text = str(digest)
     clean_suffix = suffix if suffix.startswith(".") or not suffix else f".{suffix}"
     return Path(root) / kind / digest_text[:2] / digest_text[2:4] / f"{digest_text}{clean_suffix}"
 
 
 def ptg2_temp_parent() -> Path:
+    """Return the PTG2 artifact store's writable temporary directory."""
     return PTG2ArtifactStore().tmp_dir
 
 
@@ -45,6 +48,7 @@ def _safe_url_suffix(url: str) -> str:
 
 
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
+    """Return a file's SHA-256 digest and byte count."""
     digest = hashlib.sha256()
     total = 0
     with open(path, "rb") as fp:
@@ -117,9 +121,11 @@ class PTG2ArtifactStore:
         self.manifest_path = self.root / "manifest.jsonl"
 
     def artifact_path(self, digest: str, kind: str = PTG2_ARTIFACT_RAW, suffix: str = "") -> Path:
+        """Return this store's content-addressed path for an artifact."""
         return content_addressed_path(self.root, digest, kind=kind, suffix=suffix)
 
     def partial_path(self, canonical_url: str, suffix: str = "") -> Path:
+        """Return and create the parent for a resumable URL-specific partial path."""
         digest = semantic_hash(canonical_url, domain="ptg2_partial_raw")
         clean_suffix = suffix if suffix.startswith(".") or not suffix else f".{suffix}"
         path = self.root / "partial-retained" / f"{digest}{clean_suffix}.partial"
@@ -127,14 +133,17 @@ class PTG2ArtifactStore:
         return path
 
     def storage_uri(self, path: str | Path) -> str:
+        """Return an absolute file URI for a local artifact path."""
         return Path(path).resolve().as_uri()
 
     def path_from_uri(self, uri: str) -> Path:
+        """Convert a local file URI or path string into a Path."""
         if uri.startswith("file://"):
             return Path(unquote(urlsplit(uri).path))
         return Path(uri)
 
     def find_candidates(self, canonical_url: str) -> list[dict[str, Any]]:
+        """Return retained raw-artifact manifest entries for a canonical URL."""
         if not self.manifest_path.exists():
             return []
         candidates: list[dict[str, Any]] = []
@@ -149,6 +158,7 @@ class PTG2ArtifactStore:
         return candidates
 
     def record_manifest(self, payload: dict[str, Any]) -> None:
+        """Append a timestamped artifact record to this store's manifest."""
         payload = dict(payload)
         payload.setdefault("recorded_at", _utcnow().isoformat())
         with open(self.manifest_path, "a", encoding="utf-8") as fp:

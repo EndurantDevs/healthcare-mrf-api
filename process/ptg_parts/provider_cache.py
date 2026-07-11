@@ -59,9 +59,11 @@ class PTG2ProviderReferenceCache:
 
     @staticmethod
     def key(ref: Any) -> str:
+        """Return the normalized string key for a provider-group reference."""
         return str(_normalize_provider_ref(ref))
 
     def put(self, ref: Any, groups: list[dict[str, Any]]) -> None:
+        """Store nonempty provider groups under a reference in SQLite and memory."""
         if ref is None or not groups:
             return
         cache_key = self.key(ref)
@@ -76,6 +78,7 @@ class PTG2ProviderReferenceCache:
         )
 
     def get(self, ref: Any) -> list[dict[str, Any]]:
+        """Return provider groups for a reference while recording cache statistics."""
         if ref is None:
             return []
         self.get_count += 1
@@ -106,6 +109,7 @@ class PTG2ProviderReferenceCache:
             self.memory_cache.popitem(last=False)
 
     def stats(self) -> dict[str, int]:
+        """Return current lookup, hit, miss, and memory-cache counters."""
         return {
             "provider_cache_gets": self.get_count,
             "provider_cache_memory_hits": self.memory_hit_count,
@@ -116,9 +120,11 @@ class PTG2ProviderReferenceCache:
         }
 
     def commit(self) -> None:
+        """Commit pending provider-reference changes to SQLite."""
         self.conn.commit()
 
     def close(self) -> None:
+        """Commit pending changes and close the SQLite cache connection."""
         self.conn.commit()
         self.conn.close()
 
@@ -136,9 +142,11 @@ class PTG2InMemoryProviderReferenceCache:
 
     @staticmethod
     def key(ref: Any) -> str:
+        """Return the normalized string key for a provider-group reference."""
         return str(_normalize_provider_ref(ref))
 
     def put(self, ref: Any, groups: list[dict[str, Any]]) -> None:
+        """Store nonempty provider groups under an in-memory reference key."""
         if ref is None or not groups:
             return
         cache_key = self.key(ref)
@@ -148,6 +156,7 @@ class PTG2InMemoryProviderReferenceCache:
         self.refs[cache_key] = groups
 
     def get(self, ref: Any) -> list[dict[str, Any]]:
+        """Return provider groups for a reference while recording cache statistics."""
         if ref is None:
             return []
         self.get_count += 1
@@ -159,6 +168,7 @@ class PTG2InMemoryProviderReferenceCache:
         return groups
 
     def stats(self) -> dict[str, int]:
+        """Return current lookup, hit, miss, and cache-size counters."""
         return {
             "provider_cache_gets": self.get_count,
             "provider_cache_memory_hits": self.hit_count,
@@ -169,9 +179,11 @@ class PTG2InMemoryProviderReferenceCache:
         }
 
     def commit(self) -> None:
+        """Provide the persistent-cache commit interface without doing work."""
         return None
 
     def close(self) -> None:
+        """Provide the persistent-cache close interface without doing work."""
         return None
 
 

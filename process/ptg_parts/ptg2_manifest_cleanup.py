@@ -44,6 +44,7 @@ class PTG2ManifestCleanupPlan:
 
     @property
     def has_actions(self) -> bool:
+        """Return whether the cleanup plan contains any database changes."""
         return any(
             (
                 self.tables,
@@ -81,6 +82,7 @@ async def build_ptg2_manifest_cleanup_plan(
     schema_name: str | None = None,
     executor: Any | None = None,
 ) -> PTG2ManifestCleanupPlan:
+    """Build a cleanup plan for obsolete manifest snapshots and tables."""
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     executor = executor or db
     manifest_snapshot_rows = await executor.all(

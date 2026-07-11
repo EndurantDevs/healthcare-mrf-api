@@ -2759,6 +2759,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     publish_stage_timings: dict[str, float] = {}
 
     def mark_stage(stage: str, stage_started_at: float) -> None:
+        """Record the elapsed duration for a completed publish stage."""
         publish_stage_timings[stage] = round(time.monotonic() - stage_started_at, 3)
 
     use_lean_source_stage = _use_direct_lean_manifest_copy()

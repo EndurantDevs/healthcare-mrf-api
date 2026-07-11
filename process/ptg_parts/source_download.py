@@ -363,6 +363,7 @@ def _progress_job_total(job: dict[str, Any], default: int) -> int:
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
+    """Return safe HTTP HEAD metadata, tolerating unavailable HEAD requests."""
     await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(timeout_seconds, 10))
     try:
@@ -516,6 +517,7 @@ async def _download_raw_artifact_ranges(
     semaphore = asyncio.Semaphore(_range_download_tasks())
 
     async def bounded_fetch(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+        """Fetch one byte range while applying retry and concurrency limits."""
         async with semaphore:
             retries = _download_retry_count()
             for attempt in range(retries + 1):
@@ -792,6 +794,7 @@ async def download_raw_artifact(
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
 ) -> PTG2RawArtifact:
+    """Download or reuse a verified raw artifact and record its manifest entry."""
     store = store or PTG2ArtifactStore()
     await assert_safe_url(url)
     keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
@@ -1054,6 +1057,7 @@ async def materialize_json_source(
     materialize_logical: bool = True,
     keep_partial_artifacts: bool | None = None,
 ) -> tuple[PTG2RawArtifact, PTG2LogicalArtifact]:
+    """Download a source and return its raw and logical artifact identities."""
     raw_artifact = await download_raw_artifact(
         url,
         reuse_raw_artifacts=reuse_raw_artifacts,
@@ -1174,6 +1178,7 @@ async def _iter_downloaded_ptg_jobs(
     job_count = max(len(jobs), 1)
 
     def schedule_more() -> None:
+        """Start downloads until the configured in-flight task limit is reached."""
         while len(pending) < download_tasks:
             try:
                 job = next(job_iter)

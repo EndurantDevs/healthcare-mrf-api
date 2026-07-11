@@ -151,6 +151,7 @@ def canonical_json_dumps(value: Any) -> str:
 
 
 def semantic_hash(value: Any, domain: str | None = None) -> str:
+    """Return the configured deterministic hash for canonicalized PTG2 data."""
     payload = {"domain": domain, "payload": _canonicalize_for_json(value)} if domain else _canonicalize_for_json(value)
     payload_bytes = canonical_json_dumps(payload).encode("utf-8")
     mode = str(os.getenv(PTG2_HASH_MODE_ENV, "checksum64")).strip().lower()
@@ -165,6 +166,7 @@ def semantic_hash(value: Any, domain: str | None = None) -> str:
 
 
 def canonicalize_url(url: str) -> str:
+    """Return a normalized URL with tracking parameters and fragments removed."""
     parsed = urlsplit(str(url).strip())
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
@@ -210,6 +212,7 @@ def normalize_tic_source_url(url: str) -> str:
 
 
 def normalize_import_month(value: str | datetime.date | None) -> datetime.date:
+    """Return the first day of the requested import month or the current month."""
     if value is None:
         today = datetime.date.today()
         return datetime.date(today.year, today.month, 1)

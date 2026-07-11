@@ -42,14 +42,17 @@ class PTG2SourceSnapshotGCPlan:
 
     @property
     def total_bytes(self) -> int:
+        """Return the aggregate size of tables selected for garbage collection."""
         return sum(table.bytes for table in self.tables)
 
     @property
     def table_count(self) -> int:
+        """Return the number of distinct tables selected for garbage collection."""
         return len({table.table_name for table in self.tables})
 
     @property
     def has_actions(self) -> bool:
+        """Return whether the garbage-collection plan selects snapshots or tables."""
         return bool(self.candidate_snapshot_ids or self.tables)
 
 
@@ -219,6 +222,7 @@ def validate_ptg2_source_snapshot_gc_plan(
     max_tables: int,
     max_bytes: int,
 ) -> None:
+    """Raise when a source-snapshot cleanup plan exceeds configured safety limits."""
     if len(plan.candidate_snapshot_ids) > max_snapshots:
         raise RuntimeError(
             f"Refusing cleanup: candidate snapshot count {len(plan.candidate_snapshot_ids)} "

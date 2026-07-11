@@ -23,6 +23,7 @@ PTG_LIVE_PROGRESS_STALE_SECONDS = IMPORT_LIVE_PROGRESS_STALE_SECONDS
 
 
 def write_live_progress(**payload: Any) -> None:
+    """Write PTG importer progress after applying its standard source labels."""
     payload.setdefault("importer", "ptg")
     payload.setdefault("source", "ptg-live-progress")
     _write_live_progress(**payload)

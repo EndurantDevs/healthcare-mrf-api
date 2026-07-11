@@ -312,6 +312,7 @@ async def _ensure_ptg2_price_set_stage_table(db_schema: str) -> None:
 
 
 async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
+    """Create and configure the PTG2 staging table for serving-rate rows."""
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     await db.status(
         f"""
@@ -412,6 +413,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
 
 
 async def ensure_ptg2_tables() -> None:
+    """Create PTG2 tables and apply their required schema migrations."""
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     try:
         await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")

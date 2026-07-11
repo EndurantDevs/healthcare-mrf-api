@@ -79,6 +79,7 @@ async def _merge_staged_price_sets(snapshot_id: str) -> None:
 
 
 async def _merge_staged_serving_rates(snapshot_id: str) -> None:
+    """Merge staging-table serving rates into the durable snapshot table."""
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     await db.status(
         f"""
@@ -189,6 +190,7 @@ async def _merge_staged_serving_rates(snapshot_id: str) -> None:
 
 
 async def _build_ptg2_provider_locations(snapshot_id: str) -> None:
+    """Materialize provider locations needed by a PTG2 serving snapshot."""
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     confidence_code = PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION
     try:

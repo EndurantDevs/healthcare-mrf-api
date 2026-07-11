@@ -45,6 +45,7 @@ async def build_ptg2_snapshot_index_artifact(
     snapshot_id: str,
     import_run_id: str,
 ) -> dict[str, Any] | None:
+    """Build the retained index artifact for a legacy PTG2 snapshot."""
     item_cls = classes["PTGInNetworkItem"]
     rate_cls = classes["PTGNegotiatedRate"]
     price_cls = classes["PTGNegotiatedPrice"]
@@ -233,6 +234,7 @@ async def build_ptg2_compact_snapshot_index_artifact(
     snapshot_id: str,
     import_run_id: str,
 ) -> dict[str, Any] | None:
+    """Build the retained index artifact for a compact PTG2 snapshot."""
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     limit_clause = ""
     raw_limit = (

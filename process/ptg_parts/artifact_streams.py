@@ -329,6 +329,7 @@ def _open_zip_member_stream(path: Path, info: zipfile.ZipInfo, zip_ref: zipfile.
 
 @contextmanager
 def open_json_artifact_stream(path: str | Path):
+    """Yield decompressed JSON bytes from plain, gzip, or zip artifacts."""
     path_obj = Path(path)
     if _raw_file_is_gzip(path_obj):
         with open(path_obj, "rb") as raw_fp:
@@ -378,6 +379,7 @@ def logical_artifact_identity(
     raw_byte_count: int | None = None,
     allow_deferred: bool = False,
 ) -> PTG2LogicalArtifact:
+    """Return the logical content identity of an artifact, optionally deferred."""
     raw_path_obj = Path(raw_path)
     compression, member_name = _compression_for_path(raw_path_obj)
     threshold = _env_int(PTG2_DEFER_LOGICAL_HASH_BYTES_ENV, 1024 * 1024 * 1024)
@@ -395,11 +397,13 @@ def logical_artifact_identity(
 
 
 def load_json_artifact(path: str | Path) -> Any:
+    """Load and decode JSON from a supported PTG2 artifact container."""
     with open_json_artifact_stream(path) as fp:
         return json.load(fp)
 
 
 def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None = None) -> PTG2LogicalArtifact:
+    """Materialize compressed JSON when needed and return its logical identity."""
     raw_path_obj = Path(raw_path)
     output_root = Path(output_dir) if output_dir else raw_path_obj.parent
     output_root.mkdir(parents=True, exist_ok=True)

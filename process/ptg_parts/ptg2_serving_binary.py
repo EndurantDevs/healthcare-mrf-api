@@ -463,6 +463,7 @@ class _PriceDictionary:
         self.values: list[bytes] = []
 
     def key_for(self, value: Any) -> int:
+        """Return the dense dictionary key for a normalized price-set identifier."""
         price_set_id = _normalize_128_id(value)
         price_key = self._by_id.get(price_set_id)
         if price_key is None:
@@ -495,6 +496,7 @@ async def _copy_serving_binary_records(
 
 
 async def create_ptg2_serving_binary_table(*, schema_name: str, target_table: str) -> None:
+    """Replace a serving-binary target table with its required storage schema."""
     qualified_target = f"{_quote_ident(schema_name)}.{_quote_ident(target_table)}"
     await db.status(f"DROP TABLE IF EXISTS {qualified_target} CASCADE;")
     await db.status(
@@ -523,6 +525,7 @@ async def copy_ptg2_serving_binary_file_to_table(
     schema_name: str,
     target_table: str,
 ) -> None:
+    """Copy a nonempty serving-binary file into its PostgreSQL target table."""
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
     async with db.acquire() as conn:
@@ -544,6 +547,7 @@ async def copy_ptg2_serving_binary_file_to_table(
 
 
 async def finalize_ptg2_serving_binary_table(*, schema_name: str, target_table: str) -> dict[str, Any]:
+    """Create indexes, analyze, and return storage metrics for a binary table."""
     qualified_target = f"{_quote_ident(schema_name)}.{_quote_ident(target_table)}"
     index_name = _short_index_name(target_table, "kind_key_block_uidx")
     await db.status(
