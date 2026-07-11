@@ -334,6 +334,21 @@ def test_restart_skips_completed_entry(tmp_path):
     assert state["entries"]["idaho"]["current_run_id"] == "run_idaho_done"
 
 
+def test_poll_rejects_run_that_changes_source_identity(tmp_path):
+    manifest = harness.load_manifest()
+    idaho = _manifest_entry(manifest, "idaho")
+    cigna = _manifest_entry(manifest, "cigna")
+    initial_run = _run_record(manifest, idaho, "run_shared", "running")
+    wrong_polled_run = _run_record(manifest, cigna, "run_shared", "running")
+    control = FakeImportControl(create_responses=[initial_run], transitions={"run_shared": [wrong_polled_run]})
+    state = _execute_case(tmp_path, manifest, control, ["idaho"])
+
+    idaho_state = state["entries"]["idaho"]
+    assert idaho_state["status"] == "active_conflict"
+    assert "polled run changed identity" in idaho_state["message"]
+    assert "params.source_ids does not match" in idaho_state["message"]
+
+
 def test_retry_lineage_is_followed(tmp_path):
     manifest = harness.load_manifest()
     entry = _manifest_entry(manifest, "idaho")

@@ -15,13 +15,13 @@ from pathlib import Path
 from typing import Any, Callable
 try:
     from scripts.research.provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
-    from scripts.research.provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry
+    from scripts.research.provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry, reject_polled_run_identity_change
     from scripts.research.provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from scripts.research.provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
-    from provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry
+    from provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry, reject_polled_run_identity_change
     from provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
@@ -94,8 +94,6 @@ def _atomic_write_json(json_path: Path, json_value: dict[str, Any]) -> None:
     finally:
         if temporary_name and os.path.exists(temporary_name):
             os.unlink(temporary_name)
-
-
 def _reject_sensitive_content(json_value: Any, location: str = "manifest") -> None:
     if isinstance(json_value, dict):
         for field_name, field_value in json_value.items():
@@ -410,6 +408,9 @@ class AcquisitionHarness:
     def _is_lineage_successful(self, entry: dict[str, Any], entry_state: dict[str, Any], run_record: dict[str, Any]) -> bool:
         while True:
             run_record = self.client.get_run(str(run_record["run_id"]))
+            reject_polled_run_identity_change(
+                entry["entry_id"], _run_param_errors(self.manifest, entry, run_record)
+            )
             self._remember_run(entry_state, run_record)
             self._persist()
             run_status = str(run_record.get("status") or "")

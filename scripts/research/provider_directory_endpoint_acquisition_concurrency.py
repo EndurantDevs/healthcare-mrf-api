@@ -102,3 +102,11 @@ def is_active_run_conflicting_with_entry(
         expected_source_ids.intersection(active_source_ids)
         or expected_endpoint in active_endpoints
     )
+
+
+def reject_polled_run_identity_change(entry_id: str, parameter_errors: list[str]) -> None:
+    """Reject a run whose mirrored parameters no longer match its source entry."""
+    if parameter_errors:
+        raise HarnessConflict(
+            f"{entry_id}: polled run changed identity: " + "; ".join(parameter_errors)
+        )
