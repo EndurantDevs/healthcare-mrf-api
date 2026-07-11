@@ -104,6 +104,125 @@ SUPPORT_TABLE_MODELS = (
     EntityAddressMedicationBridge,
     FacilityAnchorNPICandidate,
 )
+PROVIDER_DIRECTORY_DATASET_FENCE_TABLES = (
+    "provider_directory_source",
+    "provider_directory_address_overlay",
+    "provider_directory_endpoint_dataset",
+    "provider_directory_dataset_resource",
+)
+PROVIDER_DIRECTORY_COMPATIBILITY_ADDRESS_TABLES = (
+    "provider_directory_practitioner",
+    "provider_directory_organization",
+    "provider_directory_location",
+    "provider_directory_practitioner_role",
+    "provider_directory_organization_affiliation",
+)
+
+_PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE = """
+WITH requested_sources AS MATERIALIZED (
+    SELECT
+        source.source_id::varchar AS source_id,
+        source.endpoint_id::varchar AS endpoint_id
+      FROM {source_ref} AS source
+      {requested_source_filter}
+), endpoint_aliases AS MATERIALIZED (
+    SELECT
+        sibling.source_id::varchar AS source_id,
+        sibling.endpoint_id::varchar AS endpoint_id
+      FROM {source_ref} AS sibling
+      JOIN (
+            SELECT DISTINCT endpoint_id
+              FROM requested_sources
+             WHERE endpoint_id IS NOT NULL
+      ) AS selected_endpoint
+        ON selected_endpoint.endpoint_id = sibling.endpoint_id
+), current_endpoint_counts AS MATERIALIZED (
+    SELECT dataset.endpoint_id
+      FROM {dataset_ref} AS dataset
+     WHERE dataset.is_current IS TRUE
+  GROUP BY dataset.endpoint_id
+    HAVING COUNT(*) = 1
+), current_datasets AS MATERIALIZED (
+    SELECT
+        dataset.endpoint_id::varchar AS endpoint_id,
+        dataset.dataset_id::varchar AS dataset_id,
+        COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id,
+        dataset.published_at
+      FROM {dataset_ref} AS dataset
+      JOIN current_endpoint_counts AS current_endpoint
+        ON current_endpoint.endpoint_id = dataset.endpoint_id
+     WHERE dataset.is_current IS TRUE
+       AND dataset.status = 'published'
+       AND dataset.superseded_at IS NULL
+       AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
+), current_overlay AS MATERIALIZED (
+    SELECT
+        overlay.*,
+        dataset.dataset_id,
+        dataset.run_id AS dataset_run_id,
+        dataset.published_at AS dataset_published_at
+      FROM {overlay_ref} AS overlay
+      JOIN endpoint_aliases AS alias
+        ON alias.source_id = overlay.source_id
+      JOIN current_datasets AS dataset
+        ON dataset.endpoint_id = alias.endpoint_id
+     WHERE overlay.last_seen_run_id = dataset.run_id
+       {run_filter}
+       AND EXISTS (
+            SELECT 1
+              FROM {dataset_resource_ref} AS dataset_resource
+             WHERE dataset_resource.dataset_id = dataset.dataset_id
+               AND dataset_resource.resource_type = overlay.resource_type
+               AND dataset_resource.resource_id = overlay.resource_id
+       )
+)
+"""
+
+_PROVIDER_DIRECTORY_PARTIAL_OVERLAY_SOURCE_TEMPLATE = """
+{current_overlay_ctes}
+SELECT
+    'npi'::varchar AS entity_type,
+    overlay.npi::varchar AS entity_id,
+    overlay.npi::bigint AS npi,
+    NULL::bigint AS inferred_npi,
+    NULL::float8 AS inference_confidence,
+    NULL::varchar AS inference_method,
+    {entity_name} AS entity_name,
+    {entity_subtype} AS entity_subtype,
+    'practice'::varchar AS type,
+    {taxonomy_array} AS taxonomy_array,
+    {plans_network_array} AS plans_network_array,
+    {procedures_array} AS procedures_array,
+    {medications_array} AS medications_array,
+    ARRAY[]::varchar[] AS aca_plan_array,
+    ARRAY[]::varchar[] AS aca_network_array,
+    ARRAY[]::varchar[] AS ptg_plan_array,
+    ARRAY[]::varchar[] AS ptg_source_array,
+    ARRAY[]::varchar[] AS group_plan_array,
+    '{base_address_version}'::varchar AS base_address_version,
+    overlay.first_line::varchar AS first_line,
+    overlay.second_line::varchar AS second_line,
+    COALESCE(overlay.city_name, '')::varchar AS city_name,
+    COALESCE(overlay.state_name, overlay.state_code, '')::varchar AS state_name,
+    overlay.postal_code::varchar AS postal_code,
+    COALESCE(NULLIF(overlay.country_code, ''), 'US')::varchar AS country_code,
+    overlay.telephone_number::varchar AS telephone_number,
+    overlay.fax_number::varchar AS fax_number,
+    NULL::varchar AS formatted_address,
+    overlay.lat::numeric AS lat,
+    overlay.long::numeric AS long,
+    NULL::date AS date_added,
+    NULL::varchar AS place_id,
+    overlay.address_key::uuid AS address_key,
+    COALESCE(overlay.source_updated_at, overlay.published_at, NOW())::timestamp AS updated_at,
+    'provider_directory_fhir'::varchar AS address_source,
+    overlay.source_record_id::varchar AS source_record_id
+  FROM current_overlay AS overlay
+  {npi_join}
+  {primary_npi_address_join}
+ WHERE overlay.npi BETWEEN 1000000000 AND 9999999999
+   AND {address_predicate}
+"""
 
 ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "npi",
@@ -2383,183 +2502,111 @@ def _provider_directory_live_source_filter_sql(
 ) -> str:
     if not source_ids:
         return ""
-    selected_source_filter = (
-        f"split_part(pd_rid.rid, ':', 3) = ANY({_string_array_literal(list(source_ids))})"
-    )
+    selected_source_ids = _string_array_literal(list(source_ids))
     return f"""
        AND EXISTS (
             SELECT 1
               FROM unnest(COALESCE({alias}.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
+              JOIN {db_schema}.provider_directory_source AS sibling_source
+                ON sibling_source.source_id = split_part(pd_rid.rid, ':', 3)
              WHERE pd_rid.rid LIKE 'provider_directory_fhir:%'
                AND NULLIF(split_part(pd_rid.rid, ':', 3), '') IS NOT NULL
-               AND (
-                    {selected_source_filter}
-                    OR NOT EXISTS (
-                        SELECT 1
-                          FROM {db_schema}.provider_directory_source AS source
-                         WHERE source.source_id = split_part(pd_rid.rid, ':', 3)
-                    )
+               AND sibling_source.endpoint_id IS NOT NULL
+               AND EXISTS (
+                    SELECT 1
+                      FROM {db_schema}.provider_directory_source AS selected_source
+                     WHERE selected_source.source_id = ANY({selected_source_ids})
+                       AND selected_source.endpoint_id = sibling_source.endpoint_id
                )
        )"""
 
 
-def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
-    source_ref = f"{db_schema}.provider_directory_source"
-    entity_address_ref = f"{db_schema}.{EntityAddressUnified.__main_table__}"
-    location_ref = f"{db_schema}.provider_directory_location"
-    organization_ref = f"{db_schema}.provider_directory_organization"
-    role_ref = f"{db_schema}.provider_directory_practitioner_role"
-    healthcare_service_ref = f"{db_schema}.provider_directory_healthcare_service"
-    affiliation_ref = f"{db_schema}.provider_directory_organization_affiliation"
-    return f"""
-    WITH completed_sources AS (
-        SELECT
-            source_id::varchar AS source_id,
-            metadata_json::jsonb->'last_resource_import'->>'run_id' AS run_id,
-            updated_at,
-            'metadata'::varchar AS scope_source
-          FROM {source_ref}
-         WHERE COALESCE(metadata_json::jsonb, '{{}}'::jsonb) ? 'last_resource_import'
-           AND (
-                (
-                    metadata_json::jsonb->'last_resource_import'->'resources'->'Location'->>'complete' = 'true'
-                    AND (
-                        metadata_json::jsonb->'last_resource_import'->'resources'->'PractitionerRole'->>'complete' = 'true'
-                     OR metadata_json::jsonb->'last_resource_import'->'resources'->'OrganizationAffiliation'->>'complete' = 'true'
-                    )
-                )
-             OR metadata_json::jsonb->'last_resource_import'->'resources'->'Organization'->>'complete' = 'true'
-           )
-    ), location_eligible_source_runs AS (
-        SELECT DISTINCT
-            role.source_id::varchar AS source_id,
-            role.last_seen_run_id::varchar AS run_id
-          FROM {role_ref} AS role
-          JOIN {db_schema}.provider_directory_practitioner AS practitioner
-            ON practitioner.source_id = role.source_id
-           AND practitioner.resource_id = NULLIF(
-                regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
-                ''
-           )
-         WHERE role.last_seen_run_id IS NOT NULL
-           AND practitioner.npi BETWEEN 1000000000 AND 9999999999
-           AND practitioner.active IS DISTINCT FROM false
-           AND role.active IS DISTINCT FROM false
-        UNION
-        SELECT DISTINCT
-            affiliation.source_id::varchar AS source_id,
-            affiliation.last_seen_run_id::varchar AS run_id
-          FROM {affiliation_ref} AS affiliation
-          JOIN LATERAL (
-              SELECT DISTINCT normalized_ref AS resource_id
-                FROM (
-                    VALUES
-                        (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
-                        (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
-                ) AS refs(normalized_ref)
-               WHERE normalized_ref IS NOT NULL
-          ) AS organization_ref ON TRUE
-          JOIN {organization_ref} AS organization
-            ON organization.source_id = affiliation.source_id
-           AND organization.resource_id = organization_ref.resource_id
-         WHERE affiliation.last_seen_run_id IS NOT NULL
-           AND organization.npi BETWEEN 1000000000 AND 9999999999
-           AND organization.active IS DISTINCT FROM false
-           AND affiliation.active IS DISTINCT FROM false
-        UNION
-        SELECT DISTINCT
-            healthcare_service.source_id::varchar AS source_id,
-            healthcare_service.last_seen_run_id::varchar AS run_id
-          FROM {healthcare_service_ref} AS healthcare_service
-         WHERE healthcare_service.last_seen_run_id IS NOT NULL
-           AND healthcare_service.active IS DISTINCT FROM false
-           AND jsonb_array_length(COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)) > 0
-    ), location_row_sources AS (
-        SELECT
-            loc.source_id::varchar AS source_id,
-            loc.last_seen_run_id::varchar AS run_id,
-            MAX(loc.updated_at) AS updated_at,
-            'resource_rows'::varchar AS scope_source
-          FROM {location_ref} AS loc
-          JOIN location_eligible_source_runs AS eligible
-            ON eligible.source_id = loc.source_id
-           AND eligible.run_id = loc.last_seen_run_id
-         WHERE loc.last_seen_run_id IS NOT NULL
-      GROUP BY loc.source_id, loc.last_seen_run_id
-    ), organization_row_sources AS (
-        SELECT
-            organization.source_id::varchar AS source_id,
-            organization.last_seen_run_id::varchar AS run_id,
-            MAX(organization.updated_at) AS updated_at,
-            'resource_rows'::varchar AS scope_source
-          FROM {organization_ref} AS organization
-         WHERE organization.last_seen_run_id IS NOT NULL
-           AND organization.npi BETWEEN 1000000000 AND 9999999999
-           AND organization.active IS DISTINCT FROM false
-           AND jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0
-      GROUP BY organization.source_id, organization.last_seen_run_id
-    ), resource_row_sources AS (
-        SELECT
-            source_id,
-            run_id,
-            MAX(updated_at) AS updated_at,
-            'resource_rows'::varchar AS scope_source
-          FROM (
-                SELECT * FROM location_row_sources
-                UNION ALL
-                SELECT * FROM organization_row_sources
-          ) AS row_sources
-      GROUP BY source_id, run_id
-    ), eligible_completed_sources AS (
-        SELECT completed.*
-          FROM completed_sources AS completed
-         WHERE EXISTS (
-                SELECT 1
-                  FROM resource_row_sources AS row_source
-                 WHERE row_source.source_id = completed.source_id
-         )
-    ), candidate_sources AS (
-        SELECT * FROM eligible_completed_sources
-        UNION ALL
-        SELECT resource_row_sources.*
-          FROM resource_row_sources
-         WHERE NOT EXISTS (SELECT 1 FROM eligible_completed_sources)
-    ), projected_sources AS (
-        SELECT DISTINCT split_part(pd_rid.rid, ':', 3)::varchar AS source_id
-          FROM {entity_address_ref} AS live
-          JOIN LATERAL unnest(COALESCE(live.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
-            ON TRUE
-         WHERE pd_rid.rid LIKE 'provider_directory_fhir:%'
-           AND NULLIF(split_part(pd_rid.rid, ':', 3), '') IS NOT NULL
-    ), unprojected_sources AS (
-        SELECT
-            candidate.source_id,
-            NULL::varchar AS run_id,
-            MAX(candidate.updated_at) AS updated_at,
-            ('unprojected_' || MAX(candidate.scope_source))::varchar AS scope_source
-          FROM candidate_sources AS candidate
-         WHERE NOT EXISTS (
-                SELECT 1
-                  FROM projected_sources AS projected
-                 WHERE projected.source_id = candidate.source_id
-         )
-      GROUP BY candidate.source_id
-    ), selected_sources AS (
-        SELECT * FROM unprojected_sources
-         WHERE EXISTS (SELECT 1 FROM unprojected_sources)
-        UNION ALL
-        SELECT * FROM candidate_sources
-         WHERE NOT EXISTS (SELECT 1 FROM unprojected_sources)
+def _missing_provider_directory_fence_relations(available: dict[str, bool]) -> list[str]:
+    return [
+        table_name
+        for table_name in PROVIDER_DIRECTORY_DATASET_FENCE_TABLES
+        if not available.get(table_name, False)
+    ]
+
+
+def _validate_provider_directory_fence(
+    available: dict[str, bool],
+    *,
+    has_compatibility_data: bool,
+    partial_refresh: bool,
+) -> None:
+    missing_relations = _missing_provider_directory_fence_relations(available)
+    if not missing_relations or not (partial_refresh or has_compatibility_data):
+        return
+    raise RuntimeError(
+        "entity-address-unified Provider Directory projection requires current "
+        "dataset fence relations: "
+        + ", ".join(missing_relations)
     )
+
+
+async def _has_provider_directory_compatibility_data(
+    db_schema: str,
+    available: dict[str, bool],
+) -> bool:
+    table_names = [
+        table_name
+        for table_name in PROVIDER_DIRECTORY_COMPATIBILITY_ADDRESS_TABLES
+        if available.get(table_name, False)
+    ]
+    if not table_names:
+        return False
+    existence_checks = " OR ".join(
+        f"EXISTS (SELECT 1 FROM {db_schema}.{table_name} LIMIT 1)"
+        for table_name in table_names
+    )
+    return bool(await db.scalar(f"SELECT {existence_checks};"))
+
+
+def _provider_directory_current_overlay_ctes_sql(
+    db_schema: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Return CTEs that retain only current, published dataset overlay rows."""
+
+    source_ref = f"{db_schema}.provider_directory_source"
+    dataset_ref = f"{db_schema}.provider_directory_endpoint_dataset"
+    dataset_resource_ref = f"{db_schema}.provider_directory_dataset_resource"
+    overlay_ref = f"{db_schema}.provider_directory_address_overlay"
+    requested_source_filter = (
+        f"WHERE source.source_id = ANY({_string_array_literal(list(source_ids))})"
+        if source_ids
+        else "WHERE source.endpoint_id IS NOT NULL"
+    )
+    run_filter = (
+        f"\n           AND overlay.last_seen_run_id = {_sql_literal(run_id)}"
+        if run_id
+        else ""
+    )
+    return _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE.format(
+        source_ref=source_ref,
+        requested_source_filter=requested_source_filter,
+        dataset_ref=dataset_ref,
+        overlay_ref=overlay_ref,
+        run_filter=run_filter,
+        dataset_resource_ref=dataset_resource_ref,
+    )
+
+
+def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
+    return f"""
+    {_provider_directory_current_overlay_ctes_sql(db_schema)}
     SELECT
-        run_id,
-        ARRAY_AGG(source_id ORDER BY source_id)::varchar[] AS source_ids,
+        dataset_run_id::varchar AS run_id,
+        ARRAY_AGG(DISTINCT source_id ORDER BY source_id)::varchar[] AS source_ids,
         COUNT(*)::bigint AS source_count,
-        MAX(updated_at) AS latest_updated_at,
-        ARRAY_AGG(DISTINCT scope_source ORDER BY scope_source)::varchar[] AS scope_sources
-      FROM selected_sources
-  GROUP BY run_id
-  ORDER BY (run_id IS NULL) DESC, MAX(updated_at) DESC NULLS LAST, run_id DESC
+        MAX(dataset_published_at) AS latest_updated_at,
+        ARRAY['current_overlay']::varchar[] AS scope_sources
+      FROM current_overlay
+  GROUP BY dataset_run_id
+  ORDER BY MAX(dataset_published_at) DESC NULLS LAST, dataset_run_id DESC
      LIMIT 1;
     """
 
@@ -3704,6 +3751,129 @@ def _source_selects(
     return selects
 
 
+def _partial_overlay_npi_context_sql(
+    db_schema: str,
+    available: dict[str, bool],
+) -> tuple[str, str, tuple[str, str, str, str]]:
+    """Return optional NPI joins and array expressions for overlay projection."""
+
+    npi_join = (
+        f"LEFT JOIN {db_schema}.npi AS n ON n.npi = overlay.npi"
+        if available.get("npi", False)
+        else ""
+    )
+    if not available.get("npi_address", False):
+        return npi_join, "", ("ARRAY[0]::int[]",) * 4
+    return (
+        npi_join,
+        f"""
+        LEFT JOIN LATERAL (
+            SELECT
+                pa.taxonomy_array,
+                pa.plans_network_array,
+                pa.procedures_array,
+                pa.medications_array
+              FROM {db_schema}.npi_address AS pa
+             WHERE pa.npi = overlay.npi
+               AND pa.type = 'primary'
+             ORDER BY pa.checksum
+             LIMIT 1
+        ) AS pa ON TRUE
+        """,
+        (
+            "COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]",
+            "COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]",
+            "COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]",
+            "COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]",
+        ),
+    )
+
+
+def _provider_directory_partial_overlay_source_select(
+    db_schema: str,
+    available: dict[str, bool],
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Project only current, dataset-member Provider Directory overlay rows."""
+
+    npi_join, primary_npi_address_join, array_expressions = (
+        _partial_overlay_npi_context_sql(db_schema, available)
+    )
+    entity_name = _npi_entity_name_expr("n") if npi_join else "NULL::varchar"
+    entity_subtype = _npi_entity_subtype_expr("n") if npi_join else "NULL::varchar"
+    address_predicate = _address_source_keyable_predicate(
+        first_line="overlay.first_line",
+        city="overlay.city_name",
+        state="COALESCE(overlay.state_name, overlay.state_code)",
+        zip_code="overlay.postal_code",
+        country="COALESCE(NULLIF(overlay.country_code, ''), 'US')",
+    )
+    return _PROVIDER_DIRECTORY_PARTIAL_OVERLAY_SOURCE_TEMPLATE.format(
+        current_overlay_ctes=_provider_directory_current_overlay_ctes_sql(
+            db_schema,
+            source_ids=source_ids,
+            run_id=run_id,
+        ),
+        entity_name=entity_name,
+        entity_subtype=entity_subtype,
+        taxonomy_array=array_expressions[0],
+        plans_network_array=array_expressions[1],
+        procedures_array=array_expressions[2],
+        medications_array=array_expressions[3],
+        base_address_version=BASE_ADDRESS_VERSION,
+        npi_join=npi_join,
+        primary_npi_address_join=primary_npi_address_join,
+        address_predicate=address_predicate,
+    )
+
+
+def _bounded_source_select_sql(source_select: str, row_limit: int | None) -> str:
+    if not row_limit or row_limit <= 0:
+        return source_select
+    return (
+        "(\n"
+        f"SELECT * FROM (\n{source_select.strip()}\n) AS src LIMIT {int(row_limit)}\n"
+        ")"
+    )
+
+
+def _current_provider_directory_source_selects(
+    db_schema: str,
+    available: dict[str, bool],
+    source_selects: list[str],
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+    test_limit_per_source: int | None = None,
+    has_compatibility_data: bool = False,
+    partial_refresh: bool = False,
+) -> list[str]:
+    _validate_provider_directory_fence(
+        available,
+        has_compatibility_data=has_compatibility_data,
+        partial_refresh=partial_refresh,
+    )
+    current_source_selects = [
+        source_select
+        for source_select in source_selects
+        if not _is_provider_directory_source_select(db_schema, source_select)
+    ]
+    if _missing_provider_directory_fence_relations(available):
+        return current_source_selects
+    overlay_source_select = _provider_directory_partial_overlay_source_select(
+        db_schema,
+        available,
+        source_ids=source_ids,
+        run_id=run_id,
+    )
+    current_source_selects.append(
+        _bounded_source_select_sql(overlay_source_select, test_limit_per_source)
+    )
+    return current_source_selects
+
+
 def _string_array_literal(values: list[str]) -> str:
     if not values:
         raise ValueError("values must be non-empty")
@@ -3751,6 +3921,7 @@ def _is_provider_directory_source_select(db_schema: str, source_select: str) -> 
         f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
         or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
         or f"FROM {db_schema}.provider_directory_organization AS organization" in source_select
+        or f"FROM {db_schema}.provider_directory_address_overlay AS overlay" in source_select
     )
 
 
@@ -3859,20 +4030,9 @@ def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_
 def _provider_directory_partial_scope_index_sql(db_schema: str) -> list[str]:
     return [
         f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_role_run_source_idx
-            ON {db_schema}.provider_directory_practitioner_role (last_seen_run_id, source_id);
-        """,
-        f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_organization_run_source_idx
-            ON {db_schema}.provider_directory_organization (last_seen_run_id, source_id);
-        """,
-        f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_affiliation_run_source_idx
-            ON {db_schema}.provider_directory_organization_affiliation (last_seen_run_id, source_id);
-        """,
-        f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_healthcare_service_run_source_idx
-            ON {db_schema}.provider_directory_healthcare_service (last_seen_run_id, source_id);
+        CREATE INDEX IF NOT EXISTS provider_directory_address_overlay_source_run_resource_idx
+            ON {db_schema}.provider_directory_address_overlay
+                (source_id, last_seen_run_id, resource_type, resource_id);
         """,
     ]
 
@@ -9876,6 +10036,10 @@ async def process_data(ctx, task=None):
         "provider_directory_network_catalog",
         "provider_directory_healthcare_service",
         "provider_directory_organization_affiliation",
+        "provider_directory_source",
+        "provider_directory_address_overlay",
+        "provider_directory_endpoint_dataset",
+        "provider_directory_dataset_resource",
         "address_archive_v2",
     ]
     available = {table: await _table_exists(db_schema, table) for table in required_checks}
@@ -9930,6 +10094,20 @@ async def process_data(ctx, task=None):
             )
         )
     context["limit_per_source"] = test_limit_per_source
+    missing_fence_relations = _missing_provider_directory_fence_relations(available)
+    has_compatibility_data = False
+    if missing_fence_relations:
+        if partial_provider_directory_refresh:
+            _validate_provider_directory_fence(
+                available,
+                has_compatibility_data=False,
+                partial_refresh=True,
+            )
+        else:
+            has_compatibility_data = await _has_provider_directory_compatibility_data(
+                db_schema,
+                available,
+            )
     if (
         partial_provider_directory_refresh
         and provider_directory_partial_scope == "latest-run"
@@ -9966,18 +10144,22 @@ async def process_data(ctx, task=None):
     context["partial_provider_directory_source_batch_size"] = provider_directory_source_batch_size
     context["partial_provider_directory_source_batches"] = len(provider_directory_source_batches)
     address_canon_available = await _address_canon_available(db_schema)
-    source_selects: list[str] = []
-    for provider_directory_source_batch in provider_directory_source_batches:
-        source_selects.extend(
-            _source_selects(
-                db_schema,
-                available,
-                test_limit_per_source=test_limit_per_source,
-                provider_directory_source_ids=provider_directory_source_batch,
-                provider_directory_run_id=provider_directory_run_id,
-                address_canon_available=address_canon_available,
-            )
-        )
+    source_selects = _source_selects(
+        db_schema,
+        available,
+        test_limit_per_source=test_limit_per_source,
+        address_canon_available=address_canon_available,
+    )
+    source_selects = _current_provider_directory_source_selects(
+        db_schema,
+        available,
+        source_selects,
+        source_ids=(provider_directory_source_ids if partial_provider_directory_refresh else None),
+        run_id=(provider_directory_run_id if partial_provider_directory_refresh else None),
+        test_limit_per_source=test_limit_per_source,
+        has_compatibility_data=has_compatibility_data,
+        partial_refresh=partial_provider_directory_refresh,
+    )
     affected_group_table: str | None = None
     if partial_provider_directory_refresh:
         if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
