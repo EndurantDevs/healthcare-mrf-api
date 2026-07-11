@@ -11,7 +11,7 @@ import queue
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NamedTuple
 
 try:
     import orjson
@@ -161,7 +161,98 @@ def _coerce_progress_float(value: Any) -> float | None:
 def _format_progress_mib(value: int | None) -> str:
     if value is None:
         return "unknown"
-    return f"{value / (1024 ** 2):.1f} MiB"
+    return f"{value / (1024 ** 2):,.1f} MiB"
+
+
+def _format_progress_duration(value: float | None) -> str | None:
+    if value is None or value < 0:
+        return None
+    elapsed_seconds = int(value)
+    minutes, seconds = divmod(elapsed_seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _format_object_rate(value: float | None) -> str | None:
+    if value is None or value < 0:
+        return None
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M objects/s"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K objects/s"
+    return f"{value:.0f} objects/s"
+
+
+class _ScannerProgress(NamedTuple):
+    compressed_bytes: int | None
+    total_bytes: int | None
+    percent: float | None
+    eta_seconds: float | None
+    elapsed_seconds: float | None
+    compressed_mib_s: float | None
+    object_count: int | None
+    scanner_object_count_by_kind: dict[str, int]
+    scanner_path: str | None
+    is_done: bool
+
+
+def _parse_scanner_progress(fields: dict[str, str]) -> _ScannerProgress:
+    scanner_object_count_by_kind = {
+        key: count
+        for key, value in fields.items()
+        if key not in _SCANNER_PROGRESS_BASE_KEYS
+        and (count := _coerce_progress_int(value)) is not None
+    }
+    return _ScannerProgress(
+        compressed_bytes=_coerce_progress_int(fields.get("compressed_bytes")),
+        total_bytes=_coerce_progress_int(fields.get("total_bytes")),
+        percent=_coerce_progress_float(fields.get("percent")),
+        eta_seconds=_coerce_progress_float(fields.get("eta_seconds")),
+        elapsed_seconds=_coerce_progress_float(fields.get("elapsed_seconds")),
+        compressed_mib_s=_coerce_progress_float(fields.get("compressed_mib_s")),
+        object_count=_coerce_progress_int(fields.get("objects")),
+        scanner_object_count_by_kind=scanner_object_count_by_kind,
+        scanner_path=fields.get("path"),
+        is_done=str(fields.get("done") or "").lower() == "true",
+    )
+
+
+def _scanner_object_progress_message(
+    phase: str,
+    scanner_objects: dict[str, int],
+    *,
+    object_count: int,
+    elapsed_seconds: float | None,
+    total_bytes: int | None,
+) -> tuple[str, float | None]:
+    negotiated_rates = scanner_objects.get("negotiated_rates", 0)
+    provider_references = scanner_objects.get("provider_references", 0)
+    in_network = scanner_objects.get("in_network", 0)
+    activity = "rate stream" if negotiated_rates or in_network else "provider-reference stream"
+    message_parts = [f"{phase}: {activity}"]
+    if negotiated_rates:
+        message_parts.append(f"rates={negotiated_rates:,}")
+    if provider_references:
+        message_parts.append(f"provider refs={provider_references:,}")
+    if in_network:
+        message_parts.append(f"code groups={in_network:,}")
+    if not any((negotiated_rates, provider_references, in_network)):
+        message_parts.append(f"objects={object_count:,}")
+    object_rate = (
+        object_count / elapsed_seconds
+        if elapsed_seconds is not None and elapsed_seconds > 0
+        else None
+    )
+    formatted_rate = _format_object_rate(object_rate)
+    if formatted_rate:
+        message_parts.append(f"throughput={formatted_rate}")
+    formatted_elapsed = _format_progress_duration(elapsed_seconds)
+    if formatted_elapsed:
+        message_parts.append(f"elapsed={formatted_elapsed}")
+    if total_bytes is not None:
+        message_parts.append(f"input={_format_progress_mib(total_bytes)}")
+    return ", ".join(message_parts), object_rate
 
 
 def _emit_scanner_live_progress(
@@ -173,57 +264,78 @@ def _emit_scanner_live_progress(
     fields = _scanner_progress_fields(line)
     if not fields:
         return
-    compressed_bytes = _coerce_progress_int(fields.get("compressed_bytes"))
-    total_bytes = _coerce_progress_int(fields.get("total_bytes"))
-    percent = _coerce_progress_float(fields.get("percent"))
-    eta_seconds = _coerce_progress_float(fields.get("eta_seconds"))
-    elapsed_seconds = _coerce_progress_float(fields.get("elapsed_seconds"))
-    compressed_mib_s = _coerce_progress_float(fields.get("compressed_mib_s"))
-    object_count = _coerce_progress_int(fields.get("objects"))
-    scanner_objects = {
-        key: count
-        for key, value in fields.items()
-        if key not in _SCANNER_PROGRESS_BASE_KEYS and (count := _coerce_progress_int(value)) is not None
-    }
+    progress = _parse_scanner_progress(fields)
     context = {
         key: value
         for key, value in (live_progress_context or {}).items()
         if value not in (None, "")
     }
+    use_object_progress = bool(
+        not progress.is_done
+        and progress.object_count is not None
+        and progress.object_count > 0
+        and (progress.compressed_bytes is None or progress.compressed_bytes <= 0)
+    )
+    phase_pct = None if use_object_progress else progress.percent
     overall_pct = _scale_stage_progress_pct(
-        percent,
+        phase_pct,
         context.get("overall_progress_start_pct"),
         context.get("overall_progress_end_pct"),
     )
-    pct = overall_pct if overall_pct is not None else percent
-    message_parts = [
-        f"{phase} {percent:.2f}%" if percent is not None else phase,
-        f"read {_format_progress_mib(compressed_bytes)} of {_format_progress_mib(total_bytes)}",
-    ]
-    if object_count is not None:
-        message_parts.append(f"objects={object_count}")
-    if compressed_mib_s is not None:
-        message_parts.append(f"{compressed_mib_s:.2f} MiB/s")
-    payload: dict[str, Any] = {
+    pct = overall_pct if overall_pct is not None else phase_pct
+    object_rate = None
+    if use_object_progress:
+        pct = _coerce_progress_float(context.get("overall_progress_start_pct"))
+        message, object_rate = _scanner_object_progress_message(
+            phase,
+            progress.scanner_object_count_by_kind,
+            object_count=progress.object_count,
+            elapsed_seconds=progress.elapsed_seconds,
+            total_bytes=progress.total_bytes,
+        )
+        progress_unit = "objects"
+        progress_done = progress.object_count
+        progress_total = None
+        progress_eta = None
+    else:
+        message_parts = [
+            f"{phase} {progress.percent:.2f}%" if progress.percent is not None else phase,
+            (
+                f"read {_format_progress_mib(progress.compressed_bytes)} "
+                f"of {_format_progress_mib(progress.total_bytes)}"
+            ),
+        ]
+        if progress.object_count is not None:
+            message_parts.append(f"objects={progress.object_count}")
+        if progress.compressed_mib_s is not None:
+            message_parts.append(f"{progress.compressed_mib_s:.2f} MiB/s")
+        message = ", ".join(message_parts)
+        progress_unit = "compressed_bytes"
+        progress_done = progress.compressed_bytes
+        progress_total = progress.total_bytes
+        progress_eta = progress.eta_seconds
+    progress_value_by_field: dict[str, Any] = {
         **context,
         "phase": phase,
-        "unit": "compressed_bytes",
-        "done": compressed_bytes,
-        "total": total_bytes,
+        "unit": progress_unit,
+        "done": progress_done,
+        "total": progress_total,
         "pct": pct,
-        "phase_pct": percent,
-        "eta_seconds": eta_seconds,
-        "elapsed_seconds": elapsed_seconds,
-        "message": ", ".join(message_parts),
-        "detail": ", ".join(message_parts),
+        "phase_pct": phase_pct,
+        "eta_seconds": progress_eta,
+        "elapsed_seconds": progress.elapsed_seconds,
+        "message": message,
+        "detail": message,
         "source": "ptg2-scanner-progress",
         "confidence": "live",
-        "scanner_path": fields.get("path"),
-        "scanner_done": str(fields.get("done") or "").lower() == "true",
-        "scanner_objects": scanner_objects or None,
+        "scanner_path": progress.scanner_path,
+        "scanner_done": progress.is_done,
+        "scanner_objects": progress.scanner_object_count_by_kind or None,
+        "scanner_progress_basis": progress_unit,
+        "scanner_object_rate": object_rate,
     }
     try:
-        write_live_progress(**payload)
+        write_live_progress(**progress_value_by_field)
     except Exception:
         logger.debug("Failed to write PTG2 scanner live progress", exc_info=True)
 
