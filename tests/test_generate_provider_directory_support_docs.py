@@ -36,7 +36,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered_document
     assert "| Registration | Reviewed at |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-07-10 | OAuth2 client credentials and Bulk" in rendered_document
+    assert "Required | 2026-07-11 | OAuth2 client credentials and Bulk" in rendered_document
     assert "Cigna (`cigna`)" in rendered_document
     assert "Not required | 2026-07-10 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
@@ -236,7 +236,7 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),
-        ("washington", "Location pagination was revalidated"),
+        ("washington", "HealthcareService preflight timed out"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
         ("amerihealth-nh", "Plan code 0900; full-refresh pages target 250 rows"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
