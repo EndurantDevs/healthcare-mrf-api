@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -88,3 +89,53 @@ async def test_v3_artifact_stream_progress_is_reported(monkeypatch):
 
     assert [details["done"] for _, details in progress_events] == [2, 3, 4, 5]
     assert {details["total"] for _, details in progress_events} == {6}
+
+
+@pytest.mark.asyncio
+async def test_v3_artifact_stream_wait_reports_remaining_work(monkeypatch):
+    progress_events = []
+    release_by_code = asyncio.Event()
+    by_code_kind = serving_binary.PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND
+    stream_kinds = (
+        by_code_kind,
+        serving_binary.PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
+        serving_binary.PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
+        serving_binary.PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
+    )
+
+    async def fake_stream(**kwargs):
+        if kwargs["kind"] == by_code_kind:
+            await release_by_code.wait()
+        return {"artifact_kind": kwargs["kind"]}
+
+    monkeypatch.setattr(serving_binary, "_V3_STREAM_PROGRESS_INTERVAL_SECONDS", 0.005)
+    monkeypatch.setattr(serving_binary, "_serving_binary_stream_tasks", lambda: 4)
+    monkeypatch.setattr(serving_binary, "_stream_serving_binary_copy", fake_stream)
+
+    stream_task = asyncio.create_task(
+        serving_binary._run_v3_streams(
+            sql_by_kind={kind: f"SELECT '{kind}'" for kind in stream_kinds},
+            schema_name="mrf",
+            target_table="binary",
+            target_copy_format="binary",
+            atom_count=10,
+            atom_key_bits=24,
+            progress_callback=lambda step, **details: progress_events.append((step, details)),
+        )
+    )
+    await asyncio.sleep(0.02)
+    wait_events = [
+        details for _, details in progress_events if details.get("pending_artifact_streams")
+    ]
+    release_by_code.set()
+    await stream_task
+
+    assert wait_events
+    latest_wait = wait_events[-1]
+    assert latest_wait["done"] == 4
+    assert latest_wait["total"] == 6
+    assert latest_wait["completed_stream_count"] == 3
+    assert latest_wait["stream_count"] == 4
+    assert latest_wait["pending_artifact_streams"] == ("by-code/provider projections",)
+    assert "3/4 PostgreSQL binary streams complete" in latest_wait["message"]
+    assert "waiting for by-code/provider projections" in latest_wait["message"]

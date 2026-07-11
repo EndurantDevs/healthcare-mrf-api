@@ -143,6 +143,7 @@ _V3_STREAM_ENCODER_KINDS = frozenset(
 logger = logging.getLogger(__name__)
 
 _V3_PUBLISH_PROGRESS_TOTAL = 6
+_V3_STREAM_PROGRESS_INTERVAL_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -2376,6 +2377,87 @@ def _report_v3_stream_progress(
     )
 
 
+def _v3_stream_progress_label(stream_kind: str) -> str:
+    label_by_kind = {
+        PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND: "by-code/provider projections",
+        PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: "price dictionary",
+        PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: "price memberships",
+        PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: "price atoms",
+    }
+    return label_by_kind.get(stream_kind, stream_kind)
+
+
+def _format_v3_stream_elapsed(elapsed_seconds: float) -> str:
+    elapsed = max(int(elapsed_seconds), 0)
+    minutes, seconds = divmod(elapsed, 60)
+    return f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+
+
+def _report_v3_stream_wait_progress(
+    progress_callback: Callable[..., None] | None,
+    *,
+    completed_stream_count: int,
+    stream_count: int,
+    pending_stream_kinds: tuple[str, ...],
+    elapsed_seconds: float,
+) -> None:
+    pending_labels = tuple(_v3_stream_progress_label(kind) for kind in pending_stream_kinds)
+    waiting_for = ", ".join(pending_labels)
+    _emit_progress(
+        progress_callback,
+        "serving binary artifact stream",
+        done=1 + completed_stream_count,
+        total=_V3_PUBLISH_PROGRESS_TOTAL,
+        message=(
+            f"{completed_stream_count}/{stream_count} PostgreSQL binary streams complete; "
+            f"waiting for {waiting_for}; elapsed={_format_v3_stream_elapsed(elapsed_seconds)}"
+        ),
+        completed_stream_count=completed_stream_count,
+        stream_count=stream_count,
+        pending_artifact_streams=pending_labels,
+        stream_elapsed_seconds=round(elapsed_seconds, 3),
+    )
+
+
+async def _await_v3_stream_tasks(
+    task_by_kind: Mapping[str, asyncio.Task[dict[str, Any]]],
+    progress_callback: Callable[..., None] | None,
+) -> dict[str, dict[str, Any]]:
+    pending_tasks = set(task_by_kind.values())
+    stream_started_at = time.monotonic()
+    try:
+        completed_stream_count = 0
+        while pending_tasks:
+            completed_tasks, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                timeout=_V3_STREAM_PROGRESS_INTERVAL_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not completed_tasks:
+                pending_stream_kinds = tuple(
+                    kind for kind, stream_task in task_by_kind.items() if stream_task in pending_tasks
+                )
+                _report_v3_stream_wait_progress(
+                    progress_callback,
+                    completed_stream_count=completed_stream_count,
+                    stream_count=len(task_by_kind),
+                    pending_stream_kinds=pending_stream_kinds,
+                    elapsed_seconds=time.monotonic() - stream_started_at,
+                )
+                continue
+            for completed_stream in completed_tasks:
+                stream_summary = await completed_stream
+                completed_stream_count += 1
+                _report_v3_stream_progress(progress_callback, completed_stream_count, stream_summary)
+        stream_summaries = [stream_task.result() for stream_task in task_by_kind.values()]
+    except (Exception, asyncio.CancelledError):
+        for stream_task in task_by_kind.values():
+            stream_task.cancel()
+        await asyncio.gather(*task_by_kind.values(), return_exceptions=True)
+        raise
+    return dict(zip(task_by_kind.keys(), stream_summaries, strict=True))
+
+
 async def _run_v3_streams(
     *,
     sql_by_kind: Mapping[str, str],
@@ -2416,19 +2498,7 @@ async def _run_v3_streams(
     task_by_kind = {
         kind: asyncio.create_task(_stream_kind(kind, sql)) for kind, sql in sql_by_kind.items()
     }
-    try:
-        completed_stream_count = 0
-        for completed_stream in asyncio.as_completed(task_by_kind.values()):
-            stream_summary = await completed_stream
-            completed_stream_count += 1
-            _report_v3_stream_progress(progress_callback, completed_stream_count, stream_summary)
-        stream_summaries = [stream_task.result() for stream_task in task_by_kind.values()]
-    except (Exception, asyncio.CancelledError):
-        for stream_task in task_by_kind.values():
-            stream_task.cancel()
-        await asyncio.gather(*task_by_kind.values(), return_exceptions=True)
-        raise
-    return dict(zip(task_by_kind.keys(), stream_summaries, strict=True))
+    return await _await_v3_stream_tasks(task_by_kind, progress_callback)
 
 
 def _v3_summary_integer(summary: Mapping[str, Any], label: str, *field_names: str) -> int:
