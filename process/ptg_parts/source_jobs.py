@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -371,7 +372,16 @@ def parse_toc_catalog_entries(
                     )
     deduped: dict[tuple[str, str, str], PTG2SourceCatalogEntry] = {}
     for entry in entries:
-        deduped[(entry.source_type, entry.domain, entry.canonical_url)] = entry
+        key = (entry.source_type, entry.domain, entry.canonical_url)
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = entry
+            continue
+        plans_by_identity = {
+            canonical_json_dumps(plan): plan
+            for plan in (*existing.plan_info, *entry.plan_info)
+        }
+        deduped[key] = replace(entry, plan_info=tuple(plans_by_identity.values()))
     return list(deduped.values())
 
 

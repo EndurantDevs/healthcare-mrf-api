@@ -317,6 +317,7 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"]
         == "cigna_static_mrf_lookup"
     )
+    assert "cigna_static_mrf_lookup" in config["source_query_expansion_platforms"]
     assert (
         config["platform_resolvers"]["bcbs_global_solutions_mrf"]["type"]
         == "bcbs_global_solutions_mrf"
@@ -1774,6 +1775,180 @@ def test_query_expansion_target_uses_query_as_company_label():
     assert matched.metadata["plan_info"][0]["plan_name"] == "Example Packaging HSA Choice POS II"
 
 
+def _synthetic_query_source(
+    *,
+    source_id="source_static",
+    platform=None,
+    index_url="https://example.test/machine-readable-files/",
+):
+    return {
+        "source_id": source_id,
+        "payer_id": f"payer_{source_id}",
+        "display_name": "Example Carrier",
+        "index_url": index_url,
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Sample Employer",
+                "query_expansion_source": True,
+            }
+        },
+        **({"hosting_platform": platform} if platform else {}),
+    }
+
+
+def _synthetic_toc_payload(*plan_specs):
+    return {
+        "reporting_entity_name": "Example Carrier",
+        "reporting_entity_type": "Health Insurance Issuer",
+        "version": "1.0.0",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": plan_name,
+                        "plan_id_type": "ein",
+                        "plan_id": plan_id,
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {
+                        "description": f"{plan_id} rates",
+                        "location": file_url,
+                    }
+                ],
+            }
+            for plan_name, plan_id, file_url in plan_specs
+        ],
+    }
+
+
+def _static_lookup_scoped_zip_target(query_source_dict):
+    [target] = discovery._parse_cigna_lookup_targets(
+        {
+            "mrfs": [
+                {
+                    "files": [
+                        {
+                            "file_name": "carrier-table-of-contents.zip",
+                            "url": "https://example.test/download?id=carrier-index",
+                        }
+                    ]
+                }
+            ]
+        },
+        lookup_url=query_source_dict["index_url"],
+        source=query_source_dict,
+        resolver={},
+    )
+    return discovery._toc_level_query_expansion_target(target, "Sample Employer")
+
+
+def _synthetic_scoped_zip_members():
+    return [
+        (
+            "matching-index.json",
+            _synthetic_toc_payload(
+                (
+                    "Sample Employer Choice Plan",
+                    "111111111",
+                    "https://example.test/matching.json.gz",
+                )
+            ),
+        ),
+        (
+            "unrelated-index.json",
+            _synthetic_toc_payload(
+                (
+                    "Unrelated Employer Choice Plan",
+                    "222222222",
+                    "https://example.test/unrelated.json.gz",
+                )
+            ),
+        ),
+    ]
+
+
+def test_query_expansion_toc_plan_fallback_is_resolver_scoped():
+    query_source_dict = _synthetic_query_source()
+    crawl_targets = [
+        discovery.CrawlTarget(
+            source=query_source_dict,
+            url="https://example.test/static-index.json",
+            label="Carrier-wide index",
+            metadata={"resolver": "cigna_static_mrf_lookup"},
+        ),
+        discovery.CrawlTarget(
+            source=query_source_dict,
+            url="https://example.test/generic-index.json",
+            label="Carrier-wide index",
+            metadata={"resolver": "html_mrf_links"},
+        ),
+    ]
+
+    [matched_target] = discovery._filter_query_expansion_targets(
+        crawl_targets, "Sample Employer"
+    )
+
+    assert matched_target.url == "https://example.test/static-index.json"
+    assert matched_target.metadata["query_expansion_match"] is True
+    assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
+    assert matched_target.metadata["company_name"] == "Sample Employer"
+
+
+def test_toc_rows_filter_to_matching_reporting_plans_and_files():
+    query_source_dict = _synthetic_query_source()
+    toc_payload = _synthetic_toc_payload(
+        (
+            "Sample Employer Open Access Plus",
+            "111111111",
+            "https://example.test/matching-rates.json.gz",
+        ),
+        (
+            "Unrelated Employer Open Access Plus",
+            "222222222",
+            "https://example.test/unrelated-rates.json.gz",
+        ),
+    )
+
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        query_source_dict,
+        "https://example.test/carrier-index.json",
+        toc_payload,
+        filter_to_target_query=True,
+    )
+
+    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
+    assert [plan_row["plan_name"] for plan_row in plan_rows] == ["Open Access Plus"]
+    assert [file_row["url"] for file_row in file_rows] == [
+        "https://example.test/matching-rates.json.gz"
+    ]
+    assert file_rows[0]["plan_ids"] == ["111111111"]
+    assert file_rows[0]["metadata_json"]["plan_info"][0]["company_name"] == (
+        "Sample Employer"
+    )
+
+
+def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
+    query_source_dict = _synthetic_query_source()
+    shared_url = "https://example.test/shared-rates.json.gz"
+    toc_payload = _synthetic_toc_payload(
+        ("Sample Employer Choice Plan", "111111111", shared_url),
+        ("Unrelated Employer Choice Plan", "222222222", shared_url),
+    )
+
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        query_source_dict,
+        "https://example.test/carrier-index.json",
+        toc_payload,
+        filter_to_target_query=True,
+    )
+
+    assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
+    assert [file_row["url"] for file_row in file_rows] == [shared_url]
+    assert file_rows[0]["plan_ids"] == ["111111111"]
+
+
 def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
     source = {
         "source_id": "src_aetna",
@@ -2323,6 +2498,45 @@ def test_crawl_source_dedupe_keeps_distinct_healthsparq_metadata_catalogs():
     assert {row["source_id"] for row in deduped} == {
         "src_aetna_self_insured",
         "src_aetna_signature",
+    }
+
+
+def test_crawl_source_dedupe_preserves_base_and_normalized_query_siblings():
+    base_source_dict = {
+        "source_id": "source_base",
+        "source_key": "source_base",
+        "display_name": "Example Carrier",
+        "hosting_platform": "uhc_public_blobs",
+        "source_type": "curated_registry",
+        "seed_provider": "master-list",
+        "status": "active",
+        "index_url": "https://example.test/machine-readable-files/",
+        "metadata_json": {},
+    }
+    queried_source_dict = {
+        **base_source_dict,
+        "source_id": "source_query",
+        "source_key": "source_query",
+        "metadata_json": {
+            "raw": {"target_payer_query": "Sample Employer"},
+        },
+    }
+    duplicate_query_source_dict = {
+        **base_source_dict,
+        "source_id": "source_query_duplicate",
+        "source_key": "source_query_duplicate",
+        "metadata_json": {
+            "raw": {"target_payer_query": "  sample   employer  "},
+        },
+    }
+
+    deduped_source_rows = discovery._dedupe_source_rows_for_crawl(
+        [base_source_dict, queried_source_dict, duplicate_query_source_dict]
+    )
+
+    assert {source_row["source_id"] for source_row in deduped_source_rows} == {
+        "source_base",
+        "source_query",
     }
 
 
@@ -5565,6 +5779,53 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_zipped_toc_plan_scope_filters_crawled_rows(monkeypatch):
+    query_source_dict = _synthetic_query_source()
+    scoped_zip_target = _static_lookup_scoped_zip_target(query_source_dict)
+    assert scoped_zip_target.metadata["target_kind"] == "file_reference"
+    assert scoped_zip_target.metadata["container_format"] == "zip"
+    zip_members = _synthetic_scoped_zip_members()
+    resolver_mock = AsyncMock(return_value=([scoped_zip_target], []))
+    zip_fetch_mock = AsyncMock(return_value=zip_members)
+    batch_push_mock = AsyncMock()
+
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", resolver_mock)
+    monkeypatch.setattr(discovery, "_fetch_zip_json_values", zip_fetch_mock)
+    monkeypatch.setattr(discovery, "_push_crawl_row_batches", batch_push_mock)
+
+    plans_discovered, files_discovered, observations = (
+        await discovery._crawl_toc_metadata(
+            [query_source_dict],
+            test_mode=False,
+            run_id="run_example",
+            max_toc_bytes=2048,
+            concurrency=1,
+        )
+    )
+    pushed_plan_rows = [
+        plan_row
+        for batch_call in batch_push_mock.await_args_list
+        for plan_row in batch_call.args[0]
+    ]
+    pushed_file_rows = [
+        file_row
+        for batch_call in batch_push_mock.await_args_list
+        for file_row in batch_call.args[1]
+    ]
+
+    assert plans_discovered == 1
+    assert files_discovered == 2
+    assert len(observations) == 1
+    assert zip_fetch_mock.await_count == 1
+    assert [plan_row["plan_id"] for plan_row in pushed_plan_rows] == ["111111111"]
+    assert [
+        file_row["url"]
+        for file_row in pushed_file_rows
+        if file_row["file_type"] == "in-network"
+    ] == ["https://example.test/matching.json.gz"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch):
     source = {
         "source_id": "source_1",
@@ -5605,6 +5866,98 @@ async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch
     assert [target.label for target in resolved] == ["Example Employer"]
     assert resolved[0].metadata["query_expansion_match"] is True
     assert resolved[0].metadata["company_name"] == "Example Employer"
+
+
+@pytest.mark.asyncio
+async def test_query_expansion_filters_and_dedupes_with_crawl_target_limit(
+    monkeypatch,
+):
+    query_source_dict = _synthetic_query_source(
+        source_id="source_example",
+        platform="html_mrf_links",
+        index_url="https://example.test/mrf",
+    )
+    generic_crawl_targets = [
+        discovery.CrawlTarget(
+            source=query_source_dict,
+            url=f"https://example.test/generic-{index}.json",
+            label=f"Generic Employer {index}",
+        )
+        for index in range(60)
+    ]
+    first_matching_target = discovery.CrawlTarget(
+        source=query_source_dict,
+        url="https://example.test/sample-employer-a.json",
+        label="Sample Employer Alpha",
+    )
+    resolver_targets = [
+        *generic_crawl_targets,
+        first_matching_target,
+        first_matching_target,
+        discovery.CrawlTarget(
+            source=query_source_dict,
+            url="https://example.test/sample-employer-b.json",
+            label="Sample Employer Beta",
+        ),
+    ]
+    crawl_mock = AsyncMock(return_value=resolver_targets)
+    monkeypatch.setattr(discovery, "_crawl_targets_for_source", crawl_mock)
+
+    resolved_targets, observations = await discovery._resolve_crawl_targets(
+        [query_source_dict],
+        session=object(),
+        run_id="run_example",
+        concurrency=1,
+        crawl_target_limit=2,
+    )
+
+    assert observations == []
+    assert crawl_mock.await_args.kwargs["target_limit"] == 2
+    assert [crawl_target.url for crawl_target in resolved_targets] == [
+        "https://example.test/sample-employer-a.json",
+        "https://example.test/sample-employer-b.json",
+    ]
+    assert all(
+        crawl_target.metadata["query_expansion_match"] is True
+        for crawl_target in resolved_targets
+    )
+
+
+@pytest.mark.asyncio
+async def test_html_mrf_resolver_filters_query_before_target_limit(monkeypatch):
+    query_source = _synthetic_query_source(
+        source_id="source_html",
+        platform="html_mrf_links",
+        index_url="https://example.test/mrf",
+    )
+    unrelated_links = "".join(
+        f'<a href="unrelated-{index}_in-network-rates.json.gz">'
+        f"Unrelated Employer {index}</a>"
+        for index in range(4)
+    )
+    html_text = (
+        unrelated_links
+        + '<a href="sample-employer-a_in-network-rates.json.gz">Sample Employer A</a>'
+        + '<a href="sample-employer-b_in-network-rates.json.gz">Sample Employer B</a>'
+    )
+    monkeypatch.setattr(discovery, "_fetch_text", AsyncMock(return_value=html_text))
+
+    matched_targets = await discovery._resolve_html_mrf_links(
+        query_source,
+        query_source["index_url"],
+        {
+            "type": "html_mrf_links",
+            "max_targets": 2,
+            "follow_directory_links": False,
+            "follow_iframe_links": False,
+        },
+        session=None,
+    )
+
+    assert [matched_target.url for matched_target in matched_targets] == [
+        "https://example.test/sample-employer-a_in-network-rates.json.gz",
+        "https://example.test/sample-employer-b_in-network-rates.json.gz",
+    ]
 
 
 @pytest.mark.asyncio
@@ -7727,6 +8080,62 @@ def test_parse_uhc_blob_listing_extracts_indexes_and_embedded_vision_direct_file
     assert targets[1]["target_file_type"] == "in-network"
     assert targets[1]["container_format"] == "gzip"
     assert targets[1]["label"] == "UHC Vision"
+
+
+@pytest.mark.asyncio
+async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
+    generic_blobs = [
+        {
+            "name": f"2026-07-01_Generic-Employer-{index:03d}_index.json",
+            "downloadUrl": (
+                "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/"
+                f"download/2026-07-01_Generic-Employer-{index:03d}_index.json"
+            ),
+            "size": 1000 + index,
+        }
+        for index in range(60)
+    ]
+    blob_listing_dict = {
+        "blobs": [
+            *generic_blobs,
+            {
+                "name": "2026-07-01_Sample-Employer-LLC_index.json",
+                "downloadUrl": (
+                    "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/"
+                    "download/2026-07-01_Sample-Employer-LLC_index.json"
+                ),
+                "size": 12345,
+            },
+        ]
+    }
+
+    async def fake_fetch_json(url, *, max_bytes, session):
+        assert url == "https://transparency-in-coverage.uhc.com/api/v1/uhc/blobs/"
+        assert max_bytes == 67108864
+        assert session == "session"
+        return blob_listing_dict
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    query_source_dict = _synthetic_query_source(
+        source_id="source_uhc_example",
+        platform="uhc_public_blobs",
+        index_url="https://transparency-in-coverage.uhc.com/",
+    )
+
+    crawl_targets = await discovery._crawl_targets_for_source(
+        query_source_dict,
+        "https://transparency-in-coverage.uhc.com/",
+        session="session",
+        target_limit=50,
+    )
+
+    assert len(crawl_targets) == 1
+    assert crawl_targets[0].label == "Sample Employer Llc"
+    assert (
+        crawl_targets[0].metadata["blob_name"]
+        == "2026-07-01_Sample-Employer-LLC_index.json"
+    )
 
 
 def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
