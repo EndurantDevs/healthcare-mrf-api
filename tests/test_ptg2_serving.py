@@ -43,7 +43,11 @@ class FakeSession:
         self.rollback_count = 0
 
     async def execute(self, *_args, **_kwargs):
-        if _args and str(_args[0]).strip().lower() == "set local jit = off":
+        statement_sql = str(_args[0]).strip().lower() if _args else ""
+        if statement_sql == "set local jit = off":
+            return FakeResult()
+        if statement_sql == "set local plan_cache_mode = force_custom_plan":
+            self.calls.append((_args, _kwargs))
             return FakeResult()
         self.calls.append((_args, _kwargs))
         value = self._results.pop(0) if self._results else None
@@ -1709,6 +1713,75 @@ async def test_membership_graph_exhaustion_grows_probe_logarithmically(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_membership_graph_grows_until_taxonomy_has_enough_rate_matches(monkeypatch):
+    matching_group_id = "00000000000000000000000000000021"
+    first_location = _sample_graph_location(1234567890)
+    rejected_location = _sample_graph_location(1234567891)
+    second_location = _sample_graph_location(1234567892)
+    location_reader = AsyncMock(
+        side_effect=[
+            [first_location, rejected_location],
+            [first_location, rejected_location, second_location],
+        ]
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, _sidecar_name, owner_ids, **_kwargs):
+        return {owner_id: (matching_group_id,) for owner_id in owner_ids}
+
+    taxonomy_filter = AsyncMock(
+        side_effect=[
+            (1234567890,),
+            (1234567890, 1234567892),
+        ]
+    )
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", location_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_filter_npis_by_provider_taxonomy",
+        taxonomy_filter,
+    )
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        {"lat": "42.3", "long": "-85.2", "taxonomy_codes": ["207Q00000X"]},
+        ptg2_serving._ptg2_build_rate_scope((matching_group_id,)),
+        2,
+    )
+
+    assert [location["npi"] for location in candidates.location_rows] == [1234567890, 1234567892]
+    assert candidates.taxonomy_filtered is True
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128]
+    assert taxonomy_filter.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_filtered_graph_candidates_are_not_filtered_twice(monkeypatch):
+    candidates = ptg2_serving._GraphLocationCandidates(
+        [_sample_graph_location(1234567890)],
+        {1234567890: {"00000000000000000000000000000021"}},
+        taxonomy_filtered=True,
+    )
+    taxonomy_filter = AsyncMock(side_effect=AssertionError("taxonomy filter repeated"))
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_filter_npis_by_provider_taxonomy",
+        taxonomy_filter,
+    )
+
+    result = await ptg2_serving._taxonomy_filtered_candidates(
+        object(),
+        {"taxonomy_codes": ["207Q00000X"]},
+        candidates,
+        1,
+    )
+
+    assert result is candidates
+    taxonomy_filter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_membership_location_query_keeps_site_addresses(monkeypatch):
     tables = ptg2_serving.PTG2ServingTables(provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test")
     monkeypatch.setattr(
@@ -1758,8 +1831,9 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
     )
 
     assert location_rows == []
-    location_statement_sql = str(session.calls[0][0][0])
-    parameter_map = session.calls[0][0][1]
+    assert str(session.calls[0][0][0]) == "SET LOCAL plan_cache_mode = force_custom_plan"
+    location_statement_sql = str(session.calls[1][0][0])
+    parameter_map = session.calls[1][0][1]
     assert "nearest_addresses AS MATERIALIZED" in location_statement_sql
     assert "entity_address_unified_idx_geo_idx" not in location_statement_sql
     assert "Geography(ST_MakePoint((addr.long)::double precision" in location_statement_sql
@@ -1768,7 +1842,39 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
     assert "addr.type IN ('primary', 'secondary', 'practice', 'site')" in location_statement_sql
     assert "addr.type = ANY" not in location_statement_sql
     assert "ROW_NUMBER() OVER" in location_statement_sql
-    assert parameter_map["probe_limit"] == 200
+    assert parameter_map["probe_limit"] == 164
+
+
+@pytest.mark.asyncio
+async def test_membership_location_knn_defers_taxonomy_until_after_indexed_probe(monkeypatch):
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test"
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    location_query = await ptg2_serving._membership_location_query(
+        object(),
+        tables,
+        {
+            "lat": "42.3",
+            "long": "-85.2",
+            "radius_miles": "10",
+            "taxonomy_codes": ["207Q00000X"],
+            "primary_only": True,
+        },
+        candidate_npis=None,
+        limit=200,
+    )
+
+    assert location_query.knn_order_sql is not None
+    assert "membership_location_specialty" not in location_query.filter_sql
+    assert "membership_location_inferred_taxonomy" not in location_query.filter_sql
+    assert "npi_taxonomy" not in location_query.filter_sql
+    assert not any("taxonomy" in parameter_name for parameter_name in location_query.parameter_map)
 
 
 @pytest.mark.asyncio

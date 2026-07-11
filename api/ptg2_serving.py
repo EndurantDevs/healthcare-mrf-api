@@ -6509,6 +6509,7 @@ def _membership_filter_sql(
     address_zip5_sql: str,
     parameter_map: dict[str, Any],
     literal_service_address_types: bool = False,
+    include_taxonomy_filters: bool = True,
 ) -> tuple[str, str] | None:
     """Build address filters while preserving ZIP-or-radius semantics."""
     address_type_filter = (
@@ -6522,7 +6523,8 @@ def _membership_filter_sql(
             return None
         filter_clauses.append("addr.npi = ANY(CAST(:candidate_npis AS bigint[]))")
         parameter_map["candidate_npis"] = list(candidate_npis)
-    filter_clauses.extend(_membership_taxonomy_filters(args, parameter_map))
+    if include_taxonomy_filters:
+        filter_clauses.extend(_membership_taxonomy_filters(args, parameter_map))
     state_code = str(args.get("state") or "").strip().upper()
     city_name = str(args.get("city") or "").strip().upper()
     zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))
@@ -6620,6 +6622,7 @@ async def _membership_location_query(
         address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
         parameter_map=parameter_map,
         literal_service_address_types=knn_order_sql is not None,
+        include_taxonomy_filters=knn_order_sql is None,
     )
     if filter_sql_parts is None:
         return None
@@ -6658,7 +6661,9 @@ async def _membership_location_rows(
         return None
     location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
     if query_context.knn_order_sql is not None and offset == 0:
-        query_context.parameter_map["probe_limit"] = max(int(limit) * 2, 64)
+        await session.execute(text("SET LOCAL plan_cache_mode = force_custom_plan"))
+        requested_limit = max(int(limit), 1)
+        query_context.parameter_map["probe_limit"] = requested_limit + max(requested_limit // 2, 64)
         location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
             location_hash_sql=location_hash_sql,
             distance_sql=query_context.distance_sql,
@@ -6684,6 +6689,46 @@ async def _membership_location_rows(
 class _GraphLocationCandidates:
     location_rows: list[dict[str, Any]]
     group_ids_by_npi: dict[int, set[str]]
+    taxonomy_filtered: bool = False
+
+
+async def _append_rate_matched_locations(
+    session,
+    serving_tables: PTG2ServingTables,
+    rate_scope: _ManifestRateScope,
+    candidate_location_rows: list[dict[str, Any]],
+    matched_location_rows: list[dict[str, Any]],
+    group_ids_by_npi: dict[int, set[str]],
+    seen_candidate_npis: set[int],
+) -> int:
+    """Append newly encountered locations whose provider groups carry the rate."""
+    new_location_rows = [
+        location
+        for location in candidate_location_rows
+        if int(location["npi"]) not in seen_candidate_npis
+    ]
+    if not new_location_rows:
+        return 0
+    prior_match_count = len(matched_location_rows)
+    seen_candidate_npis.update(int(location["npi"]) for location in new_location_rows)
+    owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in new_location_rows)
+    group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+        session,
+        serving_tables,
+        "provider_npi_group",
+        owner_ids,
+    )
+    for location_data, owner_id in zip(new_location_rows, owner_ids):
+        npi = int(location_data["npi"])
+        matching_group_ids = {
+            group_id
+            for group_id in group_ids_by_owner.get(owner_id, ())
+            if _has_rate_scope_group(rate_scope, group_id)
+        }
+        if matching_group_ids:
+            group_ids_by_npi[npi].update(matching_group_ids)
+            matched_location_rows.append(location_data)
+    return len(matched_location_rows) - prior_match_count
 
 
 async def _direct_group_ids_by_npi(
@@ -6717,13 +6762,15 @@ async def _paged_graph_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
-    batch_size = min(max(candidate_limit * 2, 64), 1000)
+    batch_size = min(max((candidate_limit * 3 + 1) // 2, 64), 1000)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
     probe_limit = min(batch_size, max_candidates)
     matched_location_rows: list[dict[str, Any]] = []
     group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
     seen_candidate_npis: set[int] = set()
-    while probe_limit <= max_candidates and len(matched_location_rows) < candidate_limit:
+    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
+    filtered_candidates: _GraphLocationCandidates | None = None
+    while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
             session,
             serving_tables,
@@ -6736,34 +6783,37 @@ async def _paged_graph_candidates(
             return None
         if not candidate_location_rows:
             break
-        new_location_rows = [
-            location
-            for location in candidate_location_rows
-            if int(location["npi"]) not in seen_candidate_npis
-        ]
-        if new_location_rows:
-            seen_candidate_npis.update(int(location["npi"]) for location in new_location_rows)
-            owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in new_location_rows)
-            group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
-                session,
-                serving_tables,
-                "provider_npi_group",
-                owner_ids,
+        appended_location_count = await _append_rate_matched_locations(
+            session,
+            serving_tables,
+            rate_scope,
+            candidate_location_rows,
+            matched_location_rows,
+            group_ids_by_npi,
+            seen_candidate_npis,
+        )
+        if appended_location_count:
+            current_candidates = _GraphLocationCandidates(
+                matched_location_rows,
+                dict(group_ids_by_npi),
             )
-            for location_data, owner_id in zip(new_location_rows, owner_ids):
-                npi = int(location_data["npi"])
-                matching_group_ids = {
-                    group_id
-                    for group_id in group_ids_by_owner.get(owner_id, ())
-                    if _has_rate_scope_group(rate_scope, group_id)
-                }
-                if matching_group_ids:
-                    group_ids_by_npi[npi].update(matching_group_ids)
-                    matched_location_rows.append(location_data)
+            if taxonomy_filter_requested:
+                filtered_candidates = await _taxonomy_filtered_candidates(
+                    session,
+                    args,
+                    current_candidates,
+                    candidate_limit,
+                )
+                if len(filtered_candidates.location_rows) >= candidate_limit:
+                    return filtered_candidates
+            elif len(matched_location_rows) >= candidate_limit:
+                break
         if probe_limit >= max_candidates:
             break
         probe_limit = min(max(probe_limit * 2, probe_limit + batch_size), max_candidates)
-    return _GraphLocationCandidates(matched_location_rows, group_ids_by_npi)
+    if taxonomy_filter_requested:
+        return filtered_candidates or _GraphLocationCandidates([], {}, taxonomy_filtered=True)
+    return _GraphLocationCandidates(matched_location_rows, dict(group_ids_by_npi))
 
 
 async def _graph_location_candidates(
@@ -6796,8 +6846,10 @@ async def _taxonomy_filtered_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates:
     """Apply provider taxonomy filters after graph membership resolution."""
-    if not candidates.location_rows:
+    if candidates.taxonomy_filtered:
         return candidates
+    if not candidates.location_rows:
+        return _GraphLocationCandidates([], {}, taxonomy_filtered=True)
     matching_npis = set(
         await _ptg2_manifest_filter_npis_by_provider_taxonomy(
             session,
@@ -6815,7 +6867,11 @@ async def _taxonomy_filtered_candidates(
         int(location["npi"]): candidates.group_ids_by_npi.get(int(location["npi"]), set())
         for location in filtered_location_rows
     }
-    return _GraphLocationCandidates(filtered_location_rows, filtered_groups_by_npi)
+    return _GraphLocationCandidates(
+        filtered_location_rows,
+        filtered_groups_by_npi,
+        taxonomy_filtered=True,
+    )
 
 
 def _graph_provider_data(
