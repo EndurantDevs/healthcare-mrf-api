@@ -1444,9 +1444,45 @@ async def test_provider_directory_coverage_audit_unified_summary_fast_probe(monk
     assert summary["provider_directory_keyed_rows"] == 1
     assert summary["provider_directory_source_record_id_rows"] == 1
     assert summary["provider_directory_source_record_id_pct"] == 100.0
+    assert "WITH sampled_rows AS MATERIALIZED" in conn.fetchrow_sql
+    assert f"LIMIT {audit.FAST_UNIFIED_SAMPLE_LIMIT}" in conn.fetchrow_sql
+    assert "FROM provider_directory_rows" in conn.fetchrow_sql
     assert "EXISTS (" in conn.fetchrow_sql
     assert "LIMIT 1" in conn.fetchrow_sql
     assert "count(*)" not in conn.fetchrow_sql.lower()
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_overlay_fast_probe_is_bounded(monkeypatch):
+    async def is_relation_present(_conn, _schema, table):
+        return table == "provider_directory_address_overlay"
+
+    class FakeConn:
+        def __init__(self):
+            self.fetchrow_sql = ""
+
+        async def fetchrow(self, sql, *_args):
+            self.fetchrow_sql = sql
+            return {
+                "has_provider_directory_rows": True,
+                "has_provider_directory_keyed_rows": True,
+                "has_provider_directory_phone_rows": True,
+                "has_provider_directory_null_key_rows": False,
+                "has_provider_directory_source_record_id_rows": True,
+                "has_provider_directory_country_001_rows": False,
+                "has_provider_directory_country_us_rows": True,
+            }
+
+    conn = FakeConn()
+    monkeypatch.setattr(audit, "_relation_exists", is_relation_present)
+
+    summary = await audit._unified_summary(conn, "mrf", fast_probe=True)
+
+    assert summary["summary_source"] == "provider_directory_address_overlay_fast_probe"
+    assert "WITH sampled_rows AS MATERIALIZED" in conn.fetchrow_sql
+    assert f"LIMIT {audit.FAST_UNIFIED_SAMPLE_LIMIT}" in conn.fetchrow_sql
+    assert "FROM sampled_rows" in conn.fetchrow_sql
+    assert 'FROM "mrf"."provider_directory_address_overlay"' in conn.fetchrow_sql
 
 
 def _serving_ready_report() -> dict:
@@ -2981,6 +3017,57 @@ async def test_provider_directory_coverage_audit_selected_pod_safe_report_stays_
     assert "semantic audit selection: `1` source(s)" in markdown
     assert "selected manifest entries: `idaho`" in markdown
     assert "broad source/resource aggregates: were skipped" in markdown
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_coverage_audit_fast_readiness_skips_exact_unified_rollup(
+    monkeypatch,
+):
+    """Fast mode keeps the maintained semantic probes but skips full unified scans."""
+    args = audit.parse_args(["--fast-serving-readiness"])
+    for option_name in (
+        "skip_ptg", "skip_network_resolution", "skip_practitioner_role_reimport_gap_summary",
+        "skip_top_source_yield", "skip_advertised_resource_gaps", "skip_valid_zero_row_sources",
+        "skip_canonical_resource_summary",
+    ):
+        setattr(args, option_name, True)
+    source_resource_coverage = AsyncMock(
+        return_value={"available": True, "source_count": 1, "sources_with_resource_rows": 1}
+    )
+    semantic_readiness = AsyncMock(return_value={"available": True, "samples": []})
+    unified_summary = AsyncMock(
+        return_value={
+            "available": True,
+            "counts_are_lower_bounds": True,
+            "provider_directory_rows": 1,
+            "provider_directory_keyed_rows": 1,
+            "provider_directory_phone_rows": 1,
+            "provider_directory_source_record_id_rows": 1,
+        }
+    )
+    conn = AsyncMock()
+    mock_by_name = {
+        "_connect": AsyncMock(return_value=conn),
+        "_source_summary": AsyncMock(return_value={"available": False}),
+        "_credential_onboarding_backlog": AsyncMock(return_value={"available": False}),
+        "_probe_timeout_summary": AsyncMock(return_value={"available": False}),
+        "_capability_status_counts": AsyncMock(return_value=[]),
+        "_resource_summary": AsyncMock(return_value={}),
+        "_source_resource_coverage_summary": source_resource_coverage,
+        "_bounded_source_semantic_readiness_summary": semantic_readiness,
+        "_unified_summary": unified_summary,
+        "_source_catalog_retest_coverage_from_path": AsyncMock(return_value={"available": False}),
+    }
+    for name, mocked_section in mock_by_name.items():
+        monkeypatch.setattr(audit, name, mocked_section)
+
+    await audit.build_report(args)
+
+    assert source_resource_coverage.call_args.kwargs["include_unified"] is False
+    assert unified_summary.call_args.kwargs["fast_probe"] is True
+    assert semantic_readiness.call_args.kwargs["include_unified"] is True
+    assert len(semantic_readiness.call_args.kwargs["maintained_source_ids"]) == 28
+    conn.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
