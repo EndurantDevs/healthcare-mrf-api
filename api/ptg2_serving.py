@@ -6637,6 +6637,43 @@ async def _membership_location_query(
     )
 
 
+async def _enable_serial_knn_planning(session) -> tuple[str, str]:
+    """Apply request-local KNN planner settings and return their prior values."""
+    settings_result = await session.execute(
+        text(
+            """
+            WITH previous_settings AS MATERIALIZED (
+                SELECT current_setting('plan_cache_mode') AS plan_cache_mode,
+                       current_setting('max_parallel_workers_per_gather') AS parallel_workers
+            )
+            SELECT previous_settings.plan_cache_mode,
+                   previous_settings.parallel_workers,
+                   set_config('plan_cache_mode', 'force_custom_plan', true),
+                   set_config('max_parallel_workers_per_gather', '0', true)
+              FROM previous_settings
+            """
+        )
+    )
+    settings_row = _row_mapping(settings_result.first())
+    return str(settings_row["plan_cache_mode"]), str(settings_row["parallel_workers"])
+
+
+async def _restore_knn_planning(session, prior_settings: tuple[str, str]) -> None:
+    """Restore planner settings after the bounded KNN statement finishes."""
+    await session.execute(
+        text(
+            """
+            SELECT set_config('plan_cache_mode', :plan_cache_mode, true),
+                   set_config('max_parallel_workers_per_gather', :parallel_workers, true)
+            """
+        ),
+        {
+            "plan_cache_mode": prior_settings[0],
+            "parallel_workers": prior_settings[1],
+        },
+    )
+
+
 async def _membership_location_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -6661,8 +6698,6 @@ async def _membership_location_rows(
         return None
     location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
     if query_context.knn_order_sql is not None and offset == 0:
-        await session.execute(text("SET LOCAL plan_cache_mode = force_custom_plan"))
-        await session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
         requested_limit = max(int(limit), 1)
         query_context.parameter_map["probe_limit"] = requested_limit + max(requested_limit // 2, 64)
         location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
@@ -6682,8 +6717,15 @@ async def _membership_location_rows(
             filter_sql=query_context.filter_sql,
         )
     location_statement = text(location_sql)
-    query_result = await session.execute(location_statement, query_context.parameter_map)
-    return [_row_mapping(query_row) for query_row in query_result]
+    prior_planner_settings = None
+    if query_context.knn_order_sql is not None and offset == 0:
+        prior_planner_settings = await _enable_serial_knn_planning(session)
+    try:
+        query_result = await session.execute(location_statement, query_context.parameter_map)
+        return [_row_mapping(query_row) for query_row in query_result]
+    finally:
+        if prior_planner_settings is not None:
+            await _restore_knn_planning(session, prior_planner_settings)
 
 
 @dataclass

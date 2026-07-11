@@ -32,6 +32,9 @@ class FakeResult:
     def scalar(self):
         return self._scalar
 
+    def first(self):
+        return self._rows[0] if self._rows else None
+
     def __iter__(self):
         return iter(self._rows)
 
@@ -46,10 +49,17 @@ class FakeSession:
         statement_sql = str(_args[0]).strip().lower() if _args else ""
         if statement_sql == "set local jit = off":
             return FakeResult()
-        if statement_sql == "set local plan_cache_mode = force_custom_plan":
+        if "set_config('plan_cache_mode', 'force_custom_plan', true)" in statement_sql:
             self.calls.append((_args, _kwargs))
-            return FakeResult()
-        if statement_sql == "set local max_parallel_workers_per_gather = 0":
+            return FakeResult(
+                rows=[
+                    {
+                        "plan_cache_mode": "auto",
+                        "parallel_workers": "2",
+                    }
+                ]
+            )
+        if "set_config('plan_cache_mode', :plan_cache_mode, true)" in statement_sql:
             self.calls.append((_args, _kwargs))
             return FakeResult()
         self.calls.append((_args, _kwargs))
@@ -1731,6 +1741,37 @@ def test_membership_graph_uses_wider_first_probe_for_taxonomy_selectivity():
 
 
 @pytest.mark.asyncio
+async def test_membership_graph_uses_taxonomy_selectivity_window_on_first_probe(monkeypatch):
+    matching_group_id = "00000000000000000000000000000021"
+    location_rows = [_sample_graph_location(1234567000 + index) for index in range(100)]
+    location_reader = AsyncMock(return_value=location_rows)
+
+    async def fake_sidecar_members_many(_session, _tables, _sidecar_name, owner_ids, **_kwargs):
+        return {owner_id: (matching_group_id,) for owner_id in owner_ids}
+
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", location_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_filter_npis_by_provider_taxonomy",
+        AsyncMock(return_value=tuple(location["npi"] for location in location_rows)),
+    )
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        {"lat": "42.3", "long": "-85.2", "taxonomy_codes": ["207Q00000X"]},
+        ptg2_serving._ptg2_build_rate_scope((matching_group_id,)),
+        100,
+    )
+
+    assert len(candidates.location_rows) == 100
+    assert candidates.taxonomy_filtered is True
+    assert location_reader.await_args.kwargs["limit"] == 1600
+    assert location_reader.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_membership_graph_grows_until_taxonomy_has_enough_rate_matches(monkeypatch):
     matching_group_id = "00000000000000000000000000000021"
     first_location = _sample_graph_location(1234567890)
@@ -1849,10 +1890,15 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
     )
 
     assert location_rows == []
-    assert str(session.calls[0][0][0]) == "SET LOCAL plan_cache_mode = force_custom_plan"
-    assert str(session.calls[1][0][0]) == "SET LOCAL max_parallel_workers_per_gather = 0"
-    location_statement_sql = str(session.calls[2][0][0])
-    parameter_map = session.calls[2][0][1]
+    planner_setup_sql = str(session.calls[0][0][0])
+    location_statement_sql = str(session.calls[1][0][0])
+    parameter_map = session.calls[1][0][1]
+    planner_restore_sql = str(session.calls[2][0][0])
+    restore_parameter_map = session.calls[2][0][1]
+    assert "set_config('plan_cache_mode', 'force_custom_plan', true)" in planner_setup_sql
+    assert "set_config('max_parallel_workers_per_gather', '0', true)" in planner_setup_sql
+    assert "set_config('plan_cache_mode', :plan_cache_mode, true)" in planner_restore_sql
+    assert restore_parameter_map == {"plan_cache_mode": "auto", "parallel_workers": "2"}
     assert "nearest_addresses AS MATERIALIZED" in location_statement_sql
     assert "entity_address_unified_idx_geo_idx" not in location_statement_sql
     assert "Geography(ST_MakePoint((addr.long)::double precision" in location_statement_sql
@@ -1862,6 +1908,31 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
     assert "addr.type = ANY" not in location_statement_sql
     assert "ROW_NUMBER() OVER" in location_statement_sql
     assert parameter_map["probe_limit"] == 164
+
+
+@pytest.mark.asyncio
+async def test_membership_location_rows_restores_planner_settings_after_query_failure(monkeypatch):
+    session = FakeSession([RuntimeError("location query failed")])
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test"
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    with pytest.raises(RuntimeError, match="location query failed"):
+        await ptg2_serving._membership_location_rows(
+            session,
+            tables,
+            {"lat": "42.3", "long": "-85.2", "radius_miles": "10"},
+            candidate_npis=None,
+            limit=100,
+        )
+
+    assert len(session.calls) == 3
+    assert "set_config('plan_cache_mode', :plan_cache_mode, true)" in str(session.calls[-1][0][0])
 
 
 @pytest.mark.asyncio
