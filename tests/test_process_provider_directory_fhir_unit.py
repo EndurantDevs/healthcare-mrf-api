@@ -4123,7 +4123,18 @@ def test_molina_quota_response_is_deferred_without_reclassifying_generic_403():
         (403, quota_payload_dict, None, 7),
     )
 
-    assert importer._classify_http(403, None, quota_payload_dict) == "quota_exhausted"
+    assert importer._classify_http(
+        403,
+        None,
+        quota_payload_dict,
+        provider_directory_source=source_lookup,
+    ) == "quota_exhausted"
+    assert importer._classify_http(
+        403,
+        None,
+        quota_payload_dict,
+        provider_directory_source={"api_base": "https://payer.example/fhir"},
+    ) == "auth_required"
     assert importer._classify_http(403, None, {"message": "Forbidden"}) == (
         "auth_required"
     )
@@ -4163,6 +4174,32 @@ def test_molina_quota_selects_later_uncapped_reset():
         max_delay_seconds=None,
         now_utc=current_time,
     ) == 18000.0
+
+
+def test_molina_quota_retry_rejects_non_finite_delay_and_rounds_up():
+    current_time = datetime.datetime(2026, 7, 11, 19, 0, tzinfo=datetime.UTC)
+    source_lookup = {
+        "source_id": "molina",
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+
+    assert importer._source_retry_after_seconds(
+        {importer.SOURCE_RETRY_AFTER_FIELD: "inf"},
+        max_delay_seconds=None,
+    ) is None
+    assert importer._source_retry_after_seconds(
+        {importer.SOURCE_RETRY_AFTER_FIELD: "nan"},
+        max_delay_seconds=None,
+    ) is None
+    assert importer._molina_quota_retry_not_before(
+        source_lookup,
+        403,
+        {
+            "message": "Out of call volume quota.",
+            importer.SOURCE_RETRY_AFTER_FIELD: "10.1",
+        },
+        now_utc=current_time,
+    ) == "2026-07-11T19:01:11Z"
 
 
 def test_resource_diagnostic_preserves_quota_retry_timestamp():

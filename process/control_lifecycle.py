@@ -109,7 +109,7 @@ async def control_single_job_start(
             status="failed",
             phase_detail=f"{target_function} failed",
             progress_message="failed",
-            error={"code": "import_failed", "message": str(exc)},
+            error={"code": "import_failed", "message": str(exc)}, metrics=_terminal_metrics_from_context(ctx.get("context")),
         )
         await _flush_terminal_status_events()
         raise
@@ -315,7 +315,7 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "published_elapsed_seconds",
         "publish_validation",
         "phase_timings",
-        "skipped_stage_indexes",
+        "audit", "skipped_stage_indexes",
     )
     metrics = {key: context[key] for key in keys if key in context}
     staged_rows = metrics.get("staged_rows")

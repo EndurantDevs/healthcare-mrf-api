@@ -9611,7 +9611,7 @@ def _is_molina_quota_response(
     )
 
 
-def _classify_http(status_code: int | None, error: str | None, payload: dict[str, Any] | None) -> str:
+def _classify_http(status_code: int | None, error: str | None, payload: dict[str, Any] | None, provider_directory_source: dict[str, Any] | None = None) -> str:
     if error:
         lower = error.lower()
         if "timeout" in lower or "timed out" in lower:
@@ -9625,7 +9625,7 @@ def _classify_http(status_code: int | None, error: str | None, payload: dict[str
         if payload and payload.get("resourceType") == "CapabilityStatement":
             return "valid"
         return "valid_non_fhir"
-    if status_code == 403 and _is_call_volume_quota_payload(payload):
+    if provider_directory_source and _is_molina_quota_response(provider_directory_source, status_code, payload):
         return "quota_exhausted"
     if status_code in {401, 403}:
         return "auth_required"
@@ -9962,7 +9962,7 @@ def _source_retry_after_seconds(
         numeric_delay = float(retry_after)
     except ValueError:
         numeric_delay = None
-    if numeric_delay is not None:
+    if numeric_delay is not None and math.isfinite(numeric_delay):
         delay_seconds = max(0.0, numeric_delay)
         return (
             min(max_delay_seconds, delay_seconds)
@@ -10016,7 +10016,7 @@ def _molina_quota_retry_not_before(
         return None
     current_time = now_utc or datetime.datetime.now(datetime.UTC)
     retry_at = current_time + datetime.timedelta(
-        seconds=max(valid_delays) + MOLINA_QUOTA_RESET_GRACE_SECONDS
+        seconds=math.ceil(max(valid_delays) + MOLINA_QUOTA_RESET_GRACE_SECONDS)
     )
     return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -10299,15 +10299,15 @@ def _targeted_required_resource_probe(
 
 
 def _resource_access_probe_result(
-    resource_url: str,
+    provider_directory_source: dict[str, Any], resource_url: str,
     resource_type: str,
     status_code: int | None,
     resource_payload: dict[str, Any] | None,
     fetch_error: str | None,
     elapsed_ms: int,
 ) -> dict[str, Any]:
-    is_quota_exhausted = (
-        status_code == 403 and _is_call_volume_quota_payload(resource_payload)
+    is_quota_exhausted = _is_molina_quota_response(
+        provider_directory_source, status_code, resource_payload
     )
     is_access_denied = status_code in {401, 403} or _is_access_denied_outcome(
         resource_payload
@@ -10393,7 +10393,7 @@ async def _probe_resource_access(
         timeout=timeout,
     )
     return _resource_access_probe_result(
-        resource_url,
+        resource_probe_source_map, resource_url,
         resource_type,
         status_code,
         resource_payload,
@@ -10415,7 +10415,7 @@ async def _probe_metadata_candidate(
         metadata_url,
         timeout=timeout,
     )
-    status = _classify_http(status_code, error, capability_payload)
+    status = _classify_http(status_code, error, capability_payload, source_record)
     credential = _credential_request_options_for_source(source_record, metadata_url)
     is_credential_missing = not credential["descriptor"] and not _alohr_source_uses_graphql_connector(
         source_record
