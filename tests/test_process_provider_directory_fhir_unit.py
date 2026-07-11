@@ -4108,6 +4108,88 @@ async def test_source_fetch_honors_retry_after_for_429(monkeypatch):
     sleep_mock.assert_awaited_once_with(3.0)
 
 
+def test_molina_quota_response_is_deferred_without_reclassifying_generic_403():
+    quota_payload_dict = {
+        "statusCode": 403,
+        "message": "Out of call volume quota. Quota will be replenished in 04:56:59.",
+    }
+    source_lookup = {
+        "source_id": "molina",
+        "api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+    }
+    fetch_result = importer._source_fetch_result_with_payload_error(
+        source_lookup,
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Location?_count=100",
+        (403, quota_payload_dict, None, 7),
+    )
+
+    assert importer._classify_http(403, None, quota_payload_dict) == "quota_exhausted"
+    assert importer._classify_http(403, None, {"message": "Forbidden"}) == (
+        "auth_required"
+    )
+    assert fetch_result == (
+        403,
+        quota_payload_dict,
+        importer.SOURCE_QUOTA_EXHAUSTED_ERROR,
+        7,
+    )
+    assert importer._is_transient_source_fetch_failure(
+        fetch_result[0],
+        fetch_result[2],
+    ) is False
+
+
+def test_molina_quota_selects_later_uncapped_reset():
+    current_time = datetime.datetime(2026, 7, 11, 19, 0, tzinfo=datetime.UTC)
+    quota_payload_dict = {
+        "message": "Out of call volume quota. Quota will be replenished in 04:56:59.",
+        importer.SOURCE_RETRY_AFTER_FIELD: "18000",
+    }
+
+    retry_not_before = importer._molina_quota_retry_not_before(
+        {
+            "source_id": "molina",
+            "canonical_api_base": importer.MOLINA_PROVIDER_DIRECTORY_BASE,
+        },
+        403,
+        quota_payload_dict,
+        now_utc=current_time,
+    )
+
+    assert retry_not_before == "2026-07-12T00:01:00Z"
+    assert importer._source_retry_after_seconds(quota_payload_dict) == 600.0
+    assert importer._source_retry_after_seconds(
+        quota_payload_dict,
+        max_delay_seconds=None,
+        now_utc=current_time,
+    ) == 18000.0
+
+
+def test_resource_diagnostic_preserves_quota_retry_timestamp():
+    retry_not_before = "2026-07-12T00:01:00Z"
+    fetch_result = importer.ResourceFetchResult(
+        model=ProviderDirectoryLocation,
+        rows=[],
+        rows_fetched=497700,
+        rows_written=0,
+        pages_fetched=4977,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=True,
+        error=importer.SOURCE_QUOTA_EXHAUSTED_ERROR,
+        retry_not_before=retry_not_before,
+    )
+
+    diagnostic_dict = importer._resource_fetch_diagnostic(
+        fetch_result,
+        rows_written=0,
+    )
+
+    assert diagnostic_dict["retry_not_before"] == retry_not_before
+
+
 @pytest.mark.asyncio
 async def test_source_fetch_does_not_retry_deterministic_http_error(monkeypatch):
     calls: list[str] = []
@@ -7653,6 +7735,56 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
     import_resources.assert_awaited_once()
     assert import_resources.await_args.args[0][0]["source_id"] == requested_source_id
     assert import_resources.await_args.kwargs["require_complete_resources"] is True
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retry_surfaces_quota_deadline_before_resume_failure(
+    monkeypatch,
+):
+    requested_source_id = "pdfhir_checkpointed"
+    _stub_checkpoint_retry_process(monkeypatch, requested_source_id)
+    retry_not_before = "2026-07-12T00:01:00Z"
+
+    async def fake_import_resources(
+        _sources,
+        *,
+        pagination_resume_required,
+        resource_retry_not_before,
+        **_kwargs,
+    ):
+        pagination_resume_required.add(f"{requested_source_id}:Location")
+        resource_retry_not_before["Location"] = retry_not_before
+        return {"Location": 0}
+
+    monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
+    process_context_map = {"context": {}}
+
+    with pytest.raises(RuntimeError, match=importer.PAGINATION_RESUME_REQUIRED_ERROR):
+        await importer.process_data(
+            process_context_map,
+            {
+                "run_id": "run_retry",
+                "retry_of_run_id": "run_parent",
+                "provider_directory_pagination_root_run_id": "run_root",
+                "seed_db_path": "fixture.db",
+                "source_ids": [requested_source_id],
+                "probe": True,
+                "import_resources": True,
+                "resources": "Location",
+                "full_refresh": True,
+                "resource_limit": 0,
+                "page_limit": 0,
+                "stream_batch_size": 5000,
+                "stale_cleanup": False,
+                "publish_artifacts": False,
+            },
+        )
+
+    audit_dict = process_context_map["context"]["audit"]
+    assert audit_dict[importer.SOURCE_RETRY_NOT_BEFORE_METRIC] == retry_not_before
+    assert audit_dict["provider_directory_retry_not_before_by_resource"] == {
+        "Location": retry_not_before
+    }
 
 
 @pytest.mark.asyncio

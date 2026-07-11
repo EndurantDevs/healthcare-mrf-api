@@ -658,6 +658,13 @@ SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
     HAP_PROVIDER_DIRECTORY_BASE: 20.0,
 }
 SOURCE_RETRY_AFTER_FIELD = "_healthporta_retry_after"
+SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
+SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
+MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
+MOLINA_QUOTA_DURATION_PATTERN = re.compile(
+    r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
+    re.IGNORECASE,
+)
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
 )
@@ -763,6 +770,7 @@ class ResourceFetchResult:
     error: str | None = None
     fetch_mode: str = "paged"
     deadline_reached: bool = False
+    retry_not_before: str | None = None
 
     @property
     def bounded(self) -> bool:
@@ -9560,6 +9568,49 @@ def _ssl_context() -> ssl.SSLContext:
     return context
 
 
+def _source_error_payload_text(payload: dict[str, Any] | None) -> str:
+    """Return normalized status text without retaining an upstream response body."""
+    if not isinstance(payload, dict):
+        return ""
+    text_values = [
+        payload.get("message"),
+        payload.get("error"),
+        payload.get("detail"),
+    ]
+    for issue_dict in payload.get("issue") or []:
+        if not isinstance(issue_dict, dict):
+            continue
+        details_dict = issue_dict.get("details")
+        text_values.append(issue_dict.get("diagnostics"))
+        if isinstance(details_dict, dict):
+            text_values.append(details_dict.get("text"))
+    return " ".join(
+        clean_value
+        for clean_value in (_clean_text(value) for value in text_values)
+        if clean_value
+    ).lower()
+
+
+def _is_call_volume_quota_payload(payload: dict[str, Any] | None) -> bool:
+    payload_text = _source_error_payload_text(payload)
+    return "out of call volume quota" in payload_text
+
+
+def _is_molina_quota_response(
+    source_record: dict[str, Any],
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+) -> bool:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    return bool(
+        api_base == MOLINA_PROVIDER_DIRECTORY_BASE
+        and status_code == 403
+        and _is_call_volume_quota_payload(fhir_payload)
+    )
+
+
 def _classify_http(status_code: int | None, error: str | None, payload: dict[str, Any] | None) -> str:
     if error:
         lower = error.lower()
@@ -9574,6 +9625,8 @@ def _classify_http(status_code: int | None, error: str | None, payload: dict[str
         if payload and payload.get("resourceType") == "CapabilityStatement":
             return "valid"
         return "valid_non_fhir"
+    if status_code == 403 and _is_call_volume_quota_payload(payload):
+        return "quota_exhausted"
     if status_code in {401, 403}:
         return "auth_required"
     if status_code == 404:
@@ -9712,7 +9765,10 @@ def _is_transient_source_fetch_failure(
     fetch_error: str | None,
 ) -> bool:
     if fetch_error:
-        return fetch_error != AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+        return fetch_error not in {
+            AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
+            SOURCE_QUOTA_EXHAUSTED_ERROR,
+        }
     return status_code in {429, 500, 502, 503, 504}
 
 
@@ -9893,7 +9949,12 @@ async def _pace_source_request(source_record: dict[str, Any]) -> None:
         source_record["_provider_directory_last_request_monotonic"] = time.monotonic()
 
 
-def _source_retry_after_seconds(fhir_payload: dict[str, Any] | None) -> float | None:
+def _source_retry_after_seconds(
+    fhir_payload: dict[str, Any] | None,
+    *,
+    max_delay_seconds: float | None = 600.0,
+    now_utc: datetime.datetime | None = None,
+) -> float | None:
     retry_after = _clean_text((fhir_payload or {}).get(SOURCE_RETRY_AFTER_FIELD))
     if not retry_after:
         return None
@@ -9902,15 +9963,62 @@ def _source_retry_after_seconds(fhir_payload: dict[str, Any] | None) -> float | 
     except ValueError:
         numeric_delay = None
     if numeric_delay is not None:
-        return min(600.0, max(0.0, numeric_delay))
+        delay_seconds = max(0.0, numeric_delay)
+        return (
+            min(max_delay_seconds, delay_seconds)
+            if max_delay_seconds is not None
+            else delay_seconds
+        )
     try:
         retry_at = email.utils.parsedate_to_datetime(retry_after)
     except (TypeError, ValueError, OverflowError):
         return None
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=datetime.UTC)
-    delay_seconds = (retry_at - datetime.datetime.now(datetime.UTC)).total_seconds()
-    return min(600.0, max(0.0, delay_seconds))
+    current_time = now_utc or datetime.datetime.now(datetime.UTC)
+    delay_seconds = max(0.0, (retry_at - current_time).total_seconds())
+    return (
+        min(max_delay_seconds, delay_seconds)
+        if max_delay_seconds is not None
+        else delay_seconds
+    )
+
+
+def _molina_quota_retry_not_before(
+    source_record: dict[str, Any],
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+    *,
+    now_utc: datetime.datetime | None = None,
+) -> str | None:
+    if not _is_molina_quota_response(source_record, status_code, fhir_payload):
+        return None
+    payload_text = _source_error_payload_text(fhir_payload)
+    duration_match = MOLINA_QUOTA_DURATION_PATTERN.search(payload_text)
+    duration_seconds = None
+    if duration_match:
+        hours, minutes, seconds = (
+            int(duration_part) for duration_part in duration_match.groups()
+        )
+        if minutes < 60 and seconds < 60:
+            duration_seconds = (hours * 60 * 60) + (minutes * 60) + seconds
+    retry_after_seconds = _source_retry_after_seconds(
+        fhir_payload,
+        max_delay_seconds=None,
+        now_utc=now_utc,
+    )
+    valid_delays = [
+        delay_seconds
+        for delay_seconds in (duration_seconds, retry_after_seconds)
+        if delay_seconds is not None
+    ]
+    if not valid_delays:
+        return None
+    current_time = now_utc or datetime.datetime.now(datetime.UTC)
+    retry_at = current_time + datetime.timedelta(
+        seconds=max(valid_delays) + MOLINA_QUOTA_RESET_GRACE_SECONDS
+    )
+    return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 async def _fetch_source_json_once(
@@ -9943,6 +10051,17 @@ def _source_fetch_result_with_payload_error(
         status_code,
         fhir_payload,
     )
+    if _is_molina_quota_response(
+        source_record,
+        status_code,
+        fhir_payload,
+    ):
+        return (
+            status_code,
+            fhir_payload,
+            SOURCE_QUOTA_EXHAUSTED_ERROR,
+            elapsed_ms,
+        )
     if not payload_error:
         return fetch_result
     return status_code, fhir_payload, payload_error, elapsed_ms
@@ -10187,6 +10306,9 @@ def _resource_access_probe_result(
     fetch_error: str | None,
     elapsed_ms: int,
 ) -> dict[str, Any]:
+    is_quota_exhausted = (
+        status_code == 403 and _is_call_volume_quota_payload(resource_payload)
+    )
     is_access_denied = status_code in {401, 403} or _is_access_denied_outcome(
         resource_payload
     )
@@ -10199,6 +10321,15 @@ def _resource_access_probe_result(
         and resource_payload.get("resourceType") == "OperationOutcome"
     ):
         resource_error = "resource_search_returned_operation_outcome"
+    if is_quota_exhausted:
+        return {
+            "status": "quota_exhausted",
+            "http_status": status_code,
+            "response_time_ms": elapsed_ms,
+            "url": resource_url,
+            "resource_type": resource_type,
+            "error": SOURCE_QUOTA_EXHAUSTED_ERROR,
+        }
     if is_access_denied:
         return {
             "status": "auth_required",
@@ -14953,6 +15084,7 @@ async def _fetch_resource_rows(
     hard_page_limit_reached = False
     next_url_remaining = False
     error_message: str | None = None
+    retry_not_before: str | None = None
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     source_api_base = _canonical_base(
@@ -15071,6 +15203,11 @@ async def _fetch_resource_rows(
                     has_restart_attempted = True
                     url = checkpoint_start_url
                     continue
+                retry_not_before = _molina_quota_retry_not_before(
+                    source,
+                    status_code,
+                    payload,
+                )
                 current_error = error or f"http_{status_code}"
                 if partitioned_fetch:
                     partition_error_count += 1
@@ -15213,6 +15350,7 @@ async def _fetch_resource_rows(
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
         deadline_reached=is_deadline_reached,
+        retry_not_before=retry_not_before,
     )
 
 
@@ -16845,6 +16983,7 @@ def _resource_fetch_diagnostic(
         "hard_page_limit_reached": result.hard_page_limit_reached,
         "deadline_reached": result.deadline_reached,
         "next_url_remaining": result.next_url_remaining,
+        "retry_not_before": result.retry_not_before,
     }
 
 
@@ -19785,6 +19924,7 @@ async def _import_resources(
     linked_counts: dict[str, int] | None = None,
     resource_fetch_stats: dict[str, dict[str, Any]] | None = None,
     resource_completion: dict[str, set[str]] | None = None,
+    resource_retry_not_before: dict[str, str] | None = None,
     stale_counts: dict[str, int] | None = None,
     stale_cleanup: bool = False,
     stream_batch_size: int = 0,
@@ -19825,6 +19965,19 @@ async def _import_resources(
             target_entry = target.setdefault(resource_type, _empty_resource_stats())
             for key, value in entry.items():
                 target_entry[key] = target_entry.get(key, 0) + value
+
+    def merge_retry_not_before(
+        target_by_resource: dict[str, str],
+        diagnostics_by_resource: dict[str, dict[str, Any]],
+    ) -> None:
+        """Keep the latest upstream retry boundary for each resource."""
+        for resource_type, diagnostic_dict in diagnostics_by_resource.items():
+            retry_at = _clean_text(diagnostic_dict.get("retry_not_before"))
+            if not retry_at:
+                continue
+            current_retry_at = target_by_resource.get(resource_type)
+            if current_retry_at is None or retry_at > current_retry_at:
+                target_by_resource[resource_type] = retry_at
 
     def progress_counts_snapshot() -> dict[str, int]:
         snapshot = dict(counts)
@@ -20480,6 +20633,11 @@ async def _import_resources(
                 merge_counts(linked_counts, source_linked_counts)
             if resource_fetch_stats is not None:
                 merge_resource_stats(resource_fetch_stats, source_resource_stats)
+            if resource_retry_not_before is not None:
+                merge_retry_not_before(
+                    resource_retry_not_before,
+                    source_resource_diagnostics,
+                )
             if stale_counts is not None:
                 merge_counts(stale_counts, source_stale_counts)
             for resource_type, ready_source_ids in source_stale_ready_source_ids.items():
@@ -20861,6 +21019,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 metrics=metrics,
             )
             completed_source_ids_by_resource: dict[str, set[str]] = {}
+            retry_not_before_by_resource: dict[str, str] = {}
             pagination_resume_required_entries: set[str] = set()
             metrics["resource_rows"] = await _import_resources(
                 importable,
@@ -20877,6 +21036,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 linked_counts=metrics.setdefault("linked_resource_rows", {}),
                 resource_fetch_stats=metrics.setdefault("resource_fetch_stats", {}),
                 resource_completion=completed_source_ids_by_resource,
+                resource_retry_not_before=retry_not_before_by_resource,
                 stale_counts=metrics.setdefault("stale_resource_rows_deleted", {}),
                 stale_cleanup=stale_cleanup,
                 stream_batch_size=stream_batch_size,
@@ -20897,6 +21057,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     and page_limit <= 0
                 ),
             )
+            if retry_not_before_by_resource:
+                metrics["provider_directory_retry_not_before_by_resource"] = dict(
+                    sorted(retry_not_before_by_resource.items())
+                )
+                metrics[SOURCE_RETRY_NOT_BEFORE_METRIC] = max(
+                    retry_not_before_by_resource.values()
+                )
             metrics["bulk_export_mode"] = _bulk_export_mode_metrics(
                 bulk_export,
                 metrics.get("resource_fetch_stats") or {},
