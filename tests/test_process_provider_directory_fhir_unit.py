@@ -7042,6 +7042,23 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
 
 
 @pytest.mark.asyncio
+async def test_main_forwards_publish_artifact_targets(monkeypatch):
+    process_data_mock = AsyncMock(return_value={"published": True})
+    monkeypatch.setattr(importer, "startup", AsyncMock())
+    monkeypatch.setattr(importer, "process_data", process_data_mock)
+    monkeypatch.setattr(importer, "shutdown", AsyncMock())
+
+    result = await importer.main(
+        test_mode=True,
+        publish_artifacts_only=True,
+        publish_artifacts_targets="corroboration",
+    )
+
+    assert result == {"published": True}
+    assert process_data_mock.await_args.args[1]["publish_artifacts_targets"] == "corroboration"
+
+
+@pytest.mark.asyncio
 async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
