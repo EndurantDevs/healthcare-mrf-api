@@ -211,6 +211,66 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_single_job_start_isolates_concurrent_job_contexts(monkeypatch):
+    terminal_marks_by_run_id = {}
+    both_started = asyncio.Event()
+    started_run_ids = set()
+    worker_context_map = {"redis": object(), "context": {"worker_value": "shared"}}
+
+    async def fake_mark(run_id, **kwargs):
+        if kwargs["status"] == "succeeded":
+            terminal_marks_by_run_id[run_id] = kwargs
+
+    async def fake_target(ctx, task):
+        run_id = task["run_id"]
+        assert ctx is not worker_context_map
+        assert ctx["context"] is not worker_context_map["context"]
+        ctx["context"]["audit"] = {"run_id": run_id}
+        started_run_ids.add(run_id)
+        if len(started_run_ids) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        return {"run_id": ctx["context"]["audit"]["run_id"]}
+
+    async def fake_shutdown(_ctx):
+        return None
+
+    class FakeModule:
+        process_data = staticmethod(fake_target)
+        shutdown = staticmethod(fake_shutdown)
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(
+        control_lifecycle,
+        "import_module",
+        lambda name: FakeModule if name == "fake.module" else None,
+    )
+
+    job_outcomes = await asyncio.gather(
+        *(
+            control_single_job_start(
+                worker_context_map,
+                {
+                    "run_id": run_id,
+                    "target_module": "fake.module",
+                    "target_function": "process_data",
+                    "run_shutdown": True,
+                },
+            )
+            for run_id in ("run_1", "run_2")
+        )
+    )
+
+    assert [outcome["result"]["run_id"] for outcome in job_outcomes] == ["run_1", "run_2"]
+    assert terminal_marks_by_run_id["run_1"]["metrics"]["run_id"] == "run_1"
+    assert terminal_marks_by_run_id["run_2"]["metrics"]["run_id"] == "run_2"
+    assert worker_context_map == {
+        "redis": worker_context_map["redis"],
+        "context": {"worker_value": "shared"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_control_single_job_start_marks_cancelled(monkeypatch):
     marks = []
 

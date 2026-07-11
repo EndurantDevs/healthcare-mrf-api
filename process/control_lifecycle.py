@@ -47,10 +47,10 @@ async def control_single_job_start(
     call_style = str(payload.get("call_style") or "ctx_task").strip()
     run_shutdown = bool(payload.get("run_shutdown"))
     target_task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+    ctx = _isolated_control_job_context(ctx, run_id)
+
     if run_id:
         target_task = {**target_task, "run_id": run_id}
-        ctx["control_run_id"] = run_id
-        ctx.setdefault("context", {})["control_run_id"] = run_id
     if not target_module or not target_function:
         await mark_control_run(
             run_id,
@@ -475,3 +475,22 @@ async def _execute_control_run_update(stmt: Any) -> None:
         db._database_override = previous_override
         if previous_override != base_database:
             await db.connect()
+
+
+def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """Copy mutable run state so concurrent ARQ jobs cannot overwrite each other."""
+    isolated_context_map = dict(ctx)
+    shared_context_map = ctx.get("context")
+    job_context_map = (
+        dict(shared_context_map) if isinstance(shared_context_map, dict) else {}
+    )
+    for key in ("audit", "finished_at", "preserve_control_run_finished_at"):
+        job_context_map.pop(key, None)
+    if run_id:
+        isolated_context_map["control_run_id"] = run_id
+        job_context_map["control_run_id"] = run_id
+    else:
+        isolated_context_map.pop("control_run_id", None)
+        job_context_map.pop("control_run_id", None)
+    isolated_context_map["context"] = job_context_map
+    return isolated_context_map
