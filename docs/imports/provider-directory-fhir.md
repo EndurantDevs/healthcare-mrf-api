@@ -790,10 +790,11 @@ Molina seed rows can point at the developer portal
 working Provider Directory metadata base at
 `https://api.interop.molinahealthcare.com/providerdirectory`, so the importer
 maps those rows to that concrete base and records the portal and metadata URLs
-in source metadata. During discovery, broad live resource searches such as
-`Practitioner?_count=1` returned HTTP 500 from Molina's API, so resource import
-diagnostics remain the authority until Molina's supported query pattern is
-confirmed or the upstream server behavior changes.
+in source metadata. Fresh dev probes validate all five configured resource
+searches and the source-specific rewrite of
+`molina.sapphirethreesixtyfive.com` cursor continuations. Molina remains
+acquisition-configured, but endpoint-wide completeness is not claimed until an
+unbounded exact-source run reaches a terminal success.
 
 UnitedHealthcare seed rows can point at the UHC interoperability landing page
 `https://www.uhc.com/legal/interoperability-apis` or stale retest bases such as
@@ -1164,7 +1165,10 @@ specific payer/resource when the live FHIR server is known to misbehave at
 larger page sizes. Aetna Commercial caps all seven supported collections at 30.
 Another confirmed case is Michigan InteropStation
 `PractitionerRole`, where `_count>=50` returns an empty Bundle while `_count=25`
-returns rows and a next link. Future source-specific caps can also be carried
+returns rows and a next link. That canonical HAPI next link currently returns
+HTTP 403 from the worker network even when cookies are preserved, so Michigan
+full acquisition fails closed until a stateless continuation is proven. Future
+source-specific caps can also be carried
 in source `metadata_json.provider_directory_resource_page_count_caps` without
 changing the monthly schedule.
 `import-control` also schedules a follow-up artifact-only Provider Directory
