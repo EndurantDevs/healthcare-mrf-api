@@ -670,6 +670,13 @@ def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
     assert seed_row["api_base"] is None
     assert seed_row["last_validated_status"] == importer.PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS
     assert seed_row["metadata_json"]["provider_directory_blocked"] is True
+    assert seed_row["metadata_json"]["provider_directory_blocked_acquisition_method"] == (
+        "not-importable"
+    )
+    assert seed_row["metadata_json"]["provider_directory_live_verification"] == {
+        "status": "not_recorded",
+        "checked_at": None,
+    }
 
     source_row = importer._source_row_from_seed(seed_row)
     selected, metrics = importer._select_resource_import_sources(
@@ -680,6 +687,26 @@ def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
     )
     assert selected == []
     assert metrics["source_import_skipped_missing_api_base"] == 1
+
+
+def test_provider_directory_blocker_runtime_rejects_non_v2_registry(
+    monkeypatch,
+    tmp_path,
+):
+    registry = json.loads(
+        importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH.read_text(encoding="utf-8")
+    )
+    registry["schema_version"] = 1
+    registry_path = tmp_path / "provider-directory-blockers.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(
+        importer,
+        "PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH",
+        registry_path,
+    )
+
+    with pytest.raises(RuntimeError, match="blocker registry is invalid"):
+        importer._provider_directory_blocker_seed_rows()
 
 
 def _cms_sma_fixture_csv() -> str:

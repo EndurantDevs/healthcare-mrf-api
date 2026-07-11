@@ -12,16 +12,20 @@ from typing import Any
 try:
     from scripts.provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
+        RESOURCE_TYPES,
         SUPPORT_LEVELS,
         SupportDocumentationError,
         validate_access_review_metadata,
+        validate_blocker_registry,
     )
 except ModuleNotFoundError:
     from provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
+        RESOURCE_TYPES,
         SUPPORT_LEVELS,
         SupportDocumentationError,
         validate_access_review_metadata,
+        validate_blocker_registry,
     )
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
@@ -29,16 +33,6 @@ DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 DEFAULT_BLOCKER_REGISTRY = ROOT / "specs/provider_directory_blocker_registry.json"
 DEFAULT_VERIFICATION_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
 METHODS = {"rest", "bulk", "graphql", "probe"}
-RESOURCE_TYPES = {
-    "InsurancePlan",
-    "PractitionerRole",
-    "Practitioner",
-    "Organization",
-    "Location",
-    "HealthcareService",
-    "OrganizationAffiliation",
-    "Endpoint",
-}
 DISPLAY_VALUES = {
     "supported": "Supported",
     "externally-supported": "Externally supported",
@@ -56,6 +50,7 @@ DISPLAY_VALUES = {
     "bulk": "Bulk",
     "graphql": "GraphQL",
     "probe": "Probe",
+    "not-importable": "Not importable",
 }
 VERIFICATION_STATUSES = {
     "bounded",
@@ -74,7 +69,6 @@ VERIFICATION_STATUSES = {
 ACCESS_VERIFICATION_VALUES = {"verified", "not_verified", "not_recorded"}
 PROOF_STATES = {"current", "superseded", "not_recorded"}
 ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
-BLOCKER_OPERATIONAL_STATUSES = {"unreachable", "auth-gated", "not-published"}
 SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
@@ -155,51 +149,6 @@ def _catalog_confirmation_fields(manifest: dict[str, Any]) -> dict[str, str]:
     if checked_at.tzinfo is None:
         raise SupportDocumentationError("catalog_confirmation.checked_at must include a timezone")
     return confirmation_by_field
-def validate_blocker_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:
-    """Validate blocked sources that cannot be acquisition manifest entries."""
-    if registry.get("schema_version") != 1:
-        raise SupportDocumentationError("blocker registry schema_version must be 1")
-    entries = registry.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise SupportDocumentationError("blocker registry entries must be a non-empty list")
-    required_fields = {
-        "id",
-        "display_name",
-        "plan_name",
-        "access_requirement",
-        "requires_registration",
-        "operational_status",
-        "reviewed_at",
-        "source_detail",
-        "source_url",
-        "reason",
-        "note",
-    }
-    seen_ids: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != required_fields:
-            raise SupportDocumentationError(f"blocker entries must contain {sorted(required_fields)}")
-        entry_id = str(entry.get("id") or "")
-        if not entry_id or entry_id in seen_ids:
-            raise SupportDocumentationError("blocker entries must have unique non-empty ids")
-        seen_ids.add(entry_id)
-        if entry.get("access_requirement") not in ACCESS_REQUIREMENTS:
-            raise SupportDocumentationError(f"{entry_id}: invalid access requirement")
-        if not isinstance(entry.get("requires_registration"), bool):
-            raise SupportDocumentationError(f"{entry_id}: requires_registration must be boolean")
-        if entry.get("operational_status") not in BLOCKER_OPERATIONAL_STATUSES:
-            raise SupportDocumentationError(f"{entry_id}: invalid operational status")
-        try:
-            dt.date.fromisoformat(str(entry.get("reviewed_at") or ""))
-        except ValueError as exc:
-            raise SupportDocumentationError(f"{entry_id}: reviewed_at must be an ISO date") from exc
-        for field_name in required_fields - {"requires_registration"}:
-            if not isinstance(entry.get(field_name), str) or not entry[field_name].strip():
-                raise SupportDocumentationError(f"{entry_id}: {field_name} must be non-empty text")
-        source_url = str(entry["source_url"])
-        if not source_url.startswith("https://"):
-            raise SupportDocumentationError(f"{entry_id}: source_url must use HTTPS")
-    return entries
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate complete top-level support metadata without altering run entries."""
     entries = manifest.get("entries")
@@ -375,8 +324,8 @@ def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
         "",
         "These sources are intentionally retained as blocked catalog evidence. They are not probe-only entries and have no runnable acquisition base.",
         "",
-        "| Source | Plan | Support | Required access | Registration | Operational state | Reviewed at | Primary evidence | Blocker |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Source | Plan | Support | Required access | Registration | Method | Resources | Canonical base | Operational state | Reviewed at | Live verification | Primary evidence | Blocker |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for blocker in blockers:
         cells = [
@@ -385,8 +334,12 @@ def _blocked_support_section(blockers: list[dict[str, Any]]) -> list[str]:
             _display("not-supported"),
             _display(blocker["access_requirement"]),
             "Required" if blocker["requires_registration"] else "Not required",
+            _display(blocker["acquisition_method"]),
+            ", ".join(blocker["documented_resources"]) or "None confirmed",
+            blocker["canonical_base"] or "None confirmed",
             blocker["operational_status"].replace("-", " ").title(),
             blocker["reviewed_at"],
+            _display_verification(blocker["live_verification"]["status"]),
             blocker["source_url"],
             blocker["note"],
         ]

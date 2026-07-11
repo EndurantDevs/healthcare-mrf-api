@@ -1,13 +1,20 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "entries": [
     {
       "id": "provider-directory-blocked-chorus-community-health-plans",
       "display_name": "Chorus Community Health Plans (fka Children's Community Health Plan)",
       "plan_name": "Medicaid MCO",
+      "acquisition_method": "not-importable",
+      "documented_resources": [],
+      "canonical_base": null,
       "access_requirement": "none",
       "requires_registration": false,
       "operational_status": "unreachable",
+      "live_verification": {
+        "status": "not_recorded",
+        "checked_at": null
+      },
       "reviewed_at": "2026-07-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://appconnect.chorushealthplans.org/developers/providerapi",
@@ -18,9 +25,20 @@
       "id": "provider-directory-blocked-first-medical-pr",
       "display_name": "First Medical Health Plan, Inc.",
       "plan_name": "Medicaid MCO",
+      "acquisition_method": "not-importable",
+      "documented_resources": [
+        "Practitioner",
+        "PractitionerRole",
+        "Location"
+      ],
+      "canonical_base": null,
       "access_requirement": "user-token",
       "requires_registration": true,
       "operational_status": "auth-gated",
+      "live_verification": {
+        "status": "not_recorded",
+        "checked_at": null
+      },
       "reviewed_at": "2026-07-10",
       "source_detail": "blocked Provider Directory endpoint discovery",
       "source_url": "https://devportal.firstmedicalpr.com/ApiLibrary",
@@ -31,9 +49,16 @@
       "id": "provider-directory-blocked-territory-of-puerto-rico",
       "display_name": "Territory of Puerto Rico",
       "plan_name": "Medicaid FFS",
+      "acquisition_method": "not-importable",
+      "documented_resources": [],
+      "canonical_base": null,
       "access_requirement": "none",
       "requires_registration": false,
       "operational_status": "not-published",
+      "live_verification": {
+        "status": "not_recorded",
+        "checked_at": null
+      },
       "reviewed_at": "2026-07-10",
       "source_detail": "CMS SMA Endpoint Directory Provider Directory status TBD",
       "source_url": "https://raw.githubusercontent.com/CMSgov/SMA-Endpoint-Directory/main/SMAEndpointDirectory.csv",

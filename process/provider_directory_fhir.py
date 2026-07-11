@@ -72,6 +72,10 @@ from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
+from scripts.provider_directory_support_contract import (
+    SupportDocumentationError,
+    validate_blocker_registry,
+)
 
 
 DEFAULT_SEED_DB_URL = (
@@ -9029,33 +9033,21 @@ def _seed_rows_from_cms_sma_endpoint_directory(
 
 
 def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
-    registry = json.loads(PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH.read_text(encoding="utf-8"))
-    registry_entries = registry.get("entries") if isinstance(registry, dict) else None
-    if (
-        not isinstance(registry, dict)
-        or registry.get("schema_version") != 1
-        or not isinstance(registry_entries, list)
-    ):
-        raise RuntimeError("Provider Directory blocker registry has an unsupported schema")
+    try:
+        registry = json.loads(
+            PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH.read_text(encoding="utf-8")
+        )
+        registry_entries = validate_blocker_registry(registry)
+    except (OSError, json.JSONDecodeError, SupportDocumentationError) as exc:
+        raise RuntimeError("Provider Directory blocker registry is invalid") from exc
     blocker_rows = []
     for registry_entry in registry_entries:
-        if not isinstance(registry_entry, dict):
-            raise RuntimeError("Provider Directory blocker registry contains a non-object entry")
         source_url = _clean_text(registry_entry.get("source_url"))
         blocked_reason = _clean_text(registry_entry.get("reason"))
         access_requirement = _clean_text(registry_entry.get("access_requirement"))
         row_id = _clean_text(registry_entry.get("id"))
         org_name = _clean_text(registry_entry.get("display_name"))
         plan_name = _clean_text(registry_entry.get("plan_name"))
-        if (
-            not row_id
-            or not org_name
-            or not plan_name
-            or not source_url
-            or not blocked_reason
-            or access_requirement not in {"none", "user-token"}
-        ):
-            raise RuntimeError("Provider Directory blocker registry entry is incomplete")
         blocker_rows.append(
             {
                 "id": row_id,
@@ -9072,6 +9064,19 @@ def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) ->
                 "metadata_json": {
                     "provider_directory_blocked": True,
                     "provider_directory_blocked_reason": blocked_reason,
+                    "provider_directory_blocked_operational_status": registry_entry[
+                        "operational_status"
+                    ],
+                    "provider_directory_blocked_acquisition_method": registry_entry[
+                        "acquisition_method"
+                    ],
+                    "provider_directory_documented_resources": registry_entry[
+                        "documented_resources"
+                    ],
+                    "provider_directory_live_verification": registry_entry[
+                        "live_verification"
+                    ],
+                    "provider_directory_reviewed_at": registry_entry["reviewed_at"],
                     "provider_directory_confirmed_catalog_url": source_url,
                 },
             }
