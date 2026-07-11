@@ -6637,6 +6637,43 @@ async def _membership_location_query(
     )
 
 
+async def _enable_serial_knn_planning(session) -> tuple[str, str]:
+    """Apply request-local KNN planner settings and return their prior values."""
+    settings_result = await session.execute(
+        text(
+            """
+            WITH previous_settings AS MATERIALIZED (
+                SELECT current_setting('plan_cache_mode') AS plan_cache_mode,
+                       current_setting('max_parallel_workers_per_gather') AS parallel_workers
+            )
+            SELECT previous_settings.plan_cache_mode,
+                   previous_settings.parallel_workers,
+                   set_config('plan_cache_mode', 'force_custom_plan', true),
+                   set_config('max_parallel_workers_per_gather', '0', true)
+              FROM previous_settings
+            """
+        )
+    )
+    settings_row = _row_mapping(settings_result.first())
+    return str(settings_row["plan_cache_mode"]), str(settings_row["parallel_workers"])
+
+
+async def _restore_knn_planning(session, prior_settings: tuple[str, str]) -> None:
+    """Restore planner settings after the bounded KNN statement finishes."""
+    await session.execute(
+        text(
+            """
+            SELECT set_config('plan_cache_mode', :plan_cache_mode, true),
+                   set_config('max_parallel_workers_per_gather', :parallel_workers, true)
+            """
+        ),
+        {
+            "plan_cache_mode": prior_settings[0],
+            "parallel_workers": prior_settings[1],
+        },
+    )
+
+
 async def _membership_location_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -6661,7 +6698,6 @@ async def _membership_location_rows(
         return None
     location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
     if query_context.knn_order_sql is not None and offset == 0:
-        await session.execute(text("SET LOCAL plan_cache_mode = force_custom_plan"))
         requested_limit = max(int(limit), 1)
         query_context.parameter_map["probe_limit"] = requested_limit + max(requested_limit // 2, 64)
         location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
@@ -6681,8 +6717,21 @@ async def _membership_location_rows(
             filter_sql=query_context.filter_sql,
         )
     location_statement = text(location_sql)
-    query_result = await session.execute(location_statement, query_context.parameter_map)
-    return [_row_mapping(query_row) for query_row in query_result]
+    prior_planner_settings = None
+    if query_context.knn_order_sql is not None and offset == 0:
+        prior_planner_settings = await _enable_serial_knn_planning(session)
+    try:
+        query_result = await session.execute(location_statement, query_context.parameter_map)
+    except Exception:
+        # PostgreSQL errors abort the transaction; its rollback also restores
+        # transaction-local planner settings. A restore query would only mask
+        # the original failure while the transaction is aborted.
+        raise
+    try:
+        return [_row_mapping(query_row) for query_row in query_result]
+    finally:
+        if prior_planner_settings is not None:
+            await _restore_knn_planning(session, prior_planner_settings)
 
 
 @dataclass
@@ -6754,6 +6803,18 @@ async def _direct_group_ids_by_npi(
     return group_ids_by_npi if len(group_ids_by_npi) <= 200_000 else None
 
 
+def _graph_location_probe_batch_size(
+    candidate_limit: int,
+    *,
+    taxonomy_filter_requested: bool,
+) -> int:
+    """Choose a bounded first probe that accounts for sparse taxonomies."""
+    batch_size = min(max((candidate_limit * 3 + 1) // 2, 64), 1000)
+    if taxonomy_filter_requested:
+        return min(max(batch_size, candidate_limit * 16), 2000)
+    return batch_size
+
+
 async def _paged_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
@@ -6762,13 +6823,13 @@ async def _paged_graph_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
-    batch_size = min(max((candidate_limit * 3 + 1) // 2, 64), 1000)
+    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
+    batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=taxonomy_filter_requested)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
-    probe_limit = min(batch_size, max_candidates)
+    probe_limit = batch_size
     matched_location_rows: list[dict[str, Any]] = []
     group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
     seen_candidate_npis: set[int] = set()
-    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
     filtered_candidates: _GraphLocationCandidates | None = None
     while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
