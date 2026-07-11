@@ -17,7 +17,7 @@ COMMENT_NOISE_FIXTURE = "# return" + " result"
 
 
 def _write_config(repo_root: Path) -> None:
-    config = {
+    config_dict = {
         "source_roots": ["pkg"],
         "include_suffixes": [".py"],
         "exclude_globs": [],
@@ -49,7 +49,7 @@ def _write_config(repo_root: Path) -> None:
             {"name": "python_noqa", "pattern": "#\\s*noqa\\b"},
         ],
     }
-    (repo_root / "readability-budget.json").write_text(json.dumps(config), encoding="utf-8")
+    (repo_root / "readability-budget.json").write_text(json.dumps(config_dict), encoding="utf-8")
 
 
 def test_readability_budget_allows_existing_debt(tmp_path):
@@ -186,7 +186,7 @@ def test_readability_budget_does_not_parse_non_python_files(tmp_path):
         "fn main() {\n    println!(\"not python\");\n}\n",
         encoding="utf-8",
     )
-    config = {
+    config_dict = {
         "source_roots": ["pkg"],
         "include_suffixes": [".py", ".rs"],
         "exclude_globs": [],
@@ -197,9 +197,9 @@ def test_readability_budget_does_not_parse_non_python_files(tmp_path):
         },
         "inline_suppression_patterns": [],
     }
-    (repo_root / "readability-budget.json").write_text(json.dumps(config), encoding="utf-8")
+    (repo_root / "readability-budget.json").write_text(json.dumps(config_dict), encoding="utf-8")
 
-    snapshot = readability_budget.build_snapshot(repo_root, config)
+    snapshot = readability_budget.build_snapshot(repo_root, config_dict)
 
     assert snapshot["issue_counts"]["syntax_errors"] == 0
 
@@ -271,3 +271,76 @@ def test_readability_budget_reports_collection_and_global_state_debt(tmp_path):
     assert snapshot["issue_counts"]["collection_name_mismatch"] == 2
     assert snapshot["issue_counts"]["global_state_usage"] == 1
     assert snapshot["issue_counts"]["pass_placeholders"] == 1
+
+
+def test_readability_ratchet_requires_reduction_and_synced_baseline(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    module = package / "module.py"
+    module.write_text(f"def existing():\n    return 1  {NOQA_FIXTURE}\n", encoding="utf-8")
+    _write_config(repo_root)
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    base_baseline = repo_root / "readability-base.json"
+    base_baseline.write_text(
+        (repo_root / "readability-baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    ratchet_args = [
+        "--repo-root",
+        str(repo_root),
+        "--ratchet-baseline",
+        str(base_baseline),
+        "--required-reduction-percent",
+        "1",
+    ]
+
+    assert readability_budget.main(ratchet_args) == 1
+    module.write_text("def existing():\n    return 1\n", encoding="utf-8")
+    assert readability_budget.main(ratchet_args) == 1
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    assert readability_budget.main(ratchet_args) == 0
+
+
+def test_readability_ratchet_rejects_replacement_debt(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    module = package / "module.py"
+    module.write_text(
+        f"def old_one():\n    return 1  {NOQA_FIXTURE}\n\n"
+        f"def old_two():\n    return 2  {NOQA_FIXTURE}\n",
+        encoding="utf-8",
+    )
+    _write_config(repo_root)
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+    base_baseline = repo_root / "readability-base.json"
+    base_baseline.write_text(
+        (repo_root / "readability-baseline.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    module.write_text(f"def replacement():\n    return 3  {NOQA_FIXTURE}\n", encoding="utf-8")
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+
+    assert readability_budget.main(
+        ["--repo-root", str(repo_root), "--ratchet-baseline", str(base_baseline)]
+    ) == 1
+
+
+def test_readability_ratchet_holds_at_zero(tmp_path):
+    repo_root = tmp_path
+    package = repo_root / "pkg"
+    package.mkdir()
+    (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _write_config(repo_root)
+    assert readability_budget.main(["--repo-root", str(repo_root), "--write-baseline"]) == 0
+
+    assert readability_budget.main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--ratchet-baseline",
+            str(repo_root / "readability-baseline.json"),
+        ]
+    ) == 0

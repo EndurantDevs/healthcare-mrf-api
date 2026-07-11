@@ -312,12 +312,16 @@ def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, pa
 
 def _delete_kubernetes_job(namespace: str, job_name: str) -> None:
     encoded = urllib.parse.quote(job_name, safe="")
-    body = {
+    delete_options_dict = {
         "apiVersion": "v1",
         "kind": "DeleteOptions",
         "propagationPolicy": "Background",
     }
-    _kubernetes_request("DELETE", f"/apis/batch/v1/namespaces/{namespace}/jobs/{encoded}", body)
+    _kubernetes_request(
+        "DELETE",
+        f"/apis/batch/v1/namespaces/{namespace}/jobs/{encoded}",
+        delete_options_dict,
+    )
 
 
 def delete_kubernetes_worker_jobs(cancel_request: dict[str, Any]) -> dict[str, Any]:
@@ -430,7 +434,8 @@ def _kubernetes_delete_record(
 
 
 def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    base = {
+    """Summarize Kubernetes jobs matching a worker spec and optional run."""
+    state_base_dict = {
         "queue": spec.queue,
         "worker_class": spec.worker_class,
         "importers": list(spec.importers),
@@ -441,7 +446,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         "command": " ".join(_worker_command(_worker_python(), spec)),
     }
     if not _kubernetes_configured():
-        return {**base, "job_name": _worker_job_name(spec, payload or {}), "job_status": "unconfigured"}
+        return {**state_base_dict, "job_name": _worker_job_name(spec, payload or {}), "job_status": "unconfigured"}
 
     selector = _kubernetes_label_selector(spec, payload or {})
     namespace = _kubernetes_namespace()
@@ -449,10 +454,10 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
     try:
         body = _kubernetes_request("GET", path)
     except _KubernetesApiError as exc:
-        return {**base, "job_name": _worker_job_name(spec, payload or {}), "job_status": "error", "message": str(exc)}
+        return {**state_base_dict, "job_name": _worker_job_name(spec, payload or {}), "job_status": "error", "message": str(exc)}
 
-    items = body.get("items") if isinstance(body, dict) else []
-    jobs = [item for item in items if isinstance(item, dict)]
+    raw_job_records = body.get("items") if isinstance(body, dict) else []
+    jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
     active = sum(int((job.get("status") or {}).get("active") or 0) for job in jobs)
     succeeded = sum(int((job.get("status") or {}).get("succeeded") or 0) for job in jobs)
     failed = sum(int((job.get("status") or {}).get("failed") or 0) for job in jobs)
@@ -467,7 +472,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
     else:
         job_status = "missing"
     state_map = {
-        **base,
+        **state_base_dict,
         "running": active > 0,
         "job_name": latest_name,
         "job_status": job_status,
@@ -560,7 +565,7 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
 
 def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) -> dict[str, Any]:
     job_name = _worker_job_name(spec, payload)
-    env = [
+    env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
         {"name": "HLTHPRT_ACTIVE_WORKER_CLASS", "value": spec.worker_class},
@@ -568,49 +573,49 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     ]
     import_id = str(payload.get("import_id") or "").strip()
     if import_id:
-        env.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
+        env_list.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
     run_id = str(payload.get("run_id") or "").strip()
     if run_id:
-        env.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
+        env_list.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
     if spec.role == "start" and spec.worker_class.startswith("process.PTG") and run_id:
-        env.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": f"ptg_start_{run_id}"})
+        env_list.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": f"ptg_start_{run_id}"})
 
-    container: dict[str, Any] = {
+    container_dict: dict[str, Any] = {
         "name": "worker",
         "image": image,
         "imagePullPolicy": os.getenv("HLTHPRT_WORKER_JOB_IMAGE_PULL_POLICY", "IfNotPresent"),
         "workingDir": str(_repo_root()),
         "command": _worker_command(_worker_python(), spec),
-        "env": env,
+        "env": env_list,
         "securityContext": _worker_job_container_security_context(),
     }
-    env_from = _worker_job_env_from()
-    if env_from:
-        container["envFrom"] = env_from
-    resources = _worker_job_resources(spec, payload)
-    if resources:
-        container["resources"] = resources
+    env_from_list = _worker_job_env_from()
+    if env_from_list:
+        container_dict["envFrom"] = env_from_list
+    resource_dict = _worker_job_resources(spec, payload)
+    if resource_dict:
+        container_dict["resources"] = resource_dict
     pvc_volumes = _worker_job_pvc_volumes()
     volumes = [*pvc_volumes, *_worker_job_secret_volumes()]
     if volumes:
-        container["volumeMounts"] = [item["volumeMount"] for item in volumes]
+        container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
 
-    pod_spec: dict[str, Any] = {
+    pod_spec_dict: dict[str, Any] = {
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
         "securityContext": _worker_job_pod_security_context(has_pvc=bool(pvc_volumes)),
-        "containers": [container],
+        "containers": [container_dict],
     }
     if volumes:
-        pod_spec["volumes"] = [item["volume"] for item in volumes]
+        pod_spec_dict["volumes"] = [volume_spec["volume"] for volume_spec in volumes]
     service_account = os.getenv("HLTHPRT_WORKER_JOB_SERVICE_ACCOUNT", "").strip()
     if service_account:
-        pod_spec["serviceAccountName"] = service_account
+        pod_spec_dict["serviceAccountName"] = service_account
     pull_secret = os.getenv("HLTHPRT_WORKER_JOB_IMAGE_PULL_SECRET", "").strip()
     if pull_secret:
-        pod_spec["imagePullSecrets"] = [{"name": item} for item in _csv(pull_secret)]
+        pod_spec_dict["imagePullSecrets"] = [{"name": secret_name} for secret_name in _csv(pull_secret)]
 
-    labels = {
+    labels_by_key = {
         "app.kubernetes.io/name": "healthporta-import-worker",
         "app.kubernetes.io/managed-by": "healthporta-worker-launcher",
         "healthporta.com/engine": _ENGINE_LABEL,
@@ -618,29 +623,29 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
         "healthporta.com/role": spec.role,
     }
     if run_id:
-        labels["healthporta.com/run-id-hash"] = _label_hash(run_id)
-    job_spec: dict[str, Any] = {
+        labels_by_key["healthporta.com/run-id-hash"] = _label_hash(run_id)
+    job_spec_dict: dict[str, Any] = {
         "backoffLimit": int(os.getenv("HLTHPRT_WORKER_JOB_BACKOFF_LIMIT", "0")),
         "ttlSecondsAfterFinished": int(os.getenv("HLTHPRT_WORKER_JOB_TTL_SECONDS", "86400")),
         "template": {
-            "metadata": {"labels": labels},
-            "spec": pod_spec,
+            "metadata": {"labels": labels_by_key},
+            "spec": pod_spec_dict,
         },
     }
     active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
     if active_deadline_seconds > 0:
-        job_spec["activeDeadlineSeconds"] = active_deadline_seconds
+        job_spec_dict["activeDeadlineSeconds"] = active_deadline_seconds
     replicas = _worker_start_replicas(spec)
     if replicas > 1:
-        job_spec["parallelism"] = replicas
-        job_spec["completions"] = replicas
+        job_spec_dict["parallelism"] = replicas
+        job_spec_dict["completions"] = replicas
 
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_name,
-            "labels": labels,
+            "labels": labels_by_key,
             "annotations": {
                 "healthporta.com/queue": spec.queue,
                 "healthporta.com/worker-class": spec.worker_class,
@@ -648,17 +653,17 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
                 "healthporta.com/run-id": run_id,
             },
         },
-        "spec": job_spec,
+        "spec": job_spec_dict,
     }
 
 
 def _worker_job_env_from() -> list[dict[str, Any]]:
-    env_from: list[dict[str, Any]] = []
+    env_from_list: list[dict[str, Any]] = []
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "")):
-        env_from.append({"configMapRef": {"name": name}})
+        env_from_list.append({"configMapRef": {"name": name}})
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "")):
-        env_from.append({"secretRef": {"name": name}})
-    return env_from
+        env_from_list.append({"secretRef": {"name": name}})
+    return env_from_list
 
 
 def _worker_job_container_security_context() -> dict[str, Any]:
@@ -669,23 +674,23 @@ def _worker_job_container_security_context() -> dict[str, Any]:
 
 
 def _worker_job_pod_security_context(*, has_pvc: bool) -> dict[str, Any]:
-    security_context: dict[str, Any] = {
+    security_context_dict: dict[str, Any] = {
         "runAsNonRoot": True,
         "runAsUser": 65534,
         "runAsGroup": 65534,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
     if has_pvc:
-        security_context["fsGroup"] = 65534
-        security_context["fsGroupChangePolicy"] = "OnRootMismatch"
-    return security_context
+        security_context_dict["fsGroup"] = 65534
+        security_context_dict["fsGroupChangePolicy"] = "OnRootMismatch"
+    return security_context_dict
 
 
 def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = _worker_job_resource_profile(spec, payload or {})
     if profile:
         return profile
-    requests = {
+    requests_dict = {
         key: value
         for key, value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_REQUEST", "").strip(),
@@ -693,7 +698,7 @@ def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = Non
         }.items()
         if value
     }
-    limits = {
+    limits_dict = {
         key: value
         for key, value in {
             "cpu": os.getenv("HLTHPRT_WORKER_JOB_CPU_LIMIT", "").strip(),
@@ -701,12 +706,12 @@ def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = Non
         }.items()
         if value
     }
-    resources: dict[str, Any] = {}
-    if requests:
-        resources["requests"] = requests
-    if limits:
-        resources["limits"] = limits
-    return resources
+    resource_dict: dict[str, Any] = {}
+    if requests_dict:
+        resource_dict["requests"] = requests_dict
+    if limits_dict:
+        resource_dict["limits"] = limits_dict
+    return resource_dict
 
 
 def _worker_job_resource_profile(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
@@ -731,26 +736,26 @@ def _worker_job_resource_profile(spec: WorkerSpec, payload: dict[str, Any]) -> d
             continue
         profile = profiles.get(key)
         if isinstance(profile, dict):
-            normalized = _normalize_resource_profile(profile)
-            if normalized:
-                return normalized
+            normalized_resource_dict = _normalize_resource_profile(profile)
+            if normalized_resource_dict:
+                return normalized_resource_dict
     return {}
 
 
 def _normalize_resource_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    resources: dict[str, Any] = {}
+    resources_by_section: dict[str, Any] = {}
     for section in ("requests", "limits"):
         values = profile.get(section)
         if not isinstance(values, dict):
             continue
-        normalized = {
+        normalized_resource_dict = {
             key: str(value).strip()
             for key, value in values.items()
             if key in {"cpu", "memory"} and str(value).strip()
         }
-        if normalized:
-            resources[section] = normalized
-    return resources
+        if normalized_resource_dict:
+            resources_by_section[section] = normalized_resource_dict
+    return resources_by_section
 
 
 def _worker_job_pvc_volumes() -> list[dict[str, Any]]:
@@ -779,40 +784,40 @@ def _worker_job_secret_volumes() -> list[dict[str, Any]]:
     if not raw:
         return []
     try:
-        payload = json.loads(raw)
+        mount_specs = json.loads(raw)
     except json.JSONDecodeError:
         return []
-    if not isinstance(payload, list):
+    if not isinstance(mount_specs, list):
         return []
 
     volumes: list[dict[str, Any]] = []
     used_names: set[str] = set()
-    for index, item in enumerate(payload):
-        if not isinstance(item, dict):
+    for index, mount_spec in enumerate(mount_specs):
+        if not isinstance(mount_spec, dict):
             continue
-        secret_name = str(item.get("secretName") or item.get("secret_name") or "").strip()
-        mount_path = str(item.get("mountPath") or item.get("mount_path") or "").strip()
+        secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
+        mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
         if not secret_name or not mount_path:
             continue
-        volume_name = _dns_safe(str(item.get("name") or secret_name))[:54].strip("-") or f"secret-{index}"
+        volume_name = _dns_safe(str(mount_spec.get("name") or secret_name))[:54].strip("-") or f"secret-{index}"
         if volume_name in used_names:
             volume_name = f"{volume_name[:50].rstrip('-')}-{index}"
         used_names.add(volume_name)
-        secret: dict[str, Any] = {"secretName": secret_name}
-        if bool(item.get("optional", False)):
-            secret["optional"] = True
-        volume_mount: dict[str, Any] = {
+        secret_dict: dict[str, Any] = {"secretName": secret_name}
+        if bool(mount_spec.get("optional", False)):
+            secret_dict["optional"] = True
+        volume_mount_dict: dict[str, Any] = {
             "name": volume_name,
             "mountPath": mount_path,
-            "readOnly": item.get("readOnly", item.get("read_only", True)) is not False,
+            "readOnly": mount_spec.get("readOnly", mount_spec.get("read_only", True)) is not False,
         }
-        sub_path = str(item.get("subPath") or item.get("sub_path") or "").strip()
+        sub_path = str(mount_spec.get("subPath") or mount_spec.get("sub_path") or "").strip()
         if sub_path:
-            volume_mount["subPath"] = sub_path
+            volume_mount_dict["subPath"] = sub_path
         volumes.append(
             {
-                "volume": {"name": volume_name, "secret": secret},
-                "volumeMount": volume_mount,
+                "volume": {"name": volume_name, "secret": secret_dict},
+                "volumeMount": volume_mount_dict,
             }
         )
     return volumes
