@@ -578,6 +578,7 @@ FHIR_OFFSET_PAGINATION_BASES = frozenset(
 )
 FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BASE})
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
+MICHIGAN_STATELESS_OFFSET_RESOURCE = "PractitionerRole"
 WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
 WYOMING_PROVIDER_DIRECTORY_BASE = "https://wy.fhir.mhbapp.com/pd/api/v1"
 MAINE_PROVIDER_DIRECTORY_BASE = "https://maineproviderdirectory.verityanalytics.org/fhir"
@@ -2072,6 +2073,12 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if (
+        api_base == INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+        and _fhir_collection_search_resource_type(source, url)
+        == MICHIGAN_STATELESS_OFFSET_RESOURCE
+    ):
+        return _url_with_replaced_query_item(url, "_getpagesoffset", "0")
     if api_base not in FHIR_OFFSET_PAGINATION_BASES | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
         return url
     sorted_url = _url_with_replaced_query_item(url, "_sort", "_id")
@@ -10696,6 +10703,12 @@ def _resolved_fhir_next_url(
     parsed_next = urllib.parse.urlsplit(next_url)
     if api_base in FHIR_OFFSET_PAGINATION_BASES:
         return _resolved_offset_next_url(api_base, current_url, next_url)
+    if (
+        api_base == INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+        and _fhir_collection_search_resource_type(source_record, current_url)
+        == MICHIGAN_STATELESS_OFFSET_RESOURCE
+    ):
+        return _resolved_michigan_next_url(current_url, next_url)
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
         return _resolved_aetna_commercial_next_url(current_url, next_url)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE:
@@ -10721,6 +10734,141 @@ def _resolved_fhir_next_url(
     if not _is_trusted_fhir_pagination_url(source_record, current_url, next_url):
         raise ValueError("untrusted_pagination_link")
     return next_url
+
+
+def _michigan_current_pagination_parts(
+    current_url: str,
+) -> tuple[urllib.parse.SplitResult, list[tuple[str, str]], str, int]:
+    canonical_base = urllib.parse.urlsplit(
+        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+    )
+    parsed_current = urllib.parse.urlsplit(current_url)
+    current_query_items = urllib.parse.parse_qsl(
+        parsed_current.query,
+        keep_blank_values=True,
+    )
+    current_count_values = [
+        query_value
+        for query_name, query_value in current_query_items
+        if query_name.lower() == "_count"
+    ]
+    current_offset_values = [
+        query_value
+        for query_name, query_value in current_query_items
+        if query_name.lower() == "_getpagesoffset"
+    ]
+    is_allowlisted = (
+        parsed_current.scheme.lower() == "https"
+        and parsed_current.netloc.lower() == canonical_base.netloc.lower()
+        and parsed_current.path.rstrip("/")
+        == f"{canonical_base.path.rstrip('/')}/{MICHIGAN_STATELESS_OFFSET_RESOURCE}"
+        and len(current_count_values) == 1
+        and current_count_values[0].isdigit()
+        and 1 <= int(current_count_values[0]) <= 25
+        and len(current_offset_values) <= 1
+        and (not current_offset_values or current_offset_values[0].isdigit())
+    )
+    if not is_allowlisted:
+        raise ValueError("untrusted_michigan_pagination_link")
+    current_offset = int(current_offset_values[0]) if current_offset_values else 0
+    return (
+        parsed_current,
+        current_query_items,
+        current_count_values[0],
+        current_offset + int(current_count_values[0]),
+    )
+
+
+def _is_michigan_next_link_allowlisted(
+    parsed_current: urllib.parse.SplitResult,
+    parsed_next: urllib.parse.SplitResult,
+    current_count: str,
+    next_offset: int,
+) -> bool:
+    canonical_base = urllib.parse.urlsplit(
+        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+    )
+    next_query_items = urllib.parse.parse_qsl(
+        parsed_next.query,
+        keep_blank_values=True,
+    )
+    next_values_by_name: dict[str, list[str]] = {}
+    for query_name, query_value in next_query_items:
+        next_values_by_name.setdefault(query_name.lower(), []).append(query_value)
+    advertised_offset_values = next_values_by_name.get("_getpagesoffset", [])
+    allowed_next_query_names = {
+        "_bundletype",
+        "_count",
+        "_getpages",
+        "_getpagesoffset",
+        "_pageid",
+    }
+    return (
+        set(next_values_by_name).issubset(allowed_next_query_names)
+        and len(next_values_by_name.get("_getpages", [])) == 1
+        and bool(next_values_by_name["_getpages"][0])
+        and len(next_values_by_name.get("_pageid", [])) == 1
+        and bool(next_values_by_name["_pageid"][0])
+        and next_values_by_name.get("_bundletype") == ["searchset"]
+        and (
+            not next_values_by_name.get("_count")
+            or next_values_by_name["_count"] == [current_count]
+        )
+        and (
+            not advertised_offset_values
+            or advertised_offset_values == [str(next_offset)]
+        )
+        and parsed_next.scheme.lower() == "https"
+        and parsed_next.netloc.lower() == canonical_base.netloc.lower()
+        and parsed_next.username is None
+        and parsed_next.password is None
+        and parsed_next.port in {None, 443}
+        and parsed_next.path.rstrip("/")
+        in {
+            canonical_base.path.rstrip("/"),
+            parsed_current.path.rstrip("/"),
+        }
+        and not parsed_next.fragment
+    )
+
+
+def _resolved_michigan_next_url(current_url: str, next_url: str) -> str:
+    """Replace Michigan's blocked opaque cursor with its stable numeric offset."""
+    (
+        parsed_current,
+        current_query_items,
+        current_count,
+        next_offset,
+    ) = _michigan_current_pagination_parts(current_url)
+    parsed_next = urllib.parse.urlsplit(next_url)
+    if not _is_michigan_next_link_allowlisted(
+        parsed_current,
+        parsed_next,
+        current_count,
+        next_offset,
+    ):
+        raise ValueError("untrusted_michigan_pagination_link")
+    preserved_query_items = [
+        (query_name, query_value)
+        for query_name, query_value in current_query_items
+        if query_name.lower() not in FHIR_CONTINUATION_QUERY_NAMES
+        and query_name.lower() != "_count"
+    ]
+    preserved_query_items.extend(
+        (
+            ("_count", current_count),
+            ("_getpagesoffset", str(next_offset)),
+        )
+    )
+    return urllib.parse.urlunsplit(
+        (
+            parsed_current.scheme,
+            parsed_current.netloc,
+            parsed_current.path,
+            urllib.parse.urlencode(preserved_query_items, doseq=True),
+            "",
+        )
+    )
 
 
 def _resolved_aetna_commercial_next_url(

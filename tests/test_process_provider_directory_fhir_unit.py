@@ -7777,8 +7777,67 @@ def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_
     )
 
     assert url == (
-        "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?_count=25"
+        "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?"
+        "_count=25&_getpagesoffset=0"
     )
+
+
+def test_michigan_interopstation_replaces_opaque_cursor_with_stateless_offset():
+    source_lookup = {
+        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+    }
+    current_url = (
+        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+        "_count=25&_getpagesoffset=25"
+    )
+    advertised_next_url = (
+        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}?"
+        "_getpages=opaque&_pageId=signed-page&_bundletype=searchset"
+    )
+
+    next_url = importer._resolved_fhir_next_url(
+        source_lookup,
+        current_url,
+        advertised_next_url,
+    )
+
+    assert next_url == (
+        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+        "_count=25&_getpagesoffset=50"
+    )
+
+
+@pytest.mark.parametrize(
+    "advertised_next_url",
+    [
+        "https://evil.example/fhir?_getpages=opaque&_pageId=signed-page&_bundletype=searchset",
+        (
+            "https://api.interopstation.com/mdhhs/fhir?"
+            "_getpages=opaque&_bundletype=searchset"
+        ),
+        (
+            "https://api.interopstation.com/mdhhs/fhir?"
+            "_getpages=opaque&_pageId=signed-page&_bundletype=searchset&extra=1"
+        ),
+    ],
+)
+def test_michigan_interopstation_rejects_untrusted_stateless_offset_cursor(
+    advertised_next_url,
+):
+    source_lookup = {
+        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+    }
+
+    with pytest.raises(ValueError, match="untrusted_michigan_pagination_link"):
+        importer._resolved_fhir_next_url(
+            source_lookup,
+            (
+                f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+                "_count=25&_getpagesoffset=0"
+            ),
+            advertised_next_url,
+        )
 
 
 def test_resource_start_url_caps_uhc_insurance_plan_page_count():
