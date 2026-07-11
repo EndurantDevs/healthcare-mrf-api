@@ -838,6 +838,7 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
     endpoint_refs = Column(JSON)
     specialty_codes = Column(JSON)
     code_codes = Column(JSON)
+    telecom = Column(JSON)
     period_start = Column(String(64))
     period_end = Column(String(64))
     last_seen_run_id = Column(String(64))

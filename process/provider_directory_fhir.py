@@ -4868,6 +4868,7 @@ def parse_fhir_resource(
             "endpoint_refs": _references(resource.get("endpoint")),
             "specialty_codes": _codings(resource.get("specialty")),
             "code_codes": _codings(resource.get("code")),
+            "telecom": _telecom(resource),
             "period_start": period_start,
             "period_end": period_end,
         }
