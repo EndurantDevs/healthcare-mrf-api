@@ -11,6 +11,11 @@
   },
   "support_documentation": {
     "schema_version": 1,
+    "freshness_policy": {
+      "catalog_confirmation_max_age_days": 45,
+      "source_review_max_age_days": 45,
+      "terminal_verification_max_age_days": 45
+    },
     "runtime_status_report": "reports/provider-directory-endpoint-acquisition/report.json",
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",

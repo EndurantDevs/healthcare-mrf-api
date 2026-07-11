@@ -1,4 +1,5 @@
 import copy
+import datetime as dt
 import json
 import re
 from pathlib import Path
@@ -36,6 +37,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "selected `--report` path; the report is not tracked" in rendered_document
     assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered_document
     assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered_document
+    assert "CI rejects expired evidence" in rendered_document
     assert "## Inventory Summary" in rendered_document
     assert "| Acquisition-configured | 23 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
@@ -46,14 +48,17 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | Required" in rendered_document
     assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
-    assert "| Registration | Reviewed at |" in rendered_document
+    assert "| Registration | Reviewed at | Review valid through |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-07-11 | OAuth2 client credentials and Bulk" in rendered_document
+    assert "Required | 2026-07-11 | 2026-08-25 | OAuth2 client credentials and Bulk" in rendered_document
     assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-07-10 | Sequential REST pagination" in rendered_document
+    assert "Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
+    assert "| Terminal status | Resource completion |" in rendered_document
+    assert "| ALOHR (`alohr`) | Current | External Completed | Complete |" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Not recorded |" in rendered_document
     assert "scripts/update_provider_directory_verification.py" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | run_" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Not recorded | run_" in rendered_document
     assert "## Known Not Importable" in rendered_document
     assert "Chorus Community Health Plans" in rendered_document
     assert "First Medical Health Plan, Inc." in rendered_document
@@ -119,6 +124,44 @@ def test_validate_manifest_rejects_registration_access_contradictions():
     entry_support["aetna-commercial-medicare"]["requires_registration"] = False
 
     with pytest.raises(generator.SupportDocumentationError, match="requires registration"):
+        generator.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("canonical_base", "http://example.test/fhir", "credential-free HTTPS URL"),
+        ("source_ids", ["short-id"], "full pdfhir IDs"),
+        ("resources", ["Doctor"], "unique known resource types"),
+    ],
+)
+def test_validate_manifest_rejects_invalid_endpoint_contract(
+    field_name,
+    value,
+    message,
+):
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    manifest["entries"][0][field_name] = value
+
+    with pytest.raises(generator.SupportDocumentationError, match=message):
+        generator.validate_manifest(manifest)
+
+
+def test_validate_manifest_rejects_external_support_without_documented_resources():
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    support = manifest["support_documentation"]["entry_support"]["alohr"]
+    support.pop("documented_resources")
+
+    with pytest.raises(generator.SupportDocumentationError, match="requires documented_resources"):
+        generator.validate_manifest(manifest)
+
+
+def test_validate_manifest_rejects_external_method_mismatch():
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    support = manifest["support_documentation"]["entry_support"]["alohr"]
+    support["method"] = "rest"
+
+    with pytest.raises(generator.SupportDocumentationError, match="external classification"):
         generator.validate_manifest(manifest)
 
 
@@ -236,6 +279,43 @@ def test_validate_manifest_rejects_unusable_catalog_confirmation():
         generator.validate_manifest(manifest)
 
 
+def test_freshness_validation_rejects_expired_catalog_source_and_proof():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    blockers = generator.validate_blocker_registry(
+        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
+    )
+    snapshot = generator.load_verification_snapshot(
+        generator.DEFAULT_VERIFICATION_SNAPSHOT
+    )
+
+    with pytest.raises(generator.SupportDocumentationError, match="catalog confirmation expired") as error:
+        generator.validate_support_freshness(
+            manifest,
+            blockers,
+            snapshot,
+            dt.date(2026, 8, 26),
+        )
+
+    assert "idaho terminal proof expired" in str(error.value)
+
+
+def test_freshness_validation_accepts_current_reviews():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    blockers = generator.validate_blocker_registry(
+        generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY)
+    )
+    snapshot = generator.load_verification_snapshot(
+        generator.DEFAULT_VERIFICATION_SNAPSHOT
+    )
+
+    generator.validate_support_freshness(
+        manifest,
+        blockers,
+        snapshot,
+        dt.date(2026, 7, 11),
+    )
+
+
 @pytest.mark.parametrize(
     "entry_id, expected_detail",
     [
@@ -291,10 +371,18 @@ def test_check_reports_generated_documentation_drift(tmp_path):
     manifest_path.write_text(json.dumps(generator.load_manifest(generator.DEFAULT_MANIFEST)), encoding="utf-8")
 
     assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path)]) == 0
-    assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path), "--check"]) == 0
+    assert generator.main([
+        "--manifest", str(manifest_path),
+        "--output", str(output_path),
+        "--check", "--as-of", "2026-07-11",
+    ]) == 0
     output_path.write_text("stale\n", encoding="utf-8")
 
-    assert generator.main(["--manifest", str(manifest_path), "--output", str(output_path), "--check"]) == 1
+    assert generator.main([
+        "--manifest", str(manifest_path),
+        "--output", str(output_path),
+        "--check", "--as-of", "2026-07-11",
+    ]) == 1
 
 
 def test_provider_directory_guide_local_links_resolve():
@@ -332,6 +420,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
         "--check",
         "openaddresses_geocode",
         "archive coordinates are never replaced",
+        "Resource completion",
+        "CI rejects expired evidence",
     ):
         assert command in guide
     assert "Never hand-edit the generated" in guide
