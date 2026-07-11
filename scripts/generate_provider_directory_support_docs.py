@@ -18,6 +18,7 @@ try:
         validate_access_review_metadata,
         validate_blocker_registry,
     )
+    from scripts.provider_directory_support_inventory import render_inventory_summary
 except ModuleNotFoundError:
     from provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
@@ -27,6 +28,7 @@ except ModuleNotFoundError:
         validate_access_review_metadata,
         validate_blocker_registry,
     )
+    from provider_directory_support_inventory import render_inventory_summary
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
@@ -288,9 +290,6 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "Catalog inventory was last confirmed in `" + confirmation_by_field["environment"] + "` against `" + confirmation_by_field["relation"] + "` at `" + confirmation_by_field["checked_at"] + "`. This timestamp confirms catalog coverage only; the tracked verification snapshot is the authority for terminal per-endpoint live status.",
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
-        "",
-        "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Known blocker or limitation |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
 def _configured_support_rows(
     manifest: dict[str, Any],
@@ -410,6 +409,7 @@ def render_markdown(
     if overlapping_ids:
         raise SupportDocumentationError("blocker registry IDs overlap runnable manifest entries: " + ", ".join(overlapping_ids))
     markdown_lines = _support_document_header(manifest)
+    markdown_lines.extend(render_inventory_summary(manifest, support_by_entry, blockers, _display))
     markdown_lines.extend(_configured_support_rows(manifest, support_by_entry))
     markdown_lines.extend(_blocked_support_section(blockers))
     markdown_lines.extend(_observed_verification_section(manifest, snapshot))

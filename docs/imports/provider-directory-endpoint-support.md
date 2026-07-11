@@ -6,6 +6,26 @@ Catalog inventory was last confirmed in `healthporta-dev` against `mrf.provider_
 
 `None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.
 
+## Inventory Summary
+
+| Category | Count |
+| --- | ---: |
+| Acquisition-configured | 23 |
+| Externally supported | 1 |
+| Probe-only | 4 |
+| Known not importable | 3 |
+| Total tracked | 31 |
+
+### Credentialed Or Registered Access
+
+| Source | Support | Access | Registration |
+| --- | --- | --- | --- |
+| Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required |
+| ALOHR (`alohr`) | Externally supported | Private connector | Required |
+| First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required |
+
+## Configured Sources
+
 | Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Known blocker or limitation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Idaho (`idaho`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api-idmedicaid.safhir.io/v1/api/provider-directory | pdfhir_b6fdc036a4686d0ab69f6f3a | Not required | 2026-07-10 | Accepts api-ida-prd.safhir.io cursor continuations with checkpoints. |

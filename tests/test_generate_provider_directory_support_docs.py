@@ -13,10 +13,12 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
 
     rendered_document = generator.render_markdown(manifest)
-    configured_table = rendered_document.split("## Known Not Importable", 1)[0]
+    configured_table = rendered_document.split(
+        "| Source | Configured support |", 1
+    )[1].split("## Known Not Importable", 1)[0]
     configured_rows = [
         line for line in configured_table.splitlines() if line.startswith("| ")
-    ][2:]
+    ][1:]
     entry_ids = [entry["entry_id"] for entry in manifest["entries"]]
 
     assert len(configured_rows) == len(entry_ids)
@@ -34,6 +36,16 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "selected `--report` path; the report is not tracked" in rendered_document
     assert "Catalog inventory was last confirmed in `healthporta-dev`" in rendered_document
     assert "tracked verification snapshot is the authority for terminal per-endpoint live status" in rendered_document
+    assert "## Inventory Summary" in rendered_document
+    assert "| Acquisition-configured | 23 |" in rendered_document
+    assert "| Externally supported | 1 |" in rendered_document
+    assert "| Probe-only | 4 |" in rendered_document
+    assert "| Known not importable | 3 |" in rendered_document
+    assert "| Total tracked | 31 |" in rendered_document
+    assert "### Credentialed Or Registered Access" in rendered_document
+    assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
+    assert "ALOHR (`alohr`) | Externally supported | Private connector | Required" in rendered_document
+    assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
     assert "| Registration | Reviewed at |" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
     assert "Required | 2026-07-11 | OAuth2 client credentials and Bulk" in rendered_document
