@@ -1180,6 +1180,10 @@ def provider_enrichment(test: bool):
     help="Publish Provider Directory contact and address archive artifacts without fetching FHIR resources.",
 )
 @click.option(
+    "--publish-artifacts-targets",
+    help="Comma-separated Provider Directory artifact stages to publish; defaults to all stages.",
+)
+@click.option(
     "--publish-corroboration/--no-publish-corroboration",
     default=None,
     help=(
@@ -1255,6 +1259,7 @@ def provider_directory_fhir(
     canonical_backfill_only: bool,
     contact_backfill_only: bool,
     publish_artifacts_only: bool,
+    publish_artifacts_targets: str | None,
     publish_corroboration: bool | None,
     full_refresh: bool,
     stale_cleanup: bool | None,
@@ -1295,6 +1300,7 @@ def provider_directory_fhir(
             canonical_backfill_only=canonical_backfill_only,
             contact_backfill_only=contact_backfill_only,
             publish_artifacts_only=publish_artifacts_only,
+            publish_artifacts_targets=publish_artifacts_targets,
             publish_corroboration=publish_corroboration,
             full_refresh=full_refresh,
             stale_cleanup=stale_cleanup,
