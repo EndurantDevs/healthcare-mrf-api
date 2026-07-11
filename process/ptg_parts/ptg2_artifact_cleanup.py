@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blobs import ptg2_artifact_id_from_db_uri
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -141,7 +142,9 @@ async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None)
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     rows = await db.all(
         f"""
-        SELECT sidecar->>'path' AS sidecar_path
+        SELECT sidecar->>'path' AS sidecar_path,
+               sidecar->>'storage' AS storage,
+               sidecar->>'storage_uri' AS storage_uri
           FROM {_quote_ident(schema_name)}.ptg2_snapshot snapshot
           CROSS JOIN LATERAL jsonb_array_elements(
               COALESCE(
@@ -153,7 +156,13 @@ async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None)
          ORDER BY sidecar->>'path'
         """
     )
-    return tuple(str(_row_value(row, "sidecar_path")) for row in rows if _row_value(row, "sidecar_path"))
+    return tuple(
+        str(_row_value(row, "sidecar_path"))
+        for row in rows
+        if _row_value(row, "sidecar_path")
+        and str(_row_value(row, "storage") or "") != "postgresql_chunks_v1"
+        and not ptg2_artifact_id_from_db_uri(str(_row_value(row, "storage_uri") or ""))
+    )
 
 
 def execute_ptg2_artifact_cleanup_plan(plan: PTG2ArtifactCleanupPlan) -> None:

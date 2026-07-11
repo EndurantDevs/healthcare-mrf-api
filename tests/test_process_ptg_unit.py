@@ -6108,6 +6108,32 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_ptg2_manifest_publish_omits_db_owned_local_paths(monkeypatch):
+    monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_retain_local_cache", lambda: False)
+
+    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+        schema_name="mrf",
+        snapshot_id="ptg2:test",
+        sidecar_artifacts={
+            "sidecars": [
+                {
+                    "name": "provider_forward",
+                    "path": "/work/ptg2-artifacts/serving/old/provider_forward.ptg2sc",
+                    "cache_path": "/tmp/ptg2-cache/provider_forward.ptg2sc",
+                    "storage": "postgresql_chunks_v1",
+                    "storage_uri": "db://ptg2_artifact/provider-forward",
+                }
+            ]
+        },
+    )
+
+    assert "path" not in artifacts["sidecars"][0]
+    assert "cache_path" not in artifacts["sidecars"][0]
+    assert artifacts["sidecars"][0]["storage_uri"] == "db://ptg2_artifact/provider-forward"
+
+
+@pytest.mark.asyncio
 async def test_ptg2_manifest_publish_uploads_base_artifact_sidecars_to_db(monkeypatch, tmp_path):
     provider_path = tmp_path / "provider_forward.ptg2sc"
     provider_path.write_bytes(b"PTG2MNDS" + b"\0" * 32)

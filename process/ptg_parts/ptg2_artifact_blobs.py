@@ -1,9 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """PostgreSQL-owned PTG2 binary artifact storage.
 
-The serving layer still uses mmap-backed binary readers for latency.  This
-module makes PostgreSQL the durable owner of those bytes and treats files as
-rebuildable local cache artifacts.
+PostgreSQL is the durable and serving source for these bytes. Files are only
+transient publish inputs unless local retention is explicitly enabled.
 """
 
 from __future__ import annotations
@@ -199,6 +198,12 @@ async def store_ptg2_artifact_file_in_db(
     if expected_byte_count != byte_count:
         raise ValueError(f"artifact byte_count changed before PostgreSQL upload: {artifact_path}")
 
+    if retain_local_cache is None:
+        retain_local_cache = ptg2_artifact_db_retain_local_cache()
+    if not retain_local_cache:
+        entry.pop("path", None)
+        entry.pop("cache_path", None)
+
     schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     artifact_name = str(entry.get("name") or name or artifact_kind)
     artifact_id = _artifact_id_for(
@@ -296,8 +301,6 @@ async def store_ptg2_artifact_file_in_db(
             "compression": compression,
         }
     )
-    if retain_local_cache is None:
-        retain_local_cache = ptg2_artifact_db_retain_local_cache()
     if not retain_local_cache:
         artifact_path.unlink(missing_ok=True)
     return entry
