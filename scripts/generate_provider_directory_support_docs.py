@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +28,12 @@ try:
         render_inventory_summary,
         resource_completion_display,
     )
+    from scripts.provider_directory_verification_contract import (
+        VERIFICATION_STATUSES,
+        provider_directory_entry_sha256,
+        validate_optional_verification_timestamp,
+        validate_verification_record,
+    )
 except ModuleNotFoundError:
     from provider_directory_support_contract import (
         ACCESS_REQUIREMENTS,
@@ -48,6 +53,12 @@ except ModuleNotFoundError:
         render_blocked_support_section,
         render_inventory_summary,
         resource_completion_display,
+    )
+    from provider_directory_verification_contract import (
+        VERIFICATION_STATUSES,
+        provider_directory_entry_sha256,
+        validate_optional_verification_timestamp,
+        validate_verification_record,
     )
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
@@ -74,24 +85,6 @@ DISPLAY_VALUES = {
     "probe": "Probe",
     "not-importable": "Not importable",
 }
-VERIFICATION_STATUSES = {
-    "bounded",
-    "canceled",
-    "cancelled",
-    "dead_letter",
-    "external_completed",
-    "external_incomplete",
-    "external_validation_failed",
-    "failed",
-    "metric_validation_failed",
-    "resume_required",
-    "succeeded",
-    "unknown_terminal",
-}
-ACCESS_VERIFICATION_VALUES = {"verified", "not_verified", "not_recorded"}
-PROOF_STATES = {"current", "superseded", "not_recorded"}
-ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
-SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 NOT_RECORDED = "not recorded"
 NOT_RECORDED_DISPLAY = "Not recorded"
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
@@ -123,6 +116,8 @@ def _entry_ids(entries: Any) -> list[str]:
     if len(entry_ids) != len(entries) or not all(entry_ids) or len(set(entry_ids)) != len(entry_ids):
         raise SupportDocumentationError("entries must have unique non-empty entry_id values")
     return entry_ids
+
+
 def _validate_entry_support(entry: dict[str, Any], support: Any) -> None:
     entry_id = str(entry["entry_id"])
     required_fields = {"support_level", "access_requirement", "requires_registration", "reviewed_at", "method", "limitation"}
@@ -214,90 +209,38 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def validate_verification_snapshot(
     snapshot: dict[str, Any],
-    entry_ids: list[str],
-    expected_campaign_id: str,
+    manifest: dict[str, Any],
+    *,
+    allow_current_spec_mismatch: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Validate the tracked snapshot and return its per-entry records."""
     if snapshot.get("schema_version") != 1:
         raise SupportDocumentationError("verification snapshot schema_version must be 1")
-    if snapshot.get("campaign_id") != expected_campaign_id:
+    if snapshot.get("campaign_id") != manifest["campaign_id"]:
         raise SupportDocumentationError("verification snapshot campaign_id does not match the manifest")
     environment = snapshot.get("environment")
     if not isinstance(environment, str) or not environment.strip():
         raise SupportDocumentationError("verification snapshot environment must be non-empty text")
-    _validate_optional_verification_timestamp(
+    validate_optional_verification_timestamp(
         snapshot.get("checked_at"),
         "verification snapshot checked_at",
     )
     entries = snapshot.get("entries")
+    manifest_entries = manifest["entries"]
+    entry_ids = [entry["entry_id"] for entry in manifest_entries]
     if not isinstance(entries, dict):
         raise SupportDocumentationError("verification snapshot entries must be an object")
     if set(entries) != set(entry_ids):
         raise SupportDocumentationError("verification snapshot entries must match manifest entries exactly")
-    for entry_id in entry_ids:
-        _validate_verification_record(entry_id, entries[entry_id])
+    for manifest_entry in manifest_entries:
+        entry_id = manifest_entry["entry_id"]
+        validate_verification_record(
+            entry_id,
+            entries[entry_id],
+            provider_directory_entry_sha256(manifest_entry),
+            allow_current_spec_mismatch=allow_current_spec_mismatch,
+        )
     return entries
-def _validate_optional_verification_timestamp(value: Any, label: str) -> None:
-    if value is None:
-        return
-    if not isinstance(value, str) or not value.strip():
-        raise SupportDocumentationError(f"{label} must be ISO-8601 or null")
-    try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SupportDocumentationError(f"{label} must be ISO-8601 or null") from exc
-    if parsed.tzinfo is None:
-        raise SupportDocumentationError(f"{label} must include a timezone")
-def _validate_verification_record(entry_id: str, verification_record: Any) -> None:
-    required_fields = {"terminal_status", "run_id", "access_verification", "checked_at"}
-    optional_fields = {"proof_state", "current_observation", "terminal_evidence"}
-    if (
-        not isinstance(verification_record, dict)
-        or not required_fields.issubset(verification_record)
-        or not set(verification_record).issubset(required_fields | optional_fields)
-    ):
-        raise SupportDocumentationError(f"{entry_id}: verification record fields are not controlled")
-    terminal_status = verification_record["terminal_status"]
-    run_id = verification_record["run_id"]
-    access_verification = verification_record["access_verification"]
-    checked_at = verification_record["checked_at"]
-    if terminal_status is not None and terminal_status not in VERIFICATION_STATUSES:
-        raise SupportDocumentationError(f"{entry_id}: invalid terminal verification status")
-    if run_id is not None and (not isinstance(run_id, str) or not run_id.startswith("run_")):
-        raise SupportDocumentationError(f"{entry_id}: run_id must be null or a run_ identifier")
-    if access_verification not in ACCESS_VERIFICATION_VALUES:
-        raise SupportDocumentationError(f"{entry_id}: invalid access verification value")
-    _validate_optional_verification_timestamp(checked_at, f"{entry_id}: checked_at")
-    if terminal_status is None and (
-        run_id is not None or checked_at is not None or access_verification != "not_recorded"
-    ):
-        raise SupportDocumentationError(f"{entry_id}: unverified entries must remain not recorded")
-    if terminal_status is not None and (
-        run_id is None or checked_at is None or access_verification == "not_recorded"
-    ):
-        raise SupportDocumentationError(f"{entry_id}: terminal entries need run_id and access verification")
-    proof_state = verification_record.get(
-        "proof_state", "current" if terminal_status is not None else "not_recorded"
-    )
-    if proof_state not in PROOF_STATES:
-        raise SupportDocumentationError(f"{entry_id}: invalid proof state")
-    if proof_state == "superseded" and terminal_status is None:
-        raise SupportDocumentationError(f"{entry_id}: superseded proof requires terminal evidence")
-    observation = verification_record.get("current_observation")
-    if observation is not None and (not isinstance(observation, dict) or set(observation) - {"run_id", "state_status", "run_status", "observed_at", "evidence"}):
-        raise SupportDocumentationError(f"{entry_id}: current observation fields are not controlled")
-    if isinstance(observation, dict):
-        _validate_optional_verification_timestamp(observation.get("observed_at"), f"{entry_id}: observed_at")
-        if observation.get("evidence") is not None and SENSITIVE_TEXT_PATTERN.search(json.dumps(observation["evidence"], sort_keys=True)):
-            raise SupportDocumentationError(f"{entry_id}: current observation evidence is not credential-safe")
-    if verification_record.get("terminal_evidence") is not None and (not isinstance(verification_record["terminal_evidence"], dict) or SENSITIVE_TEXT_PATTERN.search(json.dumps(verification_record["terminal_evidence"], sort_keys=True))):
-        raise SupportDocumentationError(f"{entry_id}: verification evidence is invalid")
-    if proof_state == "superseded":
-        if not isinstance(observation, dict):
-            raise SupportDocumentationError(f"{entry_id}: superseded proof requires a current observation")
-        observed_status = observation.get("run_status") or observation.get("state_status")
-        if observed_status not in ACTIVE_RUN_STATUSES or observation.get("run_id") == run_id:
-            raise SupportDocumentationError(f"{entry_id}: superseded proof requires a newer active run")
 def _support_document_header(manifest: dict[str, Any]) -> list[str]:
     report_path = manifest["support_documentation"]["runtime_status_report"]
     confirmation_by_field = _catalog_confirmation_fields(manifest)
@@ -375,8 +318,7 @@ def _observed_verification_section(
     manifest: dict[str, Any],
     snapshot: dict[str, Any],
 ) -> list[str]:
-    entry_ids = [entry["entry_id"] for entry in manifest["entries"]]
-    verification_records = validate_verification_snapshot(snapshot, entry_ids, manifest["campaign_id"])
+    verification_records = validate_verification_snapshot(snapshot, manifest)
     checked_at = snapshot["checked_at"] or NOT_RECORDED
     support_by_entry = manifest["support_documentation"]["entry_support"]
     verification_age = validate_freshness_policy(manifest)[
@@ -386,7 +328,7 @@ def _observed_verification_section(
         "",
         "## Observed Live Verification",
         "",
-        "This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.",
+        "This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. Every terminal record is bound to the fingerprint of its source entry, so changing an endpoint, resource set, or acquisition parameters invalidates only that source's current proof. Support-note edits do not invalidate unrelated acquisition evidence. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.",
         "",
         "After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.",
         "",

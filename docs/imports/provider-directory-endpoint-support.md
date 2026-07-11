@@ -71,7 +71,7 @@ These sources are intentionally retained as blocked catalog evidence. They are n
 
 ## Observed Live Verification
 
-This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.
+This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. Every terminal record is bound to the fingerprint of its source entry, so changing an endpoint, resource set, or acquisition parameters invalidates only that source's current proof. Support-note edits do not invalidate unrelated acquisition evidence. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.
 
 After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.
 
