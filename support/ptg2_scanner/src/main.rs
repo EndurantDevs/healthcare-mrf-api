@@ -12,7 +12,7 @@ use ptg2_scanner::config::{
 };
 use ptg2_scanner::copy_format::{
     emit_compact_copy_row, emit_manifest_lean_serving_copy_row, emit_manifest_serving_copy_row,
-    pg_text_array_field, pg_text_copy_field, write_copy_fields, CompactCopyRow,
+    pg_text_array_copy_field, pg_text_copy_field, write_copy_fields, CompactCopyRow,
     ManifestLeanServingCopyRow, ManifestServingCopyRow,
 };
 use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
@@ -2959,10 +2959,10 @@ impl DictionaryCopySinks {
             pg_text_copy_field(atom.negotiated_type.as_deref()),
             pg_text_copy_field(Some(&atom.negotiated_rate)),
             pg_text_copy_field(atom.expiration_date.as_deref()),
-            pg_text_array_field(&atom.service_code),
+            pg_text_array_copy_field(&atom.service_code),
             pg_text_copy_field(atom.billing_class.as_deref()),
             pg_text_copy_field(atom.setting.as_deref()),
-            pg_text_array_field(&atom.billing_code_modifier),
+            pg_text_array_copy_field(&atom.billing_code_modifier),
             pg_text_copy_field(atom.additional_information.as_deref()),
         ];
         let writer = sink.writer.as_mut().ok_or_else(|| {
@@ -3007,7 +3007,7 @@ impl DictionaryCopySinks {
         };
         let fields = [
             pg_text_copy_field(Some(code_set_hash)),
-            pg_text_array_field(codes),
+            pg_text_array_copy_field(codes),
         ];
         let writer = sink.writer.as_mut().ok_or_else(|| {
             io::Error::new(

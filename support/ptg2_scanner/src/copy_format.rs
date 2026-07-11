@@ -75,6 +75,11 @@ pub fn pg_text_array_field(values: &[String]) -> String {
     format!("{{{body}}}")
 }
 
+pub fn pg_text_array_copy_field(values: &[String]) -> String {
+    let array_literal = pg_text_array_field(values);
+    pg_text_copy_field(Some(&array_literal))
+}
+
 pub fn write_copy_fields<W: Write>(writer: &mut W, fields: &[String]) -> io::Result<()> {
     writer.write_all(fields.join("\t").as_bytes())?;
     writer.write_all(b"\n")?;
@@ -189,8 +194,8 @@ pub fn emit_manifest_lean_serving_copy_row<W: Write>(
 mod tests {
     use super::{
         emit_compact_copy_row, emit_manifest_lean_serving_copy_row, emit_manifest_serving_copy_row,
-        pg_text_array_field, pg_text_copy_field, CompactCopyRow, ManifestLeanServingCopyRow,
-        ManifestServingCopyRow,
+        pg_text_array_copy_field, pg_text_array_field, pg_text_copy_field, CompactCopyRow,
+        ManifestLeanServingCopyRow, ManifestServingCopyRow,
     };
 
     #[test]
@@ -213,6 +218,10 @@ mod tests {
         assert_eq!(
             pg_text_array_field(&values),
             "{\"26\",\"a\\\"b\",\"c\\\\d\",\"ef\"}"
+        );
+        assert_eq!(
+            pg_text_array_copy_field(&values).as_bytes(),
+            br#"{"26","a\\"b","c\\\\d","ef"}"#,
         );
     }
 
