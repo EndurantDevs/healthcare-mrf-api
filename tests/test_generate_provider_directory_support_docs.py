@@ -330,6 +330,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
         "scripts/update_provider_directory_verification.py",
         "scripts/generate_provider_directory_support_docs.py",
         "--check",
+        "openaddresses_geocode",
+        "archive coordinates are never replaced",
     ):
         assert command in guide
     assert "Never hand-edit the generated" in guide

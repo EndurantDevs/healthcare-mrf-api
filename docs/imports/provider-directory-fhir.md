@@ -574,6 +574,14 @@ table-backed PTG corroboration relation used by serving/search. The CLI defaults
 Provider Directory resource set. PTG corroboration publication defaults off
 because it is a global join; use `--publish-corroboration` only when refreshing
 that optional relation is part of the run.
+For newly staged FHIR keys whose archive rows still lack coordinates, artifact
+publication also applies an indexed exact-`address_key` fallback from
+`openaddresses_geocode`. It accepts duplicate OpenAddresses observations only
+when their coordinate spread is within the configured duplicate tolerance and
+rejects coordinate pairs outside plausible US and territory bounds. Existing
+archive coordinates are never replaced. The later overlay and temporary
+unified-address rebuild consume the enriched archive rows before their atomic
+serving-table cutovers.
 Small payer or single-resource smoke runs should pass `--no-publish-artifacts`
 or `publish_artifacts=false`; otherwise a bounded test can spend most of its
 runtime rebuilding global address artifacts that are unrelated to the smoke.
