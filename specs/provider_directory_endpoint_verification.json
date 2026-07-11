@@ -1,6 +1,6 @@
 {
   "campaign_id": "provider-directory-canonical-acquisition-2026-07-10-v2",
-  "checked_at": "2026-07-10T17:19:26Z",
+  "checked_at": "2026-07-11T01:12:22Z",
   "entries": {
     "aetna-commercial-medicare": {
       "access_verification": "not_recorded",
@@ -9,10 +9,145 @@
       "terminal_status": null
     },
     "alohr": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
-      "run_id": null,
-      "terminal_status": null
+      "access_verification": "verified",
+      "checked_at": "2026-07-11T01:12:22Z",
+      "current_observation": {
+        "evidence": {
+          "effective_acquisition": {
+            "bulk_export": null,
+            "completed_source_ids": {},
+            "selected_groups": 1,
+            "selected_sources": 1,
+            "sources_probed": 1
+          },
+          "resource_outcomes": {
+            "Location": {
+              "bulk_export_sources": 0,
+              "pages_fetched": 1194,
+              "rows_fetched": 119268,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Organization": {
+              "bulk_export_sources": 0,
+              "pages_fetched": 385,
+              "rows_fetched": 38419,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "OrganizationAffiliation": {
+              "bulk_export_sources": 0,
+              "pages_fetched": 385,
+              "rows_fetched": 38419,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Practitioner": {
+              "bulk_export_sources": 0,
+              "pages_fetched": 809,
+              "rows_fetched": 80849,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "PractitionerRole": {
+              "bulk_export_sources": 0,
+              "pages_fetched": 809,
+              "rows_fetched": 80849,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            }
+          },
+          "source_ids": [
+            "pdfhir_0f81c146991b27031b1ec366"
+          ]
+        },
+        "observed_at": "2026-07-11T01:12:22Z",
+        "run_id": "run_17baae4934f54639bd748d50554a9cbd",
+        "run_status": "succeeded",
+        "state_status": "external_completed"
+      },
+      "proof_state": "current",
+      "run_id": "run_17baae4934f54639bd748d50554a9cbd",
+      "terminal_evidence": {
+        "effective_acquisition": {
+          "bulk_export": null,
+          "completed_source_ids": {},
+          "selected_groups": 1,
+          "selected_sources": 1,
+          "sources_probed": 1
+        },
+        "resource_outcomes": {
+          "Location": {
+            "bulk_export_sources": 0,
+            "pages_fetched": 1194,
+            "rows_fetched": 119268,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Organization": {
+            "bulk_export_sources": 0,
+            "pages_fetched": 385,
+            "rows_fetched": 38419,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "OrganizationAffiliation": {
+            "bulk_export_sources": 0,
+            "pages_fetched": 385,
+            "rows_fetched": 38419,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Practitioner": {
+            "bulk_export_sources": 0,
+            "pages_fetched": 809,
+            "rows_fetched": 80849,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "PractitionerRole": {
+            "bulk_export_sources": 0,
+            "pages_fetched": 809,
+            "rows_fetched": 80849,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          }
+        },
+        "source_ids": [
+          "pdfhir_0f81c146991b27031b1ec366"
+        ]
+      },
+      "terminal_status": "external_completed"
     },
     "amerihealth-dc": {
       "access_verification": "not_recorded",
@@ -172,5 +307,12 @@
     }
   },
   "environment": "healthporta-dev",
+  "report_identity": {
+    "generated_at": "2026-07-11T01:12:22Z",
+    "manifest_sha256": "ed0d7971747b4473c6843d4ba667a5737892fda7897d6c30a18ccda925604d3c",
+    "mode": "apply",
+    "report_sha256": "87186e3ab04408d32a71c31ab6e919b1b12b5c018edf862c4dc7117dfba18175",
+    "schema_version": 1
+  },
   "schema_version": 1
 }
