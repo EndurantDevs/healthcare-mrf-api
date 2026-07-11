@@ -43,14 +43,20 @@ class PTG2ArtifactCleanupPlan:
 
     @property
     def referenced_bytes(self) -> int:
+        """Return bytes occupied by manifest-referenced local files."""
+
         return sum(path.stat().st_size for path in self.referenced_files if path.exists())
 
     @property
     def unreferenced_bytes(self) -> int:
+        """Return bytes that the cleanup plan can remove."""
+
         return sum(path.stat().st_size for path in self.unreferenced_files if path.exists())
 
     @property
     def has_actions(self) -> bool:
+        """Return whether the plan contains removable files."""
+
         return bool(self.unreferenced_files)
 
 
@@ -116,6 +122,8 @@ def build_ptg2_artifact_cleanup_plan(
     root: str | Path | None = None,
     referenced_paths: Iterable[str | Path] = (),
 ) -> PTG2ArtifactCleanupPlan:
+    """Classify local sidecar files against authoritative manifest paths."""
+
     sidecar_root = _resolve_existing_root(root)
     referenced = _normalize_referenced_paths(referenced_paths, sidecar_root=sidecar_root)
     if not sidecar_root.exists():
@@ -139,6 +147,8 @@ def build_ptg2_artifact_cleanup_plan(
 
 
 async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None) -> tuple[str, ...]:
+    """Return filesystem-owned sidecar paths still referenced by snapshots."""
+
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     rows = await db.all(
         f"""
@@ -166,6 +176,8 @@ async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None)
 
 
 def execute_ptg2_artifact_cleanup_plan(plan: PTG2ArtifactCleanupPlan) -> None:
+    """Delete unreferenced files and then prune empty directories."""
+
     for path in plan.unreferenced_files:
         if path.exists() and path.is_file():
             path.unlink()

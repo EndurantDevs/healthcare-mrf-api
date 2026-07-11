@@ -756,6 +756,7 @@ async def _zip_radius_rows(
     anchor_context: dict[str, Any] | None = None,
     limit: int = 512,
 ) -> list[dict[str, Any]]:
+    """Return ZIP codes within the requested radius, using cached anchor data when available."""
     normalized_zip = _normalize_zip5(zip5)
     if not normalized_zip:
         return []
@@ -1143,6 +1144,7 @@ async def _build_dynamic_zip_peer_stats(
     min_providers: int,
     iqr_factor: float,
 ) -> tuple[dict[str, Any], str] | None:
+    """Build trimmed ZIP-based peer charge statistics for a procedure cohort."""
     if not zip_candidates:
         return None
 
@@ -1340,6 +1342,7 @@ async def _enrich_provider_service_cost_indices(
     fallback_city: str | None = None,
     fallback_zip5: str | None = None,
 ) -> None:
+    """Populate provider service rows with peer-derived cost indices when profile tables exist."""
     if not items or not internal_codes:
         return
     if not await _table_exists(session, provider_procedure_cost_profile_table.name):
@@ -2538,6 +2541,7 @@ def _collect_peer_target_candidates(
     taxonomy_code: str | None,
     requested_procedure_codes: set[str],
 ) -> list[dict[str, Any]]:
+    """Collect quality peer targets matching geography, specialty, taxonomy, and procedure criteria."""
     geography_priority = _geography_priority_for_benchmark_mode(
         benchmark_mode,
         state_key=state_key,
@@ -2833,6 +2837,7 @@ async def _load_provider_quality_profile(
     npi: int,
     year: int | None,
 ) -> dict[str, Any] | None:
+    """Load provider identity, location, taxonomy, and enrichment attributes for quality scoring."""
     provider_year_filter = "AND p.year = :year" if year is not None else ""
     claims_state_expr = _state_code_sql("p.state")
     doctor_state_expr = _state_code_sql("d.state")
@@ -3173,6 +3178,7 @@ async def _load_estimated_quality_modes(
     taxonomy_code_override: str | None = None,
     specialty_key_override: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
+    """Load estimated quality scores for the profile's eligible benchmark modes."""
     scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
         mode: None
         for mode in QUALITY_BENCHMARK_MODE_ORDER
@@ -3372,6 +3378,7 @@ async def _resolve_procedure_override_codes(
 
 
 async def _load_provider_quality_observed(session, *, npi: int, year: int) -> dict[str, Any] | None:
+    """Load observed utilization, cost, prescription, and QPP measures for a provider and year."""
     provider_result = await session.execute(
         select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
     )
@@ -3488,6 +3495,7 @@ async def _load_quality_peer_targets(
     state_key: str | None = None,
     zip5: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Load quality peer targets for the requested benchmark modes and geographic scopes."""
     normalized_modes = [
         mode
         for mode in (benchmark_modes or QUALITY_BENCHMARK_MODE_ORDER)
@@ -3590,6 +3598,7 @@ def _build_live_mode_payload_for_candidate(
     procedure_match_threshold: float,
     selected_candidate: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """Build a live quality-score payload from observed measures and a selected peer target."""
     target_values: dict[str, float | None] = {
         "target_appropriateness": None,
         "target_rx_appropriateness": None,
@@ -3958,6 +3967,7 @@ async def _resolve_code_context(
     code_raw: Any,
     expand_codes: bool = False,
 ) -> dict[str, Any]:
+    """Resolve an input procedure code through crosswalk and optional catalog expansion rules."""
     code_system = _normalize_code_system(code_system_raw)
     code = _normalize_code(code_raw, "code")
 
@@ -4190,6 +4200,7 @@ def _classify_procedure_taxonomy_resolution(
     evidence_items: list[dict[str, Any]],
     allow_hard_filter: bool,
 ) -> dict[str, Any]:
+    """Classify taxonomy evidence and return recommended filters, confidence, and review flags."""
     normalized_code = str(reported_code or "").strip().upper()
     intent_codes, intent_source = _taxonomy_codes_for_intent(clinical_intent)
     curated_rule = _taxonomy_rule_for_reported_code(normalized_code)
@@ -4373,6 +4384,7 @@ async def _load_procedure_taxonomy_evidence(
     internal_codes: list[int],
     limit: int,
 ) -> list[dict[str, Any]]:
+    """Load provider taxonomy evidence for procedure codes, using cached and fallback sources."""
     if not internal_codes:
         return []
 
@@ -4530,6 +4542,7 @@ async def _resolve_internal_rx_codes_for_request(
     args,
     default_system: str = INTERNAL_RX_CODE_SYSTEM,
 ) -> tuple[list[str], dict[str, Any]]:
+    """Resolve an input prescription code to internal codes and crosswalk match metadata."""
     code_system = _normalize_code_system(args.get("rx_code_system") or args.get("code_system") or default_system)
     code = _normalize_code(rx_code_value, "rx_code")
     expand_codes = _parse_bool(args.get("expand_codes"), "expand_codes", default=False)
@@ -4801,6 +4814,7 @@ async def _search_ptg_allowed_amount_evidence(
     args: Mapping[str, Any],
     pagination,
 ) -> dict[str, Any] | None:
+    """Search imported PTG allowed-amount tables for provider-level matching evidence."""
     plan_id = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     code = str(args.get("code") or "").strip()
     if not plan_id or not code:
@@ -5933,6 +5947,7 @@ async def group_plan_providers(request):
 
 @blueprint.get("/statistics", name="pricing.statistics")
 async def pricing_statistics(request):
+    """Return aggregate provider and pricing statistics for the selected dataset."""
     session = _get_session(request)
 
     medicare_individuals_stmt = (
@@ -5977,6 +5992,7 @@ async def pricing_statistics(request):
 @blueprint.get("/providers", name="pricing.providers.list")
 @blueprint.get("/physicians", name="pricing.physicians.list")
 async def list_pricing_providers(request):
+    """List providers matching pricing filters and pagination parameters."""
     session = _get_session(request)
     args = request.args
 
@@ -6119,6 +6135,7 @@ async def list_pricing_providers(request):
 @blueprint.get("/providers/<npi>", name="pricing.providers.get")
 @blueprint.get("/physicians/<npi>", name="pricing.physicians.get")
 async def get_pricing_provider(request, npi: str):
+    """Return one provider's pricing summary, service count, and location count."""
     session = _get_session(request)
     args = request.args
 
@@ -6161,6 +6178,7 @@ async def get_pricing_provider(request, npi: str):
 @blueprint.get("/providers/<npi>/score", name="pricing.providers.score")
 @blueprint.get("/physicians/<npi>/score", name="pricing.physicians.score")
 async def get_pricing_provider_score(request, npi: str):
+    """Return provider quality scores, including estimated data when observed scores are unavailable."""
     session = _get_session(request)
     args = request.args
 
@@ -6193,6 +6211,7 @@ async def get_pricing_provider_score(request, npi: str):
         year_used: int,
         year_source_value: str,
     ):
+        """Return a fallback provider quality response for the selected year and benchmark mode."""
         profile = await _load_provider_quality_profile(session, npi=provider_npi, year=year_used)
         reasons = _provider_quality_unavailable_reasons(profile, benchmark_mode=benchmark_mode)
         scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
@@ -6553,6 +6572,7 @@ async def get_pricing_provider_score(request, npi: str):
 @blueprint.get("/providers/<npi>/procedures", name="pricing.providers.procedures.list")
 @blueprint.get("/physicians/<npi>/services", name="pricing.physicians.services.list")
 async def list_provider_procedures(request, npi: str):
+    """List procedure pricing records reported for a provider."""
     session = _get_session(request)
     args = request.args
 
@@ -6777,6 +6797,7 @@ async def _provider_procedure_detail(
     *,
     default_code_system: str = INTERNAL_CODE_SYSTEM,
 ):
+    """Build the provider procedure detail response for an internal or external service code."""
     session = _get_session(request)
     args = request.args
 
@@ -6839,6 +6860,7 @@ async def _provider_procedure_detail(
 
 @blueprint.get("/providers/<npi>/procedures/<procedure_code>", name="pricing.providers.procedures.get")
 async def get_provider_procedure(request, npi: str, procedure_code: str):
+    """Return provider-level pricing for an internal procedure code."""
     return await _provider_procedure_detail(
         request,
         npi,
@@ -6849,6 +6871,7 @@ async def get_provider_procedure(request, npi: str, procedure_code: str):
 
 @blueprint.get("/physicians/<npi>/services/<code_system>/<code>", name="pricing.physicians.services.get")
 async def get_physician_service(request, npi: str, code_system: str, code: str):
+    """Return physician service pricing after resolving the supplied code system."""
     return await _provider_procedure_detail(
         request,
         npi,
@@ -6864,6 +6887,7 @@ async def _provider_procedure_cost_level(
     *,
     default_code_system: str = INTERNAL_CODE_SYSTEM,
 ):
+    """Build the provider procedure estimated cost-level response from peer cost profiles."""
     session = _get_session(request)
     args = request.args
 
@@ -7221,6 +7245,7 @@ async def _provider_procedure_cost_level(
     name="pricing.providers.procedures.estimated_cost_level_internal.get",
 )
 async def get_provider_procedure_estimated_cost_level_internal(request, npi: str, procedure_code: str):
+    """Return estimated provider procedure cost level for an internal procedure code."""
     return await _provider_procedure_cost_level(
         request,
         npi,
@@ -7234,6 +7259,7 @@ async def get_provider_procedure_estimated_cost_level_internal(request, npi: str
     name="pricing.providers.procedures.estimated_cost_level.get",
 )
 async def get_provider_procedure_estimated_cost_level(request, npi: str, code_system: str, code: str):
+    """Return estimated provider procedure cost level after resolving the supplied code system."""
     return await _provider_procedure_cost_level(
         request,
         npi,
@@ -7247,6 +7273,7 @@ async def get_provider_procedure_estimated_cost_level(request, npi: str, code_sy
     name="pricing.physicians.services.estimated_cost_level.get",
 )
 async def get_physician_service_estimated_cost_level(request, npi: str, code_system: str, code: str):
+    """Return estimated physician service cost level after resolving the supplied code system."""
     return await _provider_procedure_cost_level(
         request,
         npi,
@@ -7262,6 +7289,7 @@ async def _provider_procedure_locations(
     *,
     default_code_system: str = INTERNAL_CODE_SYSTEM,
 ):
+    """Build the provider procedure location list response for a service code."""
     session = _get_session(request)
     args = request.args
 
@@ -7352,6 +7380,7 @@ async def _provider_procedure_locations(
 
 @blueprint.get("/providers/<npi>/procedures/<procedure_code>/locations", name="pricing.providers.procedures.locations.list")
 async def list_provider_procedure_locations(request, npi: str, procedure_code: str):
+    """List locations where a provider reports the requested internal procedure."""
     return await _provider_procedure_locations(
         request,
         npi,
@@ -7362,6 +7391,7 @@ async def list_provider_procedure_locations(request, npi: str, procedure_code: s
 
 @blueprint.get("/physicians/<npi>/services/<code_system>/<code>/locations", name="pricing.physicians.services.locations.list")
 async def list_physician_service_locations(request, npi: str, code_system: str, code: str):
+    """List physician service locations after resolving the supplied code system."""
     return await _provider_procedure_locations(
         request,
         npi,
@@ -7372,6 +7402,7 @@ async def list_physician_service_locations(request, npi: str, code_system: str, 
 
 @blueprint.get("/procedures/<code_system>/<code>/providers", name="pricing.procedures.providers.list")
 async def list_procedure_providers(request, code_system: str, code: str):
+    """List providers with claims history for the requested procedure or service code."""
     session = _get_session(request)
     args = request.args
 
@@ -7520,6 +7551,7 @@ async def list_procedure_providers(request, code_system: str, code: str):
 
 @blueprint.get("/procedures/<code_system>/<code>/benchmarks", name="pricing.procedures.benchmarks.get")
 async def get_procedure_benchmarks(request, code_system: str, code: str):
+    """Return national and state pricing benchmarks for a procedure or service code."""
     session = _get_session(request)
     args = request.args
 
@@ -7632,6 +7664,7 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
 
 @blueprint.get("/procedures/<code_system>/<code>/geo-benchmarks", name="pricing.procedures.geo_benchmarks.get")
 async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
+    """Return geographic pricing benchmarks for a procedure or service code."""
     session = _get_session(request)
     args = request.args
 
@@ -7737,12 +7770,13 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
 @blueprint.get("/provider-types/autocomplete", name="pricing.provider_types.autocomplete")
 @blueprint.get("/provider-specialties/autocomplete", name="pricing.provider_specialties.autocomplete")
 async def autocomplete_provider_types(request):
+    """Return paginated provider-type or specialty autocomplete matches."""
     session = _get_session(request)
     args = request.args
 
     pagination = parse_pagination(args, default_limit=20, max_limit=100)
     q = _normalize_query_text(args.get("q"), "q", min_len=2)
-    rows = await _query_terminology(
+    provider_type_rows = await _query_terminology(
         session,
         domain="provider_type",
         term=q,
@@ -7751,7 +7785,7 @@ async def autocomplete_provider_types(request):
         limit=max((pagination.offset + pagination.limit) * 5, 100),
     )
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in rows:
+    for row in provider_type_rows:
         target_system = str(row.get("target_system") or "").upper()
         target_code = str(row.get("target_code") or "")
         key = (target_system, target_code)
@@ -7795,7 +7829,7 @@ async def autocomplete_provider_types(request):
             },
             "query": {
                 "q": q,
-                "data_status": "available" if rows else "empty_or_unavailable",
+                "data_status": "available" if provider_type_rows else "empty_or_unavailable",
             },
         }
     )
@@ -7804,6 +7838,7 @@ async def autocomplete_provider_types(request):
 @blueprint.get("/provider-types/resolve", name="pricing.provider_types.resolve")
 @blueprint.get("/provider-specialties/resolve", name="pricing.provider_specialties.resolve")
 async def resolve_provider_type(request):
+    """Resolve a provider type or specialty query to canonical terminology matches."""
     session = _get_session(request)
     q = _normalize_query_text(request.args.get("q"), "q", min_len=2)
     resolution = await _resolve_provider_type_terms(session, [q])
@@ -7822,12 +7857,13 @@ async def resolve_provider_type(request):
 @blueprint.get("/procedures/resolve", name="pricing.procedures.resolve")
 @blueprint.get("/services/resolve", name="pricing.services.resolve")
 async def resolve_procedure_term(request):
+    """Resolve a procedure or service term to catalog and internal codes."""
     session = _get_session(request)
     args = request.args
     q = _normalize_query_text(args.get("q"), "q", min_len=2)
     exact = _parse_bool(args.get("exact"), "exact", default=True)
     include_broad = _parse_bool(args.get("include_broad"), "include_broad", default=True)
-    rows = await _query_terminology(
+    procedure_rows = await _query_terminology(
         session,
         domain="procedure",
         term=q,
@@ -7835,20 +7871,20 @@ async def resolve_procedure_term(request):
         include_broad=include_broad,
         limit=100,
     )
-    internal_codes = await _internal_procedure_codes_from_terminology(session, rows)
+    internal_codes = await _internal_procedure_codes_from_terminology(session, procedure_rows)
     return response.json(
         {
-            "items": rows,
+            "items": procedure_rows,
             "internal_codes": [str(value) for value in internal_codes],
             "resolved_codes": [
                 {"code_system": row.get("target_system"), "code": row.get("target_code")}
-                for row in rows
+                for row in procedure_rows
             ],
             "query": {
                 "q": q,
                 "exact": exact,
                 "include_broad": include_broad,
-                "matched": bool(rows),
+                "matched": bool(procedure_rows),
             },
         }
     )
@@ -7858,11 +7894,12 @@ async def resolve_procedure_term(request):
 @blueprint.get("/drugs/resolve", name="pricing.drugs.resolve")
 @blueprint.get("/prescriptions/resolve", name="pricing.prescriptions.resolve")
 async def resolve_medication_term(request):
+    """Resolve a medication term to terminology matches and internal codes."""
     session = _get_session(request)
     args = request.args
     q = _normalize_query_text(args.get("q"), "q", min_len=2)
     exact = _parse_bool(args.get("exact"), "exact", default=True)
-    rows = await _query_terminology(
+    medication_rows = await _query_terminology(
         session,
         domain="medication",
         term=q,
@@ -7870,19 +7907,22 @@ async def resolve_medication_term(request):
         include_broad=True,
         limit=100,
     )
-    internal_codes = await _internal_rx_codes_from_terminology(session, rows)
+    internal_codes = await _internal_rx_codes_from_terminology(session, medication_rows)
     return response.json(
         {
-            "items": rows,
+            "items": medication_rows,
             "internal_codes": internal_codes,
             "resolved_codes": [
-                {"code_system": row.get("target_system"), "code": row.get("target_code")}
-                for row in rows
+                {
+                    "code_system": medication_row.get("target_system"),
+                    "code": medication_row.get("target_code"),
+                }
+                for medication_row in medication_rows
             ],
             "query": {
                 "q": q,
                 "exact": exact,
-                "matched": bool(rows),
+                "matched": bool(medication_rows),
             },
         }
     )
@@ -7891,6 +7931,7 @@ async def resolve_medication_term(request):
 @blueprint.get("/procedures/autocomplete", name="pricing.procedures.autocomplete")
 @blueprint.get("/services/autocomplete", name="pricing.services.autocomplete")
 async def autocomplete_procedures(request):
+    """Return paginated procedure or service autocomplete matches from the code catalog."""
     session = _get_session(request)
     args = request.args
 
@@ -8152,6 +8193,7 @@ async def autocomplete_procedures(request):
 
 @blueprint.get("/procedure-taxonomy/resolve", name="pricing.procedure_taxonomy.resolve")
 async def resolve_procedure_taxonomy(request):
+    """Resolve procedure taxonomy evidence and recommended provider filters."""
     session = _get_session(request)
     args = request.args
     code = _normalize_code(args.get("code"), "code")
@@ -8237,6 +8279,7 @@ async def resolve_procedure_taxonomy(request):
 @blueprint.get("/provider-specialties", name="pricing.provider_specialties.list")
 @blueprint.get("/providers/specialties", name="pricing.providers.specialties.list")
 async def list_provider_specialties(request):
+    """List provider specialties with optional search and geographic filters."""
     session = _get_session(request)
     args = request.args
 
@@ -8409,6 +8452,7 @@ async def list_provider_specialties(request):
 @blueprint.get("/drugs/autocomplete", name="pricing.drugs.autocomplete")
 @blueprint.get("/medications/autocomplete", name="pricing.medications.autocomplete")
 async def autocomplete_prescriptions(request):
+    """Return paginated prescription autocomplete matches."""
     session = _get_session(request)
     args = request.args
 
@@ -8572,6 +8616,7 @@ async def autocomplete_prescriptions(request):
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
 async def list_providers_by_procedure(request):
+    """List providers with pricing records matching a procedure or service code."""
     session = _get_session(request)
     args = request.args
 
@@ -9089,6 +9134,7 @@ async def list_providers_by_procedure(request):
 @blueprint.get("/physicians/by-prescription", name="pricing.physicians.by_prescription")
 @blueprint.get("/physicians/by-drug", name="pricing.physicians.by_drug")
 async def list_providers_by_prescription(request):
+    """List providers with prescription records matching a medication code."""
     session = _get_session(request)
     args = request.args
 
@@ -9290,6 +9336,7 @@ async def list_providers_by_prescription(request):
 @blueprint.get("/providers/<npi>/prescriptions", name="pricing.providers.prescriptions.list")
 @blueprint.get("/physicians/<npi>/prescriptions", name="pricing.physicians.prescriptions.list")
 async def list_provider_prescriptions(request, npi: str):
+    """List a provider's prescription utilization records with optional filters."""
     session = _get_session(request)
     args = request.args
 
@@ -9499,6 +9546,7 @@ async def _provider_prescription_detail(
     name="pricing.providers.prescriptions.get",
 )
 async def get_provider_prescription(request, npi: str, rx_code_system: str, rx_code: str):
+    """Return provider-level prescription utilization for a resolved prescription code."""
     return await _provider_prescription_detail(request, npi, rx_code_system, rx_code)
 
 
@@ -9507,6 +9555,7 @@ async def get_provider_prescription(request, npi: str, rx_code_system: str, rx_c
     name="pricing.physicians.prescriptions.get",
 )
 async def get_physician_prescription(request, npi: str, rx_code_system: str, rx_code: str):
+    """Return physician prescription utilization after resolving the supplied code system."""
     return await _provider_prescription_detail(request, npi, rx_code_system, rx_code)
 
 
@@ -9515,6 +9564,7 @@ async def get_physician_prescription(request, npi: str, rx_code_system: str, rx_
     name="pricing.prescriptions.providers.list",
 )
 async def list_prescription_providers(request, rx_code_system: str, rx_code: str):
+    """List providers with prescription records matching a code and optional filters."""
     session = _get_session(request)
     args = request.args
 
@@ -9668,6 +9718,7 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
     name="pricing.prescriptions.benchmarks.get",
 )
 async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str):
+    """Return aggregate prescription benchmarks for a code and optional geography."""
     session = _get_session(request)
     args = request.args
 

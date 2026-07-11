@@ -625,6 +625,8 @@ def _ptg2_manifest_provider_location_filters(
     query_context: _ManifestProviderLocationQuery,
     group_filter_sql: str,
 ) -> list[str]:
+    """Build predicates for one manifest-backed provider-location query."""
+
     location_filter_clauses = ["loc.npi IS NOT NULL", group_filter_sql]
     if query_context.state_value:
         location_filter_clauses.append("loc.state_name = :state_value")
@@ -862,6 +864,8 @@ def _ptg2_address_zip5_sql(alias: str, *, unified: bool) -> str:
 
 
 def normalize_ptg2_mode(value: str | None) -> str:
+    """Normalize and validate the requested PTG2 serving mode."""
+
     mode = str(value or PTG2_MODE_PRODUCT_SEARCH).strip().lower()
     if mode not in {PTG2_MODE_EXACT_SOURCE, PTG2_MODE_PRODUCT_SEARCH}:
         raise ValueError("mode must be exact_source or product_search")
@@ -1266,6 +1270,8 @@ def _address_verification_payload(
     data: dict[str, Any],
     address_payload: dict[str, Any],
 ) -> dict[str, Any]:
+    """Describe the network and address evidence behind one provider row."""
+
     displayed_address_present = _has_displayed_address_payload(item, address_payload)
     if displayed_address_present is False:
         return {
@@ -1622,6 +1628,8 @@ async def _overlay_provider_directory_corroboration(
     snapshot_id: str | None = None,
     source_key: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Overlay plan-scoped directory corroboration onto provider rows."""
+
     if not rows or not (plan_id or snapshot_id or source_key):
         return rows
     lookup_pairs: list[tuple[int, str]] = []
@@ -2092,6 +2100,8 @@ def search_ptg2_index(
     zip5: str | None = None,
     npi: int | str | None = None,
 ) -> dict[str, Any]:
+    """Search the legacy in-memory PTG2 index using exact request filters."""
+
     requested_plan = str(plan_id or plan_external_id or "").strip()
     requested_code = str(code or "").strip()
     requested_state = str(state or "").strip().upper()
@@ -2162,6 +2172,8 @@ def search_ptg2_index(
 
 
 def warm_cache_benchmark(index: PTG2ServingIndex, request_count: int = 100) -> dict[str, Any]:
+    """Measure warm repeated lookup latency for an in-memory PTG2 index."""
+
     request_count = max(int(request_count or 1), 1)
     plan_id = next(iter(index.rates.keys()), "")
     code = next(iter(dict(index.rates.get(plan_id) or {}).keys()), "")
@@ -2182,6 +2194,8 @@ def _ptg2_manifest_artifact_entries(serving_tables: PTG2ServingTables, name: str
     seen: set[tuple[str, str]] = set()
 
     def add_entry(value: Any) -> None:
+        """Append a unique artifact descriptor to the candidate list."""
+
         if not isinstance(value, dict):
             return
         path = str(value.get("path") or "").strip()
@@ -2921,6 +2935,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
     offset: int = 0,
     apply_window: bool = False,
 ) -> list[dict[str, Any]] | None:
+    """Resolve one provider's procedure rows from reverse binary artifacts."""
+
     if not (
         serving_tables.serving_binary_table
         or _ptg2_manifest_artifact_entry(serving_tables, "serving_by_provider_set")
@@ -3881,6 +3897,8 @@ async def _ptg2_manifest_provider_procedure_rows_from_lean_table(
     limit: int,
     offset: int = 0,
 ) -> list[dict[str, Any]] | None:
+    """Resolve one provider's procedure rows from the retained lean table."""
+
     table_name = _safe_table_name(serving_tables.serving_table)
     if not table_name:
         return None
@@ -4079,6 +4097,8 @@ async def _ptg2_manifest_sidecar_members_many_async(
     *,
     max_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
+    """Fetch sidecar memberships for many owner IDs from PostgreSQL artifacts."""
+
     owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
     result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
     if not owner_id_list:
@@ -4398,6 +4418,8 @@ async def _manifest_rate_provider_groups_from_sidecar(
     reported_code: str,
     code_system: str | None,
 ) -> tuple[str, ...]:
+    """Resolve provider groups for one plan and reported code from artifacts."""
+
     table_name = _safe_table_name(serving_table)
     if (
         not plan_id
@@ -5411,6 +5433,8 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     snapshot_id: str | None = None,
     source_key: str | None = None,
 ) -> list[dict[str, Any]] | None:
+    """Enrich NPIs with provider, taxonomy, and address serving data."""
+
     npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))[:limit]
     if not npis:
         return []
@@ -5791,6 +5815,8 @@ async def _search_ptg2_manifest_route_item_table(
     requested_system: str | None,
     requested_code: str,
 ) -> dict[str, Any] | None:
+    """Serve an eligible geo query through preprojected route-item tables."""
+
     if not _ptg2_route_item_fast_path_allowed(args):
         return None
     try:
@@ -7408,6 +7434,8 @@ async def _ptg2_manifest_location_provider_matches(
     snapshot_id: str | None = None,
     source_key: str | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
+    """Resolve location-filtered provider sets and their matching rows."""
+
     if _has_membership_graph(serving_tables):
         graph_candidate_limit = _ptg2_manifest_location_match_limit()
         if candidate_limit is not None:
@@ -8121,6 +8149,8 @@ async def _ptg2_manifest_location_provider_matches(
         return _ptg2_filter_location_rows(member_result_set, rate_provider_group_scope, configured_limit)
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Query matching provider locations for the requested address types."""
+
         address_filters = [*filters]
         address_params = {**params, "address_types": list(address_types)}
         final_member_where_sql = f"WHERE {' AND '.join(final_member_filters)}" if final_member_filters else ""
@@ -8273,6 +8303,8 @@ async def _ptg2_manifest_location_provider_matches(
         return _ptg2_filter_location_rows(location_rows, rate_provider_group_scope, configured_limit)
 
     async def _fill_location_phone_fallbacks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fill missing unified-address phones from indexed fallback rows."""
+
         if not using_unified_address_table:
             return rows
         missing_rows = [row for row in rows if not row.get("telephone_number") and not row.get("phone_number")]
@@ -8540,6 +8572,8 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     limit_per_set: int,
     args: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]] | None:
+    """Resolve enriched provider rows for each requested provider set."""
+
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
     if not provider_set_ids:
         return {}
@@ -9455,6 +9489,8 @@ def _compact_provider_filter_sql(
     *,
     address_table: str | None = None,
 ) -> tuple[str, bool]:
+    """Build the provider-filter CTE for a compact serving query."""
+
     has_geo = bool(args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long") or args.get("radius_miles"))
     specialty_filter = resolve_provider_specialty_filter(args)
     inferred_sql = _inferred_provider_taxonomy_code_sql(
@@ -9673,6 +9709,8 @@ def _compact_provider_expansion_sql(
     address_table: str | None = None,
     provider_name_table: str | None = None,
 ) -> str:
+    """Build joins that expand compact rates into provider response rows."""
+
     if not _request_bool(args.get("include_providers")):
         return ""
     resolved_address_table = address_table or f"{PTG2_SCHEMA}.npi_address"
@@ -9845,6 +9883,8 @@ def _compact_provider_expansion_sql(
 
 
 def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Shape one compact database row into the public provider payload."""
+
     prices = _normalize_price_payload(data.get("prices") or [])
     provider_set_hashes = _coerce_json_payload(data.get("provider_set_hashes"), [])
     provider_set_hash = data.get("provider_set_hash") or (provider_set_hashes[0] if provider_set_hashes else None)
@@ -9925,6 +9965,8 @@ async def _search_compact_serving_table(
     params: dict[str, Any],
     mode_value: str,
 ) -> dict[str, Any] | None:
+    """Search one compact serving relation with resolved request filters."""
+
     if not _compact_required_tables(serving_tables):
         return None
     params = dict(params)
@@ -10259,6 +10301,8 @@ async def search_ptg2_serving_table(
     *,
     serving_tables: PTG2ServingTables | None = None,
 ) -> dict[str, Any] | None:
+    """Dispatch a snapshot query to its explicit serving architecture."""
+
     mode_value = normalize_ptg2_mode(args.get("mode"))
     serving_tables = serving_tables or PTG2ServingTables()
     table_name = _safe_table_name(serving_tables.serving_table)
@@ -10340,6 +10384,8 @@ async def _search_ptg2_manifest_provider_procedures(
     snapshot_id: str,
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any] | None:
+    """Search manifest-backed procedures and prices for one provider NPI."""
+
     table_name = _safe_table_name(serving_tables.serving_table)
     has_reverse_sidecar = bool(
         serving_tables.serving_binary_table
@@ -10622,6 +10668,8 @@ async def _search_compact_provider_procedures(
     snapshot_id: str,
     serving_tables: PTG2ServingTables,
 ) -> dict[str, Any] | None:
+    """Search a compact serving relation for one provider's procedures."""
+
     table_name = _safe_table_name(serving_tables.serving_table)
     if not table_name or not await _serving_table_available(session, table_name):
         return None
@@ -11167,6 +11215,8 @@ async def _search_multi_ptg2_snapshots(
 
 
 async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -> dict[str, Any] | None:
+    """Resolve current plan snapshots and execute a single or multi-network query."""
+
     explicit_snapshot = str(args.get("snapshot_id") or "").strip()
     explicit_source = str(args.get("source_key") or "").strip()
     plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
