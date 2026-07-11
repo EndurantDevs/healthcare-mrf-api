@@ -83,6 +83,7 @@ def _success_metrics(entry):
 
 def _run_record(manifest, entry, run_id, status="succeeded", metrics=None, extra_params=None):
     params_by_name = harness.entry_params(manifest, entry)
+    params_by_name["provider_directory_endpoint_scope"] = entry["canonical_base"]
     params_by_name.update(extra_params or {})
     return {
         "run_id": run_id,
@@ -171,6 +172,7 @@ def test_aetna_bulk_acquisition_payload_is_exact_and_audited():
         "importer": "provider-directory-fhir",
         "engine": "healthcare-mrf-api",
         "params": expected_params_by_name,
+        "provider_directory_endpoint_scope": "https://apif1.aetna.com/fhir/v1/providerdirectorydata",
         "idempotency_key": "1374e1a4c9ee0440892ed944c80d2039830d70c09bbd8757",
         "client_id": "provider-directory-canonical-acquisition-2026-07-10-v2:aetna-commercial-medicare",
         "triggered_by": "endpoint_acquisition",
@@ -330,19 +332,6 @@ def test_restart_skips_completed_entry(tmp_path):
     assert len(control.created_requests) == 1
     assert control.created_requests[0]["params"]["source_ids"] == molina["source_ids"]
     assert state["entries"]["idaho"]["current_run_id"] == "run_idaho_done"
-
-
-def test_unrelated_active_run_blocks(tmp_path):
-    manifest = harness.load_manifest()
-    molina = _manifest_entry(manifest, "molina")
-    active_run = _run_record(manifest, molina, "run_other", "running")
-    control = FakeImportControl(runs=[active_run])
-
-    state = _execute_case(tmp_path, manifest, control, ["idaho"])
-
-    assert control.created_requests == []
-    assert state["entries"]["idaho"]["status"] == "active_conflict"
-    assert "run_other" in state["entries"]["idaho"]["message"]
 
 
 def test_retry_lineage_is_followed(tmp_path):

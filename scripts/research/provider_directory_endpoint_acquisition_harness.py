@@ -15,10 +15,14 @@ from pathlib import Path
 from typing import Any, Callable
 try:
     from scripts.research.provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
+    from scripts.research.provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry
+    from scripts.research.provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from scripts.research.provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
+    from provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry
+    from provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
     from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,9 +36,6 @@ FINISHED_STATE_STATUSES = {"succeeded", "external_completed"}
 VERIFICATION_TERMINAL_STATUSES = {"bounded", "canceled", "cancelled", "dead_letter", "external_completed", "external_incomplete", "external_validation_failed", "failed", "metric_validation_failed", "resume_required", "succeeded", "unknown_terminal"}
 SOURCE_ID_PATTERN = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-SENSITIVE_TEXT_PATTERN = re.compile(
-    r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
-)
 PAGINATION_ERROR = "provider_directory_pagination_resume_required"
 RESOURCE_PROFILES = {
     "R8": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"],
@@ -93,6 +94,8 @@ def _atomic_write_json(json_path: Path, json_value: dict[str, Any]) -> None:
     finally:
         if temporary_name and os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
 def _reject_sensitive_content(json_value: Any, location: str = "manifest") -> None:
     if isinstance(json_value, dict):
         for field_name, field_value in json_value.items():
@@ -185,6 +188,7 @@ def create_run_payload(manifest: dict[str, Any], entry: dict[str, Any], fresh_ro
     return {
         "importer": manifest["importer"], "engine": manifest["engine"],
         "params": entry_params(manifest, entry),
+        "provider_directory_endpoint_scope": entry["canonical_base"],
         "idempotency_key": hashlib.sha256(idempotency_seed.encode("utf-8")).hexdigest()[:48],
         "client_id": _client_id(manifest, entry), "triggered_by": "endpoint_acquisition",
     }
@@ -212,11 +216,16 @@ def _run_param_errors(manifest: dict[str, Any], entry: dict[str, Any], run_recor
     for param_name, expected_value in entry_params(manifest, entry).items():
         if actual_params.get(param_name) != expected_value:
             errors.append(f"params.{param_name} does not match the manifest")
+    actual_endpoint_scope = str(actual_params.get("provider_directory_endpoint_scope") or "").rstrip("/")
+    if actual_endpoint_scope and actual_endpoint_scope != str(entry["canonical_base"]).rstrip("/"):
+        errors.append("params.provider_directory_endpoint_scope does not match the manifest")
     if entry["classification"] == "probe_only":
         forbidden_keys = sorted(PROBE_OMITTED_KEYS.intersection(actual_params))
         if forbidden_keys:
             errors.append(f"probe-only run contains resource/pagination params: {','.join(forbidden_keys)}")
     return errors
+
+
 def terminal_metric_errors(manifest: dict[str, Any], entry: dict[str, Any], run_record: dict[str, Any]) -> list[str]:
     """Return terminal safety and completeness failures for one run."""
     errors = _run_param_errors(manifest, entry, run_record)
@@ -243,37 +252,6 @@ def _is_resume_required(run_record: dict[str, Any]) -> bool:
     if metrics.get("pagination_resume_required"):
         return True
     return PAGINATION_ERROR in json.dumps(run_record.get("error") or "", sort_keys=True).lower()
-def _has_bounded_metrics(run_record: dict[str, Any]) -> bool:
-    metrics = run_record.get("metrics") if isinstance(run_record.get("metrics"), dict) else {}
-    stats = metrics.get("resource_fetch_stats") if isinstance(metrics.get("resource_fetch_stats"), dict) else {}
-    return any(isinstance(resource_stats, dict) and resource_stats.get("sources_bounded", 0) for resource_stats in stats.values())
-
-def _terminal_error_summary(error: Any) -> dict[str, str] | None:
-    if not isinstance(error, dict):
-        return None
-    safe_field_names = ("code", "type", "status", "reason", "message")
-    terminal_error_by_field = {name: str(error[name])[:500] for name in safe_field_names if isinstance(error.get(name), (str, int, float, bool)) and "..." not in str(error[name]) and not SENSITIVE_TEXT_PATTERN.search(str(error[name]))}
-    return terminal_error_by_field or None
-
-
-def _run_summary(run_record: dict[str, Any]) -> dict[str, Any]:
-    metrics = run_record.get("metrics") if isinstance(run_record.get("metrics"), dict) else {}
-    params_by_name = run_record.get("params") if isinstance(run_record.get("params"), dict) else {}
-    run_summary_dict = {
-        "run_id": run_record.get("run_id"), "status": run_record.get("status"), "created_at": run_record.get("created_at"),
-        "finished_at": run_record.get("finished_at"), "retry_of_run_id": params_by_name.get("retry_of_run_id"),
-        "source_ids": metrics.get("source_ids"), "sources_probed": metrics.get("sources_probed"),
-        "selected_sources": metrics.get("source_import_sources_selected"), "selected_groups": metrics.get("source_import_groups_attempted"),
-        "pagination_resume_required": metrics.get("pagination_resume_required"),
-        "resource_outcomes": metrics.get("resource_fetch_stats"),
-        "effective_acquisition": {"sources_probed": metrics.get("sources_probed"), "selected_sources": metrics.get("source_import_sources_selected"), "selected_groups": metrics.get("source_import_groups_attempted"), "completed_source_ids": metrics.get("resource_fetch_completed_source_ids"), "bulk_export": metrics.get("bulk_export_mode")},
-    }
-    terminal_error = _terminal_error_summary(run_record.get("error"))
-    if terminal_error:
-        run_summary_dict["terminal_error"] = terminal_error
-    return run_summary_dict
-
-
 class AcquisitionHarness:
     def __init__(self, manifest: dict[str, Any], client: Any, config: HarnessConfig, sleeper: Callable[[float], None] = time.sleep):
         self.manifest = manifest
@@ -283,12 +261,21 @@ class AcquisitionHarness:
         self.state = _load_state(config.state_path, manifest)
     def execute_campaign(self) -> dict[str, Any]:
         """Execute selected entries serially, stopping at the first apply failure."""
+        with campaign_state_lock(self.config.state_path):
+            return self._execute_locked_campaign()
+    def _execute_locked_campaign(self) -> dict[str, Any]:
+        """Execute while this harness exclusively owns its state/report pair."""
         AdoptionManager(
             self.manifest,
             self.state,
             self.client,
             lambda entry, run_record: _run_param_errors(self.manifest, entry, run_record),
             self._remember_run,
+            lambda entry, run_record: is_active_run_conflicting_with_entry(
+                entry,
+                entry_params(self.manifest, entry),
+                run_record,
+            ),
         ).apply(self.config.adopt_run_ids, self.config.restart_entry_ids, self.config.apply)
         self._restart_requested_entries()
         self._persist()
@@ -396,8 +383,19 @@ class AcquisitionHarness:
         active_runs = [run for run in run_list if run.get("status") in ACTIVE_STATUSES]
         matching_runs = [run for run in active_runs if not _run_param_errors(self.manifest, entry, run)]
         unrelated_runs = [run for run in active_runs if run not in matching_runs]
-        if unrelated_runs or len(matching_runs) > 1:
-            conflict_ids = ",".join(str(run.get("run_id")) for run in active_runs)
+        blocking_runs = [
+            run
+            for run in unrelated_runs
+            if is_active_run_conflicting_with_entry(
+                entry,
+                entry_params(self.manifest, entry),
+                run,
+            )
+        ]
+        if blocking_runs or len(matching_runs) > 1:
+            conflict_ids = ",".join(
+                str(run.get("run_id")) for run in [*matching_runs, *blocking_runs]
+            )
             raise HarnessConflict(f"{entry['entry_id']}: active Provider Directory conflict: {conflict_ids}")
         return matching_runs[0] if matching_runs else None
     def _latest_lineage_run(self, root_run: dict[str, Any], run_list: list[dict[str, Any]]) -> dict[str, Any]:
