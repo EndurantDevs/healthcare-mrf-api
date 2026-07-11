@@ -3521,6 +3521,82 @@ def test_ptg2_logical_identity_streams_gzip_without_materializing_json(tmp_path)
         assert fp.read() == expected
 
 
+@pytest.mark.parametrize("container", ["plain", "gzip", "zip"])
+def test_ptg2_json_artifact_stream_strips_utf8_bom(tmp_path, container):
+    expected = b'{"in_network":[]}'
+    payload = b"\xef\xbb\xbf" + expected
+    if container == "plain":
+        raw_path = tmp_path / "rates.json"
+        raw_path.write_bytes(payload)
+    elif container == "gzip":
+        raw_path = tmp_path / "rates.json.gz"
+        with gzip.open(raw_path, "wb") as gzip_fp:
+            gzip_fp.write(payload)
+    else:
+        raw_path = tmp_path / "rates.zip"
+        with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
+            zip_ref.writestr("rates.json", payload)
+
+    with process_ptg.open_json_artifact_stream(raw_path) as json_fp:
+        assert json_fp.read(1) == expected[:1]
+        assert json_fp.read() == expected[1:]
+
+
+def test_ptg2_bom_reader_zero_length_reads_do_not_consume_source():
+    expected = b'{"in_network":[]}'
+    source = io.BytesIO(b"\xef\xbb\xbf" + expected)
+    reader = ptg_artifact_streams._Utf8BomSkippingReader(source)
+
+    assert reader.read(0) == b""
+    assert reader.readinto(bytearray()) == 0
+    assert source.tell() == 0
+    assert reader.read() == expected
+
+
+@pytest.mark.parametrize("container", ["plain", "gzip", "zip"])
+def test_ptg2_bom_logical_identity_matches_materialized_artifact(tmp_path, container):
+    expected = b'{"in_network":[]}'
+    payload = b"\xef\xbb\xbf" + expected
+    if container == "plain":
+        raw_path = tmp_path / "rates.json"
+        raw_path.write_bytes(payload)
+    elif container == "gzip":
+        raw_path = tmp_path / "rates.json.gz"
+        with gzip.open(raw_path, "wb") as gzip_fp:
+            gzip_fp.write(payload)
+    else:
+        raw_path = tmp_path / "rates.zip"
+        with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
+            zip_ref.writestr("rates.json", payload)
+
+    identified = process_ptg.logical_artifact_identity(raw_path)
+    materialized = process_ptg.stream_logical_artifact(raw_path, output_dir=tmp_path / "logical")
+
+    assert identified.logical_sha256 == process_ptg.sha256_bytes(expected)
+    assert materialized.logical_sha256 == identified.logical_sha256
+    assert materialized.byte_count == identified.byte_count == len(expected)
+    with process_ptg.open_json_artifact_stream(materialized.logical_path) as logical_fp:
+        assert logical_fp.read() == expected
+
+
+def test_ptg2_metadata_extraction_accepts_utf8_bom(tmp_path):
+    raw_path = tmp_path / "rates.json"
+    raw_path.write_bytes(
+        b'\xef\xbb\xbf{"reporting_entity_name":"Example Administrator",'
+        b'"reporting_entity_type":"third-party administrator",'
+        b'"last_updated_on":"2026-06-01",'
+        b'"version":"1.0",'
+        b'"in_network":[]}'
+    )
+
+    metadata = asyncio.run(process_ptg._extract_metadata_fields(str(raw_path)))
+
+    assert metadata["reporting_entity_name"] == "Example Administrator"
+    assert metadata["reporting_entity_type"] == "third-party administrator"
+    assert metadata["last_updated_on"] == "2026-06-01"
+    assert metadata["version"] == "1.0"
+
+
 def test_ptg2_open_json_artifact_stream_reads_deflate64_zip(tmp_path):
     raw_path = tmp_path / "rates.zip"
     expected = b'{"in_network":[{"negotiated_rates":[]}]}'
@@ -8588,12 +8664,19 @@ def test_scanner_allows_sigterm_after_dedupe():
     assert ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         -15,
         ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+        has_stdout_terminal_summary=True,
+    )
+    assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
+        -15,
+        ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
     )
     assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         -15,
         ["PTG2_SCANNER_PROGRESS\tpercent=99.66"],
+        has_stdout_terminal_summary=True,
     )
     assert not ptg_rust_scanner._is_scanner_sigterm_after_dedupe(
         1,
         ["PTG2_DEDUPE_SUMMARY\tserving_rate_unique=146682732"],
+        has_stdout_terminal_summary=True,
     )

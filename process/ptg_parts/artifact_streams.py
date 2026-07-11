@@ -24,7 +24,6 @@ try:
 except ImportError:  # pragma: no cover - dependency is installed in deployed images
     inflate64 = None
 
-from process.ptg_parts.artifacts import sha256_file
 from process.ptg_parts.config import (
     PTG2_DEFER_LOGICAL_HASH_BYTES_ENV,
     PTG2_ISAL_GZIP_ENV,
@@ -92,6 +91,60 @@ class _DecompressedByteLimitReader:
         return len(chunk)
 
 
+class _Utf8BomSkippingReader:
+    def __init__(self, source):
+        self._source = source
+        self._prefix = b""
+        self._checked = False
+
+    def is_readable(self) -> bool:
+        """Return whether the JSON stream accepts reads."""
+
+        return True
+
+    readable = is_readable
+
+    def _ensure_checked(self) -> None:
+        if self._checked:
+            return
+        prefix_parts = []
+        prefix_length = 0
+        while prefix_length < 3:
+            part = self._source.read(3 - prefix_length)
+            if not part:
+                break
+            prefix_parts.append(part)
+            prefix_length += len(part)
+        prefix = b"".join(prefix_parts)
+        self._prefix = b"" if prefix == b"\xef\xbb\xbf" else prefix
+        self._checked = True
+
+    def read(self, size: int = -1) -> bytes:
+        """Read JSON bytes after removing one leading UTF-8 BOM."""
+
+        if size == 0:
+            return b""
+        self._ensure_checked()
+        if size is None or size < 0:
+            result = self._prefix + self._source.read()
+            self._prefix = b""
+            return result
+        if len(self._prefix) >= size:
+            result = self._prefix[:size]
+            self._prefix = self._prefix[size:]
+            return result
+        prefix = self._prefix
+        self._prefix = b""
+        return prefix + self._source.read(size - len(prefix))
+
+    def readinto(self, buffer) -> int:
+        """Fill a writable buffer without exposing a leading UTF-8 BOM."""
+
+        chunk = self.read(len(buffer))
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
+
 def _stream_copy_with_hash(src, dst, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
     digest = hashlib.sha256()
     total = 0
@@ -99,6 +152,15 @@ def _stream_copy_with_hash(src, dst, chunk_size: int = 1024 * 1024) -> tuple[str
         digest.update(chunk)
         total += len(chunk)
         dst.write(chunk)
+    return digest.hexdigest(), total
+
+
+def _stream_hash(src, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    for chunk in iter(lambda: src.read(chunk_size), b""):
+        digest.update(chunk)
+        total += len(chunk)
     return digest.hexdigest(), total
 
 
@@ -273,7 +335,8 @@ def open_json_artifact_stream(path: str | Path):
             gzip_cls = igzip.IGzipFile if igzip is not None and _env_bool(PTG2_ISAL_GZIP_ENV, False) else gzip.GzipFile
             with gzip_cls(fileobj=raw_fp, mode="rb") as gzip_fp:
                 with io.BufferedReader(gzip_fp, buffer_size=_stream_buffer_bytes()) as buffered_fp:
-                    yield _bounded_decompressed_reader(buffered_fp, label=str(path_obj))
+                    bounded_fp = _bounded_decompressed_reader(buffered_fp, label=str(path_obj))
+                    yield _Utf8BomSkippingReader(bounded_fp)
         return
     if zipfile.is_zipfile(path_obj):
         with zipfile.ZipFile(path_obj, "r") as zip_ref:
@@ -281,14 +344,15 @@ def open_json_artifact_stream(path: str | Path):
             if member_info is None:
                 raise RuntimeError(f"No file members found in zip artifact {path_obj}")
             with _open_zip_member_stream(path_obj, member_info, zip_ref) as fp:
-                yield _bounded_decompressed_reader(
+                bounded_fp = _bounded_decompressed_reader(
                     fp,
                     label=f"{path_obj}:{member_info.filename}",
                     declared_size=member_info.file_size,
                 )
+                yield _Utf8BomSkippingReader(bounded_fp)
         return
     with open(path_obj, "rb") as fp:
-        yield fp
+        yield _Utf8BomSkippingReader(fp)
 
 
 def _zip_member_name(path: str | Path) -> str | None:
@@ -325,13 +389,9 @@ def logical_artifact_identity(
             compression=compression,
             member_name=member_name,
         )
-    digest = hashlib.sha256()
-    total = 0
     with open_json_artifact_stream(raw_path_obj) as src:
-        for chunk in iter(lambda: src.read(1024 * 1024), b""):
-            digest.update(chunk)
-            total += len(chunk)
-    return PTG2LogicalArtifact(str(raw_path_obj), digest.hexdigest(), total, compression=compression, member_name=member_name)
+        digest, total = _stream_hash(src)
+    return PTG2LogicalArtifact(str(raw_path_obj), digest, total, compression=compression, member_name=member_name)
 
 
 def load_json_artifact(path: str | Path) -> Any:
@@ -365,7 +425,8 @@ def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None 
                         label=f"{raw_path_obj}:{member_info.filename}",
                         declared_size=member_info.file_size,
                     )
-                    digest, total = _materialize_stream_with_hash(bounded_src, logical_path)
+                    normalized_src = _Utf8BomSkippingReader(bounded_src)
+                    digest, total = _materialize_stream_with_hash(normalized_src, logical_path)
             except BaseException:
                 logical_path.unlink(missing_ok=True)
                 raise
@@ -376,5 +437,6 @@ def stream_logical_artifact(raw_path: str | Path, output_dir: str | Path | None 
                 compression="zip",
                 member_name=member_info.filename,
             )
-    digest, total = sha256_file(raw_path_obj)
+    with open_json_artifact_stream(raw_path_obj) as src:
+        digest, total = _stream_hash(src)
     return PTG2LogicalArtifact(str(raw_path_obj), digest, total)
