@@ -832,6 +832,121 @@ async def find_active_run_by_importer(importer: str) -> dict[str, Any] | None:
     return normalize_run(row) if row else None
 
 
+async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
+    """Return every active run for an importer in admission order."""
+    result = await db.execute(
+        select(ImportRun)
+        .where(ImportRun.importer == importer)
+        .where(ImportRun.status.in_(ACTIVE_STATUSES))
+        .order_by(ImportRun.created_at.asc())
+    )
+    return [normalize_run(row) for row in result.scalars().all()]
+
+
+def _canonical_provider_directory_endpoint_scope(value: Any) -> str | None:
+    from urllib.parse import urlsplit
+
+    raw_scope = str(value or "").strip().rstrip("/")
+    if not raw_scope:
+        return None
+    parsed_scope = urlsplit(raw_scope)
+    if (
+        parsed_scope.scheme != "https"
+        or not parsed_scope.netloc
+        or parsed_scope.username
+        or parsed_scope.password
+        or parsed_scope.query
+        or parsed_scope.fragment
+    ):
+        return None
+    canonical_scope = f"https://{parsed_scope.netloc.lower()}{parsed_scope.path.rstrip('/')}"
+    return canonical_scope if raw_scope == canonical_scope else None
+
+
+def _provider_directory_acquisition_scope(
+    params: dict[str, Any],
+    metrics: dict[str, Any] | None = None,
+) -> tuple[frozenset[str], str] | None:
+    if params.get("import_resources") is not True:
+        return None
+    exclusive_flags = (
+        "stale_cleanup",
+        "publish_artifacts",
+        "publish_after_acquisition",
+        "publish_corroboration",
+    )
+    if any(params.get(flag_name) is not False for flag_name in exclusive_flags):
+        return None
+    incompatible_modes = (
+        "canonical_backfill_only",
+        "contact_backfill_only",
+        "publish_artifacts_only",
+        "seed_only",
+    )
+    if any(params.get(flag_name) for flag_name in incompatible_modes):
+        return None
+    try:
+        source_concurrency = int(params.get("source_concurrency") or 1)
+    except (TypeError, ValueError):
+        return None
+    if source_concurrency != 1:
+        return None
+    source_values = params.get("source_ids")
+    if not isinstance(source_values, list):
+        return None
+    source_ids = frozenset(str(source_id).strip() for source_id in source_values if str(source_id).strip())
+    if not source_ids or len(source_ids) != len(source_values):
+        return None
+    raw_endpoint_scope = str(params.get("provider_directory_endpoint_scope") or "").strip()
+    endpoint_scopes = set()
+    if raw_endpoint_scope:
+        endpoint_scope = _canonical_provider_directory_endpoint_scope(raw_endpoint_scope)
+        if endpoint_scope is None:
+            return None
+        endpoint_scopes.add(endpoint_scope)
+    else:
+        active_groups = (metrics or {}).get("active_source_groups")
+        if isinstance(active_groups, list):
+            for active_group in active_groups:
+                if not isinstance(active_group, dict) or not active_group.get("api_base"):
+                    continue
+                endpoint_scope = _canonical_provider_directory_endpoint_scope(active_group["api_base"])
+                if endpoint_scope is None:
+                    return None
+                endpoint_scopes.add(endpoint_scope)
+    if len(endpoint_scopes) != 1:
+        return None
+    return source_ids, endpoint_scopes.pop()
+
+
+def _provider_directory_blocking_run(
+    params: dict[str, Any],
+    active_runs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not active_runs:
+        return None
+    if len(active_runs) >= 2:
+        return active_runs[0]
+    requested_scope = _provider_directory_acquisition_scope(params)
+    if requested_scope is None:
+        return active_runs[0]
+    requested_source_ids, requested_endpoint = requested_scope
+    for active_run in active_runs:
+        active_params = active_run.get("params")
+        if not isinstance(active_params, dict):
+            return active_run
+        active_metrics = active_run.get("metrics")
+        if not isinstance(active_metrics, dict):
+            active_metrics = None
+        active_scope = _provider_directory_acquisition_scope(active_params, active_metrics)
+        if active_scope is None:
+            return active_run
+        active_source_ids, active_endpoint = active_scope
+        if not requested_source_ids.isdisjoint(active_source_ids) or requested_endpoint == active_endpoint:
+            return active_run
+    return None
+
+
 def _allows_parallel_active_importer_runs(
     importer: str,
     payload: dict[str, Any],
@@ -858,7 +973,13 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
-    if not _allows_parallel_active_importer_runs(importer, payload, idempotency_key):
+    if importer == "provider-directory-fhir":
+        active_runs = await find_active_runs_by_importer(importer)
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        blocking_run = _provider_directory_blocking_run(params, active_runs)
+        if blocking_run:
+            return blocking_run, False
+    elif not _allows_parallel_active_importer_runs(importer, payload, idempotency_key):
         active_importer = await find_active_run_by_importer(importer)
         if active_importer:
             return active_importer, False

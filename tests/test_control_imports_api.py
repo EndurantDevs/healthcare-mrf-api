@@ -1397,6 +1397,249 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
     assert row == active
 
 
+def _provider_directory_acquisition_params(source_id, endpoint_scope, **overrides):
+    params_by_name = {
+        "import_resources": True,
+        "source_ids": [source_id],
+        "source_concurrency": 1,
+        "provider_directory_endpoint_scope": endpoint_scope,
+        "stale_cleanup": False,
+        "publish_artifacts": False,
+        "publish_after_acquisition": False,
+        "publish_corroboration": False,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
+def _provider_directory_active_run(run_id, source_id, endpoint_scope):
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "importer": "provider-directory-fhir",
+        "params": _provider_directory_acquisition_params(source_id, endpoint_scope),
+    }
+
+
+def _legacy_provider_directory_active_run(run_id, source_id, endpoint_scope):
+    active_run = _provider_directory_active_run(run_id, source_id, endpoint_scope)
+    active_run["params"].pop("provider_directory_endpoint_scope")
+    active_run["metrics"] = {"active_source_groups": [{"api_base": endpoint_scope}]}
+    return active_run
+
+
+def test_provider_directory_legacy_active_group_scope_controls_parallel_admission():
+    active = _legacy_provider_directory_active_run(
+        "run_cigna",
+        "pdfhir_cigna",
+        "https://fhir.cigna.com/ProviderDirectory/v1",
+    )
+    idaho_params = _provider_directory_acquisition_params(
+        "pdfhir_idaho",
+        "https://api-idmedicaid.safhir.io/v1/api/provider-directory",
+    )
+    same_base_params = _provider_directory_acquisition_params(
+        "pdfhir_other",
+        "https://fhir.cigna.com/ProviderDirectory/v1",
+    )
+
+    assert control_imports._provider_directory_blocking_run(idaho_params, [active]) is None
+    assert control_imports._provider_directory_blocking_run(same_base_params, [active]) == active
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_replays_provider_directory_idempotency_key(monkeypatch):
+    active = _provider_directory_active_run(
+        "run_idaho",
+        "pdfhir_idaho",
+        "https://idaho.example.org/fhir",
+    )
+
+    async def fake_find_idem(_idempotency_key):
+        return active
+
+    async def fail_find_active(_importer):
+        raise AssertionError("idempotency replay must precede provider-directory admission")
+
+    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
+    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fail_find_active)
+
+    replayed_run, created = await create_import_run(
+        {"importer": "provider-directory-fhir", "idempotency_key": "idaho-acquisition"}
+    )
+
+    assert created is False
+    assert replayed_run == active
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_allows_disjoint_provider_directory_acquisition(monkeypatch):
+    statements = []
+    active = _legacy_provider_directory_active_run(
+        "run_cigna",
+        "pdfhir_cigna",
+        "https://fhir.cigna.com/ProviderDirectory/v1",
+    )
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(statement)
+
+    async def fake_find_idem(_idempotency_key):
+        return None
+
+    async def fake_find_active(_importer):
+        return [active]
+
+    async def fake_enqueue(row):
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {"queue": "arq:ProviderDirectoryFHIR"},
+            "error": None,
+        }
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
+    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+
+    created_run, created = await create_import_run(
+        {
+            "run_id": "run_idaho",
+            "importer": "provider-directory-fhir",
+            "idempotency_key": "idaho-acquisition",
+            "params": _provider_directory_acquisition_params(
+                "pdfhir_idaho",
+                "https://api-idmedicaid.safhir.io/v1/api/provider-directory",
+            ),
+        }
+    )
+
+    assert created is True
+    assert created_run["run_id"] == "run_idaho"
+    assert len(statements) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_id", "endpoint_scope"),
+    [
+        ("pdfhir_cigna", "https://idaho.example.org/fhir"),
+        ("pdfhir_idaho", "https://fhir.cigna.com/ProviderDirectory/v1"),
+    ],
+)
+async def test_create_import_run_blocks_overlapping_provider_directory_scope(
+    monkeypatch,
+    source_id,
+    endpoint_scope,
+):
+    active = _legacy_provider_directory_active_run(
+        "run_cigna",
+        "pdfhir_cigna",
+        "https://fhir.cigna.com/ProviderDirectory/v1",
+    )
+
+    async def fake_find_active(_importer):
+        return [active]
+
+    async def fail_enqueue(_row):
+        raise AssertionError("overlapping provider-directory acquisition must not enqueue")
+
+    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+
+    row, created = await create_import_run(
+        {
+            "importer": "provider-directory-fhir",
+            "params": _provider_directory_acquisition_params(source_id, endpoint_scope),
+        }
+    )
+
+    assert created is False
+    assert row == active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_override",
+    [
+        {"stale_cleanup": True},
+        {"publish_artifacts": True},
+        {"publish_after_acquisition": True},
+        {"publish_corroboration": True},
+        {"source_concurrency": 2},
+        {"canonical_backfill_only": True},
+        {"contact_backfill_only": True},
+        {"publish_artifacts_only": True},
+        {"seed_only": True},
+        {"provider_directory_endpoint_scope": "https://user:secret@example.org/fhir"},
+    ],
+)
+async def test_create_import_run_blocks_unsafe_provider_directory_parallel_flags(
+    monkeypatch,
+    unsafe_override,
+):
+    active = _provider_directory_active_run(
+        "run_cigna",
+        "pdfhir_cigna",
+        "https://fhir.cigna.com/ProviderDirectory/v1",
+    )
+
+    async def fake_find_active(_importer):
+        return [active]
+
+    async def fail_enqueue(_row):
+        raise AssertionError("unsafe provider-directory acquisition must not enqueue")
+
+    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+    params_by_name = _provider_directory_acquisition_params(
+        "pdfhir_idaho",
+        "https://idaho.example.org/fhir",
+    )
+    params_by_name.update(unsafe_override)
+
+    blocked_run, created = await create_import_run(
+        {"importer": "provider-directory-fhir", "params": params_by_name}
+    )
+
+    assert created is False
+    assert blocked_run == active
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_blocks_third_provider_directory_acquisition(monkeypatch):
+    active_runs = [
+        _provider_directory_active_run("run_one", "pdfhir_one", "https://one.example.org/fhir"),
+        _provider_directory_active_run("run_two", "pdfhir_two", "https://two.example.org/fhir"),
+    ]
+
+    async def fake_find_active(_importer):
+        return active_runs
+
+    async def fail_enqueue(_row):
+        raise AssertionError("third provider-directory acquisition must not enqueue")
+
+    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+
+    row, created = await create_import_run(
+        {
+            "importer": "provider-directory-fhir",
+            "params": _provider_directory_acquisition_params(
+                "pdfhir_three",
+                "https://three.example.org/fhir",
+            ),
+        }
+    )
+
+    assert created is False
+    assert row == active_runs[0]
+
+
 class _CancelUpdateResult:
     """Minimal SQLAlchemy result stub for cancel update tests."""
 
