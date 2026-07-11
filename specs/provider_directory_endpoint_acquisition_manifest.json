@@ -49,12 +49,12 @@
       "washington": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Uses standard _count=100 pagination. Populated core collections page successfully, but the latest bounded HealthcareService preflight timed out before a response, so terminal full-acquisition proof remains pending."},
       "wyoming": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Uses standard _count=100 pagination; PractitionerRole pagination was revalidated after the earlier gateway limit was removed."},
       "health-partners-plans": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Official public Provider Directory FHIR base (source pdfhir_384bff82e94cf93d2aec8af2). Full acquisition is active under run prefix run_a278; the run is not terminal, so no terminal full-import proof is claimed."},
-      "amerihealth-nh": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 0900; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
-      "amerihealth-de": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 7100; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
-      "amerihealth-la": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 2100; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
-      "amerihealth-nc": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 1200; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
-      "amerihealth-dc": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 5400; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
-      "amerihealth-pa": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Plan code 0500; full-refresh pages target 250 rows. Anonymous initial and continuation pages were revalidated for the configured resource scope."},
+      "amerihealth-nh": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 0900. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
+      "amerihealth-de": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 7100. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
+      "amerihealth-la": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 2100. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
+      "amerihealth-nc": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 1200. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
+      "amerihealth-dc": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 5400. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
+      "amerihealth-pa": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Plan code 0500. The official public endpoint requires no registration, but all six configured AmeriHealth plan-code bases return Incapsula HTTP 403 from worker egress. Proxy probes report identical 21,809,233-resource counts for every base, so normal unbounded or monthly acquisition is blocked pending real worker WAF access and one canonical-lane proof of whether the dataset is shared; six lanes could otherwise duplicate about 130.9 million rows. No terminal acquisition proof exists."},
       "horizon-nj": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "probe", "limitation": "Metadata is publicly reachable but declares no resources; core resource searches return HAPI HTTP 403 Access denied by rule, so no pageable acquisition profile is verified."},
       "texas-tmhp": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Lightweight probe confirms seven populated public collections using stable _id sorting and offset pagination. Endpoint is empty and excluded. This is probe evidence only; no terminal full-import proof is claimed."},
       "nebraska": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Seven public collections use stable _id sorting and offset pagination. Lightweight probe confirms Endpoint is excluded because it returns HTTP 404. UAT continuation is canonicalized before acquisition. This is probe evidence only; no terminal full-import proof is claimed."},
@@ -268,10 +268,10 @@
       "owner_id": "amerihealth-caritas-0900",
       "source_ids": ["pdfhir_3e8f8d73e9f63b41f4f3fca5"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/0900/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "amerihealth-de",
@@ -279,10 +279,10 @@
       "owner_id": "amerihealth-caritas-7100",
       "source_ids": ["pdfhir_5ec84ed54e6553236e7cda7b"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/7100/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "amerihealth-la",
@@ -290,10 +290,10 @@
       "owner_id": "amerihealth-caritas-2100",
       "source_ids": ["pdfhir_6571cbf9a177e83423c891d3"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/2100/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "amerihealth-nc",
@@ -301,10 +301,10 @@
       "owner_id": "amerihealth-caritas-1200",
       "source_ids": ["pdfhir_7cc6538c83f3cb72897656ce"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/1200/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "amerihealth-dc",
@@ -312,10 +312,10 @@
       "owner_id": "amerihealth-caritas-5400",
       "source_ids": ["pdfhir_8e9bf902c028e349d6238382"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/5400/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "amerihealth-pa",
@@ -323,10 +323,10 @@
       "owner_id": "amerihealth-caritas-0500",
       "source_ids": ["pdfhir_c1552ccaac4326f676710337"],
       "canonical_base": "https://api-ext.amerihealthcaritas.com/0500/provider-api",
-      "classification": "acquisition",
+      "classification": "probe_only",
       "launch_mode": "create",
-      "resource_profile": "A6",
-      "resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "NONE",
+      "resources": []
     },
     {
       "entry_id": "horizon-nj",
