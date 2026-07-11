@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
-import hashlib
 import json
 import os
 import re
@@ -18,8 +17,24 @@ from typing import Any
 
 try:
     from scripts import generate_provider_directory_support_docs as generator
+    from scripts.provider_directory_verification_contract import (
+        VerificationUpdateError,
+        ensure_verification_report_is_fresh as _ensure_report_is_fresh,
+        manifest_sha256 as _manifest_sha256,
+        provider_directory_entry_sha256,
+        supersede_changed_entry_proofs,
+        verification_report_identity as _report_identity,
+    )
 except ModuleNotFoundError:
     import generate_provider_directory_support_docs as generator
+    from provider_directory_verification_contract import (
+        VerificationUpdateError,
+        ensure_verification_report_is_fresh as _ensure_report_is_fresh,
+        manifest_sha256 as _manifest_sha256,
+        provider_directory_entry_sha256,
+        supersede_changed_entry_proofs,
+        verification_report_identity as _report_identity,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,9 +49,6 @@ RAW_TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_l
 SENSITIVE_TEXT_PATTERN = re.compile(
     r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
 )
-
-class VerificationUpdateError(ValueError):
-    """Raised when a live report cannot be imported safely."""
 
 def _load_audited_manifest(manifest_path: Path) -> dict[str, Any]:
     needs_repo_root = str(ROOT) not in sys.path
@@ -234,6 +246,7 @@ def _terminal_record(
         "access_verification": _access_verification(report_entry, terminal_status),
         "checked_at": checked_at,
         "proof_state": "current",
+        "entry_spec_sha256": provider_directory_entry_sha256(manifest_entry),
         "current_observation": _current_observation(
             entry_id, manifest_entry, report_entry, checked_at
         ),
@@ -258,28 +271,6 @@ def _empty_snapshot(manifest: dict[str, Any]) -> dict[str, Any]:
             }
             for entry in manifest["entries"]
         },
-    }
-
-def _manifest_sha256(manifest: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-def _report_identity(report: dict[str, Any], checked_at: str) -> dict[str, Any]:
-    schema_version = report.get("schema_version")
-    if schema_version not in {None, 1}:
-        raise VerificationUpdateError("report schema_version is unsupported")
-    mode = report.get("mode", "unknown")
-    if mode not in {"apply", "dry-run", "unknown"}:
-        raise VerificationUpdateError("report mode is invalid")
-    return {
-        "schema_version": schema_version,
-        "generated_at": checked_at,
-        "mode": mode,
-        "manifest_sha256": report["manifest_sha256"],
-        "report_sha256": hashlib.sha256(
-            json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
     }
 
 def _validate_integration_metadata(
@@ -335,27 +326,6 @@ def _validate_integration_metadata(
         raise VerificationUpdateError("report verification_update terminal identities do not agree")
     return set(selected)
 
-def _ensure_report_is_fresh(
-    prior_snapshot: dict[str, Any],
-    report_identity: dict[str, Any],
-) -> None:
-    prior_checked_at = prior_snapshot.get("checked_at")
-    if prior_checked_at is None:
-        return
-    report_time = _parsed_timestamp(report_identity["generated_at"], "report.generated_at")
-    prior_time = _parsed_timestamp(
-        prior_checked_at, "verification snapshot checked_at"
-    )
-    if report_time < prior_time:
-        raise VerificationUpdateError("report is older than the verification snapshot")
-    prior_identity = prior_snapshot.get("report_identity")
-    if (
-        report_time == prior_time
-        and isinstance(prior_identity, dict)
-        and prior_identity.get("report_sha256") != report_identity["report_sha256"]
-    ):
-        raise VerificationUpdateError("a different report must be newer than the verification snapshot")
-
 def _merge_nonterminal_observation(
     entry_id: str,
     manifest_entry: dict[str, Any],
@@ -381,10 +351,19 @@ def _merge_nonterminal_observation(
         )
     )
     if prior_record.get("terminal_status") is not None:
-        merged["proof_state"] = "superseded" if has_newer_active_run else merged.get("proof_state", "current")
+        expected_entry_sha256 = provider_directory_entry_sha256(manifest_entry)
+        if prior_record.get("entry_spec_sha256") != expected_entry_sha256:
+            merged["proof_state"] = "superseded"
+            merged["superseded_reason"] = "manifest_entry_changed"
+        elif has_newer_active_run:
+            merged["proof_state"] = "superseded"
+            merged["superseded_reason"] = "newer_active_run"
+        else:
+            merged["proof_state"] = merged.get("proof_state", "current")
     else:
         merged["proof_state"] = "not_recorded"
     return merged
+
 
 def update_verification_snapshot(
     manifest: dict[str, Any],
@@ -406,7 +385,11 @@ def update_verification_snapshot(
     unknown_entries = sorted(set(report_entries) - set(entry_ids))
     if unknown_entries:
         raise VerificationUpdateError("report contains unknown entries: " + ", ".join(unknown_entries))
-    generator.validate_verification_snapshot(prior_snapshot, entry_ids, manifest["campaign_id"])
+    generator.validate_verification_snapshot(
+        prior_snapshot,
+        manifest,
+        allow_current_spec_mismatch=True,
+    )
     checked_at = _checked_timestamp(report)
     report_identity = _report_identity(report, checked_at)
     _ensure_report_is_fresh(prior_snapshot, report_identity)
@@ -419,6 +402,10 @@ def update_verification_snapshot(
         "report_identity": report_identity,
         "entries": copy.deepcopy(prior_snapshot["entries"]),
     }
+    supersede_changed_entry_proofs(
+        snapshot_by_field["entries"],
+        manifest_entry_by_id,
+    )
     for entry_id in selected_entry_ids:
         report_entry = report_entries[entry_id]
         terminal_record = _terminal_record(
@@ -434,7 +421,7 @@ def update_verification_snapshot(
                 snapshot_by_field["entries"][entry_id],
                 checked_at,
             )
-    generator.validate_verification_snapshot(snapshot_by_field, entry_ids, manifest["campaign_id"])
+    generator.validate_verification_snapshot(snapshot_by_field, manifest)
     return snapshot_by_field
 
 def _atomic_write_text(path: Path, content: str) -> None:

@@ -422,6 +422,7 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
         "archive coordinates are never replaced",
         "Resource completion",
         "CI rejects expired evidence",
+        "stores the fingerprint of its manifest entry",
     ):
         assert command in guide
     assert "Never hand-edit the generated" in guide
@@ -442,6 +443,19 @@ def test_verification_snapshot_rejects_terminal_record_without_timestamp():
     with pytest.raises(generator.SupportDocumentationError, match="terminal entries need"):
         generator.validate_verification_snapshot(
             snapshot,
-            [entry["entry_id"] for entry in manifest["entries"]],
-            manifest["campaign_id"],
+            manifest,
         )
+
+
+def test_verification_snapshot_rejects_current_proof_for_changed_entry():
+    manifest = copy.deepcopy(generator.load_manifest(generator.DEFAULT_MANIFEST))
+    snapshot = copy.deepcopy(
+        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    )
+    idaho_entry = next(
+        entry for entry in manifest["entries"] if entry["entry_id"] == "idaho"
+    )
+    idaho_entry["canonical_base"] = "https://changed.example.test/fhir"
+
+    with pytest.raises(generator.SupportDocumentationError, match="current manifest entry"):
+        generator.validate_verification_snapshot(snapshot, manifest)

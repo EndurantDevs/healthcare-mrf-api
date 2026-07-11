@@ -11,6 +11,7 @@
     "alohr": {
       "access_verification": "verified",
       "checked_at": "2026-07-11T01:12:22Z",
+      "entry_spec_sha256": "8db17ad892410f2d62a2478659751a105ef9c377abbc4fb10c8e3f720ed5eb23",
       "current_observation": {
         "evidence": {
           "effective_acquisition": {
@@ -236,6 +237,7 @@
     "idaho": {
       "access_verification": "verified",
       "checked_at": "2026-07-10T17:19:26Z",
+      "entry_spec_sha256": "8ce12e2c07d34249fcb041b99fa5d4d25917cd1f5e8c72501fd3f1168e627f3c",
       "run_id": "run_685b1ff3a18c432e8b2333fe349ce69f",
       "terminal_status": "succeeded"
     },

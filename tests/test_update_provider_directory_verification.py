@@ -164,6 +164,9 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     )
     assert "InsurancePlan" in idaho_record["terminal_evidence"]["resource_outcomes"]
     assert updated["report_identity"]["mode"] == "apply"
+    assert idaho_record["entry_spec_sha256"] == generator.provider_directory_entry_sha256(
+        next(entry for entry in manifest["entries"] if entry["entry_id"] == "idaho")
+    )
     assert report["verification_update"]["eligible"] is True
     assert report["verification_update"]["argv"][1] == "scripts/update_provider_directory_verification.py"
     serialized_snapshot = snapshot_path.read_text(encoding="utf-8")
@@ -204,6 +207,13 @@ def test_selected_update_preserves_unselected_source_evidence():
         "run_id": "run_molina_prior",
         "access_verification": "verified",
         "checked_at": "2026-07-10T17:00:00Z",
+        "entry_spec_sha256": generator.provider_directory_entry_sha256(
+            next(
+                entry
+                for entry in manifest["entries"]
+                if entry["entry_id"] == "molina"
+            )
+        ),
         "proof_state": "current",
         "current_observation": {
             "run_id": "run_molina_prior",
@@ -229,6 +239,36 @@ def test_selected_update_preserves_unselected_source_evidence():
     )
 
     assert updated["entries"]["molina"] == prior_molina
+
+
+def test_entry_contract_change_supersedes_unselected_terminal_proof():
+    manifest, snapshot = _manifest_and_snapshot()
+    molina_entry = next(
+        entry for entry in manifest["entries"] if entry["entry_id"] == "molina"
+    )
+    prior_entry_sha256 = generator.provider_directory_entry_sha256(molina_entry)
+    snapshot["entries"]["molina"] = {
+        "terminal_status": "succeeded",
+        "run_id": "run_molina_prior",
+        "access_verification": "verified",
+        "checked_at": "2026-07-10T17:00:00Z",
+        "proof_state": "current",
+        "entry_spec_sha256": prior_entry_sha256,
+    }
+    molina_entry["canonical_base"] = "https://changed.example.test/fhir"
+    report = _report(manifest)
+
+    updated = updater.update_verification_snapshot(
+        manifest,
+        report,
+        snapshot,
+        "healthporta-dev",
+    )
+
+    molina_proof = updated["entries"]["molina"]
+    assert molina_proof["proof_state"] == "superseded"
+    assert molina_proof["superseded_reason"] == "manifest_entry_changed"
+    assert molina_proof["entry_spec_sha256"] == prior_entry_sha256
 
 
 def test_same_timestamp_different_report_is_rejected():

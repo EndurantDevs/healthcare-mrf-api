@@ -32,7 +32,10 @@ Keep these authorities separate when reviewing Provider Directory coverage:
 - Live evidence is maintained in the [verification snapshot](../../specs/provider_directory_endpoint_verification.json).
   The campaign report is the untracked runtime observation; the snapshot is
   the tracked terminal proof. A newer active run can supersede older proof, so
-  do not read configured support as live verification.
+  do not read configured support as live verification. Each terminal record
+  stores the fingerprint of its manifest entry. Endpoint, resource, or import
+  parameter changes supersede only that source's proof; support-note edits do
+  not invalidate evidence for an unchanged acquisition contract.
 
 The manifest also carries the documentation freshness policy. The generated
 matrix shows when each catalog confirmation, source review, and current
