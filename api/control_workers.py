@@ -82,10 +82,14 @@ _K8S_API_NAMESPACE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespa
 
 
 def worker_registry() -> list[dict[str, Any]]:
+    """Return the current state of every registered import worker."""
+
     return [_worker_state(spec) for spec in _WORKERS]
 
 
 def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    """Start or locate workers selected by one launch payload."""
+
     specs = _resolve_specs(payload)
     if not specs:
         importer = str(payload.get("importer") or "").strip()
@@ -564,6 +568,8 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
 
 
 def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) -> dict[str, Any]:
+    """Build the Kubernetes Job manifest for one import worker."""
+
     job_name = _worker_job_name(spec, payload)
     env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},

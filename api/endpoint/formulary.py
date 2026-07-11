@@ -215,6 +215,8 @@ def _hydrate_formulary_row(row) -> Dict[str, Any]:
 
 @blueprint.get("/ids")
 async def list_formularies(request):
+    """List filtered formularies with plan, issuer, and pagination metadata."""
+
     session = _get_session(request)
 
     args = request.args
@@ -326,6 +328,8 @@ async def list_formularies(request):
 
 @blueprint.get("/id/<formulary_id>")
 async def get_formulary(request, formulary_id):
+    """Return plan, issuer, tier, pharmacy, and drug metadata for one formulary."""
+
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
 
@@ -427,6 +431,8 @@ async def get_formulary(request, formulary_id):
 
 @blueprint.get("/id/<formulary_id>/drugs")
 async def list_formulary_drugs(request, formulary_id):
+    """List filtered and sorted drugs for one formulary with pagination metadata."""
+
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
     if not await _formulary_exists(session, plan_id, year):
@@ -561,6 +567,8 @@ async def list_formulary_drugs(request, formulary_id):
 
 @blueprint.get("/id/<formulary_id>/drugs/<rxnorm_id>")
 async def get_formulary_drug(request, formulary_id, rxnorm_id):
+    """Return tier and coverage restrictions for one drug in a formulary."""
+
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
     if not await _formulary_exists(session, plan_id, year):
@@ -634,6 +642,8 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
 
 @blueprint.get("/id/<formulary_id>/summary")
 async def get_formulary_summary(request, formulary_id):
+    """Return aggregate tier and coverage-restriction counts for one formulary."""
+
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
     if not await _formulary_exists(session, plan_id, year):
@@ -712,6 +722,8 @@ async def get_formulary_summary(request, formulary_id):
 
 @blueprint.get("/drugs/<rxnorm_id>")
 async def cross_formulary_drug(request, rxnorm_id):
+    """List formularies covering an RxNorm drug, filtered by plan attributes."""
+
     session = _get_session(request)
     args = request.args
 
@@ -789,6 +801,8 @@ async def cross_formulary_drug(request, rxnorm_id):
 
 @blueprint.get("/statistics")
 async def formulary_statistics(request):
+    """Return formulary statistics filtered by year, state, or issuer."""
+
     session = _get_session(request)
     args = request.args
 
@@ -905,6 +919,8 @@ async def formulary_statistics(request):
 
 @blueprint.get("/plan/<plan_id>/drug/<rxnorm_id>")
 async def check_plan_drug(request, plan_id, rxnorm_id):
+    """Return whether a plan covers a drug for the requested or latest year."""
+
     session = _get_session(request)
     plan_table = Plan.__table__
     plan_drug_table = PlanDrugRaw.__table__

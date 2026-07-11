@@ -37,15 +37,21 @@ CODE_SYSTEM_ALIASES = {
 
 
 def normalize_code_system(raw_system: Any, default: str | None = None) -> str:
+    """Return the canonical uppercase identifier for an external code system."""
+
     system = str(raw_system if raw_system not in (None, "") else (default or "")).strip().upper()
     return CODE_SYSTEM_ALIASES.get(system, system)
 
 
 def normalize_code(raw_code: Any) -> str:
+    """Return a stripped uppercase representation of an external code."""
+
     return str(raw_code or "").strip().upper()
 
 
 def canonical_catalog_code(code_system: str, raw_code: Any) -> str:
+    """Normalize one code according to its catalog system's width rules."""
+
     code = normalize_code(raw_code)
     digits = "".join(ch for ch in code if ch.isdigit())
     if code_system == "RC" and digits:
@@ -80,14 +86,20 @@ def catalog_code_lookup_values(code_system: Any, raw_code: Any) -> tuple[str, ..
 
 
 def restricted_terminology_public_enabled() -> bool:
+    """Return whether public responses may expose restricted terminology."""
+
     return str(os.getenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES") or "").strip().lower() in {"1", "true", "yes"}
 
 
 def is_restricted_terminology_system(code_system: Any) -> bool:
+    """Return whether a code system carries restricted terminology."""
+
     return normalize_code_system(code_system) in RESTRICTED_TERMINOLOGY_CODE_SYSTEMS
 
 
 def equivalent_external_procedure_pairs(system: str, code: str) -> set[tuple[str, str]]:
+    """Return equivalent external system/code pairs for shared procedure codes."""
+
     if system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or len(code) != 5 or not code.isalnum():
         return set()
     if code.isdigit():

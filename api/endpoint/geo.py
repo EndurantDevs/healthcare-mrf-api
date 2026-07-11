@@ -260,6 +260,8 @@ async def _lookup_provider_count(session, zip_code):
 
 
 async def _lookup_census_profile(session, zip_code):
+    """Return census, SVI, and provider-density data for a ZIP when available."""
+
     stmt = (
         select(
             geo_census_table.c.total_population,
@@ -396,6 +398,8 @@ async def _lookup_zip_from_tiger(session, zip_code):
 
 @blueprint.get('/get')
 async def get_geo_status(request):
+    """Return timestamp, release, and environment metadata for the geo service."""
+
     request.args.get("zip_code")
     request.args.get("lat")
     data = {
@@ -410,6 +414,8 @@ async def get_geo_status(request):
 
 @blueprint.get('/zip/<zip_code>', name='get_geo_by_zip')
 async def get_geo(request, zip_code):
+    """Return ZIP geography with optional census enrichment and TIGER fallback."""
+
     zip_code = zip_code.strip().rjust(5, '0')
     session = _get_session(request)
     try:
@@ -460,6 +466,8 @@ async def get_geo(request, zip_code):
 
 @blueprint.get('/city', name='get_geo_by_city')
 async def get_geo_by_city(request):
+    """Return ZIP records matching a required city and optional state."""
+
     city = request.args.get("city")
     if not city:
         raise InvalidUsage("city query parameter is required")
@@ -521,12 +529,12 @@ async def get_geo_by_city(request):
 
 @blueprint.get('/zip/<zip_code>/places', name='get_places_by_zip')
 async def get_places_by_zip(request, zip_code):
+    """Return PLACES measures for a ZIP and requested or latest available year."""
     zip_code = zip_code.strip().rjust(5, '0')
     args = request.args
     year = args.get("year")
     measure_id = (args.get("measure_id") or "").strip() or None
     session = _get_session(request)
-
     if year is not None:
         try:
             year = int(year)
@@ -584,6 +592,8 @@ async def get_places_by_zip(request, zip_code):
 
 @blueprint.get('/states', name='list_geo_states')
 async def list_geo_states(request):
+    """List paginated state aggregates with each state's most populous ZIPs."""
+
     session = _get_session(request)
     args = request.args
 
@@ -734,6 +744,8 @@ async def list_geo_states(request):
 
 @blueprint.get('/state/<state>/cities', name='get_top_cities_by_state')
 async def get_top_cities_by_state(request, state):
+    """List paginated city aggregates for a two-letter state code."""
+
     state = state.strip().upper()
     if len(state) != 2:
         raise InvalidUsage("state must be 2-letter abbreviation")

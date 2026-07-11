@@ -497,6 +497,8 @@ def _quote_ident(value: str) -> str:
 
 
 def parse_ptg_toc_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    """Parse and summarize an inline PTG table of contents."""
+
     from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
     toc_content = payload.get("toc")
@@ -559,6 +561,8 @@ def _serialize_run_timestamps(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_run(row: Any) -> dict[str, Any]:
+    """Convert an import-run model or mapping to its API representation."""
+
     if row is None:
         return {}
     if hasattr(row, "to_json_dict"):
@@ -631,6 +635,8 @@ def _finish_function(importer: str):
 async def list_import_runs(
     *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
 ) -> list[dict[str, Any]]:
+    """Return the items from one filtered import-run page."""
+
     page = await list_import_runs_page(status=status, importer=importer, limit=limit, cursor=cursor)
     return page["items"]
 
@@ -638,6 +644,8 @@ async def list_import_runs(
 async def list_import_runs_page(
     *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
 ) -> dict[str, Any]:
+    """Return a stable cursor page of filtered import runs."""
+
     bounded_limit = max(1, min(int(limit or 50), MAX_IMPORT_RUN_LIST_LIMIT))
     stmt = select(ImportRun)
     if status:
@@ -688,6 +696,8 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
 
 
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
+    """Return one import run after reconciling terminal worker failures."""
+
     result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
     row = result.scalar_one_or_none()
     if not row:
@@ -778,22 +788,24 @@ def _worker_job_failure_error(worker_item: dict[str, Any]) -> dict[str, Any]:
     return error_dict
 
 
-async def finalize_import_run(run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    current = await get_import_run(run_id)
-    if not current:
+async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Dispatch and record the importer-specific finalization phase."""
+
+    current_run = await get_import_run(run_id)
+    if not current_run:
         return None
-    importer = str(current.get("importer") or "").strip()
+    importer = str(current_run.get("importer") or "").strip()
     if importer not in _FINISH_IMPORTERS:
         raise ValueError(f"importer does not support finalize: {importer}")
-    if current.get("status") in TERMINAL_STATUSES:
-        return current
+    if current_run.get("status") in TERMINAL_STATUSES:
+        return current_run
 
-    finish_params = _finish_params_for(importer, current, payload)
+    finish_params = _finish_params_for(importer, current_run, finalize_payload)
     finish_fn = _finish_function(importer)
-    result = await finish_fn(**finish_params)
+    finalize_result = await finish_fn(**finish_params)
     now = utc_now()
-    metrics = dict(current.get("metrics") or {})
-    metrics["finalize"] = result if isinstance(result, dict) else {"queued": True}
+    metrics = dict(current_run.get("metrics") or {})
+    metrics["finalize"] = finalize_result if isinstance(finalize_result, dict) else {"queued": True}
     await db.execute(
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
@@ -810,6 +822,8 @@ async def finalize_import_run(run_id: str, payload: dict[str, Any]) -> dict[str,
 
 
 async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, Any] | None:
+    """Find the active run that owns an idempotency key."""
+
     result = await db.execute(
         select(ImportRun)
         .where(ImportRun.idempotency_key == idempotency_key)
@@ -821,6 +835,8 @@ async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, 
 
 
 async def find_active_run_by_importer(importer: str) -> dict[str, Any] | None:
+    """Return the earliest active run for an importer."""
+
     result = await db.execute(
         select(ImportRun)
         .where(ImportRun.importer == importer)
@@ -973,6 +989,8 @@ def _normalize_triggered_by(value: Any) -> str:
 
 
 async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Create and enqueue an import run unless admission deduplicates it."""
+
     importer = str(payload.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
@@ -1047,6 +1065,8 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
 
 
 async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
+    """Enqueue one importer start job and return its run-state update."""
+
     importer = str(row.get("importer") or "")
     now = utc_now()
     params = row.get("params") if isinstance(row.get("params"), dict) else {}
@@ -1200,6 +1220,8 @@ def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[
 
 
 async def request_cancel(run_id: str) -> dict[str, Any] | None:
+    """Mark an active run for cancellation and signal its worker."""
+
     current = await get_import_run(run_id)
     if not current:
         return None
@@ -1392,6 +1414,8 @@ def _retry_child_params(
 
 
 async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool] | None:
+    """Create a retry derived from an existing import run."""
+
     current = await get_import_run(run_id)
     if not current:
         return None
