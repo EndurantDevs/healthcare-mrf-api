@@ -5145,6 +5145,47 @@ def test_identifier_mapping_accepts_type_coded_npi_and_systemless_plan_ids():
     assert hios_row["plan_identifier"] == "12345IL0010001"
 
 
+def test_parse_fhir_resource_maps_nebraska_participating_network_extension():
+    _model, row = importer.parse_fhir_resource(
+        "source_nebraska",
+        {
+            "resourceType": "PractitionerRole",
+            "id": "role-nebraska-network",
+            "extension": [
+                {
+                    "url": (
+                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/plannet-ParticipatingNetwork-extension"
+                    ),
+                    "valueReference": {
+                        "reference": "https://directory.example.test/fhir/Organization/ne-network"
+                    },
+                }
+            ],
+        },
+    )
+
+    assert row["network_refs"] == ["https://directory.example.test/fhir/Organization/ne-network"]
+
+
+def test_parse_fhir_resource_maps_formulary_identifier_to_plan_identifier():
+    _model, row = importer.parse_fhir_resource(
+        "source_nebraska",
+        {
+            "resourceType": "InsurancePlan",
+            "id": "plan-nebraska-formulary",
+            "identifier": [
+                {
+                    "type": {"coding": [{"code": "formulary_id"}]},
+                    "value": "NEMW000001-UNDETERMINED-2026",
+                }
+            ],
+        },
+    )
+
+    assert row["plan_identifier"] == "NEMW000001-UNDETERMINED-2026"
+
+
 def test_address_corroboration_sql_links_overlay_roles():
     """Validate the corroboration view joins overlay NPI addresses to FHIR roles."""
     sql = importer.provider_directory_address_corroboration_sql("mrf")
