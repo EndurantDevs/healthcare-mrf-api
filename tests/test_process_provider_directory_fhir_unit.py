@@ -6563,6 +6563,38 @@ def test_provider_directory_location_archive_stage_sql_can_scope_to_current_run_
     assert "provider_directory_import_seen_stage" not in sql
 
 
+def test_provider_directory_openaddresses_archive_backfill_sql_is_exact_and_guarded():
+    sql = importer._provider_directory_openaddresses_archive_backfill_sql(
+        "mrf",
+        "provider_directory_location_archive_stage_test",
+    )
+
+    assert 'FROM "mrf"."provider_directory_location_archive_stage_test" AS stage_row' in sql
+    assert 'FROM "mrf"."openaddresses_geocode" AS oa' in sql
+    assert "oa.address_key = target.address_key" in sql
+    assert "HAVING count(*) > 0" in sql
+    assert "max(oa.lat) - min(oa.lat) <= :coord_tolerance" in sql
+    assert "oa.lat BETWEEN 24 AND 50 AND oa.long BETWEEN -125 AND -66" in sql
+    assert "archive.lat IS NULL" in sql
+    assert "archive.long IS NULL" in sql
+    assert "geocode_source = 'openaddresses_address_key'" in sql
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_openaddresses_archive_backfill_skips_without_source(monkeypatch):
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    updated = await importer._backfill_archive_openaddresses_coordinates(
+        "mrf",
+        "provider_directory_location_archive_stage_test",
+    )
+
+    assert updated == 0
+    status.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_archive_resolves_and_cleans_stage(monkeypatch):
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
@@ -6589,12 +6621,14 @@ async def test_publish_provider_directory_location_archive_resolves_and_cleans_s
 
     assert stats["inserted"] == 7
     assert stats["provenance_updates"] == 1
+    assert stats["openaddresses_coordinate_backfill_rows"] == 0
     status_calls = [call.args[0] for call in status.await_args_list]
     assert status_calls[0] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
     assert 'CREATE UNLOGGED TABLE "mrf"."provider_directory_location_archive_stage_test" AS' in status_calls[1]
     assert "loc.last_seen_run_id = CAST(:run_id AS varchar)" in status_calls[1]
     assert status.await_args_list[1].kwargs == {"run_id": "run_1"}
     assert status_calls[2] == 'ANALYZE "mrf"."provider_directory_location_archive_stage_test";'
+    assert any('FROM "mrf"."openaddresses_geocode" AS oa' in sql for sql in status_calls)
     assert status_calls[-1] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
     resolve.assert_awaited_once()
     assert resolve.await_args.args[0] == "provider_directory_location_archive_stage_test"
