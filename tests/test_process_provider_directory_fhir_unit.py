@@ -614,6 +614,28 @@ def test_idaho_medicaid_supports_durable_pagination_checkpoints():
     )
 
 
+def test_michigan_supports_durable_pagination_checkpoints():
+    source_lookup = {
+        "source_id": "michigan",
+        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+    }
+
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["michigan"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+
+    assert importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE in (
+        importer.PAGINATION_CHECKPOINT_API_BASES
+    )
+    assert checkpoint_context is not None
+    assert checkpoint_context.canonical_api_base == (
+        importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+    )
+
+
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
     rows = importer._contra_costa_seed_rows_from_developer_html(
         """
@@ -3805,6 +3827,91 @@ async def test_cigna_source_fetch_cools_down_after_empty_search_sets(monkeypatch
     assert fetch_result[3] == 23
     assert fetch_source_json_once.await_count == 3
     assert [sleep_call.args[0] for sleep_call in sleep_mock.await_args_list] == [2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_michigan_source_fetch_retries_empty_offset_page(monkeypatch):
+    empty_bundle_dict = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [],
+    }
+    populated_bundle_dict = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": {"resourceType": "Location", "id": "loc-26"}}],
+    }
+    fetch_source_json_once = AsyncMock(
+        side_effect=[
+            (200, empty_bundle_dict, None, 5),
+            (200, populated_bundle_dict, None, 7),
+        ]
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        importer,
+        "MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS",
+        (2.0, 4.0),
+    )
+
+    fetch_result = await importer._fetch_source_json(
+        {
+            "source_id": "michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        },
+        (
+            f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/Location?"
+            "_count=25&_getpagesoffset=25"
+        ),
+        timeout=3,
+    )
+
+    assert fetch_result == (200, populated_bundle_dict, None, 12)
+    assert fetch_source_json_once.await_count == 2
+    sleep_mock.assert_awaited_once_with(2.0)
+
+
+@pytest.mark.asyncio
+async def test_michigan_source_fetch_fails_closed_after_empty_offset_retries(
+    monkeypatch,
+):
+    empty_bundle_dict = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [],
+    }
+    fetch_source_json_once = AsyncMock(
+        return_value=(200, empty_bundle_dict, None, 5)
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
+    monkeypatch.setattr(importer.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS",
+        (0.0, 0.0),
+    )
+
+    fetch_result = await importer._fetch_source_json(
+        {
+            "source_id": "michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        },
+        (
+            f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+            "_count=100&_getpagesoffset=100"
+        ),
+        timeout=3,
+    )
+
+    assert fetch_result == (
+        200,
+        empty_bundle_dict,
+        importer.MICHIGAN_STATELESS_OFFSET_EMPTY_ERROR,
+        15,
+    )
+    assert fetch_source_json_once.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -7545,6 +7652,7 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
     assert metrics["source_import_sources_selected_live_probe_valid"] == 0
     import_resources.assert_awaited_once()
     assert import_resources.await_args.args[0][0]["source_id"] == requested_source_id
+    assert import_resources.await_args.kwargs["require_complete_resources"] is True
 
 
 @pytest.mark.asyncio
@@ -7856,14 +7964,29 @@ def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_
     )
 
 
-def test_michigan_interopstation_replaces_opaque_cursor_with_stateless_offset():
+@pytest.mark.parametrize(
+    ("resource_type", "page_count", "current_offset", "expected_offset"),
+    [
+        ("Location", 100, 100, 200),
+        ("Organization", 100, 100, 200),
+        ("OrganizationAffiliation", 100, 100, 200),
+        ("Practitioner", 100, 100, 200),
+        ("PractitionerRole", 25, 25, 50),
+    ],
+)
+def test_michigan_interopstation_replaces_opaque_cursor_with_stateless_offset(
+    resource_type,
+    page_count,
+    current_offset,
+    expected_offset,
+):
     source_lookup = {
         "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
     }
     current_url = (
-        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
-        "_count=25&_getpagesoffset=25"
+        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/{resource_type}?"
+        f"_count={page_count}&_getpagesoffset={current_offset}"
     )
     advertised_next_url = (
         f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}?"
@@ -7877,8 +8000,8 @@ def test_michigan_interopstation_replaces_opaque_cursor_with_stateless_offset():
     )
 
     assert next_url == (
-        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
-        "_count=25&_getpagesoffset=50"
+        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/{resource_type}?"
+        f"_count={page_count}&_getpagesoffset={expected_offset}"
     )
 
 
@@ -7944,14 +8067,41 @@ def test_resource_start_url_uses_standard_count_for_state_directory_pages(
     assert url == f"{api_base}/{resource_type}?_count=100"
 
 
-def test_resource_start_url_does_not_cap_other_michigan_interopstation_resources():
+def test_resource_start_url_adds_offset_without_capping_other_michigan_resources():
     url = importer._resource_start_url(
         {"api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE},
         "Practitioner",
         page_count=100,
     )
 
-    assert url == "https://api.interopstation.com/mdhhs/fhir/Practitioner?_count=100"
+    assert url == (
+        "https://api.interopstation.com/mdhhs/fhir/Practitioner?"
+        "_count=100&_getpagesoffset=0"
+    )
+
+
+def test_michigan_source_profile_excludes_forbidden_resource_collections():
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+    supported_resources = sorted(importer.MICHIGAN_STATELESS_OFFSET_RESOURCES)
+
+    assert source_row["last_validated_status"] == "valid"
+    assert source_row["metadata_json"]["provider_directory_supported_resources"] == (
+        supported_resources
+    )
+    assert source_row["metadata_json"][
+        "provider_directory_fully_enumerable_resources"
+    ] == supported_resources
+    assert importer._resource_start_url(
+        source_row,
+        "InsurancePlan",
+        page_count=100,
+    ) is None
 
 
 def test_resource_start_url_uses_metadata_resource_page_count_cap():
@@ -9807,6 +9957,32 @@ async def test_uhc_incomplete_partition_requires_resume():
     assert importer.UHC_PROVIDER_DIRECTORY_BASE in importer.PAGINATION_CHECKPOINT_API_BASES
     assert checkpoint_context is not None
     assert resume_required_entries == {"uhc_owner:Practitioner"}
+
+
+@pytest.mark.asyncio
+async def test_uncheckpointed_full_acquisition_fails_on_incomplete_resource():
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"{importer.RESOURCE_FETCH_INCOMPLETE_ERROR}:"
+            r"uncheckpointed:Location=http_403"
+        ),
+    ):
+        await importer._finalize_source_pagination_checkpoints(
+            {
+                "source_id": "uncheckpointed",
+                "api_base": "https://example.test/fhir",
+            },
+            {
+                "Location": {
+                    "complete": False,
+                    "error": "http_403",
+                    "bounded": False,
+                }
+            },
+            set(),
+            require_complete_resources=True,
+        )
 
 
 @pytest.mark.asyncio
