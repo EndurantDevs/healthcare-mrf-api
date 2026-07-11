@@ -128,12 +128,12 @@ async def test_price_map_is_distinct_and_dense(monkeypatch):
         stage_table="price_key_map",
         expected_price_set_count=3,
     )
-
     assert "SET (n_distinct = 3)" in _compact_sql(status_statements[0])
     assert _compact_sql(status_statements[1]) == 'ANALYZE "mrf"."price_set_atom_source";'
     create_sql = _compact_sql(status_statements[2])
     assert "CREATE UNLOGGED TABLE" in create_sql
-    assert "SELECT DISTINCT price_set_global_id_128" in create_sql
+    assert "SELECT DISTINCT ON (price_set_global_id_128) price_set_global_id_128" in create_sql
+    assert create_sql.count("ORDER BY price_set_global_id_128") == 3
     assert "ROW_NUMBER() OVER (ORDER BY price_set_global_id_128)" in create_sql
     assert "FROM \"mrf\".\"price_set_atom_source\"" in create_sql
     assert sum("CREATE UNIQUE INDEX" in sql for sql in status_statements) == 1

@@ -2166,8 +2166,9 @@ async def _create_v3_price_key_stage(
             price_set_global_id_128,
             (ROW_NUMBER() OVER (ORDER BY price_set_global_id_128) - 1)::bigint AS price_key
         FROM (
-            SELECT DISTINCT price_set_global_id_128
+            SELECT DISTINCT ON (price_set_global_id_128) price_set_global_id_128
             FROM {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)}
+            ORDER BY price_set_global_id_128
         ) distinct_price_set
         ORDER BY price_set_global_id_128;
         """
