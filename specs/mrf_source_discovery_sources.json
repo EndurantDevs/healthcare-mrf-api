@@ -15,7 +15,8 @@
     "bcbsal_html_mrf_links",
     "blueadvantage_html_mrf_links",
     "auxiant_wordpress",
-    "payercompass_mrf"
+    "payercompass_mrf",
+    "cigna_static_mrf_lookup"
   ],
   "providers": {
     "master-list": {

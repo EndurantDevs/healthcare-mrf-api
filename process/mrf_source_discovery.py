@@ -291,6 +291,7 @@ TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "sapphire",
     "auxiant_wordpress",
 )
+TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset({"cigna_static_mrf_lookup"})
 SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
     platform: rank
     for rank, platform in enumerate(TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS)
@@ -3002,7 +3003,11 @@ def _healthsparq_rows_from_metadata(
 
 
 def _toc_rows_from_content(
-    source: dict[str, Any], url: str, toc: dict[str, Any]
+    source: dict[str, Any],
+    url: str,
+    toc: dict[str, Any],
+    *,
+    filter_to_target_query: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if isinstance(toc.get("files"), list):
         return _healthsparq_rows_from_metadata(source, url, toc)
@@ -3012,7 +3017,13 @@ def _toc_rows_from_content(
     schema_version = _truncate_text(toc.get("version"), 32)
     target_query = _source_target_payer_query(source)
     for entry in entries:
-        plan_info = _query_expanded_plan_info(entry.plan_info or (), target_query)
+        plan_info = _query_expanded_plan_info(
+            entry.plan_info or (),
+            target_query,
+            filter_to_target_query=filter_to_target_query,
+        )
+        if filter_to_target_query and target_query and not plan_info:
+            continue
         for plan in plan_info:
             plan_id = str(plan.get("plan_id") or "").strip()
             plan_name = plan.get("plan_name")
@@ -3293,6 +3304,25 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return targets
+
+
+def _uhc_blob_targets_matching_query(
+    targets: list[dict[str, Any]], query: str | None
+) -> list[dict[str, Any]]:
+    if not _clean_text(query):
+        return targets
+    return [
+        target
+        for target in targets
+        if _search_values_match_query(
+            (
+                target.get("label"),
+                target.get("name"),
+                target.get("url"),
+            ),
+            query,
+        )
+    ]
 
 
 def _uhc_provider_mrf_collection_from_url(url: str | None) -> str:
@@ -6109,6 +6139,16 @@ async def _resolve_html_mrf_links(
                 )
         targets = _dedupe_crawl_targets_by_url(targets)
     targets = _filter_crawl_targets_by_resolver_patterns(targets, resolver)
+    target_query = _source_target_payer_query(source)
+    if target_query:
+        targets = [
+            matched
+            for target in targets
+            if (
+                matched := _matched_query_expansion_target(target, target_query)
+            )
+            is not None
+        ]
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
         targets = targets[:max_targets]
@@ -9959,10 +9999,14 @@ def _parse_cigna_lookup_targets(
                     "entityType",
                 ),
             )
+            container_format = _container_format(file_url) or _container_format(file_name)
             metadata = {
                 "resolver": "cigna_static_mrf_lookup",
-                "target_kind": "toc_json",
+                "target_kind": (
+                    "file_reference" if container_format == "zip" else "toc_json"
+                ),
                 "target_file_type": "table-of-contents",
+                "container_format": container_format,
                 "target_max_bytes": toc_max_bytes,
                 "lookup_url": lookup_url,
                 "file_name": file_name,
@@ -11268,12 +11312,17 @@ def _healthsparq_query_plan_label(
 
 
 def _query_expanded_plan_info(
-    plan_info: Iterable[dict[str, Any]], target_query: str | None
+    plan_info: Iterable[dict[str, Any]],
+    target_query: str | None,
+    *,
+    filter_to_target_query: bool = False,
 ) -> list[dict[str, Any]]:
     query = _clean_text(target_query)
     items: list[dict[str, Any]] = []
     for raw_plan in plan_info:
         if not isinstance(raw_plan, dict):
+            continue
+        if filter_to_target_query and not _is_plan_info_query_match(raw_plan, query):
             continue
         item = dict(raw_plan)
         plan_name, sponsor_name = _healthsparq_query_plan_label(
@@ -11286,6 +11335,29 @@ def _query_expanded_plan_info(
             item.setdefault("company_name", sponsor_name)
         items.append(item)
     return items
+
+
+def _is_plan_info_query_match(plan: dict[str, Any], query: str | None) -> bool:
+    if not _clean_text(query):
+        return True
+    return _search_values_match_query(
+        [
+            plan.get("plan_name"),
+            plan.get("planName"),
+            plan.get("plan_sponsor_name"),
+            plan.get("plan_sponser_name"),
+            plan.get("sponsor_name"),
+            plan.get("issuer_name"),
+            plan.get("company_name"),
+            plan.get("plan_id"),
+            plan.get("planId"),
+            plan.get("plan_id_type"),
+            plan.get("planIdType"),
+            plan.get("plan_market_type"),
+            plan.get("planMarketType"),
+        ],
+        query,
+    )
 
 
 def _healthsparq_plan_info(
@@ -11856,6 +11928,7 @@ async def _crawl_targets_for_source(
             else resolver.get("path_templates")
         )
         paths = [str(item) for item in (configured_paths or ()) if str(item).strip()]
+        target_query = _source_target_payer_query(source)
         targets: list[CrawlTarget] = []
         for path in paths:
             listing_url = urljoin(url, path)
@@ -11864,7 +11937,15 @@ async def _crawl_targets_for_source(
                 max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024),
                 session=session,
             )
-            for target in _parse_uhc_blob_listing(listing):
+            parsed_targets = _uhc_blob_targets_matching_query(
+                _parse_uhc_blob_listing(listing),
+                target_query,
+            )
+            if target_query:
+                max_targets = _as_int(resolver.get("max_targets"))
+                if max_targets and max_targets > 0:
+                    parsed_targets = parsed_targets[:max_targets]
+            for target in parsed_targets:
                 targets.append(
                     CrawlTarget(
                         source=source,
@@ -11884,7 +11965,12 @@ async def _crawl_targets_for_source(
                     )
                 )
         if not targets:
-            raise ValueError(f"no UHC blob index links found for {url}")
+            suffix = (
+                f" matching target payer query {target_query!r}"
+                if target_query
+                else ""
+            )
+            raise ValueError(f"no UHC blob index links found for {url}{suffix}")
         return targets
     if resolver_type == "sapphire_html_tocs":
         if _looks_direct_toc_url(url):
@@ -12202,6 +12288,50 @@ def _matched_query_expansion_target(
     )
 
 
+def _supports_toc_plan_query_scan(target: CrawlTarget) -> bool:
+    resolver_type = str((target.metadata or {}).get("resolver") or "").strip()
+    return resolver_type in TOC_LEVEL_QUERY_EXPANSION_RESOLVERS
+
+
+def _toc_level_query_expansion_target(
+    target: CrawlTarget, query: str | None
+) -> CrawlTarget:
+    metadata = dict(target.metadata or {})
+    query_label = _clean_text(query)
+    if query_label:
+        metadata.setdefault("company_name", query_label)
+        metadata.setdefault("employer_name", query_label)
+    metadata["target_payer_query"] = query
+    metadata["query_expansion_match"] = True
+    metadata["query_expansion_match_scope"] = "toc_plan"
+    return CrawlTarget(
+        source=target.source,
+        url=target.url,
+        label=target.label,
+        resolved_from_url=target.resolved_from_url,
+        metadata=metadata,
+    )
+
+
+def _filter_query_expansion_targets(
+    targets: list[CrawlTarget],
+    query: str | None,
+    *,
+    limit: int | None = None,
+) -> list[CrawlTarget]:
+    if not query:
+        return targets[:limit] if limit and limit > 0 else targets
+    matched_targets: list[CrawlTarget] = []
+    for target in targets:
+        matched = _matched_query_expansion_target(target, query)
+        if matched is not None:
+            matched_targets.append(matched)
+        elif _supports_toc_plan_query_scan(target):
+            matched_targets.append(_toc_level_query_expansion_target(target, query))
+    matched_targets = _dedupe_crawl_targets_by_url(matched_targets)
+    return matched_targets[:limit] if limit and limit > 0 else matched_targets
+
+
 async def _resolve_crawl_targets(
     source_rows: list[dict[str, Any]],
     *,
@@ -12273,16 +12403,11 @@ async def _resolve_crawl_targets(
                 resolved_targets.extend(
                     await query_probe_targets(source, url_text, target_query)
                 )
-                resolved_targets = [
-                    matched
-                    for target in resolved_targets
-                    if (
-                        matched := _matched_query_expansion_target(
-                            target, target_query
-                        )
-                    )
-                    is not None
-                ]
+                resolved_targets = _filter_query_expansion_targets(
+                    resolved_targets,
+                    target_query,
+                    limit=crawl_target_limit,
+                )
             if not resolved_targets:
                 return idx, [], [
                     _crawl_skipped_observation(
@@ -12509,9 +12634,15 @@ def _crawl_source_score(source: dict[str, Any]) -> tuple[int, int]:
 
 def _crawl_source_identity_key(source: dict[str, Any]) -> str:
     url = str(source.get("index_url") or source.get("human_url") or "").strip()
+    target_query = _source_target_payer_query(source)
     if not url:
         return str(source.get("source_id") or source.get("source_key") or "")
     resolver = _platform_resolver_config(source.get("hosting_platform"))
+    context_suffix = (
+        f"#target_payer_query={_clean_text(target_query).lower()}"
+        if target_query
+        else ""
+    )
     if str(resolver.get("type") or "").strip() == "healthsparq_public_mrf":
         try:
             params = _healthsparq_public_params(url)
@@ -12519,9 +12650,9 @@ def _crawl_source_identity_key(source: dict[str, Any]) -> str:
         except (TypeError, ValueError):
             metadata_url = None
         if metadata_url:
-            return _canonical_or_none(metadata_url) or metadata_url
-        return url
-    return _canonical_or_none(url) or url
+            return f"{_canonical_or_none(metadata_url) or metadata_url}{context_suffix}"
+        return f"{url}{context_suffix}"
+    return f"{_canonical_or_none(url) or url}{context_suffix}"
 
 
 def _dedupe_source_rows_for_crawl(
@@ -13090,6 +13221,11 @@ async def _crawl_toc_metadata(
             target_kind = (target.metadata or {}).get("target_kind")
             target_file_type = (target.metadata or {}).get("target_file_type")
             target_max_bytes = _target_fetch_max_bytes(target, max_toc_bytes)
+            should_filter_to_target_query = (
+                (target.metadata or {}).get("query_expansion_match_scope")
+                == "toc_plan"
+                and _supports_toc_plan_query_scan(target)
+            )
             if (
                 target_kind == "file_reference"
                 and target_file_type == "table-of-contents"
@@ -13116,9 +13252,17 @@ async def _crawl_toc_metadata(
                 for _member_name, toc in toc_values:
                     if not isinstance(toc, dict):
                         raise ValueError("expected JSON object")
-                    member_plan_rows, member_file_rows = _toc_rows_from_content(
-                        target.source, target.url, toc
-                    )
+                    if should_filter_to_target_query:
+                        member_plan_rows, member_file_rows = _toc_rows_from_content(
+                            target.source,
+                            target.url,
+                            toc,
+                            filter_to_target_query=True,
+                        )
+                    else:
+                        member_plan_rows, member_file_rows = _toc_rows_from_content(
+                            target.source, target.url, toc
+                        )
                     plan_rows.extend(member_plan_rows)
                     file_rows.extend(
                         _apply_crawl_target_context_to_file_rows(
@@ -13161,9 +13305,17 @@ async def _crawl_toc_metadata(
                 toc = await _fetch_json(
                     target.url, max_bytes=target_max_bytes, session=session
                 )
-                plan_rows, file_rows = _toc_rows_from_content(
-                    target.source, target.url, toc
-                )
+                if should_filter_to_target_query:
+                    plan_rows, file_rows = _toc_rows_from_content(
+                        target.source,
+                        target.url,
+                        toc,
+                        filter_to_target_query=True,
+                    )
+                else:
+                    plan_rows, file_rows = _toc_rows_from_content(
+                        target.source, target.url, toc
+                    )
                 file_rows = _apply_crawl_target_context_to_file_rows(file_rows, target)
             return (
                 plan_rows,
