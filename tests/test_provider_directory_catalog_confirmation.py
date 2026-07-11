@@ -16,7 +16,7 @@ def test_rendered_catalog_snapshot_distinguishes_full_catalog_from_curated_matri
     assert "## Catalog Inventory Snapshot" in rendered_document
     assert "entire live catalog: `866` sources confirmed in `healthporta-dev`" in rendered_document
     assert (
-        "not the curated support matrix below, which tracks `31` entries, including `23` "
+        "not the curated support matrix below, which tracks `31` entries, including `17` "
         "acquisition-configured entries"
     ) in rendered_document
     assert (
