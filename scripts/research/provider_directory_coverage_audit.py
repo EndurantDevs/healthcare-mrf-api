@@ -2002,6 +2002,9 @@ async def _resource_summary(
     return summary
 
 
+FAST_UNIFIED_SAMPLE_LIMIT = 10_000
+
+
 async def _unified_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -2013,45 +2016,54 @@ async def _unified_summary(
             row = await _fetch_mapping(
                 conn,
                 f"""
+                WITH sampled_rows AS MATERIALIZED (
+                    SELECT
+                        address_key,
+                        NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') AS phone_number,
+                        NULLIF(BTRIM(source_record_id), '') AS source_record_id,
+                        country_code
+                      FROM {_qt(schema, "provider_directory_address_overlay")}
+                     LIMIT {FAST_UNIFIED_SAMPLE_LIMIT}
+                )
                 SELECT
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
+                          FROM sampled_rows
                          LIMIT 1
                     ) AS has_provider_directory_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
+                          FROM sampled_rows
                          WHERE address_key IS NOT NULL
                          LIMIT 1
                     ) AS has_provider_directory_keyed_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
-                         WHERE NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
+                          FROM sampled_rows
+                         WHERE phone_number IS NOT NULL
                          LIMIT 1
                     ) AS has_provider_directory_phone_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
+                          FROM sampled_rows
                          WHERE address_key IS NULL
                          LIMIT 1
                     ) AS has_provider_directory_null_key_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
-                         WHERE NULLIF(BTRIM(source_record_id), '') IS NOT NULL
+                          FROM sampled_rows
+                         WHERE source_record_id IS NOT NULL
                          LIMIT 1
                     ) AS has_provider_directory_source_record_id_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
+                          FROM sampled_rows
                          WHERE country_code = '001'
                          LIMIT 1
                     ) AS has_provider_directory_country_001_rows,
                     EXISTS (
                         SELECT 1
-                          FROM {_qt(schema, "provider_directory_address_overlay")}
+                          FROM sampled_rows
                          WHERE country_code = 'US'
                          LIMIT 1
                     ) AS has_provider_directory_country_us_rows
@@ -2109,53 +2121,61 @@ async def _unified_summary(
         row = await _fetch_mapping(
             conn,
             f"""
+            WITH sampled_rows AS MATERIALIZED (
+                SELECT
+                    address_sources,
+                    address_key,
+                    telephone_number,
+                    source_record_ids,
+                    country_code
+                  FROM {_qt(schema, "entity_address_unified")}
+                 LIMIT {FAST_UNIFIED_SAMPLE_LIMIT}
+            ),
+            provider_directory_rows AS MATERIALIZED (
+                SELECT address_key, telephone_number, source_record_ids, country_code
+                  FROM sampled_rows
+                 WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
+            )
             SELECT
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
+                      FROM provider_directory_rows
                      LIMIT 1
                 ) AS has_provider_directory_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND address_key IS NOT NULL
+                      FROM provider_directory_rows
+                     WHERE address_key IS NOT NULL
                      LIMIT 1
                 ) AS has_provider_directory_keyed_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND telephone_number IS NOT NULL
+                      FROM provider_directory_rows
+                     WHERE telephone_number IS NOT NULL
                      LIMIT 1
                 ) AS has_provider_directory_phone_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND address_key IS NULL
+                      FROM provider_directory_rows
+                     WHERE address_key IS NULL
                      LIMIT 1
                 ) AS has_provider_directory_null_key_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND cardinality(COALESCE(source_record_ids, ARRAY[]::varchar[])) > 0
+                      FROM provider_directory_rows
+                     WHERE cardinality(COALESCE(source_record_ids, ARRAY[]::varchar[])) > 0
                      LIMIT 1
                 ) AS has_provider_directory_source_record_id_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND country_code = '001'
+                      FROM provider_directory_rows
+                     WHERE country_code = '001'
                      LIMIT 1
                 ) AS has_provider_directory_country_001_rows,
                 EXISTS (
                     SELECT 1
-                      FROM {_qt(schema, "entity_address_unified")}
-                     WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-                       AND country_code = 'US'
+                      FROM provider_directory_rows
+                     WHERE country_code = 'US'
                      LIMIT 1
                 ) AS has_provider_directory_country_us_rows
             """,
@@ -5384,7 +5404,7 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     conn,
                     schema,
                     sample_limit=args.sample_limit,
-                    include_unified=not args.skip_unified,
+                    include_unified=not args.skip_unified and not args.fast_serving_readiness,
                 )
             ),
             "source_semantic_readiness_summary": (
