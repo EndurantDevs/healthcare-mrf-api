@@ -299,6 +299,7 @@ SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
 
 
 def _provider_config(provider: str) -> dict[str, Any]:
+    """Return the configured source-discovery provider definition."""
     providers = _source_config().get("providers") or {}
     config = providers.get(provider)
     if not isinstance(config, dict):
@@ -307,6 +308,7 @@ def _provider_config(provider: str) -> dict[str, Any]:
 
 
 def _platform_resolver_config(platform: str | None) -> dict[str, Any]:
+    """Return a copy of the resolver configuration for one platform."""
     if not platform:
         return {}
     resolvers = _source_config().get("platform_resolvers") or {}
@@ -315,6 +317,7 @@ def _platform_resolver_config(platform: str | None) -> dict[str, Any]:
 
 
 def _source_query_expansion_platforms() -> set[str]:
+    """Return platforms allowed to expand targeted source queries."""
     values = _source_config().get("source_query_expansion_platforms")
     if not isinstance(values, list):
         values = list(DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS)
@@ -842,6 +845,7 @@ _MONTH_NAME_TO_NUMBER = {
 
 
 def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
+    """Identify references that are clearly unrelated to TiC MRF data."""
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower().replace("_", "-")
@@ -1000,6 +1004,7 @@ def _canonical_or_none(url: str | None) -> str | None:
 
 
 def classify_hosting_platform(url: str | None) -> str | None:
+    """Classify a URL into its known hosting-platform resolver."""
     host = _domain(url) or ""
     raw = str(url or "").lower()
     path = urlsplit(str(url or "")).path.lower()
@@ -1835,6 +1840,7 @@ def _file_benefit_metadata(source: dict[str, Any], *values: Any) -> dict[str, An
 
 
 def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
+    """Parse the markdown source list into source candidates."""
     candidates: list[SourceCandidate] = []
     current_section = ""
     for raw_line in (markdown_text or "").splitlines():
@@ -1965,6 +1971,7 @@ def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidat
     by_key: dict[tuple[str, str | None, str | None], SourceCandidate] = {}
 
     def rank(item: SourceCandidate) -> tuple[int, int, int]:
+        """Rank duplicate source candidates by status and URL coverage."""
         status_rank = {
             "active": 5,
             "stale": 4,
@@ -2007,6 +2014,7 @@ async def _fetch_text(
     session: aiohttp.ClientSession | None = None,
     expect_json: bool = False,
 ) -> str:
+    """Fetch text from a URL with bounded size and fallback handling."""
     await _assert_fetch_url_allowed(url)
     if session is None:
         timeout = aiohttp.ClientTimeout(
@@ -2030,6 +2038,7 @@ async def _fetch_text(
         *,
         allow_browser_fallback: bool,
     ) -> tuple[bytes, str]:
+        """Read and validate a response body as bytes and content type."""
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
         if (
@@ -2516,6 +2525,7 @@ async def _ensure_catalog_tables() -> None:
 def _candidate_to_rows(
     candidate: SourceCandidate, now: dt.datetime
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Convert one source candidate into payer and source database rows."""
     payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
     source_url = candidate.index_url or candidate.human_url
     aliases = sorted(
@@ -2635,6 +2645,7 @@ def _candidate_metadata(
 async def _store_candidates(
     candidates: list[SourceCandidate],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize and persist discovered payer and source rows."""
     now = _utc_now()
     payer_rows_by_id: dict[str, dict[str, Any]] = {}
     source_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -2703,6 +2714,7 @@ async def _store_observations(
     progress_run_id: str | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> list[dict[str, Any]]:
+    """Check source URLs and build normalized URL observations."""
     observations: list[dict[str, Any]] = []
     items = [
         (source, source.get("index_url") or source.get("human_url"))
@@ -2719,6 +2731,7 @@ async def _store_observations(
     async def check_one(
         source: dict[str, Any], url: Any, session: aiohttp.ClientSession
     ) -> dict[str, Any]:
+        """Check one source URL and return its normalized observation row."""
         async with semaphore:
             if test_mode:
                 head = {"status": "skipped_test_mode", "checked_at": _utc_now()}
@@ -2891,6 +2904,7 @@ def _healthsparq_last_updated_on(file_item: dict[str, Any]) -> Any:
 def _healthsparq_rows_from_metadata(
     source: dict[str, Any], metadata_url: str, payload: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convert HealthSparq metadata into normalized plan and file rows."""
     files = _healthsparq_metadata_files(payload if isinstance(payload, dict) else {})
     now = _utc_now()
     target_query = _source_target_payer_query(source)
@@ -3009,6 +3023,7 @@ def _toc_rows_from_content(
     *,
     filter_to_target_query: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convert TOC content into plan and file rows."""
     if isinstance(toc.get("files"), list):
         return _healthsparq_rows_from_metadata(source, url, toc)
     plan_rows: list[dict[str, Any]] = []
@@ -3148,6 +3163,7 @@ def _metadata_text_fields(line: str) -> dict[str, str]:
 def _metadata_text_rows_from_content(
     source: dict[str, Any], url: str, text: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse text metadata into normalized plan and file rows."""
     now = _utc_now()
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -3941,6 +3957,7 @@ async def _mymedicalshopper_entity_employers(
     resolver: dict[str, Any],
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
+    """Retrieve employer records from a MyMedicalShopper websocket."""
     config_messages = await _mymedicalshopper_ddp_subscribe_collect(
         ws,
         name="entityMRFsConfig",
@@ -4102,6 +4119,7 @@ def _mymedicalshopper_targets_from_generated(
     resolver_type: str,
     resolved_from_url: str,
 ) -> list[CrawlTarget]:
+    """Convert generated MyMedicalShopper records into crawl targets."""
     employer_slug = str(employer.get("slug") or "").strip()
     employer_name = _clean_text(employer.get("name") or employer_slug)
     employer_id = (
@@ -4180,6 +4198,7 @@ async def _resolve_mymedicalshopper_talon_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve a MyMedicalShopper Talon MRF URL into crawl targets."""
     entity_slug = _mymedicalshopper_entity_slug_from_url(url)
     employer_slug = _mymedicalshopper_employer_slug_from_url(url)
     if not entity_slug and not employer_slug:
@@ -4574,6 +4593,7 @@ async def _resolve_magnacare_transparency_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve MagnaCare transparency search results into crawl targets."""
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
     search_terms = _magnacare_search_terms(source, resolver)
     max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
@@ -4873,6 +4893,7 @@ def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[di
     by_group: dict[str, dict[str, Any]] = {}
 
     def add_group(value: Any, metadata: dict[str, Any] | None = None) -> None:
+        """Add a validated ASR group target, merging metadata for duplicates."""
         group_number = str(value or "").strip()
         if not group_number or group_number in seen:
             if group_number and metadata:
@@ -5241,6 +5262,7 @@ async def _resolve_auxiant_wordpress_directory(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve Auxiant WordPress directory pages into crawl targets."""
     resolver_type = str(resolver.get("type") or "auxiant_wordpress_directory")
     directory_url = _auxiant_directory_url(url, resolver)
     directory_html = await _fetch_text(
@@ -5545,6 +5567,7 @@ def _parse_sapphire_static_query_toc_links(
     *,
     base_url: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Parse Sapphire query JSON and collect TOC links."""
     try:
         payload = json.loads(query_text or "{}")
     except json.JSONDecodeError:
@@ -5552,6 +5575,7 @@ def _parse_sapphire_static_query_toc_links(
     urls: dict[str, dict[str, Any]] = {}
 
     def visit(value: Any, context: dict[str, Any] | None = None) -> None:
+        """Recursively inspect Sapphire query values and collect labeled links."""
         if isinstance(value, dict):
             next_context = dict(context or {})
             for key in ("payer_name", "name", "label", "title", "file_name"):
@@ -5671,6 +5695,7 @@ async def _resolve_healthgram_network_index(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve a Healthgram network index into crawl targets."""
     resolver_type = str(resolver.get("type") or "healthgram_network_index")
     html_text = await _fetch_text(
         url,
@@ -5841,6 +5866,7 @@ async def _resolve_point32_azure_mrf_directory(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve Point32 Azure directory pages into crawl targets."""
     targets: list[CrawlTarget] = []
     if urlsplit(url).netloc.lower().endswith(".web.core.windows.net"):
         directory_urls = [url]
@@ -6004,6 +6030,7 @@ async def _resolve_html_mrf_links(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve an HTML MRF directory into crawl targets."""
     html_text = await _fetch_text(
         url,
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
@@ -6471,6 +6498,7 @@ async def _resolve_ebms_caa_directory(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve EBMS CAA directory pages into crawl targets."""
     root_html = await _fetch_text(
         url,
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
@@ -6496,6 +6524,7 @@ async def _resolve_ebms_caa_directory(
     async def page_targets(
         page_url: str, *, client_url: str, client_label: str, nested_url: str | None
     ) -> list[CrawlTarget]:
+        """Fetch one EBMS directory page and extract its crawl targets."""
         page_html = await _fetch_text(
             page_url,
             max_bytes=nested_page_max_bytes if nested_url else client_page_max_bytes,
@@ -6577,6 +6606,7 @@ async def _resolve_ebms_caa_directory(
 
 
 def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
+    """Extract likely MRF directory URLs from an HTML page."""
     urls: list[str] = []
     seen: set[str] = set()
     base_key = _canonical_or_none(base_url) or base_url
@@ -6702,10 +6732,12 @@ def _json_mrf_directory_targets_from_payload(
     directory_url: str,
     resolver_type: str,
 ) -> list[CrawlTarget]:
+    """Walk a JSON directory payload and build unique crawl targets."""
     targets: list[CrawlTarget] = []
     seen: set[str] = set()
 
     def visit(value: Any) -> None:
+        """Visit nested JSON values and collect directory MRF references."""
         if isinstance(value, dict):
             for nested in value.values():
                 visit(nested)
@@ -6921,6 +6953,7 @@ async def _resolve_humana_pct_file_list(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve Humana PCT file-list endpoints into crawl targets."""
     resolver_type = str(resolver.get("type") or "humana_pct_file_list")
     api_url = str(
         resolver.get("api_url")
@@ -7401,6 +7434,7 @@ async def _enrich_payercompass_targets_with_index_plan_info(
     max_bytes: int,
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Add index plan metadata to PayerCompass crawl targets."""
     index_fetch_max_bytes = (
         _as_int(resolver.get("index_max_bytes"))
         or _as_int(resolver.get("max_index_bytes"))
@@ -7649,6 +7683,7 @@ async def _resolve_webtpa_mrf_api(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve WebTPA API responses into crawl targets."""
     base_url = _webtpa_api_base_url(url)
     plans_url = urljoin(base_url, str(resolver.get("plans_path") or ""))
     plans = await _fetch_json_value(
@@ -8165,6 +8200,7 @@ class _MRFHtmlLinkParser(HTMLParser):
             )
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Track table cells and links while parsing an HTML start tag."""
         tag = tag.lower()
         start = self._offset()
         end = self._tag_end(start)
@@ -8180,6 +8216,7 @@ class _MRFHtmlLinkParser(HTMLParser):
     def handle_startendtag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
+        """Process self-closing HTML tags that may contain link attributes."""
         start = self._offset()
         end = self._tag_end(start)
         self._append_attr_candidates(
@@ -8191,12 +8228,14 @@ class _MRFHtmlLinkParser(HTMLParser):
         )
 
     def handle_data(self, data: str) -> None:
+        """Collect text encountered inside the current table cell."""
         if data:
             self.text_parts.append(data)
         if self._anchor_stack:
             self._anchor_stack[-1]["label_parts"].append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Close the active cell or row when an HTML end tag arrives."""
         if tag.lower() != "a" or not self._anchor_stack:
             return
         start = self._offset()
@@ -8277,6 +8316,7 @@ class _MidlandsChoiceMrfParser(HTMLParser):
         self._current_cell: dict[str, Any] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Open cells and capture links from a Midlands Choice table."""
         tag = tag.lower()
         if tag == "tr":
             self._current_row = []
@@ -8291,10 +8331,12 @@ class _MidlandsChoiceMrfParser(HTMLParser):
                 self._current_cell["href"] = href
 
     def handle_data(self, data: str) -> None:
+        """Append cell text while parsing the Midlands Choice table."""
         if self._current_cell is not None and data:
             self._current_cell["text_parts"].append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize cells and rows from Midlands Choice table end tags."""
         tag = tag.lower()
         if tag in {"td", "th"} and self._current_row is not None and self._current_cell:
             self._current_row.append(
@@ -8452,6 +8494,7 @@ def _decode_embedded_url_text(value: str | None) -> str:
 
 
 def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
+    """Classify whether a URL or label refers to an MRF table of contents."""
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower()
@@ -8536,6 +8579,7 @@ def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
 
 
 def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
+    """Classify whether a URL or label refers to an MRF body file."""
     query_file_name = _query_mrf_file_name(url)
     direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
     parsed = urlsplit(str(url or ""))
@@ -8700,6 +8744,7 @@ def _mrf_file_type_from_html_link_context(
 
 
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+    """Extract normalized MRF links and file types from HTML."""
     urls: dict[tuple[str, str], dict[str, Any]] = {}
     section_file_type: str | None = None
     last_html_position = 0
@@ -9425,6 +9470,7 @@ async def _resolve_healthcarebluebook_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve Healthcare Bluebook grid data into crawl targets."""
     resolver_type = str(resolver.get("type") or "healthcarebluebook_mrf")
     html_text = await _fetch_text(
         url,
@@ -9537,6 +9583,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve an HTML MRF page and enrich targets with Healthcare Bluebook data."""
     resolver_type = str(resolver.get("type") or "html_mrf_with_healthcarebluebook")
     html_text = await _fetch_text(
         url,
@@ -9910,6 +9957,7 @@ def _parse_cigna_lookup_targets(
     source: dict[str, Any],
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
+    """Convert a Cigna lookup payload into crawl targets."""
     toc_max_bytes = (
         _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
     )
@@ -10184,6 +10232,7 @@ async def _resolve_bcbs_global_solutions_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve BCBS Global Solutions pages into crawl targets."""
     resolver_type = str(resolver.get("type") or "bcbs_global_solutions_mrf")
     max_pages = _as_int(resolver.get("max_pages")) or 5
     max_targets = _as_int(resolver.get("max_targets")) or 20
@@ -10386,6 +10435,7 @@ def _monthly_toc_targets(
     *,
     now: dt.datetime | None = None,
 ) -> list[CrawlTarget]:
+    """Generate crawl targets for configured monthly TOC files."""
     base_url = str(resolver.get("base_url") or url or "").strip()
     if not base_url:
         raise ValueError("monthly TOC resolver requires base_url or source URL")
@@ -10600,6 +10650,7 @@ def _triples_mtt_targets_from_payload(
     resolved_from_url: str,
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
+    """Convert a Triples MTT payload into crawl targets."""
     if not isinstance(payload, dict):
         return []
     resolver_type = str(resolver.get("type") or "triples_mtt_api")
@@ -10769,6 +10820,7 @@ def _healthspace_mrf_targets_from_soap(
     resolved_from_url: str,
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
+    """Parse HealthSpace SOAP metadata into crawl targets."""
     root = ElementTree.fromstring((soap_text or "").lstrip("\ufeff"))
     resolver_type = str(resolver.get("type") or "healthspace_machine_readable_files")
     targets: list[CrawlTarget] = []
@@ -11507,6 +11559,7 @@ async def _resolve_healthsparq_public_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
+    """Resolve HealthSparq public metadata into crawl targets."""
     params = _healthsparq_public_params(url)
     metadata_url = _healthsparq_direct_metadata_url(resolver, params)
     if metadata_url:
@@ -11757,6 +11810,7 @@ async def _crawl_targets_for_source(
     *,
     target_limit: int | None = None,
 ) -> list[CrawlTarget]:
+    """Resolve crawl targets for one source URL using its platform resolver."""
     platform = source.get("hosting_platform") or classify_hosting_platform(url)
     resolver = _platform_resolver_config(str(platform) if platform else None)
     if resolver and target_limit and target_limit > 0:
@@ -12341,6 +12395,7 @@ async def _resolve_crawl_targets(
     concurrency: int,
     crawl_target_limit: int | None = None,
 ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
+    """Resolve source URLs concurrently and return targets and observations."""
     items = [
         (idx, source, source.get("index_url") or source.get("human_url"))
         for idx, source in enumerate(source_rows)
@@ -12362,6 +12417,7 @@ async def _resolve_crawl_targets(
     }
 
     def pending_detail() -> str | None:
+        """Format a compact description of pending crawl work."""
         if not pending_labels:
             return None
         sample = list(pending_labels.values())[:5]
@@ -12372,6 +12428,7 @@ async def _resolve_crawl_targets(
     async def query_probe_targets(
         source: dict[str, Any], url_text: str, query: str | None
     ) -> list[CrawlTarget]:
+        """Probe a source query endpoint and return matching crawl targets."""
         if not query:
             return []
         try:
@@ -12389,10 +12446,12 @@ async def _resolve_crawl_targets(
     async def resolve_one(
         idx: int, source: dict[str, Any], url: Any
     ) -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
+        """Resolve one source URL and capture failures as observations."""
         url_text = str(url)
         target_query = _source_target_payer_query(source)
 
         async def resolve_body() -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
+            """Crawl the source URL and expand its target-payer query results."""
             resolved_targets = await _crawl_targets_for_source(
                 source,
                 url_text,
@@ -12554,6 +12613,7 @@ def _target_fetch_max_bytes(target: CrawlTarget, default: int) -> int:
 
 
 def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
+    """Convert a crawl target into a persisted TOC file row."""
     now = _utc_now()
     source = target.source
     target_metadata = {
@@ -12683,6 +12743,7 @@ async def _push_crawl_row_batches(
     row_write_timeout: float | None = None,
 ) -> None:
     async def push_chunked(rows: list[dict[str, Any]], model: type[Any]) -> None:
+        """Write pending crawl rows in bounded chunks."""
         size = max(1, int(batch_size or len(rows) or 1))
         while rows:
             chunk = rows[:size]
@@ -13088,6 +13149,7 @@ async def _probe_mrf_file_heads(
     progress_run_id: str | None = None,
     concurrency: int,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Probe MRF file URLs and persist their response observations."""
     targets = await _load_file_probe_targets(
         file_types, limit, entity_types=entity_types, payer_query=payer_query
     )
@@ -13106,6 +13168,7 @@ async def _probe_mrf_file_heads(
         target_queue.put_nowait(None)
 
     async def worker(session: aiohttp.ClientSession) -> None:
+        """Consume file-probe targets and enqueue response heads."""
         while True:
             target = await target_queue.get()
             try:
@@ -13118,6 +13181,7 @@ async def _probe_mrf_file_heads(
                 target_queue.task_done()
 
     async def writer() -> tuple[list[dict[str, Any]], int]:
+        """Persist file-probe observations and report completion counts."""
         done = 0
         ok_count = 0
         finished_workers = 0
@@ -13190,6 +13254,7 @@ async def _crawl_toc_metadata(
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
+    """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
         return 0, 0, []
     discovery_count_map = {"plans": 0, "files": 0}
@@ -13217,6 +13282,7 @@ async def _crawl_toc_metadata(
     async def crawl_one(
         target: CrawlTarget, session: aiohttp.ClientSession
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+        """Crawl one TOC target and return rows with its observation."""
         try:
             target_kind = (target.metadata or {}).get("target_kind")
             target_file_type = (target.metadata or {}).get("target_file_type")
@@ -14555,6 +14621,7 @@ def _source_row_url_match_values(row: dict[str, Any]) -> list[str]:
 async def _private_context_snapshot_source_ids(
     row: dict[str, Any], *, limit: int = 8
 ) -> list[str]:
+    """Find importable private-context source IDs related to a source row."""
     source_id = str(row.get("source_id") or "")
     url_values = _source_row_url_match_values(row)
     if not source_id or not url_values:
@@ -15581,6 +15648,7 @@ async def main(
     crawl_target_limit: int | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    """Run source discovery, optional crawling and probing, and synchronization."""
     max_toc_bytes = max_toc_bytes or MAX_TOC_BYTES_DEFAULT
     concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     crawl_target_limit = max(1, int(crawl_target_limit)) if crawl_target_limit else None
@@ -15967,6 +16035,7 @@ async def main(
 async def process_data(
     ctx: dict[str, Any] | None = None, task: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    """Run discovery from a worker task and return its result mapping."""
     task = task or {}
     run_id = (
         str(
@@ -16008,10 +16077,12 @@ async def process_data(
 
 
 async def startup(ctx: dict[str, Any]) -> None:
+    """Initialize the database connection for the worker."""
     loop = asyncio.get_event_loop()
     ctx.setdefault("context", {})
     await init_db(db, loop)
 
 
 async def shutdown(_ctx: dict[str, Any]) -> None:
+    """Provide the worker shutdown hook."""
     return None
