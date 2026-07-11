@@ -28,6 +28,8 @@ from process.ptg_parts.config import (
     _uses_postgres_binary_provider_membership_graph)
 from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir
 from process.ptg_parts.ptg2_artifact_blobs import (
+    ptg2_artifact_db_retain_local_cache,
+    ptg2_artifact_id_from_db_uri,
     ptg2_artifact_db_store_enabled,
     store_ptg2_artifact_file_in_db,
 )
@@ -1120,6 +1122,19 @@ async def _write_ptg2_manifest_serving_sidecars(
     }
 
 
+def _postgresql_artifact_manifest_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove transient file locations from a PostgreSQL-owned artifact entry."""
+
+    manifest_entry_map = dict(entry)
+    if (
+        ptg2_artifact_id_from_db_uri(str(manifest_entry_map.get("storage_uri") or ""))
+        and not ptg2_artifact_db_retain_local_cache()
+    ):
+        manifest_entry_map.pop("path", None)
+        manifest_entry_map.pop("cache_path", None)
+    return manifest_entry_map
+
+
 async def _store_ptg2_manifest_sidecar_artifacts_in_db(
     *,
     schema_name: str,
@@ -1141,8 +1156,8 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             return None
         entry = dict(value)
         storage_uri = str(entry.get("storage_uri") or "").strip()
-        if storage_uri.startswith("db://ptg2_artifact/"):
-            return entry
+        if ptg2_artifact_id_from_db_uri(storage_uri):
+            return _postgresql_artifact_manifest_entry(entry)
         raw_path = str(entry.get("path") or "").strip()
         if not raw_path:
             return entry
@@ -1196,6 +1211,7 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             schema_name=schema_name,
             metadata=entry,
         )
+        uploaded = _postgresql_artifact_manifest_entry(uploaded)
         uploaded_by_key[cache_key] = uploaded
         if upload_total:
             upload_progress_by_name["done"] += 1

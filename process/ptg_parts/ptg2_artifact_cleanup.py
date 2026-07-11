@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_artifact_blobs import ptg2_artifact_id_from_db_uri
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -42,14 +43,20 @@ class PTG2ArtifactCleanupPlan:
 
     @property
     def referenced_bytes(self) -> int:
+        """Return bytes occupied by manifest-referenced local files."""
+
         return sum(path.stat().st_size for path in self.referenced_files if path.exists())
 
     @property
     def unreferenced_bytes(self) -> int:
+        """Return bytes that the cleanup plan can remove."""
+
         return sum(path.stat().st_size for path in self.unreferenced_files if path.exists())
 
     @property
     def has_actions(self) -> bool:
+        """Return whether the plan contains removable files."""
+
         return bool(self.unreferenced_files)
 
 
@@ -115,6 +122,8 @@ def build_ptg2_artifact_cleanup_plan(
     root: str | Path | None = None,
     referenced_paths: Iterable[str | Path] = (),
 ) -> PTG2ArtifactCleanupPlan:
+    """Classify local sidecar files against authoritative manifest paths."""
+
     sidecar_root = _resolve_existing_root(root)
     referenced = _normalize_referenced_paths(referenced_paths, sidecar_root=sidecar_root)
     if not sidecar_root.exists():
@@ -138,10 +147,14 @@ def build_ptg2_artifact_cleanup_plan(
 
 
 async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None) -> tuple[str, ...]:
+    """Return filesystem-owned sidecar paths still referenced by snapshots."""
+
     schema_name = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     rows = await db.all(
         f"""
-        SELECT sidecar->>'path' AS sidecar_path
+        SELECT sidecar->>'path' AS sidecar_path,
+               sidecar->>'storage' AS storage,
+               sidecar->>'storage_uri' AS storage_uri
           FROM {_quote_ident(schema_name)}.ptg2_snapshot snapshot
           CROSS JOIN LATERAL jsonb_array_elements(
               COALESCE(
@@ -153,10 +166,18 @@ async def fetch_referenced_ptg2_sidecar_paths(*, schema_name: str | None = None)
          ORDER BY sidecar->>'path'
         """
     )
-    return tuple(str(_row_value(row, "sidecar_path")) for row in rows if _row_value(row, "sidecar_path"))
+    return tuple(
+        str(_row_value(row, "sidecar_path"))
+        for row in rows
+        if _row_value(row, "sidecar_path")
+        and str(_row_value(row, "storage") or "") != "postgresql_chunks_v1"
+        and not ptg2_artifact_id_from_db_uri(str(_row_value(row, "storage_uri") or ""))
+    )
 
 
 def execute_ptg2_artifact_cleanup_plan(plan: PTG2ArtifactCleanupPlan) -> None:
+    """Delete unreferenced files and then prune empty directories."""
+
     for path in plan.unreferenced_files:
         if path.exists() and path.is_file():
             path.unlink()

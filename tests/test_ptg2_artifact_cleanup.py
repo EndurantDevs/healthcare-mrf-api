@@ -1,8 +1,12 @@
 from pathlib import Path
 
+import pytest
+
+from process.ptg_parts import ptg2_artifact_cleanup as artifact_cleanup
 from process.ptg_parts.ptg2_artifact_cleanup import (
     build_ptg2_artifact_cleanup_plan,
     execute_ptg2_artifact_cleanup_plan,
+    fetch_referenced_ptg2_sidecar_paths,
 )
 
 
@@ -66,3 +70,32 @@ def test_ptg2_artifact_cleanup_remaps_stale_default_artifact_root(tmp_path):
     assert plan.referenced_files == (keep.resolve(),)
     assert plan.unreferenced_files == ()
     assert plan.missing_referenced_files == ()
+
+
+@pytest.mark.asyncio
+async def test_ptg2_artifact_cleanup_ignores_postgresql_owned_paths(monkeypatch):
+    class FakeDB:
+        async def all(self, _query):
+            return [
+                {
+                    "sidecar_path": "/work/ptg2-artifacts/serving/db-owned.ptg2sc",
+                    "storage": "postgresql_chunks_v1",
+                    "storage_uri": "db://ptg2_artifact/db-owned",
+                },
+                {
+                    "sidecar_path": "/work/ptg2-artifacts/serving/db-uri-owned.ptg2sc",
+                    "storage": None,
+                    "storage_uri": "db://ptg2_artifact/db-uri-owned",
+                },
+                {
+                    "sidecar_path": "/work/ptg2-artifacts/serving/filesystem.ptg2sc",
+                    "storage": "filesystem_v1",
+                    "storage_uri": None,
+                },
+            ]
+
+    monkeypatch.setattr(artifact_cleanup, "db", FakeDB())
+
+    paths = await fetch_referenced_ptg2_sidecar_paths(schema_name="mrf")
+
+    assert paths == ("/work/ptg2-artifacts/serving/filesystem.ptg2sc",)
