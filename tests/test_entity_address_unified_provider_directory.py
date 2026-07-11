@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -20,6 +22,19 @@ def _provider_directory_available() -> dict[str, bool]:
         "provider_directory_healthcare_service": True,
         "provider_directory_organization_affiliation": True,
     }
+
+
+def _provider_directory_fenced_available() -> dict[str, bool]:
+    available = _provider_directory_available()
+    available.update(
+        {
+            "provider_directory_source": True,
+            "provider_directory_address_overlay": True,
+            "provider_directory_endpoint_dataset": True,
+            "provider_directory_dataset_resource": True,
+        }
+    )
+    return available
 
 
 def test_provider_directory_fhir_source_identity_bits_are_stable():
@@ -172,15 +187,111 @@ def test_provider_directory_source_selects_keep_direct_locations_without_healthc
     assert "COALESCE(affiliation.healthcare_service_refs::jsonb" not in sql
 
 
-def test_provider_directory_partial_scope_includes_healthcare_service_location_refs():
+def test_provider_directory_partial_scope_selects_only_current_published_datasets():
     sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")
     indexes = "\n".join(entity_address_unified._provider_directory_partial_scope_index_sql("mrf"))
 
-    assert "mrf.provider_directory_healthcare_service" in sql
-    assert "healthcare_service.last_seen_run_id IS NOT NULL" in sql
-    assert "healthcare_service.active IS DISTINCT FROM false" in sql
-    assert "jsonb_array_length(COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)) > 0" in sql
-    assert "provider_directory_healthcare_service_run_source_idx" in indexes
+    assert "mrf.provider_directory_address_overlay AS overlay" in sql
+    assert "dataset.is_current IS TRUE" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "dataset.superseded_at IS NULL" in sql
+    assert "HAVING COUNT(*) = 1" in sql
+    assert "provider_directory_address_overlay_source_run_resource_idx" in indexes
+    assert "provider_directory_dataset_resource_dataset_type_id_idx" not in indexes
+    assert len(entity_address_unified._provider_directory_partial_scope_index_sql("mrf")) == 1
+
+
+def test_full_projection_replaces_compatibility_fhir_with_current_overlay():
+    available = _provider_directory_fenced_available()
+    compatibility_selects = entity_address_unified._source_selects("mrf", available)
+
+    source_selects = entity_address_unified._current_provider_directory_source_selects(
+        "mrf",
+        available,
+        compatibility_selects,
+        test_limit_per_source=17,
+    )
+    sql = "\n".join(source_selects)
+
+    assert sql.count("FROM mrf.provider_directory_address_overlay AS overlay") == 1
+    assert "FROM mrf.provider_directory_practitioner_role AS role" not in sql
+    assert "FROM mrf.provider_directory_organization_affiliation AS affiliation" not in sql
+    assert "FROM mrf.provider_directory_organization AS organization" not in sql
+    assert "WHERE source.endpoint_id IS NOT NULL" in sql
+    assert "source.source_id = ANY(" not in sql
+    assert "dataset.is_current IS TRUE" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "overlay.last_seen_run_id = dataset.run_id" in sql
+    assert "dataset_resource.resource_id = overlay.resource_id" in sql
+    assert "LIMIT 17" in sql
+
+
+def test_full_projection_fails_closed_without_dataset_fence():
+    available = _provider_directory_fenced_available()
+    available["provider_directory_dataset_resource"] = False
+    compatibility_selects = entity_address_unified._source_selects("mrf", available)
+
+    with pytest.raises(RuntimeError, match="current dataset fence relations"):
+        entity_address_unified._current_provider_directory_source_selects(
+            "mrf",
+            available,
+            compatibility_selects,
+            has_compatibility_data=True,
+            partial_refresh=False,
+        )
+
+
+def test_provider_directory_partial_overlay_excludes_stale_rows():
+    sql = entity_address_unified._provider_directory_partial_overlay_source_select(
+        "mrf",
+        _provider_directory_available(),
+    )
+
+    assert "overlay.last_seen_run_id = dataset.run_id" in sql
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in sql
+    assert "current_overlay AS MATERIALIZED" in sql
+
+
+def test_provider_directory_partial_overlay_requires_dataset_resource_membership():
+    sql = entity_address_unified._provider_directory_partial_overlay_source_select(
+        "mrf",
+        _provider_directory_available(),
+    )
+
+    assert "FROM mrf.provider_directory_dataset_resource AS dataset_resource" in sql
+    assert "dataset_resource.dataset_id = dataset.dataset_id" in sql
+    assert "dataset_resource.resource_type = overlay.resource_type" in sql
+    assert "dataset_resource.resource_id = overlay.resource_id" in sql
+
+
+def test_provider_directory_partial_overlay_expands_selected_aliases_to_endpoint_siblings():
+    sql = entity_address_unified._provider_directory_partial_overlay_source_select(
+        "mrf",
+        _provider_directory_available(),
+        source_ids=["alias_a"],
+    )
+    live_filter = entity_address_unified._provider_directory_live_source_filter_sql(
+        "mrf",
+        "live",
+        source_ids=["alias_a"],
+    )
+
+    assert "source.source_id = ANY(ARRAY['alias_a']::varchar[])" in sql
+    assert "endpoint_aliases AS MATERIALIZED" in sql
+    assert "selected_endpoint.endpoint_id = sibling.endpoint_id" in sql
+    assert "selected_source.endpoint_id = sibling_source.endpoint_id" in live_filter
+
+
+def test_provider_directory_partial_live_filter_preserves_unrelated_sources():
+    live_filter = entity_address_unified._provider_directory_live_source_filter_sql(
+        "mrf",
+        "live",
+        source_ids=["alias_a"],
+    )
+
+    assert "sibling_source.endpoint_id IS NOT NULL" in live_filter
+    assert "selected_source.source_id = ANY(ARRAY['alias_a']::varchar[])" in live_filter
+    assert "OR NOT EXISTS" not in live_filter
 
 
 def test_provider_directory_source_selects_can_scope_by_source_and_run():

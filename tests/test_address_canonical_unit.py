@@ -1215,43 +1215,34 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
     assert "provider_directory_organization AS organization" in sql
     assert "organization.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
     assert "organization.last_seen_run_id = 'run_123'" in sql
-    assert "split_part(pd_rid.rid, ':', 3) = ANY(ARRAY['source_a']::varchar[])" in sql
-    assert "OR NOT EXISTS (" in sql
-    assert "FROM mrf.provider_directory_source AS source" in sql
-    assert "source.source_id = split_part(pd_rid.rid, ':', 3)" in sql
+    assert "JOIN mrf.provider_directory_source AS sibling_source" in sql
+    assert "sibling_source.source_id = split_part(pd_rid.rid, ':', 3)" in sql
+    assert "FROM mrf.provider_directory_source AS selected_source" in sql
+    assert "selected_source.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "selected_source.endpoint_id = sibling_source.endpoint_id" in sql
+    assert "OR NOT EXISTS (" not in sql
 
 
-def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resource_rows():
+def test_latest_provider_directory_partial_scope_sql_uses_current_published_datasets():
     sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")
 
-    assert "FROM mrf.provider_directory_source" in sql
-    assert "last_resource_import" in sql
-    assert "'metadata'::varchar AS scope_source" in sql
-    assert "location_eligible_source_runs AS" in sql
-    assert "organization_row_sources AS" in sql
-    assert "resource_row_sources AS" in sql
-    assert "FROM mrf.provider_directory_location AS loc" in sql
-    assert "FROM mrf.provider_directory_practitioner_role AS role" in sql
-    assert "FROM mrf.provider_directory_organization_affiliation AS affiliation" in sql
-    assert "FROM mrf.provider_directory_organization AS organization" in sql
-    assert "JOIN mrf.provider_directory_practitioner AS practitioner" in sql
-    assert "practitioner.npi BETWEEN 1000000000 AND 9999999999" in sql
-    assert "JOIN LATERAL (" in sql
-    assert "organization.resource_id = organization_ref.resource_id" in sql
-    assert "organization.npi BETWEEN 1000000000 AND 9999999999" in sql
-    assert "jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0" in sql
-    assert "JOIN location_eligible_source_runs AS eligible" in sql
-    assert "eligible.source_id = loc.source_id" in sql
-    assert "eligible.run_id = loc.last_seen_run_id" in sql
-    assert "eligible_completed_sources AS" in sql
-    assert "row_source.source_id = completed.source_id" in sql
-    assert "WHERE NOT EXISTS (SELECT 1 FROM eligible_completed_sources)" in sql
-    assert "projected_sources AS" in sql
-    assert "FROM mrf.entity_address_unified AS live" in sql
-    assert "unprojected_sources AS" in sql
-    assert "NULL::varchar AS run_id" in sql
-    assert "('unprojected_' || MAX(candidate.scope_source))::varchar AS scope_source" in sql
-    assert "ORDER BY (run_id IS NULL) DESC" in sql
+    assert "requested_sources AS MATERIALIZED" in sql
+    assert "FROM mrf.provider_directory_source AS source" in sql
+    assert "endpoint_aliases AS MATERIALIZED" in sql
+    assert "selected_endpoint.endpoint_id = sibling.endpoint_id" in sql
+    assert "FROM mrf.provider_directory_endpoint_dataset AS dataset" in sql
+    assert "dataset.is_current IS TRUE" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "dataset.superseded_at IS NULL" in sql
+    assert "HAVING COUNT(*) = 1" in sql
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id" in sql
+    assert "overlay.last_seen_run_id = dataset.run_id" in sql
+    assert "FROM mrf.provider_directory_dataset_resource AS dataset_resource" in sql
+    assert "dataset_resource.dataset_id = dataset.dataset_id" in sql
+    assert "dataset_resource.resource_type = overlay.resource_type" in sql
+    assert "dataset_resource.resource_id = overlay.resource_id" in sql
+    assert "ARRAY['current_overlay']::varchar[] AS scope_sources" in sql
+    assert "provider_directory_source_resource" not in sql
 
 
 @pytest.mark.asyncio
