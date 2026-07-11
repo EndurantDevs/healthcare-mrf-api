@@ -1429,7 +1429,8 @@ def _legacy_provider_directory_active_run(run_id, source_id, endpoint_scope):
     return active_run
 
 
-def test_provider_directory_legacy_active_group_scope_controls_parallel_admission():
+def test_provider_directory_legacy_active_group_scope_controls_parallel_admission(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "6")
     active = _legacy_provider_directory_active_run(
         "run_cigna",
         "pdfhir_cigna",
@@ -1639,6 +1640,20 @@ async def test_create_import_run_blocks_third_provider_directory_acquisition(mon
 
     assert created is False
     assert row == active_runs[0]
+
+
+def test_provider_directory_capacity_override_allows_third_disjoint_acquisition(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "6")
+    active_runs = [
+        _provider_directory_active_run("run_one", "pdfhir_one", "https://one.example.org/fhir"),
+        _provider_directory_active_run("run_two", "pdfhir_two", "https://two.example.org/fhir"),
+    ]
+    requested_params = _provider_directory_acquisition_params(
+        "pdfhir_three",
+        "https://three.example.org/fhir",
+    )
+
+    assert control_imports._provider_directory_blocking_run(requested_params, active_runs) is None
 
 
 class _CancelUpdateResult:
