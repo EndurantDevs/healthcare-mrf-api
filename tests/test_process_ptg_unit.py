@@ -1441,6 +1441,55 @@ def test_rust_scanner_progress_scales_to_overall_run_progress(monkeypatch):
     assert events[0]["phase_pct"] == 50.0
 
 
+def test_rust_scanner_progress_uses_object_throughput_when_bytes_are_deferred(monkeypatch):
+    progress_events = []
+
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "write_live_progress",
+        lambda **progress_payload: progress_events.append(progress_payload),
+    )
+
+    ptg_rust_scanner._emit_scanner_live_progress(
+        "PTG2_SCANNER_PROGRESS\t"
+        "path=/work/raw/rates.json.gz\t"
+        "compressed_bytes=0\t"
+        "total_bytes=14968051667\t"
+        "percent=0.00\t"
+        "compressed_mib_s=0.00\t"
+        "elapsed_seconds=119\t"
+        "eta_seconds=unknown\t"
+        "objects=122007993\t"
+        "negotiated_rates=121938948\t"
+        "provider_references=63905\t"
+        "in_network=5140\t"
+        "done=false",
+        phase="compact-serving scanner",
+        live_progress_context={
+            "run_id": "run_ptg",
+            "overall_progress_start_pct": 20,
+            "overall_progress_end_pct": 90,
+        },
+    )
+
+    [progress_update] = progress_events
+    assert progress_update["unit"] == "objects"
+    assert progress_update["done"] == 122007993
+    assert progress_update["total"] is None
+    assert progress_update["pct"] == 20.0
+    assert progress_update["phase_pct"] is None
+    assert progress_update["eta_seconds"] is None
+    assert progress_update["scanner_progress_basis"] == "objects"
+    assert progress_update["scanner_object_rate"] == pytest.approx(1025277.2521)
+    assert "rate stream" in progress_update["message"]
+    assert "rates=121,938,948" in progress_update["message"]
+    assert "provider refs=63,905" in progress_update["message"]
+    assert "code groups=5,140" in progress_update["message"]
+    assert "throughput=1.03M objects/s" in progress_update["message"]
+    assert "elapsed=1m 59s" in progress_update["message"]
+    assert "input=14,274.6 MiB" in progress_update["message"]
+
+
 def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
     captured = {}
 
