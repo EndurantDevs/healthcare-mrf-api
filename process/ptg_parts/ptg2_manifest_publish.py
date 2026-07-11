@@ -3161,10 +3161,11 @@ async def _publish_ptg2_manifest_serving_snapshot(
     serving_binary_manifest: dict[str, Any] | None = None
     if lean_serving_manifest is not None:
         if _is_postgres_binary_snapshot_arch(arch_version):
+            serving_binary_progress_total = 6 if _is_postgres_binary_v3_arch(arch_version) else 4
             _emit_ptg2_manifest_publish_progress(
                 "serving binary start",
                 done=0,
-                total=4,
+                total=serving_binary_progress_total,
                 message="starting PostgreSQL binary serving table generation",
                 serving_rows=row_count,
             )
@@ -3192,6 +3193,9 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 arch_version=arch_version,
                 price_atom_table_layout=(lean_price_atom_manifest or {}).get("price_atom_table_layout"),
                 price_atom_constant_keys=(lean_price_atom_manifest or {}).get("price_atom_constant_keys"),
+                expected_price_set_count=(
+                    int(dedupe_metrics.get("price_set_unique") or 0) or None
+                ),
                 progress_callback=_emit_ptg2_manifest_publish_progress,
             )
             mark_stage("serving_binary_build", stage_started_at)
@@ -3204,8 +3208,8 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
             _emit_ptg2_manifest_publish_progress(
                 "serving binary complete",
-                done=4,
-                total=4,
+                done=serving_binary_progress_total,
+                total=serving_binary_progress_total,
                 message="PostgreSQL binary serving table generated",
                 serving_rows=row_count,
                 serving_binary_table=serving_binary_manifest.get("table"),
