@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import importlib
+import string
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -669,6 +670,13 @@ def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
     assert seed_row["api_base"] is None
     assert seed_row["last_validated_status"] == importer.PROVIDER_DIRECTORY_CATALOG_BLOCKED_STATUS
     assert seed_row["metadata_json"]["provider_directory_blocked"] is True
+    assert seed_row["metadata_json"]["provider_directory_blocked_acquisition_method"] == (
+        "not-importable"
+    )
+    assert seed_row["metadata_json"]["provider_directory_live_verification"] == {
+        "status": "not_recorded",
+        "checked_at": None,
+    }
 
     source_row = importer._source_row_from_seed(seed_row)
     selected, metrics = importer._select_resource_import_sources(
@@ -679,6 +687,26 @@ def test_provider_directory_blocker_rows_are_non_importable_catalog_sources():
     )
     assert selected == []
     assert metrics["source_import_skipped_missing_api_base"] == 1
+
+
+def test_provider_directory_blocker_runtime_rejects_non_v2_registry(
+    monkeypatch,
+    tmp_path,
+):
+    registry = json.loads(
+        importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH.read_text(encoding="utf-8")
+    )
+    registry["schema_version"] = 1
+    registry_path = tmp_path / "provider-directory-blockers.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(
+        importer,
+        "PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH",
+        registry_path,
+    )
+
+    with pytest.raises(RuntimeError, match="blocker registry is invalid"):
+        importer._provider_directory_blocker_seed_rows()
 
 
 def _cms_sma_fixture_csv() -> str:
@@ -7994,12 +8022,16 @@ def test_resource_start_urls_partitions_uhc_provider_directory_searches():
         page_count=100,
     )
 
-    assert practitioner_urls[0] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=AA"
-    assert practitioner_urls[-1] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=ZZ"
-    assert len(practitioner_urls) == 26 * 26
-    assert organization_urls[0] == "https://flex.optum.com/fhirpublic/R4/Organization?_count=100&name=AA"
-    assert organization_urls[-1] == "https://flex.optum.com/fhirpublic/R4/Organization?_count=100&name=ZZ"
-    assert len(organization_urls) == 26 * 26
+    assert practitioner_urls[0] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=A"
+    assert practitioner_urls[25].endswith("_count=100&family=Z")
+    assert practitioner_urls[26].endswith("_count=100&family=0")
+    assert practitioner_urls[-1].endswith("_count=100&family=9")
+    assert len(practitioner_urls) == len(importer.UHC_NAME_ROOT_ALPHABET)
+    assert organization_urls[0] == "https://flex.optum.com/fhirpublic/R4/Organization?_count=100&name=A"
+    assert organization_urls[25].endswith("_count=100&name=Z")
+    assert organization_urls[26].endswith("_count=100&name=0")
+    assert organization_urls[-1].endswith("_count=100&name=9")
+    assert len(organization_urls) == len(importer.UHC_NAME_ROOT_ALPHABET)
     assert location_urls[0] == "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-state=AL"
     assert location_urls[-1].endswith("_count=100&address-state=VI")
     assert len(location_urls) == len(importer.US_STATE_ABBRS)
@@ -8017,6 +8049,55 @@ def test_provider_directory_partition_concurrency_defaults_to_sixteen(monkeypatc
     monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", raising=False)
 
     assert importer._partition_fetch_concurrency() == 16
+
+
+@pytest.mark.asyncio
+async def test_uhc_partition_scan_uses_deadline_instead_of_global_page_cap(monkeypatch):
+    observed_options: list[importer.PartitionFetchOptions] = []
+
+    async def capture_partition_options(
+        _source,
+        _resource_type,
+        resource_model,
+        _start_urls,
+        fetch_options,
+    ):
+        observed_options.append(fetch_options)
+        return importer.ResourceFetchResult(
+            model=resource_model,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=True,
+            error="uhc_location_state_residual_unverified",
+            fetch_mode="partitioned_paged",
+        )
+
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", "1")
+    monkeypatch.setattr(
+        importer,
+        "_fetch_partitioned_resource_rows",
+        capture_partition_options,
+    )
+
+    await importer._fetch_resource_rows(
+        {"source_id": "uhc", "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE},
+        "Location",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        deadline_seconds=60,
+    )
+
+    assert observed_options[0].max_pages == 0
+    assert observed_options[0].deadline_at is not None
 
 
 def test_uhc_postal_checkpoint_type_is_scoped_to_alias_set():
@@ -8077,8 +8158,10 @@ def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
     )
 
     assert children[0] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SMA"
-    assert children[-1] == "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SMZ"
-    assert len(children) == 26
+    assert any(child.endswith("_count=100&family=SM0") for child in children)
+    assert any(child.endswith("_count=100&family=SM+") for child in children)
+    assert any(child.endswith("_count=100&family=SM-") for child in children)
+    assert len(children) == len(importer.UHC_TEXT_SEARCH_ALPHABET)
     assert (
         importer._uhc_adaptive_partition_child_urls(
             source_dict,
@@ -8088,6 +8171,139 @@ def test_uhc_adaptive_partition_child_urls_split_capped_prefix():
         )
         == []
     )
+
+
+def test_uhc_text_partition_uses_safe_root_and_separator_sets():
+    expected_root_characters = set(string.ascii_uppercase + string.digits)
+    expected_child_characters = set(string.ascii_uppercase + string.digits + " -.")
+
+    assert set(importer.UHC_NAME_ROOT_ALPHABET) == expected_root_characters
+    assert set(importer.UHC_TEXT_SEARCH_ALPHABET) == expected_child_characters
+
+
+@pytest.mark.parametrize(
+    "continuation_name",
+    ("_getpages", "_getpagesoffset", "_page_token", "cursor"),
+)
+def test_uhc_partition_helpers_recognize_all_continuation_shapes(continuation_name):
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    request_url = (
+        "https://flex.optum.com/fhirpublic/R4/Location?"
+        f"address-state=CA&{continuation_name}=continuation"
+    )
+    capped_payload_dict = {"resourceType": "Bundle", "total": 10000}
+
+    assert not importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "Location",
+        request_url,
+        capped_payload_dict,
+    )
+    assert not importer._is_uhc_partition_cap_exhausted(
+        source_lookup,
+        request_url,
+        capped_payload_dict,
+    )
+    assert importer._uhc_partition_identity(
+        source_lookup,
+        "Location",
+        request_url,
+    ) is None
+
+
+def test_uhc_exact_partition_entries_separate_parent_value_from_children():
+    practitioner_payload_dict = {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": "exact-sm",
+                    "name": [{"family": "SM"}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": "longer-smith",
+                    "name": [{"family": "Smith"}],
+                }
+            },
+        ],
+    }
+    exact_entries = importer._uhc_exact_partition_entries(
+        "Practitioner",
+        "https://flex.optum.com/fhirpublic/R4/Practitioner?family=SM",
+        practitioner_payload_dict,
+    )
+
+    assert [bundle_entry["resource"]["id"] for bundle_entry in exact_entries or []] == [
+        "exact-sm"
+    ]
+
+
+def test_uhc_exact_partition_entries_keep_organization_alias_match():
+    organization_payload_dict = {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Organization",
+                    "id": "alias-sm",
+                    "name": "Acme Health",
+                    "alias": ["SM"],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Organization",
+                    "id": "longer-smith",
+                    "name": "Smith Health",
+                }
+            },
+        ],
+    }
+
+    exact_entries = importer._uhc_exact_partition_entries(
+        "Organization",
+        "https://flex.optum.com/fhirpublic/R4/Organization?name=SM",
+        organization_payload_dict,
+    )
+
+    assert [bundle_entry["resource"]["id"] for bundle_entry in exact_entries or []] == [
+        "alias-sm"
+    ]
+
+
+def test_uhc_location_state_parent_keeps_missing_city_residual():
+    location_payload_dict = {
+        "resourceType": "Bundle",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Location",
+                    "id": "missing-city",
+                    "address": {"state": "CA"},
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Location",
+                    "id": "san-diego",
+                    "address": {"state": "CA", "city": "San Diego"},
+                }
+            },
+        ],
+    }
+    exact_entries = importer._uhc_exact_partition_entries(
+        "Location",
+        "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA",
+        location_payload_dict,
+    )
+
+    assert [bundle_entry["resource"]["id"] for bundle_entry in exact_entries or []] == [
+        "missing-city"
+    ]
 
 
 def test_uhc_adaptive_partition_child_urls_split_capped_role_postal_prefix():
@@ -8108,6 +8324,215 @@ def test_uhc_adaptive_partition_child_urls_split_capped_role_postal_prefix():
     assert children[0].endswith("_count=100&location.address-postalcode=6060")
     assert children[-1].endswith("_count=100&location.address-postalcode=6069")
     assert len(children) == 10
+
+
+def test_uhc_location_capped_state_splits_into_city_prefixes():
+    source_lookup = {
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    children = importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "Location",
+        "https://flex.optum.com/fhirpublic/R4/Location?_count=100&address-state=CA",
+        {"resourceType": "Bundle", "total": 10000},
+    )
+
+    assert children[0].endswith("_count=100&address-state=CA&address-city=A")
+    assert any(child.endswith("_count=100&address-state=CA&address-city=0") for child in children)
+    assert not any(child.endswith("_count=100&address-state=CA&address-city=+") for child in children)
+    assert len(children) == len(importer.UHC_NAME_ROOT_ALPHABET)
+
+
+def test_uhc_location_city_partition_covers_space_branch_beyond_four_characters():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    children = importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "Location",
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?"
+            "_count=100&address-state=CA&address-city=SAN+"
+        ),
+        {"resourceType": "Bundle", "total": 10000},
+    )
+
+    assert any(child.endswith("address-city=SAN+D") for child in children)
+    assert any(child.endswith("address-city=SAN+J") for child in children)
+
+
+def test_uhc_location_partition_identity_preserves_significant_space():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+
+    assert importer._uhc_partition_identity(
+        source_lookup,
+        "Location",
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?"
+            "_count=100&address-state=CA&address-city=SAN+"
+        ),
+    ) == "address-state=CA&address-city=SAN+"
+
+
+@pytest.mark.parametrize(
+    ("request_url", "address", "expected_error"),
+    (
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA",
+            {"state": "NV", "city": "Carson City"},
+            "uhc_location_address_state_predicate_rejected",
+        ),
+        (
+            "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA&address-city=S",
+            {"state": "CA", "city": "Oakland"},
+            "uhc_location_address_city_predicate_rejected",
+        ),
+    ),
+)
+def test_uhc_location_partition_rejects_ignored_predicates(
+    request_url,
+    address,
+    expected_error,
+):
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    payload = {
+        "resourceType": "Bundle",
+        "total": 10000,
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Location",
+                    "id": "location-1",
+                    "address": address,
+                }
+            }
+        ],
+    }
+
+    assert (
+        importer._uhc_location_partition_predicate_error(
+            source_lookup,
+            "Location",
+            request_url,
+            payload,
+        )
+        == expected_error
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_location_predicate_rejection_does_not_enqueue_children():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    start_url_queue: asyncio.Queue[str] = asyncio.Queue()
+    partition_fetch_state = importer.PartitionFetchState(
+        result_model=ProviderDirectoryLocation,
+        retained_resource_rows=[],
+    )
+    bounded_outcome = await importer._partition_page_bounded_outcome(
+        source_lookup,
+        "Location",
+        start_url_queue,
+        partition_fetch_state,
+        "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA",
+        "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA",
+        {
+            "resourceType": "Bundle",
+            "total": 10000,
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "Location",
+                        "id": "location-1",
+                        "address": {"state": "NV", "city": "Reno"},
+                    }
+                }
+            ],
+        },
+    )
+
+    assert bounded_outcome == "predicate_failed"
+    assert start_url_queue.empty()
+    assert partition_fetch_state.error_message == (
+        "partition_errors_1_last_uhc_location_address_state_predicate_rejected"
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_location_continuation_uses_partition_start_predicate():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    partition_fetch_state = importer.PartitionFetchState(
+        result_model=ProviderDirectoryLocation,
+        retained_resource_rows=[],
+    )
+    bounded_outcome = await importer._partition_page_bounded_outcome(
+        source_lookup,
+        "Location",
+        asyncio.Queue(),
+        partition_fetch_state,
+        "https://flex.optum.com/fhirpublic/R4/Location?address-state=CA&address-city=S",
+        "https://flex.optum.com/fhirpublic/R4?_getpages=cursor&_getpagesoffset=100",
+        {
+            "resourceType": "Bundle",
+            "total": 9999,
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "Location",
+                        "id": "location-2",
+                        "address": {"state": "CA", "city": "Oakland"},
+                    }
+                }
+            ],
+        },
+    )
+
+    assert bounded_outcome == "predicate_failed"
+    assert partition_fetch_state.error_message == (
+        "partition_errors_1_last_uhc_location_address_city_predicate_rejected"
+    )
+
+
+def test_uhc_location_max_city_prefix_reports_unsplittable_cap():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    request_url = (
+        "https://flex.optum.com/fhirpublic/R4/Location?"
+        "_count=100&address-state=CA&address-city=ABCDEFGH"
+    )
+    payload = {"resourceType": "Bundle", "total": 10000}
+
+    assert not importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "Location",
+        request_url,
+        payload,
+    )
+    assert importer._is_uhc_partition_cap_exhausted(
+        source_lookup,
+        request_url,
+        payload,
+    )
+
+
+def test_uhc_organization_affiliation_has_no_false_partition_strategy():
+    source_lookup = {"api_base": importer.UHC_PROVIDER_DIRECTORY_BASE}
+    start_urls = importer._resource_start_urls(
+        source_lookup,
+        "OrganizationAffiliation",
+        page_count=100,
+    )
+
+    assert start_urls == [
+        "https://flex.optum.com/fhirpublic/R4/OrganizationAffiliation?_count=100"
+    ]
+    assert not importer._uhc_adaptive_partition_child_urls(
+        source_lookup,
+        "OrganizationAffiliation",
+        start_urls[0] + "&address-state=CA&address-city=S",
+        {"resourceType": "Bundle", "total": 10000},
+    )
+    assert importer._uhc_partition_checkpoint_type(
+        source_lookup,
+        "OrganizationAffiliation",
+    ) is None
 
 
 def test_uhc_role_postal_partition_reports_unsplittable_zip_cap():
@@ -8237,6 +8662,131 @@ def _practitioner_role_partition_bundle() -> dict[str, Any]:
     }
 
 
+def _capped_practitioner_prefix_payload(
+    exact_resource_id: str,
+    longer_resource_id: str,
+    longer_family_name: str,
+    next_url: str | None = None,
+) -> dict[str, Any]:
+    """Build one capped UHC page with exact and longer family values."""
+    payload_dict: dict[str, Any] = {
+        "resourceType": "Bundle",
+        "total": 10000,
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": exact_resource_id,
+                    "name": [{"family": "SM"}],
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Practitioner",
+                    "id": longer_resource_id,
+                    "name": [{"family": longer_family_name}],
+                }
+            },
+        ],
+    }
+    if next_url:
+        payload_dict["link"] = [{"relation": "next", "url": next_url}]
+    return payload_dict
+
+
+def _capped_practitioner_prefix_fetcher(
+    partition_start_url: str,
+    continuation_url: str,
+):
+    """Return a two-page capped-prefix HTTP stub."""
+    async def fetch_source_json(_source_record, request_url, *, timeout):
+        del timeout
+        if request_url == partition_start_url:
+            return (
+                200,
+                _capped_practitioner_prefix_payload(
+                    "exact-sm-1",
+                    "longer-smith",
+                    "Smith",
+                    continuation_url,
+                ),
+                None,
+                5,
+            )
+        assert request_url == continuation_url
+        return (
+            200,
+            _capped_practitioner_prefix_payload(
+                "exact-sm-2",
+                "longer-smythe",
+                "Smythe",
+            ),
+            None,
+            5,
+        )
+
+    return fetch_source_json
+
+
+@pytest.mark.asyncio
+async def test_uhc_capped_parent_cursor_keeps_only_exact_prefix_rows(monkeypatch):
+    """Capped parent cursors retain exact values without claiming completeness."""
+    partition_start_url = (
+        "https://flex.optum.com/fhirpublic/R4/Practitioner?_count=100&family=SM"
+    )
+    continuation_url = (
+        "https://flex.optum.com/fhirpublic/R4?"
+        "_getpages=cursor&_getpagesoffset=100"
+    )
+
+    fetch_source_json = _capped_practitioner_prefix_fetcher(
+        partition_start_url,
+        continuation_url,
+    )
+    record_checkpoint = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_record_partition_checkpoint", record_checkpoint)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+    }
+    child_url_queue: asyncio.Queue[str] = asyncio.Queue()
+    partition_fetch_state = importer.PartitionFetchState(
+        result_model=ProviderDirectoryPractitioner,
+        retained_resource_rows=[],
+    )
+
+    await importer._fetch_partition_url_chain(
+        importer.PartitionChainRequest(
+            source_record=source_lookup,
+            resource_type="Practitioner",
+            start_url_queue=child_url_queue,
+            state=partition_fetch_state,
+            request_url=partition_start_url,
+            fetch_options=importer.PartitionFetchOptions(
+                timeout=3,
+                run_id="run_1",
+                row_batch_handler=None,
+                row_batch_size=100,
+                retain_rows=True,
+                deadline_at=None,
+                max_pages=0,
+            ),
+        ),
+    )
+
+    assert [
+        resource_row["resource_id"]
+        for resource_row in partition_fetch_state.retained_resource_rows
+    ] == [
+        "exact-sm-1",
+        "exact-sm-2",
+    ]
+    assert child_url_queue.qsize() == len(importer.UHC_TEXT_SEARCH_ALPHABET)
+    record_checkpoint.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch):
     requested_urls: list[str] = []
@@ -8289,9 +8839,42 @@ async def test_fetch_resource_rows_uses_concurrent_partition_workers(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_single_partition_worker_checks_cancellation_before_fetch(monkeypatch):
+    start_urls = [
+        "https://example.test/fhir/Practitioner?part=1",
+        "https://example.test/fhir/Practitioner?part=2",
+    ]
+    fetch_source_json = AsyncMock(
+        side_effect=AssertionError("partition request ran after cancellation")
+    )
+
+    async def cancel_partition(_cancel_ctx, _cancel_task):
+        raise RuntimeError("partition canceled")
+
+    monkeypatch.setattr(importer, "_resource_start_urls", lambda *_args, **_kwargs: start_urls)
+    monkeypatch.setattr(importer, "_partition_fetch_concurrency", lambda: 1)
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "raise_if_cancelled", cancel_partition)
+
+    with pytest.raises(RuntimeError, match="partition canceled"):
+        await importer._fetch_resource_rows(
+            {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+            "Practitioner",
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=3,
+            run_id="run_1",
+            cancel_ctx={},
+            cancel_task={},
+        )
+
+    fetch_source_json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     checkpoint_batches: list[list[dict[str, Any]]] = []
-    cleared_checkpoints: list[tuple[str, str | None]] = []
 
     async def fake_db_all(_statement, **_query_params):
         return []
@@ -8304,17 +8887,13 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
         checkpoint_batches.append(rows)
         return len(rows)
 
-    async def fake_clear_checkpoints(source_record, **options):
-        assert options["run_id"] == "run_1"
-        cleared_checkpoints.append(
-            (source_record["canonical_api_base"], options.get("seed_resource_type"))
-        )
-        return 1
+    async def fail_clear_checkpoints(_source_record, **_options):
+        raise AssertionError("residual-unverified scan cleared successful checkpoints")
 
     monkeypatch.setattr(importer.db, "all", fake_db_all)
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert_rows)
-    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", fake_clear_checkpoints)
+    monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", fail_clear_checkpoints)
     source_lookup = {
         "source_id": "uhc",
         "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
@@ -8345,7 +8924,6 @@ async def test_uhc_role_partition_persists_completed_postal_prefix(monkeypatch):
     checkpoint_type = importer._uhc_role_postal_checkpoint_type(source_lookup)
     assert checkpoint_batches[0][0]["seed_resource_type"] == checkpoint_type
     assert checkpoint_batches[0][0]["seed_resource_id"] == "1"
-    assert cleared_checkpoints == [(importer.UHC_PROVIDER_DIRECTORY_BASE, checkpoint_type)]
 
 
 @pytest.mark.asyncio
@@ -8399,6 +8977,36 @@ async def test_partition_checkpoints_require_matching_lineage(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_uhc_non_role_partition_checkpoint_resumes_retry_lineage(monkeypatch):
+    checkpoint_queries: list[dict[str, Any]] = []
+
+    async def load_checkpoints(_statement, **query_params):
+        checkpoint_queries.append(query_params)
+        return [("address-state=CA&address-city=S",)]
+
+    monkeypatch.setattr(importer.db, "all", load_checkpoints)
+    source_lookup = {
+        "source_id": "uhc",
+        "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+        "_partition_checkpoint_source_ids": ("uhc", "uhc-community"),
+        "_partition_checkpoint_owner_run_id": "run_root",
+    }
+
+    completed = await importer._load_partition_checkpoints(
+        source_lookup,
+        "Location",
+        "run_retry_2",
+    )
+
+    assert completed == {"address-state=CA&address-city=S"}
+    assert checkpoint_queries[0]["checkpoint_owner_run_id"] == "run_root"
+    assert checkpoint_queries[0]["seed_resource_type"] == (
+        importer._uhc_partition_checkpoint_type(source_lookup, "Location")
+    )
+
+
+@pytest.mark.asyncio
 async def test_uhc_incomplete_partition_requires_resume():
     source_lookup = {
         "source_id": "uhc_owner",
@@ -8433,7 +9041,17 @@ async def test_uhc_incomplete_partition_requires_resume():
 
 
 @pytest.mark.asyncio
-async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatch):
+async def test_non_role_uhc_residual_partition_retains_checkpoints(monkeypatch):
+    checkpoint_rows: list[dict[str, Any]] = []
+
+    async def fake_db_all(_statement, **_query_params):
+        return []
+
+    async def fake_upsert_rows(model, rows, **_kwargs):
+        assert model is importer.ProviderDirectoryReverseLookupCheckpoint
+        checkpoint_rows.extend(rows)
+        return len(rows)
+
     async def fake_fetch_json(_source_record, request_url, *, timeout):
         resource_id = request_url.rsplit("=", 1)[-1]
         return 200, _practitioner_partition_bundle(resource_id), None, 5
@@ -8442,6 +9060,8 @@ async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatc
         raise AssertionError("non-role resource cleared PractitionerRole checkpoints")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+    monkeypatch.setattr(importer.db, "all", fake_db_all)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert_rows)
     monkeypatch.setattr(importer, "_clear_reverse_lookup_checkpoints", fail_clear_checkpoints)
     source_lookup = {
         "source_id": "uhc",
@@ -8467,6 +9087,7 @@ async def test_non_role_uhc_partition_does_not_clear_role_checkpoints(monkeypatc
 
     assert partition_fetch_result.complete is False
     assert partition_fetch_result.error == "uhc_practitioner_name_residual_unverified"
+    assert checkpoint_rows[0]["seed_resource_id"] == "family=AB"
 
 
 @pytest.mark.asyncio

@@ -122,6 +122,10 @@ def test_blocker_registry_is_complete_and_shared_with_generated_docs():
     assert len(entries) == 3
     assert all(entry["id"] in rendered for entry in entries)
     assert "Operational state" in rendered
+    assert "| Method | Resources | Canonical base |" in rendered
+    assert "Not importable | None confirmed | None confirmed" in rendered
+    assert "Practitioner, PractitionerRole, Location | None confirmed" in rendered
+    assert "| Live verification |" in rendered
     assert "2026-07-10" in rendered
 
 
@@ -130,6 +134,52 @@ def test_validate_blocker_registry_rejects_unknown_access_requirement():
     registry["entries"][0]["access_requirement"] = "portal-maybe"
 
     with pytest.raises(generator.SupportDocumentationError, match="invalid access requirement"):
+        generator.validate_blocker_registry(registry)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("acquisition_method", {}, "invalid acquisition method"),
+        ("access_requirement", [], "invalid access requirement"),
+        ("operational_status", {}, "invalid operational status"),
+    ],
+)
+def test_validate_blocker_registry_rejects_non_string_control_values(
+    field_name,
+    value,
+    message,
+):
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    registry["entries"][0][field_name] = value
+
+    with pytest.raises(generator.SupportDocumentationError, match=message):
+        generator.validate_blocker_registry(registry)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("acquisition_method", "rest", "invalid acquisition method"),
+        ("documented_resources", ["Practitioner", "Practitioner"], "unique known resource types"),
+        ("documented_resources", [{"type": "Practitioner"}], "unique known resource types"),
+        ("canonical_base", "https://example.test/fhir", "canonical_base must be null"),
+        (
+            "live_verification",
+            {"status": "succeeded", "checked_at": "2026-07-10T00:00:00Z"},
+            "live_verification must remain not recorded",
+        ),
+    ],
+)
+def test_validate_blocker_registry_rejects_false_importability(
+    field_name,
+    value,
+    message,
+):
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    registry["entries"][0][field_name] = value
+
+    with pytest.raises(generator.SupportDocumentationError, match=message):
         generator.validate_blocker_registry(registry)
 
 
@@ -145,6 +195,14 @@ def test_validate_blocker_registry_rejects_uncontrolled_freshness(field_name, va
     registry["entries"][0][field_name] = value
 
     with pytest.raises(generator.SupportDocumentationError, match=message):
+        generator.validate_blocker_registry(registry)
+
+
+def test_validate_blocker_registry_rejects_legacy_schema_shape():
+    registry = copy.deepcopy(generator.load_blocker_registry(generator.DEFAULT_BLOCKER_REGISTRY))
+    registry["schema_version"] = 1
+
+    with pytest.raises(generator.SupportDocumentationError, match="schema_version must be 2"):
         generator.validate_blocker_registry(registry)
 
 

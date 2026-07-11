@@ -23,7 +23,10 @@ Keep these authorities separate when reviewing Provider Directory coverage:
   configured.
 - Known non-importable coverage is maintained in the [blocker registry](../../specs/provider_directory_blocker_registry.json).
   Its required access, registration flag, operational state, review date, and
-  primary evidence are rendered in the matrix as `Not supported`. Do not turn
+  primary evidence are rendered in the matrix as `Not supported`. The registry
+  also records the non-runnable acquisition method, documented resource scope,
+  absence of a confirmed canonical base, and absence of terminal campaign
+  verification so those facts are explicit rather than inferred. Do not turn
   an unresolved discovery gap into a supported source without current primary
   evidence.
 - Live evidence is maintained in the [verification snapshot](../../specs/provider_directory_endpoint_verification.json).
