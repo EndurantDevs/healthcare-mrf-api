@@ -13483,6 +13483,9 @@ def test_address_overlay_affiliation_component_uses_org_phone_and_service_locati
     assert "affiliation.healthcare_service_refs" in sql
     assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
     assert "healthcare_service.location_refs" in sql
+    assert "WITH overlay_rows AS MATERIALIZED" in sql
+    assert "FROM overlay_rows" in sql
+    assert sql.count("addr_key_v1(") == 1
 
 
 def test_address_overlay_stage_index_names_are_hash_safe():
@@ -13663,6 +13666,11 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
         "practitioner_role": 7,
         "organization_affiliation": 8,
     }
+    assert set(metrics["component_seconds"]) == {
+        "organization_address",
+        "practitioner_role",
+        "organization_affiliation",
+    }
     assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
     assert metrics["archive_coordinate_backfill_rows"] == 0
@@ -13714,6 +13722,7 @@ async def test_overlay_publish_can_refresh_practitioner_component_only(monkeypat
     assert metrics["copied_existing"] == 11
     assert metrics["inserted"] == 7
     assert metrics["inserted_by_component"] == {"practitioner_role": 7}
+    assert set(metrics["component_seconds"]) == {"practitioner_role"}
     assert copy_params["refresh_resource_types"] == ["PractitionerRole"]
     assert "provider_directory_fhir:organization_address:" not in joined_sql
     assert "provider_directory_fhir:organization_affiliation:" not in joined_sql
