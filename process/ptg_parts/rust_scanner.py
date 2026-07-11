@@ -521,6 +521,7 @@ def _iter_compact_serving_records_rust(
         stderr_thread.start()
     terminated_by_consumer = False
     has_frame_stream_failure = False
+    has_stdout_terminal_summary = False
     try:
         while True:
             header = process.stdout.readline()
@@ -553,6 +554,8 @@ def _iter_compact_serving_records_rust(
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
             record_kind = name_bytes.decode("utf-8")
             record_payload = _json_loads(payload)
+            if record_kind in {"dedupe_summary", "scanner_summary"}:
+                has_stdout_terminal_summary = True
             if record_kind in _SCANNER_METRIC_RECORD_KINDS and isinstance(record_payload, dict):
                 _emit_scanner_metric_progress(
                     record_kind,
@@ -575,7 +578,11 @@ def _iter_compact_serving_records_rust(
             return_code != 0
             and not terminated_by_consumer
             and not has_frame_stream_failure
-            and not _is_scanner_sigterm_after_dedupe(return_code, stderr_tail)
+            and not _is_scanner_sigterm_after_dedupe(
+                return_code,
+                stderr_tail,
+                has_stdout_terminal_summary=has_stdout_terminal_summary,
+            )
         ):
             raise RuntimeError(_scanner_error_message("PTG2 Rust compact scanner", return_code, stderr_tail))
 
@@ -698,5 +705,14 @@ def _scanner_return_code_label(return_code: int) -> str:
     return f"signal {signal_number} ({signal_name})"
 
 
-def _is_scanner_sigterm_after_dedupe(return_code: int, stderr_tail: list[str]) -> bool:
-    return return_code == -15 and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
+def _is_scanner_sigterm_after_dedupe(
+    return_code: int,
+    stderr_tail: list[str],
+    *,
+    has_stdout_terminal_summary: bool = False,
+) -> bool:
+    return (
+        return_code == -15
+        and has_stdout_terminal_summary
+        and any(line.startswith("PTG2_DEDUPE_SUMMARY\t") for line in stderr_tail)
+    )
