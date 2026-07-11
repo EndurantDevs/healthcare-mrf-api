@@ -13,6 +13,7 @@ from api.code_systems import (
     INTERNAL_PROCEDURE_CODE_SYSTEM,
     PROCEDURE_CODE_SYSTEMS,
     canonical_catalog_code,
+    catalog_code_lookup_values,
     normalize_code_system,
 )
 from api.ptg2_response import _include_ptg2_details
@@ -242,12 +243,36 @@ def _is_signed_int_text(value: str) -> bool:
     return value.lstrip("-").isdigit() and value not in {"", "-"}
 
 
+def _reported_code_values_for_system(code_system: str | None, code: Any) -> tuple[str, ...]:
+    if code_system:
+        return catalog_code_lookup_values(code_system, code)
+    value = _normalize_code(code)
+    return (value,) if value else ()
+
+
+def _append_reported_code_values_filter(
+    filters: list[str],
+    params: dict[str, Any],
+    *,
+    values: tuple[str, ...],
+) -> None:
+    params["reported_code"] = values[0]
+    if len(values) == 1:
+        filters.append("reported_code = :reported_code")
+        return
+    placeholders = [":reported_code"]
+    for idx, value in enumerate(values[1:], start=1):
+        key = f"reported_code_{idx}"
+        params[key] = value
+        placeholders.append(f":{key}")
+    filters.append("reported_code IN (" + ", ".join(placeholders) + ")")
+
+
 def _append_code_filter(filters: list[str], params: dict[str, Any], *, code: Any, code_system: Any) -> None:
     requested_system = _normalize_code_system(code_system)
     requested_code = _normalize_code_for_system(code, requested_system)
     if not requested_code:
         return
-    params["reported_code"] = requested_code
     if requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
         if _is_signed_int_text(requested_code):
             filters.append("procedure_code = :procedure_code")
@@ -255,19 +280,25 @@ def _append_code_filter(filters: list[str], params: dict[str, Any], *, code: Any
         else:
             filters.append("FALSE")
         return
+    code_filters: list[str] = []
+    _append_reported_code_values_filter(
+        code_filters,
+        params,
+        values=_reported_code_values_for_system(requested_system, code),
+    )
     if requested_system:
         filters.append(
-            """
+            f"""
             (
                 reported_code_system = :reported_code_system
-            AND reported_code = :reported_code
+            AND {code_filters[0]}
             )
             """
         )
         params["reported_code_system"] = requested_system
         return
 
-    code_clauses = ["reported_code = :reported_code"]
+    code_clauses = code_filters
     if _is_signed_int_text(requested_code) and (requested_code.startswith("-") or len(requested_code) > 5):
         code_clauses.append("procedure_code = :procedure_code")
         params["procedure_code"] = int(requested_code)
@@ -329,11 +360,11 @@ def _append_resolved_code_filter(
     clauses: list[str] = []
     external_codes_by_value: dict[str, list[str]] = {}
     for resolved_code in code_context.get("resolved_codes") or []:
-        system = str(resolved_code.get("code_system") or "").strip().upper()
-        resolved_value = str(resolved_code.get("code") or "").strip().upper()
+        system = _normalize_code_system(resolved_code.get("code_system")) or ""
         if system == INTERNAL_PROCEDURE_CODE_SYSTEM:
             continue
-        external_codes_by_value.setdefault(resolved_value, []).append(system)
+        for resolved_value in _reported_code_values_for_system(system, resolved_code.get("code")):
+            external_codes_by_value.setdefault(resolved_value, []).append(system)
     for idx, (resolved_value, systems) in enumerate(sorted(external_codes_by_value.items())):
         params[f"reported_code_{idx}"] = resolved_value
         system_placeholders = []

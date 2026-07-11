@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping
 
 from sqlalchemy import bindparam, text
 
-from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code
+from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code, catalog_code_lookup_values
 from api.endpoint.pagination import PaginationParams
 from api.ptg2_code_filters import (
     INFERRED_PROVIDER_TAXONOMY_RULES,
@@ -397,7 +397,11 @@ def _ptg2_manifest_provider_location_scope(
             route_filters = [
                 "rpg_location.provider_group_global_id_128 = loc.provider_group_global_id_128",
                 plan_filter,
-                "rpg_location.reported_code = :location_reported_code",
+                _reported_code_param_filter(
+                    "rpg_location.reported_code",
+                    "location_reported_code",
+                    query_context.params,
+                ),
             ]
             if "location_reported_code_system" in query_context.params:
                 route_filters.append("rpg_location.reported_code_system = :location_reported_code_system")
@@ -425,14 +429,17 @@ async def _manifest_provider_group_rate_scope_available(
     if not provider_group_rate_scope_table or not plan_id or not reported_code:
         return False
     plan_filter, _ = _code_plan_scope_sql(plan_id)
-    filters = [
-        plan_filter,
-        "reported_code = :reported_code",
-    ]
+    filters = [plan_filter]
     params: dict[str, Any] = {
         "plan_id": plan_id,
-        "reported_code": reported_code,
     }
+    _append_reported_code_value_filter(
+        filters,
+        params,
+        column="reported_code",
+        param_name="reported_code",
+        values=_ptg2_reported_code_lookup_values(code_system, reported_code),
+    )
     if code_system:
         filters.append("reported_code_system = :reported_code_system")
         params["reported_code_system"] = code_system
@@ -1957,6 +1964,83 @@ def _code_plan_scope_sql(
     return f"COALESCE({plan_column}, '') = ''", f"{plan_column} NULLS FIRST"
 
 
+def _preferred_code_metadata_rows(
+    code_rows: Iterable[Mapping[str, Any]],
+    requested_plan: str,
+) -> list[Mapping[str, Any]]:
+    """Prefer plan rows independently for each compatible reported-code form."""
+
+    rows_by_code: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for code_row in code_rows:
+        key = (
+            str(code_row.get("reported_code_system") or ""),
+            str(code_row.get("reported_code") or ""),
+        )
+        rows_by_code.setdefault(key, []).append(code_row)
+    preferred_rows: list[Mapping[str, Any]] = []
+    for compatible_rows in rows_by_code.values():
+        plan_rows = [
+            code_row
+            for code_row in compatible_rows
+            if str(code_row.get("plan_id") or "").strip() == requested_plan
+        ]
+        preferred_rows.extend(plan_rows or compatible_rows)
+    return preferred_rows
+
+
+def _ptg2_reported_code_lookup_values(code_system: Any, code: Any) -> tuple[str, ...]:
+    if code_system:
+        return catalog_code_lookup_values(code_system, code)
+    value = str(code or "").strip()
+    return (value,) if value else ()
+
+
+def _append_reported_code_value_filter(
+    filters: list[str],
+    params: dict[str, Any],
+    *,
+    column: str,
+    param_name: str,
+    values: tuple[str, ...],
+) -> None:
+    if not values:
+        return
+    params[param_name] = values[0]
+    if len(values) == 1:
+        filters.append(f"{column} = :{param_name}")
+        return
+    placeholders = [f":{param_name}"]
+    for idx, value in enumerate(values[1:], start=1):
+        key = f"{param_name}_{idx}"
+        params[key] = value
+        placeholders.append(f":{key}")
+    filters.append(f"{column} IN ({', '.join(placeholders)})")
+
+
+def _reported_code_param_filter(column: str, param_name: str, params: Mapping[str, Any]) -> str:
+    placeholders = [f":{param_name}"]
+    idx = 1
+    while f"{param_name}_{idx}" in params:
+        placeholders.append(f":{param_name}_{idx}")
+        idx += 1
+    if len(placeholders) == 1:
+        return f"{column} = :{param_name}"
+    return f"{column} IN ({', '.join(placeholders)})"
+
+
+def _external_catalog_lookup_pairs(code_context: Mapping[str, Any] | None) -> set[tuple[str, str]]:
+    """Expand resolved external codes into compatible persisted lookup pairs."""
+
+    external_pairs: set[tuple[str, str]] = set()
+    for resolved_code in (code_context or {}).get("resolved_codes") or []:
+        resolved_system = _normalize_code_system(resolved_code.get("code_system"))
+        if not resolved_system or resolved_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
+            continue
+        lookup_values = catalog_code_lookup_values(resolved_system, resolved_code.get("code"))
+        external_pairs.update((resolved_system, lookup_value) for lookup_value in lookup_values if lookup_value)
+    return external_pairs
+
+
 def _append_manifest_reported_code_filter(
     filters: list[str],
     params: dict[str, Any],
@@ -1969,15 +2053,10 @@ def _append_manifest_reported_code_filter(
     requested_code = canonical_catalog_code(requested_system, code) if requested_system else _normalize_code(code)
     if not requested_code:
         return
-    external_pairs: set[tuple[str, str]] = set()
-    if code_context:
-        for resolved_code in code_context.get("resolved_codes") or []:
-            system = _normalize_code_system(resolved_code.get("code_system"))
-            value = canonical_catalog_code(system, resolved_code.get("code")) if system else _normalize_code(resolved_code.get("code"))
-            if system and value and system != INTERNAL_PROCEDURE_CODE_SYSTEM:
-                external_pairs.add((system, value))
+    external_pairs = _external_catalog_lookup_pairs(code_context)
     if not external_pairs and requested_system and requested_system != INTERNAL_PROCEDURE_CODE_SYSTEM:
-        external_pairs.add((requested_system, requested_code))
+        for value in catalog_code_lookup_values(requested_system, code):
+            external_pairs.add((requested_system, value))
     if not external_pairs and not requested_system:
         params["reported_code"] = requested_code
         filters.append("reported_code = :reported_code")
@@ -2581,6 +2660,63 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
         limit=limit,
         offset=offset,
     )
+
+
+def _manifest_response_row_order(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        -int(row.get("provider_count") or 0),
+        _ptg2_manifest_id(row.get("provider_set_global_id_128")),
+        _ptg2_manifest_id(row.get("price_set_global_id_128")),
+        str(row.get("reported_code") or ""),
+        str(row.get("serving_content_hash_128") or ""),
+    )
+
+
+async def _merge_manifest_code_variant_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_rows: list[Mapping[str, Any]],
+    provider_set_keys: Iterable[int] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int | None,
+    offset: int,
+) -> list[dict[str, Any]] | None:
+    """Merge one ordered serving window across compatible persisted code forms."""
+
+    if len(code_rows) == 1:
+        return await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+            session,
+            serving_tables,
+            code_data=code_rows[0],
+            provider_set_keys=provider_set_keys,
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            limit=limit,
+            offset=offset,
+        )
+    start = max(int(offset), 0)
+    per_code_limit = None if limit is None else start + max(int(limit), 0)
+    combined_rows: list[dict[str, Any]] = []
+    for code_row in code_rows:
+        variant_rows = await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+            session,
+            serving_tables,
+            code_data=code_row,
+            provider_set_keys=provider_set_keys,
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            limit=per_code_limit,
+            offset=0,
+        )
+        if variant_rows is None:
+            return None
+        combined_rows.extend(variant_rows)
+    combined_rows.sort(key=_manifest_response_row_order)
+    if limit is None:
+        return combined_rows[start:]
+    return combined_rows[start : start + max(int(limit), 0)]
 
 
 async def _full_code_sidecar_rows(
@@ -4231,6 +4367,28 @@ async def _is_manifest_component_table_populated(session, table_name: str | None
         return False
 
 
+async def _manifest_sidecar_entries_for_code_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    code_rows: Iterable[Mapping[str, Any]],
+) -> list[Any]:
+    """Load complete forward entries for each compatible code dictionary row."""
+
+    sidecar_entries: list[Any] = []
+    for code_row in code_rows:
+        code_key = code_row.get("code_key")
+        if code_key is None:
+            continue
+        sidecar_entries.extend(
+            await _ptg2_manifest_lookup_serving_by_code_sidecar(
+                session,
+                serving_tables,
+                int(code_key),
+            )
+        )
+    return sidecar_entries
+
+
 async def _manifest_rate_provider_groups_from_sidecar(
     session,
     serving_tables: PTG2ServingTables,
@@ -4247,7 +4405,8 @@ async def _manifest_rate_provider_groups_from_sidecar(
         or not _ptg2_manifest_artifact_entry(serving_tables, "provider_forward")
     ):
         return ()
-    query_params_by_name: dict[str, Any] = {"plan_id": plan_id, "reported_code": reported_code}
+    query_params_by_name: dict[str, Any] = {"plan_id": plan_id}
+    reported_code_values = _ptg2_reported_code_lookup_values(code_system, reported_code)
     lean_provider_key_layout = _ptg2_manifest_uses_lean_provider_key_layout(serving_tables)
     if lean_provider_key_layout:
         code_count_table = _safe_table_name(serving_tables.code_count_table)
@@ -4255,10 +4414,14 @@ async def _manifest_rate_provider_groups_from_sidecar(
         if not code_count_table or not provider_set_dictionary_table:
             return ()
         plan_filter, plan_order = _code_plan_scope_sql(plan_id, column="code_count.plan_id")
-        rate_scope_filters = [
-            plan_filter,
-            "code_count.reported_code = :reported_code",
-        ]
+        rate_scope_filters = [plan_filter]
+        _append_reported_code_value_filter(
+            rate_scope_filters,
+            query_params_by_name,
+            column="code_count.reported_code",
+            param_name="reported_code",
+            values=reported_code_values,
+        )
         if code_system:
             rate_scope_filters.append("code_count.reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
@@ -4266,24 +4429,27 @@ async def _manifest_rate_provider_groups_from_sidecar(
             code_result = await session.execute(
                 text(
                     f"""
-                    SELECT code_count.code_key
+                    SELECT
+                        code_count.code_key,
+                        code_count.plan_id,
+                        code_count.reported_code_system,
+                        code_count.reported_code
                     FROM {code_count_table} code_count
                     WHERE {" AND ".join(rate_scope_filters)}
-                    ORDER BY {plan_order}, code_count.code_key
-                    LIMIT 1
+                    ORDER BY {plan_order}, code_count.reported_code, code_count.code_key
                     """
                 ),
                 query_params_by_name,
             )
-            code_key = None
-            for code_row in code_result:
-                code_key = _row_mapping(code_row).get("code_key")
-                break
-            if code_key is not None:
-                sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
+            code_rows = _preferred_code_metadata_rows(
+                (_row_mapping(code_row) for code_row in code_result),
+                plan_id,
+            )
+            if code_rows:
+                sidecar_rows = await _manifest_sidecar_entries_for_code_rows(
                     session,
                     serving_tables,
-                    int(code_key),
+                    code_rows,
                 )
                 provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
                     session,
@@ -4317,7 +4483,14 @@ async def _manifest_rate_provider_groups_from_sidecar(
         if not table_name:
             return ()
         plan_filter, plan_order = _code_plan_scope_sql(plan_id)
-        rate_scope_filters = [plan_filter, "reported_code = :reported_code"]
+        rate_scope_filters = [plan_filter]
+        _append_reported_code_value_filter(
+            rate_scope_filters,
+            query_params_by_name,
+            column="reported_code",
+            param_name="reported_code",
+            values=reported_code_values,
+        )
         if code_system:
             rate_scope_filters.append("reported_code_system = :reported_code_system")
             query_params_by_name["reported_code_system"] = code_system
@@ -5464,12 +5637,12 @@ def _ptg2_route_item_slug(value: Any, *, max_length: int = 32) -> str:
     return (slug or "none")[:max_length]
 
 
-def _ptg2_route_item_table_candidates(
+def _route_item_candidates_for_codes(
     serving_tables: PTG2ServingTables,
     *,
     plan_id: str,
     code_system: str | None,
-    code: str,
+    code_values: Iterable[str],
 ) -> tuple[str, ...]:
     serving_table = _safe_table_name(serving_tables.serving_table)
     if not serving_table:
@@ -5480,13 +5653,56 @@ def _ptg2_route_item_table_candidates(
         return ()
     plan_slug = _ptg2_route_item_slug(plan_id, max_length=24)
     system_slug = _ptg2_route_item_slug(code_system or "code", max_length=12)
-    code_slug = _ptg2_route_item_slug(code, max_length=16)
+    code_slugs = tuple(dict.fromkeys(_ptg2_route_item_slug(value, max_length=16) for value in code_values))
     suffixes = tuple(dict.fromkeys((serving_suffix, serving_suffix[:5])))
     return tuple(
         f"{PTG2_SCHEMA}.ptg2_route_item_{suffix}_{plan_slug}_{system_slug}_{code_slug}"
         for suffix in suffixes
+        for code_slug in code_slugs
         if suffix
     )
+
+
+def _ptg2_route_item_table_candidates(
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    code_system: str | None,
+    code: str,
+) -> tuple[str, ...]:
+    return _route_item_candidates_for_codes(
+        serving_tables,
+        plan_id=plan_id,
+        code_system=code_system,
+        code_values=_ptg2_reported_code_lookup_values(code_system, code),
+    )
+
+
+async def _ptg2_route_item_tables(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    plan_id: str,
+    code_system: str | None,
+    code: str,
+) -> tuple[str, ...]:
+    selected_tables: list[str] = []
+    for code_value in _ptg2_reported_code_lookup_values(code_system, code):
+        candidates = _route_item_candidates_for_codes(
+            serving_tables,
+            plan_id=plan_id,
+            code_system=code_system,
+            code_values=(code_value,),
+        )
+        for table_name in candidates:
+            if table_name in selected_tables:
+                break
+            if not await _serving_table_available(session, table_name):
+                continue
+            if await _ptg2_table_has_columns(session, table_name, _PTG2_ROUTE_ITEM_COLUMNS):
+                selected_tables.append(table_name)
+                break
+    return tuple(selected_tables)
 
 
 async def _ptg2_route_item_table(
@@ -5497,17 +5713,14 @@ async def _ptg2_route_item_table(
     code_system: str | None,
     code: str,
 ) -> str | None:
-    for table_name in _ptg2_route_item_table_candidates(
+    route_tables = await _ptg2_route_item_tables(
+        session,
         serving_tables,
         plan_id=plan_id,
         code_system=code_system,
         code=code,
-    ):
-        if not await _serving_table_available(session, table_name):
-            continue
-        if await _ptg2_table_has_columns(session, table_name, _PTG2_ROUTE_ITEM_COLUMNS):
-            return table_name
-    return None
+    )
+    return route_tables[0] if route_tables else None
 
 
 def _ptg2_route_item_fast_path_allowed(args: dict[str, Any]) -> bool:
@@ -5587,15 +5800,32 @@ async def _search_ptg2_manifest_route_item_table(
     except (TypeError, ValueError):
         return None
     zip_value = _normalize_zip5(args.get("zip5"))
-    table_name = await _ptg2_route_item_table(
+    route_tables = await _ptg2_route_item_tables(
         session,
         serving_tables,
         plan_id=requested_plan,
         code_system=requested_system,
         code=requested_code,
     )
-    if not table_name:
+    if not route_tables:
         return None
+    route_item_source_sql = "\nUNION ALL\n".join(
+        f"""
+        SELECT
+            item_payload,
+            zip5,
+            lat,
+            long,
+            address_precision,
+            min_rate,
+            provider_name,
+            npi,
+            location_hash,
+            {route_table_ordinal}::integer AS route_table_ordinal
+        FROM {table_name}
+        """
+        for route_table_ordinal, table_name in enumerate(route_tables)
+    )
 
     params: dict[str, Any] = {
         "zip5": zip_value,
@@ -5641,7 +5871,7 @@ async def _search_ptg2_manifest_route_item_table(
         order_sql = (
             f"min_rate {direction} NULLS LAST, "
             f"distance_miles {distance_direction} NULLS LAST, "
-            "provider_name, npi"
+            "provider_name, npi, route_table_ordinal, location_hash NULLS LAST"
         )
     elif order_by in distance_order_fields:
         direction = "DESC" if descending else "ASC"
@@ -5649,7 +5879,8 @@ async def _search_ptg2_manifest_route_item_table(
         order_sql = (
             f"zip_rank {zip_direction}, "
             f"distance_miles {direction} NULLS LAST, "
-            "min_rate ASC NULLS LAST, provider_name, npi"
+            "min_rate ASC NULLS LAST, provider_name, npi, "
+            "route_table_ordinal, location_hash NULLS LAST"
         )
     else:
         return None
@@ -5660,15 +5891,20 @@ async def _search_ptg2_manifest_route_item_table(
             result = await session.execute(
                 text(
                     f"""
-            WITH raw AS (
+            WITH route_items AS MATERIALIZED (
+                {route_item_source_sql}
+            ),
+            raw AS (
                 SELECT
                     r.item_payload,
                     CASE WHEN r.zip5 = :zip5 THEN 0.0 ELSE {distance_sql} END AS distance_miles,
                     CASE WHEN r.zip5 = :zip5 THEN 0 ELSE 1 END AS zip_rank,
                     r.min_rate,
                     r.provider_name,
-                    r.npi
-                  FROM {table_name} r
+                    r.npi,
+                    r.route_table_ordinal,
+                    r.location_hash
+                  FROM route_items r
                  WHERE (
                         r.zip5 = :zip5
                         OR (
@@ -5740,7 +5976,7 @@ async def _search_ptg2_manifest_route_item_table(
                     "npi": args.get("npi") or None,
                     "source": "ptg2_db",
                     "serving_table": _safe_table_name(serving_tables.serving_table),
-                    "route_item_table": table_name,
+                    "route_item_table": route_tables[0],
                     "include_providers": True,
                     "procedure_consolidation": "REPORTED_CODE",
                 },
@@ -7300,16 +7536,19 @@ async def _ptg2_manifest_location_provider_matches(
     ):
         has_component_rate_scope = True
         params["location_plan_id"] = requested_plan_id
-        params["location_reported_code"] = requested_code
         plan_filter, _ = _code_plan_scope_sql(
             requested_plan_id,
             column="rate_scope.plan_id",
             param_name="location_plan_id",
         )
-        rate_scope_filters = [
-            plan_filter,
-            "rate_scope.reported_code = :location_reported_code",
-        ]
+        rate_scope_filters = [plan_filter]
+        _append_reported_code_value_filter(
+            rate_scope_filters,
+            params,
+            column="rate_scope.reported_code",
+            param_name="location_reported_code",
+            values=_ptg2_reported_code_lookup_values(requested_system, requested_code),
+        )
         if requested_system:
             rate_scope_filters.append("rate_scope.reported_code_system = :location_reported_code_system")
             params["location_reported_code_system"] = requested_system
@@ -8519,16 +8758,23 @@ async def _search_ptg2_manifest_db_serving_table(
         expand_providers=expand_providers,
         location_filter_requested=location_filter_requested,
     )
+    requested_code_values = _ptg2_reported_code_lookup_values(requested_system, requested_code)
     plan_filter, plan_order = _code_plan_scope_sql(requested_plan)
-    filters = [plan_filter, "reported_code = :reported_code"]
+    filters = [plan_filter]
     params: dict[str, Any] = {
         "plan_id": requested_plan,
-        "reported_code": requested_code,
         "limit": int(pagination.limit),
         "rate_candidate_limit": rate_candidate_limit,
         "rate_candidate_offset": 0 if expand_providers else int(pagination.offset),
         "offset": int(pagination.offset),
     }
+    _append_reported_code_value_filter(
+        filters,
+        params,
+        column="reported_code",
+        param_name="reported_code",
+        values=requested_code_values,
+    )
     if requested_system:
         filters.append("reported_code_system = :reported_code_system")
         params["reported_code_system"] = requested_system
@@ -8607,34 +8853,50 @@ async def _search_ptg2_manifest_db_serving_table(
         if not code_count_table or not provider_set_dictionary_table:
             return None
         code_plan_filter, code_plan_order = _code_plan_scope_sql(requested_plan)
+        code_count_filter_clauses = [
+            code_plan_filter,
+            "reported_code_system IS NOT DISTINCT FROM :reported_code_system",
+        ]
+        code_count_params_by_name: dict[str, Any] = {
+            "plan_id": requested_plan,
+            "reported_code_system": requested_system or None,
+        }
+        _append_reported_code_value_filter(
+            code_count_filter_clauses,
+            code_count_params_by_name,
+            column="reported_code",
+            param_name="reported_code",
+            values=requested_code_values,
+        )
         code_result = await session.execute(
             text(
                 f"""
                 SELECT code_key, plan_id, reported_code_system, reported_code, rate_count
                 FROM {code_count_table}
-                WHERE {code_plan_filter}
-                  AND reported_code = :reported_code
-                  AND reported_code_system IS NOT DISTINCT FROM :reported_code_system
-                ORDER BY {code_plan_order}, code_key
-                LIMIT 1
+                WHERE {" AND ".join(code_count_filter_clauses)}
+                ORDER BY {code_plan_order}, CASE WHEN reported_code = :reported_code THEN 0 ELSE 1 END, code_key
                 """
             ),
-            {
-                "plan_id": requested_plan,
-                "reported_code": requested_code,
-                "reported_code_system": requested_system or None,
-            },
+            code_count_params_by_name,
         )
-        code_rows = [_row_mapping(row) for row in code_result]
+        code_rows = _preferred_code_metadata_rows(
+            (_row_mapping(row) for row in code_result),
+            requested_plan,
+        )
         if not code_rows:
             return None
-        code_data = code_rows[0]
-        params["code_key"] = code_data.get("code_key")
+        params["code_keys"] = [
+            int(code_row["code_key"])
+            for code_row in code_rows
+            if code_row.get("code_key") is not None
+        ]
+        if not params["code_keys"]:
+            return None
         if not location_filter_requested:
-            total = int(code_data.get("rate_count") or 0)
+            total = sum(int(code_row.get("rate_count") or 0) for code_row in code_rows)
             if total <= 0:
                 return None
-        lean_filters = ["serving.code_key = :code_key"]
+        lean_filters = ["serving.code_key = ANY(CAST(:code_keys AS integer[]))"]
         if location_filter_requested:
             provider_key_result = await session.execute(
                 text(
@@ -8701,10 +8963,10 @@ async def _search_ptg2_manifest_db_serving_table(
         if has_serving_by_code_sidecar:
             sidecar_start = 0 if expand_providers else int(params.get("rate_candidate_offset") or 0)
             sidecar_limit = int(params.get("rate_candidate_limit") or pagination.limit)
-            sidecar_rows = await _ptg2_manifest_rows_from_serving_by_code_sidecar(
+            sidecar_rows = await _merge_manifest_code_variant_rows(
                 session,
                 serving_tables,
-                code_data=code_data,
+                code_rows=code_rows,
                 provider_set_keys=params.get("provider_set_keys") if location_filter_requested else None,
                 source_trace_set_hash=source_trace_set_hash,
                 network_names=network_names,
@@ -8726,17 +8988,22 @@ async def _search_ptg2_manifest_db_serving_table(
                             serving.code_key,
                             serving.provider_set_key,
                             serving.provider_count,
-                            serving.price_set_global_id_128
+                            serving.price_set_global_id_128,
+                            code_metadata.plan_id,
+                            code_metadata.reported_code_system,
+                            code_metadata.reported_code
                         FROM {table_name} serving
+                        JOIN {code_count_table} code_metadata
+                          ON code_metadata.code_key = serving.code_key
                         WHERE {" AND ".join(lean_filters)}
-                        ORDER BY serving.provider_count DESC NULLS LAST
+                        ORDER BY serving.provider_count DESC NULLS LAST, serving.code_key
                         LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
                     )
                     SELECT
                         {serving_hash_sql} AS serving_content_hash_128,
-                        :lean_plan_id AS plan_id,
-                        :lean_reported_code_system AS reported_code_system,
-                        :lean_reported_code AS reported_code,
+                        serving_page.plan_id,
+                        serving_page.reported_code_system,
+                        serving_page.reported_code,
                         NULL::{manifest_id_sql_type} AS procedure_global_id_128,
                         (
                             SELECT provider_sets.provider_set_global_id_128
@@ -8753,30 +9020,36 @@ async def _search_ptg2_manifest_db_serving_table(
                 ),
                 {
                     **params,
-                    "lean_plan_id": code_data.get("plan_id"),
-                    "lean_reported_code_system": code_data.get("reported_code_system"),
-                    "lean_reported_code": code_data.get("reported_code"),
                     "lean_source_trace_set_hash": source_trace_set_hash,
                     "lean_network_names": network_names,
                 },
             )
             row_data = [_row_mapping(row) for row in row_result]
     elif code_count_table and requested_system and not location_filter_requested:
+        code_count_filter_clauses = [
+            plan_filter,
+            "reported_code_system IS NOT DISTINCT FROM :reported_code_system",
+        ]
+        code_count_params_by_name = {
+            "plan_id": requested_plan,
+            "reported_code_system": requested_system or None,
+        }
+        _append_reported_code_value_filter(
+            code_count_filter_clauses,
+            code_count_params_by_name,
+            column="reported_code",
+            param_name="reported_code",
+            values=requested_code_values,
+        )
         count_result = await session.execute(
             text(
                 f"""
                 SELECT COALESCE(SUM(rate_count), 0) AS rate_count
                 FROM {code_count_table}
-                WHERE {plan_filter}
-                  AND reported_code = :reported_code
-                  AND reported_code_system IS NOT DISTINCT FROM :reported_code_system
+                WHERE {" AND ".join(code_count_filter_clauses)}
                 """
             ),
-            {
-                "plan_id": requested_plan,
-                "reported_code": requested_code,
-                "reported_code_system": requested_system or None,
-            },
+            code_count_params_by_name,
         )
         total = int(count_result.scalar() or 0)
         if total <= 0:
@@ -10499,9 +10772,16 @@ async def _has_ptg2_table_plan_code(
 ) -> bool:
     query_params_by_name: dict[str, Any] = {
         "plan_id": requested_plan,
-        "reported_code": requested_code,
     }
     plan_filter_sql, _ = _code_plan_scope_sql(requested_plan)
+    code_filters = [plan_filter_sql]
+    _append_reported_code_value_filter(
+        code_filters,
+        query_params_by_name,
+        column="reported_code",
+        param_name="reported_code",
+        values=_ptg2_reported_code_lookup_values(requested_system, requested_code),
+    )
     system_sql = ""
     if requested_system:
         query_params_by_name["reported_code_system"] = requested_system
@@ -10512,8 +10792,7 @@ async def _has_ptg2_table_plan_code(
             SELECT EXISTS (
                 SELECT 1
                 FROM {table_name}
-                WHERE {plan_filter_sql}
-                  AND reported_code = :reported_code
+                WHERE {" AND ".join(code_filters)}
                   {system_sql}
                 LIMIT 1
             )

@@ -515,9 +515,11 @@ async def test_ptg2_manifest_db_snapshot_serves_lean_provider_key_layout():
     assert item["provider_count"] == 42
     row_sql = str(session.calls[2][0][0])
     row_params = session.calls[2][0][1]
-    assert "serving.code_key = :code_key" in row_sql
+    assert "serving.code_key = ANY(CAST(:code_keys AS integer[]))" in row_sql
+    assert "JOIN mrf.ptg2_code_count_snap_manifest code_metadata" in row_sql
     assert "provider_sets.provider_set_global_id_128" in row_sql
     assert "serving.price_set_global_id_128" in row_sql
+    assert row_params["code_keys"] == [7]
     assert row_params["lean_network_names"] == ["C2"]
 
 
