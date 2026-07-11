@@ -173,8 +173,9 @@ def _decode_provider_code_block(
     *,
     block_key: int,
     entry_count: int,
+    requested_provider_set_keys: set[int],
 ) -> dict[int, tuple[int, ...]]:
-    """Decode provider-set code containers embedded in one provider-key block."""
+    """Decode requested provider sets without expanding neighboring containers."""
 
     try:
         provider_count, cursor = read_uvarint(block_bytes, 0)
@@ -194,9 +195,10 @@ def _decode_provider_code_block(
                 raise ValueError("provider-set entry is outside its block")
             if previous_provider_set_key is not None and provider_set_key <= previous_provider_set_key:
                 raise ValueError("provider-set entries are not strictly ordered")
-            code_keys_by_provider_set[provider_set_key] = decode_provider_code_set(
-                block_bytes[cursor:code_bytes_end]
-            )
+            if provider_set_key in requested_provider_set_keys:
+                code_keys_by_provider_set[provider_set_key] = decode_provider_code_set(
+                    block_bytes[cursor:code_bytes_end]
+                )
             previous_provider_set_key = provider_set_key
             cursor = code_bytes_end
         if cursor != len(block_bytes) or provider_count != entry_count:
@@ -231,6 +233,7 @@ async def lookup_provider_code_keys_from_db(
             block_bytes,
             block_key=block_key,
             entry_count=entry_count,
+            requested_provider_set_keys=requested_key_set,
         ).items():
             _store_requested_value(
                 code_keys_by_provider_set,
