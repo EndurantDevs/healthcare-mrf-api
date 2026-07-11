@@ -177,9 +177,10 @@ class RunResult:
 
 
 def load_suite(path: Path | str = DEFAULT_SUITE_PATH) -> dict[str, Any]:
+    """Load experiment variants and fixture cases from a suite file."""
     suite_path = Path(path)
-    with suite_path.open("r", encoding="utf-8") as fp:
-        suite = json.load(fp)
+    with suite_path.open("r", encoding="utf-8") as suite_file:
+        suite = json.load(suite_file)
     if not isinstance(suite, dict):
         raise ValueError("suite must be a JSON object")
     cases = suite.get("cases")
@@ -201,22 +202,29 @@ def load_suite(path: Path | str = DEFAULT_SUITE_PATH) -> dict[str, Any]:
         if not case_id:
             raise ValueError("every case needs an id")
         selected = case.get("variants") or list(variant_ids)
-        missing = [item for item in selected if item not in variant_ids]
+        missing = [
+            selected_variant_id
+            for selected_variant_id in selected
+            if selected_variant_id not in variant_ids
+        ]
         if missing:
             raise ValueError(f"case {case_id} references missing variants: {missing}")
     return suite
 
 
 def variant_map(suite: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index configured experiment variants by name."""
     return {str(item["id"]): item for item in suite.get("variants") or []}
 
 
 def resolve_root_path(value: str | Path) -> Path:
+    """Resolve a configured path relative to the repository root."""
     path = Path(value)
     return path if path.is_absolute() else ROOT / path
 
 
 def selected_cases(suite: dict[str, Any], case_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    """Return fixture cases selected by command-line filters."""
     cases = list(suite.get("cases") or [])
     if case_ids:
         cases = [case for case in cases if str(case.get("id")) in case_ids]
@@ -224,6 +232,7 @@ def selected_cases(suite: dict[str, Any], case_ids: set[str] | None = None) -> l
 
 
 def env_for_variant(case: dict[str, Any], variant: dict[str, Any]) -> dict[str, str]:
+    """Build the scanner environment for one experiment variant."""
     result: dict[str, str] = {}
     for source in (case.get("env") or {}, variant.get("env") or {}):
         for key, value in source.items():
@@ -236,6 +245,7 @@ def env_for_variant(case: dict[str, Any], variant: dict[str, Any]) -> dict[str, 
 
 
 def parse_sized_frames(stdout: bytes | str) -> list[dict[str, Any]]:
+    """Parse length-prefixed JSON frames emitted by the scanner."""
     data = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
     frames: list[dict[str, Any]] = []
     offset = 0
@@ -266,6 +276,7 @@ def parse_sized_frames(stdout: bytes | str) -> list[dict[str, Any]]:
 
 
 def first_frame_payload(frames: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    """Return the payload from the first framed record."""
     for frame in frames:
         if frame.get("name") == name and isinstance(frame.get("payload"), dict):
             return frame["payload"]
@@ -273,6 +284,7 @@ def first_frame_payload(frames: list[dict[str, Any]], name: str) -> dict[str, An
 
 
 def parse_key_value_line(line: str) -> dict[str, Any]:
+    """Parse one tab-delimited scanner metric line."""
     values: dict[str, Any] = {}
     parts = line.strip().split("\t")
     for part in parts[1:]:
@@ -284,11 +296,13 @@ def parse_key_value_line(line: str) -> dict[str, Any]:
 
 
 def parse_scanner_progress(stderr: bytes | str) -> list[dict[str, Any]]:
+    """Parse periodic scanner progress records from stderr."""
     text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
     return [parse_key_value_line(line) for line in text.splitlines() if line.startswith("PTG2_SCANNER_PROGRESS\t")]
 
 
 def parse_import_done(text: bytes | str) -> dict[str, Any] | None:
+    """Parse the scanner's terminal import summary."""
     decoded = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
     for line in decoded.splitlines():
         if line.startswith("PTG2_IMPORT_DONE\t"):
@@ -297,6 +311,7 @@ def parse_import_done(text: bytes | str) -> dict[str, Any] | None:
 
 
 def parse_dedupe_summary(text: bytes | str) -> dict[str, Any] | None:
+    """Parse the scanner's deduplication summary."""
     decoded = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
     for line in decoded.splitlines():
         if line.startswith("PTG2_DEDUPE_SUMMARY\t"):
@@ -305,6 +320,7 @@ def parse_dedupe_summary(text: bytes | str) -> dict[str, Any] | None:
 
 
 def parse_serving_only_summary(text: bytes | str) -> dict[str, Any] | None:
+    """Parse the serving-only import summary."""
     decoded = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
     prefix = "PTG2 serving-only import summary: "
     for line in decoded.splitlines():
@@ -320,6 +336,7 @@ def parse_serving_only_summary(text: bytes | str) -> dict[str, Any] | None:
 
 
 def coerce_scalar(value: str) -> Any:
+    """Convert a scalar value into a stable report representation."""
     if value in {"true", "false"}:
         return value == "true"
     if value in {"None", "null", ""}:
@@ -333,6 +350,7 @@ def coerce_scalar(value: str) -> Any:
 
 
 def read_proc_status(status_path: Path) -> dict[str, int]:
+    """Read Linux process counters for resource sampling."""
     metrics: dict[str, int] = {}
     if not status_path.exists():
         return metrics
@@ -351,6 +369,7 @@ def read_proc_status(status_path: Path) -> dict[str, int]:
 
 
 def parse_ps_memory(output: str) -> dict[str, int]:
+    """Parse RSS and virtual-memory counters from ps output."""
     parts = output.strip().split()
     if len(parts) < 2:
         return {}
@@ -361,6 +380,7 @@ def parse_ps_memory(output: str) -> dict[str, int]:
 
 
 def read_ps_memory(pid: int) -> dict[str, int]:
+    """Read process memory usage from ps output."""
     completed = subprocess.run(
         ["ps", "-o", "rss=", "-o", "vsz=", "-p", str(pid)],
         check=False,
@@ -404,6 +424,7 @@ class ProcSampler:
 
 
 def max_optional(current: int | None, candidate: int | None) -> int | None:
+    """Return the larger available measurement."""
     if candidate is None:
         return current
     if current is None:
@@ -412,6 +433,7 @@ def max_optional(current: int | None, candidate: int | None) -> int | None:
 
 
 def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
+    """Build the synthetic MRF payload used by scanner benchmarks."""
     fixture = str(case.get("fixture") or "large_in_network")
     if fixture == "large_in_network":
         rate_count = int(case.get("negotiated_rates") or 64)
@@ -500,6 +522,7 @@ def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
+    """Load one JSON document from the experiment workspace."""
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as fp:
         payload = json.load(fp)
@@ -509,6 +532,7 @@ def load_json_file(path: Path) -> dict[str, Any]:
 
 
 def write_fixture(case: dict[str, Any], output_dir: Path) -> Path:
+    """Write a synthetic JSON fixture and return its path."""
     artifact = output_dir / f"{case['id']}.json.gz"
     with gzip.open(artifact, "wb") as fp:
         fp.write(json.dumps(build_fixture_payload(case), separators=(",", ":")).encode("utf-8"))
@@ -516,6 +540,7 @@ def write_fixture(case: dict[str, Any], output_dir: Path) -> Path:
 
 
 def write_ptg_toc_fixture(case: dict[str, Any], output_dir: Path, *, base_url: str) -> Path:
+    """Write a synthetic PTG table-of-contents fixture."""
     output_dir.mkdir(parents=True, exist_ok=True)
     rates_path = output_dir / "rates.json.gz"
     with gzip.open(rates_path, "wb") as fp:
@@ -553,6 +578,7 @@ def write_ptg_toc_fixture(case: dict[str, Any], output_dir: Path, *, base_url: s
 
 
 def expected_original_file_summary(path: Path) -> dict[str, Any]:
+    """Summarize source-fixture values expected after import."""
     payload = load_json_file(path)
     provider_npis_by_ref: dict[int, set[str]] = {}
     for ref in payload.get("provider_references") or []:
@@ -601,6 +627,7 @@ def expected_original_file_summary(path: Path) -> dict[str, Any]:
 
 
 def price_atom_original_key(price: dict[str, Any]) -> str:
+    """Build the canonical source key for a price atom."""
     return "\t".join(
         [
             normalize_text(price.get("negotiated_type")),
@@ -616,16 +643,19 @@ def price_atom_original_key(price: dict[str, Any]) -> str:
 
 
 def normalize_text(value: Any) -> str:
+    """Normalize optional text for deterministic comparison."""
     return "" if value is None else str(value)
 
 
 def normalize_rate(value: Any) -> str:
+    """Normalize a negotiated rate for deterministic comparison."""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return normalize_text(value)
 
 
 def digest_text_lines(lines: list[str]) -> str:
+    """Compute a stable digest of text lines."""
     digest = hashlib.md5()  # nosec B324 - local non-security parity digest
     for line in sorted(lines):
         digest.update(line.encode("utf-8"))
@@ -634,6 +664,7 @@ def digest_text_lines(lines: list[str]) -> str:
 
 
 def psql_json(env_overrides: dict[str, str], sql: str) -> dict[str, Any]:
+    """Execute SQL through psql and decode its JSON result."""
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
@@ -665,6 +696,7 @@ def psql_json(env_overrides: dict[str, str], sql: str) -> dict[str, Any]:
 
 
 def psql_exec(env_overrides: dict[str, str], sql: str) -> None:
+    """Execute a SQL statement through psql."""
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
@@ -734,18 +766,21 @@ def serving_binary_artifact_kinds(env_overrides: dict[str, str], table_name: str
 
 
 def validate_qualified_table_name(value: str) -> str:
+    """Validate a schema-qualified PostgreSQL relation name."""
     if not QUALIFIED_TABLE_RE.fullmatch(value or ""):
         raise ValueError(f"unsafe or invalid qualified table name: {value!r}")
     return value
 
 
 def validate_identifier(value: str) -> str:
+    """Validate a PostgreSQL identifier supplied to the harness."""
     if not IDENTIFIER_RE.fullmatch(value or ""):
         raise ValueError(f"unsafe or invalid identifier: {value!r}")
     return value
 
 
 def short_pg_identifier(seed: str, suffix: str = "") -> str:
+    """Shorten a value into a PostgreSQL-safe identifier."""
     normalized = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in seed.lower()).strip("_")
     suffix = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in suffix.lower()).strip("_")
     digest = hashlib.sha1(f"{normalized}:{suffix}".encode("utf-8")).hexdigest()[:10]  # nosec B324
@@ -761,12 +796,14 @@ def short_pg_identifier(seed: str, suffix: str = "") -> str:
 
 
 def split_qualified_table(value: str) -> tuple[str, str]:
+    """Split a schema-qualified table name into its components."""
     qualified = validate_qualified_table_name(value)
     schema_name, table_name = qualified.split(".", 1)
     return validate_identifier(schema_name), validate_identifier(table_name)
 
 
 def serving_index_table(serving_index: dict[str, Any], *keys: str) -> str:
+    """Return the serving relation named in a snapshot manifest."""
     materialized = serving_index.get("materialized_tables")
     materialized_tables = materialized if isinstance(materialized, dict) else {}
     role_aliases = {
@@ -1243,6 +1280,7 @@ def verify_local_import_against_original(
     original_path: Path,
     import_run_id: str,
 ) -> dict[str, Any]:
+    """Verify imported rows against the original fixture payload."""
     expected = expected_original_file_summary(original_path)
     schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
     run_payload = psql_json(
@@ -1380,6 +1418,7 @@ def import_run_serving_index(
 
 
 def psql_copy_lines(env_overrides: dict[str, str], sql: str):
+    """Stream line records into PostgreSQL with psql COPY."""
     database = env_overrides["HLTHPRT_DB_DATABASE"]
     suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
     db_name = f"{database}{suffix}"
@@ -1568,6 +1607,7 @@ def write_serving_by_code_candidate(rows: Any, output_path: Path) -> dict[str, A
 
 
 def digest_serving_by_code_candidate(path: Path) -> str:
+    """Compute a stable digest of serving by code candidate."""
     data = path.read_bytes()
     if data[:8] != b"PTG2SBC1":
         raise ValueError("unexpected serving-by-code artifact magic")
@@ -1753,6 +1793,7 @@ def write_serving_by_provider_set_candidate(rows: Any, output_path: Path) -> dic
 
 
 def digest_serving_by_provider_set_candidate(path: Path) -> str:
+    """Compute a stable digest of serving by provider set candidate."""
     data = path.read_bytes()
     if data[:8] != b"PTG2SBP1":
         raise ValueError("unexpected serving-by-provider-set artifact magic")
@@ -1804,6 +1845,7 @@ def _price_dictionary_payload(price_set_values: list[str]) -> bytes:
 
 
 def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
+    """Build database records for the code-oriented serving candidate."""
     records: list[tuple[str, int, int, int, bytes]] = []
     price_set_to_key: dict[str, int] = {}
     price_set_values: list[str] = []
@@ -1879,6 +1921,7 @@ def build_serving_by_code_db_records(rows: Any) -> dict[str, Any]:
 
 
 def digest_serving_by_code_db_records(records: list[tuple[str, int, int, int, bytes]]) -> str:
+    """Compute a stable digest of serving by code db records."""
     dictionaries = [record for record in records if record[0] == "by_code_price_dictionary"]
     if not dictionaries:
         raise ValueError("missing by-code price dictionary")
@@ -1906,6 +1949,7 @@ def digest_serving_by_code_db_records(records: list[tuple[str, int, int, int, by
 
 
 def build_serving_by_provider_set_db_records(rows: Any) -> dict[str, Any]:
+    """Build database records for the provider-set serving candidate."""
     price_set_to_key: dict[str, int] = {}
     price_set_values: list[str] = []
     code_keys_seen: set[int] = set()
@@ -2022,6 +2066,7 @@ def build_serving_by_provider_set_db_records(rows: Any) -> dict[str, Any]:
 
 
 def digest_serving_by_provider_set_db_records(records: list[tuple[str, int, int, int, bytes]]) -> str:
+    """Compute a stable digest of serving by provider set db records."""
     dictionaries = [record for record in records if record[0] == "by_provider_set_price_dictionary"]
     if not dictionaries:
         raise ValueError("missing by-provider-set price dictionary")
@@ -2070,6 +2115,7 @@ def postgres_binary_candidate_table_names(
     import_run_id: str,
     variant_id: str,
 ) -> dict[str, str]:
+    """Return relation names used by the binary storage candidate."""
     schema = validate_identifier(schema_name)
     relation = short_pg_identifier(f"ptg2_research_binary_{variant_id}_{import_run_id}")
     return {"serving_binary": f"{schema}.{relation}"}
@@ -2081,6 +2127,7 @@ def postgres_posting_candidate_table_names(
     import_run_id: str,
     variant_id: str,
 ) -> dict[str, str]:
+    """Return relation names used by the posting-list candidate."""
     schema = validate_identifier(schema_name)
     posting_relation = short_pg_identifier(
         f"ptg2_research_posting_{variant_id}_{import_run_id}"
@@ -2101,6 +2148,7 @@ def postgres_posting_candidate_sql(
     price_set_dictionary_table: str,
     block_rows: int,
 ) -> list[str]:
+    """Build SQL for the PostgreSQL posting-list candidate."""
     serving = validate_qualified_table_name(serving_table)
     posting = validate_qualified_table_name(posting_table)
     dictionary = validate_qualified_table_name(price_set_dictionary_table)
@@ -2273,6 +2321,7 @@ def analyze_postgres_binary_candidate(
     variant_id: str,
     include_reverse: bool,
 ) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the PostgreSQL binary candidate."""
     schema_name, _serving_name = split_qualified_table(serving_table)
     table_names = postgres_binary_candidate_table_names(
         schema_name=schema_name,
@@ -2409,6 +2458,7 @@ def analyze_postgres_posting_candidate(
     variant_id: str,
     block_rows: int,
 ) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the PostgreSQL posting candidate."""
     schema_name, _serving_name = split_qualified_table(serving_table)
     table_names = postgres_posting_candidate_table_names(
         schema_name=schema_name,
@@ -2514,6 +2564,7 @@ def analyze_local_serving_sidecar_candidate(
     output_dir: Path,
     max_rows: int,
 ) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the local sidecar candidate."""
     schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
     run_payload = psql_json(
         env_overrides,
@@ -2719,6 +2770,7 @@ def analyze_published_serving_binary_storage(
 
 
 def sql_literal(value: str) -> str:
+    """Quote a scalar value as a SQL literal."""
     return str(value).replace("'", "''")
 
 
@@ -2756,6 +2808,7 @@ def run_scanner_fixture(
     output_root: Path,
     dry_run: bool = False,
 ) -> RunResult:
+    """Run one synthetic fixture through the Rust scanner."""
     case_id = str(case["id"])
     variant_id = str(variant["id"])
     run_dir = output_root / case_id / variant_id
@@ -2823,6 +2876,7 @@ def run_scanner_fixture(
 
 
 def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd: Path) -> tuple[subprocess.CompletedProcess, float, dict[str, Any]]:
+    """Run a command while sampling its process resources."""
     env = {**os.environ, **env_overrides}
     sampler = ProcSampler()
     started = time.monotonic()
@@ -2847,6 +2901,7 @@ def run_with_sampling(command: list[str], env_overrides: dict[str, str], *, cwd:
 
 
 def collect_copy_outputs(run_dir: Path) -> dict[str, Any]:
+    """Collect COPY artifacts emitted by an experiment run."""
     outputs: dict[str, Any] = {}
     for label, pattern in {
         "serving": "manifest_serving.copy*",
@@ -2873,6 +2928,7 @@ def collect_copy_outputs(run_dir: Path) -> dict[str, Any]:
 
 
 def digest_lines(lines: list[str]) -> str:
+    """Compute a stable SHA-256 digest for sorted text lines."""
     digest = hashlib.sha256()
     for line in sorted(lines):
         digest.update(line.encode("utf-8"))
@@ -2948,6 +3004,7 @@ def run_import_control_run(
     variant: dict[str, Any],
     dry_run: bool = False,
 ) -> RunResult:
+    """Run one import through the local import-control service."""
     case_id = str(case["id"])
     variant_id = str(variant["id"])
     params = dict(case.get("params") or {})
@@ -3067,6 +3124,7 @@ def poll_import_control_run(
     timeout_seconds: float,
     progress_samples: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Poll an import-control run until it reaches a terminal state."""
     if not run_id:
         raise ValueError("import-control response did not include run_id")
     samples = list(progress_samples or [])
@@ -3092,6 +3150,7 @@ def run_local_ptg_cli(
     output_root: Path,
     dry_run: bool = False,
 ) -> RunResult:
+    """Run one fixture through the local PTG command."""
     case_id = str(case["id"])
     variant_id = str(variant["id"])
     run_dir = output_root / case_id / variant_id
@@ -3278,6 +3337,7 @@ def run_local_ptg_cli(
 
 
 def env_to_scanner_params(env: dict[str, str]) -> dict[str, Any]:
+    """Convert scanner environment values into command parameters."""
     mapping = {
         "HLTHPRT_PTG2_RUST_WORKERS": "_scanner_rust_workers",
         "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "_scanner_parse_in_workers",
@@ -3296,6 +3356,7 @@ def env_to_scanner_params(env: dict[str, str]) -> dict[str, Any]:
 
 
 def post_json(url: str, payload: dict[str, Any], *, token: str) -> dict[str, Any]:
+    """Post JSON to the local import-control service."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -3311,6 +3372,7 @@ def post_json(url: str, payload: dict[str, Any], *, token: str) -> dict[str, Any
 
 
 def get_json(url: str, *, token: str) -> dict[str, Any]:
+    """Fetch and decode JSON from the local control service."""
     request = urllib.request.Request(
         url,
         method="GET",
@@ -3330,6 +3392,7 @@ def run_suite(
     variant_ids: set[str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    """Run every selected case and variant in an experiment suite."""
     variants = variant_map(suite)
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = report_dir / f"run-{timestamp}"
@@ -3403,6 +3466,7 @@ def evaluate_gates(
     *,
     case_gates: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Evaluate candidates against configured correctness and performance gates."""
     gate_default_dict = gate_default_options(gates)
     by_case: dict[str, list[dict[str, Any]]] = {}
     for result in report.get("results") or []:
@@ -3678,12 +3742,14 @@ def required_candidate_gate_statuses(checks: dict[str, Any]) -> list[str]:
 
 
 def result_storage(result: dict[str, Any]) -> dict[str, Any]:
+    """Return storage measurements from a candidate result."""
     import_run = result.get("import_run") if isinstance(result.get("import_run"), dict) else {}
     storage = import_run.get("storage") if isinstance(import_run, dict) else None
     return storage if isinstance(storage, dict) else {}
 
 
 def evaluate_storage_result(result: dict[str, Any], *, min_storage_ratio: float) -> dict[str, Any]:
+    """Evaluate a candidate's storage evidence against its required ratio."""
     verification = (result.get("import_run") or {}).get("verification") if isinstance(result.get("import_run"), dict) else {}
     verification_status = str((verification or {}).get("status") or "")
     checks = {
@@ -3703,6 +3769,7 @@ def evaluate_storage_result(result: dict[str, Any], *, min_storage_ratio: float)
 
 
 def compare_storage(storage: dict[str, Any], *, min_storage_ratio: float) -> dict[str, Any]:
+    """Compare a candidate's storage ratio with the configured gate."""
     if not storage:
         return {"status": "unknown", "ratio": None, "required_ratio": min_storage_ratio}
     if storage.get("status") == "skipped":
@@ -3834,6 +3901,7 @@ def with_snapshot_total_storage_check(
 
 
 def compare_copy_outputs(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Compare COPY artifact hashes across experiment variants."""
     labels = sorted(set(baseline) | set(candidate))
     mismatches = []
     for label in labels:
@@ -3845,6 +3913,7 @@ def compare_copy_outputs(baseline: dict[str, Any], candidate: dict[str, Any]) ->
 
 
 def compare_dedupe(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Compare deduplication counters across experiment variants."""
     keys = [
         "negotiated_rates",
         "serving_rate_attempted",
@@ -3859,6 +3928,7 @@ def compare_dedupe(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[
 
 
 def compare_elapsed(base: Any, candidate: Any, *, min_improvement_pct: float) -> dict[str, Any]:
+    """Compare elapsed time across experiment variants."""
     if not base or not candidate:
         return {"status": "unknown", "improvement_pct": None}
     improvement = ((float(base) - float(candidate)) / float(base)) * 100.0
@@ -3914,6 +3984,7 @@ def compare_import_total_seconds(
 
 
 def compare_memory(base: Any, candidate: Any, *, max_memory_growth_pct: float) -> dict[str, Any]:
+    """Compare peak memory use across experiment variants."""
     if not base or not candidate:
         return {"status": "unknown", "growth_pct": None}
     growth = ((float(candidate) - float(base)) / float(base)) * 100.0
@@ -3925,6 +3996,7 @@ def compare_memory(base: Any, candidate: Any, *, max_memory_growth_pct: float) -
 
 
 def write_report(output_root: Path, report: dict[str, Any]) -> None:
+    """Write a rendered experiment report to disk."""
     json_path = output_root / "report.json"
     markdown_path = output_root / "report.md"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -3932,6 +4004,7 @@ def write_report(output_root: Path, report: dict[str, Any]) -> None:
 
 
 def render_markdown_report(report: dict[str, Any]) -> str:
+    """Render experiment results as a Markdown report."""
     suite = report.get("suite") if isinstance(report.get("suite"), dict) else {}
     title = suite.get("title") or "PTG2 Experiment Report"
     lines = [
@@ -3973,12 +4046,14 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
 
 def format_optional_float(value: Any) -> str:
+    """Format an optional floating-point report value."""
     if value is None:
         return ""
     return f"{float(value):.3f}"
 
 
 def format_scanner_summary(result: dict[str, Any]) -> str:
+    """Format scanner configuration and throughput for the report."""
     config = result.get("scanner_config") or {}
     summary = result.get("scanner_summary") or {}
     if not config and not summary:
@@ -4000,6 +4075,7 @@ def format_scanner_summary(result: dict[str, Any]) -> str:
 
 
 def format_import_done(report_result: dict[str, Any]) -> str:
+    """Format terminal import timings for the experiment report."""
     import_run = report_result.get("import_run") or {}
     import_done_payload = import_run.get("import_done") if isinstance(import_run, dict) else None
     if not isinstance(import_done_payload, dict) or not import_done_payload:
@@ -4088,6 +4164,7 @@ def format_serving_arch_checks(report_result: dict[str, Any]) -> str:
 
 
 def format_verification(result: dict[str, Any]) -> str:
+    """Format parity-verification results for the experiment report."""
     import_run = result.get("import_run") or {}
     verification = import_run.get("verification") if isinstance(import_run, dict) else None
     parts = []
@@ -4129,6 +4206,7 @@ def format_api_latency(api_latency: dict[str, Any]) -> str:
 
 
 def format_bytes(value: Any) -> str:
+    """Format a byte count for the experiment report."""
     if value is None:
         return ""
     size = float(value)
@@ -4140,6 +4218,7 @@ def format_bytes(value: Any) -> str:
 
 
 def format_storage_analysis(result: dict[str, Any]) -> str:
+    """Format candidate storage measurements for the experiment report."""
     import_run = result.get("import_run") or {}
     storage = import_run.get("storage") if isinstance(import_run, dict) else None
     if not isinstance(storage, dict) or not storage:
@@ -4281,6 +4360,7 @@ def format_storage_analysis(result: dict[str, Any]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for the experiment harness."""
     parser = argparse.ArgumentParser(description="Run PTG2 research-branch experiments.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     list_parser = subparsers.add_parser("list", help="List cases and variants.")
@@ -4295,6 +4375,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the PTG2 experiment command."""
     args = build_parser().parse_args(argv)
     suite = load_suite(args.suite)
     if args.command == "list":
