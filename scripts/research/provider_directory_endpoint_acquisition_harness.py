@@ -372,6 +372,7 @@ class AcquisitionHarness:
             run for run in run_list
             if str(run.get("run_id") or "") not in prior_run_ids
             and campaign_id in ((run.get("metrics") or {}).get("client_ids") or [])
+            and not _run_param_errors(self.manifest, entry, run)
         ]
         if campaign_runs:
             roots = [run for run in campaign_runs if not (run.get("params") or {}).get("retry_of_run_id")]
