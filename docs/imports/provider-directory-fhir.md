@@ -34,6 +34,14 @@ Keep these authorities separate when reviewing Provider Directory coverage:
   the tracked terminal proof. A newer active run can supersede older proof, so
   do not read configured support as live verification.
 
+The manifest also carries the documentation freshness policy. The generated
+matrix shows when each catalog confirmation, source review, and current
+terminal proof expires. Its `Resource completion` column is separate from the
+run's terminal status: `Succeeded` without structured evidence is not presented
+as proof that every configured resource completed. CI rejects expired evidence,
+invalid source IDs or canonical bases, unsupported resource names, and
+classification/method contradictions.
+
 Use this sequence for a campaign or documentation review:
 
 1. Validate the manifest without starting runs:

@@ -5,8 +5,20 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+try:
+    from scripts.provider_directory_support_contract import (
+        parse_review_date,
+        review_valid_through,
+    )
+except ModuleNotFoundError:
+    from provider_directory_support_contract import (
+        parse_review_date,
+        review_valid_through,
+    )
+
 
 DisplayValue = Callable[[str], str]
+NOT_RECORDED_DISPLAY = "Not recorded"
 
 
 def _markdown_cell(value: str) -> str:
@@ -89,7 +101,85 @@ def render_inventory_summary(
         "",
         "## Configured Sources",
         "",
-        "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Known blocker or limitation |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Review valid through | Known blocker or limitation |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     return summary_lines
+
+
+def render_blocked_support_section(
+    blocker_entries: list[dict[str, Any]],
+    maximum_age_days: int,
+    display_value: DisplayValue,
+    display_verification: DisplayValue,
+) -> list[str]:
+    """Render known sources that have no runnable acquisition base."""
+    markdown_lines = [
+        "",
+        "## Known Not Importable",
+        "",
+        "These sources are intentionally retained as blocked catalog evidence. They are not probe-only entries and have no runnable acquisition base.",
+        "",
+        "| Source | Plan | Support | Required access | Registration | Method | Resources | Canonical base | Operational state | Reviewed at | Review valid through | Live verification | Primary evidence | Blocker |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for blocker_entry in blocker_entries:
+        reviewed_on = parse_review_date(
+            blocker_entry["reviewed_at"],
+            f"{blocker_entry['id']}: reviewed_at",
+        )
+        cells = [
+            f"{blocker_entry['display_name']} (`{blocker_entry['id']}`)",
+            blocker_entry["plan_name"],
+            display_value("not-supported"),
+            display_value(blocker_entry["access_requirement"]),
+            "Required" if blocker_entry["requires_registration"] else "Not required",
+            display_value(blocker_entry["acquisition_method"]),
+            ", ".join(blocker_entry["documented_resources"]) or "None confirmed",
+            blocker_entry["canonical_base"] or "None confirmed",
+            blocker_entry["operational_status"].replace("-", " ").title(),
+            blocker_entry["reviewed_at"],
+            review_valid_through(reviewed_on, maximum_age_days),
+            display_verification(blocker_entry["live_verification"]["status"]),
+            blocker_entry["source_url"],
+            blocker_entry["note"],
+        ]
+        markdown_lines.append(
+            "| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |"
+        )
+    return markdown_lines
+
+
+def resource_completion_display(
+    entry: dict[str, Any],
+    support_record: dict[str, Any],
+    verification_record: dict[str, Any],
+) -> str:
+    """Summarize whether terminal evidence covers every configured resource."""
+    expected_resources = list(
+        support_record.get("documented_resources") or entry["resources"]
+    )
+    if not expected_resources:
+        return "Not applicable"
+    terminal_evidence = verification_record.get("terminal_evidence")
+    resource_outcomes = (
+        terminal_evidence.get("resource_outcomes")
+        if isinstance(terminal_evidence, dict)
+        else None
+    )
+    if not isinstance(resource_outcomes, dict):
+        return NOT_RECORDED_DISPLAY
+    for resource_name in expected_resources:
+        resource_outcome = resource_outcomes.get(resource_name)
+        if not isinstance(resource_outcome, dict):
+            return "Incomplete"
+        attempted_sources = resource_outcome.get("sources_attempted")
+        if (
+            not isinstance(attempted_sources, int)
+            or attempted_sources <= 0
+            or resource_outcome.get("sources_completed") != attempted_sources
+            or resource_outcome.get("sources_bounded") != 0
+            or resource_outcome.get("sources_failed") != 0
+        ):
+            return "Incomplete"
+    return "Complete"

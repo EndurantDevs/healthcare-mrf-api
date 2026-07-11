@@ -171,7 +171,7 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     assert "SECRET" not in serialized_snapshot
     assert "SECRET" not in serialized_docs
     assert '"error"' not in serialized_snapshot
-    assert "| Idaho (`idaho`) | Current | Succeeded | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
     assert '"InsurancePlan": {' in serialized_docs
     assert '"sources_bounded": 0' in serialized_docs
     assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded" in serialized_docs
@@ -269,7 +269,7 @@ def test_newer_nonterminal_report_marks_prior_terminal_proof_superseded():
     assert idaho_verification["terminal_status"] == "succeeded"
     assert idaho_verification["proof_state"] == "superseded"
     assert idaho_verification["current_observation"]["run_id"] == "run_idaho_new"
-    assert "| Idaho (`idaho`) | Superseded | Succeeded | run_idaho | Running (`run_idaho_new`)" in rendered
+    assert "| Idaho (`idaho`) | Superseded | Succeeded | Complete | run_idaho | Running (`run_idaho_new`)" in rendered
 
 
 def test_terminal_label_backed_by_active_run_is_rejected():
