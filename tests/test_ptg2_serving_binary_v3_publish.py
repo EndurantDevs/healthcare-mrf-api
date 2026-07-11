@@ -9,6 +9,7 @@ import pytest
 from process.ptg_parts import config as ptg_config
 from process.ptg_parts import ptg2_manifest_publish as manifest_publish
 from process.ptg_parts import ptg2_serving_binary as serving_binary
+from tests.ptg2_serving_binary_v3_fixtures import stream_summary_by_kind
 
 
 def _compact_sql(sql):
@@ -180,41 +181,9 @@ async def test_v3_streams_start_together(monkeypatch):
     assert options_by_kind[serving_binary.PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND] == ()
 
 
-def _stream_summary_by_kind():
-    provider_code_summary_by_field = {
-        "artifact_kind": serving_binary.PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
-        "row_count": 3,
-        "pair_count": 3,
-        "code_count": 3,
-        "duplicate_pair_count": 0,
-        "provider_set_count": 2,
-    }
-    return {
-        serving_binary.PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND: {
-            "artifact_kind": serving_binary.PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
-            "row_count": 4, "group_count": 3, "price_set_count": 2,
-            "maximum_price_key": 1, "price_key_upper_bound": 2, "provider_set_count": 2,
-            "provider_set_codes": provider_code_summary_by_field,
-        },
-        serving_binary.PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: {
-            "artifact_kind": serving_binary.PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
-            "row_count": 2, "price_set_count": 2, "id_bytes": 16,
-        },
-        serving_binary.PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: {
-            "artifact_kind": serving_binary.PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
-            "row_count": 3, "atom_reference_count": 3, "price_set_count": 2,
-            "maximum_price_key": 1, "atom_key_bits": 24, "atom_key_bytes": 3,
-        },
-        serving_binary.PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: {
-            "artifact_kind": serving_binary.PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
-            "atom_count": 2, "attribute_count": 7, "atom_key_bits": 24, "atom_key_bytes": 3,
-        },
-    }
-
-
 @pytest.mark.asyncio
 async def test_v3_finish_uses_stream_summaries_without_source_precounts(monkeypatch):
-    summary_by_kind = _stream_summary_by_kind()
+    summary_by_kind = stream_summary_by_kind()
     reject_db_scan = AsyncMock(side_effect=AssertionError("v3 finish must not pre-count sources"))
     for method_name in ("all", "first", "scalar", "status"):
         monkeypatch.setattr(serving_binary.db, method_name, reject_db_scan)

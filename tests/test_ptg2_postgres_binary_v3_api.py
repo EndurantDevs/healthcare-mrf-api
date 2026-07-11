@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from api import ptg2_serving
@@ -185,6 +187,21 @@ def _configure_version_three_reverse(monkeypatch):
     monkeypatch.setattr(ptg2_serving, "lookup_provider_code_keys_from_db", _stub_reverse_provider_codes)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", _stub_reverse_code_metadata)
     monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", _stub_reverse_forward_entries)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "has_provider_pages_in_db",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_has_single_plan_page_order",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_provider_pages_from_db",
+        AsyncMock(return_value=None),
+    )
 
 
 @pytest.mark.asyncio
@@ -262,9 +279,10 @@ class VersionThreeBatchHarness:
 
     async def code_metadata(self, _session, _tables, **query_kwargs):
         requested_code = str(query_kwargs.get("code_value") or "")
+        candidate_code_keys = query_kwargs.get("code_keys") or self.candidate_code_keys
         matching_code_keys = [
             code_key
-            for code_key in query_kwargs["code_keys"]
+            for code_key in candidate_code_keys
             if not requested_code or f"{code_key:05d}" == requested_code
         ]
         metadata_offset = int(query_kwargs.get("offset_rows") or 0)
@@ -330,6 +348,21 @@ class VersionThreeBatchHarness:
         monkeypatch.setattr(ptg2_serving, "lookup_provider_code_keys_from_db", self.provider_codes)
         monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_code_rows_for_provider_reverse", self.code_metadata)
         monkeypatch.setattr(ptg2_serving, "lookup_binary_code_batch_from_db", self.forward_entries)
+        monkeypatch.setattr(
+            ptg2_serving,
+            "has_provider_pages_in_db",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            ptg2_serving,
+            "_has_single_plan_page_order",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            ptg2_serving,
+            "lookup_provider_pages_from_db",
+            AsyncMock(return_value=None),
+        )
 
 
 def _batched_reverse_query(*, limit, offset=0, apply_window=True, code_value=""):
@@ -421,3 +454,29 @@ async def test_v3_exact_code_uses_one_unbounded_batch(monkeypatch):
     assert [_candidate_identity(candidate) for candidate in reverse_rows] == [("02000", 2000), ("02000", 2000)]
     assert harness.metadata_calls == [(None, 0, 1)]
     assert harness.forward_code_batches == [(2000,)]
+
+
+@pytest.mark.asyncio
+async def test_v3_exact_code_skips_reverse_membership_expansion(monkeypatch):
+    harness = VersionThreeBatchHarness()
+    harness.install(monkeypatch)
+    reverse_memberships = AsyncMock(
+        side_effect=AssertionError("exact code must not expand provider reverse memberships")
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_provider_code_keys_from_db",
+        reverse_memberships,
+    )
+
+    reverse_rows = await ptg2_serving._version_three_reverse_rows(
+        object(),
+        _version_three_tables(),
+        _batched_reverse_query(limit=25, code_value="02000"),
+    )
+
+    assert [_candidate_identity(candidate) for candidate in reverse_rows] == [
+        ("02000", 2000),
+        ("02000", 2000),
+    ]
+    reverse_memberships.assert_not_awaited()

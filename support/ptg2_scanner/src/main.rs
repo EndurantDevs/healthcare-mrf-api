@@ -40,7 +40,7 @@ use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::cell::Cell;
-use std::cmp::Ordering as CmpOrdering;
+use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
@@ -8866,6 +8866,8 @@ const PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND: &str =
 const PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND: &str = "price_set_atoms_by_id_v2";
 const PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_FORMAT: &str = "price_set_atoms_by_id_v2";
 const PTG2_SERVING_BINARY_V3_FORMAT: &str = "postgres_binary_v3";
+const PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND: &str = "by_code_page_v3_f2";
+const PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND: &str = "provider_set_page_v3_s1";
 const PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: &str = "provider_set_codes_v3";
 const PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: &str =
     "price_set_atom_memberships_v3";
@@ -8873,8 +8875,11 @@ const PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND: &str = "price_atoms_v3";
 const PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND: &str = "by_code_assigned_v3";
 const PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: &str = "by_code_price_dictionary_v3";
 const PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_BLOCK_SPAN: i64 = 1024;
+const PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN: i64 = 1;
 const PTG2_SERVING_BINARY_PRICE_MEMBERSHIPS_V3_BLOCK_SPAN: i64 = 512;
 const PTG2_SERVING_BINARY_PRICE_ATOMS_V3_BLOCK_SPAN: i64 = 512;
+const PTG2_SERVING_BINARY_V3_PAGE_ROWS: usize = 64;
+const PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION: u8 = 2;
 const PTG2_SERVING_BINARY_PRICE_ATOM_V3_ATTRIBUTE_COUNT: usize = 7;
 const PTG2_SERVING_BINARY_V3_ATOM_COUNT_ENV: &str = "HLTHPRT_PTG2_SERVING_BINARY_V3_ATOM_COUNT";
 const PTG2_SERVING_BINARY_V3_ATOM_KEY_BITS_ENV: &str =
@@ -11908,6 +11913,211 @@ fn append_serving_binary_by_code_group<W: Write>(
     Ok(())
 }
 
+type ServingBinaryV3ForwardPageCandidate = (Reverse<u64>, i32, u32);
+
+fn push_serving_binary_v3_forward_page_candidate(
+    candidates: &mut BinaryHeap<ServingBinaryV3ForwardPageCandidate>,
+    candidate: ServingBinaryV3ForwardPageCandidate,
+) {
+    if candidates.len() < PTG2_SERVING_BINARY_V3_PAGE_ROWS {
+        candidates.push(candidate);
+        return;
+    }
+    if candidates
+        .peek()
+        .is_some_and(|worst_candidate| candidate < *worst_candidate)
+    {
+        candidates.pop();
+        candidates.push(candidate);
+    }
+}
+
+fn write_serving_binary_v3_forward_page<W: Write>(
+    writer: &mut W,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+    code_key: Option<i32>,
+    candidates: &mut BinaryHeap<ServingBinaryV3ForwardPageCandidate>,
+    block_stats: &mut ServingBinaryV3BlockStats,
+) -> io::Result<()> {
+    let Some(code_key) = code_key else {
+        candidates.clear();
+        return Ok(());
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut ordered_candidates = candidates.drain().collect::<Vec<_>>();
+    ordered_candidates.sort_unstable();
+    let mut payload = Vec::with_capacity(1 + ordered_candidates.len() * 8);
+    payload.push(PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION);
+    write_uvarint_to_vec(&mut payload, ordered_candidates.len() as u64);
+    for (Reverse(provider_count), provider_set_key, price_key) in &ordered_candidates {
+        write_uvarint_to_vec(&mut payload, *provider_set_key as u64);
+        write_uvarint_to_vec(&mut payload, *provider_count);
+        write_uvarint_to_vec(&mut payload, u64::from(*price_key));
+    }
+    write_serving_binary_v3_logical_block(
+        writer,
+        target_format,
+        max_payload_bytes,
+        ServingBinaryV3LogicalBlock {
+            artifact_kind: PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+            block_key: code_key,
+            entry_count: ordered_candidates.len(),
+            payload: &payload,
+        },
+        block_stats,
+    )
+}
+
+struct ServingBinaryV3ProviderProjection {
+    provider_count: u64,
+    total_row_count: u64,
+    page_rows: Vec<(i32, u32)>,
+}
+
+fn push_serving_binary_v3_provider_projection(
+    projections: &mut BTreeMap<i32, ServingBinaryV3ProviderProjection>,
+    provider_set_key: i32,
+    provider_count: u64,
+    code_key: i32,
+    price_key: u32,
+) -> io::Result<()> {
+    let projection =
+        projections
+            .entry(provider_set_key)
+            .or_insert_with(|| ServingBinaryV3ProviderProjection {
+                provider_count,
+                total_row_count: 0,
+                page_rows: Vec::with_capacity(1),
+            });
+    if projection.provider_count != provider_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "provider_count changed for provider_set_key {provider_set_key}: {} != {provider_count}",
+                projection.provider_count
+            ),
+        ));
+    }
+    projection.total_row_count = projection.total_row_count.saturating_add(1);
+    if projection.page_rows.len() < PTG2_SERVING_BINARY_V3_PAGE_ROWS {
+        projection.page_rows.push((code_key, price_key));
+    }
+    Ok(())
+}
+
+fn serving_binary_provider_projection_count_payload(
+    projections: &BTreeMap<i32, ServingBinaryV3ProviderProjection>,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(projections.len() * 2);
+    let mut previous_provider_set_key = 0i32;
+    for (provider_set_key, projection) in projections {
+        write_uvarint_to_vec(
+            &mut payload,
+            (provider_set_key - previous_provider_set_key) as u64,
+        );
+        write_uvarint_to_vec(&mut payload, projection.provider_count);
+        previous_provider_set_key = *provider_set_key;
+    }
+    payload
+}
+
+fn serving_binary_v3_provider_page_block_payload(
+    block_key: i32,
+    provider_entries: &[(i32, &ServingBinaryV3ProviderProjection)],
+) -> io::Result<Vec<u8>> {
+    let block_start = i64::from(block_key) * PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN;
+    let mut payload = Vec::new();
+    payload.push(PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION);
+    write_uvarint_to_vec(&mut payload, provider_entries.len() as u64);
+    for (provider_set_key, projection) in provider_entries {
+        let relative_key = i64::from(*provider_set_key) - block_start;
+        if !(0..PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN).contains(&relative_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTG2 v3 provider page key is outside its logical block",
+            ));
+        }
+        write_uvarint_to_vec(&mut payload, relative_key as u64);
+        write_uvarint_to_vec(&mut payload, projection.provider_count);
+        write_uvarint_to_vec(&mut payload, projection.total_row_count);
+        write_uvarint_to_vec(&mut payload, projection.page_rows.len() as u64);
+        let mut previous_code_key = 0i32;
+        let mut previous_pair = None;
+        for (code_key, price_key) in &projection.page_rows {
+            let pair = (*code_key, *price_key);
+            if previous_pair.is_some_and(|previous| pair < previous) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PTG2 v3 provider page rows are not ordered",
+                ));
+            }
+            write_uvarint_to_vec(&mut payload, (*code_key - previous_code_key) as u64);
+            write_uvarint_to_vec(&mut payload, u64::from(*price_key));
+            previous_code_key = *code_key;
+            previous_pair = Some(pair);
+        }
+    }
+    Ok(payload)
+}
+
+fn write_serving_binary_v3_provider_pages<W: Write>(
+    writer: &mut W,
+    target_format: ServingBinaryTargetCopyFormat,
+    max_payload_bytes: usize,
+    projections: &BTreeMap<i32, ServingBinaryV3ProviderProjection>,
+    block_stats: &mut ServingBinaryV3BlockStats,
+) -> io::Result<()> {
+    let mut current_block_key = None;
+    let mut provider_entries = Vec::new();
+    for (provider_set_key, projection) in projections {
+        let block_key = serving_binary_v3_block_key(
+            i64::from(*provider_set_key),
+            PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN,
+            "provider_set_key",
+        )?;
+        if current_block_key.is_some_and(|current| current != block_key) {
+            let payload = serving_binary_v3_provider_page_block_payload(
+                current_block_key.unwrap_or_default(),
+                &provider_entries,
+            )?;
+            write_serving_binary_v3_logical_block(
+                writer,
+                target_format,
+                max_payload_bytes,
+                ServingBinaryV3LogicalBlock {
+                    artifact_kind: PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+                    block_key: current_block_key.unwrap_or_default(),
+                    entry_count: provider_entries.len(),
+                    payload: &payload,
+                },
+                block_stats,
+            )?;
+            provider_entries.clear();
+        }
+        current_block_key = Some(block_key);
+        provider_entries.push((*provider_set_key, projection));
+    }
+    if let Some(block_key) = current_block_key {
+        let payload = serving_binary_v3_provider_page_block_payload(block_key, &provider_entries)?;
+        write_serving_binary_v3_logical_block(
+            writer,
+            target_format,
+            max_payload_bytes,
+            ServingBinaryV3LogicalBlock {
+                artifact_kind: PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+                block_key,
+                entry_count: provider_entries.len(),
+                payload: &payload,
+            },
+            block_stats,
+        )?;
+    }
+    Ok(())
+}
+
 const SERVING_BINARY_V3_PROVIDER_CODE_PAIR_BYTES: usize = 8;
 
 struct ServingBinaryV3ProviderCodeSpool {
@@ -12177,8 +12387,11 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
 ) -> io::Result<Value> {
     read_pg_binary_copy_header(reader)?;
     write_serving_binary_copy_header(writer, target_format)?;
-    let mut provider_count_by_key: BTreeMap<i32, u64> = BTreeMap::new();
+    let mut provider_projection_by_key: BTreeMap<i32, ServingBinaryV3ProviderProjection> =
+        BTreeMap::new();
     let mut group_state = ServingBinaryByCodeGroupState::new(max_payload_bytes);
+    let mut forward_page_candidates = BinaryHeap::new();
+    let mut forward_page_block_stats = ServingBinaryV3BlockStats::default();
     let mut previous_row_key: Option<(i32, i32, u32)> = None;
     let mut row_count = 0u64;
     let mut code_count = 0u64;
@@ -12223,20 +12436,15 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
             previous_provider_code_pair = Some(provider_code_pair);
         }
 
-        if let Some(existing_provider_count) = provider_count_by_key.get(&provider_set_key) {
-            if *existing_provider_count != provider_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "provider_count changed for provider_set_key {provider_set_key}: {existing_provider_count} != {provider_count}"
-                    ),
-                ));
-            }
-        } else {
-            provider_count_by_key.insert(provider_set_key, provider_count);
-        }
-
         if group_state.current_code != Some(code_key) {
+            write_serving_binary_v3_forward_page(
+                writer,
+                target_format,
+                max_payload_bytes,
+                group_state.current_code,
+                &mut forward_page_candidates,
+                &mut forward_page_block_stats,
+            )?;
             append_serving_binary_by_code_group(writer, &mut group_state, target_format)?;
             flush_serving_binary_by_code_block(
                 writer,
@@ -12256,6 +12464,17 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         }
         group_state.current_provider_set_key = Some(provider_set_key);
         group_state.current_price_keys.push(price_key);
+        push_serving_binary_v3_forward_page_candidate(
+            &mut forward_page_candidates,
+            (Reverse(provider_count), provider_set_key, price_key),
+        );
+        push_serving_binary_v3_provider_projection(
+            &mut provider_projection_by_key,
+            provider_set_key,
+            provider_count,
+            code_key,
+            price_key,
+        )?;
         maximum_price_key = Some(maximum_price_key.map_or(price_key, |value| value.max(price_key)));
         row_count = row_count.saturating_add(1);
     }
@@ -12270,15 +12489,24 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         &mut group_state.current_payload,
         &mut group_state.record_count,
     )?;
+    write_serving_binary_v3_forward_page(
+        writer,
+        target_format,
+        max_payload_bytes,
+        group_state.current_code,
+        &mut forward_page_candidates,
+        &mut forward_page_block_stats,
+    )?;
     let grouped_record_count = group_state.record_count;
-    let provider_count_payload = serving_binary_provider_count_payload(&provider_count_by_key);
+    let provider_count_payload =
+        serving_binary_provider_projection_count_payload(&provider_projection_by_key);
     write_serving_binary_copy_record(
         writer,
         target_format,
         PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
         0,
         0,
-        provider_count_by_key.len(),
+        provider_projection_by_key.len(),
         &provider_count_payload,
     )?;
     group_state.record_count = group_state.record_count.saturating_add(1);
@@ -12290,6 +12518,14 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         serving_binary_v3_provider_code_sort_chunk_bytes(),
     )?;
     provider_code_state.finish(writer, target_format)?;
+    let mut provider_page_block_stats = ServingBinaryV3BlockStats::default();
+    write_serving_binary_v3_provider_pages(
+        writer,
+        target_format,
+        max_payload_bytes,
+        &provider_projection_by_key,
+        &mut provider_page_block_stats,
+    )?;
     let by_code_copy_record_count = group_state.record_count;
     let provider_code_summary = json!({
         "name": "serving_binary_v3_provider_set_codes",
@@ -12319,9 +12555,50 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         "target_copy_format": if target_format == ServingBinaryTargetCopyFormat::Binary { "postgres_binary" } else { "text" },
         "storage": provider_code_state.block_stats.storage_summary(),
     });
+    let forward_page_summary = json!({
+        "name": "serving_binary_v3_by_code_page",
+        "format": PTG2_SERVING_BINARY_V3_FORMAT,
+        "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+        "page_rows": PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+        "row_count": forward_page_block_stats.entry_count,
+        "code_count": forward_page_block_stats.logical_block_count,
+        "block_count": forward_page_block_stats.logical_block_count,
+        "copy_record_count": forward_page_block_stats.copy_record_count,
+        "block_bytes": max_payload_bytes,
+        "storage": forward_page_block_stats.storage_summary(),
+    });
+    let provider_page_row_count = provider_projection_by_key
+        .values()
+        .map(|projection| projection.page_rows.len() as u64)
+        .sum::<u64>();
+    let provider_page_source_row_count = provider_projection_by_key
+        .values()
+        .map(|projection| projection.total_row_count)
+        .sum::<u64>();
+    let truncated_provider_set_count = provider_projection_by_key
+        .values()
+        .filter(|projection| projection.total_row_count > projection.page_rows.len() as u64)
+        .count();
+    let provider_page_summary = json!({
+        "name": "serving_binary_v3_provider_set_page",
+        "format": PTG2_SERVING_BINARY_V3_FORMAT,
+        "artifact_kind": PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+        "block_span": PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_BLOCK_SPAN,
+        "page_rows": PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+        "row_count": provider_page_row_count,
+        "source_row_count": provider_page_source_row_count,
+        "provider_set_count": provider_projection_by_key.len(),
+        "truncated_provider_set_count": truncated_provider_set_count,
+        "block_count": provider_page_block_stats.logical_block_count,
+        "copy_record_count": provider_page_block_stats.copy_record_count,
+        "block_bytes": max_payload_bytes,
+        "storage": provider_page_block_stats.storage_summary(),
+    });
     group_state.record_count = group_state
         .record_count
-        .saturating_add(provider_code_state.block_stats.copy_record_count);
+        .saturating_add(provider_code_state.block_stats.copy_record_count)
+        .saturating_add(forward_page_block_stats.copy_record_count)
+        .saturating_add(provider_page_block_stats.copy_record_count);
     write_serving_binary_copy_trailer(writer, target_format)?;
     writer.flush()?;
     let price_key_upper_bound = maximum_price_key.map_or(0u64, |key| u64::from(key) + 1);
@@ -12332,8 +12609,10 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         "artifact_kind": PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
         "emitted_artifact_kinds": [
             PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+            PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
             PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
             PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
         ],
         "row_count": row_count,
         "group_count": group_state.group_count,
@@ -12342,10 +12621,12 @@ fn write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader<R: Read, 
         "price_set_count": price_key_upper_bound,
         "maximum_price_key": maximum_price_key,
         "price_key_upper_bound": price_key_upper_bound,
-        "provider_set_count": provider_count_by_key.len(),
+        "provider_set_count": provider_projection_by_key.len(),
         "copy_record_count": group_state.record_count,
         "by_code_copy_record_count": by_code_copy_record_count,
         "provider_set_codes": provider_code_summary,
+        "by_code_page": forward_page_summary,
+        "provider_set_page": provider_page_summary,
         "byte_count": writer.byte_count(),
         "block_bytes": max_payload_bytes,
         "source_copy_format": "postgres_binary",
@@ -15910,7 +16191,14 @@ mod tests {
             .collect::<Vec<_>>();
         let assigned_shared_records = assigned_records
             .iter()
-            .filter(|record| record.kind != PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND)
+            .filter(|record| {
+                !matches!(
+                    record.kind.as_str(),
+                    PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND
+                        | PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND
+                        | PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND
+                )
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(assigned_shared_records, legacy_shared_records);
@@ -15931,13 +16219,105 @@ mod tests {
         assert_eq!(summary["provider_set_count"], 2);
         assert_eq!(summary["price_set_count"], 3);
         assert_eq!(summary["maximum_price_key"], 2);
-        assert_eq!(summary["copy_record_count"], 4);
+        assert_eq!(summary["copy_record_count"], 8);
         assert_eq!(summary["by_code_copy_record_count"], 3);
         assert_eq!(summary["provider_set_codes"]["row_count"], 3);
         assert_eq!(summary["provider_set_codes"]["provider_set_count"], 2);
+        assert_eq!(summary["by_code_page"]["row_count"], 4);
+        assert_eq!(summary["by_code_page"]["code_count"], 2);
+        assert_eq!(summary["provider_set_page"]["row_count"], 4);
+        assert_eq!(summary["provider_set_page"]["provider_set_count"], 2);
         assert!(assigned_records
             .iter()
             .any(|record| record.kind == PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND));
+        assert!(assigned_records
+            .iter()
+            .any(|record| record.kind == PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND));
+        assert!(assigned_records
+            .iter()
+            .any(|record| record.kind == PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND));
+    }
+
+    #[test]
+    fn serving_binary_v3_page_projections_cap_and_report_dense_rows() {
+        let assigned_rows = (0..100)
+            .map(|price_key| {
+                vec![
+                    pg_i32_field(7),
+                    pg_i32_field(3),
+                    pg_i32_field(10),
+                    pg_i64_field(price_key),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let input = pg_binary_copy_rows(&assigned_rows);
+        let mut reader = Cursor::new(input);
+        let mut writer = CountingWriter::new(Vec::new());
+
+        let summary = write_serving_binary_v3_assigned_by_code_copy_from_pg_binary_reader(
+            &mut reader,
+            &mut writer,
+            ServingBinaryTargetCopyFormat::Binary,
+            serving_binary_block_bytes(),
+        )
+        .unwrap();
+        let records = read_test_serving_binary_records(writer.inner);
+
+        assert_eq!(summary["by_code_page"]["row_count"], 64);
+        assert_eq!(summary["by_code_page"]["code_count"], 1);
+        assert_eq!(summary["provider_set_page"]["row_count"], 64);
+        assert_eq!(summary["provider_set_page"]["source_row_count"], 100);
+        assert_eq!(summary["provider_set_page"]["provider_set_count"], 1);
+        assert_eq!(summary["provider_set_page"]["block_span"], 1);
+        assert_eq!(
+            summary["provider_set_page"]["truncated_provider_set_count"],
+            1
+        );
+
+        let forward_payload =
+            logical_test_payload(&records, PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND, 7);
+        let mut cursor = 0usize;
+        assert_eq!(
+            forward_payload[cursor],
+            PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION
+        );
+        cursor += 1;
+        assert_eq!(test_read_uvarint(&forward_payload, &mut cursor), 64);
+        for expected_price_key in 0..64 {
+            assert_eq!(test_read_uvarint(&forward_payload, &mut cursor), 3);
+            assert_eq!(test_read_uvarint(&forward_payload, &mut cursor), 10);
+            assert_eq!(
+                test_read_uvarint(&forward_payload, &mut cursor),
+                expected_price_key
+            );
+        }
+        assert_eq!(cursor, forward_payload.len());
+
+        let provider_payload =
+            logical_test_payload(&records, PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND, 3);
+        cursor = 0;
+        assert_eq!(
+            provider_payload[cursor],
+            PTG2_SERVING_BINARY_V3_PAGE_FORMAT_VERSION
+        );
+        cursor += 1;
+        assert_eq!(test_read_uvarint(&provider_payload, &mut cursor), 1);
+        assert_eq!(test_read_uvarint(&provider_payload, &mut cursor), 0);
+        assert_eq!(test_read_uvarint(&provider_payload, &mut cursor), 10);
+        assert_eq!(test_read_uvarint(&provider_payload, &mut cursor), 100);
+        assert_eq!(test_read_uvarint(&provider_payload, &mut cursor), 64);
+        for expected_price_key in 0..64 {
+            let expected_code_delta = if expected_price_key == 0 { 7 } else { 0 };
+            assert_eq!(
+                test_read_uvarint(&provider_payload, &mut cursor),
+                expected_code_delta
+            );
+            assert_eq!(
+                test_read_uvarint(&provider_payload, &mut cursor),
+                expected_price_key
+            );
+        }
+        assert_eq!(cursor, provider_payload.len());
     }
 
     #[test]

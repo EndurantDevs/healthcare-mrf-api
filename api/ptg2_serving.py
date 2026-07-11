@@ -120,6 +120,7 @@ from api.ptg2_db_sidecars import (
     lookup_global_sidecar_members_many_from_db,
     lookup_serving_binary_by_code_from_db,
     lookup_binary_code_batch_from_db,
+    lookup_price_ids_from_db,
     lookup_serving_binary_by_provider_set_from_db,
     lookup_serving_binary_by_provider_set_patterns_from_db,
     lookup_serving_binary_by_provider_sets_patterns_from_db,
@@ -133,6 +134,14 @@ from api.ptg2_db_serving_v3 import (
     lookup_price_atom_memberships_from_db,
     lookup_price_atoms_from_db,
     lookup_provider_code_keys_from_db,
+)
+from api.ptg2_db_serving_v3_pages import (
+    PTG2_SERVING_BINARY_V3_PAGE_ROWS,
+    PTG2V3PageRecord,
+    PTG2V3ProviderPage,
+    has_provider_pages_in_db,
+    lookup_code_page_from_db,
+    lookup_provider_pages_from_db,
 )
 from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import (
@@ -2417,6 +2426,110 @@ def _ptg2_serving_sidecar_window(
     return ordered_sidecar_rows[start : start + max(int(limit), 0)]
 
 
+def _version_three_page_price_lookup_hints(serving_tables: PTG2ServingTables) -> dict[str, Any]:
+    return {
+        "price_dictionary_item_count": serving_tables.price_dictionary_item_count,
+        "price_dictionary_block_bytes": serving_tables.price_dictionary_block_bytes,
+        "price_dictionary_compressed_records": serving_tables.price_dictionary_compressed_records,
+    }
+
+
+def _version_three_forward_page_payloads(
+    page_entries: tuple[PTG2V3PageRecord, ...],
+    code_metadata: Mapping[str, Any],
+    provider_ids_by_key: Mapping[int, str],
+    price_ids_by_key: Mapping[int, str],
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Shape a validated forward projection window as serving rows."""
+
+    start = max(int(offset), 0)
+    return [
+        {
+            "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                page_entry.code_key,
+                page_entry.provider_set_key,
+                price_ids_by_key[page_entry.price_key],
+            ),
+            "plan_id": code_metadata.get("plan_id"),
+            "reported_code_system": code_metadata.get("reported_code_system"),
+            "reported_code": code_metadata.get("reported_code"),
+            "procedure_global_id_128": None,
+            "provider_set_global_id_128": provider_ids_by_key[page_entry.provider_set_key],
+            "provider_count": page_entry.provider_count,
+            "price_set_global_id_128": price_ids_by_key[page_entry.price_key],
+            "price_key": page_entry.price_key,
+            "source_trace_set_hash": source_trace_set_hash,
+            "network_names": network_names,
+        }
+        for page_entry in page_entries[start : start + max(int(limit), 0)]
+    ]
+
+
+async def _version_three_forward_page_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_metadata: Mapping[str, Any],
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]] | None:
+    """Materialize one bounded code page without scanning the full forward block."""
+
+    if not serving_tables.serving_binary_table:
+        return None
+    page_end = max(int(offset), 0) + max(int(limit), 0)
+    if page_end > PTG2_SERVING_BINARY_V3_PAGE_ROWS:
+        return None
+    code_key = code_metadata.get("code_key")
+    if code_key is None:
+        return None
+    page_entries = await lookup_code_page_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        int(code_key),
+    )
+    if page_entries is None:
+        return None
+    total_rows = int(code_metadata.get("rate_count") or 0)
+    if total_rows <= 0 or len(page_entries) != min(total_rows, PTG2_SERVING_BINARY_V3_PAGE_ROWS):
+        raise PTG2ManifestArtifactError("PTG2 v3 forward page has an invalid row count")
+    start = max(int(offset), 0)
+    selected_entries = page_entries[start : start + max(int(limit), 0)]
+    provider_keys = {page_entry.provider_set_key for page_entry in selected_entries}
+    provider_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
+        session,
+        serving_tables,
+        provider_keys,
+    )
+    if set(provider_ids_by_key) != provider_keys:
+        raise PTG2ManifestArtifactError("PTG2 v3 forward page references an unknown provider set")
+    price_keys = {page_entry.price_key for page_entry in selected_entries}
+    price_ids_by_key = await lookup_price_ids_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        price_keys,
+        **_version_three_page_price_lookup_hints(serving_tables),
+    )
+    if set(price_ids_by_key) != price_keys:
+        raise PTG2ManifestArtifactError("PTG2 v3 forward page references an unknown price set")
+    return _version_three_forward_page_payloads(
+        selected_entries,
+        code_metadata,
+        provider_ids_by_key,
+        price_ids_by_key,
+        source_trace_set_hash,
+        network_names,
+        len(selected_entries),
+        0,
+    )
+
+
 async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     session,
     serving_tables: PTG2ServingTables,
@@ -2432,23 +2545,66 @@ async def _ptg2_manifest_rows_from_serving_by_code_sidecar(
     code_key = code_data.get("code_key")
     if code_key is None:
         return None
+    if (
+        serving_tables.effective_arch_version == "postgres_binary_v3"
+        and provider_set_keys is None
+        and limit is not None
+    ):
+        page_rows = await _version_three_forward_page_rows(
+            session,
+            serving_tables,
+            code_metadata=code_data,
+            source_trace_set_hash=source_trace_set_hash,
+            network_names=network_names,
+            limit=limit,
+            offset=offset,
+        )
+        if page_rows is not None:
+            return page_rows
+    return await _full_code_sidecar_rows(
+        session,
+        serving_tables,
+        code_data=code_data,
+        provider_set_keys=provider_set_keys,
+        source_trace_set_hash=source_trace_set_hash,
+        network_names=network_names,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _full_code_sidecar_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_data: Mapping[str, Any],
+    provider_set_keys: Iterable[int] | None,
+    source_trace_set_hash: str | None,
+    network_names: list[str],
+    limit: int | None,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Read and materialize an authoritative complete by-code block."""
+
+    code_key = int(code_data["code_key"])
     sidecar_rows = await _ptg2_manifest_lookup_serving_by_code_sidecar(
         session,
         serving_tables,
-        int(code_key),
+        code_key,
         provider_set_keys=provider_set_keys,
     )
     if not sidecar_rows:
-        await _raise_missing_v3_block(session, serving_tables, int(code_key))
+        await _raise_missing_v3_block(session, serving_tables, code_key)
         return []
     provider_set_ids_by_key = await _ptg2_manifest_provider_set_ids_for_keys(
         session,
         serving_tables,
-        [row.provider_set_key for row in sidecar_rows],
+        [sidecar_entry.provider_set_key for sidecar_entry in sidecar_rows],
     )
     if (
         serving_tables.effective_arch_version == "postgres_binary_v3"
-        and set(provider_set_ids_by_key) != {row.provider_set_key for row in sidecar_rows}
+        and set(provider_set_ids_by_key)
+        != {sidecar_entry.provider_set_key for sidecar_entry in sidecar_rows}
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 v3 provider-set dictionary is missing a referenced key"
@@ -3023,12 +3179,35 @@ def _version_three_candidate_rows(
 
 _PTG2_VERSION_THREE_REVERSE_CODE_BATCH_SIZE = 128
 _PTG2_VERSION_THREE_REVERSE_INITIAL_BATCH_SIZE = 1
+_PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT = 64
 
 
 @dataclass(frozen=True)
 class _VersionThreeReverseScope:
     provider_set_id_by_key: Mapping[int, str]
     candidate_code_keys: tuple[int, ...]
+    exact_code_metadata_rows: tuple[Mapping[str, Any], ...] | None = None
+
+
+async def _version_three_exact_code_metadata(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> tuple[Mapping[str, Any], ...]:
+    """Resolve exact code metadata without expanding provider reverse sets."""
+
+    code_metadata_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        serving_tables,
+        requested_plan=reverse_query.requested_plan,
+        code_value=reverse_query.code_value,
+        code_system=reverse_query.code_system,
+        q_text=reverse_query.q_text,
+        code_context=reverse_query.code_context,
+    )
+    if code_metadata_rows is None:
+        raise PTG2ManifestArtifactError("PTG2 v3 code dictionary is unavailable")
+    return tuple(code_metadata_rows)
 
 
 @dataclass
@@ -3066,6 +3245,57 @@ def _version_three_row_window(reverse_query: _VersionThreeReverseQuery) -> _Vers
     return _VersionThreeRowWindow(limit=row_limit, remaining_offset=row_offset)
 
 
+async def _version_three_scope_code_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+    provider_set_id_by_key: Mapping[int, str],
+) -> tuple[tuple[int, ...], tuple[Mapping[str, Any], ...] | None]:
+    """Resolve candidate codes through the cheapest correct direction."""
+
+    if str(reverse_query.code_value or "").strip():
+        exact_code_metadata_rows = await _version_three_exact_code_metadata(
+            session,
+            serving_tables,
+            reverse_query,
+        )
+        return (
+            tuple(
+                int(code_metadata["code_key"])
+                for code_metadata in exact_code_metadata_rows
+                if code_metadata.get("code_key") is not None
+            ),
+            exact_code_metadata_rows,
+        )
+    provider_set_code_keys = await lookup_provider_code_keys_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        provider_set_id_by_key,
+    )
+    missing_provider_code_keys = set(provider_set_id_by_key).difference(provider_set_code_keys)
+    empty_provider_code_keys = {
+        provider_set_key
+        for provider_set_key, code_keys in provider_set_code_keys.items()
+        if not code_keys
+    }
+    if missing_provider_code_keys or empty_provider_code_keys:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-code artifact is missing a referenced provider set"
+        )
+    return (
+        tuple(
+            sorted(
+                {
+                    code_key
+                    for code_keys in provider_set_code_keys.values()
+                    for code_key in code_keys
+                }
+            )
+        ),
+        None,
+    )
+
+
 async def _version_three_reverse_scope(
     session,
     serving_tables: PTG2ServingTables,
@@ -3094,29 +3324,18 @@ async def _version_three_reverse_scope(
         provider_set_key: provider_set_id
         for provider_set_id, provider_set_key in provider_set_key_by_id.items()
     }
-    provider_set_code_keys = await lookup_provider_code_keys_from_db(
+    candidate_code_keys, exact_code_metadata_rows = await _version_three_scope_code_keys(
         session,
-        serving_tables.serving_binary_table,
+        serving_tables,
+        reverse_query,
         provider_set_id_by_key,
-    )
-    missing_provider_code_keys = set(provider_set_id_by_key).difference(provider_set_code_keys)
-    empty_provider_code_keys = {
-        provider_set_key
-        for provider_set_key, code_keys in provider_set_code_keys.items()
-        if not code_keys
-    }
-    if missing_provider_code_keys or empty_provider_code_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 provider-code artifact is missing a referenced provider set"
-        )
-    candidate_code_keys = tuple(
-        sorted({code_key for code_keys in provider_set_code_keys.values() for code_key in code_keys})
     )
     if not candidate_code_keys:
         return None
     return _VersionThreeReverseScope(
         provider_set_id_by_key=provider_set_id_by_key,
         candidate_code_keys=candidate_code_keys,
+        exact_code_metadata_rows=exact_code_metadata_rows,
     )
 
 
@@ -3144,18 +3363,23 @@ async def _version_three_candidate_batch(
 ) -> tuple[list[list[dict[str, Any]]], int] | None:
     """Read and materialize one ordered metadata/forward block batch."""
 
-    code_metadata_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
-        session,
-        serving_tables,
-        requested_plan=reverse_query.requested_plan,
-        code_value=reverse_query.code_value,
-        code_system=reverse_query.code_system,
-        q_text=reverse_query.q_text,
-        code_context=reverse_query.code_context,
-        code_keys=reverse_scope.candidate_code_keys,
-        limit_rows=metadata_batch_size,
-        offset_rows=metadata_offset,
-    )
+    if reverse_scope.exact_code_metadata_rows is not None:
+        code_metadata_rows = (
+            list(reverse_scope.exact_code_metadata_rows) if metadata_offset == 0 else []
+        )
+    else:
+        code_metadata_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+            session,
+            serving_tables,
+            requested_plan=reverse_query.requested_plan,
+            code_value=reverse_query.code_value,
+            code_system=reverse_query.code_system,
+            q_text=reverse_query.q_text,
+            code_context=reverse_query.code_context,
+            code_keys=reverse_scope.candidate_code_keys,
+            limit_rows=metadata_batch_size,
+            offset_rows=metadata_offset,
+        )
     if code_metadata_rows is None:
         return None
     if not code_metadata_rows:
@@ -3186,6 +3410,273 @@ async def _version_three_candidate_batch(
     return candidate_row_groups, len(code_metadata_rows)
 
 
+def _is_version_three_reverse_page_eligible(reverse_query: _VersionThreeReverseQuery) -> bool:
+    requested_end = max(int(reverse_query.offset or 0), 0) + max(int(reverse_query.limit or 0), 0)
+    return bool(
+        reverse_query.apply_window
+        and reverse_query.limit is not None
+        and requested_end <= PTG2_SERVING_BINARY_V3_PAGE_ROWS
+        and not str(reverse_query.code_value or "").strip()
+        and not reverse_query.code_system
+        and not reverse_query.q_text
+        and not reverse_query.code_context
+    )
+
+
+async def _has_single_plan_page_order(
+    session,
+    serving_tables: PTG2ServingTables,
+    requested_plan: str,
+) -> bool:
+    """Prove that dense code-key order matches the requested API plan order."""
+
+    code_count_table = _safe_table_name(serving_tables.code_count_table)
+    if not code_count_table:
+        return False
+    plan_order_result = await session.execute(
+        text(
+            f"""
+            SELECT CASE
+                WHEN :page_plan_id <> '' THEN COALESCE(
+                    BOOL_AND(COALESCE(plan_id = :page_plan_id, FALSE)),
+                    FALSE
+                )
+                ELSE COALESCE(BOOL_AND(plan_id IS NULL), FALSE)
+                  OR COALESCE(
+                        BOOL_AND(COALESCE(plan_id = '', FALSE)),
+                        FALSE
+                     )
+            END AS single_plan_scope
+            FROM {code_count_table}
+            """
+        ),
+        {"page_plan_id": str(requested_plan or "")},
+    )
+    return bool(plan_order_result.scalar())
+
+
+@dataclass(frozen=True)
+class _VersionThreePageProjectionScope:
+    provider_set_id_by_key: Mapping[int, str]
+    provider_pages_by_key: Mapping[int, PTG2V3ProviderPage]
+    page_entries: tuple[PTG2V3PageRecord, ...]
+
+
+async def _load_version_three_page_projection(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _VersionThreePageProjectionScope | None:
+    """Load and validate provider-keyed page blocks for one reverse query."""
+
+    provider_set_key_by_id = await _ptg2_manifest_provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        reverse_query.provider_set_ids,
+    )
+    normalized_provider_ids = set(_ptg2_manifest_ids(tuple(reverse_query.provider_set_ids)))
+    if set(provider_set_key_by_id) != normalized_provider_ids:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 provider-set dictionary is missing a referenced provider set"
+        )
+    provider_set_id_by_key = {
+        provider_set_key: provider_set_id
+        for provider_set_id, provider_set_key in provider_set_key_by_id.items()
+    }
+    provider_pages_by_key = await lookup_provider_pages_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        provider_set_id_by_key,
+    )
+    if provider_pages_by_key is None:
+        return None
+    if set(provider_pages_by_key) != set(provider_set_id_by_key):
+        raise PTG2ManifestArtifactError("PTG2 v3 reverse page is missing a referenced provider set")
+    page_entries = tuple(
+        page_entry
+        for provider_set_key in provider_set_id_by_key
+        for page_entry in provider_pages_by_key[provider_set_key].entries
+    )
+    return _VersionThreePageProjectionScope(
+        provider_set_id_by_key=provider_set_id_by_key,
+        provider_pages_by_key=provider_pages_by_key,
+        page_entries=page_entries,
+    )
+
+
+async def _version_three_page_projection_scope(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> _VersionThreePageProjectionScope | None:
+    """Validate page eligibility and load the requested provider projections."""
+
+    if not _is_version_three_reverse_page_eligible(reverse_query):
+        return None
+    if not serving_tables.serving_binary_table:
+        return None
+    if not await has_provider_pages_in_db(
+        session,
+        serving_tables.serving_binary_table,
+    ):
+        return None
+    try:
+        provider_set_count = len(reverse_query.provider_set_ids)
+    except TypeError:
+        return None
+    if provider_set_count > _PTG2_VERSION_THREE_PAGE_PROVIDER_SET_LIMIT:
+        return None
+    if not await _has_single_plan_page_order(
+        session,
+        serving_tables,
+        reverse_query.requested_plan,
+    ):
+        return None
+    return await _load_version_three_page_projection(
+        session,
+        serving_tables,
+        reverse_query,
+    )
+
+
+def _version_three_ordered_page_entries(
+    code_metadata_rows: Iterable[Mapping[str, Any]],
+    page_entries: Iterable[PTG2V3PageRecord],
+) -> tuple[PTG2V3PageRecord, ...]:
+    """Order dense page entries exactly like the authoritative reverse path."""
+
+    entries_by_code: dict[int, list[PTG2V3PageRecord]] = {}
+    for page_entry in page_entries:
+        entries_by_code.setdefault(page_entry.code_key, []).append(page_entry)
+    ordered_entries = []
+    for code_metadata in code_metadata_rows:
+        code_key = int(code_metadata["code_key"])
+        code_entries = entries_by_code.get(code_key, [])
+        code_entries.sort(
+            key=lambda page_entry: (
+                -page_entry.provider_count,
+                page_entry.provider_set_key,
+                page_entry.price_key,
+            )
+        )
+        ordered_entries.extend(code_entries)
+    return tuple(ordered_entries)
+
+
+def _version_three_reverse_page_candidates(
+    code_metadata_by_key: Mapping[int, Mapping[str, Any]],
+    page_entries: Iterable[PTG2V3PageRecord],
+    provider_set_id_by_key: Mapping[int, str],
+    price_ids_by_key: Mapping[int, str],
+    reverse_query: _VersionThreeReverseQuery,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "serving_content_hash_128": _ptg2_manifest_serving_content_hash(
+                page_entry.code_key,
+                page_entry.provider_set_key,
+                price_ids_by_key[page_entry.price_key],
+            ),
+            "plan_id": code_metadata_by_key[page_entry.code_key].get("plan_id"),
+            "reported_code_system": code_metadata_by_key[page_entry.code_key].get(
+                "reported_code_system"
+            ),
+            "reported_code": code_metadata_by_key[page_entry.code_key].get("reported_code"),
+            "procedure_global_id_128": None,
+            "provider_set_global_id_128": provider_set_id_by_key[page_entry.provider_set_key],
+            "provider_count": page_entry.provider_count,
+            "price_set_global_id_128": price_ids_by_key[page_entry.price_key],
+            "price_key": page_entry.price_key,
+            "source_trace_set_hash": reverse_query.source_trace_set_hash,
+            "network_names": reverse_query.network_names,
+        }
+        for page_entry in page_entries
+    ]
+
+
+async def _version_three_page_window(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+    page_scope: _VersionThreePageProjectionScope,
+) -> tuple[dict[int, Mapping[str, Any]], tuple[PTG2V3PageRecord, ...]] | None:
+    """Validate projected code metadata and select the requested dense window."""
+
+    code_metadata_rows = await _ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        serving_tables,
+        requested_plan=reverse_query.requested_plan,
+        code_value="",
+        code_system=None,
+        q_text="",
+        code_context=None,
+        code_keys=(page_entry.code_key for page_entry in page_scope.page_entries),
+    )
+    if code_metadata_rows is None:
+        return None
+    code_metadata_by_key = {
+        int(code_metadata["code_key"]): code_metadata
+        for code_metadata in code_metadata_rows
+        if code_metadata.get("code_key") is not None
+    }
+    projected_code_keys = {page_entry.code_key for page_entry in page_scope.page_entries}
+    if set(code_metadata_by_key) != projected_code_keys:
+        raise PTG2ManifestArtifactError("PTG2 v3 reverse page references an unknown code")
+    ordered_entries = _version_three_ordered_page_entries(
+        code_metadata_rows,
+        page_scope.page_entries,
+    )
+    requested_end = max(int(reverse_query.offset or 0), 0) + max(int(reverse_query.limit or 0), 0)
+    has_truncated_page = any(
+        provider_page.total_row_count > len(provider_page.entries)
+        for provider_page in page_scope.provider_pages_by_key.values()
+    )
+    if len(ordered_entries) < requested_end and has_truncated_page:
+        return None
+    start = max(int(reverse_query.offset or 0), 0)
+    return code_metadata_by_key, ordered_entries[start:requested_end]
+
+
+async def _version_three_reverse_page_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    reverse_query: _VersionThreeReverseQuery,
+) -> list[dict[str, Any]] | None:
+    """Serve a shallow provider page without probing each full forward code block."""
+
+    page_scope = await _version_three_page_projection_scope(
+        session,
+        serving_tables,
+        reverse_query,
+    )
+    if page_scope is None:
+        return None
+    page_window = await _version_three_page_window(
+        session,
+        serving_tables,
+        reverse_query,
+        page_scope,
+    )
+    if page_window is None:
+        return None
+    code_metadata_by_key, selected_entries = page_window
+    price_ids_by_key = await lookup_price_ids_from_db(
+        session,
+        serving_tables.serving_binary_table,
+        (page_entry.price_key for page_entry in selected_entries),
+        **_version_three_page_price_lookup_hints(serving_tables),
+    )
+    if set(price_ids_by_key) != {page_entry.price_key for page_entry in selected_entries}:
+        raise PTG2ManifestArtifactError("PTG2 v3 reverse page references an unknown price set")
+    return _version_three_reverse_page_candidates(
+        code_metadata_by_key,
+        selected_entries,
+        page_scope.provider_set_id_by_key,
+        price_ids_by_key,
+        reverse_query,
+    )
+
+
 async def _version_three_reverse_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -3196,6 +3687,9 @@ async def _version_three_reverse_rows(
     row_window = _version_three_row_window(reverse_query)
     if row_window.is_full:
         return []
+    page_rows = await _version_three_reverse_page_rows(session, serving_tables, reverse_query)
+    if page_rows is not None:
+        return page_rows
     reverse_scope = await _version_three_reverse_scope(session, serving_tables, reverse_query)
     if reverse_scope is None:
         return []
