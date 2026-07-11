@@ -20750,8 +20750,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
     """,
     "organization_affiliation": """
         INSERT INTO {stage_ref} ({columns})
-        SELECT {columns}
-          FROM (
+        WITH overlay_rows AS MATERIALIZED (
             SELECT
                 ('provider_directory_fhir:organization_affiliation:' || affiliation.source_id || ':' ||
                     affiliation.resource_id || ':' || loc.resource_id)::varchar AS source_record_id,
@@ -20849,7 +20848,9 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
                AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
                {component_scope}
-          ) AS overlay_rows
+        )
+        SELECT {columns}
+          FROM overlay_rows
          WHERE address_key IS NOT NULL;
     """,
 }
@@ -20994,6 +20995,7 @@ async def _populate_address_overlay_stage(
     query_param_dict: dict[str, Any],
     components: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
+    """Build a complete replacement overlay stage and return publication metrics."""
     target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     columns = ", ".join(_provider_directory_address_overlay_columns())
     selected_components = _clean_address_overlay_components(components)
@@ -21009,20 +21011,16 @@ async def _populate_address_overlay_stage(
         source_ids,
         refresh_resource_types=refresh_resource_types,
     )
-    inserted_by_component: dict[str, int] = {}
-    for component in selected_components:
-        inserted_by_component[component] = _coerce_rowcount(
-            await db.status(
-                _address_overlay_component_insert_sql(
-                    schema,
-                    stage_table,
-                    component=component,
-                    run_id=run_id,
-                    source_ids=source_ids,
-                ),
-                **query_param_dict,
-            )
+    inserted_by_component, duration_seconds_by_component = (
+        await _insert_address_overlay_components(
+            schema,
+            stage_table,
+            run_id,
+            source_ids,
+            query_param_dict,
+            selected_components,
         )
+    )
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     archive_coordinate_backfill_rows = await _backfill_address_overlay_stage_coordinates(schema, stage_ref)
@@ -21038,12 +21036,55 @@ async def _populate_address_overlay_stage(
         "copied_existing": copied_existing,
         "inserted": inserted,
         "inserted_by_component": inserted_by_component,
+        "component_seconds": duration_seconds_by_component,
         "components": selected_components,
         "countries_normalized": countries_normalized,
         "archive_coordinate_backfill_rows": archive_coordinate_backfill_rows,
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
+
+
+async def _insert_address_overlay_components(
+    schema: str,
+    stage_table: str,
+    run_id: str | None,
+    source_ids: list[str],
+    query_param_dict: dict[str, Any],
+    selected_components: tuple[str, ...],
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Insert scoped overlay components independently and record their durations."""
+    inserted_rows_by_component: dict[str, int] = {}
+    duration_seconds_by_component: dict[str, float] = {}
+    for component in selected_components:
+        component_started = time.monotonic()
+        LOGGER.info(
+            "Provider Directory address overlay component started: %s",
+            component,
+        )
+        inserted_rows_by_component[component] = _coerce_rowcount(
+            await db.status(
+                _address_overlay_component_insert_sql(
+                    schema,
+                    stage_table,
+                    component=component,
+                    run_id=run_id,
+                    source_ids=source_ids,
+                ),
+                **query_param_dict,
+            )
+        )
+        duration_seconds_by_component[component] = round(
+            time.monotonic() - component_started,
+            3,
+        )
+        LOGGER.info(
+            "Provider Directory address overlay component completed: %s rows=%s seconds=%.3f",
+            component,
+            inserted_rows_by_component[component],
+            duration_seconds_by_component[component],
+        )
+    return inserted_rows_by_component, duration_seconds_by_component
 
 
 async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
@@ -21149,6 +21190,7 @@ def _address_overlay_publish_result(
         "rows": stage_metric_dict["stage_rows"],
         "inserted": stage_metric_dict["inserted"],
         "inserted_by_component": stage_metric_dict["inserted_by_component"],
+        "component_seconds": stage_metric_dict.get("component_seconds", {}),
         "components": list(stage_metric_dict.get("components") or ADDRESS_OVERLAY_COMPONENTS),
         "countries_normalized": stage_metric_dict.get("countries_normalized", 0),
         "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),
