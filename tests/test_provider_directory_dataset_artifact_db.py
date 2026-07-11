@@ -177,7 +177,10 @@ async def _dataset_database(monkeypatch):
     schema = f"provider_directory_dataset_artifact_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     database = Database()
-    await database.connect()
+    try:
+        await database.connect()
+    except Exception as exc:
+        pytest.skip(f"Postgres is not available for artifact DB tests: {exc}")
     is_schema_created = False
     try:
         await _require_disposable_postgres(database)
