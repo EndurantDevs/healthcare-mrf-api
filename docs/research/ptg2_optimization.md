@@ -222,12 +222,10 @@ The current measured estimate is 2.63-2.99 GB decimal, or 2.45-2.78 GiB:
 The v3 reader and Rust streaming writer now implement this shape. Price-set
 keys remain 32-bit, atom widths are selected from complete snapshot
 cardinality, provider/code pairs use bounded spill runs plus a streaming k-way
-merge, and missing referenced blocks fail closed. This remains a real-source
-design budget until a dense production pilot proves its final PostgreSQL footprint;
-synthetic scaling is evidence for the encoding, not proof of the 2-3 GiB
-headline.
+merge, and missing referenced blocks fail closed. The full-scale pilot below
+validated the 2-3 GiB budget on a 513M-row snapshot.
 
-### Current v3 evidence (2026-07-10)
+### Current v3 evidence (2026-07-11)
 
 A cache-disabled local PostgreSQL run with 4,194,304 serving rates, 4,096 code
 keys, and 1,024 provider sets produced a complete 14,742,560-byte snapshot. The
@@ -240,6 +238,48 @@ p95 gate with binary, dictionary, and sidecar caches disabled. The report is:
 ```text
 /tmp/ptg2-v3-final-4m-report/run-20260710T194138Z/report.json
 ```
+
+A full-scale dev pilot published 513,262,462 serving rates as a durable,
+PostgreSQL-only v3 snapshot. Source, plan, and snapshot identifiers are omitted
+from this public report. The snapshot used 2,739,963,383 bytes (2.552 GiB),
+including its estimated share of compressed PostgreSQL artifact chunks. The
+historical v2 snapshot for the same logical source used 7.783 GiB, so v3 was
+3.05 times smaller. Adding bounded first-page projections increased the
+page-less v3 footprint by 30.15 MiB, or 1.17 percent.
+
+| Full-scale metric | Historical v2 | Page-enabled v3 | Result |
+| --- | ---: | ---: | ---: |
+| Total snapshot storage | 7.783 GiB | 2.552 GiB | 3.05x smaller |
+| End-to-end import | 2,404.13 s | 1,436.89 s | 1.67x faster |
+| Scanner/data phase | 931.58 s | 760.43 s | 18.4% faster |
+| Pre-COPY merge | Not isolated | 56.48 s | Measured |
+| Binary build | 1,312.92 s | 502.45 s | 2.61x faster |
+| Publish phase | 1,386.71 s | 560.55 s | 2.47x faster |
+
+The v2 timing came from the earlier unlogged pilot, while the v3 relations are
+logged. Treat the speed comparison as operational evidence, not a controlled
+WAL A/B. The v3 snapshot and shared artifact relation both reported
+`relpersistence='p'`; all five retained lineage snapshots remained present.
+Every API pod served directly from PostgreSQL with no PTG filesystem cache.
+
+The bounded page projections were compared with the immediately preceding
+page-less v3 snapshot using 20 randomized codes, 20 randomized NPIs, and three
+rounds per lookup class. All 180 response pairs matched exactly.
+
+| Warm lookup | Page-less v3 p95 | Page-enabled v3 p95 |
+| --- | ---: | ---: |
+| Code forward | 855.69 ms | 16.07 ms |
+| NPI reverse | 2,120.57 ms | 22.90 ms |
+| NPI plus code | 153.45 ms | 24.09 ms |
+
+Geo lookup now uses a PostGIS GiST nearest-neighbor probe, applies taxonomy
+after the index-bounded location prefix, and restores request-local planner
+settings after the KNN statement. Ten fixed response hashes matched the prior
+deployment exactly. After all six API workers were warmed, identical-query p95
+was 0.837 ms. With the response cache bypassed by 100 unique radius values,
+p50 was 59.43 ms, p95 was 101.11 ms, and the maximum was 118.88 ms. The latter
+is the honest uncached geo contract; do not describe all geo requests as a
+40 ms path.
 
 A separate fresh-process run with zero warmups measured the first code request
 at 59.704 ms and the following NPI reverse request at 86.436 ms. The current
@@ -266,10 +306,9 @@ improvement. Both produced the same 168 unique COPY rows and SHA-256 after
 deduplication. The temporary `gztool` index was 102,915 bytes; the default
 `indexed_gzip` format was about 46x larger on the same input.
 
-Before promotion, deploy readers first, preserve side-by-side immutable
-snapshots, compare logical tuple checksums against v2, verify forward, reverse,
-geo, and price hydration parity, and complete the real-source storage and
-memory pilot.
+Reader-first deployment, side-by-side immutable snapshots, logical parity,
+storage, latency, durability, and no-disk-cache checks are complete for the dev
+pilot. Keep those gates for every wider environment promotion.
 
 After taxonomy filtering was moved ahead of the v2 location candidate limit,
 the warmed PostgreSQL-only API p95 values were 20.48 ms for code-to-provider,

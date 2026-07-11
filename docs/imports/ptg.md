@@ -105,10 +105,12 @@ Supported import modes:
   width is recorded and validated in both block headers and the manifest.
   Provider/code pairs spill to bounded sorted runs before their final streaming
   merge, so dense reverse indexes do not require one import-sized in-memory
-  vector. API readers dispatch from the explicit manifest architecture, read
-  only the required blocks, and raise an artifact-integrity error when a
-  referenced code, provider set, price set, atom, or dictionary value is
-  missing. No request path materializes a filesystem cache.
+  vector. Bounded code and provider-set page projections cover the first 64
+  members of high-frequency lookup paths without duplicating the full graph.
+  API readers dispatch from the explicit manifest architecture, read only the
+  required blocks, and raise an artifact-integrity error when a referenced
+  code, provider set, price set, atom, or dictionary value is missing. No
+  request path materializes a filesystem cache.
 - `HLTHPRT_PTG2_SNAPSHOT_ARCH=postgres_binary_v2` is the normalized membership
   layout for high-fan-out group plans. It retains four compressed graph
   directions in PostgreSQL: provider set to group, group to provider set, group
@@ -172,12 +174,20 @@ When `HLTHPRT_PTG2_SNAPSHOT_ARCH` is unset, new imports default to
 deployed and a real-source correctness, storage, latency, and memory pilot has
 passed.
 
+The 2026-07-11 full-scale dev pilot published 513,262,462 serving rates in
+1,436.89 seconds and used 2.552 GiB of durable PostgreSQL storage. The same
+logical source's historical v2 snapshot used 7.783 GiB. Randomized forward,
+reverse, and NPI-plus-code comparisons matched exactly and measured v3 p95s of
+16.07 ms, 22.90 ms, and 24.09 ms. Fully warmed identical geo requests measured
+0.837 ms p95; 100 uncached unique-radius requests measured 101.11 ms p95. Keep
+the cached and uncached geo contracts separate when reporting latency.
+
 ## Notes
 - Raw artifacts are retained under `HLTHPRT_PTG2_ARTIFACT_DIR` when set, otherwise under the system temp directory. Files are stored by SHA-256 prefix.
 - Before downloading, PTG2 checks server metadata. Strong ETag plus content length allows reuse; length plus last-modified is allowed for metadata reuse; otherwise the local SHA-256 is verified before reuse.
 - Gzip and ZIP inputs are streamed to logical JSON files; decompressed members are not loaded into memory.
 - `HLTHPRT_PTG2_MAX_DECOMPRESSED_BYTES` limits one logical gzip/ZIP member and defaults to 1 TiB. Deflate64 members must reach decoder EOF and match their declared size and CRC-32 before an import can succeed.
-- Full UHC-scale serving imports use the Rust scanner. It writes rotating COPY shard files under the PTG2 temp directory and Python streams those shards into unlogged stage tables.
+- Full payer-scale serving imports use the Rust scanner. It writes rotating COPY shard files under the PTG2 temp directory and Python streams those shards into unlogged stage tables.
 - Serving-rate Rust worker shards are routed to separate PostgreSQL stage tables (`worker0000` -> base stage table, `worker0001+` -> lane stage tables). This allows parallel COPY across tables without multiple COPY sessions extending the same large heap.
 - `HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES` defaults to 128 MiB. Shards are deleted after successful COPY.
 - `HLTHPRT_PTG2_COMPACT_COPY_TASKS` controls global shard COPY concurrency (default `4`).
@@ -192,7 +202,8 @@ passed.
 - `HLTHPRT_PTG2_MANIFEST_MERGE_DIR` and `HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES` control temporary files and chunk size for the Rust pre-COPY merge.
 - `HLTHPRT_PTG2_HOT_ARTIFACT_DIR` should point at node-local scratch for scanner COPY shards, `.ready` files, spill, and pre-COPY merge work. Scratch is deleted after publish. In both PostgreSQL binary architectures, retained serving and relationship artifacts are copied into PostgreSQL and must not be served from node-local files.
 - `HLTHPRT_PTG2_ARTIFACT_DB_STORE=true` stores retained artifact payloads in PostgreSQL. For both PostgreSQL binary architectures, keep `HLTHPRT_PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE=false`, `HLTHPRT_PTG2_ARTIFACT_DB_MATERIALIZE_ON_READ=false`, and leave `HLTHPRT_PTG2_ARTIFACT_DB_CACHE_DIR` unset so API pods do not create hidden per-pod disk caches.
-- `HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE=4` keeps the current source snapshot and its three predecessors during normal publish cleanup. Use the same depth with the source-snapshot GC command so comparison snapshots are not removed by a later maintenance run.
+- `HLTHPRT_PTG2_DB_SIDECAR_CHUNK_CACHE_BYTES` bounds the per-worker in-memory PostgreSQL chunk cache. The dev pilot uses 128 MiB. This is RAM-only and does not authorize a filesystem cache.
+- `HLTHPRT_PTG2_SOURCE_SNAPSHOT_RETAIN_LINEAGE` controls current-source lineage retention. The dev comparison environment uses `5`, preserving the current snapshot and four predecessors. Use the same depth with the source-snapshot GC command so comparison snapshots are not removed by a later maintenance run.
 - Import-control resource lanes route PTG runs to `small`, `normal`, `large`, or `huge` worker classes. The selected lane is recorded under `metrics.ptg_resource`; queue/class guards reject mismatched payloads.
 - `HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK=true` is the publish-time safety guard for manifest imports. Normal PTG runs keep the DB `DISTINCT ON` dedupe backstop even after Rust pre-COPY merge because live payer files can still contain duplicate serving identities. If a direct helper path disables the guard and PostgreSQL reports duplicate keys while creating a manifest unique index, publish runs a one-shot DB dedupe rescue and retries the index instead of leaving a half-published snapshot.
 - `HLTHPRT_PTG2_RUST_EVENT_QUEUE` controls Rust scanner copy-event buffering (default `32`). This bounds `.ready` shard backlog when PostgreSQL COPY is slower than parsing.
@@ -270,7 +281,7 @@ manifest has all four provider graph artifacts in PostgreSQL storage.
 
 ## Cleanup After Stopped Runs
 
-If a PTG2 import is stopped before publish, remove only PTG/PTG2 temp artifacts and tables from that failed run. Do not delete retained raw artifacts under `raw/`; they allow reruns to avoid redownloading large UHC files.
+If a PTG2 import is stopped before publish, remove only PTG/PTG2 temp artifacts and tables from that failed run. Do not delete retained raw artifacts under `raw/`; they allow reruns to avoid redownloading large payer files.
 
 ```bash
 # Remove PTG2 COPY shards from the configured temp directory
