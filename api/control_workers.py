@@ -577,8 +577,14 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     run_id = str(payload.get("run_id") or "").strip()
     if run_id:
         env_list.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
-    if spec.role == "start" and spec.worker_class.startswith("process.PTG") and run_id:
-        env_list.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": f"ptg_start_{run_id}"})
+    target_job_id = _single_job_worker_target(spec, payload)
+    if target_job_id:
+        env_list.append(
+            {
+                "name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID",
+                "value": target_job_id,
+            }
+        )
 
     container_dict: dict[str, Any] = {
         "name": "worker",
@@ -835,8 +841,30 @@ def _worker_python() -> str:
     return os.getenv("HLTHPRT_WORKER_JOB_PYTHON", "/opt/venv/bin/python")
 
 
+def _uses_single_job_worker(spec: WorkerSpec) -> bool:
+    return spec.role == "start" and (
+        spec.worker_class.startswith("process.PTG")
+        or spec.worker_class == "process.ProviderDirectoryFHIR"
+    )
+
+
+def _single_job_worker_target(
+    spec: WorkerSpec,
+    payload: dict[str, Any],
+) -> str | None:
+    if not _uses_single_job_worker(spec):
+        return None
+    queued_job_id = str(payload.get("job_id") or "").strip()
+    if queued_job_id:
+        return queued_job_id
+    run_id = str(payload.get("run_id") or "").strip()
+    if spec.worker_class.startswith("process.PTG") and run_id:
+        return f"ptg_start_{run_id}"
+    return None
+
+
 def _worker_command(python: str, spec: WorkerSpec) -> list[str]:
-    if spec.role == "start" and spec.worker_class.startswith("process.PTG"):
+    if _uses_single_job_worker(spec):
         return [python, str(_main_path()), "worker-once", spec.worker_class]
     return [python, str(_main_path()), "worker", spec.worker_class, "--burst"]
 
