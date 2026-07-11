@@ -16243,6 +16243,22 @@ def _has_fhir_continuation_query(url: str) -> bool:
     return bool(FHIR_CONTINUATION_QUERY_NAMES.intersection(query_names))
 
 
+def _is_humana_continuation_token_url(url: str) -> bool:
+    canonical_url = _canonical_base(url)
+    if not canonical_url or not (
+        canonical_url == HUMANA_PROVIDER_DIRECTORY_BASE
+        or canonical_url.startswith(f"{HUMANA_PROVIDER_DIRECTORY_BASE}/")
+    ):
+        return False
+    return any(
+        name.lower() == "_continuationtoken"
+        for name, _value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    )
+
+
 def _should_restart_expired_pagination_checkpoint(
     *,
     status_code: int | None,
@@ -16251,12 +16267,15 @@ def _should_restart_expired_pagination_checkpoint(
     resume_state: PaginationResumeState | None,
     has_restart_attempted: bool,
 ) -> bool:
+    is_expired_status = status_code in {400, 404, 410} or (
+        status_code == 403 and _is_humana_continuation_token_url(request_url)
+    )
     return bool(
         resume_state
         and resume_state.resumed
         and not has_restart_attempted
         and fetch_error is None
-        and status_code in {400, 404, 410}
+        and is_expired_status
         and _has_fhir_continuation_query(request_url)
     )
 

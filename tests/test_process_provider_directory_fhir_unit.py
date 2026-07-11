@@ -14003,6 +14003,25 @@ def _cigna_checkpoint_context(
     )
 
 
+def _humana_checkpoint_values():
+    source_lookup = {
+        "source_id": "humana_source",
+        "api_base": importer.HUMANA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.HUMANA_PROVIDER_DIRECTORY_BASE,
+    }
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=importer.HUMANA_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="humana_scope",
+        source_ids=("humana_source",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_humana",
+        lineage_verified=True,
+    )
+    return source_lookup, checkpoint_context
+
+
 def _practitioner_search_bundle(resource_id: str, next_url: str | None = None):
     payload = {
         "resourceType": "Bundle",
@@ -14049,6 +14068,30 @@ def _checkpoint_page_callbacks(
         )
 
     return load_checkpoint, fetch_source_json
+
+
+def _expired_resume_callbacks(
+    resume_url: str,
+    request_urls: list[str],
+    saved_next_urls: list[str | None],
+):
+    async def load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=resume_url,
+            pages_processed=5,
+            rows_processed=500,
+            recent_url_hashes=(),
+            resumed=True,
+        )
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        request_urls.append(request_url)
+        return 403, {"resourceType": "OperationOutcome"}, None, 5
+
+    async def save_checkpoint(_context, _resource_type, **checkpoint_values_by_name):
+        saved_next_urls.append(checkpoint_values_by_name["next_url"])
+
+    return load_checkpoint, fetch_source_json, save_checkpoint
 
 
 def _stub_checkpoint_restart_connection(monkeypatch, *status_results):
@@ -14728,6 +14771,157 @@ async def test_fetch_resource_rows_restarts_expired_resume_once(monkeypatch):
     assert fetch_result.complete is True
     assert calls == [resume_url, start_url]
     assert saved_next_urls == [start_url, None]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "request_url"),
+    (
+        (400, f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_getpages=expired"),
+        (404, f"{importer.WASHINGTON_PROVIDER_DIRECTORY_BASE}/Practitioner?_getpages=expired"),
+        (410, f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_page_token=expired"),
+    ),
+)
+def test_expired_pagination_statuses_restart_resumed_checkpoint(
+    status_code,
+    request_url,
+):
+    resume_state = importer.PaginationResumeState(
+        next_url=request_url,
+        pages_processed=1,
+        rows_processed=100,
+        recent_url_hashes=(),
+        resumed=True,
+    )
+
+    assert importer._should_restart_expired_pagination_checkpoint(
+        status_code=status_code,
+        fetch_error=None,
+        request_url=request_url,
+        resume_state=resume_state,
+        has_restart_attempted=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "request_url",
+    (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_continuationToken=expired",
+        f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/Practitioner?_getpages=expired",
+    ),
+)
+def test_http_403_restart_requires_humana_continuation_token(request_url):
+    resume_state = importer.PaginationResumeState(
+        next_url=request_url,
+        pages_processed=1,
+        rows_processed=100,
+        recent_url_hashes=(),
+        resumed=True,
+    )
+
+    assert not importer._should_restart_expired_pagination_checkpoint(
+        status_code=403,
+        fetch_error=None,
+        request_url=request_url,
+        resume_state=resume_state,
+        has_restart_attempted=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_humana_403_continuation_restart_stops_after_one_reset(monkeypatch):
+    start_url = f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    resume_url = f"{start_url}&_continuationToken=expired"
+    source_record, checkpoint_context = _humana_checkpoint_values()
+    request_urls: list[str] = []
+    saved_next_urls: list[str | None] = []
+    load_checkpoint, fetch_source_json, save_checkpoint = _expired_resume_callbacks(
+        resume_url,
+        request_urls,
+        saved_next_urls,
+    )
+    clear_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_clear_checkpoint_dataset_resource_type",
+        clear_checkpoint,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_record,
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=checkpoint_context,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "http_403"
+    assert request_urls == [resume_url, start_url]
+    assert saved_next_urls == [start_url]
+    clear_checkpoint.assert_awaited_once_with(checkpoint_context, "Practitioner")
+
+
+@pytest.mark.asyncio
+async def test_generic_403_continuation_remains_fetch_error(monkeypatch):
+    start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+    resume_url = f"{start_url}&_continuationToken=blocked"
+    request_urls: list[str] = []
+    saved_next_urls: list[str | None] = []
+    load_checkpoint, fetch_source_json, save_checkpoint = _expired_resume_callbacks(
+        resume_url,
+        request_urls,
+        saved_next_urls,
+    )
+    clear_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(
+        importer,
+        "_clear_checkpoint_dataset_resource_type",
+        clear_checkpoint,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        _cigna_checkpoint_source(),
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=_cigna_checkpoint_context(
+            "run_retry",
+            "run_original",
+        ),
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.error == "http_403"
+    assert request_urls == [resume_url]
+    assert saved_next_urls == []
+    clear_checkpoint.assert_not_awaited()
 
 
 @pytest.mark.asyncio
