@@ -37,6 +37,10 @@ from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
                                          _table_exists, _table_has_rows)
 from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2ManifestArtifactError,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES,
+    PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION,
     PTG2_SERVING_BY_CODE_ARTIFACT_KIND,
     PTG2_SERVING_BY_CODE_FORMAT,
     PTG2_SERVING_BY_CODE_MAGIC,
@@ -44,7 +48,9 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_SERVING_BY_PROVIDER_SET_FORMAT,
     PTG2_SERVING_BY_PROVIDER_SET_MAGIC,
     _existing_serving_sidecar_path_entry,
+    membership_index_fence_metadata,
     read_global_sidecar_entries,
+    validate_v3_graph_db_entry,
     write_serving_by_code_sidecar_async,
     write_serving_by_provider_set_sidecar_async,
 )
@@ -83,14 +89,8 @@ _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_FULL = "full"
 _PROVIDER_GROUP_LOCATION_INDEX_PROFILE_LEAN = "lean"
 _MANIFEST_PUBLISH_DETAIL_START_PCT = 96.38
 _MANIFEST_PUBLISH_DETAIL_END_PCT = 97.24
-_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES = frozenset(
-    {
-        "provider_forward",
-        "provider_inverted",
-        "provider_group_npi",
-        "provider_npi_group",
-    }
-)
+_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES = PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
+_PROVIDER_MEMBERSHIP_GRAPH_V2_VERSION = "provider_membership_graph_v2"
 
 
 def _row_value(row: Any, key: str, position: int = 0) -> Any:
@@ -1163,6 +1163,13 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
             return entry
         path = Path(raw_path)
         artifact_name = str(entry.get("name") or default_name).strip() or default_name
+        if (
+            require_db_storage
+            and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
+        ):
+            entry.update(membership_index_fence_metadata(path))
+        if require_db_storage and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES:
+            entry["chunk_bytes"] = PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES
         if upload_total:
             _emit_ptg2_manifest_publish_progress(
                 "artifact upload",
@@ -1178,6 +1185,8 @@ async def _store_ptg2_manifest_sidecar_artifacts_in_db(
         if cached is not None:
             merged = dict(cached)
             merged["name"] = artifact_name
+            if "source_shard_id" in entry:
+                merged["source_shard_id"] = entry["source_shard_id"]
             if upload_total:
                 upload_progress_by_name["done"] += 1
                 _emit_ptg2_manifest_publish_progress(
@@ -1268,13 +1277,61 @@ def _ptg2_sidecar_entry_name(name: str, value: Any) -> str:
     return str(name or "").strip()
 
 
+def _provider_membership_graph_version(arch_version: str) -> str:
+    """Return the graph contract actually emitted by one snapshot architecture."""
+
+    if _is_postgres_binary_v3_arch(arch_version):
+        return PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION
+    return _PROVIDER_MEMBERSHIP_GRAPH_V2_VERSION
+
+
+def _record_v3_graph_shard(
+    observed_names_by_shard: dict[str, set[str]],
+    metadata: Mapping[str, Any],
+    artifact_name: str,
+) -> None:
+    """Track one graph direction without allowing shard identity loss."""
+
+    source_shard_id = str(metadata.get("source_shard_id") or "").strip()
+    if not source_shard_id:
+        raise RuntimeError(
+            f"PTG2 postgres_binary_v3 provider graph artifact {artifact_name!r} lacks source shard identity"
+        )
+    observed_names = observed_names_by_shard.setdefault(source_shard_id, set())
+    if artifact_name in observed_names:
+        raise RuntimeError(
+            f"PTG2 postgres_binary_v3 provider graph source shard {source_shard_id!r} "
+            f"has duplicate {artifact_name!r} artifacts"
+        )
+    observed_names.add(artifact_name)
+
+
+def _require_complete_v3_graph_shards(
+    observed_names_by_shard: Mapping[str, set[str]],
+) -> None:
+    """Require all graph directions independently for every source shard."""
+
+    if not observed_names_by_shard:
+        raise RuntimeError(
+            "PTG2 postgres_binary_v3 provider graph is incomplete; no source shards"
+        )
+    for source_shard_id, observed_names in observed_names_by_shard.items():
+        missing_names = _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES - observed_names
+        if missing_names:
+            raise RuntimeError(
+                f"PTG2 postgres_binary_v3 provider graph source shard {source_shard_id!r} "
+                "is incomplete; missing "
+                + ", ".join(sorted(missing_names))
+            )
+
+
 def _retain_v3_provider_graph_artifacts(
     sidecar_artifacts: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Keep every v2 provider-graph shard and omit v3-obsolete sidecars."""
+    """Keep every provider-graph shard and omit v3-obsolete sidecars."""
 
     artifact_by_name: dict[str, Any] = {}
-    observed_names: set[str] = set()
+    observed_names_by_shard: dict[str, set[str]] = {}
     for name, artifact_metadata in dict(sidecar_artifacts or {}).items():
         if name == "sidecars" and isinstance(artifact_metadata, list):
             retained_sidecars = []
@@ -1284,8 +1341,13 @@ def _retain_v3_provider_graph_artifacts(
                     isinstance(sidecar_metadata, Mapping)
                     and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
                 ):
-                    retained_sidecars.append(dict(sidecar_metadata))
-                    observed_names.add(artifact_name)
+                    retained_sidecar_map = dict(sidecar_metadata)
+                    retained_sidecars.append(retained_sidecar_map)
+                    _record_v3_graph_shard(
+                        observed_names_by_shard,
+                        retained_sidecar_map,
+                        artifact_name,
+                    )
             if retained_sidecars:
                 artifact_by_name[name] = retained_sidecars
             continue
@@ -1294,35 +1356,30 @@ def _retain_v3_provider_graph_artifacts(
             isinstance(artifact_metadata, Mapping)
             and artifact_name in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
         ):
-            artifact_by_name[str(name)] = dict(artifact_metadata)
-            observed_names.add(artifact_name)
-    missing_names = _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES - observed_names
-    if missing_names:
-        raise RuntimeError(
-            "PTG2 postgres_binary_v3 provider graph is incomplete; missing "
-            + ", ".join(sorted(missing_names))
-        )
+            retained_artifact_map = dict(artifact_metadata)
+            artifact_by_name[str(name)] = retained_artifact_map
+            _record_v3_graph_shard(
+                observed_names_by_shard,
+                retained_artifact_map,
+                artifact_name,
+            )
+    _require_complete_v3_graph_shards(observed_names_by_shard)
     return artifact_by_name
 
 
 def _v3_graph_db_entry(
     default_name: str,
     artifact_metadata: Any,
-    observed_names: set[str],
+    observed_names_by_shard: dict[str, set[str]],
 ) -> dict[str, Any]:
     if not isinstance(artifact_metadata, Mapping):
         raise RuntimeError("PTG2 postgres_binary_v3 provider graph entry is not metadata")
     metadata = dict(artifact_metadata)
-    artifact_name = _ptg2_sidecar_entry_name(default_name, metadata)
-    if artifact_name not in _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES:
-        raise RuntimeError(f"unexpected PTG2 v3 provider graph artifact: {artifact_name!r}")
-    storage_uri = str(metadata.get("storage_uri") or "").strip()
-    if not storage_uri.startswith("db://ptg2_artifact/"):
-        raise RuntimeError(
-            f"PTG2 postgres_binary_v3 provider graph artifact {artifact_name!r} "
-            "was not persisted to PostgreSQL"
-        )
-    observed_names.add(artifact_name)
+    try:
+        artifact_name = validate_v3_graph_db_entry(metadata, default_name)
+    except PTG2ManifestArtifactError as exc:
+        raise RuntimeError(str(exc)) from exc
+    _record_v3_graph_shard(observed_names_by_shard, metadata, artifact_name)
     metadata.pop("path", None)
     metadata.pop("cache_path", None)
     metadata.pop("local_path", None)
@@ -1335,24 +1392,23 @@ def _require_v3_graph_db_artifacts(
     """Validate DB ownership and remove runtime filesystem references."""
 
     stored_artifact_by_name: dict[str, Any] = {}
-    observed_names: set[str] = set()
+    observed_names_by_shard: dict[str, set[str]] = {}
 
     for name, value in dict(sidecar_artifacts or {}).items():
         if name == "sidecars" and isinstance(value, list):
             stored_artifact_by_name[name] = [
-                _v3_graph_db_entry(f"sidecar_{index}", sidecar, observed_names)
+                _v3_graph_db_entry(
+                    f"sidecar_{index}",
+                    sidecar,
+                    observed_names_by_shard,
+                )
                 for index, sidecar in enumerate(value)
             ]
             continue
         stored_artifact_by_name[name] = _v3_graph_db_entry(
-            str(name), value, observed_names
+            str(name), value, observed_names_by_shard
         )
-    missing_names = _PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES - observed_names
-    if missing_names:
-        raise RuntimeError(
-            "PTG2 postgres_binary_v3 persisted provider graph is incomplete; missing "
-            + ", ".join(sorted(missing_names))
-        )
+    _require_complete_v3_graph_shards(observed_names_by_shard)
     return stored_artifact_by_name
 
 
@@ -3380,7 +3436,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         "arch_version": arch_version,
         "provider_membership_graph": (
             {
-                "artifact_version": "provider_membership_graph_v2",
+                "artifact_version": _provider_membership_graph_version(arch_version),
                 "artifact_names": sorted(_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES),
                 "storage": (
                     "postgresql_chunks_v1"

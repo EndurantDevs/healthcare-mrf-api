@@ -218,7 +218,12 @@ async def store_ptg2_artifact_file_in_db(
         sha256=artifact_sha,
         byte_count=byte_count,
     )
-    chunk_size = _artifact_db_chunk_bytes()
+    requested_chunk_bytes = entry.get("chunk_bytes")
+    chunk_size = (
+        _artifact_db_chunk_bytes()
+        if requested_chunk_bytes is None
+        else max(int(requested_chunk_bytes), 1024 * 1024)
+    )
     compression_level = _artifact_db_compression_level()
     compression = "zlib" if compression_level > 0 else "none"
     storage_uri = ptg2_db_artifact_uri(artifact_id)

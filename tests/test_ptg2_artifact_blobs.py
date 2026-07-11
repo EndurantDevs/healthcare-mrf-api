@@ -58,3 +58,32 @@ async def test_store_ptg2_artifact_in_db_removes_transient_local_path(monkeypatc
     assert "path" not in stored
     assert "path" not in manifest_payload
     assert stored["storage_uri"].startswith("db://ptg2_artifact/")
+
+
+@pytest.mark.asyncio
+async def test_store_ptg2_artifact_honors_per_artifact_chunk_size(monkeypatch, tmp_path):
+    artifact_path = tmp_path / "provider-graph.ptg2sc"
+    artifact_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+    fake_db = FakeDB()
+
+    async def fake_ensure(_schema):
+        return None
+
+    monkeypatch.setattr(artifact_blobs, "db", fake_db)
+    monkeypatch.setattr(artifact_blobs, "ensure_ptg2_artifact_blob_table", fake_ensure)
+
+    stored = await artifact_blobs.store_ptg2_artifact_file_in_db(
+        artifact_path,
+        snapshot_id="ptg2:test",
+        artifact_kind="provider_npi_group",
+        retain_local_cache=True,
+        metadata={"chunk_bytes": 1024 * 1024},
+    )
+
+    chunk_inserts = [
+        params
+        for sql, params in fake_db.session.calls
+        if "INSERT INTO" in sql and "ptg2_artifact_blob_chunk" in sql
+    ]
+    assert len(chunk_inserts) == 3
+    assert stored["chunk_bytes"] == 1024 * 1024

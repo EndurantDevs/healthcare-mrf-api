@@ -22,7 +22,7 @@ import struct
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterable, Iterable, Mapping
+from typing import Any, AsyncIterable, BinaryIO, Iterable, Mapping
 
 
 PTG2_MANIFEST_VERSION = 1
@@ -1623,3 +1623,274 @@ def _validate_sidecar_metadata(sidecar_path: Path, sidecar: Mapping[str, Any]) -
         )
     if actual_sha != expected_sha:
         raise PTG2ManifestArtifactError(f"PTG2 sidecar checksum mismatch for {sidecar_path.name}")
+
+
+PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION = "provider_membership_graph_v3"
+PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES = 1024 * 1024
+PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES = frozenset(
+    {
+        "provider_forward",
+        "provider_inverted",
+        "provider_group_npi",
+        "provider_npi_group",
+    }
+)
+PTG2_V3_OBSOLETE_PROVIDER_ARTIFACT_NAMES = frozenset({"provider_npi"})
+PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT = "owner_hex_stride_v1"
+PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE = 32_768
+
+
+def membership_index_fence_metadata(path: str | Path) -> dict[str, Any]:
+    """Build sparse owner fences for bounded PostgreSQL index reads."""
+    sidecar_path = Path(path)
+    sidecar_byte_count = sidecar_path.stat().st_size
+    member_global_count: int | None = None
+    with sidecar_path.open("rb") as sidecar_file:
+        header = sidecar_file.read(PTG2_MANIFEST_DENSE_MEMBERSHIP_HEADER_SIZE)
+        magic = header[:8]
+        if magic == PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC:
+            if len(header) < PTG2_MANIFEST_DENSE_MEMBERSHIP_HEADER_SIZE:
+                raise PTG2ManifestArtifactError("dense global membership sidecar is missing its header")
+            _magic, version, owner_count, member_global_count = _DENSE_MEMBERSHIP_HEADER.unpack(header)
+            header_size = PTG2_MANIFEST_DENSE_MEMBERSHIP_HEADER_SIZE
+            record_format = PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
+        elif magic == PTG2_MANIFEST_MEMBERSHIP_MAGIC:
+            if len(header) < PTG2_MANIFEST_MEMBERSHIP_HEADER_SIZE:
+                raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
+            _magic, version, owner_count = _MEMBERSHIP_HEADER.unpack(
+                header[:PTG2_MANIFEST_MEMBERSHIP_HEADER_SIZE]
+            )
+            header_size = PTG2_MANIFEST_MEMBERSHIP_HEADER_SIZE
+            record_format = PTG2_MANIFEST_MEMBERSHIP_FORMAT
+        else:
+            raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
+        if version != PTG2_MANIFEST_VERSION:
+            raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
+        index_end = header_size + owner_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
+        if sidecar_byte_count < index_end:
+            raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
+        if member_global_count is None:
+            member_bytes = sidecar_byte_count - index_end
+            if member_bytes % 16:
+                raise PTG2ManifestArtifactError("global membership sidecar member block is misaligned")
+            member_count = member_bytes // 16
+        else:
+            member_bytes = sidecar_byte_count - index_end - member_global_count * 16
+            if member_bytes < 0 or member_bytes % _DENSE_MEMBER_RECORD.size:
+                raise PTG2ManifestArtifactError("dense global membership sidecar member block is misaligned")
+            member_count = member_bytes // _DENSE_MEMBER_RECORD.size
+        fence_owners = _membership_index_fence_owners(
+            sidecar_file,
+            header_size=header_size,
+            owner_count=owner_count,
+            member_count=member_count,
+        )
+    metadata = {
+        "membership_version": version,
+        "membership_header_hex": header[:header_size].hex(),
+        "record_format": record_format,
+        "entry_count": owner_count,
+        "owner_count": owner_count,
+        "member_count": member_count,
+        "index_record_size": PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE,
+        "owner_index_fence_format": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+        "owner_index_fence_stride": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE,
+        "owner_index_fence_owners": fence_owners,
+    }
+    if member_global_count is not None:
+        metadata["member_global_count"] = member_global_count
+    return metadata
+
+
+def _membership_index_fence_owners(
+    sidecar_file: BinaryIO,
+    *,
+    header_size: int,
+    owner_count: int,
+    member_count: int,
+) -> list[str]:
+    """Read and validate sparse fence owners from one membership index."""
+
+    fence_owners: list[str] = []
+    previous_owner_id: bytes | None = None
+    expected_member_offset = 0
+    with mmap.mmap(sidecar_file.fileno(), 0, access=mmap.ACCESS_READ) as mapped_sidecar:
+        for owner_ordinal in range(owner_count):
+            owner_id, member_offset, owner_member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
+                mapped_sidecar,
+                header_size + owner_ordinal * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE,
+            )
+            if previous_owner_id is not None and owner_id <= previous_owner_id:
+                raise PTG2ManifestArtifactError("global membership sidecar owner index is not ordered")
+            if member_offset != expected_member_offset or member_offset + owner_member_count > member_count:
+                raise PTG2ManifestArtifactError("global membership sidecar owner member range is invalid")
+            if owner_ordinal % PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE == 0:
+                fence_owners.append(owner_id.hex())
+            previous_owner_id = owner_id
+            expected_member_offset += owner_member_count
+    if expected_member_offset != member_count:
+        raise PTG2ManifestArtifactError("global membership sidecar has unowned member records")
+    return fence_owners
+
+
+def _required_provider_graph_metadata_integer(metadata: Mapping[str, Any], field_name: str) -> int:
+    try:
+        parsed_value = int(metadata.get(field_name))
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(f"provider graph {field_name} is missing or invalid") from exc
+    if parsed_value < 0:
+        raise PTG2ManifestArtifactError(f"provider graph {field_name} is invalid")
+    return parsed_value
+
+
+def _v3_graph_geometry(
+    metadata: Mapping[str, Any],
+    *,
+    version: int,
+    owner_count: int,
+    member_count: int,
+) -> tuple[bytes, int]:
+    """Return the exact current-v3 header and uncompressed byte count."""
+
+    record_format = metadata.get("record_format")
+    if record_format == PTG2_MANIFEST_MEMBERSHIP_FORMAT:
+        expected_header = _MEMBERSHIP_HEADER.pack(
+            PTG2_MANIFEST_MEMBERSHIP_MAGIC,
+            version,
+            owner_count,
+        )
+        expected_byte_count = (
+            PTG2_MANIFEST_MEMBERSHIP_HEADER_SIZE
+            + owner_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
+            + member_count * 16
+        )
+        return expected_header, expected_byte_count
+    if record_format != PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT:
+        raise PTG2ManifestArtifactError("v3 provider graph artifact has invalid format")
+    member_global_count = _required_provider_graph_metadata_integer(metadata, "member_global_count")
+    expected_header = _DENSE_MEMBERSHIP_HEADER.pack(
+        PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
+        version,
+        owner_count,
+        member_global_count,
+    )
+    expected_byte_count = (
+        PTG2_MANIFEST_DENSE_MEMBERSHIP_HEADER_SIZE
+        + owner_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
+        + member_global_count * 16
+        + member_count * _DENSE_MEMBER_RECORD.size
+    )
+    return expected_header, expected_byte_count
+
+
+def validate_v3_graph_db_entry(metadata: Mapping[str, Any], default_name: str) -> str:
+    """Validate one current-generation PostgreSQL provider-graph entry."""
+
+    artifact_name = str(metadata.get("name") or metadata.get("kind") or default_name).strip()
+    if not str(metadata.get("source_shard_id") or "").strip():
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} lacks source shard identity")
+    if artifact_name not in PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES:
+        raise PTG2ManifestArtifactError(f"unexpected v3 provider graph artifact: {artifact_name!r}")
+    if not str(metadata.get("storage_uri") or "").startswith("db://ptg2_artifact/"):
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} is not in PostgreSQL")
+    if _required_provider_graph_metadata_integer(metadata, "chunk_bytes") != PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES:
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has obsolete chunks")
+
+    version = _required_provider_graph_metadata_integer(metadata, "membership_version")
+    owner_count = _required_provider_graph_metadata_integer(metadata, "owner_count")
+    entry_count = _required_provider_graph_metadata_integer(metadata, "entry_count")
+    member_count = _required_provider_graph_metadata_integer(metadata, "member_count")
+    byte_count = _required_provider_graph_metadata_integer(metadata, "byte_count")
+    if version != PTG2_MANIFEST_VERSION or entry_count != owner_count:
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has invalid counts")
+
+    expected_header, expected_byte_count = _v3_graph_geometry(
+        metadata,
+        version=version,
+        owner_count=owner_count,
+        member_count=member_count,
+    )
+    if metadata.get("membership_header_hex") != expected_header.hex() or byte_count != expected_byte_count:
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has invalid geometry")
+
+    if metadata.get("owner_index_fence_format") != PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT:
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} lacks owner fences")
+    fence_stride = _required_provider_graph_metadata_integer(metadata, "owner_index_fence_stride")
+    raw_fence_owners = metadata.get("owner_index_fence_owners")
+    if fence_stride != PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE or not isinstance(raw_fence_owners, list):
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has invalid owner fences")
+    try:
+        fence_owners = tuple(_normalize_global_id(owner) for owner in raw_fence_owners)
+    except (TypeError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has invalid owner fences") from exc
+    expected_fence_count = (owner_count + fence_stride - 1) // fence_stride
+    if len(fence_owners) != expected_fence_count or fence_owners != tuple(sorted(set(fence_owners))):
+        raise PTG2ManifestArtifactError(f"v3 provider graph artifact {artifact_name!r} has invalid owner fences")
+    return artifact_name
+
+
+def _named_graph_entries(
+    serving_index: Mapping[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return named artifact mappings from one serving manifest."""
+
+    artifacts = serving_index.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return []
+    named_entries: list[tuple[str, dict[str, Any]]] = []
+    for artifact_name, artifact_value in artifacts.items():
+        if artifact_name == "sidecars" and isinstance(artifact_value, list):
+            named_entries.extend(
+                (f"sidecar_{index}", entry)
+                for index, entry in enumerate(artifact_value)
+                if isinstance(entry, dict)
+            )
+        elif isinstance(artifact_value, dict):
+            named_entries.append((str(artifact_name), artifact_value))
+    return named_entries
+
+
+def v3_graph_contract_errors(serving_index: Mapping[str, Any]) -> list[str]:
+    """Return promotion-blocking errors for the current v3 graph contract."""
+
+    if str(serving_index.get("arch_version") or "").strip().lower() != "postgres_binary_v3":
+        return []
+    graph_metadata = serving_index.get("provider_membership_graph")
+    expected_names = PTG2_PROVIDER_MEMBERSHIP_GRAPH_ARTIFACT_NAMES
+    if not isinstance(graph_metadata, dict):
+        return [PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION]
+    artifact_names = graph_metadata.get("artifact_names")
+    has_expected_names = isinstance(artifact_names, list) and artifact_names == sorted(expected_names)
+    if (
+        graph_metadata.get("artifact_version") != PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION
+        or not has_expected_names
+        or graph_metadata.get("storage") != "postgresql_chunks_v1"
+    ):
+        return [PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION]
+    contract_errors: list[str] = []
+    observed_names_by_shard: dict[str, set[str]] = {}
+    for default_name, artifact_entry in _named_graph_entries(serving_index):
+        candidate_name = str(
+            artifact_entry.get("name") or artifact_entry.get("kind") or default_name
+        ).strip()
+        if candidate_name in PTG2_V3_OBSOLETE_PROVIDER_ARTIFACT_NAMES:
+            contract_errors.append(f"obsolete:{candidate_name}")
+            continue
+        if candidate_name not in expected_names:
+            continue
+        source_shard_id = str(artifact_entry.get("source_shard_id") or "missing")
+        observed_names = observed_names_by_shard.setdefault(source_shard_id, set())
+        if candidate_name in observed_names:
+            contract_errors.append(f"{source_shard_id}:{candidate_name}:duplicate")
+            continue
+        observed_names.add(candidate_name)
+        try:
+            validate_v3_graph_db_entry(artifact_entry, default_name)
+        except PTG2ManifestArtifactError as exc:
+            contract_errors.append(f"{source_shard_id}:{candidate_name}:{exc}")
+    if not observed_names_by_shard:
+        return [PTG2_PROVIDER_MEMBERSHIP_GRAPH_VERSION]
+    for source_shard_id, observed_names in observed_names_by_shard.items():
+        for missing_name in sorted(expected_names - observed_names):
+            contract_errors.append(f"{source_shard_id}:{missing_name}:missing")
+    return contract_errors

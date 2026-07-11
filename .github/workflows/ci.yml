@@ -103,8 +103,11 @@ jobs:
           tests/test_pharmacy_license_run_failure_unit.py
           tests/test_process_ptg_unit.py
           tests/test_ptg_publish_state_races.py
+          tests/test_ptg2_artifact_blobs.py
+          tests/test_ptg2_db_sidecars.py
           tests/test_ptg2_db_serving_binary.py
           tests/test_ptg2_db_serving_v3.py
+          tests/test_ptg2_manifest_artifacts.py
           tests/test_ptg2_manifest_cleanup.py
           tests/test_ptg2_postgres_binary_v3_api.py
           tests/test_ptg2_scanner_indexed_rapidgzip.py

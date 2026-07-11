@@ -17,6 +17,7 @@ from process.ptg_parts.ptg2_artifact_blobs import ptg2_db_artifact_uri
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
     PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
     write_global_membership_sidecar,
     write_serving_by_code_sidecar,
     write_serving_by_provider_set_sidecar,
@@ -263,6 +264,137 @@ async def test_db_membership_sidecar_batches_sparse_index_lookup_for_many_owners
     assert members[owner_c] == (member_c,)
     assert members[missing_owner] == ()
     assert any(call.get("chunk_nos") for call in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_db_membership_fences_limit_cold_index_chunk_reads(tmp_path, monkeypatch):
+    owners = tuple(owner_ordinal.to_bytes(16, "big") for owner_ordinal in range(12))
+    members = tuple((100 + owner_ordinal).to_bytes(16, "big") for owner_ordinal in range(12))
+    manifest = write_global_membership_sidecar(
+        tmp_path,
+        "provider_npi_group",
+        {owner: [member] for owner, member in zip(owners, members)},
+    )
+    sidecar = manifest["sidecars"][0]
+    raw_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, raw_payload, artifact_id="membership-fence-artifact", chunk_bytes=64)
+    entry.update(
+        {
+            "membership_version": 1,
+            "membership_header_hex": raw_payload[:20].hex(),
+            "entry_count": len(owners),
+            "owner_index_fence_format": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+            "owner_index_fence_stride": 4,
+            "owner_index_fence_owners": [owner.hex() for owner in owners[::4]],
+        }
+    )
+    session = FakeChunkSession(raw_payload, chunk_bytes=64, compression="zlib")
+    monkeypatch.setattr(db_sidecars, "_INDEX_READ_MAX_BYTES", 1024 * 1024)
+    monkeypatch.setattr(db_sidecars, "PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE", 4)
+    monkeypatch.setattr(db_sidecars, "PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES", 64)
+    members_by_owner = await lookup_global_sidecar_members_many_from_db(
+        session,
+        entry,
+        [owners[10]],
+        schema_name="mrf",
+        require_index_fences=True,
+    )
+
+    fetched_chunks = {
+        int(chunk_no)
+        for call in session.calls
+        for chunk_no in (
+            call.get("chunk_nos")
+            or ([call["chunk_no"]] if call.get("chunk_no") is not None else [])
+        )
+    }
+    assert members_by_owner[owners[10]] == (members[10],)
+    assert fetched_chunks.isdisjoint({0, 1, 2})
+
+
+@pytest.mark.asyncio
+async def test_db_membership_required_fences_reject_old_v3_artifact(tmp_path):
+    owner = (1).to_bytes(16, "big")
+    member = (2).to_bytes(16, "big")
+    manifest = write_global_membership_sidecar(tmp_path, "provider_npi_group", {owner: [member]})
+    sidecar = manifest["sidecars"][0]
+    raw_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, raw_payload, artifact_id="membership-old-v3-artifact", chunk_bytes=64)
+    session = FakeChunkSession(raw_payload, chunk_bytes=64, compression="zlib")
+    with pytest.raises(db_sidecars.PTG2ManifestArtifactError, match="reimport the snapshot"):
+        await lookup_global_sidecar_members_many_from_db(
+            session,
+            entry,
+            [owner],
+            schema_name="mrf",
+            require_index_fences=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_db_membership_fences_validate_against_artifact_index(tmp_path, monkeypatch):
+    owners = tuple(owner_ordinal.to_bytes(16, "big") for owner_ordinal in range(8))
+    member = (100).to_bytes(16, "big")
+    manifest = write_global_membership_sidecar(
+        tmp_path,
+        "provider_npi_group",
+        {owner: [member] for owner in owners},
+    )
+    sidecar = manifest["sidecars"][0]
+    raw_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, raw_payload, artifact_id="membership-bad-fence-artifact", chunk_bytes=64)
+    entry.update(
+        {
+            "membership_version": 1,
+            "membership_header_hex": raw_payload[:20].hex(),
+            "entry_count": len(owners),
+            "owner_index_fence_format": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+            "owner_index_fence_stride": 4,
+            "owner_index_fence_owners": [owners[1].hex(), owners[4].hex()],
+        }
+    )
+    session = FakeChunkSession(raw_payload, chunk_bytes=64, compression="zlib")
+    monkeypatch.setattr(db_sidecars, "PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE", 4)
+    monkeypatch.setattr(db_sidecars, "PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES", 64)
+    with pytest.raises(db_sidecars.PTG2ManifestArtifactError, match="does not match"):
+        await lookup_global_sidecar_members_many_from_db(
+            session,
+            entry,
+            [owners[2]],
+            schema_name="mrf",
+            require_index_fences=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_db_membership_required_fences_validate_header_metadata(tmp_path, monkeypatch):
+    owner = (1).to_bytes(16, "big")
+    member = (2).to_bytes(16, "big")
+    manifest = write_global_membership_sidecar(tmp_path, "provider_npi_group", {owner: [member]})
+    sidecar = manifest["sidecars"][0]
+    valid_payload = (tmp_path / sidecar["path"]).read_bytes()
+    entry = _db_entry(sidecar, valid_payload, artifact_id="membership-bad-header", chunk_bytes=64)
+    entry.update(
+        {
+            "membership_version": 1,
+            "membership_header_hex": (b"BROKEN!!" + valid_payload[8:20]).hex(),
+            "entry_count": 1,
+            "owner_index_fence_format": PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_FORMAT,
+            "owner_index_fence_stride": 4,
+            "owner_index_fence_owners": [owner.hex()],
+        }
+    )
+    session = FakeChunkSession(valid_payload, chunk_bytes=64, compression="zlib")
+    monkeypatch.setattr(db_sidecars, "PTG2_MANIFEST_MEMBERSHIP_INDEX_FENCE_STRIDE", 4)
+    monkeypatch.setattr(db_sidecars, "PTG2_PROVIDER_MEMBERSHIP_GRAPH_CHUNK_BYTES", 64)
+    with pytest.raises(db_sidecars.PTG2ManifestArtifactError, match="header metadata"):
+        await lookup_global_sidecar_members_many_from_db(
+            session,
+            entry,
+            [owner],
+            schema_name="mrf",
+            require_index_fences=True,
+        )
 
 
 @pytest.mark.asyncio

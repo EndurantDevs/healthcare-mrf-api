@@ -181,6 +181,17 @@ def _snapshot_identity_test_options() -> dict[str, object]:
     }
 
 
+def test_v3_snapshot_identity_variant_requires_fenced_reimport():
+    assert process_ptg._ptg2_snapshot_arch_identity_variant(
+        "postgres_binary_v3",
+        "postgres_binary_v3",
+    ) == "postgres_binary_v3:membership_fences_v1"
+    assert process_ptg._ptg2_snapshot_arch_identity_variant(
+        "postgres_binary_v2",
+        "postgres_binary_v2",
+    ) == "postgres_binary_v2"
+
+
 @pytest.mark.parametrize(
     ("option_name", "changed_value"),
     [
@@ -6018,7 +6029,7 @@ def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
 
 def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     provider_forward = tmp_path / "provider_forward.ptg2sc"
-    provider_forward.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+    provider_forward.write_bytes(struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0))
     empty_price_forward = tmp_path / "price_forward.ptg2sc"
     empty_price_forward.touch()
 
@@ -6034,18 +6045,20 @@ def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
     assert artifacts["provider_forward"]["name"] == "provider_forward"
     assert artifacts["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert artifacts["provider_forward"]["path"] == str(provider_forward)
+    assert "owner_index_fence_owners" not in artifacts["provider_forward"]
 
 
 def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
     price_forward = tmp_path / "price_forward.ptg2sc"
-    price_forward.write_bytes(b"PTG2MNSC" + b"\0" * 32)
+    price_forward.write_bytes(struct.pack("<8sIQ", b"PTG2MNSC", 1, 0))
     provider_forward = tmp_path / "provider_forward.ptg2sc"
-    provider_forward.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+    provider_forward.write_bytes(struct.pack("<8sIQQ", b"PTG2MNDS", 1, 0, 0))
 
     artifact_dict = process_ptg._collect_manifest_artifacts(
         [
             {
                 "summary": {
+                    "logical_sha256": "logical-shard-a",
                     "manifest": {
                         "sidecars": {},
                         "sidecar_paths": {
@@ -6063,6 +6076,7 @@ def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
     assert sidecar_map["price_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_MEMBERSHIP_FORMAT
     assert sidecar_map["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert sidecar_map["provider_forward"]["path"] == str(provider_forward)
+    assert sidecar_map["provider_forward"]["source_shard_id"] == "manifest:logical-shard-a"
 
 
 @pytest.mark.asyncio
@@ -6105,6 +6119,42 @@ async def test_ptg2_manifest_publish_uploads_sidecars_to_db(monkeypatch, tmp_pat
     assert calls[0][1]["artifact_kind"] == "provider_forward"
     assert progress_events[-1]["publish_step"] == "artifact upload complete"
     assert progress_events[-1]["artifact_name"] == "provider_forward"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_manifest_publish_reuses_bytes_without_collapsing_source_shards(monkeypatch, tmp_path):
+    sidecar_path = tmp_path / "price_forward.ptg2sc"
+    sidecar_path.write_bytes(b"shared-sidecar")
+    store_calls = []
+
+    async def fake_store(_path, **kwargs):
+        store_calls.append(kwargs)
+        metadata = dict(kwargs["metadata"])
+        metadata.update({"storage_uri": "db://ptg2_artifact/shared", "artifact_id": "shared"})
+        return metadata
+
+    monkeypatch.setattr(ptg_manifest_publish, "ptg2_artifact_db_store_enabled", lambda: True)
+    monkeypatch.setattr(ptg_manifest_publish, "store_ptg2_artifact_file_in_db", fake_store)
+
+    artifacts = await ptg_manifest_publish._store_ptg2_manifest_sidecar_artifacts_in_db(
+        schema_name="mrf",
+        snapshot_id="ptg2:test",
+        sidecar_artifacts={
+            "sidecars": [
+                {
+                    "name": "price_forward",
+                    "path": str(sidecar_path),
+                    "sha256": "same-sha",
+                    "byte_count": sidecar_path.stat().st_size,
+                    "source_shard_id": source_shard_id,
+                }
+                for source_shard_id in ("source-a", "source-b")
+            ]
+        },
+    )
+
+    assert len(store_calls) == 1
+    assert [entry["source_shard_id"] for entry in artifacts["sidecars"]] == ["source-a", "source-b"]
 
 
 @pytest.mark.asyncio
