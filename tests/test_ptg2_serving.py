@@ -49,6 +49,9 @@ class FakeSession:
         if statement_sql == "set local plan_cache_mode = force_custom_plan":
             self.calls.append((_args, _kwargs))
             return FakeResult()
+        if statement_sql == "set local max_parallel_workers_per_gather = 0":
+            self.calls.append((_args, _kwargs))
+            return FakeResult()
         self.calls.append((_args, _kwargs))
         value = self._results.pop(0) if self._results else None
         if isinstance(value, Exception):
@@ -1712,6 +1715,21 @@ async def test_membership_graph_exhaustion_grows_probe_logarithmically(monkeypat
     assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128, 256, 320]
 
 
+def test_membership_graph_uses_wider_first_probe_for_taxonomy_selectivity():
+    assert ptg2_serving._graph_location_probe_batch_size(
+        100,
+        taxonomy_filter_requested=False,
+    ) == 150
+    assert ptg2_serving._graph_location_probe_batch_size(
+        100,
+        taxonomy_filter_requested=True,
+    ) == 1600
+    assert ptg2_serving._graph_location_probe_batch_size(
+        500,
+        taxonomy_filter_requested=True,
+    ) == 2000
+
+
 @pytest.mark.asyncio
 async def test_membership_graph_grows_until_taxonomy_has_enough_rate_matches(monkeypatch):
     matching_group_id = "00000000000000000000000000000021"
@@ -1832,8 +1850,9 @@ async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordi
 
     assert location_rows == []
     assert str(session.calls[0][0][0]) == "SET LOCAL plan_cache_mode = force_custom_plan"
-    location_statement_sql = str(session.calls[1][0][0])
-    parameter_map = session.calls[1][0][1]
+    assert str(session.calls[1][0][0]) == "SET LOCAL max_parallel_workers_per_gather = 0"
+    location_statement_sql = str(session.calls[2][0][0])
+    parameter_map = session.calls[2][0][1]
     assert "nearest_addresses AS MATERIALIZED" in location_statement_sql
     assert "entity_address_unified_idx_geo_idx" not in location_statement_sql
     assert "Geography(ST_MakePoint((addr.long)::double precision" in location_statement_sql

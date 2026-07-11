@@ -6662,6 +6662,7 @@ async def _membership_location_rows(
     location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
     if query_context.knn_order_sql is not None and offset == 0:
         await session.execute(text("SET LOCAL plan_cache_mode = force_custom_plan"))
+        await session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
         requested_limit = max(int(limit), 1)
         query_context.parameter_map["probe_limit"] = requested_limit + max(requested_limit // 2, 64)
         location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
@@ -6754,6 +6755,18 @@ async def _direct_group_ids_by_npi(
     return group_ids_by_npi if len(group_ids_by_npi) <= 200_000 else None
 
 
+def _graph_location_probe_batch_size(
+    candidate_limit: int,
+    *,
+    taxonomy_filter_requested: bool,
+) -> int:
+    """Choose a bounded first probe that accounts for sparse taxonomies."""
+    batch_size = min(max((candidate_limit * 3 + 1) // 2, 64), 1000)
+    if taxonomy_filter_requested:
+        return min(max(batch_size, candidate_limit * 16), 2000)
+    return batch_size
+
+
 async def _paged_graph_candidates(
     session,
     serving_tables: PTG2ServingTables,
@@ -6762,13 +6775,13 @@ async def _paged_graph_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
-    batch_size = min(max((candidate_limit * 3 + 1) // 2, 64), 1000)
+    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
+    batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=taxonomy_filter_requested)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
-    probe_limit = min(batch_size, max_candidates)
+    probe_limit = batch_size
     matched_location_rows: list[dict[str, Any]] = []
     group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
     seen_candidate_npis: set[int] = set()
-    taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
     filtered_candidates: _GraphLocationCandidates | None = None
     while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
