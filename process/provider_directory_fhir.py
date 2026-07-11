@@ -236,6 +236,8 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
+PROVIDER_DIRECTORY_OPENADDRESSES_TABLE = "openaddresses_geocode"
+DEFAULT_PROVIDER_DIRECTORY_OPENADDRESSES_COORD_TOLERANCE = 0.0005
 RESOURCE_MODELS_BY_TYPE = {
     "InsurancePlan": ProviderDirectoryInsurancePlan,
     "Practitioner": ProviderDirectoryPractitioner,
@@ -6818,6 +6820,86 @@ def provider_directory_location_archive_stage_sql(
     """
 
 
+def _provider_directory_openaddresses_archive_backfill_sql(schema: str, stage_table: str) -> str:
+    """Build an exact-key, ambiguity-guarded OpenAddresses archive update."""
+    archive_ref = _qt(schema, "address_archive_v2")
+    openaddresses_ref = _qt(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE)
+    stage_ref = _qt(schema, stage_table)
+    geo_source_type = _qt(schema, "address_archive_geo_source")
+    return f"""
+        WITH target_keys AS MATERIALIZED (
+            SELECT archive.address_key
+              FROM {stage_ref} AS stage_row
+              JOIN {archive_ref} AS archive
+                ON archive.address_key = stage_row.address_key
+             WHERE archive.merged_into IS NULL
+               AND archive.lat IS NULL
+               AND archive.long IS NULL
+        ),
+        winners AS (
+            SELECT target.address_key, candidate.*
+              FROM target_keys AS target
+              JOIN LATERAL (
+                    SELECT avg(oa.lat)::numeric(11,8) AS lat,
+                           avg(oa.long)::numeric(11,8) AS long,
+                           min(oa.formatted_address) AS formatted_address,
+                           min(oa.feature_id) AS place_id,
+                           NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
+                      FROM {openaddresses_ref} AS oa
+                     WHERE oa.address_key = target.address_key
+                       AND ((oa.lat BETWEEN 24 AND 50 AND oa.long BETWEEN -125 AND -66)
+                         OR (oa.lat BETWEEN 51 AND 72 AND oa.long BETWEEN -180 AND -129)
+                         OR (oa.lat BETWEEN 18 AND 23 AND oa.long BETWEEN -161 AND -154)
+                         OR (oa.lat BETWEEN 17 AND 19 AND oa.long BETWEEN -68 AND -64)
+                         OR (oa.lat BETWEEN 13 AND 16 AND oa.long BETWEEN 144 AND 146)
+                         OR (oa.lat BETWEEN -15 AND -10 AND oa.long BETWEEN -171 AND -168))
+                    HAVING count(*) > 0
+                       AND (count(*) = 1 OR (
+                            max(oa.lat) - min(oa.lat) <= :coord_tolerance
+                        AND max(oa.long) - min(oa.long) <= :coord_tolerance
+                       ))
+              ) AS candidate ON TRUE
+        )
+        UPDATE {archive_ref} AS archive
+           SET lat = winners.lat,
+               long = winners.long,
+               formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
+               place_id = COALESCE(archive.place_id, winners.place_id),
+               geo_source = 'openaddresses'::{geo_source_type},
+               geocode_source = 'openaddresses_address_key',
+               geocode_quality = COALESCE(winners.accuracy, 'address_key_exact'),
+               geocoded_at = now()
+          FROM winners
+         WHERE archive.address_key = winners.address_key
+           AND archive.merged_into IS NULL
+           AND archive.lat IS NULL
+           AND archive.long IS NULL;
+    """
+
+
+async def _backfill_archive_openaddresses_coordinates(
+    schema: str,
+    stage_table: str,
+) -> int:
+    """Fill null archive coordinates for staged FHIR keys from safe OA matches."""
+    if not await _table_exists(schema, PROVIDER_DIRECTORY_OPENADDRESSES_TABLE):
+        return 0
+    parsed_tolerance = _parse_coordinate_number(
+        os.getenv("HLTHPRT_OPENADDRESSES_DUPLICATE_COORD_TOLERANCE")
+    )
+    coordinate_tolerance = (
+        parsed_tolerance
+        if parsed_tolerance is not None and parsed_tolerance >= 0
+        else DEFAULT_PROVIDER_DIRECTORY_OPENADDRESSES_COORD_TOLERANCE
+    )
+    return _coerce_rowcount(
+        await db.status(
+            _provider_directory_openaddresses_archive_backfill_sql(schema, stage_table),
+            coord_tolerance=coordinate_tolerance,
+        )
+    )
+
+
 async def publish_provider_directory_location_archive(
     db_schema: str | None = None,
     *,
@@ -6859,7 +6941,14 @@ async def publish_provider_directory_location_archive(
             priority=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
             schema=schema,
         )
-        return dict(stats.__dict__)
+        archive_metric_dict = dict(stats.__dict__)
+        archive_metric_dict["openaddresses_coordinate_backfill_rows"] = (
+            await _backfill_archive_openaddresses_coordinates(
+                schema,
+                stage,
+            )
+        )
+        return archive_metric_dict
     finally:
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
 
