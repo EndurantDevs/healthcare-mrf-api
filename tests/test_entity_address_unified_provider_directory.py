@@ -112,7 +112,10 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "COALESCE(loc.state_name, loc.state_code)" in sql
     assert "loc.postal_code" in sql
     assert "loc.address_key ~* '^[0-9a-f]{8}-" in sql
-    assert "COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number" in sql
+    assert (
+        "WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number" in sql
+    )
+    assert "role_phone.telephone_number" in sql
     assert "loc.telephone_number::varchar AS telephone_number" in sql
     assert "pd.latitude" in sql
     assert "pd.longitude" in sql

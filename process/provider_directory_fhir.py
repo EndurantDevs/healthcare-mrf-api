@@ -23509,8 +23509,10 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
             loc.postal_code::varchar AS postal_code,
             {location_country_expr}::varchar AS country_code,
             COALESCE(
+                CASE
+                    WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number
+                END,
                 role_phone.telephone_number,
-                loc.telephone_number,
                 practitioner_phone.telephone_number
             )::varchar AS telephone_number,
             COALESCE(
@@ -23519,8 +23521,8 @@ ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE = """
                 practitioner_fax.fax_number
             )::varchar AS fax_number,
             COALESCE(
-                {role_phone_number_expr},
                 loc.phone_number,
+                {role_phone_number_expr},
                 {practitioner_phone_number_expr}
             )::varchar AS phone_number,
             COALESCE(
@@ -24011,8 +24013,10 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 loc.postal_code::varchar AS postal_code,
                 {location_country_expr}::varchar AS country_code,
                 COALESCE(
+                    CASE
+                        WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number
+                    END,
                     role_phone.telephone_number,
-                    loc.telephone_number,
                     practitioner_phone.telephone_number
                 )::varchar AS telephone_number,
                 COALESCE(
@@ -24021,8 +24025,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                     practitioner_fax.fax_number
                 )::varchar AS fax_number,
                 COALESCE(
-                    {role_phone_number_expr},
                     loc.phone_number,
+                    {role_phone_number_expr},
                     {practitioner_phone_number_expr}
                 )::varchar AS phone_number,
                 COALESCE(

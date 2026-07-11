@@ -3456,7 +3456,12 @@ def _source_selects(
                     COALESCE(NULLIF(loc.state_name, ''), loc.state_code)::varchar AS state_name,
                     loc.postal_code::varchar AS postal_code,
                     COALESCE(NULLIF(loc.country_code, ''), 'US')::varchar AS country_code,
-                    COALESCE(role_phone.telephone_number, loc.telephone_number)::varchar AS telephone_number,
+                    COALESCE(
+                        CASE
+                            WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number
+                        END,
+                        role_phone.telephone_number
+                    )::varchar AS telephone_number,
                     loc.fax_number::varchar AS fax_number,
                     loc.latitude::varchar AS latitude,
                     loc.longitude::varchar AS longitude,

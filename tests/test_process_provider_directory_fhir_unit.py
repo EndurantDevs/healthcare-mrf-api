@@ -15819,7 +15819,7 @@ def test_address_overlay_practitioner_component_uses_all_phone_and_location_path
     )
 
     assert "role_phone.telephone_number," in sql
-    assert "loc.telephone_number," in sql
+    assert "WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number" in sql
     assert "practitioner_phone.telephone_number" in sql
     assert "practitioner_fax.fax_number" in sql
     assert "AS role_phone ON TRUE" in sql
@@ -15833,6 +15833,38 @@ def test_address_overlay_practitioner_component_uses_all_phone_and_location_path
     assert "loc.longitude" in sql
     assert "/ 1000000" in sql
     assert "ABS(" in sql
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        importer.provider_directory_address_overlay_insert_sql(
+            "mrf",
+            "provider_directory_address_overlay_stage_test",
+        ),
+        importer._address_overlay_component_insert_sql(
+            "mrf",
+            "provider_directory_address_overlay_stage_test",
+            component="practitioner_role",
+        ),
+    ],
+)
+def test_practitioner_role_address_phone_prefers_usable_location_then_role(sql):
+    role_sql = sql.split("provider_directory_fhir:practitioner_role:", 1)[1]
+    compact_sql = " ".join(role_sql.split())
+    raw_phone_sql, normalized_phone_sql = compact_sql.split("AS telephone_number", 1)[0], compact_sql.split(
+        "AS fax_number,", 1
+    )[1].split("AS phone_number", 1)[0]
+
+    assert (
+        "COALESCE( CASE WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number END, "
+        "role_phone.telephone_number, practitioner_phone.telephone_number )::varchar AS telephone_number"
+        in f"{raw_phone_sql}AS telephone_number"
+    )
+    assert normalized_phone_sql.lstrip().startswith("COALESCE( loc.phone_number,")
+    assert normalized_phone_sql.index("role_phone.telephone_number") < normalized_phone_sql.index(
+        "practitioner_phone.telephone_number"
+    )
 
 
 def test_address_overlay_affiliation_component_uses_org_phone_and_service_locations():
