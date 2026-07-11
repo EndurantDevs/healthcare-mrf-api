@@ -837,6 +837,16 @@ def _ptg2_geo_dwithin_sql(lat_sql: str, long_sql: str) -> str:
     )
 
 
+def _ptg2_geo_knn_meters_sql(lat_sql: str, long_sql: str) -> str:
+    """Return the PostGIS KNN expression matching the unified-address GiST index."""
+    request_lat = "CAST(:geo_lat AS double precision)"
+    request_long = "CAST(:geo_long AS double precision)"
+    return (
+        f"Geography(ST_MakePoint(({long_sql})::double precision, ({lat_sql})::double precision)) "
+        f"<-> Geography(ST_MakePoint({request_long}, {request_lat}))"
+    )
+
+
 def _ptg2_address_zip5_sql(alias: str, *, unified: bool) -> str:
     """Return the zip5 expression that matches the hot address-serving index."""
     if unified:
@@ -6281,6 +6291,7 @@ class _MembershipLocationQuery:
     filter_sql: str
     parameter_map: dict[str, Any]
     distance_sql: str
+    knn_order_sql: str | None
 
 
 _MEMBERSHIP_LOCATION_SQL = """
@@ -6332,6 +6343,85 @@ FROM matched
 WHERE address_rank = 1
 ORDER BY distance_miles ASC NULLS LAST, npi
 LIMIT :limit OFFSET :offset
+"""
+
+
+_MEMBERSHIP_LOCATION_KNN_SQL = """
+WITH nearest_addresses AS MATERIALIZED (
+    SELECT
+        addr.npi,
+        addr.state_name,
+        addr.city_name,
+        addr.postal_code,
+        addr.lat,
+        addr.long,
+        addr.type,
+        addr.checksum,
+        addr.telephone_number,
+        addr.fax_number,
+        addr.phone_number,
+        addr.phone_extension,
+        addr.fax_number_digits,
+        addr.fax_extension,
+        addr.first_line,
+        addr.second_line,
+        addr.country_code,
+        addr.address_key,
+        {distance_sql} AS candidate_distance_miles
+    FROM {address_table} addr
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    WHERE {filter_sql}
+    ORDER BY {knn_order_sql},
+             addr.npi,
+             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+             addr.checksum
+    LIMIT :probe_limit
+), matched AS MATERIALIZED (
+    SELECT
+        addr.npi,
+        {location_hash_sql} AS location_hash,
+        addr.state_name AS state,
+        addr.city_name AS city,
+        LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+        addr.candidate_distance_miles AS distance_miles,
+        addr.type,
+        addr.checksum,
+        addr.telephone_number,
+        addr.fax_number,
+        addr.phone_number,
+        addr.phone_extension,
+        addr.fax_number_digits,
+        addr.fax_extension,
+        jsonb_build_object(
+            'first_line', addr.first_line,
+            'second_line', addr.second_line,
+            'city', addr.city_name,
+            'state', addr.state_name,
+            'postal_code', addr.postal_code,
+            'country_code', addr.country_code,
+            'telephone_number', addr.telephone_number,
+            'fax_number', addr.fax_number,
+            'phone_number', addr.phone_number,
+            'phone_extension', addr.phone_extension,
+            'fax_number_digits', addr.fax_number_digits,
+            'fax_extension', addr.fax_extension,
+            'address_key', addr.address_key::text,
+            'lat', addr.lat,
+            'long', addr.long
+        )::text AS address_payload,
+        ROW_NUMBER() OVER (
+            PARTITION BY addr.npi
+            ORDER BY addr.candidate_distance_miles ASC NULLS LAST,
+                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                     addr.checksum
+        ) AS address_rank
+    FROM nearest_addresses addr
+)
+SELECT *
+FROM matched
+WHERE address_rank = 1
+ORDER BY distance_miles ASC NULLS LAST, npi
+LIMIT :limit
 """
 
 
@@ -6418,9 +6508,15 @@ def _membership_filter_sql(
     uses_unified_addresses: bool,
     address_zip5_sql: str,
     parameter_map: dict[str, Any],
+    literal_service_address_types: bool = False,
 ) -> tuple[str, str] | None:
     """Build address filters while preserving ZIP-or-radius semantics."""
-    filter_clauses = ["addr.npi IS NOT NULL", "addr.type = ANY(CAST(:address_types AS varchar[]))"]
+    address_type_filter = (
+        "addr.type IN ('primary', 'secondary', 'practice', 'site')"
+        if literal_service_address_types
+        else "addr.type = ANY(CAST(:address_types AS varchar[]))"
+    )
+    filter_clauses = ["addr.npi IS NOT NULL", address_type_filter]
     if candidate_npis is not None:
         if not candidate_npis:
             return None
@@ -6459,6 +6555,29 @@ def _membership_filter_sql(
     return " AND ".join(filter_clauses), distance_sql
 
 
+def _membership_knn_order_sql(
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    uses_unified_addresses: bool,
+    offset: int,
+) -> str | None:
+    """Select indexed coordinate ordering for an unscoped first-page probe."""
+    if not uses_unified_addresses or candidate_npis is not None or offset != 0:
+        return None
+    has_coordinate_pair = all(
+        args.get(field) not in (None, "", "null")
+        for field in ("lat", "long")
+    )
+    has_non_coordinate_locator = any(
+        args.get(field) not in (None, "", "null")
+        for field in ("state", "city", "zip5", "zip", "npi")
+    )
+    if not has_coordinate_pair or has_non_coordinate_locator:
+        return None
+    return _ptg2_geo_knn_meters_sql("addr.lat", "addr.long")
+
+
 async def _membership_location_query(
     session,
     serving_tables: PTG2ServingTables,
@@ -6468,6 +6587,7 @@ async def _membership_location_query(
     limit: int,
     offset: int = 0,
 ) -> _MembershipLocationQuery | None:
+    """Build one bounded address lookup against immutable snapshot membership."""
     provider_npi_scope_table = _safe_table_name(serving_tables.provider_npi_scope_table)
     if not provider_npi_scope_table:
         return None
@@ -6487,12 +6607,19 @@ async def _membership_location_query(
         if uses_unified_addresses
         else ["primary", "secondary"],
     }
+    knn_order_sql = _membership_knn_order_sql(
+        args,
+        candidate_npis=candidate_npis,
+        uses_unified_addresses=uses_unified_addresses,
+        offset=offset,
+    )
     filter_sql_parts = _membership_filter_sql(
         args,
         candidate_npis=candidate_npis,
         uses_unified_addresses=uses_unified_addresses,
         address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
         parameter_map=parameter_map,
+        literal_service_address_types=knn_order_sql is not None,
     )
     if filter_sql_parts is None:
         return None
@@ -6503,6 +6630,7 @@ async def _membership_location_query(
         filter_sql=filter_sql,
         parameter_map=parameter_map,
         distance_sql=distance_sql,
+        knn_order_sql=knn_order_sql,
     )
 
 
@@ -6528,15 +6656,26 @@ async def _membership_location_rows(
     )
     if query_context is None:
         return None
-    location_statement = text(
-        _MEMBERSHIP_LOCATION_SQL.format(
-            location_hash_sql=_ptg2_address_location_hash_sql("addr", query_context.address_table),
+    location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
+    if query_context.knn_order_sql is not None and offset == 0:
+        query_context.parameter_map["probe_limit"] = max(int(limit) * 2, 64)
+        location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
+            location_hash_sql=location_hash_sql,
+            distance_sql=query_context.distance_sql,
+            knn_order_sql=query_context.knn_order_sql,
+            address_table=query_context.address_table,
+            npi_scope_table=query_context.npi_scope_table,
+            filter_sql=query_context.filter_sql,
+        )
+    else:
+        location_sql = _MEMBERSHIP_LOCATION_SQL.format(
+            location_hash_sql=location_hash_sql,
             distance_sql=query_context.distance_sql,
             address_table=query_context.address_table,
             npi_scope_table=query_context.npi_scope_table,
             filter_sql=query_context.filter_sql,
         )
-    )
+    location_statement = text(location_sql)
     query_result = await session.execute(location_statement, query_context.parameter_map)
     return [_row_mapping(query_row) for query_row in query_result]
 
@@ -6578,44 +6717,52 @@ async def _paged_graph_candidates(
     candidate_limit: int,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
-    batch_size = min(max(candidate_limit * 20, 1000), 10_000)
+    batch_size = min(max(candidate_limit * 2, 64), 1000)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
-    candidate_offset = 0
+    probe_limit = min(batch_size, max_candidates)
     matched_location_rows: list[dict[str, Any]] = []
     group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
-    while candidate_offset < max_candidates and len(matched_location_rows) < candidate_limit:
+    seen_candidate_npis: set[int] = set()
+    while probe_limit <= max_candidates and len(matched_location_rows) < candidate_limit:
         candidate_location_rows = await _membership_location_rows(
             session,
             serving_tables,
             args,
             candidate_npis=None,
-            limit=batch_size,
-            offset=candidate_offset,
+            limit=probe_limit,
+            offset=0,
         )
         if candidate_location_rows is None:
             return None
         if not candidate_location_rows:
             break
-        candidate_offset += len(candidate_location_rows)
-        owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in candidate_location_rows)
-        group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
-            session,
-            serving_tables,
-            "provider_npi_group",
-            owner_ids,
-        )
-        for location_data, owner_id in zip(candidate_location_rows, owner_ids):
-            npi = int(location_data["npi"])
-            matching_group_ids = {
-                group_id
-                for group_id in group_ids_by_owner.get(owner_id, ())
-                if _has_rate_scope_group(rate_scope, group_id)
-            }
-            if matching_group_ids:
-                group_ids_by_npi[npi].update(matching_group_ids)
-                matched_location_rows.append(location_data)
-        if len(candidate_location_rows) < batch_size:
+        new_location_rows = [
+            location
+            for location in candidate_location_rows
+            if int(location["npi"]) not in seen_candidate_npis
+        ]
+        if new_location_rows:
+            seen_candidate_npis.update(int(location["npi"]) for location in new_location_rows)
+            owner_ids = tuple(_ptg2_npi_member_id(int(location["npi"])) for location in new_location_rows)
+            group_ids_by_owner = await _ptg2_manifest_sidecar_members_many_async(
+                session,
+                serving_tables,
+                "provider_npi_group",
+                owner_ids,
+            )
+            for location_data, owner_id in zip(new_location_rows, owner_ids):
+                npi = int(location_data["npi"])
+                matching_group_ids = {
+                    group_id
+                    for group_id in group_ids_by_owner.get(owner_id, ())
+                    if _has_rate_scope_group(rate_scope, group_id)
+                }
+                if matching_group_ids:
+                    group_ids_by_npi[npi].update(matching_group_ids)
+                    matched_location_rows.append(location_data)
+        if probe_limit >= max_candidates:
             break
+        probe_limit = min(max(probe_limit * 2, probe_limit + batch_size), max_candidates)
     return _GraphLocationCandidates(matched_location_rows, group_ids_by_npi)
 
 

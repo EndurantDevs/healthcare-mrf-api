@@ -1607,6 +1607,108 @@ async def test_membership_graph_uses_address_first_for_broad_codes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_membership_graph_grows_address_probe_until_a_rate_match(monkeypatch):
+    matching_group_id = "00000000000000000000000000000021"
+    unrelated_group_id = "00000000000000000000000000000099"
+    rate_scope = ptg2_serving._ptg2_build_rate_scope(
+        tuple([matching_group_id] + [f"{group_index:032x}" for group_index in range(1000, 3000)])
+    )
+    first_location = _sample_graph_location(1234567890)
+    second_location = _sample_graph_location(1234567891)
+    location_reader = AsyncMock(
+        side_effect=[
+            [first_location],
+            [first_location, second_location],
+        ]
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, sidecar_name, owner_ids, **_kwargs):
+        assert sidecar_name == "provider_npi_group"
+        matching_owner_id = ptg2_serving._ptg2_npi_member_id(1234567891)
+        return {
+            owner_id: (matching_group_id if owner_id == matching_owner_id else unrelated_group_id,)
+            for owner_id in owner_ids
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", location_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        {"lat": "42.3", "long": "-85.2", "radius_miles": "10"},
+        rate_scope,
+        1,
+    )
+
+    assert [location["npi"] for location in candidates.location_rows] == [1234567891]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128]
+    assert [call.kwargs["offset"] for call in location_reader.await_args_list] == [0, 0]
+
+
+@pytest.mark.asyncio
+async def test_membership_graph_crosses_deduplicated_probe_plateau(monkeypatch):
+    matching_group_id = "00000000000000000000000000000021"
+    unrelated_group_id = "00000000000000000000000000000099"
+    rate_scope = ptg2_serving._ptg2_build_rate_scope(
+        tuple([matching_group_id] + [f"{group_index:032x}" for group_index in range(1000, 3000)])
+    )
+    first_location = _sample_graph_location(1234567890)
+    second_location = _sample_graph_location(1234567891)
+    location_reader = AsyncMock(
+        side_effect=[
+            [first_location],
+            [first_location],
+            [first_location, second_location],
+        ]
+    )
+
+    async def fake_sidecar_members_many(_session, _tables, _sidecar_name, owner_ids, **_kwargs):
+        matching_owner_id = ptg2_serving._ptg2_npi_member_id(1234567891)
+        return {
+            owner_id: (matching_group_id if owner_id == matching_owner_id else unrelated_group_id,)
+            for owner_id in owner_ids
+        }
+
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", location_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_members_many)
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        {"lat": "42.3", "long": "-85.2", "radius_miles": "10"},
+        rate_scope,
+        1,
+    )
+
+    assert [location["npi"] for location in candidates.location_rows] == [1234567891]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128, 256]
+
+
+@pytest.mark.asyncio
+async def test_membership_graph_exhaustion_grows_probe_logarithmically(monkeypatch):
+    location_reader = AsyncMock(return_value=[_sample_graph_location(1234567890)])
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", location_reader)
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many_async",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_location_match_limit", lambda: 16)
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        {"lat": "42.3", "long": "-85.2", "radius_miles": "10"},
+        ptg2_serving._ptg2_build_rate_scope(tuple(f"{value:032x}" for value in range(2000))),
+        1,
+    )
+
+    assert candidates.location_rows == []
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128, 256, 320]
+
+
+@pytest.mark.asyncio
 async def test_membership_location_query_keeps_site_addresses(monkeypatch):
     tables = ptg2_serving.PTG2ServingTables(provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test")
     monkeypatch.setattr(
@@ -1631,7 +1733,42 @@ async def test_membership_location_query_keeps_site_addresses(monkeypatch):
     )
 
     assert "site" in location_query.parameter_map["address_types"]
+    assert location_query.knn_order_sql is None
     assert invalid_radius_query is None
+
+
+@pytest.mark.asyncio
+async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordinate_probe(monkeypatch):
+    session = FakeSession([FakeResult(rows=[])])
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test"
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    location_rows = await ptg2_serving._membership_location_rows(
+        session,
+        tables,
+        {"lat": "42.3", "long": "-85.2", "radius_miles": "10"},
+        candidate_npis=None,
+        limit=100,
+    )
+
+    assert location_rows == []
+    location_statement_sql = str(session.calls[0][0][0])
+    parameter_map = session.calls[0][0][1]
+    assert "nearest_addresses AS MATERIALIZED" in location_statement_sql
+    assert "entity_address_unified_idx_geo_idx" not in location_statement_sql
+    assert "Geography(ST_MakePoint((addr.long)::double precision" in location_statement_sql
+    assert "<-> Geography(ST_MakePoint" in location_statement_sql
+    assert "ST_DWithin(" in location_statement_sql
+    assert "addr.type IN ('primary', 'secondary', 'practice', 'site')" in location_statement_sql
+    assert "addr.type = ANY" not in location_statement_sql
+    assert "ROW_NUMBER() OVER" in location_statement_sql
+    assert parameter_map["probe_limit"] == 200
 
 
 @pytest.mark.asyncio
