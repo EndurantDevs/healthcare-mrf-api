@@ -117,6 +117,7 @@ async def promote_ptg2_source_snapshot(
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
 ) -> dict[str, Any]:
+    """Atomically point a source and its plan rows at a published snapshot."""
     source_key = str(source_key or "").strip()
     snapshot_id = str(snapshot_id or "").strip()
     if not source_key or not snapshot_id:
@@ -219,6 +220,7 @@ async def build_ptg2_source_snapshot_remove_plan(
     snapshot_id: str,
     source_key: str | None = None,
 ) -> dict[str, Any]:
+    """Describe whether a source-scoped snapshot can be safely removed."""
     snapshot_id = str(snapshot_id or "").strip()
     source_key = str(source_key or "").strip() or None
     if not snapshot_id:
@@ -275,6 +277,7 @@ async def remove_ptg2_source_snapshot(
     snapshot_id: str,
     source_key: str | None = None,
 ) -> dict[str, Any]:
+    """Remove an unreferenced source snapshot after validating its removal plan."""
     schema = _schema_name()
     async with db.transaction() as session:
         await _lock_source_pointer_gc(session)

@@ -13,6 +13,7 @@ import api.ptg2_db_sidecars as db_sidecars
 from api.ptg2_db_sidecars import (
     lookup_atoms_by_price_id,
     lookup_atoms_by_price_key,
+    lookup_binary_code_batch_from_db,
     lookup_binary_price_atoms_from_db,
     lookup_serving_binary_by_code_from_db,
     lookup_serving_binary_by_provider_set_patterns_from_db,
@@ -522,6 +523,91 @@ async def test_db_serving_binary_by_code_reads_provider_count_dictionary():
         (decoded_row.code_key, decoded_row.provider_set_key, decoded_row.provider_count, decoded_row.price_set_global_id_128)
         for decoded_row in decoded_rows
     ] == [(7, 5, 20, second_price_set_id.hex())]
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_filtered_code_uses_sparse_provider_counts():
+    first_price_set_id = bytes.fromhex("00000000000000000000000000000081")
+    second_price_set_id = bytes.fromhex("00000000000000000000000000000082")
+    grouped_payload = b"".join(_uvarint(payload_part) for payload_part in (5, 1, 0, 2, 1, 1))
+    fake_session = FakeServingBinarySession(
+        {
+            ("by_code_grouped", 7): [
+                {"block_no": 0, "entry_count": 2, "payload": grouped_payload}
+            ],
+            "by_code_price_dictionary": [
+                {"payload": first_price_set_id + second_price_set_id}
+            ],
+        }
+    )
+
+    decoded_rows = await lookup_serving_binary_by_code_from_db(
+        fake_session,
+        "mrf.ptg2_serving_binary_sparse_count_test",
+        7,
+        provider_set_keys=[5],
+        provider_counts_by_key={5: 20},
+    )
+
+    assert [(row.provider_set_key, row.provider_count) for row in decoded_rows] == [(5, 20)]
+    assert not any(
+        call.get("artifact_kind") == "provider_set_count_dictionary"
+        for call in fake_session.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_filtered_code_validates_complete_provider_counts():
+    price_set_id = bytes.fromhex("00000000000000000000000000000084")
+    grouped_payload = b"".join(_uvarint(payload_part) for payload_part in (5, 1, 0, 2, 1, 0))
+    count_dictionary_payload = b"".join(_uvarint(payload_part) for payload_part in (5, 20))
+    fake_session = FakeServingBinarySession(
+        {
+            ("by_code_grouped", 7): [
+                {"block_no": 0, "entry_count": 2, "payload": grouped_payload}
+            ],
+            "by_code_price_dictionary": [{"payload": price_set_id}],
+            "provider_set_count_dictionary": [
+                {"entry_count": 1, "payload": count_dictionary_payload}
+            ],
+        }
+    )
+
+    with pytest.raises(db_sidecars.PTG2ManifestArtifactError, match="provider-count key is missing"):
+        await lookup_serving_binary_by_code_from_db(
+            fake_session,
+            "mrf.ptg2_serving_binary_complete_count_test",
+            7,
+            provider_set_keys=[5],
+        )
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_filtered_batch_uses_sparse_provider_counts():
+    price_set_id = bytes.fromhex("00000000000000000000000000000083")
+    grouped_payload = b"".join(_uvarint(payload_part) for payload_part in (5, 1, 0))
+    fake_session = FakeServingBinarySession(
+        {
+            ("by_code_grouped", 7): [
+                {"block_no": 0, "entry_count": 1, "payload": grouped_payload}
+            ],
+            "by_code_price_dictionary": [{"payload": price_set_id}],
+        }
+    )
+
+    decoded_rows_by_code = await lookup_binary_code_batch_from_db(
+        fake_session,
+        "mrf.ptg2_serving_binary_sparse_batch_test",
+        (7,),
+        provider_set_keys=[5],
+        provider_counts_by_key={5: 20},
+    )
+
+    assert decoded_rows_by_code[7][0].provider_count == 20
+    assert not any(
+        call.get("artifact_kind") == "provider_set_count_dictionary"
+        for call in fake_session.calls
+    )
 
 
 @pytest.mark.asyncio

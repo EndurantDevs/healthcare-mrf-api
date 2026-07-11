@@ -43,6 +43,7 @@ def _qualified_table_ref(qualified_table_name: str) -> str:
 
 
 async def provider_group_member_table_for_snapshot(session, snapshot_id: str) -> str:
+    """Return the validated provider-group member table for a published snapshot."""
     from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 
     tables = await snapshot_serving_tables(session, snapshot_id)
@@ -198,6 +199,7 @@ async def _main_async(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for provider-group member repairs."""
     parser = argparse.ArgumentParser(
         description="Report or remove malformed NPIs from a PTG2 provider_group_member table.",
     )
@@ -210,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Run the provider-group member repair command with parsed arguments."""
     asyncio.run(_main_async(build_parser().parse_args()))
 
 

@@ -47,6 +47,7 @@ def _ptg2_serving_rate_row(
     confidence: dict[str, Any] | None = None,
     confidence_code: str | None = None,
 ) -> dict[str, Any]:
+    """Build one serving-rate row from a normalized rate pack and plan context."""
     plan_id = str(plan_fields.get("plan_id") or "")
     raw_billing_code = procedure_payload.get("billing_code")
     billing_code = str(raw_billing_code or "")

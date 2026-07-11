@@ -49,6 +49,10 @@ class PTG2ServingBinaryRow(PTG2ServingSidecarRow):
     price_key: int | None = None
 
 
+class _SparseProviderCountMap(dict[int, int]):
+    """Mark a provider-count map that intentionally covers only filtered keys."""
+
+
 @dataclass(frozen=True)
 class _DictionaryBlockMetadata:
     block_no: int
@@ -343,7 +347,11 @@ def _decode_serving_binary_by_code_record(
         if provider_count_map is None and not grouped_payload:
             provider_count, cursor = _read_uvarint(payload_bytes, cursor)
         provider_set_key += provider_delta
-        if provider_count_map is not None:
+        is_provider_match = provider_filter is None or provider_set_key in provider_filter
+        should_read_provider_count = provider_count_map is not None and (
+            is_provider_match or not isinstance(provider_count_map, _SparseProviderCountMap)
+        )
+        if should_read_provider_count:
             provider_count = provider_count_map.get(provider_set_key)
             if provider_count is None:
                 raise PTG2ManifestArtifactError("PTG2 serving binary provider-count key is missing")
@@ -352,7 +360,7 @@ def _decode_serving_binary_by_code_record(
             cursor,
             grouped_payload=grouped_payload,
         )
-        if provider_filter is not None and provider_set_key not in provider_filter:
+        if not is_provider_match:
             if provider_filter_max is not None and provider_set_key > provider_filter_max:
                 break
             continue
@@ -757,10 +765,12 @@ async def _serving_binary_payload_rows_for_keys(
         binary_block_row_map = _row_mapping(binary_block_row)
         fetched_rows_by_key.setdefault(int(binary_block_row_map.get("block_key") or 0), []).append(binary_block_row_map)
     for block_key in missing_block_keys:
-        fetched_rows_by_key[block_key] = _binary_block_cache_set(
-            (relation_key, artifact_kind, block_key),
-            fetched_rows_by_key.get(block_key, []),
-        )
+        fetched_rows = fetched_rows_by_key.get(block_key, [])
+        if fetched_rows:
+            fetched_rows_by_key[block_key] = _binary_block_cache_set(
+                (relation_key, artifact_kind, block_key),
+                fetched_rows,
+            )
     return [
         binary_block_row
         for block_key in block_key_values
@@ -1337,6 +1347,21 @@ async def _serving_binary_provider_counts(
     return provider_count_map
 
 
+async def _provider_counts_for_binary_lookup(
+    session: Any,
+    table_name: str,
+    provider_counts_by_key: Mapping[int, int] | None,
+) -> dict[int, int] | None:
+    """Prefer caller-supplied sparse counts and retain the legacy dictionary fallback."""
+
+    if provider_counts_by_key is not None:
+        return _SparseProviderCountMap({
+            int(provider_set_key): int(provider_count)
+            for provider_set_key, provider_count in provider_counts_by_key.items()
+        })
+    return await _serving_binary_provider_counts(session, table_name)
+
+
 async def lookup_binary_price_atoms_from_db(
     session: Any,
     table_name: str,
@@ -1498,7 +1523,7 @@ async def lookup_serving_binary_by_code_from_db(
     table_name: str,
     code_key: int,
     *,
-    provider_set_keys: Iterable[int] | None = None,
+    provider_set_keys: Iterable[int] | None = None, provider_counts_by_key: Mapping[int, int] | None = None,
     price_dictionary_item_count: int | None = None,
     price_dictionary_block_bytes: int | None = None,
     price_dictionary_compressed_records: int | None = None,
@@ -1521,7 +1546,7 @@ async def lookup_serving_binary_by_code_from_db(
         )
     if not records:
         return ()
-    provider_count_map = await _serving_binary_provider_counts(session, table_name)
+    provider_count_map = await _provider_counts_for_binary_lookup(session, table_name, provider_counts_by_key)
     decoded_keys = _decode_serving_binary_code_records(
         records,
         provider_count_map=provider_count_map,
@@ -1719,7 +1744,7 @@ async def lookup_binary_code_batch_from_db(
     table_name: str,
     code_keys: Iterable[int],
     *,
-    provider_set_keys: Iterable[int] | None = None,
+    provider_set_keys: Iterable[int] | None = None, provider_counts_by_key: Mapping[int, int] | None = None,
     price_dictionary_item_count: int | None = None,
     price_dictionary_block_bytes: int | None = None,
     price_dictionary_compressed_records: int | None = None,
@@ -1739,7 +1764,7 @@ async def lookup_binary_code_batch_from_db(
         raise PTG2ManifestArtifactError(
             "PTG2 v3 forward artifact is missing referenced code blocks"
         )
-    provider_count_map = await _serving_binary_provider_counts(session, table_name)
+    provider_count_map = await _provider_counts_for_binary_lookup(session, table_name, provider_counts_by_key)
     decoded_entries_by_code, needed_price_keys = _decode_binary_forward_entries_by_code(
         forward_blocks_by_code,
         grouped_code_keys,

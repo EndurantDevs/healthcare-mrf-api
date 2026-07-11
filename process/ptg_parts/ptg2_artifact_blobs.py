@@ -43,10 +43,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def ptg2_artifact_db_store_enabled() -> bool:
+    """Return whether PTG2 artifacts should be persisted as PostgreSQL blobs."""
     return _env_bool(PTG2_ARTIFACT_DB_STORE_ENV, True)
 
 
 def ptg2_artifact_db_retain_local_cache() -> bool:
+    """Return whether PostgreSQL-backed artifacts retain a local file cache."""
     return _env_bool(PTG2_ARTIFACT_DB_RETAIN_LOCAL_CACHE_ENV, False)
 
 
@@ -65,10 +67,12 @@ def _artifact_db_compression_level() -> int:
 
 
 def ptg2_db_artifact_uri(artifact_id: str) -> str:
+    """Return the database storage URI for an artifact identifier."""
     return f"{PTG2_ARTIFACT_DB_URI_PREFIX}{artifact_id}"
 
 
 def ptg2_artifact_id_from_db_uri(uri: str) -> str | None:
+    """Extract a valid artifact identifier from a PTG2 database URI."""
     text_value = str(uri or "").strip()
     if not text_value.startswith(PTG2_ARTIFACT_DB_URI_PREFIX):
         return None
@@ -88,6 +92,7 @@ def _row_mapping(row: Any) -> dict[str, Any]:
 
 
 async def ensure_ptg2_artifact_blob_table(schema_name: str | None = None) -> None:
+    """Create the PTG2 artifact chunk table and lookup index when absent."""
     schema = schema_name or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     qualified_table = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     await db.status(
@@ -414,6 +419,7 @@ async def hydrate_ptg2_artifact_entry_from_db(
     *,
     schema_name: str | None = None,
 ) -> dict[str, Any]:
+    """Materialize a database-backed artifact entry into a local cache file."""
     hydrated = dict(entry)
     storage_uri = str(hydrated.get("storage_uri") or "").strip()
     if not ptg2_artifact_id_from_db_uri(storage_uri):

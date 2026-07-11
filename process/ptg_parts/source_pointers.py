@@ -110,6 +110,7 @@ async def _source_plan_rows(
     updated_at: datetime.datetime,
     serving_index: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Build source-plan pointer rows for a snapshot's discovered plan IDs."""
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     rows = await db.all(
         f"""

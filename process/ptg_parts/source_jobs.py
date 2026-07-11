@@ -243,6 +243,7 @@ def parse_toc_catalog_entries(
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
 ) -> list[PTG2SourceCatalogEntry]:
+    """Return filtered PTG source catalog entries parsed from a TOC payload."""
     if _is_provider_directory_index_payload(toc_content):
         return []
     toc_meta = {

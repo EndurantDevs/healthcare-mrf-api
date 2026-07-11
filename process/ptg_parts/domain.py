@@ -92,6 +92,7 @@ class PTG2ConfidenceEnum(str, Enum):
 
 
 def normalize_ptg2_search_mode(value: str | None) -> str:
+    """Validate and return a PTG2 source or product search mode."""
     mode = str(value or PTG2_MODE_PRODUCT_SEARCH).strip().lower()
     if mode not in {PTG2_MODE_EXACT_SOURCE, PTG2_MODE_PRODUCT_SEARCH}:
         raise ValueError("mode must be exact_source or product_search")
@@ -99,6 +100,7 @@ def normalize_ptg2_search_mode(value: str | None) -> str:
 
 
 def ptg2_confidence_statement(confidence_code: str) -> str:
+    """Return the user-facing evidence caveat for a PTG2 confidence code."""
     statements = {
         PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION: (
             "Provider location is based on the NPPES practice address; TiC rate files do not prove the service is offered there."
