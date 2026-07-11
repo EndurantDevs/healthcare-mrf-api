@@ -5094,6 +5094,46 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
+def test_contra_costa_affiliation_telecom_preserves_phone_and_fax_in_dataset_payload():
+    contra_costa_affiliation_payload_dict = {
+        "resourceType": "OrganizationAffiliation",
+        "id": "contra-costa-affiliation-21438",
+        "active": True,
+        "organization": {"reference": "Organization/contra-costa-health-plan"},
+        "participatingOrganization": {"reference": "Organization/21438"},
+        "location": [{"reference": "Location/496899"}],
+        "telecom": [
+            {"system": "phone", "value": "(925) 313-6000", "use": "work", "rank": 1},
+            {"system": "fax", "value": "(925) 313-6001", "use": "work", "rank": 2},
+        ],
+    }
+
+    affiliation_model, affiliation_row = importer.parse_fhir_resource(
+        "pdfhir_8ee2865f928f1d67b8a86090",
+        contra_costa_affiliation_payload_dict,
+        run_id="run_contra_costa",
+    )
+    endpoint_dataset_rows = importer._endpoint_dataset_resource_rows(
+        affiliation_model,
+        [affiliation_row],
+        dataset_id="dataset_contra_costa",
+    )
+    expected_dataset_payload_dict = importer._canonical_resource_payload(affiliation_row)
+
+    assert affiliation_model is ProviderDirectoryOrganizationAffiliation
+    assert ProviderDirectoryOrganizationAffiliation.__table__.c.telecom.nullable is True
+    assert affiliation_row["telecom"] == contra_costa_affiliation_payload_dict["telecom"]
+    assert contra_costa_affiliation_payload_dict["telecom"][0]["value"] == "(925) 313-6000"
+    assert len(endpoint_dataset_rows) == 1
+    assert endpoint_dataset_rows[0]["dataset_id"] == "dataset_contra_costa"
+    assert endpoint_dataset_rows[0]["resource_type"] == "OrganizationAffiliation"
+    assert endpoint_dataset_rows[0]["resource_id"] == "contra-costa-affiliation-21438"
+    assert endpoint_dataset_rows[0]["payload_json"] == expected_dataset_payload_dict
+    assert endpoint_dataset_rows[0]["payload_json"]["telecom"] == contra_costa_affiliation_payload_dict[
+        "telecom"
+    ]
+
+
 def test_identifier_mapping_accepts_type_coded_npi_and_systemless_plan_ids():
     _role_model, role_row = importer.parse_fhir_resource(
         "source_michigan",
