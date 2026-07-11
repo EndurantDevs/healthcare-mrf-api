@@ -38,8 +38,8 @@
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Accepts api-ida-prd.safhir.io cursor continuations with checkpoints."},
-      "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "The first unbounded dev run checkpointed 497,700 Location rows before the remote cursor returned HTTP 403. Exact-source checkpoint retries remain selectable even when the immediate retry probe is rejected, so acquisition can resume the durable cursor; terminal endpoint-wide proof remains pending."},
-      "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "PractitionerRole pages are capped at 25. The signed HAPI cursor returns HTTP 403, so the importer validates its shape and advances the endpoint's deterministic _getpagesoffset continuation without replaying the opaque token."},
+      "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "The first unbounded dev run checkpointed 497,700 Location rows before Molina returned a quota-specific HTTP 403 with an advertised reset delay. Exact-source retries preserve and resume the durable cursor; quota-aware deferred retry and terminal endpoint-wide proof remain pending."},
+      "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Five public collections are enumerable. The importer validates signed HAPI next links and replaces their blocked opaque cursor with deterministic _getpagesoffset continuation; PractitionerRole is capped at 25 rows. InsurancePlan, HealthcareService, and Endpoint consistently return HTTP 403 and are excluded."},
       "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-10", "method": "rest", "limitation": "Sequential REST pagination at _count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets for role, organization, location, service, and affiliation collections. No Bulk. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns."},
       "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-07-11", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint collection is unavailable. The separate /providerdirectory Medicaid base has 19 credentialed catalog aliases and only targeted search semantics, so it is not treated as another fully enumerable carrier directory."},
       "humana": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-11", "method": "rest", "limitation": "Overrides portal or stale paths to the public FHIR base."},
@@ -160,8 +160,8 @@
       "canonical_base": "https://api.interopstation.com/mdhhs/fhir",
       "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "R8",
-      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
+      "resource_profile": "M5",
+      "resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
     },
     {
       "entry_id": "cigna",

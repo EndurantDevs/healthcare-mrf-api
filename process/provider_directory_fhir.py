@@ -578,7 +578,19 @@ FHIR_OFFSET_PAGINATION_BASES = frozenset(
 )
 FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BASE})
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
-MICHIGAN_STATELESS_OFFSET_RESOURCE = "PractitionerRole"
+MICHIGAN_STATELESS_OFFSET_RESOURCES = frozenset(
+    {
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    }
+)
+MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS = (1.0, 3.0)
+MICHIGAN_STATELESS_OFFSET_EMPTY_ERROR = (
+    "michigan_stateless_offset_unexpected_empty_page"
+)
 WASHINGTON_PROVIDER_DIRECTORY_BASE = "https://wa.fhir.mhbapp.com/pd/api/v1"
 WYOMING_PROVIDER_DIRECTORY_BASE = "https://wy.fhir.mhbapp.com/pd/api/v1"
 MAINE_PROVIDER_DIRECTORY_BASE = "https://maineproviderdirectory.verityanalytics.org/fhir"
@@ -673,6 +685,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
+        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         MAINE_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
@@ -689,6 +702,7 @@ PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
+RESOURCE_FETCH_INCOMPLETE_ERROR = "provider_directory_resource_fetch_incomplete"
 BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-bulk-v1"
 BULK_EXPORT_CHECKPOINT_STARTING = "starting"
 BULK_EXPORT_CHECKPOINT_ACCEPTED = "accepted"
@@ -2076,7 +2090,7 @@ def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
     if (
         api_base == INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
         and _fhir_collection_search_resource_type(source, url)
-        == MICHIGAN_STATELESS_OFFSET_RESOURCE
+        in MICHIGAN_STATELESS_OFFSET_RESOURCES
     ):
         return _url_with_replaced_query_item(url, "_getpagesoffset", "0")
     if api_base not in FHIR_OFFSET_PAGINATION_BASES | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
@@ -3825,6 +3839,45 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def _michigan_provider_directory_override(
+    source_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Limit Michigan acquisition to its five public enumerable collections."""
+    api_base = _canonical_base(source_row.get("api_base"))
+    if api_base != INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE:
+        return None
+    supported_resources = sorted(MICHIGAN_STATELESS_OFFSET_RESOURCES)
+    return {
+        "api_base": INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(
+            INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+        ),
+        "metadata": {
+            "provider_directory_override": "michigan_public_resource_subset",
+            "provider_directory_override_reason": (
+                "Michigan's public relay supports five enumerable Provider Directory "
+                "collections. InsurancePlan, HealthcareService, and Endpoint return "
+                "HTTP 403 and are intentionally excluded."
+            ),
+            "provider_directory_previous_api_base": _clean_text(
+                source_row.get("api_base")
+            ),
+            "provider_directory_confirmed_base": (
+                INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+            ),
+            "provider_directory_confirmed_metadata_url": (
+                f"{INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/metadata"
+            ),
+            "provider_directory_supported_resources": supported_resources,
+            "provider_directory_fully_enumerable_resources": supported_resources,
+        },
+    }
+
+
 def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
     if api_base == TMHP_PROVIDER_DIRECTORY_BASE:
@@ -4104,6 +4157,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         or _amerihealth_caritas_provider_directory_override(row)
         or _molina_provider_directory_override(row)
         or _uhc_provider_directory_override(row)
+        or _michigan_provider_directory_override(row)
         or _state_public_provider_directory_override(row)
         or _maine_provider_directory_override(row)
         or _hap_provider_directory_override(row)
@@ -9729,6 +9783,37 @@ def _cigna_empty_collection_retry_delays(
     return CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS
 
 
+def _michigan_empty_collection_retry_delays(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> tuple[float, ...]:
+    api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    resource_type = _fhir_collection_search_resource_type(
+        source_record,
+        request_url,
+    )
+    if (
+        api_base != INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+        or resource_type not in MICHIGAN_STATELESS_OFFSET_RESOURCES
+    ):
+        return ()
+    offset_values = [
+        value
+        for name, value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(request_url).query,
+            keep_blank_values=True,
+        )
+        if name.lower() == "_getpagesoffset"
+    ]
+    if len(offset_values) != 1 or not offset_values[0].isdigit():
+        return ()
+    if int(offset_values[0]) <= 0:
+        return ()
+    return MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS
+
+
 def _is_empty_fhir_search_set(
     status_code: int | None,
     fhir_payload: dict[str, Any] | None,
@@ -9927,6 +10012,28 @@ async def _fetch_source_json_attempt(
     )
 
 
+def _fail_closed_on_michigan_empty_offset(
+    source_record: dict[str, Any],
+    candidate_url: str,
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Reject a repeatedly empty Michigan offset without advancing its cursor."""
+    if not _michigan_empty_collection_retry_delays(source_record, candidate_url):
+        return fetch_result
+    if not _is_empty_fhir_search_set(
+        fetch_result[0],
+        fetch_result[1],
+        fetch_result[2],
+    ):
+        return fetch_result
+    return (
+        fetch_result[0],
+        fetch_result[1],
+        MICHIGAN_STATELESS_OFFSET_EMPTY_ERROR,
+        fetch_result[3],
+    )
+
+
 async def _fetch_source_json_candidate(
     source_record: dict[str, Any],
     candidate_url: str,
@@ -9938,7 +10045,7 @@ async def _fetch_source_json_candidate(
     empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
         source_record,
         candidate_url,
-    )
+    ) or _michigan_empty_collection_retry_delays(source_record, candidate_url)
     attempt_count = max(
         _source_fetch_retry_attempts(),
         len(empty_collection_retry_delays) + 1,
@@ -9975,6 +10082,11 @@ async def _fetch_source_json_candidate(
                 should_retry_empty_collection,
             )
         )
+    fetch_result = _fail_closed_on_michigan_empty_offset(
+        source_record,
+        candidate_url,
+        fetch_result,
+    )
     return (
         (fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms),
         False,
@@ -10720,7 +10832,7 @@ def _resolved_fhir_next_url(
     if (
         api_base == INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
         and _fhir_collection_search_resource_type(source_record, current_url)
-        == MICHIGAN_STATELESS_OFFSET_RESOURCE
+        in MICHIGAN_STATELESS_OFFSET_RESOURCES
     ):
         return _resolved_michigan_next_url(current_url, next_url)
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
@@ -10771,14 +10883,18 @@ def _michigan_current_pagination_parts(
         for query_name, query_value in current_query_items
         if query_name.lower() == "_getpagesoffset"
     ]
+    base_path = canonical_base.path.rstrip("/")
+    current_path = parsed_current.path.rstrip("/")
+    resource_type = current_path[len(base_path) :].strip("/")
+    max_count = 25 if resource_type == "PractitionerRole" else _max_page_count()
     is_allowlisted = (
         parsed_current.scheme.lower() == "https"
         and parsed_current.netloc.lower() == canonical_base.netloc.lower()
-        and parsed_current.path.rstrip("/")
-        == f"{canonical_base.path.rstrip('/')}/{MICHIGAN_STATELESS_OFFSET_RESOURCE}"
+        and current_path == f"{base_path}/{resource_type}"
+        and resource_type in MICHIGAN_STATELESS_OFFSET_RESOURCES
         and len(current_count_values) == 1
         and current_count_values[0].isdigit()
-        and 1 <= int(current_count_values[0]) <= 25
+        and 1 <= int(current_count_values[0]) <= max_count
         and len(current_offset_values) <= 1
         and (not current_offset_values or current_offset_values[0].isdigit())
     )
@@ -18419,6 +18535,8 @@ async def _finalize_source_pagination_checkpoints(
     source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
     resume_required_entries: set[str] | None,
+    *,
+    require_complete_resources: bool = False,
 ) -> None:
     incomplete_resource_types = [
         resource_type
@@ -18448,6 +18566,16 @@ async def _finalize_source_pagination_checkpoints(
                 for resource_type in graph_failures
             )
             raise RuntimeError(f"{UHC_PLAN_GRAPH_INCOMPLETE_ERROR}:{failure_details}")
+        if require_complete_resources:
+            source_id = _clean_text(source_record.get("source_id")) or "unknown-source"
+            failure_details = ",".join(
+                f"{resource_type}="
+                f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
+                for resource_type in incomplete_resource_types
+            )
+            raise RuntimeError(
+                f"{RESOURCE_FETCH_INCOMPLETE_ERROR}:{source_id}:{failure_details}"
+            )
         return
     context = source_record.get("_pagination_checkpoint_context")
     if not isinstance(context, PaginationCheckpointContext):
@@ -19671,6 +19799,7 @@ async def _import_resources(
     pagination_root_run_id: str | None = None,
     pagination_resume_required: set[str] | None = None,
     provider_directory_endpoint_scope: str | None = None,
+    require_complete_resources: bool = False,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
@@ -19880,6 +20009,7 @@ async def _import_resources(
                 source,
                 import_summary[1],
                 pagination_resume_required,
+                require_complete_resources=require_complete_resources,
             )
             _record_uhc_plan_graph_completion(
                 resource_completion,
@@ -20254,6 +20384,7 @@ async def _import_resources(
             source,
             source_resource_diagnostics,
             pagination_resume_required,
+            require_complete_resources=require_complete_resources,
         )
         return (
             source_ids,
@@ -20760,6 +20891,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 pagination_root_run_id=pagination_root_run_id,
                 pagination_resume_required=pagination_resume_required_entries,
                 provider_directory_endpoint_scope=provider_directory_endpoint_scope,
+                require_complete_resources=(
+                    full_refresh
+                    and resource_limit <= 0
+                    and page_limit <= 0
+                ),
             )
             metrics["bulk_export_mode"] = _bulk_export_mode_metrics(
                 bulk_export,
