@@ -3193,6 +3193,9 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 arch_version=arch_version,
                 price_atom_table_layout=(lean_price_atom_manifest or {}).get("price_atom_table_layout"),
                 price_atom_constant_keys=(lean_price_atom_manifest or {}).get("price_atom_constant_keys"),
+                expected_price_set_count=(
+                    int(dedupe_metrics.get("price_set_unique") or 0) or None
+                ),
                 progress_callback=_emit_ptg2_manifest_publish_progress,
             )
             mark_stage("serving_binary_build", stage_started_at)

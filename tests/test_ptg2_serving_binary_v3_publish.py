@@ -28,6 +28,7 @@ def _publish_options(progress_callback=None):
         provider_set_dictionary_table=None,
         price_atom_table_layout="lean_dict_v2",
         price_atom_constant_keys={"setting_key": 0},
+        expected_price_set_count=2,
         progress_callback=progress_callback,
     )
 
@@ -35,9 +36,7 @@ def _publish_options(progress_callback=None):
 @pytest.mark.parametrize("alias", ["postgres_binary_v3", "db_binary_v3", "binary_v3"])
 def test_v3_config_aliases(monkeypatch, alias):
     monkeypatch.setenv(ptg_config.PTG2_SNAPSHOT_ARCH_ENV, alias)
-
     arch_version = ptg_config._ptg2_snapshot_arch_from_env()
-
     assert arch_version == ptg_config.PTG2_SNAPSHOT_ARCH_POSTGRES_BINARY_V3
     assert ptg_config._is_postgres_binary_snapshot_arch(arch_version)
     assert ptg_config._is_postgres_binary_v3_arch(arch_version)
@@ -127,10 +126,12 @@ async def test_price_map_is_distinct_and_dense(monkeypatch):
         schema_name="mrf",
         price_set_atom_table="price_set_atom_source",
         stage_table="price_key_map",
+        expected_price_set_count=3,
     )
 
-    assert _compact_sql(status_statements[0]) == 'ANALYZE "mrf"."price_set_atom_source";'
-    create_sql = _compact_sql(status_statements[1])
+    assert "SET (n_distinct = 3)" in _compact_sql(status_statements[0])
+    assert _compact_sql(status_statements[1]) == 'ANALYZE "mrf"."price_set_atom_source";'
+    create_sql = _compact_sql(status_statements[2])
     assert "CREATE UNLOGGED TABLE" in create_sql
     assert "SELECT DISTINCT price_set_global_id_128" in create_sql
     assert "ROW_NUMBER() OVER (ORDER BY price_set_global_id_128)" in create_sql
@@ -261,11 +262,11 @@ async def test_v3_stage_cleanup_allows_retry(monkeypatch):
         if len(map_build_attempts) == 1:
             raise RuntimeError("map build failed")
         dense_stat_by_name = {
-            "row_count": 1,
-            "distinct_id_count": 1,
-            "distinct_key_count": 1,
+            "row_count": 2,
+            "distinct_id_count": 2,
+            "distinct_key_count": 2,
             "minimum_key": 0,
-            "maximum_key": 0,
+            "maximum_key": 1,
         }
         return dense_stat_by_name, dense_stat_by_name
 

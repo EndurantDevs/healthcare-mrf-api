@@ -20,6 +20,7 @@ def _publish_options(progress_callback):
         provider_set_dictionary_table=None,
         price_atom_table_layout="lean_dict_v2",
         price_atom_constant_keys={"setting_key": 0},
+        expected_price_set_count=2,
         progress_callback=progress_callback,
     )
 

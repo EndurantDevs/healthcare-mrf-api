@@ -175,6 +175,7 @@ class _V3PublishOptions:
     provider_set_dictionary_table: str | None
     price_atom_table_layout: str | None
     price_atom_constant_keys: Mapping[str, Any]
+    expected_price_set_count: int | None
     progress_callback: Callable[..., None] | None
 
 
@@ -2131,14 +2132,32 @@ async def _validate_v3_dense_map(
     return dense_stat_by_name
 
 
-async def _create_v3_price_key_stage(
-    *, schema_name: str, price_set_atom_table: str, stage_table: str
-) -> dict[str, int | None]:
-    # V3 plans a large DISTINCT over this transient table. Without fresh
-    # cardinality statistics PostgreSQL can underestimate dense sources by an
-    # order of magnitude and choose a heavily spilling aggregate.
+async def _prepare_v3_price_key_source(
+    *, schema_name: str, price_set_atom_table: str, expected_price_set_count: int | None
+) -> None:
+    """Give the dense-map planner the scanner's exact price-set cardinality."""
+    if expected_price_set_count is not None:
+        await db.status(
+            f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)} "
+            "ALTER COLUMN price_set_global_id_128 SET "
+            f"(n_distinct = {max(int(expected_price_set_count), 0)});"
+        )
     await db.status(
         f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};"
+    )
+
+
+async def _create_v3_price_key_stage(
+    *,
+    schema_name: str,
+    price_set_atom_table: str,
+    stage_table: str,
+    expected_price_set_count: int | None = None,
+) -> dict[str, int | None]:
+    await _prepare_v3_price_key_source(
+        schema_name=schema_name,
+        price_set_atom_table=price_set_atom_table,
+        expected_price_set_count=expected_price_set_count,
     )
     await db.status(
         f"""
@@ -2769,6 +2788,7 @@ async def _create_v3_stage_maps(
             schema_name=publish_options.schema_name,
             price_set_atom_table=publish_options.price_set_atom_table,
             stage_table=stage_tables.price_key_map,
+            expected_price_set_count=publish_options.expected_price_set_count,
         ),
         _create_v3_atom_key_stage(
             schema_name=publish_options.schema_name,
@@ -2864,6 +2884,15 @@ async def _write_v3_serving_binary(publish_options: _V3PublishOptions) -> dict[s
             publish_options,
             stage_tables,
         )
+        observed_price_set_count = int(price_map_stats["row_count"] or 0)
+        if (
+            publish_options.expected_price_set_count is not None
+            and observed_price_set_count != publish_options.expected_price_set_count
+        ):
+            raise RuntimeError(
+                "PTG2 v3 dense price-map count mismatch: "
+                f"expected {publish_options.expected_price_set_count}, got {observed_price_set_count}"
+            )
         timing_by_stage["dense_map_seconds"] = _elapsed_seconds(map_started_at)
         _emit_progress(
             publish_options.progress_callback,
@@ -3494,6 +3523,7 @@ async def write_ptg2_serving_binary_table(
     arch_version: str | None = None,
     price_atom_table_layout: str | None = None,
     price_atom_constant_keys: Mapping[str, Any] | None = None,
+    expected_price_set_count: int | None = None,
     progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Create a PostgreSQL-native forward/reverse serving block table."""
@@ -3521,6 +3551,7 @@ async def write_ptg2_serving_binary_table(
             provider_set_dictionary_table=provider_set_dictionary_table,
             price_atom_table_layout=price_atom_table_layout,
             price_atom_constant_keys=dict(price_atom_constant_keys or {}),
+            expected_price_set_count=expected_price_set_count,
             progress_callback=progress_callback,
         )
         try:
