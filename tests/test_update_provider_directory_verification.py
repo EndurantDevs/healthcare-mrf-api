@@ -12,7 +12,11 @@ from scripts.research import provider_directory_endpoint_acquisition_harness as 
 
 def _manifest_and_snapshot():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-    snapshot = generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    snapshot = copy.deepcopy(
+        generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    )
+    snapshot["checked_at"] = "2026-07-10T17:19:26Z"
+    snapshot.pop("report_identity", None)
     return manifest, snapshot
 
 
@@ -189,6 +193,63 @@ def test_bounded_terminal_evidence_preserves_safe_structured_details():
     assert evidence["terminal_error"] == {"message": "safe terminal detail"}
     assert evidence["effective_acquisition"]["selected_sources"] == 1
     assert evidence["resource_outcomes"]["InsurancePlan"]["sources_bounded"] == 1
+
+
+def test_selected_update_preserves_unselected_source_evidence():
+    manifest, snapshot = _manifest_and_snapshot()
+    report = _report(manifest)
+    report["entries"]["molina"] = {"status": "pending", "run_ids": []}
+    snapshot["entries"]["molina"] = {
+        "terminal_status": "succeeded",
+        "run_id": "run_molina_prior",
+        "access_verification": "verified",
+        "checked_at": "2026-07-10T17:00:00Z",
+        "proof_state": "current",
+        "current_observation": {
+            "run_id": "run_molina_prior",
+            "state_status": "succeeded",
+            "run_status": "succeeded",
+            "observed_at": "2026-07-10T17:00:00Z",
+        },
+        "terminal_evidence": {
+            "source_ids": next(
+                entry["source_ids"]
+                for entry in manifest["entries"]
+                if entry["entry_id"] == "molina"
+            )
+        },
+    }
+    prior_molina = copy.deepcopy(snapshot["entries"]["molina"])
+
+    updated = updater.update_verification_snapshot(
+        manifest,
+        report,
+        snapshot,
+        "healthporta-dev",
+    )
+
+    assert updated["entries"]["molina"] == prior_molina
+
+
+def test_same_timestamp_different_report_is_rejected():
+    manifest, snapshot = _manifest_and_snapshot()
+    report = _report(manifest)
+    prior = updater.update_verification_snapshot(
+        manifest,
+        report,
+        snapshot,
+        "healthporta-dev",
+    )
+    different_report = copy.deepcopy(report)
+    different_report["report_note"] = "different report at the same timestamp"
+
+    with pytest.raises(updater.VerificationUpdateError, match="must be newer"):
+        updater.update_verification_snapshot(
+            manifest,
+            different_report,
+            prior,
+            "healthporta-dev",
+        )
 
 
 def test_newer_nonterminal_report_marks_prior_terminal_proof_superseded():

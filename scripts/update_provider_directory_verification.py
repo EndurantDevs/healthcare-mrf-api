@@ -285,10 +285,10 @@ def _report_identity(report: dict[str, Any], checked_at: str) -> dict[str, Any]:
 def _validate_integration_metadata(
     report: dict[str, Any],
     entry_ids: set[str],
-) -> None:
+) -> set[str]:
     integration = report.get("verification_update")
     if integration is None:
-        return
+        return set(report["entries"])
     if not isinstance(integration, dict):
         raise VerificationUpdateError("report verification_update must be an object")
     selected = integration.get("selected_entry_ids")
@@ -333,6 +333,7 @@ def _validate_integration_metadata(
     }
     if set(terminal) != expected_terminal_ids:
         raise VerificationUpdateError("report verification_update terminal identities do not agree")
+    return set(selected)
 
 def _ensure_report_is_fresh(
     prior_snapshot: dict[str, Any],
@@ -409,7 +410,7 @@ def update_verification_snapshot(
     checked_at = _checked_timestamp(report)
     report_identity = _report_identity(report, checked_at)
     _ensure_report_is_fresh(prior_snapshot, report_identity)
-    _validate_integration_metadata(report, set(entry_ids))
+    selected_entry_ids = _validate_integration_metadata(report, set(entry_ids))
     snapshot_by_field = {
         "schema_version": 1,
         "environment": _safe_environment(environment),
@@ -418,7 +419,8 @@ def update_verification_snapshot(
         "report_identity": report_identity,
         "entries": copy.deepcopy(prior_snapshot["entries"]),
     }
-    for entry_id, report_entry in report_entries.items():
+    for entry_id in selected_entry_ids:
+        report_entry = report_entries[entry_id]
         terminal_record = _terminal_record(
             entry_id, manifest_entry_by_id[entry_id], report_entry, checked_at
         )
