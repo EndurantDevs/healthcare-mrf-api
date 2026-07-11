@@ -325,7 +325,7 @@ def test_freshness_validation_accepts_current_reviews():
     "entry_id, expected_detail",
     [
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
-        ("molina", "molina.sapphirethreesixtyfive.com cursor continuations"),
+        ("molina", "checkpointed 497,700 Location rows"),
         ("michigan", "deterministic _getpagesoffset continuation"),
         ("cigna", "_count=75 returns false-empty search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
