@@ -59,6 +59,26 @@ def canonical_catalog_code(code_system: str, raw_code: Any) -> str:
     return code
 
 
+def catalog_code_lookup_values(code_system: Any, raw_code: Any) -> tuple[str, ...]:
+    """Return compatible persisted forms for an externally supplied code."""
+
+    system = normalize_code_system(code_system)
+    canonical = canonical_catalog_code(system, raw_code) if system else normalize_code(raw_code)
+    if not canonical:
+        return ()
+    values = [canonical]
+    if system == "RC":
+        normalized_raw = normalize_code(raw_code)
+        if normalized_raw and normalized_raw not in values:
+            values.append(normalized_raw)
+        digits = "".join(ch for ch in canonical if ch.isdigit())
+        while len(digits) > 1 and digits.startswith("0"):
+            digits = digits[1:]
+            if digits not in values:
+                values.append(digits)
+    return tuple(values)
+
+
 def restricted_terminology_public_enabled() -> bool:
     return str(os.getenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES") or "").strip().lower() in {"1", "true", "yes"}
 

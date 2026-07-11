@@ -4604,7 +4604,13 @@ def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path)
     assert "unnest(COALESCE(sts.source_trace_hashes" in insert_sql
     assert "sts.canonical_payload::jsonb->'source_trace_hashes'" not in insert_sql
     assert "code_catalog" in insert_sql
-    assert "code_system IN ('CPT', 'HCPCS', 'CDT', 'MS_DRG')" in source_observed_catalog_sql
+    assert "WHEN 'REVENUE_CODE' THEN 'RC'" in insert_sql
+    assert "regexp_replace(COALESCE(NULLIF(UPPER(BTRIM(proc.billing_code)), ''), ''), '[^0-9]', '', 'g')" in insert_sql
+    assert "LPAD(" in insert_sql
+    assert "AS reported_code,\n                proc.billing_code," in insert_sql
+    assert "NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS reported_code" not in insert_sql
+    assert "code_system IN ('CPT', 'HCPCS', 'CDT', 'MS_DRG', 'RC')" in source_observed_catalog_sql
+    assert "GROUP BY code_system, code" in source_observed_catalog_sql
     assert "source_attribution" in source_observed_catalog_sql
     assert "source_description" in source_observed_synonym_sql
     assert "snapshot_index" not in [part.name for part in tmp_path.iterdir()]

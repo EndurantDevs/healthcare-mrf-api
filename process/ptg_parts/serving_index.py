@@ -28,7 +28,7 @@ PTG2_SOURCE_OBSERVED_PROCEDURE_SOURCE = "ptg2_source_observed_procedure"
 PTG2_SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION = (
     "Source-observed label from payer pricing data; not an AMA CPT or ADA CDT reference import."
 )
-PTG2_SOURCE_OBSERVED_CODE_SYSTEMS = "('CPT', 'HCPCS', 'CDT', 'MS_DRG')"
+PTG2_SOURCE_OBSERVED_CODE_SYSTEMS = "('CPT', 'HCPCS', 'CDT', 'MS_DRG', 'RC')"
 PTG2_PRICING_PROCEDURE_FALLBACK_SYSTEMS = "('CPT', 'HCPCS', 'CDT')"
 
 
@@ -36,11 +36,34 @@ def _normalized_code_system_sql(expr: str) -> str:
     return (
         f"""
         CASE NULLIF(UPPER(BTRIM({expr})), '')
+            WHEN 'CLM_REV_CNTR_CD' THEN 'RC'
+            WHEN 'REVENUE_CENTER' THEN 'RC'
+            WHEN 'REVENUE_CODE' THEN 'RC'
+            WHEN 'REV_CNTR' THEN 'RC'
             WHEN 'MS-DRG' THEN 'MS_DRG'
             WHEN 'MSDRG' THEN 'MS_DRG'
             WHEN 'DRG' THEN 'MS_DRG'
             WHEN 'ICD-10-PCS' THEN 'ICD10PCS'
             ELSE NULLIF(UPPER(BTRIM({expr})), '')
+        END
+        """
+    )
+
+
+def _canonical_reported_code_sql(code_system_expr: str, code_expr: str) -> str:
+    normalized_system = _normalized_code_system_sql(code_system_expr)
+    normalized_code = f"NULLIF(UPPER(BTRIM({code_expr})), '')"
+    digits = f"NULLIF(regexp_replace(COALESCE({normalized_code}, ''), '[^0-9]', '', 'g'), '')"
+    return (
+        f"""
+        CASE
+            WHEN {normalized_system} = 'RC'
+             AND {digits} IS NOT NULL
+                THEN CASE
+                    WHEN LENGTH({digits}) < 4 THEN LPAD({digits}, 4, '0')
+                    ELSE {digits}
+                END
+            ELSE {normalized_code}
         END
         """
     )
@@ -75,7 +98,7 @@ async def _materialize_ptg2_source_observed_terms(snapshot_id: str, schema: str)
         WITH snapshot_procedure AS (
             SELECT DISTINCT
                 {_normalized_code_system_sql("proc.billing_code_type")} AS code_system,
-                NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS code,
+                {_canonical_reported_code_sql("proc.billing_code_type", "proc.billing_code")} AS code,
                 NULLIF(BTRIM(proc.name), '') AS procedure_name,
                 NULLIF(BTRIM(proc.description), '') AS procedure_description
             FROM {schema}.ptg2_plan_month pm
@@ -90,12 +113,13 @@ async def _materialize_ptg2_source_observed_terms(snapshot_id: str, schema: str)
             SELECT
                 code_system,
                 code,
-                procedure_name,
-                procedure_description,
-                COALESCE(procedure_name, procedure_description, code) AS display_name
+                MIN(procedure_name) AS procedure_name,
+                MIN(procedure_description) AS procedure_description,
+                COALESCE(MIN(procedure_name), MIN(procedure_description), code) AS display_name
             FROM snapshot_procedure
             WHERE code_system IN {PTG2_SOURCE_OBSERVED_CODE_SYSTEMS}
               AND code IS NOT NULL
+            GROUP BY code_system, code
         )
         INSERT INTO {schema}.{CodeCatalog.__tablename__}
             (
@@ -139,7 +163,7 @@ async def _materialize_ptg2_source_observed_terms(snapshot_id: str, schema: str)
         WITH snapshot_procedure AS (
             SELECT DISTINCT
                 {_normalized_code_system_sql("proc.billing_code_type")} AS code_system,
-                NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS code,
+                {_canonical_reported_code_sql("proc.billing_code_type", "proc.billing_code")} AS code,
                 NULLIF(BTRIM(proc.name), '') AS procedure_name,
                 NULLIF(BTRIM(proc.description), '') AS procedure_description
             FROM {schema}.ptg2_plan_month pm
@@ -212,7 +236,7 @@ async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> d
                 SELECT cw.to_code::bigint AS procedure_code
                 FROM {schema}.code_crosswalk cw
                 WHERE UPPER(BTRIM(cw.from_system)) = {_normalized_code_system_sql("proc.billing_code_type")}
-                  AND UPPER(BTRIM(cw.from_code)) = UPPER(BTRIM(proc.billing_code))
+                  AND UPPER(BTRIM(cw.from_code)) = {_canonical_reported_code_sql("proc.billing_code_type", "proc.billing_code")}
                   AND UPPER(BTRIM(cw.to_system)) = 'HP_PROCEDURE_CODE'
                   AND cw.to_code ~ '^[0-9]+$'
                 ORDER BY cw.confidence DESC NULLS LAST, cw.updated_at DESC NULLS LAST
@@ -265,7 +289,7 @@ async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> d
         f"""
             LEFT JOIN {schema}.code_catalog external_catalog
               ON UPPER(BTRIM(external_catalog.code_system)) = {_normalized_code_system_sql("proc.billing_code_type")}
-             AND UPPER(BTRIM(external_catalog.code)) = UPPER(BTRIM(proc.billing_code))
+             AND UPPER(BTRIM(external_catalog.code)) = {_canonical_reported_code_sql("proc.billing_code_type", "proc.billing_code")}
             LEFT JOIN {schema}.code_catalog internal_catalog
               ON UPPER(BTRIM(internal_catalog.code_system)) = 'HP_PROCEDURE_CODE'
              AND internal_catalog.code = COALESCE(mapped_code.procedure_code, pricing_proc.procedure_code)::text
@@ -317,7 +341,7 @@ async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> d
                 proc.procedure_hash,
                 COALESCE(mapped_code.procedure_code, pricing_proc.procedure_code) AS procedure_code,
                 {_normalized_code_system_sql("proc.billing_code_type")} AS reported_code_system,
-                NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS reported_code,
+                {_canonical_reported_code_sql("proc.billing_code_type", "proc.billing_code")} AS reported_code,
                 proc.billing_code,
                 proc.billing_code_type,
                 proc.name AS procedure_name,

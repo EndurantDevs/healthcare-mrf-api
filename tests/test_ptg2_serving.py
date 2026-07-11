@@ -17,6 +17,7 @@ from api import ptg2_serving_utils
 from api import ptg2_code_details
 from api import ptg2_code_context
 from api import ptg2_snapshot
+from api.code_systems import catalog_code_lookup_values
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 from process.ptg_parts.ptg2_manifest_artifacts import (
     write_serving_by_code_sidecar,
@@ -83,6 +84,114 @@ class _Pagination:
     def __init__(self, *, limit=25, offset=0):
         self.limit = limit
         self.offset = offset
+
+
+def test_revenue_code_lookup_values_include_raw_and_canonical_forms():
+    assert catalog_code_lookup_values("RC", "110") == ("0110", "110")
+    assert catalog_code_lookup_values("revenue_code", "0450") == ("0450", "450")
+    assert catalog_code_lookup_values("RC", "020") == ("0020", "020", "20")
+    assert catalog_code_lookup_values("RC", "0020") == ("0020", "020", "20")
+    assert catalog_code_lookup_values("CPT", "99213") == ("99213",)
+
+
+def _revenue_code_count_rows(*, include_rate_count: bool = False):
+    """Build canonical and raw code-dictionary rows for synthetic tests."""
+
+    rows = [
+        {
+            "code_key": code_key,
+            "plan_id": "TESTPLAN001",
+            "reported_code_system": "RC",
+            "reported_code": reported_code,
+        }
+        for code_key, reported_code in ((7, "0110"), (8, "110"))
+    ]
+    if include_rate_count:
+        for row in rows:
+            row["rate_count"] = 1
+    return rows
+
+
+def _manifest_fixture_rate_row(
+    *,
+    code_key: int,
+    reported_code: str,
+    provider_set_id: str,
+    price_set_id: str,
+    provider_count: int,
+):
+    """Build one synthetic manifest response row."""
+
+    return {
+        "serving_content_hash_128": f"{code_key + 500:032x}",
+        "plan_id": "TESTPLAN001",
+        "reported_code_system": "RC",
+        "reported_code": reported_code,
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": provider_count,
+        "price_set_global_id_128": price_set_id,
+        "source_trace_set_hash": None,
+        "network_names": [],
+    }
+
+
+def _v3_revenue_forward_fixture(monkeypatch):
+    """Configure a synthetic v3 forward lookup with two compatible code forms."""
+
+    canonical_provider_set_id = "0000000000000000000000000000000a"
+    raw_provider_set_id = "0000000000000000000000000000000b"
+    canonical_price_set_id = "00000000000000000000000000000101"
+    raw_price_set_id = "00000000000000000000000000000102"
+    session = FakeSession([FakeResult(rows=_revenue_code_count_rows(include_rate_count=True))])
+    tables = ptg2_serving.PTG2ServingTables(
+        arch_version="postgres_binary_v3",
+        storage="manifest_snapshot",
+        serving_binary_table="mrf.ptg2_serving_binary_fixture",
+        code_count_table="mrf.ptg2_code_count_fixture",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dictionary_fixture",
+        serving_table_layout="lean_provider_key_v1",
+    )
+    variant_reader = AsyncMock(
+        return_value=[
+            _manifest_fixture_rate_row(
+                code_key=7,
+                reported_code="0110",
+                provider_set_id=canonical_provider_set_id,
+                price_set_id=canonical_price_set_id,
+                provider_count=2,
+            ),
+            _manifest_fixture_rate_row(
+                code_key=8,
+                reported_code="110",
+                provider_set_id=raw_provider_set_id,
+                price_set_id=raw_price_set_id,
+                provider_count=3,
+            ),
+        ]
+    )
+    price_reader = AsyncMock(
+        return_value={
+            canonical_price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": "100.00"}],
+            raw_price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": "200.00"}],
+        }
+    )
+    procedure_reader = AsyncMock(
+        return_value={
+            ("RC", "0110"): {"procedure_name": "Example revenue service"},
+            ("RC", "110"): {"procedure_name": "Example revenue service"},
+        }
+    )
+    monkeypatch.setattr(ptg2_serving, "_merge_manifest_code_variant_rows", variant_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_reader)
+    return SimpleNamespace(
+        session=session,
+        tables=tables,
+        variant_reader=variant_reader,
+        price_reader=price_reader,
+        canonical_price_set_id=canonical_price_set_id,
+        raw_price_set_id=raw_price_set_id,
+    )
 
 
 def _fake_call_sql(session: FakeSession, pattern: str) -> str:
@@ -987,6 +1096,83 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         for item in payload["items"]
     }
     assert prices_by_provider_set == {provider_set_a: 100.0, provider_set_b: 200.0}
+
+
+@pytest.mark.asyncio
+async def test_v3_forward_combines_raw_and_canonical_revenue_codes(monkeypatch):
+    """Forward lookup must preserve rows stored under both revenue-code forms."""
+    fixture = _v3_revenue_forward_fixture(monkeypatch)
+
+    response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        fixture.session,
+        "ptg2:202607:fixture",
+        {"plan_id": "TESTPLAN001", "code": "110", "code_system": "RC"},
+        FakePagination(),
+        fixture.tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert response["pagination"]["total"] == 2
+    assert {response_item["reported_code"] for response_item in response["items"]} == {"0110", "110"}
+    assert [code_row["code_key"] for code_row in fixture.variant_reader.await_args.kwargs["code_rows"]] == [7, 8]
+    assert fixture.price_reader.await_args.args[2] == [
+        fixture.canonical_price_set_id,
+        fixture.raw_price_set_id,
+    ]
+    code_sql = str(fixture.session.calls[0][0][0])
+    code_params_by_name = fixture.session.calls[0][0][1]
+    assert "reported_code IN (:reported_code, :reported_code_1)" in code_sql
+    assert "LIMIT 1" not in code_sql
+    assert code_params_by_name["reported_code"] == "0110"
+    assert code_params_by_name["reported_code_1"] == "110"
+
+
+@pytest.mark.asyncio
+async def test_code_variant_rows_merge_before_pagination(monkeypatch):
+    row_reader = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "serving_content_hash_128": f"{7:032x}",
+                    "reported_code_system": "RC",
+                    "reported_code": "0110",
+                    "provider_set_global_id_128": f"{17:032x}",
+                    "provider_count": 2,
+                    "price_set_global_id_128": f"{27:032x}",
+                }
+            ],
+            [
+                {
+                    "serving_content_hash_128": f"{8:032x}",
+                    "reported_code_system": "RC",
+                    "reported_code": "110",
+                    "provider_set_global_id_128": f"{18:032x}",
+                    "provider_count": 9,
+                    "price_set_global_id_128": f"{28:032x}",
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_rows_from_serving_by_code_sidecar",
+        row_reader,
+    )
+
+    merged_rows = await ptg2_serving._merge_manifest_code_variant_rows(
+        object(),
+        ptg2_serving.PTG2ServingTables(),
+        code_rows=_revenue_code_count_rows(),
+        provider_set_keys=None,
+        source_trace_set_hash=None,
+        network_names=[],
+        limit=1,
+        offset=1,
+    )
+
+    assert [serving_row["reported_code"] for serving_row in merged_rows] == ["0110"]
+    assert [call.kwargs["limit"] for call in row_reader.await_args_list] == [2, 2]
+    assert [call.kwargs["offset"] for call in row_reader.await_args_list] == [0, 0]
 
 
 @pytest.mark.asyncio
@@ -2729,27 +2915,106 @@ async def test_ptg2_code_context_expands_internal_code_crosswalk():
 
 
 @pytest.mark.asyncio
-async def test_ptg2_code_context_keeps_non_procedure_system_exact():
+async def test_ptg2_code_context_matches_raw_and_canonical_revenue_codes():
     context = await ptg2_serving._resolve_ptg2_code_search_context(
         FakeSession([]),
-        code="0450",
+        code="110",
         code_system="RC",
     )
     filters = []
-    params = {}
+    params_by_name = {}
 
     ptg2_serving._append_resolved_code_filter(
         filters,
-        params,
-        code="0450",
+        params_by_name,
+        code="110",
         code_system="RC",
         code_context=context,
     )
 
     assert context is None
     assert "reported_code_system = :reported_code_system" in filters[0]
-    assert params["reported_code_system"] == "RC"
-    assert params["reported_code"] == "0450"
+    assert "reported_code IN (:reported_code, :reported_code_1)" in filters[0]
+    assert params_by_name["reported_code_system"] == "RC"
+    assert params_by_name["reported_code"] == "0110"
+    assert params_by_name["reported_code_1"] == "110"
+
+
+def test_manifest_code_filter_matches_revenue_code_forms():
+    filters = []
+    params_by_name = {}
+
+    ptg2_serving._append_manifest_reported_code_filter(
+        filters,
+        params_by_name,
+        code="0110",
+        code_system="RC",
+    )
+
+    assert "reported_code_system = :reported_code_system_0" in filters[0]
+    assert "reported_code = :reported_code_0" in filters[0]
+    assert "reported_code_system = :reported_code_system_1" in filters[0]
+    assert "reported_code = :reported_code_1" in filters[0]
+    assert params_by_name["reported_code_system_0"] == "RC"
+    assert params_by_name["reported_code_0"] == "0110"
+    assert params_by_name["reported_code_system_1"] == "RC"
+    assert params_by_name["reported_code_1"] == "110"
+
+
+def test_preferred_code_rows_select_plan_scope_per_code_form():
+    preferred_rows = ptg2_serving._preferred_code_metadata_rows(
+        [
+            {"code_key": 1, "plan_id": "", "reported_code_system": "RC", "reported_code": "0110"},
+            {
+                "code_key": 2,
+                "plan_id": "TESTPLAN001",
+                "reported_code_system": "RC",
+                "reported_code": "0110",
+            },
+            {"code_key": 3, "plan_id": "", "reported_code_system": "RC", "reported_code": "110"},
+        ],
+        "TESTPLAN001",
+    )
+
+    assert [row["code_key"] for row in preferred_rows] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_v3_reverse_matches_revenue_code_forms():
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_key": 7,
+                        "plan_id": "TESTPLAN001",
+                        "reported_code_system": "RC",
+                        "reported_code": "110",
+                        "rate_count": 1,
+                    }
+                ]
+            )
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(code_count_table="mrf.ptg2_code_count_fixture")
+
+    metadata_rows = await ptg2_serving._ptg2_manifest_code_rows_for_provider_reverse(
+        session,
+        tables,
+        requested_plan="TESTPLAN001",
+        code_value="110",
+        code_system="RC",
+        q_text="",
+        code_context=None,
+    )
+
+    assert metadata_rows[0]["reported_code"] == "110"
+    sql = str(session.calls[0][0][0])
+    query_params_by_name = session.calls[0][0][1]
+    assert "reported_code = :reported_code_0" in sql
+    assert "reported_code = :reported_code_1" in sql
+    assert query_params_by_name["reported_code_0"] == "0110"
+    assert query_params_by_name["reported_code_1"] == "110"
 
 
 @pytest.mark.asyncio
@@ -3359,6 +3624,113 @@ async def test_search_current_ptg2_index_combined_pagination_reports_has_more(mo
     assert combined_payload["pagination"]["has_more"] is True
 
 
+def test_manifest_route_item_candidates_include_raw_and_canonical_revenue_code():
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+        storage="manifest_snapshot",
+        id_storage="uuid",
+    )
+
+    candidates = ptg2_serving._ptg2_route_item_table_candidates(
+        tables,
+        plan_id="TESTPLAN001",
+        code_system="RC",
+        code="110",
+    )
+
+    assert candidates == (
+        "mrf.ptg2_route_item_3f764988bc31fee2_testplan001_rc_0110",
+        "mrf.ptg2_route_item_3f764988bc31fee2_testplan001_rc_110",
+        "mrf.ptg2_route_item_3f764_testplan001_rc_0110",
+        "mrf.ptg2_route_item_3f764_testplan001_rc_110",
+    )
+
+
+@pytest.mark.asyncio
+async def test_manifest_route_item_tables_select_each_revenue_code_form(monkeypatch):
+    availability_check = AsyncMock(return_value=True)
+    column_check = AsyncMock(return_value=True)
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", availability_check)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_table_has_columns", column_check)
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_3f764988bc31fee2",
+    )
+
+    route_tables = await ptg2_serving._ptg2_route_item_tables(
+        FakeSession([]),
+        tables,
+        plan_id="TESTPLAN001",
+        code_system="RC",
+        code="110",
+    )
+
+    assert route_tables == (
+        "mrf.ptg2_route_item_3f764988bc31fee2_testplan001_rc_0110",
+        "mrf.ptg2_route_item_3f764988bc31fee2_testplan001_rc_110",
+    )
+    assert availability_check.await_count == 2
+    assert column_check.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manifest_route_item_fast_path_unions_revenue_code_tables(monkeypatch):
+    route_tables = (
+        "mrf.ptg2_route_item_fixture_testplan001_rc_0110",
+        "mrf.ptg2_route_item_fixture_testplan001_rc_110",
+    )
+    route_table_lookup = AsyncMock(return_value=route_tables)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_route_item_tables", route_table_lookup)
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "item_payload": {"npi": 1234567890, "reported_code": "0110"},
+                        "distance_miles": 1.0,
+                        "zip_rank": 1,
+                        "total_matches": 2,
+                    },
+                    {
+                        "item_payload": {"npi": 1234567891, "reported_code": "110"},
+                        "distance_miles": 2.0,
+                        "zip_rank": 1,
+                        "total_matches": 2,
+                    },
+                ]
+            )
+        ]
+    )
+
+    response = await ptg2_serving._search_ptg2_manifest_route_item_table(
+        session,
+        "ptg2:fixture",
+        {
+            "plan_id": "TESTPLAN001",
+            "code": "110",
+            "code_system": "RC",
+            "include_providers": "true",
+            "lat": "40.0",
+            "long": "-75.0",
+            "radius_miles": "10",
+        },
+        FakePagination(),
+        ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_fixture"),
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+        requested_plan="TESTPLAN001",
+        requested_system="RC",
+        requested_code="0110",
+    )
+
+    query_sql = str(session.calls[0][0][0])
+    assert response["pagination"]["total"] == 2
+    assert response["pagination"]["has_more"] is False
+    assert "UNION ALL" in query_sql
+    assert all(table_name in query_sql for table_name in route_tables)
+    assert "0::integer AS route_table_ordinal" in query_sql
+    assert "1::integer AS route_table_ordinal" in query_sql
+    assert "route_table_ordinal, location_hash NULLS LAST" in query_sql
+
+
 @pytest.mark.asyncio
 async def test_manifest_route_item_table_fast_path_shapes_payload():
     columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
@@ -3426,7 +3798,8 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
     assert response["pagination"]["has_more"] is True
     route_sql = str(session.calls[-1][0][0])
     assert "FROM location_zip_scope zip_scope" not in route_sql
-    assert "FROM mrf.ptg2_route_item_fixture_table_a_testplan001_cpt_90837 r" in route_sql
+    assert "FROM mrf.ptg2_route_item_fixture_table_a_testplan001_cpt_90837" in route_sql
+    assert "FROM route_items r" in route_sql
     assert "COUNT(*) OVER () AS total_matches" in route_sql
     assert "ORDER BY min_rate ASC NULLS LAST" in route_sql
 
@@ -3502,7 +3875,8 @@ async def test_manifest_route_item_table_fast_path_supports_lat_long_taxonomy_fi
     assert response["pagination"]["has_more"] is False
     route_sql = str(session.calls[-1][0][0])
     route_params = session.calls[-1][0][1]
-    assert "FROM mrf.ptg2_route_item_7cabb84262c9_testplan001_cpt_99213 r" in route_sql
+    assert "FROM mrf.ptg2_route_item_7cabb84262c9_testplan001_cpt_99213" in route_sql
+    assert "FROM route_items r" in route_sql
     assert "r.npi IN (SELECT route_item_specialty_nt.npi" in route_sql
     assert "route_item_specialty_nt.npi = r.npi" not in route_sql
     assert "UPPER(COALESCE(route_item_specialty_nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'" in route_sql
@@ -3664,6 +4038,34 @@ async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(m
         "reported_code": "99213",
         "reported_code_system": "CPT",
     }
+
+
+@pytest.mark.asyncio
+async def test_manifest_snapshot_preflight_matches_revenue_code_forms(monkeypatch):
+    class RealishFakeSession(FakeSession):
+        sync_session = object()
+
+    session = RealishFakeSession([FakeResult(scalar=True)])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_fixture",
+        code_count_table="mrf.ptg2_code_count_fixture",
+        serving_table_layout="lean_provider_key_v1",
+    )
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
+
+    result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+        session,
+        "ptg2:fixture",
+        {"plan_id": "TESTPLAN001", "code": "110", "code_system": "RC"},
+        serving_tables=tables,
+    )
+
+    sql = str(session.calls[0][0][0])
+    params_by_name = session.calls[0][0][1]
+    assert result is True
+    assert "reported_code IN (:reported_code, :reported_code_1)" in sql
+    assert params_by_name["reported_code"] == "0110"
+    assert params_by_name["reported_code_1"] == "110"
 
 
 @pytest.mark.asyncio
@@ -5287,6 +5689,57 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
     assert "provider_set_dictionary.provider_set_key = serving.provider_set_key" in sql
     assert "code_count.plan_id = :plan_id" in sql
     assert "code_count.reported_code = :reported_code" in sql
+
+
+@pytest.mark.asyncio
+async def test_manifest_rate_scope_combines_revenue_code_forms(monkeypatch):
+    """Provider scope must include sets stored under both revenue-code forms."""
+    canonical_provider_set_id = "00000000000000000000000000000012"
+    raw_provider_set_id = "00000000000000000000000000000013"
+    canonical_group_id = "00000000000000000000000000000021"
+    raw_group_id = "00000000000000000000000000000022"
+    session = FakeSession([FakeResult(rows=_revenue_code_count_rows())])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_binary_table="mrf.ptg2_serving_binary_fixture",
+        code_count_table="mrf.ptg2_code_count_fixture",
+        provider_set_dictionary_table="mrf.ptg2_provider_set_dictionary_fixture",
+        serving_table_layout="lean_provider_key_v1",
+        artifacts={"provider_forward": {"path": "postgres://provider-forward"}},
+    )
+    sidecar_reader = AsyncMock(
+        side_effect=[
+            (SimpleNamespace(provider_set_key=1),),
+            (SimpleNamespace(provider_set_key=2),),
+        ]
+    )
+    provider_set_reader = AsyncMock(
+        return_value={1: canonical_provider_set_id, 2: raw_provider_set_id}
+    )
+    member_reader = AsyncMock(
+        return_value={
+            canonical_provider_set_id: (canonical_group_id,),
+            raw_provider_set_id: (raw_group_id,),
+        }
+    )
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_lookup_serving_by_code_sidecar", sidecar_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_set_ids_for_keys", provider_set_reader)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", member_reader)
+
+    group_ids = await ptg2_serving._manifest_rate_provider_groups_from_sidecar(
+        session,
+        tables,
+        serving_table=None,
+        plan_id="TESTPLAN001",
+        reported_code="0110",
+        code_system="RC",
+    )
+
+    query_sql = str(session.calls[0][0][0])
+    assert group_ids == (canonical_group_id, raw_group_id)
+    assert provider_set_reader.await_args.args[2] == [1, 2]
+    assert member_reader.await_args.args[3] == (canonical_provider_set_id, raw_provider_set_id)
+    assert "LIMIT 1" not in query_sql
+    assert "code_count.reported_code IN (:reported_code, :reported_code_1)" in query_sql
 
 
 @pytest.mark.asyncio
