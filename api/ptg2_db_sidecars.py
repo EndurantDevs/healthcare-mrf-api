@@ -1520,6 +1520,33 @@ async def lookup_serving_binary_by_code_from_db(
     )
 
 
+async def lookup_price_ids_from_db(
+    session: Any,
+    table_name: str,
+    price_keys: Iterable[int],
+    *,
+    price_dictionary_item_count: int | None = None,
+    price_dictionary_block_bytes: int | None = None,
+    price_dictionary_compressed_records: int | None = None,
+) -> dict[int, str]:
+    """Resolve selected dense price keys without decoding serving rows."""
+
+    normalized_price_keys = {int(price_key) for price_key in price_keys}
+    if not normalized_price_keys:
+        return {}
+    return await _serving_binary_dictionary_values_for_keys(
+        session,
+        table_name,
+        artifact_kind=_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
+        item_keys=normalized_price_keys,
+        **_dictionary_value_lookup_hints(
+            price_dictionary_item_count,
+            price_dictionary_block_bytes,
+            price_dictionary_compressed_records,
+        ),
+    )
+
+
 def _decode_serving_binary_code_records(
     records: Iterable[Mapping[str, Any]],
     *,

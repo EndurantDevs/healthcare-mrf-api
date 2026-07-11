@@ -50,12 +50,17 @@ PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND = "provider_set_count_diction
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_KIND = "by_provider_set"
 PTG2_SERVING_BINARY_BY_PROVIDER_SET_DICTIONARY_KIND = "by_provider_set_price_dictionary"
 PTG2_SERVING_BINARY_PRICE_SET_ATOMS_BY_ID_V2_KIND = "price_set_atoms_by_id_v2"
+PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND = "by_code_page_v3_f2"
+PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND = "provider_set_page_v3_s1"
+PTG2_SERVING_BINARY_V3_PAGE_ROWS = 64
+PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN = 1
+PTG2_SERVING_BINARY_V3_STREAM_COUNT = 4
 PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND = "provider_set_codes_v3"
 PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND = "price_set_atom_memberships_v3"
 PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND = "price_atoms_v3"
 PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND = "by_code_assigned_v3"
 PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND = "by_code_price_dictionary_v3"
-PTG2_SERVING_BINARY_V3_ARTIFACT_VERSION = 3
+PTG2_SERVING_BINARY_V3_ARTIFACT_VERSION = 4
 PTG2_SERVING_BINARY_BLOCK_BYTES_ENV = "HLTHPRT_PTG2_SERVING_BINARY_BLOCK_BYTES"
 PTG2_SERVING_BINARY_DICTIONARY_BLOCK_BYTES_ENV = (
     "HLTHPRT_PTG2_SERVING_BINARY_DICTIONARY_BLOCK_BYTES"
@@ -116,8 +121,10 @@ _V3_ATTRIBUTE_KEY_COLUMNS = (
 _V3_REQUIRED_ARTIFACT_KINDS = frozenset(
     {
         PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+        PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
         PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND,
         PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+        PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
         PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
         PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
         PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
@@ -2530,6 +2537,67 @@ def _v3_provider_stats_from_summary(summary: Mapping[str, Any]) -> dict[str, int
     }
 
 
+def _validate_v3_page_summaries(
+    by_code_summary: Mapping[str, Any],
+    provider_stats: Mapping[str, int],
+) -> None:
+    """Tie bounded projection summaries to authoritative stream cardinalities."""
+
+    source_row_count = _v3_summary_integer(by_code_summary, "assigned by-code", "row_count")
+    source_code_count = _v3_summary_integer(by_code_summary, "assigned by-code", "code_count")
+    forward_page_summary = by_code_summary.get("by_code_page")
+    provider_page_summary = by_code_summary.get("provider_set_page")
+    if not isinstance(forward_page_summary, Mapping) or not isinstance(
+        provider_page_summary, Mapping
+    ):
+        raise RuntimeError("PTG2 v3 assigned stream omitted a required page projection")
+    _validate_v3_summary_kind(
+        forward_page_summary,
+        PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+    )
+    _validate_v3_summary_kind(
+        provider_page_summary,
+        PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+    )
+    if _v3_summary_integer(forward_page_summary, "forward page", "page_rows") != (
+        PTG2_SERVING_BINARY_V3_PAGE_ROWS
+    ):
+        raise RuntimeError("PTG2 v3 forward page width mismatch")
+    if _v3_summary_integer(forward_page_summary, "forward page", "code_count") != source_code_count:
+        raise RuntimeError("PTG2 v3 forward page omitted a code")
+    forward_row_count = _v3_summary_integer(forward_page_summary, "forward page", "row_count")
+    if not source_code_count <= forward_row_count <= source_row_count:
+        raise RuntimeError("PTG2 v3 forward page row count is inconsistent")
+    if _v3_summary_integer(provider_page_summary, "reverse page", "page_rows") != (
+        PTG2_SERVING_BINARY_V3_PAGE_ROWS
+    ):
+        raise RuntimeError("PTG2 v3 reverse page width mismatch")
+    if _v3_summary_integer(provider_page_summary, "reverse page", "block_span") != (
+        PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN
+    ):
+        raise RuntimeError("PTG2 v3 reverse page block span mismatch")
+    provider_set_count = _v3_summary_integer(
+        provider_page_summary,
+        "reverse page",
+        "provider_set_count",
+    )
+    if provider_set_count != int(provider_stats["provider_set_count"]):
+        raise RuntimeError("PTG2 v3 reverse page omitted a provider set")
+    if _v3_summary_integer(
+        provider_page_summary,
+        "reverse page",
+        "source_row_count",
+    ) != source_row_count:
+        raise RuntimeError("PTG2 v3 reverse page source row count mismatch")
+    provider_page_row_count = _v3_summary_integer(
+        provider_page_summary,
+        "reverse page",
+        "row_count",
+    )
+    if not provider_set_count <= provider_page_row_count <= source_row_count:
+        raise RuntimeError("PTG2 v3 reverse page row count is inconsistent")
+
+
 def _v3_membership_stats_from_summary(
     summary: Mapping[str, Any],
     *,
@@ -2639,12 +2707,22 @@ def _validate_v3_physical_entries(
     membership_stats: Mapping[str, Any],
     atom_count: int,
 ) -> None:
+    forward_page_summary = by_code_summary.get("by_code_page")
+    provider_page_summary = by_code_summary.get("provider_set_page")
+    if not isinstance(forward_page_summary, Mapping) or not isinstance(
+        provider_page_summary, Mapping
+    ):
+        raise RuntimeError("PTG2 v3 by-code summary is missing page projections")
     expected_entry_count_by_kind = {
         PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND: _v3_summary_integer(
             by_code_summary, "assigned by-code", "group_count"
         ),
+        PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND: _v3_summary_integer(
+            forward_page_summary, "forward page", "row_count"
+        ),
         PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND: price_set_count,
         PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND: int(provider_stats["provider_set_count"]),
+        PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND: int(provider_stats["provider_set_count"]),
         PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: int(provider_stats["provider_set_count"]),
         PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: int(
             membership_stats["price_set_count"]
@@ -2685,6 +2763,10 @@ def _validate_v3_stream_artifacts(
     artifact_kind_by_stream_kind = {
         PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND: (
             PTG2_SERVING_BINARY_BY_CODE_DICTIONARY_KIND
+        ),
+        PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND: PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+        PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND: (
+            PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND
         ),
         PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: (
             PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND
@@ -2820,6 +2902,7 @@ def _v3_build_stats_from_summaries(
     provider_stats = _v3_provider_stats_from_summary(
         summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND]
     )
+    _validate_v3_page_summaries(by_code_summary, provider_stats)
     membership_stats = _v3_membership_stats_from_summary(
         summary_by_kind[PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND],
         price_set_count=price_set_count,
@@ -2947,13 +3030,7 @@ async def _finish_v3_serving_binary(
         progress_callback=publish_options.progress_callback,
     )
     timing_by_stage["v3_stream_seconds"] = _elapsed_seconds(stream_started_at)
-    by_code_summary = stream_summary_by_kind[PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND]
-    provider_code_summary = by_code_summary.get("provider_set_codes")
-    if not isinstance(provider_code_summary, Mapping):
-        raise RuntimeError("PTG2 v3 fused by-code stream omitted provider-set codes")
-    stream_summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND] = dict(
-        provider_code_summary
-    )
+    by_code_summary = _register_v3_fused_summaries(stream_summary_by_kind)
     provider_stats, membership_stats = _v3_build_stats_from_summaries(
         stream_summary_by_kind,
         expected_row_count=publish_options.expected_row_count,
@@ -2977,11 +3054,87 @@ async def _finish_v3_serving_binary(
     )
 
 
+def _register_v3_fused_summaries(
+    stream_summary_by_kind: dict[str, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Expose fused by-code artifact summaries under their physical kinds."""
+
+    by_code_summary = stream_summary_by_kind[
+        PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND
+    ]
+    nested_summary_fields = (
+        (
+            "provider_set_codes",
+            PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+            "provider-set codes",
+        ),
+        (
+            "by_code_page",
+            PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+            "forward page projection",
+        ),
+        (
+            "provider_set_page",
+            PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+            "reverse page projection",
+        ),
+    )
+    for summary_field, artifact_kind, label in nested_summary_fields:
+        nested_summary = by_code_summary.get(summary_field)
+        if not isinstance(nested_summary, Mapping):
+            raise RuntimeError(f"PTG2 v3 fused by-code stream omitted {label}")
+        stream_summary_by_kind[artifact_kind] = dict(nested_summary)
+    return by_code_summary
+
+
+def _validate_v3_final_artifacts(
+    publish_options: _V3PublishOptions,
+    build_state: _V3BuildState,
+    storage_summary: Mapping[str, Any],
+    artifact_summary_by_kind: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Cross-check persisted v3 artifacts against every authoritative count."""
+
+    atom_count = int(build_state.atom_map_stats["row_count"] or 0)
+    price_set_count = int(build_state.price_map_stats["row_count"] or 0)
+    _validate_v3_physical_entries(
+        artifact_summary_by_kind,
+        by_code_summary=build_state.by_code_summary,
+        price_set_count=price_set_count,
+        provider_stats=build_state.provider_stats,
+        membership_stats=build_state.membership_stats,
+        atom_count=atom_count,
+    )
+    _validate_v3_stream_artifacts(build_state.stream_summary_by_kind, artifact_summary_by_kind)
+    _validate_v3_total_storage(storage_summary, artifact_summary_by_kind)
+    by_code_record_count = sum(
+        artifact_summary_by_kind[artifact_kind]["record_count"]
+        for artifact_kind in (
+            PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
+            PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
+            PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND,
+        )
+    )
+    _validate_v3_copy_records(
+        build_state.by_code_summary,
+        {"record_count": by_code_record_count},
+        "by-code",
+    )
+    if publish_options.expected_row_count is not None:
+        persisted_source_rows = _v3_summary_integer(
+            build_state.by_code_summary,
+            "assigned by-code",
+            "row_count",
+        )
+        if persisted_source_rows != publish_options.expected_row_count:
+            raise RuntimeError("PTG2 v3 finalized source row count mismatch")
+
+
 async def _finalize_v3_serving_binary(
     publish_options: _V3PublishOptions, build_state: _V3BuildState
 ) -> dict[str, Any]:
-    atom_count = int(build_state.atom_map_stats["row_count"] or 0)
-    price_set_count = int(build_state.price_map_stats["row_count"] or 0)
     _emit_progress(
         publish_options.progress_callback,
         "serving binary finalizing",
@@ -2999,28 +3152,11 @@ async def _finalize_v3_serving_binary(
         schema_name=publish_options.schema_name,
         target_table=publish_options.target_table,
     )
-    _validate_v3_physical_entries(
+    _validate_v3_final_artifacts(
+        publish_options,
+        build_state,
+        storage_summary,
         artifact_summary_by_kind,
-        by_code_summary=build_state.by_code_summary,
-        price_set_count=price_set_count,
-        provider_stats=build_state.provider_stats,
-        membership_stats=build_state.membership_stats,
-        atom_count=atom_count,
-    )
-    _validate_v3_stream_artifacts(build_state.stream_summary_by_kind, artifact_summary_by_kind)
-    _validate_v3_total_storage(storage_summary, artifact_summary_by_kind)
-    by_code_record_count = sum(
-        artifact_summary_by_kind[artifact_kind]["record_count"]
-        for artifact_kind in (
-            PTG2_SERVING_BINARY_BY_CODE_GROUPED_KIND,
-            PTG2_SERVING_BINARY_PROVIDER_COUNT_DICTIONARY_KIND,
-            PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
-        )
-    )
-    _validate_v3_copy_records(
-        build_state.by_code_summary,
-        {"record_count": by_code_record_count},
-        "by-code",
     )
     build_state.timing_by_stage["total_seconds"] = _elapsed_seconds(build_state.started_at)
     _emit_progress(
@@ -3091,8 +3227,11 @@ def _v3_serving_manifest(
         "row_count": int(build_state.by_code_summary.get("row_count") or 0),
         "source_copy_format": "binary",
         "target_copy_format": _serving_binary_target_copy_format(),
-        "stream_tasks": min(_serving_binary_stream_tasks(), len(build_state.stream_summary_by_kind)),
+        "stream_tasks": min(_serving_binary_stream_tasks(), PTG2_SERVING_BINARY_V3_STREAM_COUNT),
         "by_code": dict(build_state.by_code_summary),
+        PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND: dict(
+            build_state.stream_summary_by_kind[PTG2_SERVING_BINARY_BY_CODE_PAGE_V3_KIND]
+        ),
         "price_dictionary": dict(
             build_state.stream_summary_by_kind[
                 PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND
@@ -3100,6 +3239,9 @@ def _v3_serving_manifest(
         ),
         PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND: dict(
             build_state.stream_summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND]
+        ),
+        PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND: dict(
+            build_state.stream_summary_by_kind[PTG2_SERVING_BINARY_PROVIDER_SET_PAGE_V3_KIND]
         ),
         PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND: dict(
             build_state.stream_summary_by_kind[
