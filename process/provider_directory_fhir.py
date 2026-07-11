@@ -105,6 +105,10 @@ PLAN_NET_NETWORK_REFERENCE_EXTENSION_URLS = frozenset(
             "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
             "StructureDefinition/network-reference"
         ),
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/plannet-ParticipatingNetwork-extension"
+        ),
     }
 )
 _PUBLISH_SCOPE_UNSET = object()
@@ -4755,6 +4759,7 @@ def parse_fhir_resource(
             resource,
             "plan",
             "hios",
+            "formulary_id",
             allow_systemless=True,
         )
         row = {
