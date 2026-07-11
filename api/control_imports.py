@@ -859,6 +859,39 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
     return [normalize_run(row) for row in result.scalars().all()]
 
 
+_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
+_PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
+_PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
+_PROVIDER_DIRECTORY_EXCLUSIVE = "exclusive"
+
+
+def _normalize_connection_run(connection_row: Any) -> dict[str, Any]:
+    mapping = getattr(connection_row, "_mapping", None)
+    return normalize_run(dict(mapping) if mapping is not None else connection_row)
+
+
+async def _active_idempotency_run(connection: Any, idempotency_key: str) -> dict[str, Any] | None:
+    statement = (
+        select(ImportRun.__table__)
+        .where(ImportRun.idempotency_key == idempotency_key)
+        .where(ImportRun.status.in_(ACTIVE_STATUSES))
+        .limit(1)
+    )
+    active_rows = await connection.all(statement)
+    return _normalize_connection_run(active_rows[0]) if active_rows else None
+
+
+async def _active_importer_runs(connection: Any, importer: str) -> list[dict[str, Any]]:
+    statement = (
+        select(ImportRun.__table__)
+        .where(ImportRun.importer == importer)
+        .where(ImportRun.status.in_(ACTIVE_STATUSES))
+        .order_by(ImportRun.created_at.asc())
+    )
+    active_rows = await connection.all(statement)
+    return [_normalize_connection_run(active_row) for active_row in active_rows]
+
+
 def _canonical_provider_directory_endpoint_scope(value: Any) -> str | None:
     from urllib.parse import urlsplit
 
@@ -907,11 +940,8 @@ def _provider_directory_acquisition_scope(
         return None
     if source_concurrency != 1:
         return None
-    source_values = params.get("source_ids")
-    if not isinstance(source_values, list):
-        return None
-    source_ids = frozenset(str(source_id).strip() for source_id in source_values if str(source_id).strip())
-    if not source_ids or len(source_ids) != len(source_values):
+    source_ids = _provider_directory_source_ids(params.get("source_ids"))
+    if source_ids is None:
         return None
     raw_endpoint_scope = str(params.get("provider_directory_endpoint_scope") or "").strip()
     endpoint_scopes = set()
@@ -935,18 +965,57 @@ def _provider_directory_acquisition_scope(
     return source_ids, endpoint_scopes.pop()
 
 
+def _provider_directory_source_ids(source_values: Any) -> frozenset[str] | None:
+    if not isinstance(source_values, list) or not source_values:
+        return None
+    if any(not isinstance(source_id, str) or not source_id.strip() for source_id in source_values):
+        return None
+    source_ids = frozenset(source_id.strip() for source_id in source_values)
+    return source_ids if len(source_ids) == len(source_values) else None
+
+
+def _provider_directory_artifact_scope(params: dict[str, Any]) -> frozenset[str] | None:
+    if params.get("publish_artifacts_only") is not True:
+        return None
+    incompatible_flags = (
+        "import_resources",
+        "canonical_backfill_only",
+        "contact_backfill_only",
+        "refresh_preset",
+        "seed_only",
+        "stale_cleanup",
+        "publish_after_acquisition",
+        "publish_artifacts",
+    )
+    if any(params.get(flag_name) for flag_name in incompatible_flags):
+        return None
+    return _provider_directory_source_ids(params.get("source_ids"))
+
+
+def _provider_directory_operation(
+    params: dict[str, Any],
+    metrics: dict[str, Any] | None = None,
+) -> tuple[str, frozenset[str], str | None]:
+    acquisition_scope = _provider_directory_acquisition_scope(params, metrics)
+    if acquisition_scope is not None:
+        source_ids, endpoint_scope = acquisition_scope
+        return _PROVIDER_DIRECTORY_ACQUISITION, source_ids, endpoint_scope
+    artifact_source_ids = _provider_directory_artifact_scope(params)
+    if artifact_source_ids is not None:
+        return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, artifact_source_ids, None
+    return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
+
+
 def _provider_directory_blocking_run(
     params: dict[str, Any],
     active_runs: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     if not active_runs:
         return None
-    if len(active_runs) >= _provider_directory_max_active():
+    requested_kind, requested_source_ids, requested_endpoint = _provider_directory_operation(params)
+    if requested_kind == _PROVIDER_DIRECTORY_EXCLUSIVE:
         return active_runs[0]
-    requested_scope = _provider_directory_acquisition_scope(params)
-    if requested_scope is None:
-        return active_runs[0]
-    requested_source_ids, requested_endpoint = requested_scope
+    classified_active_runs = []
     for active_run in active_runs:
         active_params = active_run.get("params")
         if not isinstance(active_params, dict):
@@ -954,10 +1023,33 @@ def _provider_directory_blocking_run(
         active_metrics = active_run.get("metrics")
         if not isinstance(active_metrics, dict):
             active_metrics = None
-        active_scope = _provider_directory_acquisition_scope(active_params, active_metrics)
-        if active_scope is None:
+        active_operation = _provider_directory_operation(active_params, active_metrics)
+        if active_operation[0] == _PROVIDER_DIRECTORY_EXCLUSIVE:
             return active_run
-        active_source_ids, active_endpoint = active_scope
+        classified_active_runs.append((active_run, active_operation))
+
+    active_acquisitions = [
+        (active_run, operation)
+        for active_run, operation in classified_active_runs
+        if operation[0] == _PROVIDER_DIRECTORY_ACQUISITION
+    ]
+    if (
+        requested_kind == _PROVIDER_DIRECTORY_ACQUISITION
+        and len(active_acquisitions) >= _provider_directory_max_active()
+    ):
+        return active_acquisitions[0][0]
+
+    for active_run, (active_kind, active_source_ids, active_endpoint) in classified_active_runs:
+        if requested_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+            if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+                return active_run
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
+        if active_kind == _PROVIDER_DIRECTORY_SCOPED_ARTIFACT:
+            if not requested_source_ids.isdisjoint(active_source_ids):
+                return active_run
+            continue
         if not requested_source_ids.isdisjoint(active_source_ids) or requested_endpoint == active_endpoint:
             return active_run
     return None
@@ -988,6 +1080,25 @@ def _normalize_triggered_by(value: Any) -> str:
     return triggered_by[:MAX_TRIGGERED_BY_LENGTH].rstrip("-_:. ") or "api"
 
 
+async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str, Any] | None:
+    async with db.acquire() as connection:
+        await connection.scalar(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            lock_key=_PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY,
+        )
+        idempotency_key = import_row.get("idempotency_key")
+        if idempotency_key:
+            active_run = await _active_idempotency_run(connection, str(idempotency_key))
+            if active_run:
+                return active_run
+        active_runs = await _active_importer_runs(connection, "provider-directory-fhir")
+        blocking_run = _provider_directory_blocking_run(import_row["params"], active_runs)
+        if blocking_run:
+            return blocking_run
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
 async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Create and enqueue an import run unless admission deduplicates it."""
 
@@ -996,17 +1107,15 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         raise ValueError(f"unknown importer: {importer}")
 
     idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
-    if idempotency_key:
+    if idempotency_key and importer != "provider-directory-fhir":
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
-    if importer == "provider-directory-fhir":
-        active_runs = await find_active_runs_by_importer(importer)
-        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
-        blocking_run = _provider_directory_blocking_run(params, active_runs)
-        if blocking_run:
-            return blocking_run, False
-    elif not _allows_parallel_active_importer_runs(importer, payload, idempotency_key):
+    if importer != "provider-directory-fhir" and not _allows_parallel_active_importer_runs(
+        importer,
+        payload,
+        idempotency_key,
+    ):
         active_importer = await find_active_run_by_importer(importer)
         if active_importer:
             return active_importer, False
@@ -1037,7 +1146,12 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         "retry_of_run_id": payload.get("retry_of_run_id"),
     }
     try:
-        await db.execute(insert(ImportRun).values(**row))
+        if importer == "provider-directory-fhir":
+            blocking_run = await _admit_provider_directory_run(row)
+            if blocking_run:
+                return blocking_run, False
+        else:
+            await db.execute(insert(ImportRun).values(**row))
     except IntegrityError:
         if idempotency_key:
             active = await find_active_run_by_idempotency_key(idempotency_key)

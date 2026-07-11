@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import types
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -1413,6 +1414,22 @@ def _provider_directory_acquisition_params(source_id, endpoint_scope, **override
     return params_by_name
 
 
+def _provider_directory_artifact_params(source_id, **overrides):
+    params_by_name = {
+        "publish_artifacts_only": True,
+        "source_ids": [source_id],
+        "import_resources": False,
+        "canonical_backfill_only": False,
+        "contact_backfill_only": False,
+        "seed_only": False,
+        "stale_cleanup": False,
+        "publish_after_acquisition": False,
+        "publish_artifacts": False,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
 def _provider_directory_active_run(run_id, source_id, endpoint_scope):
     return {
         "run_id": run_id,
@@ -1422,11 +1439,154 @@ def _provider_directory_active_run(run_id, source_id, endpoint_scope):
     }
 
 
+def _provider_directory_artifact_run(run_id, source_id):
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "importer": "provider-directory-fhir",
+        "params": _provider_directory_artifact_params(source_id),
+    }
+
+
 def _legacy_provider_directory_active_run(run_id, source_id, endpoint_scope):
     active_run = _provider_directory_active_run(run_id, source_id, endpoint_scope)
     active_run["params"].pop("provider_directory_endpoint_scope")
     active_run["metrics"] = {"active_source_groups": [{"api_base": endpoint_scope}]}
     return active_run
+
+
+class _ProviderAdmissionDb:
+    def __init__(self):
+        self.events = []
+        self.committed = False
+
+    @asynccontextmanager
+    async def acquire(self):
+        self.events.append(("acquire",))
+        try:
+            yield self
+        finally:
+            self.committed = True
+            self.events.append(("commit",))
+
+    async def scalar(self, statement, **params):
+        self.events.append(("scalar", statement, params))
+
+    async def status(self, statement):
+        self.events.append(("status", statement))
+        return 1
+
+    async def execute(self, statement):
+        self.events.append(("execute", statement))
+
+
+def _install_provider_admission_stubs(monkeypatch, active_runs, *, idempotency_run=None):
+    database = _ProviderAdmissionDb()
+
+    async def active_idempotency(connection, _idempotency_key):
+        assert connection is database
+        return idempotency_run
+
+    async def active_importers(connection, importer):
+        assert connection is database
+        assert importer == "provider-directory-fhir"
+        return active_runs
+
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(control_imports, "_active_idempotency_run", active_idempotency)
+    monkeypatch.setattr(control_imports, "_active_importer_runs", active_importers)
+    return database
+
+
+@pytest.mark.parametrize(
+    "artifact_options",
+    [
+        {},
+        {"publish_artifacts_targets": "address_archive,entity_address"},
+        {"publish_corroboration": True},
+        {"publish_corroboration": False},
+    ],
+)
+def test_fhir_scoped_artifact_classifier(artifact_options):
+    params_by_name = _provider_directory_artifact_params("pdfhir_artifact", **artifact_options)
+
+    operation_kind, source_ids, endpoint_scope = control_imports._provider_directory_operation(params_by_name)
+
+    assert operation_kind == control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT
+    assert source_ids == frozenset({"pdfhir_artifact"})
+    assert endpoint_scope is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_override",
+    [
+        {"source_ids": None},
+        {"source_ids": []},
+        {"source_ids": [""]},
+        {"source_ids": ["pdfhir_one", "pdfhir_one"]},
+        {"source_ids": [123]},
+        {"import_resources": True},
+        {"canonical_backfill_only": True},
+        {"contact_backfill_only": True},
+        {"refresh_preset": "monthly-full"},
+        {"seed_only": True},
+        {"stale_cleanup": True},
+        {"publish_after_acquisition": True},
+        {"publish_artifacts": True},
+    ],
+)
+def test_fhir_exclusive_artifact_classifier(unsafe_override):
+    params_by_name = _provider_directory_artifact_params("pdfhir_artifact", **unsafe_override)
+
+    operation_kind, _, _ = control_imports._provider_directory_operation(params_by_name)
+
+    assert operation_kind == control_imports._PROVIDER_DIRECTORY_EXCLUSIVE
+
+
+def test_fhir_artifact_separate_capacity(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "2")
+    first_acquisition = _provider_directory_active_run(
+        "run_one",
+        "pdfhir_one",
+        "https://one.example.org/fhir",
+    )
+    second_acquisition = _provider_directory_active_run(
+        "run_two",
+        "pdfhir_two",
+        "https://two.example.org/fhir",
+    )
+    artifact_run = _provider_directory_artifact_run("run_artifact", "pdfhir_artifact")
+
+    artifact_blocker = control_imports._provider_directory_blocking_run(
+        artifact_run["params"],
+        [first_acquisition, second_acquisition],
+    )
+    acquisition_blocker = control_imports._provider_directory_blocking_run(
+        second_acquisition["params"],
+        [first_acquisition, artifact_run],
+    )
+
+    assert artifact_blocker is None
+    assert acquisition_blocker is None
+
+
+def test_fhir_artifact_conflicts():
+    acquisition_run = _provider_directory_active_run(
+        "run_acquisition",
+        "pdfhir_shared",
+        "https://shared.example.org/fhir",
+    )
+    artifact_run = _provider_directory_artifact_run("run_artifact", "pdfhir_artifact")
+    overlapping_artifact = _provider_directory_artifact_params("pdfhir_shared")
+    second_artifact = _provider_directory_artifact_params("pdfhir_other")
+    overlapping_acquisition = _provider_directory_acquisition_params(
+        "pdfhir_artifact",
+        "https://other.example.org/fhir",
+    )
+
+    assert control_imports._provider_directory_blocking_run(overlapping_artifact, [acquisition_run]) == acquisition_run
+    assert control_imports._provider_directory_blocking_run(second_artifact, [artifact_run]) == artifact_run
+    assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [artifact_run]) == artifact_run
 
 
 def test_provider_directory_legacy_active_group_scope_controls_parallel_admission(monkeypatch):
@@ -1457,14 +1617,7 @@ async def test_create_import_run_replays_provider_directory_idempotency_key(monk
         "https://idaho.example.org/fhir",
     )
 
-    async def fake_find_idem(_idempotency_key):
-        return active
-
-    async def fail_find_active(_importer):
-        raise AssertionError("idempotency replay must precede provider-directory admission")
-
-    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fail_find_active)
+    database = _install_provider_admission_stubs(monkeypatch, [], idempotency_run=active)
 
     replayed_run, created = await create_import_run(
         {"importer": "provider-directory-fhir", "idempotency_key": "idaho-acquisition"}
@@ -1472,28 +1625,20 @@ async def test_create_import_run_replays_provider_directory_idempotency_key(monk
 
     assert created is False
     assert replayed_run == active
+    assert [event[0] for event in database.events] == ["acquire", "scalar", "commit"]
 
 
 @pytest.mark.asyncio
 async def test_create_import_run_allows_disjoint_provider_directory_acquisition(monkeypatch):
-    statements = []
     active = _legacy_provider_directory_active_run(
         "run_cigna",
         "pdfhir_cigna",
         "https://fhir.cigna.com/ProviderDirectory/v1",
     )
 
-    class FakeDb:
-        async def execute(self, statement):
-            statements.append(statement)
-
-    async def fake_find_idem(_idempotency_key):
-        return None
-
-    async def fake_find_active(_importer):
-        return [active]
-
     async def fake_enqueue(row):
+        assert database.committed is True
+        database.events.append(("enqueue", row["run_id"]))
         return {
             "status": "queued",
             "phase_detail": "enqueued",
@@ -1503,9 +1648,7 @@ async def test_create_import_run_allows_disjoint_provider_directory_acquisition(
             "error": None,
         }
 
-    monkeypatch.setattr(control_imports, "db", FakeDb())
-    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
-    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    database = _install_provider_admission_stubs(monkeypatch, [active])
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
     created_run, created = await create_import_run(
@@ -1522,7 +1665,18 @@ async def test_create_import_run_allows_disjoint_provider_directory_acquisition(
 
     assert created is True
     assert created_run["run_id"] == "run_idaho"
-    assert len(statements) == 2
+    assert [event[0] for event in database.events] == [
+        "acquire",
+        "scalar",
+        "status",
+        "commit",
+        "enqueue",
+        "execute",
+    ]
+    lock_event = database.events[1]
+    assert "pg_advisory_xact_lock" in str(lock_event[1])
+    assert lock_event[2] == {"lock_key": control_imports._PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY}
+    assert control_imports._PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY != control_imports._IMPORT_RUN_ADVISORY_LOCK_KEY
 
 
 @pytest.mark.asyncio
@@ -1544,13 +1698,10 @@ async def test_create_import_run_blocks_overlapping_provider_directory_scope(
         "https://fhir.cigna.com/ProviderDirectory/v1",
     )
 
-    async def fake_find_active(_importer):
-        return [active]
-
     async def fail_enqueue(_row):
         raise AssertionError("overlapping provider-directory acquisition must not enqueue")
 
-    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    _install_provider_admission_stubs(monkeypatch, [active])
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
     row, created = await create_import_run(
@@ -1590,13 +1741,10 @@ async def test_create_import_run_blocks_unsafe_provider_directory_parallel_flags
         "https://fhir.cigna.com/ProviderDirectory/v1",
     )
 
-    async def fake_find_active(_importer):
-        return [active]
-
     async def fail_enqueue(_row):
         raise AssertionError("unsafe provider-directory acquisition must not enqueue")
 
-    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    _install_provider_admission_stubs(monkeypatch, [active])
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
     params_by_name = _provider_directory_acquisition_params(
         "pdfhir_idaho",
@@ -1619,13 +1767,10 @@ async def test_create_import_run_blocks_third_provider_directory_acquisition(mon
         _provider_directory_active_run("run_two", "pdfhir_two", "https://two.example.org/fhir"),
     ]
 
-    async def fake_find_active(_importer):
-        return active_runs
-
     async def fail_enqueue(_row):
         raise AssertionError("third provider-directory acquisition must not enqueue")
 
-    monkeypatch.setattr(control_imports, "find_active_runs_by_importer", fake_find_active)
+    _install_provider_admission_stubs(monkeypatch, active_runs)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
     row, created = await create_import_run(

@@ -67,6 +67,144 @@ async def _fake_enqueue(row: dict) -> dict:
     }
 
 
+def _acquisition_params(source_id: str, endpoint_scope: str, **overrides) -> dict:
+    params_by_name = {
+        "import_resources": True,
+        "source_ids": [source_id],
+        "source_concurrency": 1,
+        "provider_directory_endpoint_scope": endpoint_scope,
+        "stale_cleanup": False,
+        "publish_artifacts": False,
+        "publish_after_acquisition": False,
+        "publish_corroboration": False,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
+def _artifact_params(source_id: str, **overrides) -> dict:
+    params_by_name = {
+        "publish_artifacts_only": True,
+        "source_ids": [source_id],
+        "import_resources": False,
+        "canonical_backfill_only": False,
+        "contact_backfill_only": False,
+        "seed_only": False,
+        "stale_cleanup": False,
+        "publish_after_acquisition": False,
+        "publish_artifacts": False,
+    }
+    params_by_name.update(overrides)
+    return params_by_name
+
+
+async def _create_fhir_run(run_id: str, params: dict) -> tuple[dict, bool]:
+    return await control_imports.create_import_run(
+        {
+            "run_id": run_id,
+            "importer": "provider-directory-fhir",
+            "params": params,
+        }
+    )
+
+
+async def _assert_fhir_blocked(run_id: str, params: dict, expected_run_id: str) -> None:
+    blocked_run, created = await _create_fhir_run(run_id, params)
+    assert created is False
+    assert blocked_run["run_id"] == expected_run_id
+
+
+async def test_fhir_admission_matrix(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_ACTIVE", "2")
+        monkeypatch.setattr(control_imports, "_enqueue_import_start", _fake_enqueue)
+        first_acquisition, first_created = await _create_fhir_run(
+            "run_acquisition_one",
+            _acquisition_params("pdfhir_one", "https://one.example.org/fhir"),
+        )
+        artifact_run, artifact_created = await _create_fhir_run(
+            "run_artifact",
+            _artifact_params("pdfhir_artifact"),
+        )
+        await _assert_fhir_blocked(
+            "run_artifact_overlap",
+            _artifact_params("pdfhir_one"),
+            "run_acquisition_one",
+        )
+        await _assert_fhir_blocked(
+            "run_acquisition_artifact_overlap",
+            _acquisition_params("pdfhir_artifact", "https://artifact-overlap.example.org/fhir"),
+            "run_artifact",
+        )
+        await _assert_fhir_blocked(
+            "run_acquisition_overlap",
+            _acquisition_params("pdfhir_one", "https://acquisition-overlap.example.org/fhir"),
+            "run_acquisition_one",
+        )
+        second_acquisition, second_created = await _create_fhir_run(
+            "run_acquisition_two",
+            _acquisition_params("pdfhir_two", "https://two.example.org/fhir"),
+        )
+
+        await _assert_fhir_blocked(
+            "run_artifact_two",
+            _artifact_params("pdfhir_other"),
+            "run_artifact",
+        )
+        await _assert_fhir_blocked(
+            "run_mixed",
+            _artifact_params("pdfhir_mixed", import_resources=True),
+            "run_acquisition_one",
+        )
+
+        assert (first_created, artifact_created, second_created) == (True, True, True)
+        assert [first_acquisition["run_id"], artifact_run["run_id"], second_acquisition["run_id"]] == [
+            "run_acquisition_one",
+            "run_artifact",
+            "run_acquisition_two",
+        ]
+        active_rows = (
+            await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES)))
+        ).scalars().all()
+        assert len(active_rows) == 3
+    finally:
+        await _drop_import_run_schema()
+
+
+async def test_fhir_artifact_admission_race(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setattr(control_imports, "_enqueue_import_start", _fake_enqueue)
+        requests = [
+            control_imports.create_import_run(
+                {
+                    "run_id": f"run_artifact_{index}",
+                    "importer": "provider-directory-fhir",
+                    "params": _artifact_params(f"pdfhir_artifact_{index}"),
+                }
+            )
+            for index in range(2)
+        ]
+
+        admission_results = await asyncio.gather(*requests)
+
+        assert sorted(created for _, created in admission_results) == [False, True]
+        active_rows = (
+            await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES)))
+        ).scalars().all()
+        active_artifacts = [
+            active_row
+            for active_row in active_rows
+            if control_imports._provider_directory_operation(active_row.params)[0]
+            == control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT
+        ]
+        assert len(active_artifacts) == 1
+        assert len(active_rows) == 1
+    finally:
+        await _drop_import_run_schema()
+
+
 async def test_duplicate_idempotency_key_uses_real_partial_unique_index(monkeypatch):
     await _reset_import_run_schema()
     try:
