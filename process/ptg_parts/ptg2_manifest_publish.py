@@ -2692,7 +2692,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
     sidecar_artifacts: Mapping[str, Any] | None = None,
     db_dedupe_fallback: bool | None = None,
     scanner_dedupe_guarded: bool = False,
-    known_serving_rows: int | None = None,
+    known_counts: Mapping[str, int | None] | None = None,
 ) -> dict[str, Any]:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if not await _table_exists(schema_name, stage_table):
@@ -3151,6 +3151,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
         serving_table=serving_work_table,
     )
     stage_started_at = time.monotonic()
+    known_serving_rows = (known_counts or {}).get("serving_rows")
     if known_serving_rows is not None and not dedupe_metrics.get("rescue"):
         row_count = max(int(known_serving_rows), 0)
         publish_stage_timings["count_serving_rows"] = 0.0
@@ -3193,9 +3194,7 @@ async def _publish_ptg2_manifest_serving_snapshot(
                 arch_version=arch_version,
                 price_atom_table_layout=(lean_price_atom_manifest or {}).get("price_atom_table_layout"),
                 price_atom_constant_keys=(lean_price_atom_manifest or {}).get("price_atom_constant_keys"),
-                expected_price_set_count=(
-                    int(dedupe_metrics.get("price_set_unique") or 0) or None
-                ),
+                expected_price_set_count=(known_counts or {}).get("price_sets"),
                 progress_callback=_emit_ptg2_manifest_publish_progress,
             )
             mark_stage("serving_binary_build", stage_started_at)

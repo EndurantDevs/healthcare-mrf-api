@@ -6505,6 +6505,10 @@ async def _fake_postgres_binary_write_result(**kwargs):
 def test_ptg2_manifest_snapshot_publish_postgres_binary_skips_serving_sidecars(monkeypatch):
     status_calls = []
 
+    async def fake_binary_write(**kwargs):
+        assert kwargs["expected_price_set_count"] == 29_122_132
+        return await _fake_postgres_binary_write_result(**kwargs)
+
     async def fake_status(statement, **_params):
         status_calls.append(statement)
 
@@ -6530,13 +6534,14 @@ def test_ptg2_manifest_snapshot_publish_postgres_binary_skips_serving_sidecars(m
     monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
     monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
     monkeypatch.setattr(ptg_manifest_publish, "_write_ptg2_manifest_serving_sidecars", sidecar_mock)
-    monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", _fake_postgres_binary_write_result)
+    monkeypatch.setattr(ptg_manifest_publish, "write_ptg2_serving_binary_table", fake_binary_write)
 
     publish_manifest = asyncio.run(
         process_ptg._publish_ptg2_manifest_serving_snapshot(
             "ptg2_manifest_stage_serving_abc",
             snapshot_id="ptg2:202604:snap",
             source_key="example_dental",
+            known_counts={"price_sets": 29_122_132},
         )
     )
 
@@ -7595,6 +7600,36 @@ def test_manifest_copy_family_cleanup_removes_nonempty_failed_shards(tmp_path):
     assert not worker_copy.exists()
     assert not ready_copy.exists()
     assert unrelated_copy.exists()
+
+
+def test_single_scanner_dedupe_count_requires_one_valid_summary():
+    serving_file_summary_map = {
+        "summary": {
+            "dedupe": {
+                "price_set_unique": 29_122_132,
+            }
+        }
+    }
+
+    assert (
+        process_ptg._single_scanner_dedupe_count(
+            [serving_file_summary_map], "price_set_unique"
+        )
+        == 29_122_132
+    )
+    assert (
+        process_ptg._single_scanner_dedupe_count(
+            [serving_file_summary_map, serving_file_summary_map], "price_set_unique"
+        )
+        is None
+    )
+    assert (
+        process_ptg._single_scanner_dedupe_count(
+            [{"summary": {"dedupe": {"price_set_unique": "invalid"}}}],
+            "price_set_unique",
+        )
+        is None
+    )
 
 
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):

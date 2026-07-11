@@ -4191,6 +4191,11 @@ async def main(
             len(serving_successful_files) == 1
             and _is_postgres_binary_snapshot_arch(_ptg2_snapshot_arch_from_env())
         )
+        expected_price_set_count = (
+            _single_scanner_dedupe_count(serving_successful_files, "price_set_unique")
+            if scanner_dedupe_guarded
+            else None
+        )
         assert source_key_val is not None
         if has_serving_files:
             if not ptg2_manifest_stage_table:
@@ -4217,7 +4222,10 @@ async def main(
                 # deduped manifest support rows.
                 db_dedupe_fallback=not scanner_dedupe_guarded,
                 scanner_dedupe_guarded=scanner_dedupe_guarded,
-                known_serving_rows=manifest_merge_metrics.get("serving_rows"),
+                known_counts={
+                    "serving_rows": manifest_merge_metrics.get("serving_rows"),
+                    "price_sets": expected_price_set_count,
+                },
             )
             failure_report["serving_index"] = serving_index
             ptg2_manifest_stage_table = None
@@ -4609,3 +4617,21 @@ def _collect_manifest_artifacts(
     if len(network_name_sets) == 1:
         artifacts["network_names"] = list(next(iter(network_name_sets)))
     return artifacts
+
+
+def _single_scanner_dedupe_count(
+    serving_files: list[dict[str, Any]], metric_name: str
+) -> int | None:
+    """Return an exact scanner count only when one scanner owned the source."""
+    if len(serving_files) != 1:
+        return None
+    file_summary = serving_files[0]
+    summary = file_summary.get("summary") if isinstance(file_summary, dict) else None
+    dedupe = summary.get("dedupe") if isinstance(summary, dict) else None
+    if not isinstance(dedupe, dict):
+        return None
+    try:
+        metric_value = int(dedupe.get(metric_name) or 0)
+    except (TypeError, ValueError):
+        return None
+    return metric_value if metric_value > 0 else None
