@@ -644,6 +644,40 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+async def _serving_binary_cache_relation_key(session: Any, qualified_table: str) -> str:
+    """Bind process-local binary caches to the live PostgreSQL relation generation."""
+    if not hasattr(session, "sync_session"):
+        return qualified_table
+    identity_by_table = getattr(session, "_ptg2_serving_binary_relation_identity", None)
+    if identity_by_table is None:
+        identity_by_table = {}
+        setattr(session, "_ptg2_serving_binary_relation_identity", identity_by_table)
+    if qualified_table in identity_by_table:
+        return identity_by_table[qualified_table]
+    identity_result = await session.execute(
+        text(
+            """
+            SELECT relation.oid::bigint AS relation_oid,
+                   relation.relfilenode::bigint AS relation_file_node
+              FROM pg_class relation
+             WHERE relation.oid = to_regclass(:qualified_table)
+            """
+        ),
+        {"qualified_table": qualified_table},
+    )
+    raw_identity_row = identity_result.first()
+    if raw_identity_row is None:
+        raise PTG2ManifestArtifactError(f"PTG2 serving binary relation is missing: {qualified_table}")
+    identity_row = _row_mapping(raw_identity_row)
+    relation_oid = identity_row.get("relation_oid")
+    relation_file_node = identity_row.get("relation_file_node")
+    if relation_oid is None or relation_file_node is None:
+        raise PTG2ManifestArtifactError(f"PTG2 serving binary relation is missing: {qualified_table}")
+    relation_key = f"{qualified_table}:{int(relation_oid)}:{int(relation_file_node)}"
+    identity_by_table[qualified_table] = relation_key
+    return relation_key
+
+
 async def _serving_binary_payload_rows(
     session: Any,
     table_name: str,
@@ -652,18 +686,15 @@ async def _serving_binary_payload_rows(
     block_key: int,
 ) -> list[dict[str, Any]]:
     qualified_table = _safe_qualified_table_name(table_name)
-    cache_key = (qualified_table, artifact_kind, int(block_key))
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
+    cache_key = (relation_key, artifact_kind, int(block_key))
     cached_rows = _binary_block_cache_get(cache_key)
     if cached_rows is not _CACHE_MISS:
         return cached_rows
     binary_block_result = await session.execute(
         text(
             f"""
-            SELECT
-                block_key,
-                block_no,
-                entry_count,
-                payload,
+            SELECT block_key, block_no, entry_count, payload,
                 COALESCE(binary_block.payload_compression, 'none') AS payload_compression,
                 binary_block.raw_payload_bytes
               FROM {qualified_table} binary_block
@@ -685,14 +716,16 @@ async def _serving_binary_payload_rows_for_keys(
     artifact_kind: str,
     block_keys: Iterable[int],
 ) -> list[dict[str, Any]]:
+    """Read selected binary blocks while sharing relation-generation-safe cache rows."""
     block_key_values = sorted({int(block_key) for block_key in block_keys})
     if not block_key_values:
         return []
     qualified_table = _safe_qualified_table_name(table_name)
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
     cached_rows_by_key: dict[int, list[dict[str, Any]]] = {}
     missing_block_keys: list[int] = []
     for block_key in block_key_values:
-        cache_key = (qualified_table, artifact_kind, block_key)
+        cache_key = (relation_key, artifact_kind, block_key)
         cached_rows = _binary_block_cache_get(cache_key)
         if cached_rows is _CACHE_MISS:
             missing_block_keys.append(block_key)
@@ -709,11 +742,7 @@ async def _serving_binary_payload_rows_for_keys(
     binary_block_result = await session.execute(
         text(
             f"""
-            SELECT
-                block_key,
-                block_no,
-                entry_count,
-                payload,
+            SELECT block_key, block_no, entry_count, payload,
                 COALESCE(binary_block.payload_compression, 'none') AS payload_compression,
                 binary_block.raw_payload_bytes
               FROM {qualified_table} binary_block
@@ -729,7 +758,7 @@ async def _serving_binary_payload_rows_for_keys(
         fetched_rows_by_key.setdefault(int(binary_block_row_map.get("block_key") or 0), []).append(binary_block_row_map)
     for block_key in missing_block_keys:
         fetched_rows_by_key[block_key] = _binary_block_cache_set(
-            (qualified_table, artifact_kind, block_key),
+            (relation_key, artifact_kind, block_key),
             fetched_rows_by_key.get(block_key, []),
         )
     return [
@@ -746,7 +775,8 @@ async def _serving_binary_dictionary(
     artifact_kind: str,
 ) -> tuple[str, ...]:
     qualified_table = _safe_qualified_table_name(table_name)
-    cache_key = (qualified_table, artifact_kind)
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
+    cache_key = (relation_key, artifact_kind)
     cached_dictionary = _binary_dictionary_cache_get(cache_key)
     if cached_dictionary is not _CACHE_MISS:
         return cached_dictionary
@@ -803,8 +833,9 @@ async def _serving_binary_dictionary_values_for_keys(
     if not requested_keys:
         return {}
     qualified_table = _safe_qualified_table_name(table_name)
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
     values_by_key, missing_keys = _cached_dictionary_values_for_keys(
-        qualified_table,
+        relation_key,
         artifact_kind,
         requested_keys,
     )
@@ -833,7 +864,7 @@ async def _serving_binary_dictionary_values_for_keys(
     for item_key, item_value in missing_values_by_key.items():
         values_by_key[item_key] = item_value
         _binary_dictionary_cache_set(
-            (qualified_table, f"{artifact_kind}:item:{item_key}"),
+            (relation_key, f"{artifact_kind}:item:{item_key}"),
             item_value,
             64,
         )
@@ -841,7 +872,7 @@ async def _serving_binary_dictionary_values_for_keys(
 
 
 def _cached_dictionary_values_for_keys(
-    qualified_table: str,
+    relation_key: str,
     artifact_kind: str,
     item_keys: Iterable[int],
 ) -> tuple[dict[int, str], tuple[int, ...]]:
@@ -851,7 +882,7 @@ def _cached_dictionary_values_for_keys(
     missing_keys: list[int] = []
     for item_key in item_keys:
         cached_value = _binary_dictionary_cache_get(
-            (qualified_table, f"{artifact_kind}:item:{item_key}")
+            (relation_key, f"{artifact_kind}:item:{item_key}")
         )
         if cached_value is _CACHE_MISS:
             missing_keys.append(item_key)
@@ -909,7 +940,8 @@ async def _serving_binary_dictionary_metadata(
     """Return small dictionary metadata without reading its potentially huge payload."""
 
     qualified_table = _safe_qualified_table_name(table_name)
-    cache_key = (qualified_table, f"{artifact_kind}:metadata")
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
+    cache_key = (relation_key, f"{artifact_kind}:metadata")
     cached_metadata = _binary_dictionary_cache_get(cache_key)
     if cached_metadata is not _CACHE_MISS:
         return cached_metadata
@@ -1242,7 +1274,8 @@ async def _binary_price_key_map(
     """Return cached ``price_set_id -> price_key`` mappings for a binary table."""
 
     qualified_table = _safe_qualified_table_name(table_name)
-    cache_key = (qualified_table, f"{_SERVING_BINARY_BY_CODE_DICTIONARY_KIND}:key_by_id")
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
+    cache_key = (relation_key, f"{_SERVING_BINARY_BY_CODE_DICTIONARY_KIND}:key_by_id")
     cached_key_by_id = _binary_dictionary_cache_get(cache_key)
     if cached_key_by_id is not _CACHE_MISS:
         return cached_key_by_id
@@ -1264,7 +1297,8 @@ async def _serving_binary_provider_counts(
     table_name: str,
 ) -> dict[int, int] | None:
     qualified_table = _safe_qualified_table_name(table_name)
-    cache_key = (qualified_table, "provider_set_count_dictionary")
+    relation_key = await _serving_binary_cache_relation_key(session, qualified_table)
+    cache_key = (relation_key, "provider_set_count_dictionary")
     cached_provider_counts = _binary_dictionary_cache_get(cache_key)
     if cached_provider_counts is not _CACHE_MISS:
         return cached_provider_counts

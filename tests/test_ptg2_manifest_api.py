@@ -805,6 +805,7 @@ async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(
         1234567890,
         {
             "plan_id": "TESTPLAN001",
+            "source_key": "network-a",
             "code": "70551",
             "code_system": "CPT",
             "include_details": "true",

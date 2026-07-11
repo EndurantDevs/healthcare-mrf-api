@@ -7039,6 +7039,63 @@ async def _direct_group_ids_by_npi(
     return group_ids_by_npi if len(group_ids_by_npi) <= 200_000 else None
 
 
+@dataclass
+class _GraphLocationProbeState:
+    matched_location_rows: list[dict[str, Any]] = field(default_factory=list)
+    group_ids_by_npi: dict[int, set[str]] = field(default_factory=lambda: defaultdict(set))
+    seen_candidate_npis: set[int] = field(default_factory=set)
+    filtered_candidates: _GraphLocationCandidates | None = None
+
+    async def has_enough_after_append(
+        self,
+        session,
+        serving_tables: PTG2ServingTables,
+        args: dict[str, Any],
+        rate_scope: _ManifestRateScope,
+        candidate_location_rows: list[dict[str, Any]],
+        *,
+        taxonomy_filter_requested: bool,
+        candidate_limit: int,
+    ) -> bool:
+        """Add one ordered address prefix and report when enough matches exist."""
+        appended_count = await _append_rate_matched_locations(
+            session,
+            serving_tables,
+            rate_scope,
+            candidate_location_rows,
+            self.matched_location_rows,
+            self.group_ids_by_npi,
+            self.seen_candidate_npis,
+        )
+        if not appended_count:
+            return False
+        current_candidates = _GraphLocationCandidates(
+            self.matched_location_rows,
+            dict(self.group_ids_by_npi),
+        )
+        if not taxonomy_filter_requested:
+            return len(self.matched_location_rows) >= candidate_limit
+        self.filtered_candidates = await _taxonomy_filtered_candidates(
+            session,
+            args,
+            current_candidates,
+            candidate_limit,
+        )
+        return len(self.filtered_candidates.location_rows) >= candidate_limit
+
+    def observed_match_count(self, *, taxonomy_filter_requested: bool) -> int:
+        """Return matches relevant to the next density projection."""
+        if taxonomy_filter_requested and self.filtered_candidates is not None:
+            return len(self.filtered_candidates.location_rows)
+        return len(self.matched_location_rows)
+
+    def result(self, *, taxonomy_filter_requested: bool) -> _GraphLocationCandidates:
+        """Build the final candidate view after the bounded probe loop."""
+        if taxonomy_filter_requested:
+            return self.filtered_candidates or _GraphLocationCandidates([], {}, taxonomy_filtered=True)
+        return _GraphLocationCandidates(self.matched_location_rows, dict(self.group_ids_by_npi))
+
+
 def _graph_location_probe_batch_size(
     candidate_limit: int,
     *,
@@ -7049,6 +7106,30 @@ def _graph_location_probe_batch_size(
     if taxonomy_filter_requested:
         return min(max(batch_size, candidate_limit * 16), 2000)
     return batch_size
+
+
+def _next_graph_location_probe_limit(
+    current_limit: int,
+    *,
+    batch_size: int,
+    max_candidates: int,
+    observed_matches: int,
+    required_matches: int,
+) -> int:
+    """Grow a prefix probe from observed match density without changing its result set."""
+    current_limit = max(int(current_limit), 1)
+    batch_size = max(int(batch_size), 1)
+    max_candidates = max(int(max_candidates), current_limit)
+    minimum_growth = max(current_limit * 2, current_limit + batch_size)
+    if observed_matches <= 0:
+        proposed_limit = current_limit * 4
+    else:
+        required_matches = max(int(required_matches), 1)
+        projected_limit = (
+            current_limit * required_matches + int(observed_matches) - 1
+        ) // int(observed_matches)
+        proposed_limit = projected_limit + max(projected_limit // 4, batch_size)
+    return min(max(minimum_growth, proposed_limit), current_limit * 8, max_candidates)
 
 
 async def _paged_graph_candidates(
@@ -7063,10 +7144,7 @@ async def _paged_graph_candidates(
     batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=taxonomy_filter_requested)
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
     probe_limit = batch_size
-    matched_location_rows: list[dict[str, Any]] = []
-    group_ids_by_npi: dict[int, set[str]] = defaultdict(set)
-    seen_candidate_npis: set[int] = set()
-    filtered_candidates: _GraphLocationCandidates | None = None
+    probe_state = _GraphLocationProbeState()
     while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
             session,
@@ -7080,37 +7158,29 @@ async def _paged_graph_candidates(
             return None
         if not candidate_location_rows:
             break
-        appended_location_count = await _append_rate_matched_locations(
+        has_enough_matches = await probe_state.has_enough_after_append(
             session,
             serving_tables,
+            args,
             rate_scope,
             candidate_location_rows,
-            matched_location_rows,
-            group_ids_by_npi,
-            seen_candidate_npis,
+            taxonomy_filter_requested=taxonomy_filter_requested,
+            candidate_limit=candidate_limit,
         )
-        if appended_location_count:
-            current_candidates = _GraphLocationCandidates(
-                matched_location_rows,
-                dict(group_ids_by_npi),
-            )
-            if taxonomy_filter_requested:
-                filtered_candidates = await _taxonomy_filtered_candidates(
-                    session,
-                    args,
-                    current_candidates,
-                    candidate_limit,
-                )
-                if len(filtered_candidates.location_rows) >= candidate_limit:
-                    return filtered_candidates
-            elif len(matched_location_rows) >= candidate_limit:
-                break
+        if has_enough_matches:
+            return probe_state.result(taxonomy_filter_requested=taxonomy_filter_requested)
         if probe_limit >= max_candidates:
             break
-        probe_limit = min(max(probe_limit * 2, probe_limit + batch_size), max_candidates)
-    if taxonomy_filter_requested:
-        return filtered_candidates or _GraphLocationCandidates([], {}, taxonomy_filtered=True)
-    return _GraphLocationCandidates(matched_location_rows, dict(group_ids_by_npi))
+        probe_limit = _next_graph_location_probe_limit(
+            probe_limit,
+            batch_size=batch_size,
+            max_candidates=max_candidates,
+            observed_matches=probe_state.observed_match_count(
+                taxonomy_filter_requested=taxonomy_filter_requested
+            ),
+            required_matches=candidate_limit,
+        )
+    return probe_state.result(taxonomy_filter_requested=taxonomy_filter_requested)
 
 
 async def _graph_location_candidates(
@@ -10705,10 +10775,15 @@ async def _search_compact_provider_procedures(
     )
 
 
-async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any], pagination) -> dict[str, Any] | None:
-    snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
-    if not snapshot_id:
-        return None
+async def _search_ptg2_provider_procedures_snapshot(
+    session,
+    npi: int,
+    args: dict[str, Any],
+    pagination,
+    *,
+    snapshot_id: str,
+) -> dict[str, Any] | None:
+    """Search one explicitly selected snapshot for a provider's procedures."""
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
     table_name = _safe_table_name(serving_tables.serving_table)
     component_table = _manifest_provider_set_component_table(serving_tables)
@@ -10733,6 +10808,117 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
         pagination,
         snapshot_id=snapshot_id,
         serving_tables=serving_tables,
+    )
+
+
+def _provider_procedure_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Order a merged reverse lookup consistently with single-snapshot readers."""
+    return (
+        str(item.get("reported_code_system") or item.get("billing_code_type") or ""),
+        str(item.get("reported_code") or item.get("billing_code") or ""),
+        -int(item.get("provider_count") or 0),
+        str(item.get("provider_set_hash") or ""),
+        str(item.get("price_set_hash") or ""),
+        str(item.get("network") or ""),
+    )
+
+
+async def _search_multi_ptg2_provider_procedures(
+    session,
+    npi: int,
+    network_snapshots: list[tuple[str, str]],
+    args: dict[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    """Combine one provider's priced procedures across every plan network."""
+    fetch_count = max(1, int(pagination.offset) + int(pagination.limit))
+    sub_pagination = PaginationParams(page=1, limit=fetch_count, offset=0, source="page")
+    combined_items: list[dict[str, Any]] = []
+    matched_networks: list[dict[str, str]] = []
+    total = 0
+    base_query_by_field: dict[str, Any] | None = None
+    for source_key, snapshot_id in network_snapshots:
+        network_response_by_field = await _search_ptg2_provider_procedures_snapshot(
+            session,
+            npi,
+            args,
+            sub_pagination,
+            snapshot_id=snapshot_id,
+        )
+        if not network_response_by_field:
+            continue
+        if base_query_by_field is None:
+            base_query_by_field = dict(network_response_by_field.get("query") or {})
+        total += int((network_response_by_field.get("pagination") or {}).get("total") or 0)
+        network_items = network_response_by_field.get("items") or []
+        if network_items:
+            matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
+        for network_procedure in network_items:
+            tagged_procedure_by_field = dict(network_procedure)
+            tagged_procedure_by_field.setdefault("network", source_key)
+            combined_items.append(tagged_procedure_by_field)
+    if base_query_by_field is None:
+        return None
+    combined_items.sort(key=_provider_procedure_sort_key)
+    start = max(int(pagination.offset), 0)
+    end = start + max(int(pagination.limit), 0)
+    page_items = combined_items[start:end]
+    base_query_by_field.update(
+        snapshot_id=None,
+        snapshots=[snapshot_id for _, snapshot_id in network_snapshots],
+        networks=matched_networks,
+        combined=True,
+    )
+    return _shape_ptg2_response(
+        {
+            "items": page_items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                "has_more": int(pagination.offset) + len(page_items) < total,
+            },
+            "query": base_query_by_field,
+        },
+        args,
+    )
+
+
+async def search_ptg2_provider_procedures(
+    session,
+    npi: int,
+    args: dict[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    """Search one or every plan-network snapshot for a provider's procedures."""
+    explicit_snapshot = str(args.get("snapshot_id") or "").strip()
+    explicit_source = str(args.get("source_key") or "").strip()
+    plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
+    if plan_scoped and not explicit_snapshot and not explicit_source:
+        network_snapshots = await current_source_snapshot_ids_for_plan(session, args)
+        if len(network_snapshots) > 1:
+            return await _search_multi_ptg2_provider_procedures(
+                session,
+                npi,
+                network_snapshots,
+                args,
+                pagination,
+            )
+        if len(network_snapshots) == 1:
+            snapshot_id = network_snapshots[0][1]
+        else:
+            return None
+    else:
+        snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
+        if not snapshot_id:
+            return None
+    return await _search_ptg2_provider_procedures_snapshot(
+        session,
+        npi,
+        args,
+        pagination,
+        snapshot_id=snapshot_id,
     )
 
 

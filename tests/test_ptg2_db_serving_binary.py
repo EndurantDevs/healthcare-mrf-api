@@ -125,6 +125,29 @@ class FakeServingBinarySession:
         return FakeResult(rows=list(records))
 
 
+class GenerationAwareServingBinarySession(FakeServingBinarySession):
+    sync_session = object()
+
+    def __init__(self, records_by_kind, *, relation_oid, relation_file_node):
+        super().__init__(records_by_kind)
+        self.relation_oid = relation_oid
+        self.relation_file_node = relation_file_node
+        self.relation_lookup_count = 0
+
+    async def execute(self, statement, params=None):
+        if "relation.relfilenode" in str(statement):
+            self.relation_lookup_count += 1
+            return FakeResult(
+                rows=[
+                    {
+                        "relation_oid": self.relation_oid,
+                        "relation_file_node": self.relation_file_node,
+                    }
+                ]
+            )
+        return await super().execute(statement, params)
+
+
 class FakeTransaction:
     def __init__(self, driver):
         self.driver = driver
@@ -718,6 +741,43 @@ async def test_db_serving_binary_reuses_cached_block_rows_for_same_table():
     assert [serving_row.provider_count for serving_row in second_rows] == [10]
     assert sum(call.get("artifact_kind") == "by_code_grouped" for call in fake_session.calls) == 1
     assert sum(call.get("artifact_kind") == "by_code" for call in fake_session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_db_serving_binary_cache_separates_recreated_relation_generation():
+    table_name = "mrf.ptg2_serving_binary_recreated"
+    first_price_set_id = bytes.fromhex("00000000000000000000000000000082")
+    second_price_set_id = bytes.fromhex("00000000000000000000000000000083")
+    first_payload = b"".join(_uvarint(payload_part) for payload_part in (1, 10, 0))
+    second_payload = b"".join(_uvarint(payload_part) for payload_part in (1, 20, 0))
+    first_session = GenerationAwareServingBinarySession(
+        {
+            ("by_code", 7): [{"block_no": 0, "entry_count": 1, "payload": first_payload}],
+            "by_code_price_dictionary": [{"payload": first_price_set_id}],
+        },
+        relation_oid=100,
+        relation_file_node=200,
+    )
+    second_session = GenerationAwareServingBinarySession(
+        {
+            ("by_code", 7): [{"block_no": 0, "entry_count": 1, "payload": second_payload}],
+            "by_code_price_dictionary": [{"payload": second_price_set_id}],
+        },
+        relation_oid=101,
+        relation_file_node=201,
+    )
+
+    first_rows = await lookup_serving_binary_by_code_from_db(first_session, table_name, 7)
+    second_rows = await lookup_serving_binary_by_code_from_db(second_session, table_name, 7)
+
+    assert [(serving_row.provider_count, serving_row.price_set_global_id_128) for serving_row in first_rows] == [
+        (10, first_price_set_id.hex())
+    ]
+    assert [(serving_row.provider_count, serving_row.price_set_global_id_128) for serving_row in second_rows] == [
+        (20, second_price_set_id.hex())
+    ]
+    assert first_session.relation_lookup_count == 1
+    assert second_session.relation_lookup_count == 1
 
 
 @pytest.mark.asyncio

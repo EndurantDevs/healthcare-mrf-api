@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 _PTG2_SNAPSHOT_RESOLVE_CACHE: dict[tuple[object, ...], tuple[float, str | None]] = {}
 
 
+def _serving_relation_name_sql(snapshot_alias: str) -> str:
+    """Prefer the retained binary relation when testing snapshot availability."""
+    serving_index = f"{snapshot_alias}.manifest->'serving_index'"
+    return (
+        f"COALESCE(NULLIF({serving_index}->>'serving_binary_table', ''), "
+        f"NULLIF({serving_index}->>'table', ''))"
+    )
+
+
+def _serving_relation_available_sql(snapshot_alias: str) -> str:
+    """Return SQL that rejects manifests whose retained serving relation is gone."""
+    return f"to_regclass({_serving_relation_name_sql(snapshot_alias)}) IS NOT NULL"
+
+
 def _snapshot_cache_enabled(session) -> bool:
     return hasattr(session, "sync_session")
 
@@ -94,7 +108,7 @@ async def current_source_snapshot_id(session, source_key: str) -> str | None:
                 ON published_snapshot.snapshot_id = pointer.snapshot_id
              WHERE pointer.source_key = :source_key
                AND published_snapshot.status = 'published'
-               AND published_snapshot.manifest->'serving_index'->>'table' IS NOT NULL
+               AND {_serving_relation_available_sql('published_snapshot')}
              LIMIT 1
             """
         ),
@@ -134,14 +148,8 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
                    {market_sql}
                    {source_sql}
                    AND s.status = 'published'
-                   AND s.manifest->'serving_index'->>'table' IS NOT NULL
-                 -- Prefer a snapshot whose serving table is actually materialized
-                 -- (to_regclass), not merely claimed by the manifest, so a plan with
-                 -- multiple networks resolves to the loaded one instead of an
-                 -- unloaded newer network (which yields snapshot_not_loaded / 0
-                 -- results). Falls back to recency when none/all are loaded.
-                 ORDER BY (to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC,
-                          cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
+                   AND {_serving_relation_available_sql('s')}
+                 ORDER BY cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
                  LIMIT 1
                 """
             ),
@@ -204,13 +212,9 @@ async def current_source_snapshot_ids_for_plan(
                    {market_sql}
                    {source_sql}
                    AND s.status = 'published'
-                   AND s.manifest->'serving_index'->>'table' IS NOT NULL
-                 -- One snapshot per network (source_key): the newest whose serving
-                 -- table is actually materialized. DISTINCT ON requires source_key
-                 -- to lead the ORDER BY; the to_regclass check keeps an unloaded
-                 -- newer network from winning and returning snapshot_not_loaded.
+                   AND {_serving_relation_available_sql('s')}
+                 -- One available snapshot per network (source_key), newest first.
                  ORDER BY cps.source_key,
-                          (to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC,
                           cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
                 """
             ),
@@ -233,6 +237,7 @@ async def current_source_snapshot_ids_for_plan(
 
 
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:
+    """Resolve the published snapshot selected by explicit or scoped arguments."""
     if args.get("snapshot_id"):
         # Serving callers immediately load snapshot_serving_tables(), whose
         # query is published-only. Avoid issuing the same status check twice.
@@ -245,6 +250,7 @@ async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> 
 
 
 async def snapshot_artifact_uri(session, snapshot_id: str) -> str | None:
+    """Return the newest snapshot-index artifact URI for a snapshot."""
     result = await session.execute(
         text(
             f"""
@@ -263,6 +269,7 @@ async def snapshot_artifact_uri(session, snapshot_id: str) -> str | None:
 
 
 async def load_current_ptg2_index(session, requested_snapshot_id: str | None = None) -> PTG2ServingIndex | None:
+    """Load and briefly cache the current legacy snapshot index when available."""
     snapshot_id = await current_snapshot_id(session, requested_snapshot_id=requested_snapshot_id)
     if not snapshot_id:
         return None

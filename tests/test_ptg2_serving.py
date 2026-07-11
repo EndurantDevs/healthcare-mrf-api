@@ -605,25 +605,104 @@ async def test_postgres_binary_provider_procedures_does_not_response_cache_rever
     first_payload = await ptg2_serving.search_ptg2_provider_procedures(
         object(),
         1234567890,
-        {"plan_id": "plan-a", "include_details": "true"},
+        {"plan_id": "plan-a", "source_key": "network-a", "include_details": "true"},
         FakePagination(),
     )
     second_payload = await ptg2_serving.search_ptg2_provider_procedures(
         object(),
         1234567890,
-        {"plan_id": "plan-a", "include_details": "true"},
+        {"plan_id": "plan-a", "source_key": "network-a", "include_details": "true"},
         FakePagination(),
     )
     await ptg2_serving.search_ptg2_provider_procedures(
         object(),
         2234567890,
-        {"plan_id": "plan-a", "include_details": "true"},
+        {"plan_id": "plan-a", "source_key": "network-a", "include_details": "true"},
         FakePagination(),
     )
 
     assert first_payload == second_payload
     assert call_count_by_name["uncached"] == 3
     ptg2_serving.clear_ptg2_index_cache()
+
+
+def _patch_multi_network_provider_procedure_search(monkeypatch):
+    async def fake_network_snapshots(_session, _args):
+        return [("network-z", "snapshot-z"), ("network-a", "snapshot-a")]
+
+    async def fake_snapshot_search(_session, npi, _args, _pagination, *, snapshot_id):
+        provider_count = 20 if snapshot_id == "snapshot-z" else 10
+        return {
+            "items": [
+                {
+                    "npi": npi,
+                    "reported_code_system": "CPT",
+                    "reported_code": "99213",
+                    "provider_count": provider_count,
+                    "provider_set_hash": f"provider-{snapshot_id}",
+                    "price_set_hash": f"price-{snapshot_id}",
+                    "prices": [{"negotiated_rate": "100.00"}],
+                }
+            ],
+            "pagination": {"total": 1},
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "current_source_snapshot_ids_for_plan",
+        fake_network_snapshots,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_search_ptg2_provider_procedures_snapshot",
+        fake_snapshot_search,
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_procedures_combines_every_plan_network(monkeypatch):
+    _patch_multi_network_provider_procedure_search(monkeypatch)
+    combined_payload_by_field = await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "TESTPLAN001", "include_details": "true"},
+        FakePagination(),
+    )
+
+    assert [procedure_item["provider_count"] for procedure_item in combined_payload_by_field["items"]] == [
+        20,
+        10,
+    ]
+    assert [procedure_item["network"] for procedure_item in combined_payload_by_field["items"]] == [
+        "network-z",
+        "network-a",
+    ]
+    assert combined_payload_by_field["pagination"]["total"] == 2
+    assert combined_payload_by_field["query"]["combined"] is True
+    assert combined_payload_by_field["query"]["snapshots"] == ["snapshot-z", "snapshot-a"]
+
+
+@pytest.mark.asyncio
+async def test_provider_procedure_network_pages_use_merged_order(monkeypatch):
+    _patch_multi_network_provider_procedure_search(monkeypatch)
+    first_page = await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "TESTPLAN001", "include_details": "true"},
+        _Pagination(limit=1, offset=0),
+    )
+    second_page = await ptg2_serving.search_ptg2_provider_procedures(
+        object(),
+        1234567890,
+        {"plan_id": "TESTPLAN001", "include_details": "true"},
+        _Pagination(limit=1, offset=1),
+    )
+
+    assert [procedure_item["network"] for procedure_item in first_page["items"]] == ["network-z"]
+    assert first_page["pagination"]["has_more"] is True
+    assert [procedure_item["network"] for procedure_item in second_page["items"]] == ["network-a"]
+    assert second_page["pagination"]["has_more"] is False
 
 
 def test_ptg2_snapshot_split_keeps_serving_facade_helpers_stable():
@@ -1845,7 +1924,7 @@ async def test_membership_graph_grows_address_probe_until_a_rate_match(monkeypat
     )
 
     assert [location["npi"] for location in candidates.location_rows] == [1234567891]
-    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 256]
     assert [call.kwargs["offset"] for call in location_reader.await_args_list] == [0, 0]
 
 
@@ -1885,7 +1964,7 @@ async def test_membership_graph_crosses_deduplicated_probe_plateau(monkeypatch):
     )
 
     assert [location["npi"] for location in candidates.location_rows] == [1234567891]
-    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128, 256]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 256, 1024]
 
 
 @pytest.mark.asyncio
@@ -1908,7 +1987,7 @@ async def test_membership_graph_exhaustion_grows_probe_logarithmically(monkeypat
     )
 
     assert candidates.location_rows == []
-    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128, 256, 320]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 256, 320]
 
 
 def test_membership_graph_uses_wider_first_probe_for_taxonomy_selectivity():
@@ -1924,6 +2003,30 @@ def test_membership_graph_uses_wider_first_probe_for_taxonomy_selectivity():
         500,
         taxonomy_filter_requested=True,
     ) == 2000
+
+
+def test_membership_graph_projects_next_probe_from_observed_density():
+    assert ptg2_serving._next_graph_location_probe_limit(
+        1600,
+        batch_size=1600,
+        max_candidates=100_000,
+        observed_matches=25,
+        required_matches=100,
+    ) == 8000
+    assert ptg2_serving._next_graph_location_probe_limit(
+        1600,
+        batch_size=1600,
+        max_candidates=100_000,
+        observed_matches=0,
+        required_matches=100,
+    ) == 6400
+    assert ptg2_serving._next_graph_location_probe_limit(
+        1600,
+        batch_size=1600,
+        max_candidates=100_000,
+        observed_matches=1,
+        required_matches=100,
+    ) == 12_800
 
 
 @pytest.mark.asyncio
@@ -1997,7 +2100,7 @@ async def test_membership_graph_grows_until_taxonomy_has_enough_rate_matches(mon
 
     assert [location["npi"] for location in candidates.location_rows] == [1234567890, 1234567892]
     assert candidates.taxonomy_filtered is True
-    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 128]
+    assert [call.kwargs["limit"] for call in location_reader.await_args_list] == [64, 192]
     assert taxonomy_filter.await_count == 2
 
 
@@ -4222,9 +4325,19 @@ async def test_current_ptg2_snapshot_prefers_loaded_serving_table():
     )
     assert snapshot_id == "snap-loaded"
     sql = str(session.calls[0][0][0])
-    assert "to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC" in sql
-    # recency stays the tiebreaker among loaded snapshots
+    assert "serving_binary_table" in sql
+    assert "to_regclass(COALESCE(" in sql
+    assert "NULLIF(s.manifest->'serving_index'->>'table', '')" in sql
+    # Recency selects among snapshots whose retained serving relation exists.
     assert "cps.import_month DESC NULLS LAST" in sql
+
+
+def test_snapshot_availability_prefers_v3_binary_relation():
+    availability_sql = ptg2_snapshot._serving_relation_available_sql("snapshot")
+
+    assert "serving_binary_table" in availability_sql
+    assert availability_sql.index("serving_binary_table") < availability_sql.index("->>'table'")
+    assert availability_sql.endswith("IS NOT NULL")
 
 
 @pytest.mark.asyncio
@@ -4435,6 +4548,7 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
         1235189762,
         {
             "plan_id": "TESTPLAN001",
+            "source_key": "network-a",
             "code": "93458",
             "code_system": "CPT",
             "pos": "21",
@@ -4494,7 +4608,13 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
     payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
-        {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT", "include_details": "true"},
+        {
+            "plan_id": "TESTPLAN001",
+            "source_key": "network-a",
+            "code": "99213",
+            "code_system": "CPT",
+            "include_details": "true",
+        },
         FakePagination(),
     )
 
