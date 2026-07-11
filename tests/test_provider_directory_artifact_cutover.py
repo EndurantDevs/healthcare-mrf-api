@@ -8,8 +8,79 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.test_provider_directory_dataset_artifact_db import _dataset_database
+
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+async def _keep_stage_indexes(_schema: str, _stage_table: str) -> None:
+    """Leave index names unchanged for simple disposable test tables."""
+    return None
+
+
+async def _fail_stage_indexes(_schema: str, _stage_table: str) -> None:
+    """Inject a late failure after every bundle relation has been renamed."""
+    raise RuntimeError("second target failed")
+
+
+async def _create_artifact_bundle_relations(database, schema: str) -> None:
+    """Create two old targets and two replacement stages."""
+    values_by_relation = {
+        "artifact_target_a": "old-a",
+        "artifact_target_b": "old-b",
+        "artifact_stage_a": "new-a",
+        "artifact_stage_b": "new-b",
+    }
+    for relation_name, value in values_by_relation.items():
+        await database.status(
+            f"CREATE TABLE {schema}.{relation_name} (value text NOT NULL);"
+        )
+        await database.status(
+            f"INSERT INTO {schema}.{relation_name} VALUES (:value);",
+            value=value,
+        )
+
+
+async def _prepared_bundle_stage(
+    schema: str,
+    stage_table: str,
+    target_relation: str,
+    rename_stage_indexes,
+):
+    """Build a prepared-stage descriptor fenced to the current target OID."""
+    target_oid = await importer._provider_directory_relation_oid(
+        schema,
+        target_relation,
+    )
+    return importer.ProviderDirectoryPreparedArtifactStage(
+        schema,
+        stage_table,
+        target_relation,
+        rename_stage_indexes,
+        importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid),
+    )
+
+
+async def _artifact_relation_value(database, schema: str, relation: str) -> str:
+    """Read the marker value stored in a disposable artifact relation."""
+    return str(
+        await database.scalar(f"SELECT value FROM {schema}.{relation};")
+    )
+
+
+async def _assert_artifact_relation_values(
+    database,
+    schema: str,
+    expected_values_by_relation: dict[str, str],
+) -> None:
+    """Assert marker values for a set of disposable artifact relations."""
+    for relation, expected_value in expected_values_by_relation.items():
+        assert await _artifact_relation_value(
+            database,
+            schema,
+            relation,
+        ) == expected_value
 
 
 class _FakeTransaction:
@@ -363,3 +434,56 @@ def test_artifact_stage_names_are_unique_for_duplicate_runs():
 
     assert len(network_names) == 10
     assert len(overlay_names) == 10
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_artifact_bundle_rolls_back_all_targets(monkeypatch):
+    """A late target failure leaves every serving relation on its old version."""
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _create_artifact_bundle_relations(database, schema)
+        target_a_stage = await _prepared_bundle_stage(
+            schema,
+            "artifact_stage_a",
+            "artifact_target_a",
+            _keep_stage_indexes,
+        )
+        failing_target_b_stage = await _prepared_bundle_stage(
+            schema,
+            "artifact_stage_b",
+            "artifact_target_b",
+            _fail_stage_indexes,
+        )
+
+        with pytest.raises(RuntimeError, match="second target failed"):
+            await importer._promote_provider_directory_artifact_bundle_transaction(
+                (target_a_stage, failing_target_b_stage)
+            )
+
+        await _assert_artifact_relation_values(
+            database,
+            schema,
+            {
+                "artifact_target_a": "old-a",
+                "artifact_target_b": "old-b",
+                "artifact_stage_a": "new-a",
+                "artifact_stage_b": "new-b",
+            },
+        )
+
+        target_b_stage = await _prepared_bundle_stage(
+            schema,
+            "artifact_stage_b",
+            "artifact_target_b",
+            _keep_stage_indexes,
+        )
+        await importer._promote_provider_directory_artifact_bundle_transaction(
+            (target_a_stage, target_b_stage)
+        )
+        await _assert_artifact_relation_values(
+            database,
+            schema,
+            {
+                "artifact_target_a": "new-a",
+                "artifact_target_b": "new-b",
+            },
+        )

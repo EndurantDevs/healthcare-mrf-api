@@ -427,6 +427,12 @@ _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE: contextvars.ContextVar[Any | None] =
         default=None,
     )
 )
+_PROVIDER_DIRECTORY_ARTIFACT_BUNDLE: contextvars.ContextVar[Any | None] = (
+    contextvars.ContextVar(
+        "provider_directory_artifact_bundle",
+        default=None,
+    )
+)
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
@@ -5725,6 +5731,87 @@ class ProviderDirectoryArtifactBuildFence:
     target_oid: int | None
 
 
+@dataclass(frozen=True)
+class ProviderDirectoryPreparedArtifactStage:
+    """One logged stage ready for an atomic serving-relation cutover."""
+
+    schema: str
+    stage_table: str
+    target_relation: str
+    rename_stage_indexes: Callable[[str, str], Awaitable[None]]
+    build_fence: ProviderDirectoryArtifactBuildFence | None = None
+
+
+@dataclass
+class ProviderDirectoryArtifactBundle:
+    """Collect serving stages and promote or clean them as one unit."""
+
+    stages: list[ProviderDirectoryPreparedArtifactStage] = field(
+        default_factory=list
+    )
+
+    def add(
+        self,
+        stage: ProviderDirectoryPreparedArtifactStage | None,
+    ) -> None:
+        """Register a prepared stage when its target is available."""
+        if stage is not None:
+            self.stages.append(stage)
+
+    @property
+    def relation_overrides(self) -> dict[str, str]:
+        """Map serving relations to their prepared dependency stages."""
+        return {
+            stage.target_relation: stage.stage_table
+            for stage in self.stages
+        }
+
+    async def promote(self) -> None:
+        """Atomically promote every registered serving stage."""
+        if self.stages:
+            await _retry_provider_directory_artifact_bundle_promotion(
+                tuple(self.stages)
+            )
+
+    async def cleanup(self) -> None:
+        """Remove every stage name that was not consumed by promotion."""
+        for stage in reversed(self.stages):
+            await _remove_provider_directory_artifact_stage(stage)
+
+
+@contextlib.contextmanager
+def _provider_directory_artifact_relation_scope(
+    relation_overrides: dict[str, str],
+) -> Iterator[None]:
+    """Temporarily route artifact dependencies to prepared stage relations."""
+    merged_overrides_by_relation = dict(
+        _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
+    )
+    merged_overrides_by_relation.update(relation_overrides)
+    relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        merged_overrides_by_relation
+    )
+    try:
+        yield
+    finally:
+        _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_artifact_bundle_scope(
+) -> AsyncIterator[ProviderDirectoryArtifactBundle]:
+    """Clean every prepared stage after bundle promotion or failure."""
+    bundle = ProviderDirectoryArtifactBundle()
+    bundle_token = _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.set(bundle)
+    try:
+        yield bundle
+    finally:
+        try:
+            await bundle.cleanup()
+        finally:
+            _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.reset(bundle_token)
+
+
 async def _try_provider_directory_artifact_build_lock(engine: Any, build_lock_key: str) -> Any | None:
     """Acquire one session advisory lock attempt on a dedicated connection."""
 
@@ -5869,6 +5956,98 @@ async def _prepare_provider_directory_artifact_stage(schema: str, stage_table: s
     await _assert_provider_directory_logged_relation(schema, stage_table)
 
 
+async def _acquire_provider_directory_artifact_cutover_lock(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    acquired = await db.scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(:target_lock_key, 0));",
+        target_lock_key=(
+            "provider-directory-artifact-cutover:"
+            f"{stage.schema}.{stage.target_relation}"
+        ),
+    )
+    if not acquired:
+        raise ProviderDirectoryArtifactCutoverConflict(stage.target_relation)
+
+
+async def _assert_provider_directory_artifact_build_fence(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    if stage.build_fence is None:
+        return
+    current_target_oid = await _provider_directory_relation_oid(
+        stage.schema,
+        stage.target_relation,
+    )
+    if current_target_oid != stage.build_fence.target_oid:
+        raise ProviderDirectoryArtifactBuildStale(stage.target_relation)
+
+
+def _provider_directory_prepared_stage_relations(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> tuple[str, str, str]:
+    return (
+        stage.stage_table,
+        stage.target_relation,
+        f"{stage.target_relation}_old",
+    )
+
+
+async def _install_provider_directory_prepared_stage(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    schema = stage.schema
+    stage_ref = _qt(schema, stage.stage_table)
+    target_ref = _qt(schema, stage.target_relation)
+    old_relation = f"{stage.target_relation}_old"
+    target_kind = await _provider_directory_relation_attribute(
+        schema,
+        stage.target_relation,
+        "relkind",
+    )
+    await db.status(
+        _drop_provider_directory_address_corroboration_relation_sql(
+            schema,
+            old_relation,
+        )
+    )
+    if target_kind in {"r", "p"}:
+        await db.status(
+            f"ALTER TABLE {target_ref} RENAME TO {_q(old_relation)};"
+        )
+    elif target_kind in {"v", "m"}:
+        await db.status(
+            _drop_provider_directory_address_corroboration_relation_sql(
+                schema,
+                stage.target_relation,
+            )
+        )
+    elif target_kind is not None:
+        raise RuntimeError(
+            "Unsupported Provider Directory artifact target relation kind: "
+            f"{target_kind!r}"
+        )
+    await db.status(
+        f"ALTER TABLE {stage_ref} RENAME TO {_q(stage.target_relation)};"
+    )
+
+
+async def _finish_provider_directory_prepared_stage(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    await db.status(
+        _drop_provider_directory_address_corroboration_relation_sql(
+            stage.schema,
+            f"{stage.target_relation}_old",
+        )
+    )
+    await stage.rename_stage_indexes(stage.schema, stage.stage_table)
+    await _assert_provider_directory_logged_relation(
+        stage.schema,
+        stage.target_relation,
+    )
+
+
 async def _promote_provider_directory_artifact_stage_transaction(
     schema: str,
     stage_table: str,
@@ -5877,41 +6056,129 @@ async def _promote_provider_directory_artifact_stage_transaction(
     build_fence: ProviderDirectoryArtifactBuildFence | None,
 ) -> None:
     """Run only the bounded metadata swap inside one database transaction."""
-
-    stage_ref = _qt(schema, stage_table)
-    target_ref = _qt(schema, target_relation)
-    old_relation = f"{target_relation}_old"
+    prepared_stage = ProviderDirectoryPreparedArtifactStage(
+        schema=schema,
+        stage_table=stage_table,
+        target_relation=target_relation,
+        rename_stage_indexes=rename_stage_indexes,
+        build_fence=build_fence,
+    )
     async with db.transaction():
         await db.status(f"SET LOCAL lock_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';")
         await db.status(f"SET LOCAL statement_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';")
-        acquired = await db.scalar(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended(:target_lock_key, 0));",
-            target_lock_key=f"provider-directory-artifact-cutover:{schema}.{target_relation}",
-        )
-        if not acquired:
-            raise ProviderDirectoryArtifactCutoverConflict(target_relation)
+        await _acquire_provider_directory_artifact_cutover_lock(prepared_stage)
         active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
         if active_fence is not None:
-            await _lock_and_verify_artifact_dataset_fence(
-                active_fence
+            await _lock_and_verify_artifact_dataset_fence(active_fence)
+        await _assert_provider_directory_artifact_build_fence(prepared_stage)
+        await _lock_provider_directory_artifact_tables(
+            schema,
+            _provider_directory_prepared_stage_relations(prepared_stage),
+        )
+        await _install_provider_directory_prepared_stage(prepared_stage)
+        await _finish_provider_directory_prepared_stage(prepared_stage)
+
+
+def _ordered_provider_directory_artifact_bundle(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+) -> tuple[ProviderDirectoryPreparedArtifactStage, ...]:
+    """Validate and deterministically order one serving artifact bundle."""
+    ordered_stages = tuple(
+        sorted(stages, key=lambda stage: stage.target_relation)
+    )
+    schemas = {stage.schema for stage in ordered_stages}
+    targets = [stage.target_relation for stage in ordered_stages]
+    if len(schemas) > 1:
+        raise ValueError("provider_directory_artifact_bundle_schema_mismatch")
+    if len(targets) != len(set(targets)):
+        raise ValueError("provider_directory_artifact_bundle_target_duplicate")
+    return ordered_stages
+
+
+async def _promote_provider_directory_artifact_bundle_transaction(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+) -> None:
+    """Swap every prepared serving relation in one bounded transaction."""
+    ordered_stages = _ordered_provider_directory_artifact_bundle(stages)
+    if not ordered_stages:
+        return
+    schema = ordered_stages[0].schema
+    relation_names = tuple(
+        sorted(
+            {
+                relation_name
+                for stage in ordered_stages
+                for relation_name in _provider_directory_prepared_stage_relations(
+                    stage
+                )
+            }
+        )
+    )
+    async with db.transaction():
+        await db.status(
+            "SET LOCAL lock_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
+        )
+        await db.status(
+            "SET LOCAL statement_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+        )
+        for stage in ordered_stages:
+            await _acquire_provider_directory_artifact_cutover_lock(stage)
+        active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+        if active_fence is not None:
+            await _lock_and_verify_artifact_dataset_fence(active_fence)
+        for stage in ordered_stages:
+            await _assert_provider_directory_artifact_build_fence(stage)
+        await _lock_provider_directory_artifact_tables(schema, relation_names)
+        for stage in ordered_stages:
+            await _install_provider_directory_prepared_stage(stage)
+        for stage in ordered_stages:
+            await _finish_provider_directory_prepared_stage(stage)
+
+
+async def _promote_provider_directory_artifact_bundle(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+) -> None:
+    """Apply a hard wall-clock limit to one atomic artifact bundle cutover."""
+    async with asyncio.timeout(
+        PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    ):
+        await _promote_provider_directory_artifact_bundle_transaction(stages)
+
+
+async def _retry_provider_directory_artifact_bundle_promotion(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+) -> None:
+    """Retry transient lock conflicts without rebuilding immutable stages."""
+    for attempt_index in range(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS):
+        try:
+            await _promote_provider_directory_artifact_bundle(stages)
+            return
+        except Exception as exc:
+            if not _is_provider_directory_artifact_cutover_retryable(exc):
+                raise
+            if attempt_index + 1 >= PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS:
+                raise
+            await asyncio.sleep(
+                PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS
+                * (attempt_index + 1)
             )
-        if build_fence is not None:
-            current_target_oid = await _provider_directory_relation_oid(schema, target_relation)
-            if current_target_oid != build_fence.target_oid:
-                raise ProviderDirectoryArtifactBuildStale(target_relation)
-        await _lock_provider_directory_artifact_tables(schema, (stage_table, target_relation, old_relation))
-        target_kind = await _provider_directory_relation_attribute(schema, target_relation, "relkind")
-        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
-        if target_kind in {"r", "p"}:
-            await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_relation)};")
-        elif target_kind in {"v", "m"}:
-            await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, target_relation))
-        elif target_kind is not None:
-            raise RuntimeError(f"Unsupported Provider Directory artifact target relation kind: {target_kind!r}")
-        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(target_relation)};")
-        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, old_relation))
-        await rename_stage_indexes(schema, stage_table)
-        await _assert_provider_directory_logged_relation(schema, target_relation)
+
+
+async def _remove_provider_directory_artifact_stage(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    """Drop an unpromoted stage without masking the publication result."""
+    stage_ref = _qt(stage.schema, stage.stage_table)
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    except Exception:  # pragma: no cover - cleanup best effort
+        LOGGER.warning(
+            "Failed to clean Provider Directory artifact stage %s",
+            stage_ref,
+            exc_info=True,
+        )
 
 
 async def _promote_provider_directory_artifact_stage(
@@ -6060,22 +6327,72 @@ def _address_corroboration_publication_metrics(
     return metrics_by_field
 
 
+async def _address_corroboration_network_metrics(
+    schema: str,
+    source_ids: list[str],
+    *,
+    refresh_network_catalog: bool,
+    metrics_override: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return network metrics without rebuilding a prepared bundle stage."""
+    if metrics_override is not None:
+        return metrics_override
+    if refresh_network_catalog:
+        return await publish_provider_directory_network_catalog(
+            schema,
+            **({"source_ids": source_ids} if source_ids else {}),
+        )
+    return await _ensure_provider_directory_network_catalog_populated(schema)
+
+
+async def _prepared_address_corroboration_result(
+    schema: str,
+    stage_table: str,
+    publish_metrics: dict[str, Any],
+    build_fence: ProviderDirectoryArtifactBuildFence,
+) -> tuple[dict[str, Any], ProviderDirectoryPreparedArtifactStage]:
+    """Mark a corroboration stage logged and package it for bundle cutover."""
+    await _prepare_provider_directory_artifact_stage(schema, stage_table)
+    return (
+        publish_metrics,
+        ProviderDirectoryPreparedArtifactStage(
+            schema=schema,
+            stage_table=stage_table,
+            target_relation=PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+            rename_stage_indexes=_rename_address_corroboration_stage_indexes,
+            build_fence=build_fence,
+        ),
+    )
+
+
+async def _best_effort_drop_address_corroboration_stage(stage_ref: str) -> None:
+    """Clean a failed corroboration stage without masking its build error."""
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    except Exception:  # pragma: no cover - cleanup best effort
+        LOGGER.warning(
+            "Failed to clean provider directory address stage table %s",
+            stage_ref,
+            exc_info=True,
+        )
+
+
 async def publish_provider_directory_address_corroboration_table(
     db_schema: str | None = None,
     *,
     refresh_network_catalog: bool = True,
     source_ids: list[str] | tuple[str, ...] | None = None,
-) -> dict[str, Any]:
+    defer_cutover: bool = False,
+    network_catalog_metrics_override: dict[str, Any] | None = None,
+) -> Any:
     schema = db_schema or _schema()
     relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
     effective_source_ids = _clean_source_id_list(source_ids)
-    network_catalog_metrics = (
-        await publish_provider_directory_network_catalog(
-            schema,
-            **({"source_ids": effective_source_ids} if effective_source_ids else {}),
-        )
-        if refresh_network_catalog
-        else await _ensure_provider_directory_network_catalog_populated(schema)
+    network_catalog_metrics = await _address_corroboration_network_metrics(
+        schema,
+        effective_source_ids,
+        refresh_network_catalog=refresh_network_catalog,
+        metrics_override=network_catalog_metrics_override,
     )
     async with _provider_directory_artifact_build_guard(schema, relation) as build_fence:
         stage_table = _stage_table_name()
@@ -6094,6 +6411,20 @@ async def publish_provider_directory_address_corroboration_table(
             row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
             await _create_provider_directory_address_corroboration_indexes(schema, stage_table)
             await db.status(f"ANALYZE {stage_ref};")
+            publish_result = _address_corroboration_publication_metrics(
+                target_ref,
+                row_count,
+                network_catalog_metrics,
+                effective_source_ids,
+                copied_existing,
+            )
+            if defer_cutover:
+                return await _prepared_address_corroboration_result(
+                    schema,
+                    stage_table,
+                    publish_result,
+                    build_fence,
+                )
             await _swap_address_corroboration_stage(
                 schema,
                 stage_table,
@@ -6102,22 +6433,9 @@ async def publish_provider_directory_address_corroboration_table(
                 build_fence,
             )
             await db.status(f"ANALYZE {_qt(schema, relation)};")
-            return _address_corroboration_publication_metrics(
-                target_ref,
-                row_count,
-                network_catalog_metrics,
-                effective_source_ids,
-                copied_existing,
-            )
+            return publish_result
         except Exception:
-            try:
-                await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-            except Exception:  # pragma: no cover - cleanup best effort
-                LOGGER.warning(
-                    "Failed to clean provider directory address stage table %s",
-                    stage_ref,
-                    exc_info=True,
-                )
+            await _best_effort_drop_address_corroboration_stage(stage_ref)
             raise
 
 
@@ -7675,29 +7993,14 @@ def _assert_locked_artifact_fence_tuples(
 
 @contextlib.asynccontextmanager
 async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIterator[None]:
-    """Keep the active artifact fence through one non-rename archive mutation."""
+    """Keep endpoint dataset identity stable during additive archive mutation."""
     fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     if fence is None:
         yield
         return
     async with db.transaction():
-        await _lock_and_verify_artifact_dataset_fence(fence)
-        yield
-
-
-@contextlib.asynccontextmanager
-async def _provider_directory_artifact_generation_guard(
-    fence: ProviderDirectoryArtifactDatasetFence,
-) -> AsyncIterator[None]:
-    """Hold source and endpoint identity stable across all artifact cutovers."""
-    if not fence.datasets:
-        yield
-        return
-    async with db.acquire() as guard_connection:
-        await _lock_and_verify_artifact_dataset_fence(
-            fence,
-            guard_connection,
-        )
+        await _lock_artifact_fence_endpoints(fence, db)
+        await _verify_provider_directory_artifact_dataset_fence(fence)
         yield
 
 
@@ -7955,14 +8258,14 @@ async def _publish_provider_directory_dataset_artifacts(
         metrics=metrics,
         resource_types=artifact_resource_types,
     ):
-        async with _provider_directory_artifact_generation_guard(fence):
+        async with _provider_directory_artifact_bundle_scope() as artifact_bundle:
             metrics["artifact_dataset_ids"] = sorted(
                 {dataset.dataset_id for dataset in fence.datasets}
             )
             metrics["artifact_dataset_evidence_run_ids"] = sorted(
                 {dataset.evidence_run_id for dataset in fence.datasets}
             )
-            return await _publish_provider_directory_artifacts(
+            publish_metrics = await _publish_provider_directory_artifacts(
                 run_id=run_id,
                 metrics=metrics,
                 address_key_run_id=None,
@@ -7971,6 +8274,8 @@ async def _publish_provider_directory_dataset_artifacts(
                 publish_corroboration=publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
             )
+            await artifact_bundle.promote()
+            return publish_metrics
 
 
 async def _publish_selected_provider_directory_artifacts(
@@ -8003,6 +8308,63 @@ async def _publish_selected_provider_directory_artifacts(
     )
 
 
+def _collect_provider_directory_artifact_stage(
+    publish_result: Any,
+    artifact_bundle: ProviderDirectoryArtifactBundle | None,
+) -> dict[str, Any]:
+    """Register a deferred stage and return its serializable metrics."""
+    if isinstance(publish_result, dict):
+        return publish_result
+    if (
+        artifact_bundle is not None
+        and isinstance(publish_result, tuple)
+        and len(publish_result) == 2
+        and isinstance(publish_result[0], dict)
+        and isinstance(
+            publish_result[1],
+            ProviderDirectoryPreparedArtifactStage,
+        )
+    ):
+        artifact_bundle.add(publish_result[1])
+        return publish_result[0]
+    raise RuntimeError("provider_directory_artifact_stage_result_invalid")
+
+
+async def _is_provider_directory_corroboration_artifact_published(
+    *,
+    source_ids: list[str] | tuple[str, ...] | None,
+    network_catalog_metrics: dict[str, Any],
+    artifact_bundle: ProviderDirectoryArtifactBundle | None,
+) -> bool:
+    """Build corroboration from either live artifacts or prepared bundle stages."""
+    if artifact_bundle is None:
+        return await publish_provider_directory_address_corroboration_if_available(
+            refresh_network_catalog=False,
+            source_ids=source_ids,
+        )
+    schema = _schema()
+    if not await _table_exists(schema, "entity_address_unified"):
+        return False
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    with _provider_directory_artifact_relation_scope(
+        artifact_bundle.relation_overrides
+    ):
+        publish_result = (
+            await publish_provider_directory_address_corroboration_table(
+                schema,
+                refresh_network_catalog=False,
+                source_ids=cleaned_source_ids,
+                defer_cutover=True,
+                network_catalog_metrics_override=network_catalog_metrics,
+            )
+        )
+    _collect_provider_directory_artifact_stage(
+        publish_result,
+        artifact_bundle,
+    )
+    return True
+
+
 async def _publish_provider_directory_artifacts(
     *,
     run_id: str | None,
@@ -8014,6 +8376,7 @@ async def _publish_provider_directory_artifacts(
     publish_corroboration: bool = False,
     publish_artifacts_targets: set[str] | None = None,
 ) -> dict[str, Any]:
+    artifact_bundle = _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get()
     effective_publish_scope_run_id = (
         run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
     )
@@ -8105,8 +8468,18 @@ async def _publish_provider_directory_artifacts(
     else:
         metrics["location_archive"] = _provider_directory_publish_target_skipped()
     if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
-        metrics["address_overlay"] = await publish_provider_directory_address_overlay(
-            run_id=effective_publish_scope_run_id, source_ids=source_ids
+        address_overlay_options_by_name: dict[str, Any] = {
+            "run_id": effective_publish_scope_run_id,
+            "source_ids": source_ids,
+        }
+        if artifact_bundle is not None:
+            address_overlay_options_by_name["defer_cutover"] = True
+        address_overlay_result = await publish_provider_directory_address_overlay(
+            **address_overlay_options_by_name,
+        )
+        metrics["address_overlay"] = _collect_provider_directory_artifact_stage(
+            address_overlay_result,
+            artifact_bundle,
         )
     else:
         metrics["address_overlay"] = _provider_directory_publish_target_skipped()
@@ -8129,9 +8502,18 @@ async def _publish_provider_directory_artifacts(
         metrics=metrics,
     )
     if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
-        metrics["network_catalog"] = await publish_provider_directory_network_catalog(
-            run_id=effective_publish_scope_run_id,
-            source_ids=source_ids,
+        network_catalog_options_by_name: dict[str, Any] = {
+            "run_id": effective_publish_scope_run_id,
+            "source_ids": source_ids,
+        }
+        if artifact_bundle is not None:
+            network_catalog_options_by_name["defer_cutover"] = True
+        network_catalog_result = await publish_provider_directory_network_catalog(
+            **network_catalog_options_by_name,
+        )
+        metrics["network_catalog"] = _collect_provider_directory_artifact_stage(
+            network_catalog_result,
+            artifact_bundle,
         )
         network_catalog_message = (
             "published Provider Directory network catalog; "
@@ -8154,9 +8536,10 @@ async def _publish_provider_directory_artifacts(
         "corroboration",
     ):
         metrics["ptg_corroboration_view_published"] = (
-            await publish_provider_directory_address_corroboration_if_available(
-                refresh_network_catalog=False,
+            await _is_provider_directory_corroboration_artifact_published(
                 source_ids=source_ids,
+                network_catalog_metrics=metrics["network_catalog"],
+                artifact_bundle=artifact_bundle,
             )
         )
         message = "published Provider Directory PTG corroboration artifacts"
@@ -8910,7 +9293,8 @@ async def publish_provider_directory_network_catalog(
     *,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
-) -> dict[str, Any]:
+    defer_cutover: bool = False,
+) -> Any:
     """Publish resolved Provider Directory networks without locking source tables."""
     schema = db_schema if db_schema is not None else _schema()
     missing_reason = await _network_catalog_missing_requirement(schema)
@@ -8966,8 +9350,7 @@ async def publish_provider_directory_network_catalog(
             stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
             await _create_provider_directory_network_catalog_indexes(schema, stage_table)
             await db.status(f"ANALYZE {stage_ref};")
-            await _swap_network_catalog_stage(schema, stage_table, stage_ref, target_ref, build_fence)
-            return {
+            publish_metrics_by_field = {
                 "published": True,
                 "rows": stage_rows,
                 "inserted": inserted,
@@ -8975,6 +9358,23 @@ async def publish_provider_directory_network_catalog(
                 "source_ids": effective_source_ids,
                 "relation": target_ref,
             }
+            if defer_cutover:
+                await _prepare_provider_directory_artifact_stage(
+                    schema,
+                    stage_table,
+                )
+                return (
+                    publish_metrics_by_field,
+                    ProviderDirectoryPreparedArtifactStage(
+                        schema=schema,
+                        stage_table=stage_table,
+                        target_relation=PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+                        rename_stage_indexes=_rename_network_catalog_stage_indexes,
+                        build_fence=build_fence,
+                    ),
+                )
+            await _swap_network_catalog_stage(schema, stage_table, stage_ref, target_ref, build_fence)
+            return publish_metrics_by_field
         except Exception:
             try:
                 await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
@@ -24143,13 +24543,99 @@ async def _drop_address_overlay_stage_best_effort(stage_ref: str) -> None:
         )
 
 
+async def _prepared_address_overlay_result(
+    schema: str,
+    stage_table: str,
+    publish_metrics: dict[str, Any],
+    build_fence: ProviderDirectoryArtifactBuildFence,
+) -> tuple[dict[str, Any], ProviderDirectoryPreparedArtifactStage]:
+    """Mark an overlay stage logged and package it for bundle cutover."""
+    await _prepare_provider_directory_artifact_stage(schema, stage_table)
+    return (
+        publish_metrics,
+        ProviderDirectoryPreparedArtifactStage(
+            schema=schema,
+            stage_table=stage_table,
+            target_relation=PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            rename_stage_indexes=_rename_address_overlay_stage_indexes,
+            build_fence=build_fence,
+        ),
+    )
+
+
+def _address_overlay_query_params(
+    run_id: str | None,
+    source_ids: list[str],
+) -> dict[str, Any]:
+    """Build query parameters for one scoped overlay stage."""
+    query_params_by_name: dict[str, Any] = {}
+    if run_id is not None:
+        query_params_by_name["run_id"] = run_id
+    if source_ids:
+        query_params_by_name["source_ids"] = source_ids
+    return query_params_by_name
+
+
+async def _build_provider_directory_address_overlay_stage(
+    schema: str,
+    run_id: str | None,
+    source_ids: list[str],
+    components: list[str] | tuple[str, ...] | str | None,
+    target_ref: str,
+    build_fence: ProviderDirectoryArtifactBuildFence,
+    defer_cutover: bool,
+) -> Any:
+    """Build and either defer or immediately promote one overlay stage."""
+    stage_table = _address_overlay_stage_table_name(run_id)
+    stage_ref = _qt(schema, stage_table)
+    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    try:
+        await db.status(
+            f"CREATE UNLOGGED TABLE {stage_ref} "
+            f"(LIKE {target_ref} INCLUDING DEFAULTS);"
+        )
+        stage_metrics = await _populate_address_overlay_stage(
+            schema,
+            stage_table,
+            stage_ref,
+            run_id,
+            source_ids,
+            _address_overlay_query_params(run_id, source_ids),
+            components=_clean_address_overlay_components(components),
+        )
+        publish_metrics = _address_overlay_publish_result(
+            stage_metrics,
+            source_ids=source_ids,
+            target_ref=target_ref,
+        )
+        if defer_cutover:
+            return await _prepared_address_overlay_result(
+                schema,
+                stage_table,
+                publish_metrics,
+                build_fence,
+            )
+        await _swap_address_overlay_stage(
+            schema,
+            stage_table,
+            stage_ref,
+            target_ref,
+            build_fence,
+        )
+        return publish_metrics
+    except Exception:
+        await _drop_address_overlay_stage_best_effort(stage_ref)
+        raise
+
+
 async def publish_provider_directory_address_overlay(
     db_schema: str | None = None,
     *,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
     components: list[str] | tuple[str, ...] | str | None = None,
-) -> dict[str, Any]:
+    defer_cutover: bool = False,
+) -> Any:
     """Publish Provider Directory address evidence without rebuilding unified addresses."""
     schema = db_schema if db_schema is not None else _schema()
     missing_reason = await _address_overlay_missing_requirement(schema)
@@ -24168,32 +24654,12 @@ async def publish_provider_directory_address_overlay(
         schema,
         PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
     ) as build_fence:
-        stage_table = _address_overlay_stage_table_name(run_id)
-        stage_ref = _qt(schema, stage_table)
-        query_param_dict: dict[str, Any] = {}
-        if run_id is not None:
-            query_param_dict["run_id"] = run_id
-        if effective_source_ids:
-            query_param_dict["source_ids"] = effective_source_ids
-
-        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        try:
-            await db.status(f"CREATE UNLOGGED TABLE {stage_ref} (LIKE {target_ref} INCLUDING DEFAULTS);")
-            stage_metric_dict = await _populate_address_overlay_stage(
-                schema,
-                stage_table,
-                stage_ref,
-                run_id,
-                effective_source_ids,
-                query_param_dict,
-                components=_clean_address_overlay_components(components),
-            )
-            await _swap_address_overlay_stage(schema, stage_table, stage_ref, target_ref, build_fence)
-            return _address_overlay_publish_result(
-                stage_metric_dict,
-                source_ids=effective_source_ids,
-                target_ref=target_ref,
-            )
-        except Exception:
-            await _drop_address_overlay_stage_best_effort(stage_ref)
-            raise
+        return await _build_provider_directory_address_overlay_stage(
+            schema,
+            run_id,
+            effective_source_ids,
+            components,
+            target_ref,
+            build_fence,
+            defer_cutover,
+        )

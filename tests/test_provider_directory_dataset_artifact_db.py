@@ -353,7 +353,7 @@ async def test_real_postgres_dataset_fence_rejects_alias_joined_after_selection(
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monkeypatch):
+async def test_real_postgres_cutover_fence_blocks_dataset_promotion(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         await _insert_next_shared_dataset(database, schema)
@@ -372,9 +372,8 @@ async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monke
                 )
 
         try:
-            async with importer._provider_directory_artifact_generation_guard(
-                fence
-            ):
+            async with database.transaction():
+                await importer._lock_and_verify_artifact_dataset_fence(fence)
                 promotion_task = asyncio.create_task(promote_current_dataset())
                 await asyncio.sleep(0.05)
                 assert not promotion_task.done()
@@ -389,7 +388,7 @@ async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monke
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_generation_guard_blocks_alias_join(monkeypatch):
+async def test_real_postgres_cutover_fence_blocks_alias_join(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(
             ["source_primary"]
@@ -405,9 +404,8 @@ async def test_real_postgres_generation_guard_blocks_alias_join(monkeypatch):
             )
 
         try:
-            async with importer._provider_directory_artifact_generation_guard(
-                fence
-            ):
+            async with database.transaction():
+                await importer._lock_and_verify_artifact_dataset_fence(fence)
                 alias_task = asyncio.create_task(join_endpoint_alias())
                 await asyncio.sleep(0.05)
                 assert not alias_task.done()

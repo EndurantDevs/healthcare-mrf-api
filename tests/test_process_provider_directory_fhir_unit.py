@@ -5823,6 +5823,15 @@ def _artifact_source_record(
     }
 
 
+@contextlib.asynccontextmanager
+async def _recording_transaction(events: list[str]):
+    events.append("transaction-enter")
+    try:
+        yield
+    finally:
+        events.append("transaction-exit")
+
+
 def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
     @contextlib.asynccontextmanager
     async def scope_guard(_schema):
@@ -6482,29 +6491,26 @@ async def test_artifact_resource_scope_does_not_copy_unrequested_model(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dataset_artifact_generation_guard_wraps_complete_publish(monkeypatch):
+async def test_dataset_artifact_bundle_promotes_after_complete_stage_build(monkeypatch):
+    """Dataset publishing promotes only after every serving stage is prepared."""
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset(selected_resources=("Location",)),)
     )
-    state_by_name = {"guard_active": False}
     scope_options_by_name: dict[str, Any] = {}
+    events: list[str] = []
+    promote_bundle = AsyncMock(side_effect=lambda: events.append("promote"))
 
     @contextlib.asynccontextmanager
     async def dataset_scope(**kwargs):
         scope_options_by_name.update(kwargs)
         yield fence
 
-    @contextlib.asynccontextmanager
-    async def generation_guard(received_fence):
-        assert received_fence is fence
-        state_by_name["guard_active"] = True
-        try:
-            yield
-        finally:
-            state_by_name["guard_active"] = False
-
     async def publish_artifacts(**kwargs):
-        assert state_by_name["guard_active"] is True
+        assert isinstance(
+            importer._PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get(),
+            importer.ProviderDirectoryArtifactBundle,
+        )
+        events.append("build")
         return kwargs["metrics"]
 
     monkeypatch.setattr(
@@ -6518,9 +6524,9 @@ async def test_dataset_artifact_generation_guard_wraps_complete_publish(monkeypa
         dataset_scope,
     )
     monkeypatch.setattr(
-        importer,
-        "_provider_directory_artifact_generation_guard",
-        generation_guard,
+        importer.ProviderDirectoryArtifactBundle,
+        "promote",
+        promote_bundle,
     )
     monkeypatch.setattr(
         importer,
@@ -6537,10 +6543,67 @@ async def test_dataset_artifact_generation_guard_wraps_complete_publish(monkeypa
     )
 
     assert metrics["artifact_dataset_ids"] == ["dataset_current"]
-    assert state_by_name["guard_active"] is False
+    assert events == ["build", "promote"]
+    assert importer._PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get() is None
     assert scope_options_by_name["resource_types"] == frozenset(
         {"Location", "Organization", "Practitioner"}
     )
+
+
+@pytest.mark.asyncio
+async def test_corroboration_bundle_reads_prepared_overlay_and_network(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    keep_indexes = AsyncMock()
+    artifact_bundle = importer.ProviderDirectoryArtifactBundle(
+        stages=[
+            importer.ProviderDirectoryPreparedArtifactStage(
+                "mrf",
+                "overlay_stage",
+                importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                keep_indexes,
+            ),
+            importer.ProviderDirectoryPreparedArtifactStage(
+                "mrf",
+                "network_stage",
+                importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+                keep_indexes,
+            ),
+        ]
+    )
+    corroboration_stage = importer.ProviderDirectoryPreparedArtifactStage(
+        "mrf",
+        "corroboration_stage",
+        importer.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+        keep_indexes,
+    )
+
+    async def publish_corroboration(*_args, **_kwargs):
+        assert importer._qt(
+            "mrf",
+            importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        ) == '"mrf"."overlay_stage"'
+        assert importer._qt(
+            "mrf",
+            importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+        ) == '"mrf"."network_stage"'
+        return {"rows": 11}, corroboration_stage
+
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_address_corroboration_table",
+        publish_corroboration,
+    )
+
+    published = await importer._is_provider_directory_corroboration_artifact_published(
+        source_ids=["source_a"],
+        network_catalog_metrics={"rows": 7},
+        artifact_bundle=artifact_bundle,
+    )
+
+    assert published is True
+    assert artifact_bundle.stages[-1] is corroboration_stage
+    assert importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == {}
 
 
 def test_endpoint_dataset_rejects_unbounded_partial_source_profile():
@@ -7898,44 +7961,30 @@ async def test_publish_provider_directory_location_archive_resolves_and_cleans_s
 
 @pytest.mark.asyncio
 async def test_location_archive_holds_active_dataset_fence_through_resolve(monkeypatch):
+    """Archive mutation keeps endpoint identity stable without a source-table lock."""
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset(selected_resources=("Location", "Organization")),)
     )
-    state_by_transaction = {"active": False}
     events: list[str] = []
-
-    @contextlib.asynccontextmanager
-    async def transaction():
-        state_by_transaction["active"] = True
-        try:
-            yield
-        finally:
-            state_by_transaction["active"] = False
 
     class Stats:
         inserted = 1
         provenance_updates = 0
 
-    async def resolve(*_args, **_kwargs):
-        assert state_by_transaction["active"] is True
-        events.append("resolve")
-        return Stats()
-
-    async def lock_and_verify(received_fence):
-        assert state_by_transaction["active"] is True
-        assert received_fence is fence
-        events.append("lock")
-
-    async def backfill(*_args, **_kwargs):
-        assert state_by_transaction["active"] is True
-        events.append("backfill")
-        return 2
-
+    endpoint_lock = AsyncMock(side_effect=lambda *_args: events.append("endpoint_lock"))
+    fence_verify = AsyncMock(side_effect=lambda *_args: events.append("verify"))
+    resolve = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("resolve") or Stats())
+    backfill = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("backfill") or 2)
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
-    monkeypatch.setattr(importer.db, "transaction", transaction)
-    monkeypatch.setattr(importer, "_lock_and_verify_artifact_dataset_fence", lock_and_verify)
+    monkeypatch.setattr(importer.db, "transaction", lambda: _recording_transaction(events))
+    monkeypatch.setattr(importer, "_lock_artifact_fence_endpoints", endpoint_lock)
+    monkeypatch.setattr(
+        importer,
+        "_verify_provider_directory_artifact_dataset_fence",
+        fence_verify,
+    )
     monkeypatch.setattr(importer, "resolve_into_archive", resolve)
     monkeypatch.setattr(importer, "_backfill_archive_openaddresses_coordinates", backfill)
     fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
@@ -7948,8 +7997,16 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
 
     assert archive_metrics["openaddresses_coordinate_backfill_rows"] == 2
-    assert events == ["lock", "resolve", "backfill"]
-    assert state_by_transaction["active"] is False
+    assert events == [
+        "transaction-enter",
+        "endpoint_lock",
+        "verify",
+        "resolve",
+        "backfill",
+        "transaction-exit",
+    ]
+    endpoint_lock.assert_awaited_once_with(fence, importer.db)
+    fence_verify.assert_awaited_once_with(fence)
 
 
 @pytest.mark.asyncio
@@ -8405,10 +8462,13 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
         "publish_provider_directory_location_archive": AsyncMock(return_value={"inserted": 0}),
         "publish_provider_directory_address_overlay": AsyncMock(return_value={"rows": 7}),
         "publish_provider_directory_network_catalog": AsyncMock(return_value={"rows": 8}),
-        "publish_provider_directory_address_corroboration_if_available": AsyncMock(return_value=True),
+        "publish_provider_directory_address_corroboration_table": AsyncMock(
+            return_value={"rows": 9}
+        ),
     }
     for artifact_name, artifact_mock in artifact_mock_map.items():
         monkeypatch.setattr(importer, artifact_name, artifact_mock)
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -8434,13 +8494,12 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
     ):
         artifact_mock_map[artifact_name].assert_awaited_once()
         assert artifact_mock_map[artifact_name].await_args.kwargs["run_id"] is None
-    importer.publish_provider_directory_address_corroboration_if_available.assert_awaited_once()
-    assert (
-        importer.publish_provider_directory_address_corroboration_if_available.await_args.kwargs[
-            "refresh_network_catalog"
-        ]
-        is False
-    )
+    corroboration_publish = artifact_mock_map[
+        "publish_provider_directory_address_corroboration_table"
+    ]
+    corroboration_publish.assert_awaited_once()
+    assert corroboration_publish.await_args.kwargs["refresh_network_catalog"] is False
+    assert corroboration_publish.await_args.kwargs["defer_cutover"] is True
 
 
 def test_provider_directory_publish_artifact_targets_parse_aliases():
@@ -15032,10 +15091,12 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     importer.publish_provider_directory_address_overlay.assert_awaited_once_with(
         run_id=None,
         source_ids=[],
+        defer_cutover=True,
     )
     importer.publish_provider_directory_network_catalog.assert_awaited_once_with(
         run_id=None,
         source_ids=[],
+        defer_cutover=True,
     )
     importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
 
