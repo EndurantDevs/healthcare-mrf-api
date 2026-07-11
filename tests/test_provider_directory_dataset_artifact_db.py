@@ -255,6 +255,30 @@ async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_cha
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scope(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        fence = await importer._resolve_provider_directory_artifact_datasets(
+            ["source_primary"]
+        )
+
+        async with importer._provider_directory_artifact_dataset_scope(
+            run_id="artifact-run",
+            source_ids=["source_primary"],
+            fence=fence,
+        ):
+            await database.status(
+                f"UPDATE {schema}.provider_directory_source "
+                "SET endpoint_id = 'endpoint_repoint' "
+                "WHERE source_id = 'source_sibling';"
+            )
+            with pytest.raises(
+                importer.ProviderDirectoryArtifactBuildStale,
+                match="provider_directory_source_endpoint_dataset_changed",
+            ):
+                await importer._lock_and_verify_artifact_dataset_fence(fence)
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_artifact_shared_lock_blocks_dataset_promotion(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])

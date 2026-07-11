@@ -1597,12 +1597,17 @@ def _q(identifier: str) -> str:
     return '"' + str(identifier).replace('"', '""') + '"'
 
 
+def _unscoped_qt(schema: str, table: str) -> str:
+    """Return a qualified live relation without artifact scope routing."""
+    return f"{_q(schema)}.{_q(table)}"
+
+
 def _qt(schema: str, table: str) -> str:
     scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
         table,
         table,
     )
-    return f"{_q(schema)}.{_q(scoped_table)}"
+    return _unscoped_qt(schema, scoped_table)
 
 
 def _provider_directory_index_elements_sql(model: Any, index: dict[str, Any]) -> str:
@@ -7361,7 +7366,10 @@ async def _lock_artifact_fence_endpoints(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> None:
     """Serialize cutover with endpoint dataset promotion."""
-    endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
+    endpoint_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryAPIEndpoint.__tablename__,
+    )
     endpoint_rows = await db.all(
         f"""
         SELECT endpoint_id
@@ -7389,8 +7397,11 @@ async def _lock_artifact_fence_tuples(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> list[Any]:
     """Lock every selected alias and its current published dataset."""
-    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
-    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
+    dataset_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
     return await db.all(
         f"""
         SELECT source.source_id,
