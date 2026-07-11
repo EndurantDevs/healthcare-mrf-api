@@ -179,11 +179,12 @@ async def _dataset_database(monkeypatch):
     database = Database()
     try:
         await database.connect()
+        await _require_disposable_postgres(database)
     except Exception as exc:
+        await database.disconnect()
         pytest.skip(f"Postgres is not available for artifact DB tests: {exc}")
     is_schema_created = False
     try:
-        await _require_disposable_postgres(database)
         await database.status(f"CREATE SCHEMA {schema};")
         is_schema_created = True
         await _create_artifact_tables(database, schema)
