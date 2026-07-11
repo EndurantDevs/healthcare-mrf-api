@@ -93,7 +93,7 @@ This tracked snapshot is separate from configured support. It records credential
 
 After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.
 
-Verification environment: `healthporta-dev`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `2026-07-11T15:06:23Z`.
+Verification environment: `healthporta-dev`. Campaign: `provider-directory-canonical-acquisition-2026-07-10-v2`. Snapshot checked at `2026-07-11T23:15:23Z`.
 
 | Source | Proof state | Terminal status | Resource completion | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Rows by resource |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -105,7 +105,7 @@ Verification environment: `healthporta-dev`. Campaign: `provider-directory-canon
 | Humana (`humana`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | IEHP (`iehp`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Arkansas (`arkansas`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
-| HAP (`hap`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| HAP (`hap`) | Current | Succeeded | Complete | run_b6fd87aad3854911bfc45498dd3ef9df | Succeeded (`run_b6fd87aad3854911bfc45498dd3ef9df`) at `2026-07-11T23:15:23Z` | Verified | 2026-07-11T23:15:23Z | 2026-08-25 | InsurancePlan: 75<br>Location: 147,591<br>Organization: 62,676<br>Practitioner: 66,378<br>PractitionerRole: 68,148 |
 | Washington (`washington`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Wyoming (`wyoming`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Health Partners Plans (`health-partners-plans`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
