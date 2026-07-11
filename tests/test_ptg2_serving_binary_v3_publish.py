@@ -15,7 +15,7 @@ def _compact_sql(sql):
     return " ".join(sql.split())
 
 
-def _publish_options():
+def _publish_options(progress_callback=None):
     return serving_binary._V3PublishOptions(
         schema_name="mrf",
         source_table="ptg2_serving_source",
@@ -28,7 +28,7 @@ def _publish_options():
         provider_set_dictionary_table=None,
         price_atom_table_layout="lean_dict_v2",
         price_atom_constant_keys={"setting_key": 0},
-        progress_callback=None,
+        progress_callback=progress_callback,
     )
 
 
@@ -129,7 +129,8 @@ async def test_price_map_is_distinct_and_dense(monkeypatch):
         stage_table="price_key_map",
     )
 
-    create_sql = _compact_sql(status_statements[0])
+    assert _compact_sql(status_statements[0]) == 'ANALYZE "mrf"."price_set_atom_source";'
+    create_sql = _compact_sql(status_statements[1])
     assert "CREATE UNLOGGED TABLE" in create_sql
     assert "SELECT DISTINCT price_set_global_id_128" in create_sql
     assert "ROW_NUMBER() OVER (ORDER BY price_set_global_id_128)" in create_sql
@@ -145,7 +146,7 @@ async def test_v3_streams_start_together(monkeypatch):
 
     async def fake_stream(**kwargs):
         calls.append(kwargs)
-        if len(calls) == 5:
+        if len(calls) == 4:
             all_started.set()
         await asyncio.wait_for(all_started.wait(), timeout=1)
         return {"artifact_kind": kwargs["kind"]}
@@ -155,7 +156,6 @@ async def test_v3_streams_start_together(monkeypatch):
     stream_kinds = (
         serving_binary.PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND,
         serving_binary.PTG2_SERVING_BINARY_PRICE_DICTIONARY_V3_ENCODER_KIND,
-        serving_binary.PTG2_SERVING_BINARY_PROVIDER_SET_CODES_V3_KIND,
         serving_binary.PTG2_SERVING_BINARY_PRICE_SET_ATOM_MEMBERSHIPS_V3_KIND,
         serving_binary.PTG2_SERVING_BINARY_PRICE_ATOMS_V3_KIND,
     )

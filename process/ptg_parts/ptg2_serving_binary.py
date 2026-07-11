@@ -135,6 +135,8 @@ _V3_STREAM_ENCODER_KINDS = frozenset(
 
 logger = logging.getLogger(__name__)
 
+_V3_PUBLISH_PROGRESS_TOTAL = 6
+
 
 @dataclass(frozen=True)
 class _StreamStageConfig:
@@ -2132,6 +2134,12 @@ async def _validate_v3_dense_map(
 async def _create_v3_price_key_stage(
     *, schema_name: str, price_set_atom_table: str, stage_table: str
 ) -> dict[str, int | None]:
+    # V3 plans a large DISTINCT over this transient table. Without fresh
+    # cardinality statistics PostgreSQL can underestimate dense sources by an
+    # order of magnitude and choose a heavily spilling aggregate.
+    await db.status(
+        f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(price_set_atom_table)};"
+    )
     await db.status(
         f"""
         CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} AS
@@ -2325,6 +2333,22 @@ def _v3_price_atom_sql(
     """
 
 
+def _report_v3_stream_progress(
+    progress_callback: Callable[..., None] | None,
+    completed_stream_count: int,
+    stream_summary: Mapping[str, Any],
+) -> None:
+    artifact_kind = str(stream_summary.get("artifact_kind") or stream_summary.get("kind") or "")
+    _emit_progress(
+        progress_callback,
+        "serving binary artifact stream",
+        done=1 + completed_stream_count,
+        total=_V3_PUBLISH_PROGRESS_TOTAL,
+        message=f"completed PostgreSQL binary artifact stream {artifact_kind}",
+        artifact_kind=artifact_kind,
+    )
+
+
 async def _run_v3_streams(
     *,
     sql_by_kind: Mapping[str, str],
@@ -2333,7 +2357,9 @@ async def _run_v3_streams(
     target_copy_format: str,
     atom_count: int,
     atom_key_bits: int,
+    progress_callback: Callable[..., None] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Run v3 artifact encoders concurrently and report each completed stream."""
     stream_limit = min(_serving_binary_stream_tasks(), len(sql_by_kind))
     stream_semaphore = asyncio.Semaphore(stream_limit)
     if select_atom_key_bits(atom_count) != atom_key_bits:
@@ -2364,7 +2390,12 @@ async def _run_v3_streams(
         kind: asyncio.create_task(_stream_kind(kind, sql)) for kind, sql in sql_by_kind.items()
     }
     try:
-        stream_summaries = await asyncio.gather(*task_by_kind.values())
+        completed_stream_count = 0
+        for completed_stream in asyncio.as_completed(task_by_kind.values()):
+            stream_summary = await completed_stream
+            completed_stream_count += 1
+            _report_v3_stream_progress(progress_callback, completed_stream_count, stream_summary)
+        stream_summaries = [stream_task.result() for stream_task in task_by_kind.values()]
     except (Exception, asyncio.CancelledError):
         for stream_task in task_by_kind.values():
             stream_task.cancel()
@@ -2821,12 +2852,28 @@ async def _write_v3_serving_binary(publish_options: _V3PublishOptions) -> dict[s
             schema_name=publish_options.schema_name,
             stage_tables=stage_tables,
         )
+        _emit_progress(
+            publish_options.progress_callback,
+            "serving binary dense maps",
+            done=0,
+            total=_V3_PUBLISH_PROGRESS_TOTAL,
+            message="building canonical price and atom key maps",
+        )
         map_started_at = time.monotonic()
         price_map_stats, atom_map_stats = await _create_v3_stage_maps(
             publish_options,
             stage_tables,
         )
         timing_by_stage["dense_map_seconds"] = _elapsed_seconds(map_started_at)
+        _emit_progress(
+            publish_options.progress_callback,
+            "serving binary dense maps complete",
+            done=1,
+            total=_V3_PUBLISH_PROGRESS_TOTAL,
+            message="canonical price and atom key maps built",
+            price_set_count=int(price_map_stats["row_count"] or 0),
+            atom_count=int(atom_map_stats["row_count"] or 0),
+        )
         await create_ptg2_serving_binary_table(
             schema_name=publish_options.schema_name,
             target_table=publish_options.target_table,
@@ -2867,6 +2914,7 @@ async def _finish_v3_serving_binary(
         target_copy_format=_serving_binary_target_copy_format(),
         atom_count=atom_count,
         atom_key_bits=atom_key_bits,
+        progress_callback=publish_options.progress_callback,
     )
     timing_by_stage["v3_stream_seconds"] = _elapsed_seconds(stream_started_at)
     by_code_summary = stream_summary_by_kind[PTG2_SERVING_BINARY_BY_CODE_ASSIGNED_V3_ENCODER_KIND]
@@ -2904,6 +2952,13 @@ async def _finalize_v3_serving_binary(
 ) -> dict[str, Any]:
     atom_count = int(build_state.atom_map_stats["row_count"] or 0)
     price_set_count = int(build_state.price_map_stats["row_count"] or 0)
+    _emit_progress(
+        publish_options.progress_callback,
+        "serving binary finalizing",
+        done=5,
+        total=_V3_PUBLISH_PROGRESS_TOTAL,
+        message="building indexes and making PostgreSQL binary artifacts durable",
+    )
     index_started_at = time.monotonic()
     storage_summary = await finalize_ptg2_serving_binary_table(
         schema_name=publish_options.schema_name,
@@ -2938,6 +2993,13 @@ async def _finalize_v3_serving_binary(
         "by-code",
     )
     build_state.timing_by_stage["total_seconds"] = _elapsed_seconds(build_state.started_at)
+    _emit_progress(
+        publish_options.progress_callback,
+        "serving binary finalized",
+        done=_V3_PUBLISH_PROGRESS_TOTAL,
+        total=_V3_PUBLISH_PROGRESS_TOTAL,
+        message="PostgreSQL binary artifacts indexed and durable",
+    )
     return _v3_serving_manifest(
         publish_options,
         build_state,
