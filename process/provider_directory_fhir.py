@@ -3298,16 +3298,9 @@ def _source_uses_known_onboarding_gateway(source: dict[str, Any]) -> bool:
     return urllib.parse.urlsplit(_canonical_base(source.get("canonical_api_base") or source.get("api_base")) or "").netloc.lower() in FHIR_ONBOARDING_GATEWAY_HOSTS
 
 
-def _select_resource_import_sources(
-    source_rows: list[dict[str, Any]],
-    *,
-    valid_source_ids: set[str] | None,
-    open_only: bool,
-    include_auth_required: bool,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    selected: list[dict[str, Any]] = []
-    metrics = {
-        "source_import_sources_considered": len(source_rows),
+def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
+    return {
+        "source_import_sources_considered": source_count,
         "source_import_sources_selected": 0,
         "source_import_skipped_missing_api_base": 0,
         "source_import_skipped_probe_not_valid": 0,
@@ -3315,9 +3308,23 @@ def _select_resource_import_sources(
         "source_import_skipped_validation_status": 0,
         "source_import_skipped_auth_required_policy": 0,
         "source_import_sources_selected_live_probe_valid": 0,
+        "source_import_sources_selected_checkpoint_retry": 0,
         "source_import_sources_selected_declared_credentialed": 0,
         "source_import_sources_selected_auth_required_seed": 0,
     }
+
+
+def _select_resource_import_sources(
+    source_rows: list[dict[str, Any]],
+    *,
+    valid_source_ids: set[str] | None,
+    open_only: bool,
+    include_auth_required: bool,
+    checkpoint_retry_source_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    selected: list[dict[str, Any]] = []
+    metrics = _resource_import_selection_metrics(len(source_rows))
+    checkpoint_retry_ids = checkpoint_retry_source_ids or set()
     for source in source_rows:
         if not _canonical_base(source.get("api_base")):
             metrics["source_import_skipped_missing_api_base"] += 1
@@ -3325,13 +3332,18 @@ def _select_resource_import_sources(
         auth_type = (_clean_text(source.get("auth_type")) or "").lower()
         validation = (_clean_text(source.get("last_validated_status")) or "").lower()
         live_probe_valid = valid_source_ids is not None and source["source_id"] in valid_source_ids
-        if valid_source_ids is not None and not live_probe_valid:
+        is_checkpoint_retry = source["source_id"] in checkpoint_retry_ids
+        if valid_source_ids is not None and not (live_probe_valid or is_checkpoint_retry):
             metrics["source_import_skipped_probe_not_valid"] += 1
             continue
-        if open_only and auth_type not in {"open", "none", ""} and not live_probe_valid:
+        if (
+            open_only
+            and auth_type not in {"open", "none", ""}
+            and not (live_probe_valid or is_checkpoint_retry)
+        ):
             metrics["source_import_skipped_open_only"] += 1
             continue
-        if valid_source_ids is None:
+        if valid_source_ids is None and not is_checkpoint_retry:
             if not include_auth_required and validation == "auth_required":
                 metrics["source_import_skipped_auth_required_policy"] += 1
                 continue
@@ -3345,6 +3357,8 @@ def _select_resource_import_sources(
         metrics["source_import_sources_selected"] += 1
         if live_probe_valid:
             metrics["source_import_sources_selected_live_probe_valid"] += 1
+        if is_checkpoint_retry:
+            metrics["source_import_sources_selected_checkpoint_retry"] += 1
         if _source_declares_credentialed_access(source):
             metrics["source_import_sources_selected_declared_credentialed"] += 1
         if validation == "auth_required":
@@ -20628,11 +20642,19 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             metrics["sources_probed"] = probed
             metrics["valid_capability_sources"] = valid
         if not seed_only and import_resources and source_rows:
+            checkpoint_retry_source_ids = (
+                set(requested_source_ids)
+                if is_pagination_checkpointing_enabled
+                and retry_of_run_id
+                and pagination_root_run_id
+                else set()
+            )
             importable, selection_metrics = _select_resource_import_sources(
                 source_rows,
                 valid_source_ids=valid_source_ids,
                 open_only=open_only,
                 include_auth_required=include_auth_required,
+                checkpoint_retry_source_ids=checkpoint_retry_source_ids,
             )
             metrics.update(selection_metrics)
             if requested_source_ids and not importable:

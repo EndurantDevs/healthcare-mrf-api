@@ -7473,6 +7473,80 @@ async def test_explicit_source_import_fails_when_requested_source_is_not_selecte
     import_resources.assert_not_awaited()
 
 
+def _stub_checkpoint_retry_process(monkeypatch, requested_source_id):
+    import_resources = AsyncMock(return_value={"Location": 1})
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        lambda *_args, **_kwargs: ("fixture.db", None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_seed_rows_from_sqlite",
+        lambda *_args, **_kwargs: [{"id": requested_source_id}],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_source_row_from_seed",
+        lambda _seed_row: {
+            "source_id": requested_source_id,
+            "org_name": "Checkpointed source",
+            "api_base": "https://payer.example/fhir",
+            "canonical_api_base": "https://payer.example/fhir",
+            "auth_type": "oauth2",
+            "last_validated_status": "auth_required",
+            "metadata_json": {},
+        },
+    )
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        importer,
+        "_probe_sources",
+        AsyncMock(return_value=(1, 0, set())),
+    )
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
+    return import_resources
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejection(
+    monkeypatch,
+):
+    requested_source_id = "pdfhir_checkpointed"
+    import_resources = _stub_checkpoint_retry_process(
+        monkeypatch,
+        requested_source_id,
+    )
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "run_id": "run_retry",
+            "retry_of_run_id": "run_parent",
+            "provider_directory_pagination_root_run_id": "run_root",
+            "seed_db_path": "fixture.db",
+            "source_ids": [requested_source_id],
+            "probe": True,
+            "import_resources": True,
+            "resources": "Location",
+            "full_refresh": True,
+            "resource_limit": 0,
+            "page_limit": 0,
+            "stream_batch_size": 5000,
+            "stale_cleanup": False,
+            "publish_artifacts": False,
+        },
+    )
+
+    assert metrics["source_import_sources_selected_checkpoint_retry"] == 1
+    assert metrics["source_import_sources_selected_live_probe_valid"] == 0
+    import_resources.assert_awaited_once()
+    assert import_resources.await_args.args[0][0]["source_id"] == requested_source_id
+
+
 @pytest.mark.asyncio
 async def test_process_data_uses_live_probe_success_over_seed_auth_required_status(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
