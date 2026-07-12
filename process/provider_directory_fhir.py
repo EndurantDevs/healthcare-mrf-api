@@ -5956,7 +5956,7 @@ async def _capture_provider_directory_artifact_promotion_identities(
     return tuple(identities)
 
 
-async def _provider_directory_artifact_promotion_was_committed(
+async def _is_provider_directory_artifact_promotion_committed(
     identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...],
 ) -> bool:
     """Confirm that every prepared stage became its logged live target."""
@@ -6241,7 +6241,7 @@ async def _promote_provider_directory_artifact_bundle(
         ):
             await _promote_provider_directory_artifact_bundle_transaction(stages)
     except TimeoutError:
-        if await _provider_directory_artifact_promotion_was_committed(
+        if await _is_provider_directory_artifact_promotion_committed(
             promotion_identities
         ):
             LOGGER.warning(
@@ -6318,7 +6318,7 @@ async def _promote_provider_directory_artifact_stage(
                 build_fence,
             )
     except TimeoutError:
-        if await _provider_directory_artifact_promotion_was_committed(
+        if await _is_provider_directory_artifact_promotion_committed(
             promotion_identities
         ):
             LOGGER.warning(

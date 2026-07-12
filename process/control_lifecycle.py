@@ -33,12 +33,6 @@ _control_run_db_throttle_redis: redis.Redis | None = None
 logger = logging.getLogger(__name__)
 
 
-def _control_exception_message(exc: BaseException) -> str:
-    """Return a useful terminal error even for message-less exceptions."""
-
-    return str(exc).strip() or type(exc).__name__
-
-
 async def control_single_job_start(
     ctx: dict[str, Any],
     task: dict[str, Any] | None = None,
@@ -110,14 +104,12 @@ async def control_single_job_start(
         await _flush_terminal_status_events()
         return {"status": "failed", "run_id": run_id, "error": str(exc)}
     except Exception as exc:
-        error_message = _control_exception_message(exc)
         await mark_control_run(
             run_id,
             status="failed",
             phase_detail=f"{target_function} failed",
             progress_message="failed",
-            error={"code": "import_failed", "message": error_message},
-            metrics=_terminal_metrics_from_context(ctx.get("context")),
+            error={"code": "import_failed", "message": str(exc).strip() or type(exc).__name__}, metrics=_terminal_metrics_from_context(ctx.get("context")),
         )
         await _flush_terminal_status_events()
         raise

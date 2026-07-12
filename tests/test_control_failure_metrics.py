@@ -18,7 +18,7 @@ async def test_control_job_persists_failure_audit_metrics(monkeypatch):
             "provider_directory_retry_not_before": "2026-07-12T00:01:00Z",
             "pagination_resume_required": ["pdfhir_molina:Location"],
         }
-        raise RuntimeError("provider_directory_pagination_resume_required")
+        raise TimeoutError
 
     class FakeModule:
         process_data = staticmethod(fake_target)
@@ -26,10 +26,7 @@ async def test_control_job_persists_failure_audit_metrics(monkeypatch):
     monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
 
-    with pytest.raises(
-        RuntimeError,
-        match="provider_directory_pagination_resume_required",
-    ):
+    with pytest.raises(TimeoutError):
         await control_single_job_start(
             {},
             {
@@ -40,6 +37,10 @@ async def test_control_job_persists_failure_audit_metrics(monkeypatch):
         )
 
     assert [run_mark[1]["status"] for run_mark in run_marks] == ["running", "failed"]
+    assert run_marks[-1][1]["error"] == {
+        "code": "import_failed",
+        "message": "TimeoutError",
+    }
     assert run_marks[-1][1]["metrics"] == {
         "audit": {
             "provider_directory_retry_not_before": "2026-07-12T00:01:00Z",
