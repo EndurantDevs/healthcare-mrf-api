@@ -9760,6 +9760,20 @@ async def _ensure_provider_directory_tables() -> None:
 
 
 async def _ensure_provider_directory_source_column_types(schema: str) -> None:
+    current_data_type = _clean_text(
+        await db.scalar(
+            """
+            SELECT data_type
+              FROM information_schema.columns
+             WHERE table_schema = :schema_name
+               AND table_name = 'provider_directory_source'
+               AND column_name = 'data_quality_checked';
+            """,
+            schema_name=schema,
+        )
+    ).lower()
+    if not current_data_type or current_data_type == "text":
+        return
     await db.status(
         f"""
         ALTER TABLE IF EXISTS {_qt(schema, "provider_directory_source")}
@@ -17349,6 +17363,8 @@ async def _fetch_resource_rows(
                 error_message = str(exc)
                 next_url_remaining = True
                 break
+            if not entries and source_api_base in FHIR_OFFSET_PAGINATION_BASES:
+                resolved_next_url = None
             if (
                 checkpoint_context
                 and not entries

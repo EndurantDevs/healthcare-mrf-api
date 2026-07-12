@@ -2956,7 +2956,9 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
 
 @pytest.mark.asyncio
 async def test_ensure_provider_directory_source_column_types_widens_data_quality_checked(monkeypatch):
+    scalar_mock = AsyncMock(return_value="character varying")
     status_mock = AsyncMock()
+    monkeypatch.setattr(importer.db, "scalar", scalar_mock)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
     await importer._ensure_provider_directory_source_column_types("mrf")
@@ -2965,6 +2967,19 @@ async def test_ensure_provider_directory_source_column_types_widens_data_quality
     sql = status_mock.await_args.args[0]
     assert 'ALTER TABLE IF EXISTS "mrf"."provider_directory_source"' in sql
     assert "ALTER COLUMN data_quality_checked TYPE text" in sql
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_source_column_types_skips_current_text_column(monkeypatch):
+    scalar_mock = AsyncMock(return_value="text")
+    status_mock = AsyncMock()
+    monkeypatch.setattr(importer.db, "scalar", scalar_mock)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    await importer._ensure_provider_directory_source_column_types("mrf")
+
+    scalar_mock.assert_awaited_once()
+    status_mock.assert_not_awaited()
 
 
 def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
@@ -15267,6 +15282,109 @@ async def test_fetch_resource_rows_resumes_exact_checkpoint_url(monkeypatch):
     assert saved_checkpoints[0]["next_url"] is None
     assert saved_checkpoints[0]["pages_processed"] == 8
     assert saved_checkpoints[0]["rows_processed"] == 701
+
+
+def _terminal_empty_offset_page_callbacks(api_base):
+    terminal_url = (
+        f"{api_base}/Organization?"
+        "_sort=_id&_offset=2585000&_count=100"
+    )
+    invalid_next_url = (
+        f"{api_base}/Organization?"
+        "_sort=_id&_offset=2585001&_count=100"
+    )
+    requested_urls: list[str] = []
+    saved_next_urls: list[str | None] = []
+
+    async def fake_load_checkpoint(_context, _resource_type, _start_url):
+        return importer.PaginationResumeState(
+            next_url=terminal_url,
+            pages_processed=25850,
+            rows_processed=1000,
+            recent_url_hashes=(),
+            resumed=True,
+        )
+
+    async def fake_fetch_source_json(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "total": 2585000,
+                "entry": [],
+                "link": [{"relation": "next", "url": invalid_next_url}],
+            },
+            None,
+            5,
+        )
+
+    async def fake_save_checkpoint(_context, _resource_type, **checkpoint):
+        saved_next_urls.append(checkpoint["next_url"])
+
+    return terminal_url, requested_urls, saved_next_urls, fake_load_checkpoint, fake_fetch_source_json, fake_save_checkpoint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_base",
+    (
+        importer.TMHP_PROVIDER_DIRECTORY_BASE,
+        importer.NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
+    ),
+)
+async def test_offset_pagination_stops_on_terminal_empty_bundle(monkeypatch, api_base):
+    """Stop state-directory checkpoints at invalid empty terminal pages."""
+    (
+        terminal_url,
+        requested_urls,
+        saved_next_urls,
+        fake_load_checkpoint,
+        fake_fetch_source_json,
+        fake_save_checkpoint,
+    ) = _terminal_empty_offset_page_callbacks(api_base)
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        fake_load_checkpoint,
+    )
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", fake_save_checkpoint)
+
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=api_base,
+        source_scope_hash="state_scope",
+        source_ids=("state_source",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        dataset_id="dataset_state",
+        lineage_verified=True,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        {
+            "source_id": "state_source",
+            "api_base": api_base,
+            "canonical_api_base": api_base,
+        },
+        "Organization",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(return_value=0),
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=checkpoint_context,
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.next_url_remaining is False
+    assert requested_urls == [terminal_url]
+    assert saved_next_urls == [None]
 
 
 @pytest.mark.asyncio
