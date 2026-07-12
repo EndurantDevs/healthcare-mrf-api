@@ -16696,6 +16696,29 @@ def test_address_overlay_affiliation_component_uses_org_phone_and_service_locati
     assert sql.count("addr_key_v1(") == 1
 
 
+def test_address_overlay_affiliation_keeps_location_lookup_correlated():
+    sql = importer._address_overlay_component_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        component="organization_affiliation",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert (
+        'JOIN "mrf"."provider_directory_location" AS location '
+        "ON location.source_id = affiliation.source_id"
+    ) in compact_sql
+    assert "UNION SELECT service_location_ref.value" in compact_sql
+    assert "OFFSET 0 ) AS loc ON TRUE" in compact_sql
+    assert (
+        'AS location_ref ON TRUE JOIN "mrf"."provider_directory_location"'
+        not in compact_sql
+    )
+    assert "location.status IS NULL OR lower(location.status) <> 'inactive'" in compact_sql
+
+
 def test_address_overlay_stage_index_names_are_hash_safe():
     stage_table = importer._address_overlay_stage_table_name("run_1")
     index_name = importer._address_overlay_index_name(stage_table, "source_record_idx")

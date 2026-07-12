@@ -24566,28 +24566,40 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 ON organization.source_id = affiliation.source_id
                AND organization.resource_id = organization_ref.resource_id
               JOIN LATERAL (
-                  SELECT direct_location_ref.value
-                    FROM jsonb_array_elements_text(
-                        COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-                    ) AS direct_location_ref(value)
-                  UNION
-                  SELECT service_location_ref.value
-                    FROM jsonb_array_elements_text(
-                        COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
-                    ) AS service_ref(value)
-                    JOIN {healthcare_service_table} AS healthcare_service
-                      ON healthcare_service.source_id = affiliation.source_id
-                     AND healthcare_service.resource_id = NULLIF(
-                            regexp_replace(service_ref.value, '^.*/', ''),
+                  SELECT location.*
+                    FROM (
+                        SELECT direct_location_ref.value
+                          FROM jsonb_array_elements_text(
+                              COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                          ) AS direct_location_ref(value)
+                        UNION
+                        SELECT service_location_ref.value
+                          FROM jsonb_array_elements_text(
+                              COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                          ) AS service_ref(value)
+                          JOIN {healthcare_service_table} AS healthcare_service
+                            ON healthcare_service.source_id = affiliation.source_id
+                           AND healthcare_service.resource_id = NULLIF(
+                                  regexp_replace(service_ref.value, '^.*/', ''),
+                                  ''
+                               )
+                          JOIN LATERAL jsonb_array_elements_text(
+                              COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                          ) AS service_location_ref(value) ON TRUE
+                    ) AS location_ref
+                    JOIN {location_table} AS location
+                      ON location.source_id = affiliation.source_id
+                     AND location.resource_id = NULLIF(
+                            regexp_replace(location_ref.value, '^.*/', ''),
                             ''
                          )
-                    JOIN LATERAL jsonb_array_elements_text(
-                        COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-                    ) AS service_location_ref(value) ON TRUE
-              ) AS location_ref ON TRUE
-              JOIN {location_table} AS loc
-                ON loc.source_id = affiliation.source_id
-               AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+                   WHERE (location.status IS NULL OR lower(location.status) <> 'inactive')
+                     AND NULLIF(TRIM(location.first_line), '') IS NOT NULL
+                     AND NULLIF(TRIM(location.city_name), '') IS NOT NULL
+                     AND NULLIF(TRIM(location.postal_code), '') IS NOT NULL
+                  -- Keep the lookup correlated so PostgreSQL uses the location primary key.
+                  OFFSET 0
+              ) AS loc ON TRUE
               LEFT JOIN LATERAL (
                   SELECT telecom.value->>'value' AS telephone_number
                     FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
@@ -24605,10 +24617,6 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
              WHERE organization.npi BETWEEN 1000000000 AND 9999999999
                AND organization.active IS DISTINCT FROM false
                AND affiliation.active IS DISTINCT FROM false
-               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
-               AND NULLIF(TRIM(loc.first_line), '') IS NOT NULL
-               AND NULLIF(TRIM(loc.city_name), '') IS NOT NULL
-               AND NULLIF(TRIM(loc.postal_code), '') IS NOT NULL
                {component_scope}
         )
         SELECT {columns}
