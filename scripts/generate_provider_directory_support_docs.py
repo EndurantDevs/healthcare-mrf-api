@@ -32,6 +32,7 @@ try:
         render_inventory_summary,
         resource_completion_display,
     )
+    from scripts.provider_directory_readiness_display import publication_readiness_display
     from scripts.provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
         provider_directory_entry_sha256,
@@ -62,6 +63,7 @@ except ModuleNotFoundError:
         render_inventory_summary,
         resource_completion_display,
     )
+    from provider_directory_readiness_display import publication_readiness_display
     from provider_directory_verification_contract import (
         VERIFICATION_STATUSES,
         provider_directory_entry_sha256,
@@ -245,6 +247,8 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",
+        "A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
+        "",
         "Freshness policy: catalog confirmation expires after `"
         + str(policy["catalog_confirmation_max_age_days"])
         + "` days, source reviews after `"
@@ -347,17 +351,20 @@ def _observed_verification_section(
         "",
         "## Observed Live Verification",
         "",
-        "This tracked snapshot is separate from configured support. It records credential-safe terminal proof and the latest observed run state. Every terminal record is bound to the fingerprint of its source entry, so changing an endpoint, resource set, or acquisition parameters invalidates only that source's current proof. Support-note edits do not invalidate unrelated acquisition evidence. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.",
+        "This tracked snapshot is separate from configured support. It records credential-safe terminal proof, the latest observed run state, and independently reviewed derived-artifact and unified/API readiness. A terminal acquisition proves only that the configured source run reached its terminal state; it does not prove that artifacts were promoted, addresses were unified, or API serving is ready. Every terminal record is bound to the fingerprint of its source entry, so changing an endpoint, resource set, or acquisition parameters invalidates only that source's current proof. Support-note edits do not invalidate unrelated acquisition evidence. When a newer active run supersedes older terminal proof, the old proof remains visible as `Superseded` and is not presented as current.",
         "",
         "After a terminal campaign, use the report's `verification_update.argv` or run `python scripts/update_provider_directory_verification.py --report <credential-safe-report.json> --environment <environment>`. The updater rejects stale reports, manifest or campaign mismatches, and terminal labels backed by nonterminal runs.",
         "",
-        f"Verification environment: `{snapshot['environment']}`. Campaign: `{snapshot['campaign_id']}`. Snapshot checked at `{checked_at}`.",
+        f"Verification environment: `{snapshot['environment']}`. Campaign: `{snapshot['campaign_id']}`. Last harness report identity at `{checked_at}`; each downstream-readiness review carries its own timestamp.",
         "",
-        "| Source | Proof state | Terminal status | Resource completion | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Rows by resource |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Source | Proof state | Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Rows by resource | Readiness evidence |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in manifest["entries"]:
         verification_record = verification_records[entry["entry_id"]]
+        artifact_state, api_state, readiness_observed_at, readiness_evidence = publication_readiness_display(
+            verification_record
+        )
         cells = [
             f"{entry['display_name']} (`{entry['entry_id']}`)",
             _display_verification(verification_record.get("proof_state", "current" if verification_record["terminal_status"] else "not_recorded")),
@@ -365,6 +372,9 @@ def _observed_verification_section(
             resource_completion_display(
                 entry, support_by_entry[entry["entry_id"]], verification_record
             ),
+            artifact_state,
+            api_state,
+            readiness_observed_at,
             verification_record["run_id"] or NOT_RECORDED_DISPLAY,
             _observation_display(verification_record),
             _display_verification(verification_record["access_verification"]),
@@ -381,6 +391,7 @@ def _observed_verification_section(
                 else NOT_RECORDED_DISPLAY
             ),
             _terminal_resource_rows_display(entry, verification_record),
+            readiness_evidence,
         ]
         return_lines.append("| " + " | ".join(_markdown_cell(str(cell)) for cell in cells) + " |")
     return return_lines

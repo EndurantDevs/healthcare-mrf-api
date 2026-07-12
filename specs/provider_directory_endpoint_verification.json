@@ -5,6 +5,32 @@
     "aetna-commercial-medicare": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "evidence": {
+          "blocking_resource": "PractitionerRole",
+          "bulk_status": "upstream_pending",
+          "completed_resource_rows": 6659493
+        },
+        "observed_at": "2026-07-12T09:48:40Z",
+        "run_id": "run_cce27bc1f57f4e95b512f90a98e2b2d0",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 1003923,
+            "coordinate_rows": 1006481,
+            "location_rows": 1006494,
+            "phone_rows": 62930,
+            "role_to_plan_refs": 0,
+            "source_rows": 6659493
+          }
+        },
+        "observed_at": "2026-07-12T09:48:40Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -581,6 +607,27 @@
     "contra-costa": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_a088c72538b54043a960b8d06f55ee29",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "evidence": {
+          "signals": {
+            "address_keys": "absent",
+            "address_overlay": "absent",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -715,6 +762,25 @@
         "run_id": "run_b6fd87aad3854911bfc45498dd3ef9df",
         "run_status": "succeeded",
         "state_status": "succeeded"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "source_rows": 344868
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "present"
+          }
+        },
+        "observed_at": "2026-07-12T09:57:30Z",
+        "unified_api_state": "ready"
       },
       "entry_spec_sha256": "118e03de4598326b3e2367ca238a9ec9d63cf822362bf7ed34df78f0f23501df",
       "proof_state": "current",
@@ -859,6 +925,17 @@
     "humana": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_67aaccb070a545d891b595500e6a8227",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -1211,10 +1288,40 @@
       "terminal_status": "succeeded"
     },
     "iehp": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
-      "run_id": null,
-      "terminal_status": null
+      "access_verification": "verified",
+      "checked_at": "2026-07-12T09:20:04Z",
+      "current_observation": {
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_776b413cb661434d8916243715573d1f",
+        "run_status": "succeeded",
+        "state_status": "succeeded"
+      },
+      "entry_spec_sha256": "2125d2d42db5445ea4702a5cb2356bc433232f5ef21b84f7720e2f9cc64682c5",
+      "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "stale",
+        "evidence": {
+          "counts": {
+            "address_keys": 36249,
+            "address_rows": 36251,
+            "coordinate_rows": 0,
+            "location_rows": 36252,
+            "phone_rows": 0,
+            "role_to_plan_refs": 0,
+            "source_rows": 458671
+          }
+        },
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
+      "run_id": "run_776b413cb661434d8916243715573d1f",
+      "terminal_evidence": {
+        "acquisition_rows": 458671,
+        "source_ids": [
+          "pdfhir_56521fb2d273045f2c3b73dc"
+        ]
+      },
+      "terminal_status": "succeeded"
     },
     "maine": {
       "access_verification": "not_recorded",
@@ -1243,6 +1350,17 @@
     "nebraska": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_84d467c0708c4220ade1192a89fcc3bd",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -1255,18 +1373,76 @@
     "texas-tmhp": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_5e507c78167d40ec92025735519f9841",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "evidence": {
+          "signals": {
+            "locations": "absent",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
     "uhc": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "evidence": {
+          "current_dataset_resource_rows": 0,
+          "legacy_rows_are_not_current": true,
+          "plan_graph_state": "incomplete"
+        },
+        "observed_at": "2026-07-12T09:48:39Z",
+        "run_id": "run_9c0952f5a0904679b4ec158377515f8a",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "evidence": {
+          "counts": {
+            "role_to_plan_refs": 0,
+            "source_rows": 0
+          },
+          "signals": {
+            "locations": "absent",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T09:48:39Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
     "washington": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "evidence": {
+          "pagination_resume_attempt": 25,
+          "retry_disposition": "do_not_retry_blindly"
+        },
+        "observed_at": "2026-07-12T09:20:04Z",
+        "run_id": "run_b4b6845aac8047539ae13a85b05513e7",
+        "run_status": "failed",
+        "state_status": "failed"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "observed_at": "2026-07-12T09:20:04Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },

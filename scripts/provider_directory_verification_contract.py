@@ -1,4 +1,4 @@
-"""Per-source acquisition-spec binding for Provider Directory terminal proof."""
+"""Per-source acquisition proof and publication-readiness contract."""
 
 from __future__ import annotations
 
@@ -31,6 +31,27 @@ VERIFICATION_STATUSES = {
     "resume_required",
     "succeeded",
     "unknown_terminal",
+}
+DERIVED_ARTIFACT_STATES = {"promoted", "stale", "not_promoted", "not_recorded"}
+UNIFIED_API_STATES = {"ready", "pending_verification", "not_ready", "not_recorded"}
+READINESS_SIGNAL_STATES = {"present", "absent", "not_checked"}
+READINESS_COUNT_FIELDS = {
+    "source_rows",
+    "location_rows",
+    "address_rows",
+    "address_keys",
+    "phone_rows",
+    "coordinate_rows",
+    "role_to_plan_refs",
+}
+READINESS_SIGNAL_FIELDS = {
+    "locations",
+    "addresses",
+    "address_keys",
+    "address_overlay",
+    "phones",
+    "coordinates",
+    "role_to_plan_refs",
 }
 SENSITIVE_TEXT_PATTERN = re.compile(
     r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
@@ -194,6 +215,62 @@ def _validate_verification_observation(entry_id: str, observation: Any) -> None:
         )
 
 
+def _validate_publication_readiness(entry_id: str, readiness_record: Any) -> None:
+    """Validate downstream readiness without treating it as acquisition proof."""
+    required_fields = {"derived_artifact_state", "unified_api_state", "observed_at"}
+    optional_fields = {"evidence"}
+    if readiness_record is None:
+        return
+    if (
+        not isinstance(readiness_record, dict)
+        or not required_fields.issubset(readiness_record)
+        or not set(readiness_record).issubset(required_fields | optional_fields)
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: publication readiness fields are not controlled"
+        )
+    if readiness_record["derived_artifact_state"] not in DERIVED_ARTIFACT_STATES:
+        raise SupportDocumentationError(f"{entry_id}: invalid derived artifact state")
+    if readiness_record["unified_api_state"] not in UNIFIED_API_STATES:
+        raise SupportDocumentationError(f"{entry_id}: invalid unified API state")
+    validate_optional_verification_timestamp(
+        readiness_record["observed_at"], f"{entry_id}: publication readiness observed_at"
+    )
+    evidence_map = readiness_record.get("evidence")
+    if evidence_map is None:
+        return
+    if not isinstance(evidence_map, dict) or set(evidence_map) - {"counts", "signals"}:
+        raise SupportDocumentationError(
+            f"{entry_id}: publication readiness evidence is not controlled"
+        )
+    count_by_field = evidence_map.get("counts")
+    if count_by_field is not None and (
+        not isinstance(count_by_field, dict)
+        or set(count_by_field) - READINESS_COUNT_FIELDS
+        or any(
+            not isinstance(count_value, int)
+            or isinstance(count_value, bool)
+            or count_value < 0
+            for count_value in count_by_field.values()
+        )
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: publication readiness counts are invalid"
+        )
+    signal_by_field = evidence_map.get("signals")
+    if signal_by_field is not None and (
+        not isinstance(signal_by_field, dict)
+        or set(signal_by_field) - READINESS_SIGNAL_FIELDS
+        or any(
+            signal_state not in READINESS_SIGNAL_STATES
+            for signal_state in signal_by_field.values()
+        )
+    ):
+        raise SupportDocumentationError(
+            f"{entry_id}: publication readiness signals are invalid"
+        )
+
+
 def validate_verification_record(
     entry_id: str,
     verification_record: Any,
@@ -209,6 +286,7 @@ def validate_verification_record(
         "entry_spec_sha256",
         "current_observation",
         "terminal_evidence",
+        "publication_readiness",
     }
     if (
         not isinstance(verification_record, dict)
@@ -227,8 +305,7 @@ def validate_verification_record(
         entry_id,
         terminal_status,
         run_id,
-        verification_record["access_verification"],
-        verification_record["checked_at"],
+        verification_record["access_verification"], verification_record["checked_at"],
     )
     if proof_state not in PROOF_STATES:
         raise SupportDocumentationError(f"{entry_id}: invalid proof state")
@@ -238,6 +315,7 @@ def validate_verification_record(
         )
     observation = verification_record.get("current_observation")
     _validate_verification_observation(entry_id, observation)
+    _validate_publication_readiness(entry_id, verification_record.get("publication_readiness"))
     terminal_evidence = verification_record.get("terminal_evidence")
     if terminal_evidence is not None and (
         not isinstance(terminal_evidence, dict)

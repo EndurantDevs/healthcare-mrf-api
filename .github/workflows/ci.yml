@@ -85,12 +85,14 @@ jobs:
           tests/test_provider_directory_artifact_cutover.py
           tests/test_provider_directory_artifact_cutover_reconciliation.py
           tests/test_entity_address_unified_provider_directory.py
+          tests/test_entity_address_unified_no_live_mutation.py
           tests/test_provider_directory_endpoint_dataset_schema.py
           tests/test_provider_directory_pagination_checkpoint_schema.py
           tests/test_provider_directory_pagination_root_identity_schema.py
           tests/test_provider_directory_schema_sync.py
           tests/test_provider_directory_bulk_checkpoint_schema.py
           tests/test_generate_provider_directory_support_docs.py
+          tests/test_provider_directory_publication_readiness.py
           tests/test_provider_directory_catalog_confirmation.py
           tests/test_update_provider_directory_verification.py
           tests/test_address_canonical_unit.py

@@ -174,13 +174,13 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     assert "SECRET" not in serialized_snapshot
     assert "SECRET" not in serialized_docs
     assert '"error"' not in serialized_snapshot
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
     assert '"InsurancePlan": {' in serialized_snapshot
     assert '"sources_bounded": 0' in serialized_snapshot
     assert "| Rows by resource |" in serialized_docs
     assert "| Evidence recorded |" in serialized_docs
     assert '"InsurancePlan": {' not in serialized_docs
-    assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded" in serialized_docs
+    assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded" in serialized_docs
 
 
 def test_bounded_terminal_evidence_preserves_safe_structured_details():
@@ -312,7 +312,24 @@ def test_newer_nonterminal_report_marks_prior_terminal_proof_superseded():
     assert idaho_verification["terminal_status"] == "succeeded"
     assert idaho_verification["proof_state"] == "superseded"
     assert idaho_verification["current_observation"]["run_id"] == "run_idaho_new"
-    assert "| Idaho (`idaho`) | Superseded | Succeeded | Complete | run_idaho | Running (`run_idaho_new`)" in rendered
+    assert "| Idaho (`idaho`) | Superseded | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_idaho | Running (`run_idaho_new`)" in rendered
+
+
+def test_terminal_update_preserves_independent_publication_readiness():
+    manifest, snapshot = _manifest_and_snapshot()
+    snapshot["entries"]["idaho"]["publication_readiness"] = {
+        "derived_artifact_state": "stale",
+        "unified_api_state": "not_ready",
+        "observed_at": "2026-07-10T17:00:00Z",
+        "evidence": {"counts": {"address_keys": 0}},
+    }
+    report = _report(manifest)
+
+    updated = updater.update_verification_snapshot(
+        manifest, report, snapshot, "healthporta-dev"
+    )
+
+    assert updated["entries"]["idaho"]["publication_readiness"] == snapshot["entries"]["idaho"]["publication_readiness"]
 
 
 def test_terminal_label_backed_by_active_run_is_rejected():

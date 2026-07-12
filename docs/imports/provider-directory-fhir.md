@@ -37,11 +37,17 @@ Keep these authorities separate when reviewing Provider Directory coverage:
   evidence.
 - Live evidence is maintained in the [verification snapshot](../../specs/provider_directory_endpoint_verification.json).
   The campaign report is the untracked runtime observation; the snapshot is
-  the tracked terminal proof. A newer active run can supersede older proof, so
-  do not read configured support as live verification. Each terminal record
-  stores the fingerprint of its manifest entry. Endpoint, resource, or import
-  parameter changes supersede only that source's proof; support-note edits do
-  not invalidate evidence for an unchanged acquisition contract.
+  the tracked terminal proof and downstream-readiness record. A newer active
+  run can supersede older proof, so do not read configured support as live
+  verification. Each terminal record stores the fingerprint of its manifest entry.
+  Endpoint, resource, or import parameter changes supersede only that
+  source's proof; support-note edits do not invalidate evidence for an
+  unchanged acquisition contract. `publication_readiness` is deliberately
+  independent: a terminal source acquisition does not establish that a derived
+  dataset was promoted, addresses were keyed or overlaid, the unified refresh
+  completed, or the API has been verified. The normal terminal-proof updater
+  retains the latest reviewed readiness record until a downstream audit updates
+  it.
 
 The manifest also carries the documentation freshness policy. The generated
 matrix shows when each catalog confirmation, source review, and current
@@ -49,7 +55,15 @@ terminal proof expires. Its `Resource completion` column is separate from the
 run's terminal status: `Succeeded` without structured evidence is not presented
 as proof that every configured resource completed. CI rejects expired evidence,
 invalid source IDs or canonical bases, unsupported resource names, and
-classification/method contradictions.
+classification/method contradictions. The `Derived artifacts` and `Unified/API
+readiness` columns are separate from both acquisition fields; `Promoted` and
+`Pending Verification` must never be read as API-ready, and `Stale` must never
+be read as a failure of the historical source acquisition.
+
+Canonical endpoint identity is transport identity, not product identity. A
+shared canonical base can have multiple source aliases, but published evidence
+must retain the source ID and its plan/product provenance. Do not merge aliases
+into one product result solely because they share a base or a physical dataset.
 
 Use this sequence for a campaign or documentation review:
 
@@ -84,7 +98,9 @@ Use this sequence for a campaign or documentation review:
 
    The updater rejects stale reports, campaign or manifest mismatches, and
    terminal labels backed by nonterminal runs. Never hand-edit the generated
-   matrix or verification snapshot.
+   matrix. Add independently reviewed downstream readiness only through the
+   controlled `publication_readiness` fields in the verification snapshot, then
+   regenerate the matrix.
 
 4. Check for drift before review. This is also the [CI drift check](../../.github/workflows/ci.yml):
 

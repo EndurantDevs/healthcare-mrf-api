@@ -5,7 +5,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from scripts import generate_provider_directory_support_docs as generator
 from scripts.research import provider_directory_endpoint_acquisition_harness as harness
 
@@ -53,9 +52,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Cigna (`cigna`)" in rendered_document
     assert "Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
-    assert "| Terminal status | Resource completion |" in rendered_document
-    assert "| ALOHR (`alohr`) | Current | External Completed | Complete |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete |" in rendered_document
+    assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
+    assert "| ALOHR (`alohr`) | Current | External Completed | Complete | Not recorded | Not recorded | Not recorded |" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded |" in rendered_document
     assert "scripts/update_provider_directory_verification.py" in rendered_document
     assert "## Known Not Importable" in rendered_document
     assert "Chorus Community Health Plans" in rendered_document
@@ -70,8 +69,8 @@ def test_rendered_live_proof_summarizes_resource_rows():
     rendered_document = generator.render_markdown(manifest)
 
     assert "| Rows by resource |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | run_" in rendered_document
-    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | run_" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_" in rendered_document
+    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_" in rendered_document
     assert "HealthcareService: 1,108,600" in rendered_document
     assert "Location: 280,847" in rendered_document
 
@@ -337,7 +336,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),
-        ("washington", "HealthcareService preflight timed out"),
+        ("washington", "Attempt 25 failed while resuming pagination"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
         ("amerihealth-nh", "shared unverified backend"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
@@ -461,6 +460,8 @@ def test_provider_directory_guide_documents_the_full_lifecycle():
         "Resource completion",
         "CI rejects expired evidence",
         "stores the fingerprint of its manifest entry",
+        "publication_readiness",
+        "Canonical endpoint identity is transport identity",
     ):
         assert command in guide
     assert "Never hand-edit the generated" in guide

@@ -365,6 +365,15 @@ def _merge_nonterminal_observation(
     return merged
 
 
+def _preserve_publication_readiness(
+    terminal_record: dict[str, Any],
+    prior_record: dict[str, Any],
+) -> None:
+    publication_readiness = prior_record.get("publication_readiness")
+    if publication_readiness is not None:
+        terminal_record["publication_readiness"] = copy.deepcopy(publication_readiness)
+
+
 def update_verification_snapshot(
     manifest: dict[str, Any],
     report: dict[str, Any],
@@ -402,16 +411,16 @@ def update_verification_snapshot(
         "report_identity": report_identity,
         "entries": copy.deepcopy(prior_snapshot["entries"]),
     }
-    supersede_changed_entry_proofs(
-        snapshot_by_field["entries"],
-        manifest_entry_by_id,
-    )
+    supersede_changed_entry_proofs(snapshot_by_field["entries"], manifest_entry_by_id)
     for entry_id in selected_entry_ids:
         report_entry = report_entries[entry_id]
         terminal_record = _terminal_record(
             entry_id, manifest_entry_by_id[entry_id], report_entry, checked_at
         )
         if terminal_record is not None:
+            _preserve_publication_readiness(
+                terminal_record, snapshot_by_field["entries"][entry_id]
+            )
             snapshot_by_field["entries"][entry_id] = terminal_record
         elif isinstance(report_entry, dict):
             snapshot_by_field["entries"][entry_id] = _merge_nonterminal_observation(
