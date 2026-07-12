@@ -4474,6 +4474,7 @@ async def test_current_plan_source_network_list_groups_dated_files_by_manifest_n
     assert "successful_files" in query_sql
     assert "source_effective_month DESC NULLS LAST" in query_sql
     assert "DISTINCT ON (logical_network_key)" in query_sql
+    assert "0" not in session.calls[0][0][0].compile().params
 
 
 def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
