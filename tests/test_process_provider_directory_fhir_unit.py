@@ -3152,16 +3152,61 @@ async def test_delete_stale_provider_directory_source_catalog_prunes_dependent_r
     status_mock = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
-    deleted = await importer._delete_stale_provider_directory_source_catalog(
+    cleanup = await importer._delete_stale_provider_directory_source_catalog(
         ["source_b", "source_a", "source_a", ""]
     )
 
-    assert deleted["provider_directory_source"] == 1
+    assert cleanup["deleted"]["provider_directory_source"] == 1
+    assert cleanup["protected_source_ids_missing"] == []
     assert status_mock.await_count == len(importer.SOURCE_CATALOG_STALE_TABLE_MODELS) + 1
     for call in status_mock.await_args_list:
         assert call.kwargs["source_ids"] == ["source_a", "source_b"]
         assert "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in call.args[0]
     assert '"mrf"."provider_directory_source"' in status_mock.await_args_list[-1].args[0]
+
+
+@pytest.mark.asyncio
+async def test_source_catalog_cleanup_retains_manifest_pinned_hap_alias(monkeypatch):
+    pinned_source_id = "pdfhir_eee751f2c17d5c473daf3060"
+    sibling_source_id = "pdfhir_f9d6f8a84714e7c298323833"
+    all_mock = AsyncMock(return_value=[{"source_id": pinned_source_id}])
+    status_mock = AsyncMock(return_value=0)
+    monkeypatch.setattr(importer.db, "all", all_mock)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    cleanup = await importer._delete_stale_provider_directory_source_catalog(
+        [sibling_source_id],
+        protected_source_ids=[pinned_source_id],
+    )
+
+    assert cleanup == {"deleted": {}, "protected_source_ids_missing": []}
+    assert all_mock.await_args.kwargs["source_ids"] == [pinned_source_id]
+    for call in status_mock.await_args_list:
+        assert call.kwargs["source_ids"] == [pinned_source_id, sibling_source_id]
+
+
+@pytest.mark.asyncio
+async def test_source_catalog_cleanup_reports_missing_protected_source_and_fails_closed(monkeypatch):
+    pinned_source_id = "pdfhir_eee751f2c17d5c473daf3060"
+    all_mock = AsyncMock(return_value=[])
+    status_mock = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", all_mock)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    cleanup = await importer._delete_stale_provider_directory_source_catalog(
+        ["pdfhir_f9d6f8a84714e7c298323833"],
+        protected_source_ids=[pinned_source_id],
+    )
+
+    assert cleanup == {
+        "deleted": {},
+        "protected_source_ids_missing": [pinned_source_id],
+    }
+    status_mock.assert_not_awaited()
+
+
+def test_catalog_protected_source_ids_include_manifest_acquisition_hap_source():
+    assert "pdfhir_eee751f2c17d5c473daf3060" in importer._configured_catalog_protected_source_ids({})
 
 
 @pytest.mark.asyncio
@@ -8808,7 +8853,7 @@ async def test_process_data_skips_full_refresh_source_catalog_stale_cleanup_with
             upserted.extend(rows)
         return len(rows)
 
-    cleanup = AsyncMock(return_value={"provider_directory_source": 1})
+    cleanup = AsyncMock(return_value={"deleted": {"provider_directory_source": 1}, "protected_source_ids_missing": []})
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
@@ -8861,7 +8906,7 @@ async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_wi
             upserted.extend(rows)
         return len(rows)
 
-    cleanup = AsyncMock(return_value={"provider_directory_source": 1})
+    cleanup = AsyncMock(return_value={"deleted": {"provider_directory_source": 1}, "protected_source_ids_missing": []})
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
@@ -8880,9 +8925,15 @@ async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_wi
         },
     )
 
-    cleanup.assert_awaited_once_with([row["source_id"] for row in upserted])
+    protected_source_ids = importer._configured_catalog_protected_source_ids({})
+    cleanup.assert_awaited_once_with(
+        [row["source_id"] for row in upserted],
+        protected_source_ids=protected_source_ids,
+    )
     assert metrics["sources_seeded"] == 2
     assert metrics["stale_source_rows_deleted"] == {"provider_directory_source": 1}
+    assert metrics["protected_source_ids"] == protected_source_ids
+    assert metrics["protected_source_ids_missing"] == []
 
 
 @pytest.mark.asyncio

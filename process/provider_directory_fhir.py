@@ -504,6 +504,11 @@ PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE = "provider-directory-blocker-registr
 PROVIDER_DIRECTORY_BLOCKER_REGISTRY_PATH = (
     Path(__file__).resolve().parents[1] / "specs/provider_directory_blocker_registry.json"
 )
+PROVIDER_DIRECTORY_ENDPOINT_ACQUISITION_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "specs/provider_directory_endpoint_acquisition_manifest.json"
+)
+PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
 URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
@@ -19282,14 +19287,86 @@ def _source_catalog_stale_cleanup_enabled(
     )
 
 
+def _configured_catalog_protected_source_ids(task: dict[str, Any]) -> list[str]:
+    """Return explicit and manifest-pinned acquisition source IDs to retain."""
+    configured_source_ids = _clean_source_id_list(
+        task.get("protected_source_ids")
+        or task.get("provider_directory_protected_source_ids")
+    )
+    try:
+        manifest = json.loads(
+            PROVIDER_DIRECTORY_ENDPOINT_ACQUISITION_MANIFEST_PATH.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("provider_directory_acquisition_manifest_unavailable") from exc
+    entries = manifest.get("entries") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        raise RuntimeError("provider_directory_acquisition_manifest_invalid")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("provider_directory_acquisition_manifest_invalid")
+        if entry.get("classification") in PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS:
+            configured_source_ids.extend(_clean_source_id_list(entry.get("source_ids")))
+    return sorted(set(configured_source_ids))
+
+
 async def _delete_stale_provider_directory_source_catalog(
     current_source_ids: list[str],
+    *,
+    protected_source_ids: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Delete stale catalog rows only after every protected alias is verified."""
+    retained_source_ids = sorted(
+        {
+            cleaned_source_id
+            for source_id in current_source_ids
+            if (cleaned_source_id := _clean_text(source_id))
+        }
+    )
+    protected_ids = sorted(
+        {_clean_text(source_id) for source_id in protected_source_ids or () if _clean_text(source_id)}
+    )
+    existing_protected_ids, missing_protected_ids = await _resolve_protected_catalog_source_ids(
+        protected_ids
+    )
+    if missing_protected_ids:
+        return {"deleted": {}, "protected_source_ids_missing": missing_protected_ids}
+    retained_source_ids = sorted(set(retained_source_ids).union(existing_protected_ids))
+    if not retained_source_ids:
+        return {"deleted": {}, "protected_source_ids_missing": []}
+    deleted_rows = await _delete_source_catalog_rows_except(retained_source_ids)
+    return {"deleted": deleted_rows, "protected_source_ids_missing": []}
+
+
+async def _resolve_protected_catalog_source_ids(
+    protected_source_ids: list[str],
+) -> tuple[set[str], list[str]]:
+    """Resolve every protected alias or report the exact missing IDs."""
+    if not protected_source_ids:
+        return set(), []
+    protected_source_records = await db.all(
+        f"""
+        SELECT source_id
+          FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
+         WHERE source_id = ANY(CAST(:source_ids AS varchar[]));
+        """,
+        source_ids=protected_source_ids,
+    )
+    existing_source_ids = {
+        source_id
+        for source_record in protected_source_records
+        if (source_id := _clean_text(source_record.get("source_id")))
+    }
+    missing_source_ids = sorted(set(protected_source_ids) - existing_source_ids)
+    return existing_source_ids, missing_source_ids
+
+
+async def _delete_source_catalog_rows_except(
+    retained_source_ids: list[str],
 ) -> dict[str, int]:
-    source_ids = sorted({_clean_text(source_id) for source_id in current_source_ids if _clean_text(source_id)})
-    if not source_ids:
-        return {}
-    params = {"source_ids": source_ids}
-    deleted: dict[str, int] = {}
+    """Delete source-catalog rows not owned by the retained aliases."""
+    query_params_by_name = {"source_ids": retained_source_ids}
+    deleted_row_counts_by_table: dict[str, int] = {}
     predicate = "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))"
     for model in SOURCE_CATALOG_STALE_TABLE_MODELS:
         count = int(
@@ -19298,25 +19375,25 @@ async def _delete_stale_provider_directory_source_catalog(
                 DELETE FROM {_qt(_schema(), model.__tablename__)}
                  WHERE {predicate};
                 """,
-                **params,
+                **query_params_by_name,
             )
             or 0
         )
         if count:
-            deleted[model.__tablename__] = count
+            deleted_row_counts_by_table[model.__tablename__] = count
     source_count = int(
         await db.status(
             f"""
             DELETE FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
              WHERE {predicate};
             """,
-            **params,
+            **query_params_by_name,
         )
         or 0
     )
     if source_count:
-        deleted[ProviderDirectorySource.__tablename__] = source_count
-    return deleted
+        deleted_row_counts_by_table[ProviderDirectorySource.__tablename__] = source_count
+    return deleted_row_counts_by_table
 
 
 def _selected_resources(raw: str | None) -> list[str]:
@@ -23003,6 +23080,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             source_rows = source_rows[:limit]
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
         stale_source_rows_deleted = {}
+        protected_source_ids: list[str] = []
+        missing_protected_source_ids: list[str] = []
         if _source_catalog_stale_cleanup_enabled(
             stale_cleanup=stale_cleanup,
             full_refresh=full_refresh,
@@ -23011,9 +23090,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             requested_source_ids=requested_source_ids,
             retest_results_configured=retest_path is not None,
         ):
-            stale_source_rows_deleted = await _delete_stale_provider_directory_source_catalog(
-                [row["source_id"] for row in source_rows]
+            protected_source_ids = _configured_catalog_protected_source_ids(task)
+            catalog_cleanup_result = await _delete_stale_provider_directory_source_catalog(
+                [row["source_id"] for row in source_rows],
+                protected_source_ids=protected_source_ids,
             )
+            stale_source_rows_deleted = catalog_cleanup_result["deleted"]
+            missing_protected_source_ids = catalog_cleanup_result["protected_source_ids_missing"]
         metrics: dict[str, Any] = {
             "sources_seeded": len(source_rows),
             "api_endpoints_seeded": endpoint_rows_seeded,
@@ -23022,6 +23105,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "supplemental_catalog_sources_considered": len(supplemental_catalog_seed_rows),
             "supplemental_catalogs": supplemental_catalog_metrics,
             "stale_source_rows_deleted": stale_source_rows_deleted,
+            "protected_source_ids": protected_source_ids,
+            "protected_source_ids_missing": missing_protected_source_ids,
             "sources_probed": 0,
             "valid_capability_sources": 0,
             "resource_rows": {},
