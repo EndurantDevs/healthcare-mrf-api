@@ -26,9 +26,9 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 
 
 class FakeResult:
-    def __init__(self, scalar=None, rows=None):
+    def __init__(self, scalar=None, result_rows=None):
         self._scalar = scalar
-        self._rows = list(rows or [])
+        self._rows = list(result_rows or [])
 
     def scalar(self):
         return self._scalar
@@ -53,7 +53,7 @@ class FakeSession:
         if "set_config('plan_cache_mode', 'force_custom_plan', true)" in statement_sql:
             self.calls.append((_args, _kwargs))
             return FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "plan_cache_mode": "auto",
                         "parallel_workers": "2",
@@ -95,9 +95,9 @@ def test_revenue_code_lookup_values_include_raw_and_canonical_forms():
 
 
 def _revenue_code_count_rows(*, include_rate_count: bool = False):
-    """Build canonical and raw code-dictionary rows for synthetic tests."""
+    """Build canonical and raw code-dictionary result_rows for synthetic tests."""
 
-    rows = [
+    result_rows = [
         {
             "code_key": code_key,
             "plan_id": "TESTPLAN001",
@@ -107,9 +107,9 @@ def _revenue_code_count_rows(*, include_rate_count: bool = False):
         for code_key, reported_code in ((7, "0110"), (8, "110"))
     ]
     if include_rate_count:
-        for row in rows:
-            row["rate_count"] = 1
-    return rows
+        for result_row in result_rows:
+            result_row["rate_count"] = 1
+    return result_rows
 
 
 def _manifest_fixture_rate_row(
@@ -120,7 +120,7 @@ def _manifest_fixture_rate_row(
     price_set_id: str,
     provider_count: int,
 ):
-    """Build one synthetic manifest response row."""
+    """Build one synthetic manifest response result_row."""
 
     return {
         "serving_content_hash_128": f"{code_key + 500:032x}",
@@ -142,7 +142,7 @@ def _v3_revenue_forward_fixture(monkeypatch):
     raw_provider_set_id = "0000000000000000000000000000000b"
     canonical_price_set_id = "00000000000000000000000000000101"
     raw_price_set_id = "00000000000000000000000000000102"
-    session = FakeSession([FakeResult(rows=_revenue_code_count_rows(include_rate_count=True))])
+    session = FakeSession([FakeResult(result_rows=_revenue_code_count_rows(include_rate_count=True))])
     tables = ptg2_serving.PTG2ServingTables(
         arch_version="postgres_binary_v3",
         storage="manifest_snapshot",
@@ -211,11 +211,12 @@ def _async_sidecar_members_many(mapping):
 
 @pytest.mark.asyncio
 async def test_overlay_provider_directory_corroboration_marks_address_and_prefers_directory_phone():
+    """Prefer a corroborated directory phone while retaining address proof."""
     session = FakeSession(
         [
             "mrf.provider_directory_address_corroboration",
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "address_key": "00000000-0000-0000-0000-000000000001",
@@ -255,7 +256,7 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
         ]
     )
 
-    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+    result_rows = await ptg2_serving._overlay_provider_directory_corroboration(
         session,
         [
             {
@@ -274,21 +275,21 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
         source_key="ptg_source",
     )
 
-    row = rows[0]
-    assert row["location_source"] == "provider_directory_fhir"
-    assert row["location_confidence_code"] == "payer_directory_corroborated_location"
-    assert row["telephone_number"] == "312-555-0100"
-    assert row["phone_number"] == "3125550100"
-    assert row["phone_extension"] == "45"
-    assert row["fax_number"] == "312-555-0101"
-    assert row["fax_number_digits"] == "3125550101"
-    assert row["fax_extension"] == "9"
-    assert row["address_payload"]["address_sources"] == ["provider_directory_fhir"]
-    assert row["address_payload"]["address_network_binding"] == "payer_directory_corroborated_location"
-    assert row["address_payload"]["provider_directory_location_name"] == "Example Clinic"
-    assert row["address_payload"]["phone_number"] == "3125550100"
-    assert row["address_payload"]["fax_number_digits"] == "3125550101"
-    item = ptg2_serving._compact_item_from_row({**row, "prices": []}, {})
+    result_row = result_rows[0]
+    assert result_row["location_source"] == "provider_directory_fhir"
+    assert result_row["location_confidence_code"] == "payer_directory_corroborated_location"
+    assert result_row["telephone_number"] == "312-555-0100"
+    assert result_row["phone_number"] == "3125550100"
+    assert result_row["phone_extension"] == "45"
+    assert result_row["fax_number"] == "312-555-0101"
+    assert result_row["fax_number_digits"] == "3125550101"
+    assert result_row["fax_extension"] == "9"
+    assert result_row["address_payload"]["address_sources"] == ["provider_directory_fhir"]
+    assert result_row["address_payload"]["address_network_binding"] == "payer_directory_corroborated_location"
+    assert result_row["address_payload"]["provider_directory_location_name"] == "Example Clinic"
+    assert result_row["address_payload"]["phone_number"] == "3125550100"
+    assert result_row["address_payload"]["fax_number_digits"] == "3125550101"
+    item = ptg2_serving._compact_item_from_row({**result_row, "prices": []}, {})
     assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
     assert item["address_verification"]["requires_location_confirmation"] is False
     assert item["address_verification"]["displayed_address_present"] is True
@@ -304,11 +305,12 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
 
 @pytest.mark.asyncio
 async def test_overlay_provider_directory_address_only_keeps_network_binding_inferred():
+    """Keep inferred network binding for directory-only addresses."""
     session = FakeSession(
         [
             "mrf.provider_directory_address_corroboration",
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "address_key": "00000000-0000-0000-0000-000000000001",
@@ -335,7 +337,7 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
         ]
     )
 
-    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+    result_rows = await ptg2_serving._overlay_provider_directory_corroboration(
         session,
         [
             {
@@ -353,10 +355,10 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
         source_key="ptg_source",
     )
 
-    item = ptg2_serving._compact_item_from_row({**rows[0], "prices": []}, {})
+    item = ptg2_serving._compact_item_from_row({**result_rows[0], "prices": []}, {})
 
-    assert rows[0]["location_confidence_code"] == "provider_directory_address"
-    assert rows[0]["address_payload"]["provider_directory_network_refs"] == ["Organization/network-1"]
+    assert result_rows[0]["location_confidence_code"] == "provider_directory_address"
+    assert result_rows[0]["address_payload"]["provider_directory_network_refs"] == ["Organization/network-1"]
     assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
     assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
     assert item["address_verification"]["requires_location_confirmation"] is True
@@ -374,7 +376,7 @@ async def test_overlay_provider_directory_without_plan_match_downgrades_network_
         [
             "mrf.provider_directory_address_corroboration",
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "address_key": "00000000-0000-0000-0000-000000000001",
@@ -401,7 +403,7 @@ async def test_overlay_provider_directory_without_plan_match_downgrades_network_
         ]
     )
 
-    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+    result_rows = await ptg2_serving._overlay_provider_directory_corroboration(
         session,
         [
             {
@@ -419,10 +421,10 @@ async def test_overlay_provider_directory_without_plan_match_downgrades_network_
         source_key="ptg_source",
     )
 
-    item = ptg2_serving._compact_item_from_row({**rows[0], "prices": []}, {})
+    item = ptg2_serving._compact_item_from_row({**result_rows[0], "prices": []}, {})
 
-    assert rows[0]["location_confidence_code"] == "provider_directory_address"
-    assert rows[0]["address_payload"]["address_network_binding"] == "provider_directory_address"
+    assert result_rows[0]["location_confidence_code"] == "provider_directory_address"
+    assert result_rows[0]["address_payload"]["address_network_binding"] == "provider_directory_address"
     assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
     assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
     assert item["address_verification"]["requires_location_confirmation"] is True
@@ -735,7 +737,7 @@ def test_ptg2_serving_utils_split_keeps_serving_facade_helpers_stable():
 
 @pytest.mark.asyncio
 async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set():
-    session = FakeSession([FakeResult(rows=[{"npi": 1234567890}])])
+    session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
     filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
         session,
@@ -755,7 +757,7 @@ async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set()
 
 @pytest.mark.asyncio
 async def test_manifest_filter_npis_by_inferred_taxonomy_requires_individual_npi():
-    session = FakeSession([FakeResult(rows=[{"npi": 1234567890}])])
+    session = FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])])
 
     filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
         session,
@@ -779,7 +781,7 @@ async def test_manifest_prices_for_price_sets_rehydrates_lean_price_atom_diction
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "price_atom_global_id_128": price_atom_id,
                         "negotiated_type": "fee schedule",
@@ -841,7 +843,7 @@ async def test_manifest_prices_for_price_sets_prefers_serving_binary_atoms(monke
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "price_atom_global_id_128": price_atom_id,
                         "negotiated_type": "fee schedule",
@@ -891,7 +893,7 @@ async def test_manifest_prices_rehydrates_lean_price_atom_constants(monkeypatch)
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "price_atom_global_id_128": price_atom_id,
                         "negotiated_type": "fee schedule",
@@ -941,13 +943,13 @@ async def test_manifest_prices_rehydrates_lean_price_atom_constants(monkeypatch)
 
 
 def _lean_source_level_case(monkeypatch):
-    """Return fake lean serving state with a source-level code-count row."""
+    """Return fake lean serving state with a source-level code-count result_row."""
     provider_hash = "00000000000000000000000000000012"
     price_hash = "00000000000000000000000000000101"
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "",
@@ -958,7 +960,7 @@ def _lean_source_level_case(monkeypatch):
                 ]
             ),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "serving_content_hash_128": "00000000000000000000000000000201",
                         "plan_id": "",
@@ -1020,9 +1022,9 @@ def _nonlean_source_level_case(monkeypatch):
     session = FakeSession(
         [
             FakeResult(scalar=2),
-            FakeResult(rows=[("network_names",)]),
+            FakeResult(result_rows=[("network_names",)]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "serving_content_hash_128": "00000000000000000000000000000301",
                         "plan_id": "",
@@ -1078,7 +1080,7 @@ async def _search_nonlean_source_case(session, tables, args):
 @pytest.mark.asyncio
 async def test_lean_serving_uses_source_level_code_count(monkeypatch):
     session, tables = _lean_source_level_case(monkeypatch)
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202607:providence",
         {
@@ -1098,14 +1100,15 @@ async def test_lean_serving_uses_source_level_code_count(monkeypatch):
     assert "plan_id = :plan_id OR COALESCE(plan_id, '') = ''" in code_sql
     assert "ORDER BY CASE WHEN plan_id = :plan_id THEN 0" in code_sql
     assert code_params["plan_id"] == "56707OR1390003-00"
-    assert payload["pagination"]["total"] == 3
-    assert payload["items"][0]["procedure_code"] == "0001A"
-    assert payload["items"][0]["procedure_name"] == "Immunization administration"
-    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+    assert serving_payload["pagination"]["total"] == 3
+    assert serving_payload["items"][0]["procedure_code"] == "0001A"
+    assert serving_payload["items"][0]["procedure_name"] == "Immunization administration"
+    assert serving_payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
 
 
 @pytest.mark.asyncio
 async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_path, monkeypatch):
+    """Serve a lean snapshot from its by-code artifact alone."""
     provider_set_a = "0000000000000000000000000000000a"
     provider_set_b = "0000000000000000000000000000000b"
     price_a = "00000000000000000000000000000101"
@@ -1120,7 +1123,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -1131,7 +1134,7 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
                 ]
             ),
             FakeResult(
-                rows=[
+                result_rows=[
                     {"provider_set_key": 1, "provider_set_global_id_128": provider_set_a},
                     {"provider_set_key": 2, "provider_set_global_id_128": provider_set_b},
                 ]
@@ -1154,13 +1157,13 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         }
 
     async def procedure_rows(_session, row_data):
-        assert [row["provider_count"] for row in row_data] == [9, 3]
+        assert [result_row["provider_count"] for result_row in row_data] == [9, 3]
         return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
 
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202607:group_fixture",
         {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
@@ -1169,17 +1172,17 @@ async def test_lean_serving_by_code_sidecar_serves_without_serving_table(tmp_pat
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload["pagination"]["total"] == 2
+    assert serving_payload["pagination"]["total"] == 2
     prices_by_provider_set = {
         item["provider_set_hash"]: item["prices"][0]["negotiated_rate"]
-        for item in payload["items"]
+        for item in serving_payload["items"]
     }
     assert prices_by_provider_set == {provider_set_a: 100.0, provider_set_b: 200.0}
 
 
 @pytest.mark.asyncio
 async def test_v3_forward_combines_raw_and_canonical_revenue_codes(monkeypatch):
-    """Forward lookup must preserve rows stored under both revenue-code forms."""
+    """Forward lookup must preserve result_rows stored under both revenue-code forms."""
     fixture = _v3_revenue_forward_fixture(monkeypatch)
 
     response = await ptg2_serving._search_ptg2_manifest_db_serving_table(
@@ -1256,6 +1259,7 @@ async def test_code_variant_rows_merge_before_pagination(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeypatch):
+    """Serve PostgreSQL binary data without a retained row table."""
     provider_set_a = "0000000000000000000000000000000a"
     provider_set_b = "0000000000000000000000000000000b"
     price_a = "00000000000000000000000000000101"
@@ -1263,7 +1267,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -1274,7 +1278,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
                 ]
             ),
             FakeResult(
-                rows=[
+                result_rows=[
                     {"provider_set_key": 1, "provider_set_global_id_128": provider_set_a},
                     {"provider_set_key": 2, "provider_set_global_id_128": provider_set_b},
                 ]
@@ -1312,7 +1316,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
         }
 
     async def procedure_rows(_session, row_data):
-        assert [row["provider_count"] for row in row_data] == [9, 3]
+        assert [result_row["provider_count"] for result_row in row_data] == [9, 3]
         return {("CPT", "70551"): {"procedure_name": "MRI brain"}}
 
     monkeypatch.setattr(ptg2_serving, "lookup_serving_binary_by_code_from_db", binary_rows)
@@ -1338,7 +1342,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", price_rows)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202607:group_fixture",
         {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
@@ -1347,10 +1351,10 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload["pagination"]["total"] == 2
+    assert serving_payload["pagination"]["total"] == 2
     prices_by_provider_set = {
         item["provider_set_hash"]: item["prices"][0]["negotiated_rate"]
-        for item in payload["items"]
+        for item in serving_payload["items"]
     }
     assert prices_by_provider_set == {provider_set_a: 100.0, provider_set_b: 200.0}
 
@@ -1358,7 +1362,7 @@ async def test_lean_serving_postgres_binary_serves_without_serving_table(monkeyp
 @pytest.mark.asyncio
 async def test_nonlean_manifest_serving_uses_source_level_plan_rows(monkeypatch):
     session, tables = _nonlean_source_level_case(monkeypatch)
-    payload = await _search_nonlean_source_case(
+    serving_payload = await _search_nonlean_source_case(
         session,
         tables,
         {
@@ -1376,16 +1380,16 @@ async def test_nonlean_manifest_serving_uses_source_level_plan_rows(monkeypatch)
     assert "COALESCE(SUM(rate_count), 0)" in count_sql
     assert "plan_id = :plan_id OR COALESCE(plan_id, '') = ''" in row_sql
     assert "ORDER BY CASE WHEN plan_id = :plan_id THEN 0" in row_sql
-    assert payload["pagination"]["total"] == 2
-    assert payload["items"][0]["procedure_code"] == "49452"
-    assert payload["items"][0]["procedure_name"] == "Gastrostomy tube replacement"
-    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
+    assert serving_payload["pagination"]["total"] == 2
+    assert serving_payload["items"][0]["procedure_code"] == "49452"
+    assert serving_payload["items"][0]["procedure_name"] == "Gastrostomy tube replacement"
+    assert serving_payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
 
 
 @pytest.mark.asyncio
 async def test_nonlean_manifest_serving_accepts_source_key_only(monkeypatch):
     session, tables = _nonlean_source_level_case(monkeypatch)
-    payload = await _search_nonlean_source_case(
+    serving_payload = await _search_nonlean_source_case(
         session,
         tables,
         {"source_key": "ptg_example_packaging", "code": "49452", "code_system": "CPT"},
@@ -1395,15 +1399,15 @@ async def test_nonlean_manifest_serving_accepts_source_key_only(monkeypatch):
     count_params = session.calls[0][0][1]
     assert "COALESCE(plan_id, '') = ''" in count_sql
     assert count_params["plan_id"] == ""
-    assert payload["query"]["plan_id"] is None
-    assert payload["items"][0]["procedure_code"] == "49452"
-    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
+    assert serving_payload["query"]["plan_id"] is None
+    assert serving_payload["items"][0]["procedure_code"] == "49452"
+    assert serving_payload["items"][0]["prices"][0]["negotiated_rate"] == 101.23
 
 
 @pytest.mark.asyncio
 async def test_lean_serving_accepts_source_key_only(monkeypatch):
     session, tables = _lean_source_level_case(monkeypatch)
-    payload = await _search_lean_source_case(
+    serving_payload = await _search_lean_source_case(
         session,
         tables,
         {"source_key": "ptg_providence", "code": "0001A", "code_system": "CPT"},
@@ -1413,9 +1417,9 @@ async def test_lean_serving_accepts_source_key_only(monkeypatch):
     code_params = session.calls[0][0][1]
     assert "COALESCE(plan_id, '') = ''" in code_sql
     assert code_params["plan_id"] == ""
-    assert payload["query"]["plan_id"] is None
-    assert payload["items"][0]["procedure_code"] == "0001A"
-    assert payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
+    assert serving_payload["query"]["plan_id"] is None
+    assert serving_payload["items"][0]["procedure_code"] == "0001A"
+    assert serving_payload["items"][0]["prices"][0]["negotiated_rate"] == 66.55
 
 
 @pytest.mark.asyncio
@@ -1425,7 +1429,7 @@ async def test_manifest_provider_rows_keep_partial_results_when_sidecar_owner_mi
     group_id = "00000000000000000000000000000021"
     session = FakeSession(
         [
-            FakeResult(rows=[{"provider_group_global_id_128": group_id, "npi": 1234567890}]),
+            FakeResult(result_rows=[{"provider_group_global_id_128": group_id, "npi": 1234567890}]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -1627,7 +1631,7 @@ async def test_manifest_provider_rows_fall_back_for_incomplete_membership(monkey
     )
 
     providers = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_set(
-        FakeSession([FakeResult(rows=[{"npi": 1234567890}])]),
+        FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])]),
         tables,
         provider_set_id,
         limit=10,
@@ -1664,7 +1668,7 @@ async def test_manifest_provider_rows_fall_back_when_direct_membership_is_unavai
     )
 
     providers = await ptg2_serving._ptg2_manifest_provider_rows_for_provider_set(
-        FakeSession([FakeResult(rows=[{"npi": 1234567890}])]),
+        FakeSession([FakeResult(result_rows=[{"npi": 1234567890}])]),
         tables,
         provider_set_id,
         limit=10,
@@ -1700,7 +1704,7 @@ async def test_manifest_serving_preserves_tin_only_rate_during_provider_expansio
     monkeypatch,
     arch_version,
 ):
-    """Provider expansion preserves priced TIN-only rows across binary readers."""
+    """Provider expansion preserves priced TIN-only result_rows across binary readers."""
 
     provider_set_id = "00000000000000000000000000000012"
     price_set_id = "00000000000000000000000000000101"
@@ -1719,8 +1723,8 @@ async def test_manifest_serving_preserves_tin_only_rate_during_provider_expansio
     session = FakeSession(
         [
             1,
-            FakeResult(rows=[{"column_name": "network_names"}]),
-            FakeResult(rows=[serving_rate_row_by_field]),
+            FakeResult(result_rows=[{"column_name": "network_names"}]),
+            FakeResult(result_rows=[serving_rate_row_by_field]),
         ]
     )
     tables = _tin_only_serving_tables(arch_version)
@@ -2188,14 +2192,14 @@ async def test_taxonomy_filtered_graph_candidates_are_not_filtered_twice(monkeyp
         taxonomy_filter,
     )
 
-    result = await ptg2_serving._taxonomy_filtered_candidates(
+    query_result = await ptg2_serving._taxonomy_filtered_candidates(
         object(),
         {"taxonomy_codes": ["207Q00000X"]},
         candidates,
         1,
     )
 
-    assert result is candidates
+    assert query_result is candidates
     taxonomy_filter.assert_not_awaited()
 
 
@@ -2230,7 +2234,7 @@ async def test_membership_location_query_keeps_site_addresses(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_membership_location_rows_uses_postgis_nearest_neighbor_for_coordinate_probe(monkeypatch):
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     tables = ptg2_serving.PTG2ServingTables(
         provider_npi_scope_table="mrf.ptg2_provider_npi_scope_test"
     )
@@ -2452,9 +2456,10 @@ async def test_manifest_membership_graph_resolves_geo_provider_sets(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
+    """Widen rate candidates before applying taxonomy expansion."""
     provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
     price_sets = [f"{idx:032x}" for idx in range(101, 106)]
-    rows = [
+    result_rows = [
         {
             "serving_content_hash_128": f"{idx + 201:032x}",
             "plan_id": "TESTPLAN001",
@@ -2469,7 +2474,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
         }
         for idx in range(5)
     ]
-    session = FakeSession([5, FakeResult(rows=[{"column_name": "network_names"}]), FakeResult(rows=rows)])
+    session = FakeSession([5, FakeResult(result_rows=[{"column_name": "network_names"}]), FakeResult(result_rows=result_rows)])
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_manifest_token",
         price_atom_table="mrf.ptg2_price_atom_manifest_token",
@@ -2510,7 +2515,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
         }
 
     async def fake_procedure_details(_session, row_data):
-        assert [row["provider_set_global_id_128"] for row in row_data] == provider_sets
+        assert [result_row["provider_set_global_id_128"] for result_row in row_data] == provider_sets
         return {("CPT", "99214"): {"procedure_name": "Office/outpatient visit"}}
 
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
@@ -2518,7 +2523,7 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_rows_for_provider_sets", fake_providers)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202606:test",
         {
@@ -2535,12 +2540,12 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert len(payload["items"]) == 1
-    assert payload["items"][0]["npi"] == 1851399604
-    assert payload["items"][0]["network_names"] == ["C2"]
-    assert payload["items"][0]["taxonomy_codes"] == ["207Q00000X"]
-    assert payload["pagination"]["limit"] == 1
-    assert payload["query"]["plan_market_type"] == "group"
+    assert len(serving_payload["items"]) == 1
+    assert serving_payload["items"][0]["npi"] == 1851399604
+    assert serving_payload["items"][0]["network_names"] == ["C2"]
+    assert serving_payload["items"][0]["taxonomy_codes"] == ["207Q00000X"]
+    assert serving_payload["pagination"]["limit"] == 1
+    assert serving_payload["query"]["plan_market_type"] == "group"
     row_sql = str(session.calls[2][0][0])
     row_params = session.calls[2][0][1]
     assert "LIMIT :rate_candidate_limit" in row_sql
@@ -2551,9 +2556,10 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
 
 @pytest.mark.asyncio
 async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_window(monkeypatch):
+    """Widen location candidates before applying geo expansion."""
     provider_set_id = "00000000000000000000000000000012"
     price_set_id = "00000000000000000000000000000101"
-    row = {
+    result_row_by_field = {
         "serving_content_hash_128": "00000000000000000000000000000201",
         "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
@@ -2565,7 +2571,12 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         "source_trace_set_hash": None,
         "network_names": ["C2"],
     }
-    session = FakeSession([FakeResult(rows=[{"column_name": "network_names"}]), FakeResult(rows=[row])])
+    session = FakeSession(
+        [
+            FakeResult(result_rows=[{"column_name": "network_names"}]),
+            FakeResult(result_rows=[result_row_by_field]),
+        ]
+    )
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_manifest_token",
         price_atom_table="mrf.ptg2_price_atom_manifest_token",
@@ -2626,7 +2637,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1074.22}]}
 
     async def fake_procedure_details(_session, row_data):
-        assert [row["provider_set_global_id_128"] for row in row_data] == [provider_set_id]
+        assert [result_row["provider_set_global_id_128"] for result_row in row_data] == [provider_set_id]
         return {("CPT", "29888"): {"procedure_name": "ACL reconstruction"}}
 
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
@@ -2634,7 +2645,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202606:test",
         {
@@ -2655,15 +2666,15 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert len(payload["items"]) == 1
-    assert payload["items"][0]["npi"] == 1154321222
-    assert payload["items"][0]["network_names"] == ["C2"]
-    assert payload["items"][0]["specialization"] == "Sports Medicine"
-    assert payload["items"][0]["phone"] == "2175551212"
-    assert payload["items"][0]["phone_number"] == "2175551212"
-    assert payload["items"][0]["telephone_number"] == "2175551212"
-    assert payload["items"][0]["fax_number"] == "2175551213"
-    assert payload["items"][0]["address"]["telephone_number"] == "2175551212"
+    assert len(serving_payload["items"]) == 1
+    assert serving_payload["items"][0]["npi"] == 1154321222
+    assert serving_payload["items"][0]["network_names"] == ["C2"]
+    assert serving_payload["items"][0]["specialization"] == "Sports Medicine"
+    assert serving_payload["items"][0]["phone"] == "2175551212"
+    assert serving_payload["items"][0]["phone_number"] == "2175551212"
+    assert serving_payload["items"][0]["telephone_number"] == "2175551212"
+    assert serving_payload["items"][0]["fax_number"] == "2175551213"
+    assert serving_payload["items"][0]["address"]["telephone_number"] == "2175551212"
     assert seen_candidate_limit["value"] == 100
     row_sql = str(session.calls[1][0][0])
     row_params = session.calls[1][0][1]
@@ -2751,7 +2762,7 @@ async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch
             False,
             False,
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "taxonomy_codes": ["207Q00000X"],
@@ -2762,13 +2773,13 @@ async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch
         ]
     )
 
-    rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
+    result_rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
         session,
         npis=[1234567890],
         limit=5,
     )
 
-    assert rows == [
+    assert result_rows == [
         {
             "npi": 1234567890,
             "provider_name": "TiC provider",
@@ -2788,19 +2799,19 @@ async def test_manifest_enriched_provider_unified_fallback_uses_bounded_cte(monk
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
             "mrf.npi",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
+    result_rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
         session,
         npis=[1234567890],
         limit=5,
     )
 
-    assert rows == []
+    assert result_rows == []
     sql = str(session.calls[-1][0][0])
     assert "source_npis AS MATERIALIZED" in sql
     assert "fallback_addresses AS MATERIALIZED" in sql
@@ -2817,7 +2828,7 @@ async def test_manifest_enriched_provider_unified_fallback_uses_bounded_cte(monk
 async def test_ptg2_address_serving_table_prefers_unified_by_default(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     session = FakeSession(
-        [FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)])]
+        [FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)])]
     )
 
     table_name = await ptg2_serving._ptg2_address_serving_table(
@@ -2865,12 +2876,12 @@ def _compact_tables(**overrides):
 def _db_serving_session():
     return FakeSession(
         [
-            FakeResult(rows=[("example_network", "snap-db")]),
+            FakeResult(result_rows=[("example_network", "snap-db")]),
             {"table": "mrf.ptg2_serving_rate"},
             "mrf.ptg2_serving_rate",
             1,
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-db",
@@ -2967,10 +2978,10 @@ def _fixture_payload():
 def test_search_ptg2_index_returns_prices_and_source_trace():
     index = ptg2_serving.PTG2ServingIndex.from_payload(_fixture_payload())
 
-    payload = ptg2_serving.search_ptg2_index(index, plan_id="TESTPLAN001", code="70551", state="IL")
+    serving_payload = ptg2_serving.search_ptg2_index(index, plan_id="TESTPLAN001", code="70551", state="IL")
 
-    assert payload["pagination"]["total"] == 1
-    item = payload["items"][0]
+    assert serving_payload["pagination"]["total"] == 1
+    item = serving_payload["items"][0]
     assert item["npi"] == 1234567890
     assert item["tic_prices"][0]["negotiated_rate"] == 450
     assert item["network_names"] == ["C2"]
@@ -2980,7 +2991,7 @@ def test_search_ptg2_index_returns_prices_and_source_trace():
     assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
     assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
     assert item["address_verification"]["requires_location_confirmation"] is True
-    assert payload["query"]["source"] == "ptg2"
+    assert serving_payload["query"]["source"] == "ptg2"
 
 
 def test_db_serving_code_filter_accepts_signed_hp_procedure_codes():
@@ -3001,7 +3012,7 @@ def test_db_serving_code_filter_accepts_signed_hp_procedure_codes():
 @pytest.mark.asyncio
 async def test_ptg2_code_context_bridges_cpt_and_hcpcs_same_code():
     context = await ptg2_serving._resolve_ptg2_code_search_context(
-        FakeSession([FakeResult(rows=[])]),
+        FakeSession([FakeResult(result_rows=[])]),
         code="70551",
         code_system="CPT",
     )
@@ -3016,7 +3027,7 @@ async def test_ptg2_code_context_bridges_cpt_and_hcpcs_same_code():
 @pytest.mark.asyncio
 async def test_ptg2_code_context_bridges_cdt_and_hcpcs_dental_code():
     context = await ptg2_serving._resolve_ptg2_code_search_context(
-        FakeSession([FakeResult(rows=[])]),
+        FakeSession([FakeResult(result_rows=[])]),
         code="D0120",
         code_system="CDT",
     )
@@ -3031,7 +3042,7 @@ async def test_ptg2_code_context_bridges_cdt_and_hcpcs_dental_code():
 @pytest.mark.asyncio
 async def test_ptg2_code_context_keeps_ms_drg_exact():
     context = await ptg2_serving._resolve_ptg2_code_search_context(
-        FakeSession([FakeResult(rows=[])]),
+        FakeSession([FakeResult(result_rows=[])]),
         code="47",
         code_system="DRG",
     )
@@ -3061,7 +3072,7 @@ async def test_ptg2_code_context_expands_internal_code_crosswalk():
         FakeSession(
             [
                 FakeResult(
-                    rows=[
+                    result_rows=[
                         {
                             "from_system": "CPT",
                             "from_code": "70551",
@@ -3073,7 +3084,7 @@ async def test_ptg2_code_context_expands_internal_code_crosswalk():
                         }
                     ]
                 ),
-                FakeResult(rows=[]),
+                FakeResult(result_rows=[]),
             ]
         ),
         code="70551",
@@ -3149,7 +3160,7 @@ def test_preferred_code_rows_select_plan_scope_per_code_form():
         "TESTPLAN001",
     )
 
-    assert [row["code_key"] for row in preferred_rows] == [2, 3]
+    assert [result_row["code_key"] for result_row in preferred_rows] == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -3157,7 +3168,7 @@ async def test_v3_reverse_matches_revenue_code_forms():
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -3191,12 +3202,12 @@ async def test_v3_reverse_matches_revenue_code_forms():
 
 
 @pytest.mark.asyncio
-async def test_ptg2_serving_table_uses_equivalent_cpt_hcpcs_filter_for_compact_search():
+async def test_compact_search_uses_equivalent_cpt_hcpcs_filter():
     session = FakeSession(
         [
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
             "mrf.ptg2_serving_rate_compact_token",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
@@ -3217,12 +3228,12 @@ async def test_ptg2_serving_table_uses_equivalent_cpt_hcpcs_filter_for_compact_s
 
 
 @pytest.mark.asyncio
-async def test_ptg2_serving_table_uses_equivalent_cdt_hcpcs_filter_for_compact_search():
+async def test_compact_search_uses_equivalent_cdt_hcpcs_filter():
     session = FakeSession(
         [
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
             "mrf.ptg2_serving_rate_compact_token",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
@@ -3243,6 +3254,7 @@ async def test_ptg2_serving_table_uses_equivalent_cdt_hcpcs_filter_for_compact_s
 
 
 def test_price_summary_groups_component_rates_and_counts_raw_prices():
+    """Group component rates while preserving the raw price count."""
     prices = [
         {
             "billing_class": "professional",
@@ -3336,16 +3348,16 @@ async def test_load_current_ptg2_index_reads_snapshot_artifact(tmp_path):
 async def test_search_current_ptg2_index_reads_db_serving_table():
     session = _db_serving_session()
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         session,
         {"plan_id": "TESTPLAN001", "code": "70551"},
         FakePagination(),
     )
 
-    assert "source" not in payload["query"]
-    assert "serving_table" not in payload["query"]
-    assert "procedure_consolidation" not in payload["query"]
-    item = payload["items"][0]
+    assert "source" not in serving_payload["query"]
+    assert "serving_table" not in serving_payload["query"]
+    assert "procedure_consolidation" not in serving_payload["query"]
+    item = serving_payload["items"][0]
     assert item["procedure_code"] == 123456
     assert item["service_code"] == "70551"
     assert item["reported_code_system"] == "CPT"
@@ -3366,16 +3378,16 @@ async def test_search_current_ptg2_index_reads_db_serving_table():
 async def test_search_current_ptg2_index_can_include_sources_without_debug_fields():
     session = _db_serving_session()
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         session,
         {"plan_id": "TESTPLAN001", "code": "70551", "include_sources": "true"},
         FakePagination(),
     )
 
-    assert payload["query"]["source"] == "ptg2_db"
-    assert payload["query"]["serving_table"] == "mrf.ptg2_serving_rate"
-    assert "procedure_consolidation" not in payload["query"]
-    item = payload["items"][0]
+    assert serving_payload["query"]["source"] == "ptg2_db"
+    assert serving_payload["query"]["serving_table"] == "mrf.ptg2_serving_rate"
+    assert "procedure_consolidation" not in serving_payload["query"]
+    item = serving_payload["items"][0]
     assert item["source_trace"][0]["source_file_version_id"] == "source-version-db-row"
     assert item["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
     assert item["snapshot_id"] == "snap-db"
@@ -3392,10 +3404,11 @@ async def test_search_current_ptg2_index_can_include_sources_without_debug_field
 
 @pytest.mark.asyncio
 async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypatch):
+    """Hydrate source trace details from the manifest trace set."""
     provider_set_id = "00000000000000000000000000000012"
     price_set_id = "00000000000000000000000000000101"
     rate_pack_id = "00000000000000000000000000000201"
-    row = {
+    result_row_by_field = {
         "serving_content_hash_128": rate_pack_id,
         "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
@@ -3410,9 +3423,9 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
     session = FakeSession(
         [
             1,
-            FakeResult(rows=[row]),
+            FakeResult(result_rows=[result_row_by_field]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "source_trace_set_hash": "trace-set-1",
                         "source_trace": [
@@ -3449,7 +3462,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202606:test",
         {
@@ -3464,7 +3477,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    item = payload["items"][0]
+    item = serving_payload["items"][0]
     assert item["source_trace"][0]["source_file_version_id"] == "source-version-1"
     assert item["source_trace"][0]["original_url"] == "https://payer.example.invalid/mrf/rates.json.gz"
     assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
@@ -3475,7 +3488,7 @@ async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypa
 async def test_manifest_db_serving_skips_source_trace_for_compact_response(monkeypatch):
     provider_set_id = "00000000000000000000000000000012"
     price_set_id = "00000000000000000000000000000101"
-    row = {
+    result_row_by_field = {
         "serving_content_hash_128": "00000000000000000000000000000201",
         "plan_id": "TESTPLAN001",
         "reported_code_system": "CPT",
@@ -3487,7 +3500,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
         "source_trace_set_hash": "trace-set-1",
         "network_names": ["C2"],
     }
-    session = FakeSession([1, FakeResult(rows=[row])])
+    session = FakeSession([1, FakeResult(result_rows=[result_row_by_field])])
     tables = ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_manifest_token")
 
     async def fake_available(_session, table_name):
@@ -3516,7 +3529,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
         AsyncMock(side_effect=AssertionError("compact responses should not hydrate source traces")),
     )
 
-    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
         session,
         "ptg2:202606:test",
         {
@@ -3530,7 +3543,7 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert "source_trace" not in payload["items"][0]
+    assert "source_trace" not in serving_payload["items"][0]
     assert not any("ptg2_source_trace_set" in str(call[0][0]) for call in session.calls if call[0])
 
 
@@ -3538,15 +3551,15 @@ async def test_manifest_db_serving_skips_source_trace_for_compact_response(monke
 async def test_search_current_ptg2_index_can_include_full_details():
     session = _db_serving_session()
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         session,
         {"plan_id": "TESTPLAN001", "code": "70551", "include_details": "true"},
         FakePagination(),
     )
 
-    assert payload["query"]["source"] == "ptg2_db"
-    assert payload["query"]["procedure_consolidation"] == "HP_PROCEDURE_CODE"
-    item = payload["items"][0]
+    assert serving_payload["query"]["source"] == "ptg2_db"
+    assert serving_payload["query"]["procedure_consolidation"] == "HP_PROCEDURE_CODE"
+    item = serving_payload["items"][0]
     assert item["source_trace"][0]["source_file_version_id"] == "source-version-db-row"
     assert item["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
     assert item["confidence"]["network"] == "tic_rate_npi_tin"
@@ -3560,7 +3573,7 @@ async def test_search_current_ptg2_index_can_include_code_details():
     session = _db_serving_session()
     session._results.append(
         FakeResult(
-            rows=[
+            result_rows=[
                 {
                     "code_system": "CPT",
                     "code": "70551",
@@ -3583,13 +3596,13 @@ async def test_search_current_ptg2_index_can_include_code_details():
         )
     )
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         session,
         {"plan_id": "TESTPLAN001", "code": "70551", "include_code_details": "true"},
         FakePagination(),
     )
 
-    item = payload["items"][0]
+    item = serving_payload["items"][0]
     assert item["billing_code_detail"]["display_name"] == "MRI brain without contrast"
     assert item["tic_prices"][0]["service_code_details"][0]["code_system"] == "POS"
     assert item["tic_prices"][0]["service_code_details"][0]["display_name"] == "Emergency Room - Hospital"
@@ -3641,12 +3654,12 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
     monkeypatch.setattr(ptg2_serving, "search_ptg2_serving_table", fake_search)
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
-    payload["items"][0]["reported_code"] = "mutated"
+    serving_payload["items"][0]["reported_code"] = "mutated"
     cached_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
@@ -3675,13 +3688,13 @@ async def test_search_current_ptg2_index_ignores_non_manifest_serving_storage(mo
     monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fake_resolve)
     monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "TESTPLAN001", "source_key": "example_network", "code": "70551"},
         FakePagination(),
     )
 
-    assert payload is None
+    assert serving_payload is None
 
 
 @pytest.mark.asyncio
@@ -3719,7 +3732,7 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
         return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
 
     async def fake_one(_session, snapshot_id, _args, pagination):
-        # Each network prices a different surgeon; the PPO row is cheaper.
+        # Each network prices a different surgeon; the PPO result_row is cheaper.
         per_network = {
             "snap-c2": {
                 "items": [
@@ -3741,21 +3754,21 @@ async def test_search_current_ptg2_index_combines_networks_for_multi_network_pla
     monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "TESTPLAN001", "code": "29888", "order_by": "rate", "order": "asc"},
         FakePagination(),
     )
 
-    # Union of both networks, globally re-sorted by rate asc (cheaper PPO row first).
-    assert [item["npi"] for item in payload["items"]] == [222, 111]
-    assert payload["pagination"]["total"] == 2
-    assert payload["pagination"]["has_more"] is False
-    # Each row stays attributable to the network it came from.
-    assert {item["npi"]: item["network"] for item in payload["items"]} == {111: "c2", 222: "ppo_ndc"}
-    assert payload["query"]["combined"] is True
-    assert payload["query"]["snapshot_id"] is None
-    assert {n["source_key"] for n in payload["query"]["networks"]} == {"c2", "ppo_ndc"}
+    # Union of both networks, globally re-sorted by rate asc (cheaper PPO result_row first).
+    assert [item["npi"] for item in serving_payload["items"]] == [222, 111]
+    assert serving_payload["pagination"]["total"] == 2
+    assert serving_payload["pagination"]["has_more"] is False
+    # Each result_row stays attributable to the network it came from.
+    assert {item["npi"]: item["network"] for item in serving_payload["items"]} == {111: "c2", 222: "ppo_ndc"}
+    assert serving_payload["query"]["combined"] is True
+    assert serving_payload["query"]["snapshot_id"] is None
+    assert {n["source_key"] for n in serving_payload["query"]["networks"]} == {"c2", "ppo_ndc"}
 
 
 @pytest.mark.asyncio
@@ -3856,7 +3869,7 @@ async def test_manifest_route_item_fast_path_unions_revenue_code_tables(monkeypa
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "item_payload": {"npi": 1234567890, "reported_code": "0110"},
                         "distance_miles": 1.0,
@@ -3906,13 +3919,14 @@ async def test_manifest_route_item_fast_path_unions_revenue_code_tables(monkeypa
 
 @pytest.mark.asyncio
 async def test_manifest_route_item_table_fast_path_shapes_payload():
+    """Shape route-item fast-path rows into the public response."""
     columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
     session = FakeSession(
         [
             FakeResult(scalar=True),
-            FakeResult(rows=[(column,) for column in columns]),
+            FakeResult(result_rows=[(column,) for column in columns]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "item_payload": {
                             "npi": 1234567890,
@@ -3979,14 +3993,14 @@ async def test_manifest_route_item_table_fast_path_shapes_payload():
 
 @pytest.mark.asyncio
 def _build_route_item_taxonomy_fake_session() -> FakeSession:
-    """Build route-item rows for the lat/long taxonomy pagination regression."""
+    """Build route-item result_rows for the lat/long taxonomy pagination regression."""
     columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
     return FakeSession(
         [
             FakeResult(scalar=True),
-            FakeResult(rows=[(column,) for column in columns]),
+            FakeResult(result_rows=[(column,) for column in columns]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "item_payload": {
                             "npi": 1234567890 + idx,
@@ -4096,12 +4110,12 @@ async def test_manifest_route_item_table_fast_path_rejects_explicit_specialty_fi
 
 
 @pytest.mark.asyncio
-async def test_manifest_route_item_table_fast_path_falls_back_when_artifact_query_fails():
+async def test_route_item_fast_path_falls_back_on_artifact_error():
     columns = sorted(ptg2_serving._PTG2_ROUTE_ITEM_COLUMNS)
     session = FakeSession(
         [
             FakeResult(scalar=True),
-            FakeResult(rows=[(column,) for column in columns]),
+            FakeResult(result_rows=[(column,) for column in columns]),
             RuntimeError("stale cached artifact"),
         ]
     )
@@ -4167,7 +4181,7 @@ async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monke
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_snapshot_has_plan_code", fake_has_plan_code)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
 
-    payload = await ptg2_serving._search_multi_ptg2_snapshots(
+    serving_payload = await ptg2_serving._search_multi_ptg2_snapshots(
         RealishFakeSession([]),
         [("empty", "snap-empty"), ("c2", "snap-c2")],
         {"plan_id": "TESTPLAN001", "code": "90837", "code_system": "CPT"},
@@ -4176,9 +4190,9 @@ async def test_search_multi_ptg2_snapshots_skips_network_without_plan_code(monke
 
     assert checked_snapshots == ["snap-empty", "snap-c2"]
     assert searched_snapshots == ["snap-c2"]
-    assert payload["items"][0]["network"] == "c2"
-    assert payload["pagination"]["total"] == 1
-    assert payload["query"]["combined"] is True
+    assert serving_payload["items"][0]["network"] == "c2"
+    assert serving_payload["pagination"]["total"] == 1
+    assert serving_payload["query"]["combined"] is True
 
 
 @pytest.mark.asyncio
@@ -4194,7 +4208,7 @@ async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(m
     )
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
 
-    result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+    query_result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
         session,
         "ptg2:test",
         {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT"},
@@ -4203,7 +4217,7 @@ async def test_manifest_snapshot_has_plan_code_uses_code_count_for_lean_layout(m
 
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
-    assert result is True
+    assert query_result is True
     assert "FROM mrf.ptg2_code_count_snap" in sql
     assert "FROM mrf.ptg2_serving_snap" not in sql
     assert params == {
@@ -4226,7 +4240,7 @@ async def test_manifest_snapshot_preflight_matches_revenue_code_forms(monkeypatc
     )
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
 
-    result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
+    query_result = await ptg2_serving._ptg2_manifest_snapshot_has_plan_code(
         session,
         "ptg2:fixture",
         {"plan_id": "TESTPLAN001", "code": "110", "code_system": "RC"},
@@ -4235,7 +4249,7 @@ async def test_manifest_snapshot_preflight_matches_revenue_code_forms(monkeypatc
 
     sql = str(session.calls[0][0][0])
     params_by_name = session.calls[0][0][1]
-    assert result is True
+    assert query_result is True
     assert "reported_code IN (:reported_code, :reported_code_1)" in sql
     assert params_by_name["reported_code"] == "0110"
     assert params_by_name["reported_code_1"] == "110"
@@ -4259,7 +4273,7 @@ async def test_search_current_ptg2_index_single_network_plan_uses_single_path(mo
     monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
     monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
 
-    payload = await ptg2_serving.search_current_ptg2_index(
+    serving_payload = await ptg2_serving.search_current_ptg2_index(
         FakeSession([]),
         {"plan_id": "TESTPLAN001", "code": "29888"},
         FakePagination(),
@@ -4268,9 +4282,9 @@ async def test_search_current_ptg2_index_single_network_plan_uses_single_path(mo
     # A single-network plan stays on the untouched single-snapshot path: no combine
     # envelope, no per-item network tag.
     assert seen["snapshot_id"] == "snap-c2"
-    assert payload["items"][0]["npi"] == 111
-    assert "network" not in payload["items"][0]
-    assert "combined" not in payload["query"]
+    assert serving_payload["items"][0]["npi"] == 111
+    assert "network" not in serving_payload["items"][0]
+    assert "combined" not in serving_payload["query"]
 
 
 @pytest.mark.asyncio
@@ -4439,8 +4453,8 @@ async def test_current_plan_source_network_list_is_not_memory_cached():
 
     session = RealishFakeSession(
         [
-            FakeResult(rows=[("ppo", "snap-ppo")]),
-            FakeResult(rows=[("ppo", "snap-ppo"), ("c2", "snap-c2")]),
+            FakeResult(result_rows=[("ppo", "snap-ppo")]),
+            FakeResult(result_rows=[("ppo", "snap-ppo"), ("c2", "snap-c2")]),
         ]
     )
 
@@ -4460,7 +4474,7 @@ async def test_current_plan_source_network_list_is_not_memory_cached():
 
 @pytest.mark.asyncio
 async def test_current_plan_source_network_list_groups_dated_files_by_manifest_network():
-    session = FakeSession([FakeResult(rows=[("current-source", "current-snapshot")])])
+    session = FakeSession([FakeResult(result_rows=[("current-source", "current-snapshot")])])
 
     snapshot_pairs = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
         session,
@@ -4507,6 +4521,7 @@ async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fa
 
 @pytest.mark.asyncio
 async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_column():
+    """Serve provider procedures when compact rows omit market type."""
     session = FakeSession(
         [
             "snap-token",
@@ -4523,9 +4538,9 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-token",
@@ -4553,7 +4568,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
         ]
     )
 
-    payload = await ptg2_serving.search_ptg2_provider_procedures(
+    serving_payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
         {
@@ -4566,9 +4581,9 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
         FakePagination(),
     )
 
-    assert payload["items"][0]["npi"] == 1083311500
-    assert payload["items"][0]["reported_code"] == "99213"
-    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
+    assert serving_payload["items"][0]["npi"] == 1083311500
+    assert serving_payload["items"][0]["reported_code"] == "99213"
+    assert serving_payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
     row_call = next(call for call in session.calls if "provider_sets AS MATERIALIZED" in str(call[0][0]))
     row_sql = str(row_call[0][0])
     assert "r.plan_market_type" not in row_sql
@@ -4583,6 +4598,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
 
 @pytest.mark.asyncio
 async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate():
+    """Filter provider prices by POS, modifier, and rate."""
     session = FakeSession(
         [
             "snap-token",
@@ -4596,9 +4612,9 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "serving_rate_id": "rate-1",
                         "snapshot_id": "snap-token",
@@ -4633,7 +4649,7 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
         ]
     )
 
-    payload = await ptg2_serving.search_ptg2_provider_procedures(
+    serving_payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1235189762,
         {
@@ -4649,11 +4665,11 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
         FakePagination(),
     )
 
-    item = payload["items"][0]
+    item = serving_payload["items"][0]
     assert item["tic_prices"][0]["negotiated_rate"] == 516.08
     assert item["tic_prices"][0]["service_code"] == ["21"]
     assert item["tic_prices"][0]["billing_code_modifier"] == ["26"]
-    assert payload["query"]["price_filter"] == {
+    assert serving_payload["query"]["price_filter"] == {
         "service_code": ["21"],
         "pos": "21",
         "billing_code_modifier": ["26"],
@@ -4690,12 +4706,12 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
             0,
         ]
     )
 
-    payload = await ptg2_serving.search_ptg2_provider_procedures(
+    serving_payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
         {
@@ -4708,15 +4724,16 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
         FakePagination(),
     )
 
-    assert payload["items"] == []
-    assert payload["pagination"]["total"] == 0
-    assert payload["query"]["snapshot_id"] == "snap-token"
-    assert payload["query"]["status"] == "no_match"
-    assert payload["query"]["source"] == "ptg2_db"
+    assert serving_payload["items"] == []
+    assert serving_payload["pagination"]["total"] == 0
+    assert serving_payload["query"]["snapshot_id"] == "snap-token"
+    assert serving_payload["query"]["status"] == "no_match"
+    assert serving_payload["query"]["source"] == "ptg2_db"
 
 
 @pytest.mark.asyncio
 async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(tmp_path, monkeypatch):
+    """Resolve lean provider procedures through the reverse artifact."""
     provider_set_id = "0000000000000000000000000000000a"
     price_set_id = "00000000000000000000000000000101"
     sidecar = write_serving_by_provider_set_sidecar(
@@ -4727,9 +4744,9 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
     )
     session = FakeSession(
         [
-            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+            FakeResult(result_rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -4780,7 +4797,7 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", procedure_rows)
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_enriched_provider_rows_for_npis", provider_context)
 
-    payload = await ptg2_serving._search_ptg2_manifest_provider_procedures(
+    serving_payload = await ptg2_serving._search_ptg2_manifest_provider_procedures(
         session,
         1234567890,
         {"plan_id": "TESTPLAN001", "code": "70551", "code_system": "CPT", "include_details": "true"},
@@ -4789,15 +4806,16 @@ async def test_ptg2_provider_procedures_uses_reverse_sidecar_for_lean_snapshot(t
         serving_tables=tables,
     )
 
-    assert payload["query"]["provider_reverse_index"] is True
-    assert payload["items"][0]["npi"] == 1234567890
-    assert payload["items"][0]["provider_set_hash"] == provider_set_id
-    assert payload["items"][0]["reported_code"] == "70551"
-    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 451.25
+    assert serving_payload["query"]["provider_reverse_index"] is True
+    assert serving_payload["items"][0]["npi"] == 1234567890
+    assert serving_payload["items"][0]["provider_set_hash"] == provider_set_id
+    assert serving_payload["items"][0]["reported_code"] == "70551"
+    assert serving_payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 451.25
 
 
 @pytest.mark.asyncio
 async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
+    """Prefer the code projection when paging reverse results."""
     provider_set_a = "0000000000000000000000000000000a"
     provider_set_b = "0000000000000000000000000000000b"
     price_a = "00000000000000000000000000000101"
@@ -4814,13 +4832,13 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {"provider_set_key": 3, "provider_set_global_id_128": provider_set_a},
                     {"provider_set_key": 4, "provider_set_global_id_128": provider_set_b},
                 ]
             ),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -4847,7 +4865,7 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
         artifacts={"serving_by_code": sidecar},
     )
 
-    rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
+    result_rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_reverse_sidecar(
         session,
         tables,
         provider_set_ids=(provider_set_a, provider_set_b),
@@ -4864,8 +4882,8 @@ async def test_ptg2_provider_reverse_window_prefers_code_sidecar(tmp_path):
     )
 
     assert [
-        (row["reported_code"], row["provider_set_global_id_128"], row["provider_count"], row["price_set_global_id_128"])
-        for row in rows
+        (result_row["reported_code"], result_row["provider_set_global_id_128"], result_row["provider_count"], result_row["price_set_global_id_128"])
+        for result_row in result_rows
     ] == [
         ("70551", provider_set_a, 5, price_a),
         ("70552", provider_set_a, 11, price_c),
@@ -4885,9 +4903,9 @@ async def test_broad_npi_prefers_reverse_sidecar(tmp_path, monkeypatch):
     code_sidecar = write_serving_by_code_sidecar(tmp_path / "serving_by_code.ptg2sbc", [(7, 3, 5, price_a), (8, 3, 11, price_b)])
     session = FakeSession(
         [
-            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set}]),
+            FakeResult(result_rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set}]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {"code_key": 7, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
                     {"code_key": 8, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
                 ]
@@ -4937,9 +4955,9 @@ def _postgres_binary_reverse_fixture():
     price_b_id = "00000000000000000000000000000102"
     session = FakeSession(
         [
-            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+            FakeResult(result_rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {"code_key": 7, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70551", "rate_count": 1},
                     {"code_key": 8, "plan_id": "TESTPLAN001", "reported_code_system": "CPT", "reported_code": "70552", "rate_count": 1},
                 ]
@@ -5124,12 +5142,13 @@ async def test_postgres_binary_async_membership_fails_closed_without_db_storage(
 
 @pytest.mark.asyncio
 async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
+    """Project lean serving rows into provider procedure responses."""
     provider_set_id = "0000000000000000000000000000000a"
     price_set_id = "00000000000000000000000000000101"
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_key": 7,
                         "plan_id": "TESTPLAN001",
@@ -5139,9 +5158,9 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
                     }
                 ]
             ),
-            FakeResult(rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
+            FakeResult(result_rows=[{"provider_set_key": 3, "provider_set_global_id_128": provider_set_id}]),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "code_order": 0,
                         "code_key": 7,
@@ -5165,7 +5184,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
         serving_table_layout="lean_provider_key_v1",
     )
 
-    rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_lean_table(
+    result_rows = await ptg2_serving._ptg2_manifest_provider_procedure_rows_from_lean_table(
         session,
         tables,
         provider_set_ids=(provider_set_id,),
@@ -5180,7 +5199,7 @@ async def test_ptg2_provider_procedures_projects_lean_serving_table_rows():
         offset=0,
     )
 
-    assert rows == [
+    assert result_rows == [
         {
             "serving_content_hash_128": ptg2_serving._ptg2_manifest_serving_content_hash(
                 7,
@@ -5225,22 +5244,22 @@ async def test_ptg2_provider_procedures_requires_normalized_provider_membership(
         ]
     )
 
-    payload = await ptg2_serving.search_ptg2_provider_procedures(
+    serving_payload = await ptg2_serving.search_ptg2_provider_procedures(
         session,
         1083311500,
         {"plan_id": "TESTPLAN001", "code": "99213", "code_system": "CPT"},
         FakePagination(),
     )
 
-    assert payload is None
+    assert serving_payload is None
 
 
 @pytest.mark.asyncio
 async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     tables = _compact_tables()
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -5252,7 +5271,7 @@ async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     assert "ptg2_price_set_token" not in sql
     assert "FROM mrf.ptg2_price_set_entry_token pse" in sql
@@ -5266,13 +5285,13 @@ async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
 
 @pytest.mark.asyncio
 async def test_compact_serving_requires_normalized_price_tables():
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_rate_compact_token",
         procedure_table="mrf.ptg2_procedure_token",
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -5284,16 +5303,16 @@ async def test_compact_serving_requires_normalized_price_tables():
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     assert session.calls == []
 
 
 @pytest.mark.asyncio
 async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -5305,7 +5324,7 @@ async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "provider_filtered_rates AS MATERIALIZED" in sql
@@ -5320,9 +5339,9 @@ async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
 @pytest.mark.asyncio
 async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -5341,7 +5360,7 @@ async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(mon
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "(LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5 OR (" in sql
@@ -5355,9 +5374,9 @@ async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(mon
 @pytest.mark.asyncio
 async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -5375,7 +5394,7 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "JOIN mrf.npi_address addr_filter" in sql
@@ -5393,9 +5412,9 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
 @pytest.mark.asyncio
 async def test_compact_serving_provider_expansion_fallback_projects_address_distance(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession(["mrf.npi", FakeResult(rows=[])])
+    session = FakeSession(["mrf.npi", FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -5415,7 +5434,7 @@ async def test_compact_serving_provider_expansion_fallback_projects_address_dist
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     params = session.calls[-1][0][1]
     assert "addr.distance_miles, addr.zip_match_type, addr.anchor_zip5, addr.zip_radius_miles" in sql
@@ -5430,15 +5449,16 @@ async def test_compact_serving_provider_expansion_fallback_projects_address_dist
 
 @pytest.mark.asyncio
 async def test_manifest_location_provider_matches_filters_coordinates_with_unified(monkeypatch):
+    """Filter manifest providers with unified location coordinates."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "provider_group_global_id_128": group_id,
                         "npi": 1234567890,
@@ -5577,11 +5597,11 @@ async def test_manifest_location_uses_component_table(monkeypatch):
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5636,11 +5656,11 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5681,13 +5701,14 @@ async def test_manifest_location_uses_component_table_with_provider_group_locati
 
 @pytest.mark.asyncio
 async def test_manifest_location_classification_filter_scopes_via_semijoin_and_array(monkeypatch):
-    """Classification filters must prefilter in-index and semi-join, not probe per row.
+    """Scope classification filters through taxonomy array semijoins."""
+    """Classification filters must prefilter in-index and semi-join, not probe per result_row.
 
     Regression for plan-scoped 502s with plan_id + zip5 + classification
     (e.g. 'Orthopaedic Surgery', CPT 99204 - no inference rule): the
     classification resolves no taxonomy codes, so the code-driven
     taxonomy_array overlap was empty and the correlated EXISTS (with a nucc
-    join) ran once per location row of a dense-metro zip radius.
+    join) ran once per location result_row of a dense-metro zip radius.
     """
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
@@ -5696,11 +5717,11 @@ async def test_manifest_location_classification_filter_scopes_via_semijoin_and_a
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5739,7 +5760,7 @@ async def test_manifest_location_classification_filter_scopes_via_semijoin_and_a
         in location_sql
     )
     # ...and the classification also derives an in-index taxonomy_array
-    # prefilter so the zip/GIN indexes narrow rows before any precise check.
+    # prefilter so the zip/GIN indexes narrow result_rows before any precise check.
     assert "loc.taxonomy_array && (" in location_sql
     assert "LOWER(COALESCE(classification, '')) = LOWER(:manifest_location_table_array_classification)" in location_sql
     assert location_params["manifest_location_table_array_classification"] == "Orthopaedic Surgery"
@@ -5755,12 +5776,12 @@ async def test_manifest_location_uses_provider_group_rate_scope_table_when_decla
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5814,12 +5835,12 @@ async def test_manifest_location_uses_rate_scope_table_without_provider_group_lo
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5863,7 +5884,7 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
     group_id = "00000000000000000000000000000011"
     session = FakeSession(
         [
-            FakeResult(rows=[{"provider_set_global_id_128": provider_set_id}]),
+            FakeResult(result_rows=[{"provider_set_global_id_128": provider_set_id}]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -5882,7 +5903,7 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
 
     monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many_async", fake_sidecar_many)
 
-    result = await ptg2_serving._manifest_rate_provider_groups_from_sidecar(
+    query_result = await ptg2_serving._manifest_rate_provider_groups_from_sidecar(
         session,
         tables,
         serving_table=tables.serving_table,
@@ -5892,7 +5913,7 @@ async def test_manifest_rate_provider_groups_sidecar_supports_lean_provider_key_
     )
 
     sql = str(session.calls[0][0][0])
-    assert result == (group_id,)
+    assert query_result == (group_id,)
     assert "JOIN mrf.ptg2_code_count_snap code_count" in sql
     assert "JOIN mrf.ptg2_provider_set_dict_snap provider_set_dictionary" in sql
     assert "code_count.code_key = serving.code_key" in sql
@@ -5908,7 +5929,7 @@ async def test_manifest_rate_scope_combines_revenue_code_forms(monkeypatch):
     raw_provider_set_id = "00000000000000000000000000000013"
     canonical_group_id = "00000000000000000000000000000021"
     raw_group_id = "00000000000000000000000000000022"
-    session = FakeSession([FakeResult(rows=_revenue_code_count_rows())])
+    session = FakeSession([FakeResult(result_rows=_revenue_code_count_rows())])
     tables = ptg2_serving.PTG2ServingTables(
         serving_binary_table="mrf.ptg2_serving_binary_fixture",
         code_count_table="mrf.ptg2_code_count_fixture",
@@ -5954,6 +5975,7 @@ async def test_manifest_rate_scope_combines_revenue_code_forms(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatch):
+    """Limit phone fallback to providers whose NPI phone is absent."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
@@ -5982,14 +6004,14 @@ async def test_manifest_location_phone_fallback_scopes_by_missing_npi(monkeypatc
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[phone_fallback]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[phone_fallback]),
             False,
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -6043,13 +6065,13 @@ async def test_manifest_location_zip_radius_uses_literal_taxonomy_lateral_fast_p
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
-            FakeResult(rows=[{"int_code": 101}, {"int_code": 202}]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[{"int_code": 101}, {"int_code": 202}]),
             FakeResult(scalar=True),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -6100,12 +6122,12 @@ async def test_manifest_location_rate_scope_table_falls_back_when_pair_uncovered
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             FakeResult(scalar=False),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -6142,11 +6164,11 @@ async def test_manifest_location_rate_prefilter_allows_missing_code_system(monke
     component_by_field = {"provider_group_global_id_128": group_id, "provider_set_global_id_128": provider_set_id}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             FakeResult(scalar=True),
             False,
-            FakeResult(rows=[location_by_field]),
-            FakeResult(rows=[component_by_field]),
+            FakeResult(result_rows=[location_by_field]),
+            FakeResult(result_rows=[component_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -6184,10 +6206,10 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
     location_by_field = {"provider_group_global_id_128": group_id, "npi": 1234567890}
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
-            FakeResult(rows=[{"provider_set_global_id_128": provider_set_id}]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[{"provider_set_global_id_128": provider_set_id}]),
             False,
-            FakeResult(rows=[location_by_field]),
+            FakeResult(result_rows=[location_by_field]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -6242,7 +6264,7 @@ async def test_manifest_location_uses_sidecar_rate_groups_without_component_tabl
 async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monkeypatch):
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     tables = ptg2_serving.PTG2ServingTables(
         provider_set_component_table="mrf.ptg2_provider_set_component_snap",
         artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
@@ -6261,6 +6283,7 @@ async def test_manifest_sets_by_group_falls_back_for_empty_component_table(monke
 
 @pytest.mark.asyncio
 async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_index(monkeypatch):
+    """Use the address-key NPI index for provider phone fallback."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
@@ -6268,10 +6291,10 @@ async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_in
     premise_key = "00000000-0000-0000-0000-000000000002"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "provider_group_global_id_128": group_id,
                         "npi": 1234567890,
@@ -6304,7 +6327,7 @@ async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_in
                 ]
             ),
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "address_key": address_key,
@@ -6347,7 +6370,7 @@ async def test_manifest_location_provider_phone_fallback_uses_address_key_npi_in
 
 
 def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
-    items = [
+    result_items = [
         {
             "provider_name": "Far cheap",
             "prices": [{"negotiated_rate": 100.0}],
@@ -6361,12 +6384,12 @@ def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
     ]
 
     by_cost = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        result_items,
         {"order_by": "total_allowed_amount", "order": "asc"},
         location_filter_requested=True,
     )
     by_distance = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        result_items,
         {"order_by": "distance", "order": "asc"},
         location_filter_requested=True,
     )
@@ -6376,7 +6399,7 @@ def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
 
 
 def test_merge_ptg2_provider_rate_items_preserves_same_provider_location_rates():
-    items = [
+    result_items = [
         {
             "provider_name": "David Clayton Tapscott",
             "npi": "1255711370",
@@ -6417,7 +6440,7 @@ def test_merge_ptg2_provider_rate_items_preserves_same_provider_location_rates()
         },
     ]
 
-    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(result_items)
 
     assert len(merged) == 1
     assert [summary["rate"] for summary in merged[0]["price_summary"]] == [1074.22, 3193.10]
@@ -6445,15 +6468,15 @@ def test_merge_ptg2_provider_rate_items_defers_duplicate_price_summary(monkeypat
         "provider_set_hash": "provider-a",
         "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100.0}],
     }
-    items = []
+    result_items = []
     for idx, rate in enumerate((100.0, 150.0, 200.0), start=1):
         item = dict(base_item)
         item["price_set_hash"] = f"price-{idx}"
         item["rate_pack_hash"] = f"rate-{idx}"
         item["prices"] = [{"negotiated_type": "negotiated", "negotiated_rate": rate}]
-        items.append(item)
+        result_items.append(item)
 
-    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(result_items)
 
     assert len(merged) == 1
     assert len(calls) == 2
@@ -6463,7 +6486,7 @@ def test_merge_ptg2_provider_rate_items_defers_duplicate_price_summary(monkeypat
 
 def test_merge_ptg2_provider_rate_items_reuses_presummarized_unique_prices(monkeypatch):
     def fail_price_response_fields(_prices):
-        raise AssertionError("unique presummarized rows should not rebuild price fields")
+        raise AssertionError("unique presummarized result_rows should not rebuild price fields")
 
     monkeypatch.setattr(ptg2_serving, "_price_response_fields", fail_price_response_fields)
     item = {
@@ -6651,7 +6674,7 @@ def test_compact_item_can_suppress_unverified_plan_address_when_requested():
 
 
 def test_ptg2_default_sort_prioritizes_network_bound_addresses():
-    items = [
+    result_items = [
         {
             "provider_name": "No Address",
             "npi": 3,
@@ -6679,7 +6702,7 @@ def test_ptg2_default_sort_prioritizes_network_bound_addresses():
     ]
 
     sorted_items = ptg2_serving._sort_ptg2_manifest_provider_items(
-        items,
+        result_items,
         {},
         location_filter_requested=False,
     )
@@ -6908,6 +6931,7 @@ def test_compact_item_marks_provider_directory_network_location_as_corroborated(
 
 
 def test_compact_item_promotes_provider_directory_network_name_match():
+    """Promote provider-directory network matches in compact items."""
     item = ptg2_serving._compact_item_from_row(
         {
             "npi": 1234567890,
@@ -7491,9 +7515,9 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -7523,8 +7547,8 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
     params = session.calls[2][0][1]
     # With a taxonomy filter, the member x taxonomy intersection is resolved
     # once in a MATERIALIZED CTE (uncorrelated semi-join, sargable code
-    # predicate) and probed per address row. Correlated per-member probes must
-    # not reappear: on whole-network member tables they run once per row and
+    # predicate) and probed per address result_row. Correlated per-member probes must
+    # not reappear: on whole-network member tables they run once per result_row and
     # time the request out.
     assert "scoped_member_npis AS MATERIALIZED" in sql
     assert "FROM mrf.ptg2_provider_group_member_snap pgm_scope" in sql
@@ -7546,9 +7570,9 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -7597,7 +7621,7 @@ async def test_manifest_location_provider_matches_inferred_taxonomy_requires_ind
 
 @pytest.mark.asyncio
 async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exists(monkeypatch):
-    # Without a taxonomy filter the member check must stay a per-address-row
+    # Without a taxonomy filter the member check must stay a per-address-result_row
     # EXISTS: materializing a whole unfiltered network (1M+ NPIs) would cost
     # more than it saves.
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
@@ -7605,9 +7629,9 @@ async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exist
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
             False,
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -7636,7 +7660,7 @@ async def test_manifest_location_provider_matches_no_taxonomy_keeps_member_exist
 async def test_manifest_location_provider_matches_small_sidecar_scope_uses_plain_any(monkeypatch):
     group_a = "00000000-0000-0000-0000-000000000011"
     group_b = "00000000-0000-0000-0000-000000000012"
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(
@@ -7683,7 +7707,7 @@ async def test_large_sidecar_filters_generic_rows(monkeypatch):
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     _fake_manifest_provider_location_row(group_id),
                     _fake_manifest_provider_location_row(out_scope_group_id),
                 ]
@@ -7831,8 +7855,8 @@ async def _location_first_test_context(monkeypatch):
     out_scope_location = _fake_manifest_provider_location_row(other_group_id)
     session = FakeSession(
         [
-            FakeResult(rows=[{"npi": 1234567890}]),
-            FakeResult(rows=[in_scope_location, out_scope_location]),
+            FakeResult(result_rows=[{"npi": 1234567890}]),
+            FakeResult(result_rows=[in_scope_location, out_scope_location]),
         ]
     )
     monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.entity_address_unified"))
@@ -7851,7 +7875,7 @@ async def _location_first_test_context(monkeypatch):
     monkeypatch.setattr(
         ptg2_serving,
         "_overlay_provider_directory_corroboration",
-        AsyncMock(side_effect=lambda _session, rows, **_kwargs: rows),
+        AsyncMock(side_effect=lambda _session, result_rows, **_kwargs: result_rows),
     )
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_token",
@@ -7914,10 +7938,10 @@ async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
     provider_set_id = "00000000000000000000000000000012"
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
-            FakeResult(rows=[{"int_code": 101}, {"int_code": 202}]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[{"int_code": 101}, {"int_code": 202}]),
             FakeResult(scalar=True),
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
     tables = ptg2_serving.PTG2ServingTables(
@@ -7950,10 +7974,10 @@ async def _run_plan_scoped_taxonomy_location_search(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_plan_scoped_taxonomy_location_search_uses_semijoin_ctes(monkeypatch):
-    """Member CTE must use uncorrelated, sargable semi-joins, never per-row probes.
+    """Member CTE must use uncorrelated, sargable semi-joins, never per-result_row probes.
 
     Regression for plan-scoped provider-pricing 502s: correlated taxonomy
-    probes ran once per member row of a whole-network member table (~32M page
+    probes ran once per member result_row of a whole-network member table (~32M page
     reads, 24-45s cold; the empty-first-pass secondary-address fallback
     doubled it).
     """
@@ -7994,12 +8018,13 @@ async def test_plan_scoped_taxonomy_location_search_stages_entity_and_address_pr
 
 @pytest.mark.asyncio
 async def test_compact_serving_include_providers_expands_without_geo_filter(monkeypatch):
+    """Expand compact providers when no geo filter is supplied."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(
         [
             "mrf.npi",
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "location_hash": "loc-1",
@@ -8033,7 +8058,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8050,9 +8075,9 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload["query"]["result_granularity"] == "provider"
-    assert payload["query"]["include_providers"] is True
-    item = payload["items"][0]
+    assert serving_payload["query"]["result_granularity"] == "provider"
+    assert serving_payload["query"]["include_providers"] is True
+    item = serving_payload["items"][0]
     assert item["npi"] == 1234567890
     assert item["provider_name"] == "Example Provider"
     assert item["state"] == "IL"
@@ -8071,12 +8096,12 @@ async def test_compact_serving_geo_filter_uses_unified_address_table_when_compat
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8088,7 +8113,7 @@ async def test_compact_serving_geo_filter_uses_unified_address_table_when_compat
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[1][0][0])
     assert "JOIN mrf.entity_address_unified addr_filter" in sql
     assert "JOIN mrf.npi_address addr_filter" not in sql
@@ -8108,12 +8133,12 @@ async def test_compact_serving_zip_geo_filter_uses_unified_zip_index_expression(
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8132,7 +8157,7 @@ async def test_compact_serving_zip_geo_filter_uses_unified_zip_index_expression(
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[1][0][0])
     assert "JOIN mrf.entity_address_unified addr_filter" in sql
     assert "COALESCE(addr_filter.zip5" in sql
@@ -8148,13 +8173,13 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
             "mrf.npi",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8166,7 +8191,7 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     assert "FROM mrf.entity_address_unified addr" in sql
     assert "FROM mrf.npi_address addr" not in sql
@@ -8180,7 +8205,7 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     assert "addr.npi = sp.npi" not in sql
     # Provider name is resolved from the canonical NPI table (mrf.npi), never
     # left as the NULL/"TiC provider" placeholder, and street-bearing address
-    # rows are preferred so city/zip-only unified rows don't hide the street.
+    # result_rows are preferred so city/zip-only unified result_rows don't hide the street.
     assert "LEFT JOIN mrf.npi n ON n.npi = pgm.npi" in sql
     assert "NULL::varchar AS provider_name" not in sql
     assert "n.provider_organization_name" in sql
@@ -8192,13 +8217,13 @@ async def test_compact_serving_provider_expansion_uses_placeholder_without_npi_t
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            FakeResult(result_rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
             FakeResult(scalar=None),
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8210,7 +8235,7 @@ async def test_compact_serving_provider_expansion_uses_placeholder_without_npi_t
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     assert "LEFT JOIN mrf.npi n ON n.npi = pgm.npi" not in sql
     assert "'TiC provider' AS provider_name" in sql
@@ -8221,13 +8246,13 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     session = FakeSession(
         [
-            FakeResult(rows=[("npi",), ("type",)]),
+            FakeResult(result_rows=[("npi",), ("type",)]),
             "mrf.npi",
-            FakeResult(rows=[]),
+            FakeResult(result_rows=[]),
         ]
     )
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8239,7 +8264,7 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     assert "FROM mrf.npi_address addr" in sql
     assert "FROM mrf.entity_address_unified addr" not in sql
@@ -8248,10 +8273,10 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
 @pytest.mark.asyncio
 async def test_compact_serving_source_scoped_provider_expansion_uses_direct_component_table(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession(["mrf.npi", FakeResult(rows=[])])
+    session = FakeSession(["mrf.npi", FakeResult(result_rows=[])])
     tables = _compact_tables()
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -8263,7 +8288,7 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_direct_comp
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     assert "JOIN mrf.ptg2_provider_set_component_token psc" in sql
     assert "ON psc.provider_set_hash = r.provider_set_hash" in sql
@@ -8275,9 +8300,9 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_direct_comp
 
 @pytest.mark.asyncio
 async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_without_geo():
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
@@ -8289,7 +8314,7 @@ async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_with
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "provider_filtered_rates AS MATERIALIZED" in sql
@@ -8301,7 +8326,7 @@ async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_with
     assert "LOWER(COALESCE" not in sql
     assert "nucc_filter.display_name" not in sql
     assert "mrf.npi_taxonomy provider_specialty_nt" in sql
-    # Uncorrelated semi-joins, never per-member-row probes: correlated EXISTS
+    # Uncorrelated semi-joins, never per-member-result_row probes: correlated EXISTS
     # re-descends npi_taxonomy for every member of whole-network provider sets.
     # CPT 70551 also triggers the radiology inferred-taxonomy rule, so the
     # inferred clause is pinned here too.
@@ -8317,8 +8342,8 @@ async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_with
 def test_compact_location_filter_scopes_taxonomy_via_semijoin():
     """filtered_locations taxonomy predicates must be uncorrelated semi-joins.
 
-    The location scan covers every row in the zip/geo set BEFORE the LIMIT; a
-    correlated EXISTS re-descends npi_taxonomy once per row — the pathology
+    The location scan covers every result_row in the zip/geo set BEFORE the LIMIT; a
+    correlated EXISTS re-descends npi_taxonomy once per result_row — the pathology
     that 502'd the manifest location matcher for sparse taxonomy codes.
     """
     params_by_name = {"limit": 25}
@@ -8346,9 +8371,9 @@ def test_compact_location_filter_scopes_taxonomy_via_semijoin():
 
 @pytest.mark.asyncio
 async def test_compact_serving_specialty_search_filters_minimal_provider_group_layout():
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(provider_set_component_table=None, provider_group_location_table=None),
@@ -8365,7 +8390,7 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[-1][0][0])
     params = session.calls[-1][0][1]
     assert "provider_filtered_rates AS MATERIALIZED" in sql
@@ -8382,7 +8407,7 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
     assert "tax.taxonomy_codes" in sql
     assert "363A00000X" not in params.values()
     assert set(
-        value for key, value in params.items()
+        parameter_value for key, parameter_value in params.items()
         if key.startswith("provider_specialty_taxonomy_code_")
     ) >= {"207Q00000X", "207R00000X", "208000000X", "208D00000X"}
 
@@ -8390,10 +8415,10 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
 @pytest.mark.asyncio
 async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_component_table(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession([FakeResult(result_rows=[])])
     tables = _compact_tables()
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -8405,7 +8430,7 @@ async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_com
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload is None
+    assert serving_payload is None
     sql = str(session.calls[0][0][0])
     assert "provider_filtered_rates AS MATERIALIZED" in sql
     assert "FROM mrf.ptg2_provider_set_component_token psc_filter" in sql
@@ -8419,10 +8444,11 @@ async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_com
 
 @pytest.mark.asyncio
 async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_location_lookup():
+    """Use NPI-scoped locations for compact provider geo expansion."""
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "location_hash": "npi_address:1234567890:primary:addr-1",
@@ -8463,7 +8489,7 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     )
     tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -8483,14 +8509,14 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload["query"]["result_granularity"] == "provider"
-    assert payload["items"][0]["location_source"] == "npi_address"
-    assert payload["items"][0]["address_key"] == "00000000-0000-0000-0000-000000000003"
-    assert payload["items"][0]["address"]["address_key"] == "00000000-0000-0000-0000-000000000003"
-    assert payload["items"][0]["specialties"] == ["Family Medicine Physician"]
-    assert payload["items"][0]["specialization"] == "Sports Medicine"
-    assert payload["items"][0]["specializations"] == ["Sports Medicine"]
-    assert payload["items"][0]["classifications"] == ["Family Medicine"]
+    assert serving_payload["query"]["result_granularity"] == "provider"
+    assert serving_payload["items"][0]["location_source"] == "npi_address"
+    assert serving_payload["items"][0]["address_key"] == "00000000-0000-0000-0000-000000000003"
+    assert serving_payload["items"][0]["address"]["address_key"] == "00000000-0000-0000-0000-000000000003"
+    assert serving_payload["items"][0]["specialties"] == ["Family Medicine Physician"]
+    assert serving_payload["items"][0]["specialization"] == "Sports Medicine"
+    assert serving_payload["items"][0]["specializations"] == ["Sports Medicine"]
+    assert serving_payload["items"][0]["classifications"] == ["Family Medicine"]
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
@@ -8594,8 +8620,8 @@ def _fake_manifest_provider_location_row(group_id: str) -> dict[str, object]:
 async def test_manifest_location_provider_matches_prefers_provider_group_location_table(monkeypatch):
     group_id = "00000000-0000-0000-0000-000000000001"
     session = FakeSession([
-        FakeResult(rows=[]),
-        FakeResult(rows=[_fake_manifest_provider_location_row(group_id)]),
+        FakeResult(result_rows=[]),
+        FakeResult(result_rows=[_fake_manifest_provider_location_row(group_id)]),
     ])
     monkeypatch.setattr(ptg2_serving, "_ptg2_address_serving_table", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(ptg2_serving, "_serving_table_available", AsyncMock(return_value=True))
@@ -8612,7 +8638,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
     monkeypatch.setattr(
         ptg2_serving,
         "_overlay_provider_directory_corroboration",
-        AsyncMock(side_effect=lambda _session, rows, **_kwargs: rows),
+        AsyncMock(side_effect=lambda _session, result_rows, **_kwargs: result_rows),
     )
 
     provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
@@ -8650,6 +8676,7 @@ async def test_manifest_location_provider_matches_prefers_provider_group_locatio
 
 @pytest.mark.asyncio
 async def test_compact_serving_geo_provider_filter_paginates_after_provider_match():
+    """Paginate compact geo results after provider matching."""
     class LimitOnePagination:
         limit = 1
         offset = 0
@@ -8657,7 +8684,7 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "location_hash": "npi_address:1234567890:primary:addr-1",
@@ -8693,7 +8720,7 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     )
     tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -8713,8 +8740,8 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
     )
 
-    assert payload["items"][0]["provider_name"] == "ACL Surgeon"
-    assert payload["items"][0]["specialization"] == "Sports Medicine"
+    assert serving_payload["items"][0]["provider_name"] == "ACL Surgeon"
+    assert serving_payload["items"][0]["specialization"] == "Sports Medicine"
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
@@ -8724,8 +8751,8 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     assert "LIMIT :rate_candidate_limit OFFSET" not in sql
     assert "provider_filtered_rates AS MATERIALIZED" in sql
     assert not sql.rstrip().endswith("LIMIT :limit OFFSET :offset")
-    assert payload["pagination"]["limit"] == 1
-    assert payload["pagination"]["total"] == 1
+    assert serving_payload["pagination"]["limit"] == 1
+    assert serving_payload["pagination"]["total"] == 1
     assert "n_entity.entity_type_code" in sql
     # Inferred-taxonomy scoping in the provider expansion is an uncorrelated
     # semi-join. The negative assertion is scoped to the EXISTS shape because
@@ -8738,10 +8765,11 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
 
 @pytest.mark.asyncio
 async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_lookup():
+    """Infer radiology taxonomy for CPT-scoped geo searches."""
     session = FakeSession(
         [
             FakeResult(
-                rows=[
+                result_rows=[
                     {
                         "npi": 1234567890,
                         "location_hash": "npi_address:1234567890:primary:addr-1",
@@ -8773,7 +8801,7 @@ async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_l
     )
     tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
 
-    payload = await ptg2_serving._search_compact_serving_table(
+    serving_payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
         tables,
@@ -8792,20 +8820,20 @@ async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_l
         ptg2_serving.PTG2_MODE_EXACT_SOURCE,
     )
 
-    assert payload["items"][0]["specialties"] == ["Diagnostic Radiology Physician"]
+    assert serving_payload["items"][0]["specialties"] == ["Diagnostic Radiology Physician"]
     sql = str(session.calls[0][0][0])
     assert "nt.healthcare_provider_taxonomy_code IN" in sql
     assert "inferred_taxonomy_code_" in sql
     params = session.calls[0][0][1]
     assert "2085R0202X" in {
-        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+        parameter_value for key, parameter_value in params.items() if key.startswith("inferred_taxonomy_code_")
     }
     assert "2084D0003X" in {
-        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+        parameter_value for key, parameter_value in params.items() if key.startswith("inferred_taxonomy_code_")
     }
     assert "JOIN mrf.nucc_taxonomy nucc\n                            ON nucc.code" not in sql
     assert "2085R0001X" not in {
-        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+        parameter_value for key, parameter_value in params.items() if key.startswith("inferred_taxonomy_code_")
     }
 
 
@@ -8850,8 +8878,8 @@ def test_inferred_provider_taxonomy_sql_ignores_mixed_use_cpt_families(code: str
 def test_warm_cache_benchmark_fixture_p95_gate():
     index = ptg2_serving.PTG2ServingIndex.from_payload(_fixture_payload())
 
-    result = ptg2_serving.warm_cache_benchmark(index, request_count=100)
+    query_result = ptg2_serving.warm_cache_benchmark(index, request_count=100)
 
-    assert result["request_count"] == 100
-    assert result["p95_ms"] <= 50.0
-    assert result["passed"] is True
+    assert query_result["request_count"] == 100
+    assert query_result["p95_ms"] <= 50.0
+    assert query_result["passed"] is True
