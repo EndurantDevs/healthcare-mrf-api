@@ -85,8 +85,8 @@ def test_manual_rollback_preserves_displaced_snapshot(monkeypatch):
     )
     monkeypatch.setattr(
         source_snapshot_control,
-        "_current_source_snapshot",
-        AsyncMock(return_value="snap_b"),
+        "_current_source_snapshot_state",
+        AsyncMock(return_value=("snap_b", None)),
     )
     monkeypatch.setattr(
         source_snapshot_control,
@@ -122,7 +122,7 @@ def test_manual_rollback_preserves_displaced_snapshot(monkeypatch):
 
 def test_manual_promotion_rejects_cleaned_table(monkeypatch):
     transaction = _RecordingTransaction()
-    current_snapshot = AsyncMock(return_value="snap_b")
+    current_snapshot = AsyncMock(return_value=("snap_b", None))
     monkeypatch.setattr(
         source_snapshot_control,
         "_snapshot_row",
@@ -136,7 +136,7 @@ def test_manual_promotion_rejects_cleaned_table(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot", current_snapshot)
+    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot_state", current_snapshot)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
     monkeypatch.setattr(snapshot_cleanup, "_table_exists", AsyncMock(return_value=False))
 
@@ -227,8 +227,8 @@ def test_postgres_v3_promotion_ignores_local_manifest(monkeypatch):
     )
     monkeypatch.setattr(
         source_snapshot_control,
-        "_current_source_snapshot",
-        AsyncMock(return_value="snap_b"),
+        "_current_source_snapshot_state",
+        AsyncMock(return_value=("snap_b", None)),
     )
     monkeypatch.setattr(
         source_snapshot_control,

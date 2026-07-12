@@ -134,7 +134,11 @@ def _install_control_fakes(monkeypatch, state):
             }
         ),
     )
-    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot", AsyncMock(return_value="snap_old"))
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_source_snapshot_state",
+        AsyncMock(return_value=("snap_old", None)),
+    )
     monkeypatch.setattr(source_snapshot_control, "_source_plan_rows", AsyncMock(return_value=[_plan_pointer_row()]))
     monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: None)
 
