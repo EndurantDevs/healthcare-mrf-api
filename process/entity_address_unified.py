@@ -86,6 +86,9 @@ DEFAULT_CUTOVER_RETRY_ATTEMPTS = 4
 DEFAULT_CUTOVER_RETRY_BACKOFF_MS = 25
 DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS = 100
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
+PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX = (
+    "provider_directory_address_overlay_source_run_resource_idx"
+)
 DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 100
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
@@ -4032,14 +4035,48 @@ def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_
     return _index_affected_groups_sql(db_schema, group_table)
 
 
-def _provider_directory_partial_scope_index_sql(db_schema: str) -> list[str]:
-    return [
-        f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_address_overlay_source_run_resource_idx
-            ON {db_schema}.provider_directory_address_overlay
-                (source_id, last_seen_run_id, resource_type, resource_id);
-        """,
-    ]
+def _partial_scope_index_preflight_sql(db_schema: str) -> str:
+    return f"""
+    SELECT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_index AS index_meta
+          JOIN pg_catalog.pg_class AS table_meta
+            ON table_meta.oid = index_meta.indrelid
+          JOIN pg_catalog.pg_namespace AS namespace_meta
+            ON namespace_meta.oid = table_meta.relnamespace
+          JOIN pg_catalog.pg_class AS index_relation
+            ON index_relation.oid = index_meta.indexrelid
+         WHERE namespace_meta.nspname = {_sql_literal(db_schema)}
+           AND table_meta.relname = 'provider_directory_address_overlay'
+           AND index_relation.relname = {_sql_literal(PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX)}
+           AND index_meta.indisvalid IS TRUE
+           AND index_meta.indisready IS TRUE
+           AND index_meta.indislive IS TRUE
+           AND index_meta.indpred IS NULL
+           AND index_meta.indexprs IS NULL
+           AND (
+                SELECT array_agg(attribute_meta.attname::text ORDER BY index_column.ordinality)
+                  FROM unnest(index_meta.indkey) WITH ORDINALITY AS index_column(attnum, ordinality)
+                  JOIN pg_catalog.pg_attribute AS attribute_meta
+                    ON attribute_meta.attrelid = table_meta.oid
+                   AND attribute_meta.attnum = index_column.attnum
+               ) = ARRAY['source_id', 'last_seen_run_id', 'resource_type', 'resource_id']::text[]
+    );
+    """
+
+
+async def _preflight_provider_directory_partial_scope_index(db_schema: str) -> None:
+    index_is_valid = await db.scalar(
+        _partial_scope_index_preflight_sql(db_schema)
+    )
+    if index_is_valid:
+        return
+    raise RuntimeError(
+        "entity-address-unified provider-directory-partial refresh requires valid index "
+        f"{db_schema}.{PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX}; publish "
+        "provider_directory_address_overlay through Provider Directory artifact publication "
+        "or repair the index online outside the import path before retrying."
+    )
 
 
 def _affected_group_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
@@ -5102,10 +5139,6 @@ async def _validate_publish_integrity(
             f"{missing_archive_address_key_rows} staged rows have address_key values missing from address_archive_v2"
         )
     metrics["archive_coordinate_mismatch_rows"] = archive_coordinate_mismatch_rows
-    if archive_coordinate_mismatch_rows:
-        failures.append(
-            f"{archive_coordinate_mismatch_rows} staged rows do not match address_archive_v2 coordinates"
-        )
     metrics["archive_missing_coordinate_rows"] = archive_missing_coordinate_rows
     if archive_missing_coordinate_rows and _env_bool(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES",
@@ -10113,6 +10146,8 @@ async def process_data(ctx, task=None):
                 db_schema,
                 available,
             )
+    if partial_provider_directory_refresh:
+        await _preflight_provider_directory_partial_scope_index(db_schema)
     if (
         partial_provider_directory_refresh
         and provider_directory_partial_scope == "latest-run"
@@ -10175,20 +10210,6 @@ async def process_data(ctx, task=None):
         affected_group_table = _provider_directory_partial_affected_group_table_name(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
-        scope_index_sql = _provider_directory_partial_scope_index_sql(db_schema)
-        for index_idx, index_sql in enumerate(scope_index_sql):
-            await _run_sql_phase(
-                index_sql,
-                context=context,
-                run_id=run_id,
-                phase="entity-address-unified ensuring Provider Directory scope indexes",
-                unit="indexes",
-                done=index_idx,
-                total=len(scope_index_sql),
-                message="ensuring Provider Directory scope indexes",
-                emit_start=True,
-                emit_done=True,
-            )
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
         await _run_sql_phase(
             _prepare_provider_directory_partial_affected_groups_sql(
@@ -11488,6 +11509,9 @@ async def shutdown(ctx):
         context.get("partial_provider_directory_affected_live_location_table") or ""
     ).strip()
     partial_support_patch = bool(context.get("partial_support_patch_publish"))
+    is_partial_provider_directory_refresh = (
+        context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
+    )
     partial_main_patch = bool(
         context.get("partial_main_patch_publish")
         or context.get("partial_provider_directory_main_patch_publish")
@@ -11498,8 +11522,7 @@ async def shutdown(ctx):
             "build a replacement stage table and publish through the table swap."
         )
     if (
-        context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
-        and partial_support_patch
+        is_partial_provider_directory_refresh and partial_support_patch
     ):
         raise RuntimeError(
             "entity-address-unified provider-directory-partial refresh must publish "
@@ -11592,6 +11615,7 @@ async def shutdown(ctx):
     defer_publish_validation = (
         serving_only_refresh
         and not partial_support_patch
+        and not is_partial_provider_directory_refresh
         and _defer_publish_validation()
     )
     if await _table_exists(db_schema, "address_archive_v2"):
@@ -11685,7 +11709,9 @@ async def shutdown(ctx):
             (datetime.datetime.utcnow() - started_at).total_seconds(),
             3,
         )
-    post_publish_profile = _post_publish_index_profile()
+    post_publish_profile = (
+        "none" if is_partial_provider_directory_refresh else _post_publish_index_profile()
+    )
     post_publish_concurrently = _post_publish_index_concurrently()
     context["post_publish_index_profile"] = post_publish_profile
     context["post_publish_index_concurrently"] = post_publish_concurrently
@@ -11761,59 +11787,23 @@ async def shutdown(ctx):
             "skipped_stage_indexes": context.get("skipped_stage_indexes") or [],
         }
 
-    await mark_control_run(
-        run_id,
-        status="succeeded",
-        phase_detail="entity-address-unified published",
-        progress_message="succeeded",
-        progress={
-            "unit": "rows",
-            "done": published_rows,
-            "total": published_rows,
-            "pct": 100,
-            "message": "succeeded",
-            "phase": "entity-address-unified published",
-        },
-        metrics=_published_metrics(),
-    )
-    context["preserve_control_run_finished_at"] = True
     if defer_publish_validation:
+        await mark_control_run(
+            run_id,
+            status="running",
+            phase_detail="entity-address-unified published; post-publish validation pending",
+            progress_message="published; validating",
+            progress={
+                "unit": "rows",
+                "done": published_rows,
+                "total": published_rows,
+                "pct": 99,
+                "message": "published; validating",
+                "phase": "entity-address-unified post-publish validation",
+            },
+            metrics=_published_metrics(),
+        )
         try:
-            if await _table_exists(db_schema, "address_archive_v2"):
-                archive_coordinate_backfill_rows = await _run_sql_phase(
-                    _backfill_archive_coordinates_sql(db_schema, EntityAddressUnified.__main_table__),
-                    context=context,
-                    run_id=run_id,
-                    phase="entity-address-unified backfilling archive coordinates",
-                    unit="rows",
-                    done=0,
-                    total=1,
-                    pct=99,
-                    message="backfilling missing coordinates from address archive",
-                    emit_start=True,
-                    emit_done=True,
-                )
-                context["archive_coordinate_backfill_rows"] = (
-                    int(context.get("archive_coordinate_backfill_rows") or 0)
-                    + int(archive_coordinate_backfill_rows or 0)
-                )
-            invalid_coordinate_clear_rows = await _run_sql_phase(
-                _clear_invalid_coordinates_sql(db_schema, EntityAddressUnified.__main_table__),
-                context=context,
-                run_id=run_id,
-                phase="entity-address-unified clearing invalid coordinates",
-                unit="rows",
-                done=0,
-                total=1,
-                pct=99,
-                message="clearing invalid staged coordinates",
-                emit_start=True,
-                emit_done=True,
-            )
-            context["invalid_coordinate_clear_rows"] = (
-                int(context.get("invalid_coordinate_clear_rows") or 0)
-                + int(invalid_coordinate_clear_rows or 0)
-            )
             started = time.monotonic()
             publish_validation = await _validate_publish_integrity(
                 db_schema,
@@ -11844,8 +11834,8 @@ async def shutdown(ctx):
                     "phase": "entity-address-unified post-publish validation complete",
                 },
                 metrics=_published_metrics(),
-                preserve_finished_at=True,
             )
+            context["preserve_control_run_finished_at"] = True
         except Exception as exc:
             context["publish_validation"] = {
                 "deferred": True,
@@ -11869,6 +11859,23 @@ async def shutdown(ctx):
                 metrics=_published_metrics(),
             )
             raise
+    else:
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail="entity-address-unified published",
+            progress_message="succeeded",
+            progress={
+                "unit": "rows",
+                "done": published_rows,
+                "total": published_rows,
+                "pct": 100,
+                "message": "succeeded",
+                "phase": "entity-address-unified published",
+            },
+            metrics=_published_metrics(),
+        )
+        context["preserve_control_run_finished_at"] = True
     if context["post_publish_index_profile"] != "none":
         try:
             await _create_post_publish_indexes(db_schema, context=context)

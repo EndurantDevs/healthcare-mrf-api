@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -192,16 +193,41 @@ def test_provider_directory_source_selects_keep_direct_locations_without_healthc
 
 def test_provider_directory_partial_scope_selects_only_current_published_datasets():
     sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")
-    indexes = "\n".join(entity_address_unified._provider_directory_partial_scope_index_sql("mrf"))
 
     assert "mrf.provider_directory_address_overlay AS overlay" in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "HAVING COUNT(*) = 1" in sql
-    assert "provider_directory_address_overlay_source_run_resource_idx" in indexes
-    assert "provider_directory_dataset_resource_dataset_type_id_idx" not in indexes
-    assert len(entity_address_unified._provider_directory_partial_scope_index_sql("mrf")) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_partial_scope_index_preflight_accepts_valid_index(monkeypatch):
+    scalar = AsyncMock(return_value=True)
+    monkeypatch.setattr(entity_address_unified.db, "scalar", scalar)
+
+    await entity_address_unified._preflight_provider_directory_partial_scope_index("mrf")
+
+    sql = scalar.await_args.args[0]
+    assert "FROM pg_catalog.pg_index AS index_meta" in sql
+    assert "index_meta.indisvalid IS TRUE" in sql
+    assert "index_meta.indisready IS TRUE" in sql
+    assert "provider_directory_address_overlay_source_run_resource_idx" in sql
+    assert "ARRAY['source_id', 'last_seen_run_id', 'resource_type', 'resource_id']" in sql
+    assert "CREATE INDEX" not in sql
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_partial_scope_index_preflight_rejects_missing_index(monkeypatch):
+    monkeypatch.setattr(entity_address_unified.db, "scalar", AsyncMock(return_value=False))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await entity_address_unified._preflight_provider_directory_partial_scope_index("mrf")
+
+    message = str(exc_info.value)
+    assert "mrf.provider_directory_address_overlay_source_run_resource_idx" in message
+    assert "artifact publication" in message
+    assert "repair the index online outside the import path" in message
 
 
 def test_full_projection_replaces_compatibility_fhir_with_current_overlay():

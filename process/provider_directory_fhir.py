@@ -18531,34 +18531,6 @@ def _should_use_uhc_plan_graph(
     )
 
 
-def _uhc_plan_graph_checkpoint_locator(
-    source_record: dict[str, Any],
-    resource_type: str,
-) -> str:
-    api_base = _canonical_base(
-        source_record.get("canonical_api_base") or source_record.get("api_base")
-    )
-    return (
-        f"{api_base}/$healthporta-plan-graph"
-        f"?resource={urllib.parse.quote(resource_type)}"
-    )
-
-
-async def _ensure_uhc_plan_graph_checkpoints(
-    source_record: dict[str, Any],
-    resource_types: list[str],
-) -> None:
-    checkpoint_context = source_record.get("_pagination_checkpoint_context")
-    if not isinstance(checkpoint_context, PaginationCheckpointContext):
-        return
-    for resource_type in resource_types:
-        await _load_or_initialize_pagination_checkpoint(
-            checkpoint_context,
-            resource_type,
-            _uhc_plan_graph_checkpoint_locator(source_record, resource_type),
-        )
-
-
 def _uhc_plan_graph_resource_diagnostic(
     acquisition: UHCPlanGraphAcquisition,
     resource_type: str,
@@ -20646,13 +20618,6 @@ async def _finalize_source_pagination_checkpoints(
         or diagnostic.get("bounded")
     ]
     if incomplete_resource_types:
-        context = source_record.get("_pagination_checkpoint_context")
-        if isinstance(context, PaginationCheckpointContext) and resume_required_entries is not None:
-            resume_required_entries.update(
-                f"{source_record['source_id']}:{resource_type}"
-                for resource_type in incomplete_resource_types
-            )
-            return
         graph_failures = [
             resource_type
             for resource_type in incomplete_resource_types
@@ -20666,6 +20631,13 @@ async def _finalize_source_pagination_checkpoints(
                 for resource_type in graph_failures
             )
             raise RuntimeError(f"{UHC_PLAN_GRAPH_INCOMPLETE_ERROR}:{failure_details}")
+        context = source_record.get("_pagination_checkpoint_context")
+        if isinstance(context, PaginationCheckpointContext) and resume_required_entries is not None:
+            resume_required_entries.update(
+                f"{source_record['source_id']}:{resource_type}"
+                for resource_type in incomplete_resource_types
+            )
+            return
         if require_complete_resources:
             source_id = _clean_text(source_record.get("source_id")) or "unknown-source"
             failure_details = ",".join(
@@ -22107,14 +22079,6 @@ async def _import_resources(
                 )
                 active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
             await report_progress(force=True)
-            await _ensure_uhc_plan_graph_checkpoints(
-                source,
-                [
-                    resource_type
-                    for resource_type in resources
-                    if resource_type in UHC_PLAN_GRAPH_RESOURCE_TYPES
-                ],
-            )
             import_summary = await _import_uhc_plan_graph_source_group(
                 source,
                 resources,
@@ -23304,6 +23268,7 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "address_key_idx",
     "source_idx",
     "phone_idx",
+    "source_run_resource_idx",
 )
 
 
@@ -23475,9 +23440,14 @@ def _address_overlay_index_name(table_name: str, suffix: str) -> str:
     return _bounded_identifier(f"{table_name}_{suffix}")
 
 
-async def _create_provider_directory_address_overlay_indexes(schema: str, table_name: str) -> None:
+async def _create_provider_directory_address_overlay_indexes(
+    schema: str,
+    table_name: str,
+    *,
+    include_scope_index: bool = False,
+) -> None:
     table_ref = _qt(schema, table_name)
-    statements = (
+    statements = [
         f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_record_idx'))} "
         f"ON {table_ref} (source_record_id);",
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
@@ -23490,9 +23460,22 @@ async def _create_provider_directory_address_overlay_indexes(schema: str, table_
             ON {table_ref} (phone_number, npi)
          WHERE phone_number IS NOT NULL AND phone_number <> '';
         """,
-    )
+    ]
+    if include_scope_index:
+        statements.append(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_run_resource_idx'))}
+                ON {table_ref} (source_id, last_seen_run_id, resource_type, resource_id);
+            """
+        )
     for statement in statements:
         await db.status(statement)
+
+
+async def _create_address_overlay_stage_indexes(schema: str, stage_table: str) -> None:
+    await _create_provider_directory_address_overlay_indexes(
+        schema, stage_table, include_scope_index=True
+    )
 
 
 async def _rename_address_overlay_stage_indexes(schema: str, stage_table: str) -> None:
@@ -24516,7 +24499,7 @@ async def _populate_address_overlay_stage(
         resource_types=refresh_resource_types,
     )
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-    await _create_provider_directory_address_overlay_indexes(schema, stage_table)
+    await _create_address_overlay_stage_indexes(schema, stage_table)
     await db.status(f"ANALYZE {stage_ref};")
     return {
         "copied_existing": copied_existing,

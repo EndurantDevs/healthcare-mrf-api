@@ -10873,7 +10873,7 @@ async def test_uhc_plan_graph_completion_does_not_request_pagination_retry(monke
 
 
 @pytest.mark.asyncio
-async def test_uhc_plan_graph_initializes_retry_lineage_checkpoints(monkeypatch):
+async def test_uhc_plan_graph_failure_precedes_generic_checkpoint_resume():
     source_lookup = _uhc_reverse_lookup_source()
     source_lookup["_pagination_checkpoint_context"] = importer._pagination_checkpoint_context(
         source_lookup,
@@ -10882,23 +10882,40 @@ async def test_uhc_plan_graph_initializes_retry_lineage_checkpoints(monkeypatch)
         retry_of_run_id=None,
         pagination_root_run_id=None,
     )
-    load_checkpoint = AsyncMock()
-    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", load_checkpoint)
+    resume_required_entries: set[str] = set()
 
-    await importer._ensure_uhc_plan_graph_checkpoints(
+    with pytest.raises(
+        RuntimeError,
+        match=importer.UHC_PLAN_GRAPH_INCOMPLETE_ERROR,
+    ):
+        await importer._finalize_source_pagination_checkpoints(
+            source_lookup,
+            _failed_uhc_plan_graph_summary(["PractitionerRole"])[1],
+            resume_required_entries,
+        )
+
+    assert resume_required_entries == set()
+
+
+@pytest.mark.asyncio
+async def test_generic_rest_failure_with_checkpoint_requires_resume():
+    source_lookup = _cigna_checkpoint_source()
+    source_lookup["_pagination_checkpoint_context"] = _cigna_checkpoint_context("run-1")
+    resume_required_entries: set[str] = set()
+
+    await importer._finalize_source_pagination_checkpoints(
         source_lookup,
-        ["InsurancePlan", "PractitionerRole"],
+        {
+            "Location": {
+                "complete": False,
+                "bounded": False,
+                "error": "http_503",
+            }
+        },
+        resume_required_entries,
     )
 
-    assert load_checkpoint.await_count == 2
-    assert [call.args[1] for call in load_checkpoint.await_args_list] == [
-        "InsurancePlan",
-        "PractitionerRole",
-    ]
-    assert all(
-        "$healthporta-plan-graph" in call.args[2]
-        for call in load_checkpoint.await_args_list
-    )
+    assert resume_required_entries == {"source_a:Location"}
 
 
 def _failed_uhc_plan_graph_summary(resource_types: list[str]):
@@ -10928,8 +10945,7 @@ def _failed_uhc_plan_graph_summary(resource_types: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_uhc_plan_graph_failure_without_checkpoint_raises(monkeypatch):
-    """A graph failure cannot report success without a durable retry path."""
+async def test_uhc_plan_graph_branch_does_not_create_synthetic_checkpoints(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
     selected_resources = [
         "InsurancePlan",
@@ -10937,17 +10953,31 @@ async def test_uhc_plan_graph_failure_without_checkpoint_raises(monkeypatch):
         "PractitionerRole",
     ]
     failed_summary = _failed_uhc_plan_graph_summary(selected_resources)
+    prepared_source = _uhc_reverse_lookup_source()
+    prepared_source["_pagination_checkpoint_context"] = importer._pagination_checkpoint_context(
+        prepared_source,
+        ["uhc"],
+        run_id="run-1",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+    )
     monkeypatch.setattr(
         importer,
         "_prepare_resource_import_source_group",
-        AsyncMock(return_value=([_uhc_reverse_lookup_source()], None)),
+        AsyncMock(return_value=([prepared_source], None)),
     )
-    monkeypatch.setattr(importer, "_ensure_uhc_plan_graph_checkpoints", AsyncMock())
+    load_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        load_checkpoint,
+    )
     monkeypatch.setattr(
         importer,
         "_import_uhc_plan_graph_source_group",
         AsyncMock(return_value=failed_summary),
     )
+    resume_required_entries: set[str] = set()
     with pytest.raises(
         RuntimeError,
         match=importer.UHC_PLAN_GRAPH_INCOMPLETE_ERROR,
@@ -10960,7 +10990,11 @@ async def test_uhc_plan_graph_failure_without_checkpoint_raises(monkeypatch):
             page_count=100,
             timeout=3,
             run_id="run-1",
+            pagination_resume_required=resume_required_entries,
         )
+
+    load_checkpoint.assert_not_awaited()
+    assert resume_required_entries == set()
 
 
 def test_endpoint_scope_rejects_mismatch_and_multiple_bases():
@@ -16099,6 +16133,40 @@ def test_address_overlay_stage_index_names_are_hash_safe():
     assert len(index_name) <= 63
     assert index_name.startswith("provider_directory_address_overlay_stage_")
     assert index_name.endswith("_idx") or "_" in index_name
+
+
+@pytest.mark.asyncio
+async def test_address_overlay_live_ensure_does_not_build_scope_index(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._ensure_provider_directory_address_overlay_table("mrf")
+
+    joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
+    assert "provider_directory_address_overlay_source_idx" in joined_sql
+    assert "provider_directory_address_overlay_source_run_resource_idx" not in joined_sql
+    assert "(source_id, last_seen_run_id, resource_type, resource_id)" not in joined_sql
+
+
+@pytest.mark.asyncio
+async def test_address_overlay_stage_builds_and_renames_scope_index(monkeypatch):
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+    stage_table = importer._address_overlay_stage_table_name("run_1")
+    stage_index = importer._address_overlay_index_name(
+        stage_table, "source_run_resource_idx"
+    )
+
+    await importer._create_address_overlay_stage_indexes("mrf", stage_table)
+    await importer._rename_address_overlay_stage_indexes("mrf", stage_table)
+
+    joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
+    assert f'CREATE INDEX IF NOT EXISTS "{stage_index}"' in joined_sql
+    assert "(source_id, last_seen_run_id, resource_type, resource_id)" in joined_sql
+    assert (
+        f'ALTER INDEX IF EXISTS "mrf"."{stage_index}" '
+        'RENAME TO "provider_directory_address_overlay_source_run_resource_idx"'
+    ) in joined_sql
 
 
 @pytest.mark.asyncio
