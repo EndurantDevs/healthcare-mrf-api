@@ -394,17 +394,18 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "AND c.npi = pn.npi" in page_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
     assert "c.zip5 = :zip_code" in page_sql
-    assert (
-        "COALESCE(NULLIF(c.phone_number, ''), "
-        "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g')) = :phone_digits"
-    ) in page_sql
+    assert "phone_candidates AS MATERIALIZED" in page_sql
+    assert "provider_directory_address_overlay AS overlay" in page_sql
+    assert "provider_directory_endpoint_dataset AS dataset" in page_sql
+    assert "dataset.is_current IS TRUE" in page_sql
+    assert "dataset.import_run_id = overlay.last_seen_run_id" in page_sql
+    assert "JOIN phone_candidates AS phone_match" in page_sql
     assert "c.type = 'primary'" not in page_sql
     assert "LEFT(c.postal_code, 5) = :zip_code" not in page_sql
 
     fallback_sql = conn.last_sql
     assert "SELECT c.*" in fallback_sql
     assert "FROM mrf.entity_address_unified AS c" in fallback_sql
-    assert "COALESCE(NULLIF(c.phone_number, '')," in fallback_sql
 
 
 @pytest.mark.asyncio
@@ -456,7 +457,9 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
     assert conn.last_params["phone_digits"] == "3125551212"
     assert "FROM mrf.entity_address_unified AS c" in conn.last_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in conn.last_sql
-    assert "COALESCE(NULLIF(c.phone_number, '')," in conn.last_sql
+    assert "phone_candidates AS MATERIALIZED" in conn.last_sql
+    assert "provider_directory_address_overlay AS overlay" in conn.last_sql
+    assert "JOIN phone_candidates AS phone_match" in conn.last_sql
 
 
 @pytest.mark.asyncio
@@ -549,6 +552,8 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
     assert "source_record_ids" not in row
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
+    assert "provider_directory_address_overlay AS overlay" in page_sql
+    assert "dataset.status = 'published'" in page_sql
     assert any(params.get("phone_digits") == "2053663010" for _sql, params in conn.sql_calls)
 
 

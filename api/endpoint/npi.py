@@ -2519,6 +2519,60 @@ def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
     return f"{raw_digits} = :phone_digits"
 
 
+def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
+    """Return indexed phone candidates, including current FHIR evidence."""
+    if not _address_table_is_unified(address_table_sql):
+        return None
+    direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
+    service_types = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
+    return f"""
+    phone_candidates AS MATERIALIZED (
+        SELECT DISTINCT
+               COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
+               phone_address.address_key
+          FROM {address_table_sql} AS phone_address
+         WHERE phone_address.type IN ({service_types})
+           AND phone_address.address_key IS NOT NULL
+           AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
+           AND {direct_phone}
+        UNION
+        SELECT DISTINCT
+               overlay.npi::bigint AS provider_npi,
+               overlay.address_key
+          FROM mrf.provider_directory_address_overlay AS overlay
+          JOIN mrf.provider_directory_source AS source
+            ON source.source_id = overlay.source_id
+          JOIN mrf.provider_directory_endpoint_dataset AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+           AND dataset.is_current IS TRUE
+           AND dataset.status = 'published'
+           AND dataset.import_run_id = overlay.last_seen_run_id
+         WHERE overlay.phone_number = :phone_digits
+           AND overlay.npi IS NOT NULL
+           AND overlay.address_key IS NOT NULL
+    )
+    """
+
+
+def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = None) -> str:
+    provider_npi = provider_npi_sql or f"COALESCE({alias}.npi, {alias}.inferred_npi)"
+    return f"""
+          JOIN phone_candidates AS phone_match
+            ON phone_match.provider_npi = {provider_npi}
+           AND phone_match.address_key = {alias}.address_key
+    """
+
+
+def _sql_with_prefix_ctes(*ctes: str | None) -> str:
+    available = [cte.strip() for cte in ctes if cte and cte.strip()]
+    return f"WITH {',\n'.join(available)},\n" if available else "WITH "
+
+
+def _sql_with_ctes(*ctes: str | None) -> str:
+    available = [cte.strip() for cte in ctes if cte and cte.strip()]
+    return f"WITH {',\n'.join(available)}\n" if available else ""
+
+
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
     if _address_table_is_unified(address_table_sql):
         return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"
@@ -3798,10 +3852,21 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         ("phone", phone_locator),
     ]
     selected_locator = None
-    for _locator_name, locator_sql in locator_candidates:
+    selected_locator_name = None
+    for locator_name, locator_sql in locator_candidates:
         if locator_sql:
             selected_locator = locator_sql
+            selected_locator_name = locator_name
             break
+    phone_candidates_cte = None
+    phone_candidates_join = ""
+    if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
+        phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+        phone_candidates_join = _address_phone_candidates_join(
+            "a",
+            columns["provider_npi"],
+        )
+        selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
     geo_locator_where: list[str] = []
     if params.get("lat") is not None and params.get("long") is not None:
@@ -3875,12 +3940,18 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         else "false"
     )
     address_key_match = "a.address_key = CAST(:address_key AS uuid)" if params.get("address_key") else "false"
-    phone_match = _address_phone_digits_filter("a", address_table_sql) if params.get("phone_digits") else "false"
+    phone_match = (
+        "true"
+        if phone_candidates_cte
+        else _address_phone_digits_filter("a", address_table_sql)
+        if params.get("phone_digits")
+        else "false"
+    )
     taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
         f"""
-        WITH candidate_locations AS (
+        {_sql_with_prefix_ctes(phone_candidates_cte)}candidate_locations AS (
             SELECT DISTINCT ON ({columns['provider_npi']})
                    {columns['provider_npi']}::bigint AS npi,
                    a.type AS address_type,
@@ -3910,6 +3981,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    ({phone_match})::boolean AS phone_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
               FROM {address_table_sql} AS a
+              {phone_candidates_join}
              WHERE {' AND '.join(address_where)}
           ORDER BY {columns['provider_npi']},
                    address_site_key_matched DESC,
@@ -4824,6 +4896,8 @@ async def get_all(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        phone_candidates_cte = None
+        phone_candidates_join = ""
         if use_taxonomy_filter:
             address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
@@ -4837,7 +4911,11 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(_address_phone_digits_filter("c", address_table_sql))
+            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            if phone_candidates_cte:
+                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+            else:
+                address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
@@ -4852,7 +4930,7 @@ async def get_all(request):
         if npi_where and use_taxonomy_filter:
             query = text(
                 f"""
-                WITH filtered_npi AS (
+                {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_npi AS (
                     SELECT DISTINCT b.npi
                       FROM mrf.npi AS b
                      WHERE {npi_where}
@@ -4860,6 +4938,7 @@ async def get_all(request):
                 SELECT COUNT(DISTINCT c.npi)
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c ON c.npi = fn.npi
+                  {phone_candidates_join}
                   CROSS JOIN {taxonomy_subquery}
                  WHERE {' AND '.join(address_where)}
                 """
@@ -4867,7 +4946,7 @@ async def get_all(request):
         elif npi_where:
             query = text(
                 f"""
-                WITH filtered_npi AS (
+                {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_npi AS (
                     SELECT DISTINCT b.npi
                       FROM mrf.npi AS b
                      WHERE {npi_where}
@@ -4875,23 +4954,28 @@ async def get_all(request):
                 SELECT COUNT(DISTINCT c.npi)
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c ON c.npi = fn.npi
+                  {phone_candidates_join}
                  WHERE {' AND '.join(address_where)}
                 """
             )
         elif use_taxonomy_filter:
             query = text(
                 f"""
+                {_sql_with_ctes(phone_candidates_cte)}
                 SELECT COUNT(DISTINCT c.npi)
-                  FROM {address_table_sql} AS c,
-                       {taxonomy_subquery}
+                  FROM {address_table_sql} AS c
+                  {phone_candidates_join}
+                  CROSS JOIN {taxonomy_subquery}
                  WHERE {' AND '.join(address_where)}
                 """
             )
         else:
             query = text(
                 f"""
+                {_sql_with_ctes(phone_candidates_cte)}
                 SELECT COUNT(DISTINCT c.npi)
                   FROM {address_table_sql} AS c
+                  {phone_candidates_join}
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -4991,6 +5075,8 @@ async def get_all(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        phone_candidates_cte = None
+        phone_candidates_join = ""
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
         if has_insurance:
@@ -5002,7 +5088,11 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(_address_phone_digits_filter("c", address_table_sql))
+            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            if phone_candidates_cte:
+                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+            else:
+                address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
@@ -5019,9 +5109,10 @@ async def get_all(request):
         taxonomy_subquery = _taxonomy_classification_subquery(taxonomy_conditions)
         query = text(
             f"""
-            WITH filtered_taxonomy AS (
+            {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_taxonomy AS (
                 SELECT DISTINCT c.npi, code.int_code
                   FROM {address_table_sql} AS c
+                  {phone_candidates_join}
                   CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)
                  WHERE {' AND '.join(address_where)}
             )
@@ -5182,6 +5273,8 @@ async def get_all(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        phone_candidates_cte = None
+        phone_candidates_join = ""
         if classification:
             where.append("classification = :classification")
         if specialization:
@@ -5204,7 +5297,11 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(_address_phone_digits_filter("c", address_table_sql))
+            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            if phone_candidates_cte:
+                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+            else:
+                address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         if address_site_key:
@@ -5222,39 +5319,41 @@ async def get_all(request):
         )
 
         taxonomy_filter = " and ".join(where) if where else "1=1"
-        cte_prefix = ""
+        filtered_npi_cte = None
         if npi_where:
-            cte_prefix = f"""
+            filtered_npi_cte = f"""
         filtered_npi AS (
             SELECT DISTINCT b.npi
               FROM mrf.npi AS b
              WHERE {npi_where}
-        ),
+        )
 """
 
         if npi_where and use_taxonomy_filter:
             address_source = (
                 "filtered_npi as fn\n"
                 f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
+                f"    {phone_candidates_join}\n"
                 f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
             )
         elif npi_where:
             address_source = (
                 "filtered_npi as fn\n"
-                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi"
+                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
+                f"    {phone_candidates_join}"
             )
         elif use_taxonomy_filter:
             address_source = (
                 f"{address_table_sql} as c\n"
+                f"    {phone_candidates_join}\n"
                 f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
             )
         else:
-            address_source = f"{address_table_sql} as c"
+            address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
         q = text(
             f"""
-        WITH {cte_prefix}
-        page_npis AS (
+        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte)}page_npis AS (
             SELECT DISTINCT c.npi
               FROM {address_source}
              WHERE {' and '.join(address_where)}
