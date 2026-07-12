@@ -495,7 +495,7 @@ def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
     row = importer._source_row_from_seed(
         {
             "id": "amerihealth-caritas-0900",
-            "org_name": "AmeriHealth Caritas",
+            "org_name": "AmeriHealth Caritas NH",
             "plan_name": "AmeriHealth Caritas NH",
             "api_base": "https://api-ext.amerihealthcaritas.com/0900/provider-api",
             "auth_type": "none",
@@ -505,14 +505,18 @@ def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
 
     assert row["api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
     assert row["canonical_api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert row["org_name"] == importer.AMERIHEALTH_CARITAS_CARRIER_ORG_NAME
     assert row["plan_name"] is None
     assert row["last_validated_status"] == "valid"
     metadata = row["metadata_json"]
     assert metadata["provider_directory_directory_scope"] == "carrier"
     assert metadata["provider_directory_plan_code"] is None
     assert metadata["provider_directory_plan_provenance_neutralized"] is True
+    assert metadata["provider_directory_acquisition_enabled"] is True
+    assert "provider_directory_acquisition_blocked_reason" not in metadata
     assert metadata["provider_directory_original_alias"] == {
         "plan_code": "0900",
+        "org_name": "AmeriHealth Caritas NH",
         "plan_name": "AmeriHealth Caritas NH",
         "api_base": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE,
     }
@@ -2889,10 +2893,41 @@ def test_provider_directory_source_seed_upsert_merges_metadata_json():
         incoming_prefix="stage_row",
     )
 
-    assert sql == (
+    merged = (
         'COALESCE(target_row."metadata_json"::jsonb, \'{}\'::jsonb) '
         '|| COALESCE(stage_row."metadata_json"::jsonb, \'{}\'::jsonb)'
     )
+    assert sql == (
+        'CASE WHEN COALESCE(stage_row."metadata_json"::jsonb ->> '
+        "'provider_directory_acquisition_enabled', 'false') = 'true' "
+        f"THEN ({merged}) - 'provider_directory_acquisition_blocked_reason' "
+        f"ELSE {merged} END"
+    )
+
+
+def test_provider_directory_source_seed_upsert_clears_obsolete_block_reason():
+    table = ProviderDirectorySource.__table__
+    statement = importer.pg_insert(table).values(
+        source_id="source_a",
+        org_name="AmeriHealth Caritas",
+        metadata_json={"provider_directory_acquisition_enabled": True},
+    )
+
+    expression = importer._effective_update_expression(
+        table,
+        statement,
+        "metadata_json",
+    )
+    sql = str(
+        expression.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "provider_directory_acquisition_enabled" in sql
+    assert "provider_directory_acquisition_blocked_reason" in sql
+    assert "CASE WHEN" in sql
 
 
 @pytest.mark.asyncio

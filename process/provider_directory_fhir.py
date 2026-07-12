@@ -623,6 +623,7 @@ AMERIHEALTH_CARITAS_DOC_URL_ENV = "HLTHPRT_PROVIDER_DIRECTORY_AMERIHEALTH_CARITA
 AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX = "https://api-ext.amerihealthcaritas.com"
 AMERIHEALTH_CARITAS_STALE_GENERIC_BASE = "https://fhir.amerihealthcaritas.com/provider-directory"
 AMERIHEALTH_CARITAS_CARRIER_ACQUISITION_PLAN_CODE = "0900"
+AMERIHEALTH_CARITAS_CARRIER_ORG_NAME = "AmeriHealth Caritas"
 AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE = (
     f"{AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX}/"
     f"{AMERIHEALTH_CARITAS_CARRIER_ACQUISITION_PLAN_CODE}/provider-api"
@@ -3897,6 +3898,7 @@ def _amerihealth_caritas_override_metadata(
         "provider_directory_coverage_mode": (
             "carrier_directory" if is_carrier_acquisition else "probe_only"
         ),
+        "provider_directory_acquisition_enabled": is_carrier_acquisition,
     }
     if not is_carrier_acquisition:
         metadata["provider_directory_acquisition_blocked_reason"] = (
@@ -3910,6 +3912,7 @@ def _amerihealth_caritas_override_metadata(
             "provider_directory_plan_provenance_neutralized": True,
             "provider_directory_original_alias": {
                 "plan_code": plan_code,
+                "org_name": _clean_text(seed_row.get("org_name")),
                 "plan_name": _clean_text(seed_row.get("plan_name")),
                 "api_base": alias_base,
             },
@@ -3946,6 +3949,11 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
     return {
         "api_base": provider_base,
         "canonical_api_base": provider_base,
+        "org_name": (
+            AMERIHEALTH_CARITAS_CARRIER_ORG_NAME
+            if is_carrier_acquisition
+            else _clean_text(row.get("org_name"))
+        ),
         "plan_name": (
             None if is_carrier_acquisition else _clean_text(row.get("plan_name"))
         ),
@@ -4423,7 +4431,11 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "source_id": source_id,
         "org_tin": _clean_text(row.get("org_tin")),
-        "org_name": _clean_text(row.get("org_name")) or "Unknown payer",
+        "org_name": (
+            override.get("org_name")
+            if override and "org_name" in override
+            else _clean_text(row.get("org_name")) or "Unknown payer"
+        ),
         "plan_name": (
             override.get("plan_name")
             if override and "plan_name" in override
@@ -10010,8 +10022,27 @@ def _effective_update_expression(table, statement, column: str):
     ):
         return func.coalesce(getattr(table.c, column), excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
-        return func.coalesce(table.c.metadata_json.cast(JSONB), func.jsonb_build_object()).op("||")(
-            func.coalesce(excluded_value.cast(JSONB), func.jsonb_build_object())
+        target_metadata = func.coalesce(
+            table.c.metadata_json.cast(JSONB), func.jsonb_build_object()
+        )
+        incoming_metadata = func.coalesce(
+            excluded_value.cast(JSONB), func.jsonb_build_object()
+        )
+        merged_metadata = target_metadata.op("||")(incoming_metadata)
+        return case(
+            (
+                func.coalesce(
+                    incoming_metadata.op("->>")(
+                        "provider_directory_acquisition_enabled"
+                    ),
+                    "false",
+                )
+                == "true",
+                merged_metadata.op("-")(
+                    "provider_directory_acquisition_blocked_reason"
+                ),
+            ),
+            else_=merged_metadata,
         )
     if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
         return case(
@@ -10033,9 +10064,17 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
         quoted = _q(column)
-        return (
+        merged_metadata = (
             f"COALESCE({target_prefix}.{quoted}::jsonb, '{{}}'::jsonb) "
             f"|| COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
+        )
+        return (
+            "CASE WHEN COALESCE("
+            f"{incoming_prefix}.{quoted}::jsonb ->> "
+            "'provider_directory_acquisition_enabled', 'false') = 'true' "
+            f"THEN ({merged_metadata}) - "
+            "'provider_directory_acquisition_blocked_reason' "
+            f"ELSE {merged_metadata} END"
         )
     if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
         quoted = _q(column)
