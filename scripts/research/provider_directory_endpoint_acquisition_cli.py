@@ -78,3 +78,7 @@ def run_acquisition_cli(argv: list[str] | None = None) -> int:
     is_successful = all(state.get("status") in accepted_statuses for state in selected_states)
     print(json.dumps({"ok": is_successful, "mode": "apply" if args.apply else "dry-run", "state": str(args.state), "report": str(args.report)}, sort_keys=True))
     return 0 if is_successful else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_acquisition_cli())
