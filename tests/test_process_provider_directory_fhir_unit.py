@@ -492,7 +492,7 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
 
 
 def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "amerihealth-caritas-0900",
             "org_name": "AmeriHealth Caritas NH",
@@ -503,12 +503,12 @@ def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
         }
     )
 
-    assert row["api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
-    assert row["canonical_api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
-    assert row["org_name"] == importer.AMERIHEALTH_CARITAS_CARRIER_ORG_NAME
-    assert row["plan_name"] is None
-    assert row["last_validated_status"] == "valid"
-    metadata = row["metadata_json"]
+    assert source_row["api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert source_row["canonical_api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert source_row["org_name"] == importer.AMERIHEALTH_CARITAS_CARRIER_ORG_NAME
+    assert source_row["plan_name"] is None
+    assert source_row["last_validated_status"] == "valid"
+    metadata = source_row["metadata_json"]
     assert metadata["provider_directory_directory_scope"] == "carrier"
     assert metadata["provider_directory_plan_code"] is None
     assert metadata["provider_directory_plan_provenance_neutralized"] is True
@@ -521,9 +521,9 @@ def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
         "api_base": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE,
     }
     selected_sources, _metrics = importer._select_resource_import_sources(
-        [row], valid_source_ids=None, open_only=True, include_auth_required=False
+        [source_row], valid_source_ids=None, open_only=True, include_auth_required=False
     )
-    assert selected_sources == [row]
+    assert selected_sources == [source_row]
 
 
 def test_source_row_from_seed_does_not_guess_ambiguous_amerihealth_caritas_retest_base():
@@ -16795,33 +16795,94 @@ def test_address_overlay_stage_index_names_are_hash_safe():
     assert index_name.endswith("_idx") or "_" in index_name
 
 
+def _address_overlay_cleanup_fixtures():
+    """Build run ownership and catalog rows for cleanup policy coverage."""
+    stages_by_status = {
+        name: importer._address_overlay_stage_table_name(f"run_{name}")
+        for name in ("current", "orphan", "active", "recent", "unowned")
+    }
+    invalid_stage = "provider_directory_address_overlay_stage_bad; DROP TABLE mrf.important"
+    owner_rows = [
+        ("run_current", "running", False),
+        ("run_orphan", "failed", True),
+        ("run_active", "running", False),
+        ("run_recent", "failed", False),
+    ]
+    catalog_rows = [
+        (stages_by_status[name],) for name in stages_by_status
+    ] + [(invalid_stage,)]
+    return stages_by_status, invalid_stage, owner_rows, catalog_rows
+
+
 @pytest.mark.asyncio
 async def test_address_overlay_orphan_stage_cleanup_removes_only_valid_orphans(monkeypatch):
-    current_stage = importer._address_overlay_stage_table_name("run_current")
-    orphan_stage = importer._address_overlay_stage_table_name("run_orphan")
-    invalid_stage = "provider_directory_address_overlay_stage_bad; DROP TABLE mrf.important"
-    catalog = AsyncMock(return_value=[(current_stage,), (orphan_stage,), (invalid_stage,)])
+    """Only an old terminal run may lose its validated overlay stage."""
+    stages_by_status, invalid_stage, owner_rows, catalog_rows = (
+        _address_overlay_cleanup_fixtures()
+    )
+    catalog_query = AsyncMock(side_effect=[owner_rows, catalog_rows])
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", catalog_query)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    metrics = await importer._cleanup_orphan_address_overlay_stages(
+        "mrf",
+        current_stage_table=stages_by_status["current"],
+    )
+
+    assert metrics == {
+        "scanned": 6,
+        "removed": 1,
+        "current_stage_retained": 1,
+        "active_stage_retained": 1,
+        "recent_stage_retained": 1,
+        "unowned_stage_retained": 1,
+        "ambiguous_owner_retained": 0,
+        "ownership_unavailable": 0,
+        "rejected": 1,
+    }
+    owner_call, catalog_call = catalog_query.await_args_list
+    owner_sql = str(owner_call.args[0])
+    assert 'FROM "mrf"."import_run"' in owner_sql
+    assert "finished_at <= now() - make_interval" in owner_sql
+    assert owner_call.kwargs == {
+        "minimum_age_seconds": (
+            importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_MIN_AGE_SECONDS
+        ),
+        "owner_history_limit": (
+            importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_HISTORY_LIMIT
+        ),
+    }
+    catalog_sql = str(catalog_call.args[0])
+    assert "pg_catalog.pg_class" in catalog_sql
+    assert "LIMIT :cleanup_limit" in catalog_sql
+    assert catalog_call.kwargs == {
+        "schema_name": "mrf",
+        "stage_name_pattern": "provider\\_directory\\_address\\_overlay\\_stage\\_%",
+        "cleanup_limit": importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT,
+    }
+    status.assert_awaited_once_with(
+        f'DROP TABLE IF EXISTS "mrf"."{stages_by_status["orphan"]}";'
+    )
+    assert stages_by_status["current"] not in str(status.await_args.args[0])
+    assert invalid_stage not in str(status.await_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_address_overlay_orphan_cleanup_fails_closed_without_run_ownership(monkeypatch):
+    catalog = AsyncMock(side_effect=RuntimeError("import run unavailable"))
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "all", catalog)
     monkeypatch.setattr(importer.db, "status", status)
 
     metrics = await importer._cleanup_orphan_address_overlay_stages(
         "mrf",
-        current_stage_table=current_stage,
+        current_stage_table=importer._address_overlay_stage_table_name("run_current"),
     )
 
-    assert metrics == {"scanned": 3, "removed": 1, "current_stage_retained": 1, "rejected": 1}
-    catalog_sql = str(catalog.await_args.args[0])
-    assert "pg_catalog.pg_class" in catalog_sql
-    assert "LIMIT :cleanup_limit" in catalog_sql
-    assert catalog.await_args.kwargs == {
-        "schema_name": "mrf",
-        "stage_name_pattern": "provider\\_directory\\_address\\_overlay\\_stage\\_%",
-        "cleanup_limit": importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT,
-    }
-    status.assert_awaited_once_with(f'DROP TABLE IF EXISTS "mrf"."{orphan_stage}";')
-    assert current_stage not in str(status.await_args.args[0])
-    assert invalid_stage not in str(status.await_args.args[0])
+    assert metrics["ownership_unavailable"] == 1
+    assert metrics["removed"] == 0
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

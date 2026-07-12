@@ -23630,6 +23630,9 @@ def _scope_source_rows(
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX = "provider_directory_address_overlay_stage"
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT = 16
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_HISTORY_LIMIT = 4096
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_MIN_AGE_SECONDS = 6 * 60 * 60
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH = 12
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "source_record_idx",
     "npi_idx",
@@ -23641,9 +23644,21 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
 
 
 def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
-    raw_identifier = f"{run_id or 'full'}:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
-    digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    if run_id:
+        owner_token = _address_overlay_stage_owner_token(run_id)
+        digest = f"{owner_token}{os.urandom(2).hex()}"
+    else:
+        raw_identifier = f"full:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
+        digest = hashlib.sha1(
+            raw_identifier.encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_{digest}"
+
+
+def _address_overlay_stage_owner_token(run_id: str) -> str:
+    return hashlib.sha1(
+        f"run:{run_id}".encode("utf-8", errors="ignore")
+    ).hexdigest()[:PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH]
 
 
 def _is_address_overlay_stage_table_name(table_name: str) -> bool:
@@ -25054,7 +25069,17 @@ def _address_overlay_publish_result(
         "copied_existing": stage_metric_dict["copied_existing"],
         "orphan_stage_cleanup": stage_metric_dict.get(
             "orphan_stage_cleanup",
-            {"scanned": 0, "removed": 0, "current_stage_retained": 0, "rejected": 0},
+            {
+                "scanned": 0,
+                "removed": 0,
+                "current_stage_retained": 0,
+                "active_stage_retained": 0,
+                "recent_stage_retained": 0,
+                "unowned_stage_retained": 0,
+                "ambiguous_owner_retained": 0,
+                "ownership_unavailable": 0,
+                "rejected": 0,
+            },
         ),
         "source_ids": source_ids,
         "relation": target_ref,
@@ -25072,23 +25097,73 @@ async def _drop_address_overlay_stage_best_effort(stage_ref: str) -> None:
         )
 
 
-async def _cleanup_orphan_address_overlay_stages(
+def _address_overlay_stage_cleanup_counts() -> dict[str, int]:
+    return {
+        "scanned": 0,
+        "removed": 0,
+        "current_stage_retained": 0,
+        "active_stage_retained": 0,
+        "recent_stage_retained": 0,
+        "unowned_stage_retained": 0,
+        "ambiguous_owner_retained": 0,
+        "ownership_unavailable": 0,
+        "rejected": 0,
+    }
+
+
+async def _address_overlay_stage_owners(
     schema: str,
-    *,
-    current_stage_table: str,
-) -> dict[str, int]:
-    """Drop a bounded set of validated orphan overlay stages while the build fence is held."""
-
-    if not _is_address_overlay_stage_table_name(current_stage_table):
-        raise ValueError(
-            f"invalid Provider Directory address overlay stage: {current_stage_table!r}"
+) -> dict[str, list[tuple[str, bool]]] | None:
+    """Map stage owner tokens to run status and age-qualified terminal state."""
+    try:
+        owner_rows = await db.all(
+            f"""
+            SELECT run_id,
+                   status,
+                   status IN ('succeeded', 'failed', 'canceled')
+                   AND finished_at IS NOT NULL
+                   AND finished_at <= now() - make_interval(secs => :minimum_age_seconds)
+                       AS cleanup_eligible
+              FROM {_qt(schema, 'import_run')}
+             WHERE importer = 'provider-directory-fhir'
+             ORDER BY created_at DESC
+             LIMIT :owner_history_limit;
+            """,
+            minimum_age_seconds=(
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_MIN_AGE_SECONDS
+            ),
+            owner_history_limit=(
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_HISTORY_LIMIT
+            ),
         )
+    except Exception:
+        LOGGER.warning(
+            "Skipped Provider Directory overlay orphan cleanup because run ownership "
+            "could not be resolved",
+            exc_info=True,
+        )
+        return None
 
+    owners_by_stage_token: dict[str, list[tuple[str, bool]]] = {}
+    for owner_row in owner_rows:
+        owner_run_id = _clean_text(owner_row[0] if owner_row else None)
+        owner_status = _clean_text(owner_row[1] if owner_row else None) or ""
+        if not owner_run_id:
+            continue
+        owner_stage_token = _address_overlay_stage_owner_token(owner_run_id)
+        owners_by_stage_token.setdefault(owner_stage_token, []).append(
+            (owner_status, bool(owner_row[2]))
+        )
+    return owners_by_stage_token
+
+
+async def _address_overlay_stage_catalog_rows(schema: str) -> list[Any]:
+    """List a bounded set of syntactically eligible overlay stage relations."""
     stage_name_pattern = (
         PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX.replace("_", r"\_")
         + r"\_%"
     )
-    stage_name_rows = await db.all(
+    return await db.all(
         """
         SELECT cls.relname
           FROM pg_catalog.pg_class AS cls
@@ -25103,24 +25178,65 @@ async def _cleanup_orphan_address_overlay_stages(
         stage_name_pattern=stage_name_pattern,
         cleanup_limit=PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT,
     )
-    cleanup_counts_by_status = {
-        "scanned": 0,
-        "removed": 0,
-        "current_stage_retained": 0,
-        "rejected": 0,
-    }
+
+
+def _address_overlay_stage_retention_status(
+    table_name: str | None,
+    current_stage_table: str,
+    owners_by_stage_token: dict[str, list[tuple[str, bool]]],
+) -> str | None:
+    """Return a retention metric or None when a validated orphan may be dropped."""
+    if not table_name or not _is_address_overlay_stage_table_name(table_name):
+        return "rejected"
+    if table_name == current_stage_table:
+        return "current_stage_retained"
+    stage_suffix = table_name.rsplit("_", 1)[-1]
+    owner_token_length = PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH
+    stage_owners = owners_by_stage_token.get(stage_suffix[:owner_token_length], [])
+    if not stage_owners:
+        return "unowned_stage_retained"
+    if len(stage_owners) != 1:
+        return "ambiguous_owner_retained"
+    owner_status, cleanup_eligible = stage_owners[0]
+    if owner_status not in {"succeeded", "failed", "canceled"}:
+        return "active_stage_retained"
+    return None if cleanup_eligible else "recent_stage_retained"
+
+
+async def _cleanup_orphan_address_overlay_stages(
+    schema: str,
+    *,
+    current_stage_table: str,
+) -> dict[str, int]:
+    """Drop only old stages owned by terminal Provider Directory runs."""
+    if not _is_address_overlay_stage_table_name(current_stage_table):
+        raise ValueError(
+            f"invalid Provider Directory address overlay stage: {current_stage_table!r}"
+        )
+    cleanup_counts_by_status = _address_overlay_stage_cleanup_counts()
+    owners_by_stage_token = await _address_overlay_stage_owners(schema)
+    if owners_by_stage_token is None:
+        cleanup_counts_by_status["ownership_unavailable"] = 1
+        return cleanup_counts_by_status
+
+    stage_name_rows = await _address_overlay_stage_catalog_rows(schema)
     for stage_name_row in stage_name_rows:
         table_name = _clean_text(stage_name_row[0] if stage_name_row else None)
         cleanup_counts_by_status["scanned"] += 1
-        if not table_name or not _is_address_overlay_stage_table_name(table_name):
-            cleanup_counts_by_status["rejected"] += 1
+        retention_status = _address_overlay_stage_retention_status(
+            table_name,
+            current_stage_table,
+            owners_by_stage_token,
+        )
+        if retention_status:
+            cleanup_counts_by_status[retention_status] += 1
+        if retention_status == "rejected":
             LOGGER.warning(
                 "Rejected invalid Provider Directory address overlay stage from catalog"
             )
+        if retention_status:
             continue
-        if table_name == current_stage_table:
-            cleanup_counts_by_status["current_stage_retained"] += 1
-            continue
+        assert table_name is not None
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
         cleanup_counts_by_status["removed"] += 1
     return cleanup_counts_by_status
