@@ -11296,7 +11296,7 @@ def test_uhc_plan_graph_diagnostic_separates_completeness_states():
         import_run_id="run-1",
         previous_dataset_id=None,
     )
-    assert importer._is_endpoint_dataset_publishable(
+    assert not importer._is_endpoint_dataset_publishable(
         candidate,
         {"InsurancePlan": diagnostic},
     )

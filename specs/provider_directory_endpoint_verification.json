@@ -217,7 +217,7 @@
       "access_verification": "not_recorded",
       "checked_at": null,
       "current_observation": {
-        "observed_at": "2026-07-12T11:19:44Z",
+        "observed_at": "2026-07-12T11:50:43Z",
         "run_id": "run_6f434cd416804bd9b13e2cf66bd2fcf6",
         "run_status": "running",
         "state_status": "running"
@@ -1503,12 +1503,14 @@
         "evidence": {
           "current_dataset_resource_rows": 0,
           "legacy_rows_are_not_current": true,
-          "plan_graph_state": "incomplete"
+          "failure_code": "provider_directory_uhc_plan_graph_incomplete",
+          "plan_graph_state": "cap_exhausted",
+          "publication_policy": "probe_only"
         },
         "observed_at": "2026-07-12T11:19:44Z",
         "run_id": "run_976340566d83450f917db41a4925093b",
-        "run_status": "running",
-        "state_status": "running"
+        "run_status": "failed",
+        "state_status": "failed"
       },
       "publication_readiness": {
         "derived_artifact_state": "not_promoted",

@@ -37,9 +37,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 18 |" in rendered_document
+    assert "| Acquisition-configured | 17 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
-    assert "| Probe-only | 9 |" in rendered_document
+    assert "| Probe-only | 10 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 31 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
@@ -341,7 +341,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
-        ("uhc", "requires two identical graph snapshots"),
+        ("uhc", "plan_graph_complete never satisfies endpoint publication"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "core resource searches return HAPI HTTP 403"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),

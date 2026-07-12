@@ -21655,22 +21655,6 @@ def _is_endpoint_dataset_publishable(
         and candidate.selected_resources != candidate.expected_resources
     ):
         return False
-    selected_diagnostics = [
-        diagnostics.get(resource_type)
-        for resource_type in candidate.selected_resources
-    ]
-    if selected_diagnostics and all(
-        diagnostic
-        and diagnostic.get("fetch_mode") == UHC_PLAN_GRAPH_FETCH_MODE
-        and diagnostic.get("plan_graph_complete") is True
-        and diagnostic.get("collection_complete") is False
-        and diagnostic.get("stability_verified") is True
-        and not diagnostic.get("error")
-        and not diagnostic.get("bounded")
-        and not diagnostic.get("next_url_remaining")
-        for diagnostic in selected_diagnostics
-    ):
-        return True
     for resource_type in candidate.selected_resources:
         diagnostic = diagnostics.get(resource_type)
         if (
