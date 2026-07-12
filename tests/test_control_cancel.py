@@ -322,6 +322,39 @@ async def test_control_single_job_start_marks_cancelled_task_failed(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_control_single_job_start_names_message_less_failure(monkeypatch):
+    marks = []
+
+    async def fake_mark(run_id, **kwargs):
+        marks.append((run_id, kwargs))
+
+    async def fake_target(_ctx, _task):
+        raise TimeoutError
+
+    class FakeModule:
+        process_data = staticmethod(fake_target)
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: FakeModule)
+
+    with pytest.raises(TimeoutError):
+        await control_single_job_start(
+            {},
+            {
+                "run_id": "run_1",
+                "target_module": "fake.module",
+                "target_function": "process_data",
+            },
+        )
+
+    assert [item[1]["status"] for item in marks] == ["running", "failed"]
+    assert marks[-1][1]["error"] == {
+        "code": "import_failed",
+        "message": "TimeoutError",
+    }
+
+
+@pytest.mark.asyncio
 async def test_control_run_update_uses_base_database_then_restores_override(monkeypatch):
     calls = []
 
