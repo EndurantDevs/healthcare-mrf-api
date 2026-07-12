@@ -394,6 +394,8 @@ def test_provider_directory_overlay_keeps_old_current_dataset_during_replacement
     assert "HAVING COUNT(*) = 1" in sql
     assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in sql
     assert "resource.dataset_id = dataset.dataset_id" in sql
+    assert "current_resources AS NOT MATERIALIZED" in sql
+    assert "WHERE overlay.npi = :npi" in sql
     assert "current_resource.resource_type = overlay.resource_type" in sql
     assert "current_resource.resource_id = overlay.resource_id" in sql
     assert "overlay.last_seen_run_id = current_resource.run_id" in sql

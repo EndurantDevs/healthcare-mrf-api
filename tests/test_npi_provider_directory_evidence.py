@@ -105,6 +105,7 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "dataset.status = 'published'" in sql
     assert "dataset.published_at IS NOT NULL" in sql
     assert "resource.dataset_id = dataset.dataset_id" in sql
+    assert "current_resources AS NOT MATERIALIZED" in sql
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
     assert "current_role.resource_type = 'PractitionerRole'" in sql

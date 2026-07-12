@@ -977,7 +977,7 @@ def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
            AND dataset.published_at IS NOT NULL
            AND dataset.superseded_at IS NULL
            AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    ), current_resources AS MATERIALIZED (
+    ), current_resources AS NOT MATERIALIZED (
         SELECT source.source_id, source.canonical_api_base,
                dataset.dataset_id, dataset.run_id,
                resource.resource_type, resource.resource_id
@@ -7186,6 +7186,7 @@ def _provider_directory_overlay_query_sql(
                AND current_resource.resource_type = overlay.resource_type
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
+             WHERE overlay.npi = :npi
         )
         SELECT
             npi,
@@ -7212,7 +7213,6 @@ def _provider_directory_overlay_query_sql(
             (COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id)) > 1)::boolean AS multi_source_confirmed,
             MAX(source_updated_at) AS updated_at
           FROM visible_overlay AS overlay
-         WHERE overlay.npi = :npi
       GROUP BY
             npi, first_line, second_line, city_name, state_name, state_code,
             postal_code, country_code, telephone_number, fax_number, phone_number,
