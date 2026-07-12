@@ -23606,6 +23606,7 @@ def _scope_source_rows(
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX = "provider_directory_address_overlay_stage"
+PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT = 16
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "source_record_idx",
     "npi_idx",
@@ -23620,6 +23621,17 @@ def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
     raw_identifier = f"{run_id or 'full'}:{os.getpid()}:{time.time_ns()}:{os.urandom(8).hex()}"
     digest = hashlib.sha1(raw_identifier.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_{digest}"
+
+
+def _is_address_overlay_stage_table_name(table_name: str) -> bool:
+    """Accept only identifiers emitted by the overlay stage-name helper."""
+
+    return bool(
+        re.fullmatch(
+            rf"{re.escape(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX)}_[0-9a-f]{{16}}",
+            table_name,
+        )
+    )
 
 
 def _coerce_rowcount(value: Any) -> int:
@@ -25017,6 +25029,10 @@ def _address_overlay_publish_result(
         "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),
         "duplicates_removed": stage_metric_dict["duplicates_removed"],
         "copied_existing": stage_metric_dict["copied_existing"],
+        "orphan_stage_cleanup": stage_metric_dict.get(
+            "orphan_stage_cleanup",
+            {"scanned": 0, "removed": 0, "current_stage_retained": 0, "rejected": 0},
+        ),
         "source_ids": source_ids,
         "relation": target_ref,
     }
@@ -25031,6 +25047,60 @@ async def _drop_address_overlay_stage_best_effort(stage_ref: str) -> None:
             stage_ref,
             exc_info=True,
         )
+
+
+async def _cleanup_orphan_address_overlay_stages(
+    schema: str,
+    *,
+    current_stage_table: str,
+) -> dict[str, int]:
+    """Drop a bounded set of validated orphan overlay stages while the build fence is held."""
+
+    if not _is_address_overlay_stage_table_name(current_stage_table):
+        raise ValueError(
+            f"invalid Provider Directory address overlay stage: {current_stage_table!r}"
+        )
+
+    stage_name_pattern = (
+        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX.replace("_", r"\_")
+        + r"\_%"
+    )
+    stage_name_rows = await db.all(
+        """
+        SELECT cls.relname
+          FROM pg_catalog.pg_class AS cls
+          JOIN pg_catalog.pg_namespace AS ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = :schema_name
+           AND cls.relkind IN ('r', 'p')
+           AND cls.relname LIKE :stage_name_pattern ESCAPE '\\'
+         ORDER BY cls.relname
+         LIMIT :cleanup_limit;
+        """,
+        schema_name=schema,
+        stage_name_pattern=stage_name_pattern,
+        cleanup_limit=PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT,
+    )
+    cleanup_counts_by_status = {
+        "scanned": 0,
+        "removed": 0,
+        "current_stage_retained": 0,
+        "rejected": 0,
+    }
+    for stage_name_row in stage_name_rows:
+        table_name = _clean_text(stage_name_row[0] if stage_name_row else None)
+        cleanup_counts_by_status["scanned"] += 1
+        if not table_name or not _is_address_overlay_stage_table_name(table_name):
+            cleanup_counts_by_status["rejected"] += 1
+            LOGGER.warning(
+                "Rejected invalid Provider Directory address overlay stage from catalog"
+            )
+            continue
+        if table_name == current_stage_table:
+            cleanup_counts_by_status["current_stage_retained"] += 1
+            continue
+        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
+        cleanup_counts_by_status["removed"] += 1
+    return cleanup_counts_by_status
 
 
 async def _prepared_address_overlay_result(
@@ -25078,12 +25148,17 @@ async def _build_provider_directory_address_overlay_stage(
     """Build and either defer or immediately promote one overlay stage."""
     stage_table = _address_overlay_stage_table_name(run_id)
     stage_ref = _qt(schema, stage_table)
-    await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    orphan_stage_cleanup = await _cleanup_orphan_address_overlay_stages(
+        schema,
+        current_stage_table=stage_table,
+    )
+    is_stage_created = False
     try:
         await db.status(
             f"CREATE UNLOGGED TABLE {stage_ref} "
             f"(LIKE {target_ref} INCLUDING DEFAULTS);"
         )
+        is_stage_created = True
         stage_metrics = await _populate_address_overlay_stage(
             schema,
             stage_table,
@@ -25093,6 +25168,7 @@ async def _build_provider_directory_address_overlay_stage(
             _address_overlay_query_params(run_id, source_ids),
             components=_clean_address_overlay_components(components),
         )
+        stage_metrics["orphan_stage_cleanup"] = orphan_stage_cleanup
         publish_metrics = _address_overlay_publish_result(
             stage_metrics,
             source_ids=source_ids,
@@ -25114,7 +25190,8 @@ async def _build_provider_directory_address_overlay_stage(
         )
         return publish_metrics
     except Exception:
-        await _drop_address_overlay_stage_best_effort(stage_ref)
+        if is_stage_created:
+            await _drop_address_overlay_stage_best_effort(stage_ref)
         raise
 
 

@@ -5967,6 +5967,7 @@ def _stub_staged_publish_db(
 
     monkeypatch.setattr(importer.db, "status", fake_status)
     monkeypatch.setattr(importer.db, "scalar", _artifact_publish_scalar(row_count))
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
     monkeypatch.setattr(importer.db, "transaction", lambda: _ArtifactPublishTransaction())
     return status_calls
 
@@ -16760,6 +16761,35 @@ def test_address_overlay_stage_index_names_are_hash_safe():
 
 
 @pytest.mark.asyncio
+async def test_address_overlay_orphan_stage_cleanup_removes_only_valid_orphans(monkeypatch):
+    current_stage = importer._address_overlay_stage_table_name("run_current")
+    orphan_stage = importer._address_overlay_stage_table_name("run_orphan")
+    invalid_stage = "provider_directory_address_overlay_stage_bad; DROP TABLE mrf.important"
+    catalog = AsyncMock(return_value=[(current_stage,), (orphan_stage,), (invalid_stage,)])
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", catalog)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    metrics = await importer._cleanup_orphan_address_overlay_stages(
+        "mrf",
+        current_stage_table=current_stage,
+    )
+
+    assert metrics == {"scanned": 3, "removed": 1, "current_stage_retained": 1, "rejected": 1}
+    catalog_sql = str(catalog.await_args.args[0])
+    assert "pg_catalog.pg_class" in catalog_sql
+    assert "LIMIT :cleanup_limit" in catalog_sql
+    assert catalog.await_args.kwargs == {
+        "schema_name": "mrf",
+        "stage_name_pattern": "provider\\_directory\\_address\\_overlay\\_stage\\_%",
+        "cleanup_limit": importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_CLEANUP_LIMIT,
+    }
+    status.assert_awaited_once_with(f'DROP TABLE IF EXISTS "mrf"."{orphan_stage}";')
+    assert current_stage not in str(status.await_args.args[0])
+    assert invalid_stage not in str(status.await_args.args[0])
+
+
+@pytest.mark.asyncio
 async def test_address_overlay_live_ensure_does_not_build_scope_index(monkeypatch):
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
@@ -16928,8 +16958,40 @@ async def test_network_catalog_publish_skips_run_scope_without_sources(monkeypat
     status.assert_not_awaited()
 
 
+def _assert_overlay_staged_swap_sql(status_calls):
+    """Verify the overlay stage is indexed and atomically promoted."""
+    sql_calls = [sql for sql, _params in status_calls]
+    joined_sql = "\n".join(sql_calls)
+    stage_table = _artifact_stage_table(
+        status_calls,
+        importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX,
+    )
+    stage_source_record_idx = importer._address_overlay_index_name(
+        stage_table,
+        "source_record_idx",
+    )
+    stage_npi_idx = importer._address_overlay_index_name(stage_table, "npi_idx")
+
+    assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
+    assert f'CREATE UNIQUE INDEX IF NOT EXISTS "{stage_source_record_idx}"' in joined_sql
+    assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_idx}"' in joined_sql
+    assert 'FROM "mrf"."provider_directory_address_overlay"' in joined_sql
+    assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
+    assert "PARTITION BY source_record_id" in joined_sql
+    assert "duplicate_rank > 1" in joined_sql
+    assert 'FROM "mrf"."address_archive_v2" AS archive' in joined_sql
+    assert f'ALTER TABLE "mrf"."{stage_table}" RENAME TO "provider_directory_address_overlay"' in joined_sql
+    assert 'ALTER TABLE "mrf"."provider_directory_address_overlay" RENAME TO "provider_directory_address_overlay_old"' in joined_sql
+    assert (
+        f'ALTER INDEX IF EXISTS "mrf"."{stage_source_record_idx}" '
+        'RENAME TO "provider_directory_address_overlay_source_record_idx"'
+    ) in joined_sql
+    assert "entity_address_unified" not in joined_sql
+
+
 @pytest.mark.asyncio
 async def test_overlay_publish_uses_staged_swap(monkeypatch):
+    """Publish through an isolated stage before the atomic relation swap."""
     _stub_artifact_build_guard(monkeypatch)
     monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
     status_calls = _stub_staged_publish_db(
@@ -16950,10 +17012,6 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
         source_ids=["source_a"],
     )
 
-    sql_calls = [sql for sql, _params in status_calls]
-    joined_sql = "\n".join(sql_calls)
-    stage_table = _artifact_stage_table(status_calls, importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX)
-
     assert metrics["published"] is True
     assert metrics["rows"] == 10
     assert metrics["inserted"] == 21
@@ -16970,24 +17028,31 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
     assert metrics["archive_coordinate_backfill_rows"] == 0
+    assert metrics["orphan_stage_cleanup"]["scanned"] == 0
     assert metrics["source_ids"] == ["source_a"]
-    assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
-    stage_source_record_idx = importer._address_overlay_index_name(stage_table, "source_record_idx")
-    stage_npi_idx = importer._address_overlay_index_name(stage_table, "npi_idx")
-    assert f'CREATE UNIQUE INDEX IF NOT EXISTS "{stage_source_record_idx}"' in joined_sql
-    assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_idx}"' in joined_sql
-    assert 'FROM "mrf"."provider_directory_address_overlay"' in joined_sql
-    assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
-    assert "PARTITION BY source_record_id" in joined_sql
-    assert "duplicate_rank > 1" in joined_sql
-    assert 'FROM "mrf"."address_archive_v2" AS archive' in joined_sql
-    assert f'ALTER TABLE "mrf"."{stage_table}" RENAME TO "provider_directory_address_overlay"' in joined_sql
-    assert 'ALTER TABLE "mrf"."provider_directory_address_overlay" RENAME TO "provider_directory_address_overlay_old"' in joined_sql
-    assert (
-        f'ALTER INDEX IF EXISTS "mrf"."{stage_source_record_idx}" '
-        'RENAME TO "provider_directory_address_overlay_source_record_idx"'
-    ) in joined_sql
-    assert "entity_address_unified" not in joined_sql
+    _assert_overlay_staged_swap_sql(status_calls)
+
+
+@pytest.mark.asyncio
+async def test_overlay_publish_does_not_cleanup_when_build_guard_conflicts(monkeypatch):
+    @contextlib.asynccontextmanager
+    async def conflicting_guard(*_args, **_kwargs):
+        raise importer.ProviderDirectoryArtifactCutoverConflict(
+            importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        )
+        yield
+
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", conflicting_guard)
+    monkeypatch.setattr(importer, "_address_overlay_missing_requirement", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer, "_ensure_provider_directory_address_overlay_table", AsyncMock())
+    monkeypatch.setattr(importer, "_address_overlay_scope_sources", AsyncMock(return_value=["source_a"]))
+    monkeypatch.setattr(importer, "_cleanup_orphan_address_overlay_stages", cleanup)
+
+    with pytest.raises(importer.ProviderDirectoryArtifactCutoverConflict):
+        await importer.publish_provider_directory_address_overlay("mrf", run_id="run_1")
+
+    cleanup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
