@@ -5766,6 +5766,14 @@ class ProviderDirectoryPreparedArtifactStage:
     build_fence: ProviderDirectoryArtifactBuildFence | None = None
 
 
+@dataclass(frozen=True)
+class ProviderDirectoryArtifactPromotionIdentity:
+    """Relation identity needed to resolve an ambiguous cutover timeout."""
+
+    stage: ProviderDirectoryPreparedArtifactStage
+    stage_oid: int
+
+
 @dataclass
 class ProviderDirectoryArtifactBundle:
     """Collect serving stages and promote or clean them as one unit."""
@@ -5924,6 +5932,64 @@ async def _provider_directory_relation_oid(schema: str, relation: str) -> int | 
         relation_name=relation,
     )
     return int(relation_oid) if relation_oid is not None else None
+
+
+async def _capture_provider_directory_artifact_promotion_identities(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+) -> tuple[ProviderDirectoryArtifactPromotionIdentity, ...]:
+    """Capture exact stage OIDs before entering the bounded cutover."""
+
+    identities: list[ProviderDirectoryArtifactPromotionIdentity] = []
+    for stage in stages:
+        stage_oid = await _provider_directory_relation_oid(
+            stage.schema,
+            stage.stage_table,
+        )
+        if stage_oid is None:
+            return ()
+        identities.append(
+            ProviderDirectoryArtifactPromotionIdentity(
+                stage=stage,
+                stage_oid=stage_oid,
+            )
+        )
+    return tuple(identities)
+
+
+async def _provider_directory_artifact_promotion_was_committed(
+    identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...],
+) -> bool:
+    """Confirm that every prepared stage became its logged live target."""
+
+    if not identities:
+        return False
+    for identity in identities:
+        stage = identity.stage
+        target_oid = await _provider_directory_relation_oid(
+            stage.schema,
+            stage.target_relation,
+        )
+        stage_oid = await _provider_directory_relation_oid(
+            stage.schema,
+            stage.stage_table,
+        )
+        old_oid = await _provider_directory_relation_oid(
+            stage.schema,
+            f"{stage.target_relation}_old",
+        )
+        target_persistence = await _provider_directory_relation_attribute(
+            stage.schema,
+            stage.target_relation,
+            "relpersistence",
+        )
+        if (
+            target_oid != identity.stage_oid
+            or stage_oid is not None
+            or old_oid is not None
+            or target_persistence != "p"
+        ):
+            return False
+    return True
 
 
 async def _provider_directory_relation_attribute(
@@ -6165,10 +6231,26 @@ async def _promote_provider_directory_artifact_bundle(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
 ) -> None:
     """Apply a hard wall-clock limit to one atomic artifact bundle cutover."""
-    async with asyncio.timeout(
-        PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
-    ):
-        await _promote_provider_directory_artifact_bundle_transaction(stages)
+
+    promotion_identities = (
+        await _capture_provider_directory_artifact_promotion_identities(stages)
+    )
+    try:
+        async with asyncio.timeout(
+            PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+        ):
+            await _promote_provider_directory_artifact_bundle_transaction(stages)
+    except TimeoutError:
+        if await _provider_directory_artifact_promotion_was_committed(
+            promotion_identities
+        ):
+            LOGGER.warning(
+                "Provider Directory artifact cutover timed out after commit; "
+                "verified promoted targets by relation identity: %s",
+                ",".join(stage.target_relation for stage in stages),
+            )
+            return
+        raise
 
 
 async def _retry_provider_directory_artifact_bundle_promotion(
@@ -6214,14 +6296,38 @@ async def _promote_provider_directory_artifact_stage(
 ) -> None:
     """Apply a hard wall-clock deadline to the live artifact cutover."""
 
-    async with asyncio.timeout(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS):
-        await _promote_provider_directory_artifact_stage_transaction(
-            schema,
-            stage_table,
-            target_relation,
-            rename_stage_indexes,
-            build_fence,
-        )
+    stage = ProviderDirectoryPreparedArtifactStage(
+        schema=schema,
+        stage_table=stage_table,
+        target_relation=target_relation,
+        rename_stage_indexes=rename_stage_indexes,
+        build_fence=build_fence,
+    )
+    promotion_identities = (
+        await _capture_provider_directory_artifact_promotion_identities((stage,))
+    )
+    try:
+        async with asyncio.timeout(
+            PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+        ):
+            await _promote_provider_directory_artifact_stage_transaction(
+                schema,
+                stage_table,
+                target_relation,
+                rename_stage_indexes,
+                build_fence,
+            )
+    except TimeoutError:
+        if await _provider_directory_artifact_promotion_was_committed(
+            promotion_identities
+        ):
+            LOGGER.warning(
+                "Provider Directory artifact cutover timed out after commit; "
+                "verified promoted target by relation identity: %s",
+                target_relation,
+            )
+            return
+        raise
 
 
 async def _retry_provider_directory_artifact_promotion(
