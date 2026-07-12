@@ -172,8 +172,24 @@ class FakeCopyDriver:
 
     async def copy_from_query(self, sql, *, output, **copy_options):
         self.events.append((sql, copy_options["format"], copy_options["delimiter"], copy_options["null"]))
-        await output(b"copy-row\n")
+        if callable(output):
+            await output(b"copy-row\n")
+        else:
+            output.write(b"copy-row\n")
         return "copied"
+
+
+class FakeCopyConnectionContext:
+    def __init__(self, driver):
+        self.connection = SimpleNamespace(
+            raw_connection=SimpleNamespace(driver_connection=driver),
+        )
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
 
 
 class FakeProcessStdin:
@@ -249,14 +265,63 @@ def test_serving_binary_copy_work_mem_rejects_unsafe_values(monkeypatch):
     assert serving_binary_writer._serving_binary_copy_work_mem() == "128MB"
 
 
+def test_serving_binary_copy_parallel_workers_default_and_zero_disable(monkeypatch):
+    env_name = (
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV
+    )
+    monkeypatch.delenv(env_name, raising=False)
+    assert serving_binary_writer._copy_parallel_workers_per_gather() is None
+
+    monkeypatch.setenv(env_name, "0")
+    assert serving_binary_writer._copy_parallel_workers_per_gather() is None
+
+
+@pytest.mark.parametrize("parallel_workers", range(1, 9))
+def test_serving_binary_copy_parallel_workers_accepts_bounded_integers(
+    monkeypatch,
+    parallel_workers,
+):
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV,
+        str(parallel_workers),
+    )
+
+    assert serving_binary_writer._copy_parallel_workers_per_gather() == parallel_workers
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "invalid", "-1", "9", "1.5", "1; SET work_mem TO '1GB'"],
+)
+def test_serving_binary_copy_parallel_workers_warns_and_disables_invalid_values(
+    monkeypatch,
+    caplog,
+    value,
+):
+    env_name = (
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV
+    )
+    monkeypatch.setenv(env_name, value)
+
+    with caplog.at_level("WARNING", logger=serving_binary_writer.__name__):
+        result = serving_binary_writer._copy_parallel_workers_per_gather()
+
+    assert result is None
+    assert env_name in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_copy_pg_query_to_rust_sets_local_work_mem(monkeypatch):
     monkeypatch.setenv(serving_binary_writer.PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, "256MB")
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV,
+        "8",
+    )
     driver = FakeCopyDriver()
     process = FakeRustProcess()
     metrics_by_name = {}
 
-    result = await serving_binary_writer._copy_pg_query_to_rust(
+    copy_result = await serving_binary_writer._copy_pg_query_to_rust(
         driver,
         "SELECT 1",
         process,
@@ -264,10 +329,11 @@ async def test_copy_pg_query_to_rust_sets_local_work_mem(monkeypatch):
         started_at=time.monotonic(),
     )
 
-    assert result == "copied"
+    assert copy_result == "copied"
     assert driver.events == [
         "begin",
         "SET LOCAL work_mem TO '256MB'",
+        "SET LOCAL max_parallel_workers_per_gather TO 8",
         ("SELECT 1", "text", "\t", "\\N"),
         "commit",
     ]
@@ -276,6 +342,61 @@ async def test_copy_pg_query_to_rust_sets_local_work_mem(monkeypatch):
     assert metrics_by_name["source_copy_bytes"] == len(b"copy-row\n")
     assert metrics_by_name["source_first_byte_seconds"] >= 0
     assert metrics_by_name["source_copy_complete_seconds"] >= metrics_by_name["source_first_byte_seconds"]
+
+
+@pytest.mark.asyncio
+async def test_copy_pg_query_to_rust_uses_parallel_workers_without_work_mem(monkeypatch):
+    monkeypatch.setenv(serving_binary_writer.PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, "0")
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV,
+        "3",
+    )
+    driver = FakeCopyDriver()
+    process = FakeRustProcess()
+
+    result = await serving_binary_writer._copy_pg_query_to_rust(
+        driver,
+        "SELECT 1",
+        process,
+    )
+
+    assert result == "copied"
+    assert driver.events == [
+        "begin",
+        "SET LOCAL max_parallel_workers_per_gather TO 3",
+        ("SELECT 1", "text", "\t", "\\N"),
+        "commit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_copy_serving_binary_query_to_file_orders_local_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv(serving_binary_writer.PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, "256MB")
+    monkeypatch.setenv(
+        serving_binary_writer.PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV,
+        "4",
+    )
+    driver = FakeCopyDriver()
+    monkeypatch.setattr(
+        serving_binary_writer.db,
+        "acquire",
+        lambda: FakeCopyConnectionContext(driver),
+    )
+    output_path = tmp_path / "serving-copy.tsv"
+
+    await serving_binary_writer._copy_serving_binary_query_to_file(
+        "SELECT 1",
+        output_path,
+    )
+
+    assert driver.events == [
+        "begin",
+        "SET LOCAL work_mem TO '256MB'",
+        "SET LOCAL max_parallel_workers_per_gather TO 4",
+        ("SELECT 1", "text", "\t", "\\N"),
+        "commit",
+    ]
+    assert output_path.read_bytes() == b"copy-row\n"
 
 
 @pytest.mark.asyncio

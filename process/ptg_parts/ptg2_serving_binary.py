@@ -79,6 +79,9 @@ PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT_ENV = (
     "HLTHPRT_PTG2_SERVING_BINARY_PAYLOAD_COMPRESSION_MIN_SAVINGS_PCT"
 )
 PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV = "HLTHPRT_PTG2_SERVING_BINARY_COPY_WORK_MEM"
+PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV = (
+    "HLTHPRT_PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER"
+)
 DB_POOL_MAX_SIZE_ENV = "HLTHPRT_DB_POOL_MAX_SIZE"
 PTG2_SERVING_BINARY_SOURCE_LAYOUT_KEYED = "keyed"
 PTG2_SERVING_BINARY_SOURCE_LAYOUT_NATURAL_LEAN = "natural_lean"
@@ -98,6 +101,7 @@ _DEFAULT_STREAM_TASKS = 3
 _DEFAULT_COMPRESSION_MIN_BYTES = 128
 _DEFAULT_COMPRESSION_MIN_SAVINGS_PCT = 2.0
 _DEFAULT_COPY_WORK_MEM = "128MB"
+_MAX_COPY_PARALLEL_WORKERS_PER_GATHER = 8
 _DEFAULT_DB_POOL_MAX_SIZE = 5
 _PRICE_SET_ATOM_ID_V2_PREFIX_BYTES = 2
 _PRICE_SET_ATOM_ID_V2_BUCKETS = 1 << (_PRICE_SET_ATOM_ID_V2_PREFIX_BYTES * 8)
@@ -314,6 +318,41 @@ def _serving_binary_copy_work_mem() -> str | None:
         return value
     logger.warning("Ignoring unsafe %s=%r", PTG2_SERVING_BINARY_COPY_WORK_MEM_ENV, value)
     return _DEFAULT_COPY_WORK_MEM
+
+
+def _copy_parallel_workers_per_gather() -> int | None:
+    raw_setting = os.getenv(PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV)
+    if raw_setting is None:
+        return None
+    normalized_setting = raw_setting.strip()
+    is_decimal_integer = re.fullmatch(r"[0-9]+", normalized_setting) is not None
+    try:
+        parallel_workers = int(normalized_setting) if is_decimal_integer else None
+    except ValueError:
+        parallel_workers = None
+    if parallel_workers is None or parallel_workers > _MAX_COPY_PARALLEL_WORKERS_PER_GATHER:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected an integer from 0 to %d",
+            PTG2_SERVING_BINARY_COPY_MAX_PARALLEL_WORKERS_PER_GATHER_ENV,
+            raw_setting,
+            _MAX_COPY_PARALLEL_WORKERS_PER_GATHER,
+        )
+        return None
+    return parallel_workers or None
+
+
+async def _set_copy_local_settings(
+    driver_connection: Any,
+    *,
+    work_mem: str | None,
+    parallel_workers: int | None,
+) -> None:
+    if work_mem:
+        await driver_connection.execute(f"SET LOCAL work_mem TO '{work_mem}'")
+    if parallel_workers is not None:
+        await driver_connection.execute(
+            f"SET LOCAL max_parallel_workers_per_gather TO {parallel_workers}"
+        )
 
 
 def _emit_progress(
@@ -606,9 +645,14 @@ async def _copy_serving_binary_query_to_file(sql: str, output_path: Path) -> Non
             raise NotImplementedError("Active database driver does not expose copy_from_query")
         with output_path.open("wb") as output:
             work_mem = _serving_binary_copy_work_mem()
-            if work_mem and hasattr(driver_conn, "transaction"):
+            parallel_workers = _copy_parallel_workers_per_gather()
+            if (work_mem or parallel_workers is not None) and hasattr(driver_conn, "transaction"):
                 async with driver_conn.transaction():
-                    await driver_conn.execute(f"SET LOCAL work_mem TO '{work_mem}'")
+                    await _set_copy_local_settings(
+                        driver_conn,
+                        work_mem=work_mem,
+                        parallel_workers=parallel_workers,
+                    )
                     await copy_from_query(
                         sql,
                         output=output,
@@ -771,9 +815,14 @@ async def _copy_pg_query_to_rust(
 
     try:
         work_mem = _serving_binary_copy_work_mem()
-        if work_mem and hasattr(source_driver, "transaction"):
+        parallel_workers = _copy_parallel_workers_per_gather()
+        if (work_mem or parallel_workers is not None) and hasattr(source_driver, "transaction"):
             async with source_driver.transaction():
-                await source_driver.execute(f"SET LOCAL work_mem TO '{work_mem}'")
+                await _set_copy_local_settings(
+                    source_driver,
+                    work_mem=work_mem,
+                    parallel_workers=parallel_workers,
+                )
                 return await source_driver.copy_from_query(
                     sql,
                     output=feed,
