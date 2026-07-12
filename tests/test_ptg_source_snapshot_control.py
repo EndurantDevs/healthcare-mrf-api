@@ -39,9 +39,9 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
             "manifest": {"serving_index": {"source_key": "source_a"}},
         }
 
-    async def fake_current_source_snapshot(*_args):
+    async def fake_current_source_snapshot_state(*_args):
         assert transaction.active
-        return "snap_old"
+        return "snap_old", None
 
     async def fake_source_plan_rows(**kwargs):
         assert transaction.active
@@ -61,7 +61,7 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
 
     clear_calls = []
     monkeypatch.setattr(source_snapshot_control, "_snapshot_row", fake_snapshot_row)
-    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot", fake_current_source_snapshot)
+    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot_state", fake_current_source_snapshot_state)
     monkeypatch.setattr(source_snapshot_control, "_source_plan_rows", fake_source_plan_rows)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
     monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: clear_calls.append(True))
@@ -86,6 +86,57 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
     assert any("DELETE FROM \"mrf\".ptg2_current_plan_source" in statement for statement, _ in executed)
     assert any("ptg2_current_plan_source" in statement and "ON CONFLICT" in statement for statement, _ in executed)
     assert clear_calls == [True]
+
+
+def test_promote_current_source_snapshot_repairs_plan_pointers_without_self_lineage(monkeypatch):
+    executed_statements = []
+    transaction = _RecordingTransaction(executed_statements)
+    captured_plan_parameter_map = {}
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_snapshot_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_current",
+                "status": "published",
+                "import_month": datetime.date(2026, 7, 1),
+                "manifest": {"serving_index": {"source_key": "source_a"}},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_source_snapshot_state",
+        AsyncMock(return_value=("snap_current", "snap_previous")),
+    )
+
+    async def fake_source_plan_rows(**kwargs):
+        captured_plan_parameter_map.update(kwargs)
+        return [{
+            "plan_source_key": "ps_1",
+            "plan_id": "P1",
+            "plan_market_type": "group",
+            **kwargs,
+        }]
+
+    monkeypatch.setattr(source_snapshot_control, "_source_plan_rows", fake_source_plan_rows)
+    monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
+    monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: None)
+
+    promotion = asyncio.run(
+        source_snapshot_control.promote_ptg2_source_snapshot(
+            source_key="source_a",
+            snapshot_id="snap_current",
+            expected_current_snapshot_id="snap_current",
+        )
+    )
+
+    assert promotion["previous_snapshot_id"] == "snap_previous"
+    assert captured_plan_parameter_map["previous_snapshot_id"] == "snap_previous"
+    assert all(
+        parameters.get("previous_snapshot_id") != "snap_current"
+        for _statement, parameters in executed_statements
+    )
 
 
 def test_source_plan_rows_falls_back_to_import_catalog(monkeypatch):
@@ -124,7 +175,10 @@ def test_source_plan_rows_falls_back_to_import_catalog(monkeypatch):
     assert [plan_source_row["plan_id"] for plan_source_row in plan_source_rows] == ["386004849", "611480273"]
     assert {plan_source_row["plan_market_type"] for plan_source_row in plan_source_rows} == {"group"}
     assert all(plan_source_row["source_key"] == "ptg_source" for plan_source_row in plan_source_rows)
-    assert any("hp_import_control" in statement for statement, _params in captured_sql_calls)
+    catalog_sql = next(statement for statement, _params in captured_sql_calls if "hp_import_control" in statement)
+    assert "'running'" in catalog_sql
+    assert "sfi.removed_at IS NULL" in catalog_sql
+    assert "sfi.status = 'succeeded'" not in catalog_sql
 
 
 def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch):
@@ -142,7 +196,11 @@ def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch
             }
         ),
     )
-    monkeypatch.setattr(source_snapshot_control, "_current_source_snapshot", AsyncMock(return_value="snap_old"))
+    monkeypatch.setattr(
+        source_snapshot_control,
+        "_current_source_snapshot_state",
+        AsyncMock(return_value=("snap_old", None)),
+    )
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
 
     with pytest.raises(source_snapshot_control.SourceSnapshotConflict):

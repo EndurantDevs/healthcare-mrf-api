@@ -199,7 +199,11 @@ async def _source_plan_rows_from_import_catalog(*, snapshot_id: str, source_key:
             ON dp.discovered_plan_id = dpf.discovered_plan_id
          WHERE sfi.snapshot_id = :snapshot_id
            AND sfi.source_key = :source_key
-           AND sfi.status = 'succeeded'
+           AND sfi.status IN (
+               'queued', 'starting', 'running', 'processing',
+               'started', 'dispatched', 'enqueued', 'succeeded'
+           )
+           AND sfi.removed_at IS NULL
            AND dp.plan_id IS NOT NULL
            AND dp.plan_id <> ''
            AND dp.status = 'active'

@@ -2405,6 +2405,7 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
 def test_ptg2_toc_jobs_repair_ucare_json_and_allowed_amount_lists(
     monkeypatch, tmp_path
 ):
+    """Verify this PTG import regression contract."""
     toc_path = tmp_path / "ucare_toc.json"
     toc_path.write_text(
         """
@@ -2634,6 +2635,7 @@ def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(monkeypatch,
 
 
 def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
+    """Verify this PTG import regression contract."""
     toc_path = tmp_path / "toc.json"
     toc_path.write_text(
         json.dumps(
@@ -2917,6 +2919,7 @@ def test_download_raw_artifact_redownloads_corrupt_gzip_reuse_candidate(monkeypa
 
 
 def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
+    """Verify this PTG import regression contract."""
     payload = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
     requests = []
 
@@ -2980,6 +2983,7 @@ def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
 
 
 def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
+    """Verify this PTG import regression contract."""
     payload = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
     attempts_by_range = {}
 
@@ -3477,6 +3481,7 @@ def test_ptg2_serving_only_provider_set_uses_real_provider_group_hashes():
 
 
 def test_ptg2_single_pass_in_network_parser_uses_provider_cache(tmp_path, monkeypatch):
+    """Verify this PTG import regression contract."""
     raw_path = tmp_path / "rates.json.gz"
     payload = {
         "provider_references": [
@@ -3937,6 +3942,7 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
 
 
 def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
+    """Verify this PTG import regression contract."""
     pushed = []
     concurrency_map = {"active": 0, "max_active": 0}
     processed_jobs = []
@@ -4173,6 +4179,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
 
 
 def test_ptg2_main_publishes_allowed_amount_only_metadata_snapshot(monkeypatch):
+    """Verify this PTG import regression contract."""
     pushed = []
     dropped_tables = []
     publish_serving = AsyncMock()
@@ -4394,6 +4401,7 @@ def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_pat
 
 
 def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
+    """Verify this PTG import regression contract."""
     pushed = []
     dropped_tables = []
     publish_serving = AsyncMock()
@@ -4469,6 +4477,7 @@ def test_ptg2_main_publishes_allowed_amount_evidence_snapshot(monkeypatch):
 
 
 def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
+    """Verify this PTG import regression contract."""
     pushed = []
 
     async def fake_push(rows, cls, **_kwargs):
@@ -4579,6 +4588,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
 
 
 def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_path):
+    """Verify this PTG import regression contract."""
     class Table:
         def __init__(self, name):
             self.schema = "mrf"
@@ -4861,6 +4871,7 @@ def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
 
 
 def test_ptg2_rust_compact_serving_mode_emits_copy_oriented_rows(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -5070,6 +5081,7 @@ def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp
 
 
 def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -5183,6 +5195,7 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
 
 
 def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -5305,6 +5318,7 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
 
 
 def test_ptg2_rust_top_level_byte_scan_matches_default_compact_output(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -5681,6 +5695,7 @@ def test_ptg2_provider_membership_sidecars_round_trip_through_python_reader(tmp_
 
 
 def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -5790,6 +5805,7 @@ def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
 
 
 def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
+    """Verify this PTG import regression contract."""
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
@@ -6321,6 +6337,7 @@ def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch)
 
 
 def test_ptg2_rust_snapshot_publish_renames_dictionary_stages_before_index(monkeypatch):
+    """Verify this PTG import regression contract."""
     status_calls = []
 
     async def fake_status(statement, **_params):
@@ -6630,6 +6647,7 @@ def test_direct_lean_swap_keeps_null_reported_codes(monkeypatch):
 
 
 def test_ptg2_manifest_snapshot_publish_attaches_serving_sidecars_and_drops_table(monkeypatch):
+    """Verify this PTG import regression contract."""
     status_calls = []
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
@@ -6887,6 +6905,7 @@ def test_ptg2_manifest_snapshot_publish_can_use_direct_lean_source_layout(monkey
 
 
 def test_ptg2_manifest_snapshot_publish_direct_lean_sidecars_skip_final_serving_table(monkeypatch):
+    """Verify this PTG import regression contract."""
     status_calls = []
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "sidecar_scope_v1")
 
@@ -6962,6 +6981,7 @@ def test_ptg2_manifest_snapshot_publish_direct_lean_sidecars_skip_final_serving_
 
 
 def test_postgres_binary_direct_lean_skips_guard(monkeypatch):
+    """Verify this PTG import regression contract."""
     status_calls = []
 
     async def fake_status(statement, **_params):
@@ -8259,6 +8279,7 @@ def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsa
 
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
+    """Verify this PTG import regression contract."""
     pushed = []
     publish_source_pointers = AsyncMock()
 

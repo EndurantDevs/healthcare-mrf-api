@@ -144,11 +144,12 @@ async def promote_ptg2_source_snapshot(
             raise ValueError(f"snapshot serving tables are missing: {', '.join(missing_tables)}")
         if missing_artifacts:
             raise ValueError(f"snapshot serving artifacts are missing: {', '.join(missing_artifacts)}")
-        previous_snapshot_id = await _current_source_snapshot(schema, source_key)
+        current_snapshot_id, rollback_snapshot_id = await _current_source_snapshot_state(schema, source_key)
         if expected_current_snapshot_id is not None and str(expected_current_snapshot_id or "") != str(
-            previous_snapshot_id or ""
+            current_snapshot_id or ""
         ):
             raise SourceSnapshotConflict("current source snapshot changed")
+        previous_snapshot_id = rollback_snapshot_id if current_snapshot_id == snapshot_id else current_snapshot_id
         import_month = _date_value(snapshot.get("import_month"))
         updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         plan_rows = await _source_plan_rows(
@@ -393,20 +394,15 @@ async def _snapshot_row(schema: str, snapshot_id: str) -> dict[str, Any]:
     return _row_mapping(rows[0]) if rows else {}
 
 
-async def _current_source_snapshot(schema: str, source_key: str) -> str | None:
-    rows = await db.all(
-        f"""
-        SELECT snapshot_id
-          FROM {_quote_ident(schema)}.ptg2_current_source_snapshot
-         WHERE source_key = :source_key
-         LIMIT 1
-        """,
+async def _current_source_snapshot_state(schema: str, source_key: str) -> tuple[str | None, str | None]:
+    row = await db.first(
+        f"SELECT snapshot_id, previous_snapshot_id FROM {_quote_ident(schema)}.ptg2_current_source_snapshot "
+        "WHERE source_key = :source_key LIMIT 1",
         source_key=source_key,
     )
-    if not rows:
-        return None
-    value = _row_mapping(rows[0]).get("snapshot_id")
-    return str(value) if value else None
+    if row is None:
+        return None, None
+    return (str(row[0]) if row[0] else None, str(row[1]) if row[1] else None)
 
 
 async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[str]]:

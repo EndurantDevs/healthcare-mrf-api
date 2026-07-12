@@ -753,6 +753,7 @@ def test_provider_directory_blocker_runtime_rejects_non_v2_registry(
 
 
 def _cms_sma_fixture_csv() -> str:
+    """Verify this provider-directory regression contract."""
     section = [""] * 34
     section[0] = "State Medicaid Agency Interoperability and Patient Access Endpoint Directory"
     section[22] = "Provider Directory Endpoint Information "
@@ -1756,6 +1757,7 @@ def test_source_row_from_seed_overrides_alohr_public_app_base():
 
 
 def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
+    """Verify this provider-directory regression contract."""
     cases = [
         (
             {
@@ -3174,6 +3176,7 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypatch):
+    """Verify this provider-directory regression contract."""
     seen_batches = []
     upsert_calls = []
 
@@ -3302,6 +3305,7 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 
 @pytest.mark.asyncio
 async def test_import_alohr_graphql_source_group_writes_existing_resource_tables(monkeypatch):
+    """Verify this provider-directory regression contract."""
     calls: list[tuple[str, str | None]] = []
 
     async def fake_fetch_page(query, root_key, item_key, *, next_token, timeout):
@@ -7411,6 +7415,7 @@ async def test_endpoint_dataset_does_not_publish_an_empty_resource_selection():
 
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
+    """Verify this provider-directory regression contract."""
     async def fake_fetch_json(url, *, timeout):
         if "/Practitioner/prac-1" in url:
             return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
@@ -7662,6 +7667,7 @@ async def test_import_linked_resource_rows_reports_progress_when_flushing(monkey
 
 @pytest.mark.asyncio
 async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
+    """Verify this provider-directory regression contract."""
     _stub_resource_import_metadata(monkeypatch)
 
     async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
@@ -7830,6 +7836,7 @@ async def test_import_resources_retries_suspicious_zero_practitioner_role(monkey
 
 @pytest.mark.asyncio
 async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_after_retry(monkeypatch):
+    """Verify this provider-directory regression contract."""
     metadata_calls: list[dict[str, Any]] = []
 
     async def fake_update_metadata(_source_ids, **kwargs):
@@ -8461,6 +8468,7 @@ async def test_process_data_does_not_import_valid_non_fhir_retest_rows_without_v
 
 @pytest.mark.asyncio
 async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
+    """Verify this provider-directory regression contract."""
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
@@ -13754,6 +13762,7 @@ async def test_fetch_resource_rows_rewrites_live_hap_page_two(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
+    """Verify this provider-directory regression contract."""
     calls: list[str] = []
 
     async def fake_fetch_json(url, *, timeout):
@@ -14926,6 +14935,7 @@ async def test_generic_403_continuation_remains_fetch_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monkeypatch):
+    """Verify this provider-directory regression contract."""
     _stub_resource_import_metadata(monkeypatch)
 
     fetch_results = [
