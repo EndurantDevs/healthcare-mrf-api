@@ -31,7 +31,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
-    assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered_document
+    assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
     assert "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "AmeriHealth Caritas DC (`amerihealth-dc`) | Probe-only" in rendered_document
     assert "clears plan_name and does not claim NH product membership" in rendered_document
@@ -44,6 +44,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "| Total tracked | 31 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
+    assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | Required" in rendered_document
     assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
     assert "| Registration | Reviewed at | Review valid through |" in rendered_document
@@ -343,10 +344,10 @@ def test_freshness_validation_accepts_current_reviews():
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
         ("uhc", "plan_graph_complete never satisfies endpoint publication"),
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
-        ("horizon-nj", "core resource searches return HAPI HTTP 403"),
+        ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
         ("scan", "family=MA returns HTTP 413 SearchTooCostly"),
-        ("centene", "CloudFront HTTP 403 from dev egress"),
+        ("centene", "return CloudFront HTTP 403 before FHIR processing"),
         ("contra-costa", "Seven public collections follow opaque next-link pagination"),
         ("alohr", "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr"),
     ],
