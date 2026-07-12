@@ -117,9 +117,9 @@ async def test_list_pricing_providers_success():
     )
 
     response = await list_pricing_providers(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
 
 
 @pytest.mark.asyncio
@@ -145,16 +145,16 @@ async def test_list_pricing_providers_tier_relevance_ordering():
     )
 
     response = await list_pricing_providers(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["query"]["order_by"] == "tier_relevance"
-    assert payload["query"]["benchmark_mode"] == "national"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["query"]["order_by"] == "tier_relevance"
+    assert pricing_response["query"]["benchmark_mode"] == "national"
 
 
 @pytest.mark.asyncio
 async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
-    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+    async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
@@ -163,7 +163,7 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_id_for_plan",
-        fake_current_source_snapshot_id_for_plan,
+        fake_snapshot_id,
     )
     monkeypatch.setattr(
         pricing_module,
@@ -180,10 +180,10 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert [item["npi"] for item in payload["providers"]["items"]] == [1000000000, 1234567890]
-    assert payload["providers"]["total_distinct"] == 2
+    assert [pricing_item["npi"] for pricing_item in pricing_response["providers"]["items"]] == [1000000000, 1234567890]
+    assert pricing_response["providers"]["total_distinct"] == 2
     first_params = request.ctx.sa_session.executions[0][0][1]
     count_params = request.ctx.sa_session.executions[1][0][1]
     assert first_params["npi_min"] == 1000000000
@@ -213,16 +213,16 @@ async def test_group_plan_providers_pages_v2_npi_scope(monkeypatch):
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert [item["npi"] for item in payload["providers"]["items"]] == [1234567890]
+    assert [pricing_item["npi"] for pricing_item in pricing_response["providers"]["items"]] == [1234567890]
     sql = str(request.ctx.sa_session.executions[0][0][0])
     assert "FROM mrf.ptg2_provider_npi_scope_test gm" in sql
 
 
 @pytest.mark.asyncio
 async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
-    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+    async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
@@ -231,7 +231,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_id_for_plan",
-        fake_current_source_snapshot_id_for_plan,
+        fake_snapshot_id,
     )
     monkeypatch.setattr(
         pricing_module,
@@ -250,11 +250,11 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert [item["npi"] for item in payload["providers"]["items"]] == [1234567890]
-    assert payload["taxonomy_filter"]["specialty"] == "Family Medicine"
-    assert payload["taxonomy_filter"]["taxonomy_code_set"] == ["207Q00000X", "208D00000X"]
+    assert [pricing_item["npi"] for pricing_item in pricing_response["providers"]["items"]] == [1234567890]
+    assert pricing_response["taxonomy_filter"]["specialty"] == "Family Medicine"
+    assert pricing_response["taxonomy_filter"]["taxonomy_code_set"] == ["207Q00000X", "208D00000X"]
     sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
     assert "mrf.npi_taxonomy group_provider_specialty_nt" in sql
@@ -267,7 +267,7 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_group_plan_providers_classification_internal_medicine_uses_base_taxonomy(monkeypatch):
-    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+    async def fake_snapshot_id(_session, _plan_fields):
         return "ptg2:test"
 
     async def fake_snapshot_serving_tables(_session, _snapshot_id):
@@ -276,7 +276,7 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     monkeypatch.setattr(
         pricing_module,
         "current_source_snapshot_id_for_plan",
-        fake_current_source_snapshot_id_for_plan,
+        fake_snapshot_id,
     )
     monkeypatch.setattr(
         pricing_module,
@@ -295,10 +295,10 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["taxonomy_filter"]["classification"] == "Internal Medicine"
-    assert payload["taxonomy_filter"]["taxonomy_code_set"] == ["207R00000X"]
+    assert pricing_response["taxonomy_filter"]["classification"] == "Internal Medicine"
+    assert pricing_response["taxonomy_filter"]["taxonomy_code_set"] == ["207R00000X"]
     sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
     assert "nucc_taxonomy" not in sql
@@ -359,9 +359,9 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["location_filter"] == {
+    assert pricing_response["location_filter"] == {
         "requested": True,
         "city": "chicago",
         "state": "IL",
@@ -374,8 +374,8 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         "count_requested": True,
         "count_exact": True,
     }
-    assert payload["providers"]["total_distinct"] == 1
-    assert payload["providers"]["items"][0]["address"] == {
+    assert pricing_response["providers"]["total_distinct"] == 1
+    assert pricing_response["providers"]["items"][0]["address"] == {
         "type": "primary",
         "first_line": "1400 W GREENLEAF AVE STE 101",
         "second_line": None,
@@ -646,14 +646,14 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     )
 
     response = await group_plan_providers(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["location_filter"]["address_source"] == "unified"
-    assert payload["location_filter"]["address_types"] == ["practice", "site", "primary", "secondary"]
-    assert payload["location_filter"]["count_requested"] is True
-    assert payload["location_filter"]["count_exact"] is False
-    assert payload["providers"]["total_distinct"] is None
-    assert payload["providers"]["items"][0]["address"] == {
+    assert pricing_response["location_filter"]["address_source"] == "unified"
+    assert pricing_response["location_filter"]["address_types"] == ["practice", "site", "primary", "secondary"]
+    assert pricing_response["location_filter"]["count_requested"] is True
+    assert pricing_response["location_filter"]["count_exact"] is False
+    assert pricing_response["providers"]["total_distinct"] is None
+    assert pricing_response["providers"]["items"][0]["address"] == {
         "type": "practice",
         "first_line": "2335 S MICHIGAN AVE",
         "second_line": None,
@@ -698,17 +698,17 @@ async def test_list_provider_procedures_success():
     )
 
     response = await list_provider_procedures(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["procedure_code"] == 123
-    assert payload["items"][0]["service_code_system"] == "HP_PROCEDURE_CODE"
-    assert payload["items"][0]["service_code"] == "123"
-    assert payload["items"][0]["service_name"] == "Apixaban"
-    assert payload["items"][0]["total_services"] == 45
-    assert payload["items"][0]["total_allowed_amount"] == 998.7
-    assert "total_30day_fills" not in payload["items"][0]
-    assert "total_day_supply" not in payload["items"][0]
-    assert "total_drug_cost" not in payload["items"][0]
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["procedure_code"] == 123
+    assert pricing_response["items"][0]["service_code_system"] == "HP_PROCEDURE_CODE"
+    assert pricing_response["items"][0]["service_code"] == "123"
+    assert pricing_response["items"][0]["service_name"] == "Apixaban"
+    assert pricing_response["items"][0]["total_services"] == 45
+    assert pricing_response["items"][0]["total_allowed_amount"] == 998.7
+    assert "total_30day_fills" not in pricing_response["items"][0]
+    assert "total_day_supply" not in pricing_response["items"][0]
+    assert "total_drug_cost" not in pricing_response["items"][0]
 
 
 @pytest.mark.asyncio
@@ -743,11 +743,11 @@ async def test_list_provider_procedure_locations_success():
     )
 
     response = await list_provider_procedure_locations(request, "1003000126", "123")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["city"] == "Bethesda"
-    assert payload["items"][0]["service_code"] == "321"
-    assert payload["items"][0]["total_allowed_amount"] == 55.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["city"] == "Bethesda"
+    assert pricing_response["items"][0]["service_code"] == "321"
+    assert pricing_response["items"][0]["total_allowed_amount"] == 55.0
 
 
 @pytest.mark.asyncio
@@ -775,13 +775,13 @@ async def test_list_provider_procedures_legacy_fields_opt_in():
     )
 
     response = await list_provider_procedures(request, "1003000126")
-    payload = json.loads(response.body)
-    item = payload["items"][0]
-    assert item["reported_code"] == "70553"
-    assert item["reported_code_system"] == "CPT"
-    assert item["total_30day_fills"] == 40
-    assert item["total_day_supply"] == 50
-    assert item["total_drug_cost"] == 998.7
+    pricing_response = json.loads(response.body)
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["reported_code"] == "70553"
+    assert pricing_item["reported_code_system"] == "CPT"
+    assert pricing_item["total_30day_fills"] == 40
+    assert pricing_item["total_day_supply"] == 50
+    assert pricing_item["total_drug_cost"] == 998.7
 
 
 @pytest.mark.asyncio
@@ -808,10 +808,10 @@ async def test_list_provider_procedures_with_code_resolution():
     )
 
     response = await list_provider_procedures(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["query"]["input_code"]["code_system"] == "HCPCS"
-    assert payload["query"]["resolved_codes"][0]["code_system"] == "HCPCS"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["query"]["input_code"]["code_system"] == "HCPCS"
+    assert pricing_response["query"]["resolved_codes"][0]["code_system"] == "HCPCS"
 
 
 @pytest.mark.asyncio
@@ -825,14 +825,15 @@ async def test_list_procedure_providers_success():
     )
 
     response = await list_procedure_providers(request, "HP_PROCEDURE_CODE", "123")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["query"]["input_code"]["code_system"] == "HP_PROCEDURE_CODE"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["query"]["input_code"]["code_system"] == "HP_PROCEDURE_CODE"
 
 
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_success():
+    """Return the configured provider score and benchmark details."""
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_quality_score"),
@@ -958,36 +959,36 @@ async def test_get_pricing_provider_score_success():
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["npi"] == 1003000126
-    assert payload["model_version"] == "v2"
-    assert payload["benchmark_mode"] == "national"
-    assert payload["tier"] == "high"
-    assert payload["borderline_status"] is False
-    assert payload["score_0_100"] == 72.4
-    assert payload["estimated_cost_level"] == "$$"
-    assert payload["score_method"] == "direct"
-    assert payload["confidence_0_100"] == 91.0
-    assert payload["confidence_band"] == "high"
-    assert payload["cost_source"] == "direct"
-    assert payload["provider_class"] == "clinician"
-    assert payload["evidence_profile"]["has_claims"] is True
-    assert payload["evidence_profile"]["has_qpp"] is True
-    assert payload["evidence_profile"]["location_source"] == "doctor_clinician_address"
-    assert payload["overall"]["risk_ratio_point"] == 0.91
-    assert payload["overall"]["ci_75"]["low"] == 0.86
-    assert payload["domains"]["appropriateness"]["risk_ratio_point"] == 0.93
-    assert payload["domains"]["effectiveness"]["score_0_100"] == 75.0
-    assert payload["domains"]["cost"]["evidence_n"] == 201.0
-    assert payload["curation_checks"]["high_score_threshold_passed"] is True
-    assert payload["cohort_context"]["computed_live"] is False
-    assert payload["cohort_context"]["selected_geography"] == "national"
-    assert payload["cohort_context"]["selected_cohort_level"] == "L3"
-    assert payload["scores_by_benchmark_mode"]["zip"]["tier"] == "low"
-    assert payload["scores_by_benchmark_mode"]["state"]["tier"] == "acceptable"
-    assert payload["scores_by_benchmark_mode"]["national"]["tier"] == "high"
-    assert payload["scores_by_benchmark_mode"]["national"]["cohort_context"]["computed_live"] is False
-    assert payload["available_benchmark_modes"] == ["zip", "state", "national"]
+    pricing_response = json.loads(response.body)
+    assert pricing_response["npi"] == 1003000126
+    assert pricing_response["model_version"] == "v2"
+    assert pricing_response["benchmark_mode"] == "national"
+    assert pricing_response["tier"] == "high"
+    assert pricing_response["borderline_status"] is False
+    assert pricing_response["score_0_100"] == 72.4
+    assert pricing_response["estimated_cost_level"] == "$$"
+    assert pricing_response["score_method"] == "direct"
+    assert pricing_response["confidence_0_100"] == 91.0
+    assert pricing_response["confidence_band"] == "high"
+    assert pricing_response["cost_source"] == "direct"
+    assert pricing_response["provider_class"] == "clinician"
+    assert pricing_response["evidence_profile"]["has_claims"] is True
+    assert pricing_response["evidence_profile"]["has_qpp"] is True
+    assert pricing_response["evidence_profile"]["location_source"] == "doctor_clinician_address"
+    assert pricing_response["overall"]["risk_ratio_point"] == 0.91
+    assert pricing_response["overall"]["ci_75"]["low"] == 0.86
+    assert pricing_response["domains"]["appropriateness"]["risk_ratio_point"] == 0.93
+    assert pricing_response["domains"]["effectiveness"]["score_0_100"] == 75.0
+    assert pricing_response["domains"]["cost"]["evidence_n"] == 201.0
+    assert pricing_response["curation_checks"]["high_score_threshold_passed"] is True
+    assert pricing_response["cohort_context"]["computed_live"] is False
+    assert pricing_response["cohort_context"]["selected_geography"] == "national"
+    assert pricing_response["cohort_context"]["selected_cohort_level"] == "L3"
+    assert pricing_response["scores_by_benchmark_mode"]["zip"]["tier"] == "low"
+    assert pricing_response["scores_by_benchmark_mode"]["state"]["tier"] == "acceptable"
+    assert pricing_response["scores_by_benchmark_mode"]["national"]["tier"] == "high"
+    assert pricing_response["scores_by_benchmark_mode"]["national"]["cohort_context"]["computed_live"] is False
+    assert pricing_response["available_benchmark_modes"] == ["zip", "state", "national"]
 
 
 @pytest.mark.asyncio
@@ -1044,15 +1045,16 @@ async def test_get_pricing_provider_score_defaults_to_most_local_mode():
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["benchmark_mode"] == "zip"
-    assert payload["tier"] == "high"
-    assert payload.get("cohort_context") is None
-    assert payload["scores_by_benchmark_mode"]["state"] is None
+    pricing_response = json.loads(response.body)
+    assert pricing_response["benchmark_mode"] == "zip"
+    assert pricing_response["tier"] == "high"
+    assert pricing_response.get("cohort_context") is None
+    assert pricing_response["scores_by_benchmark_mode"]["state"] is None
 
 
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_live_override_path():
+    """Prefer a qualifying live score over the stored score."""
     request = make_request(
         [
             FakeResult(
@@ -1118,29 +1120,30 @@ async def test_get_pricing_provider_score_live_override_path():
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["benchmark_mode"] == "zip"
-    assert payload["tier"] == "acceptable"
-    assert payload["score_0_100"] == 50.0
-    assert payload["available_benchmark_modes"] == ["zip"]
-    assert payload["scores_by_benchmark_mode"]["zip"] is not None
-    assert payload["scores_by_benchmark_mode"]["state"] is None
-    assert payload["scores_by_benchmark_mode"]["national"] is None
-    assert payload["cohort_context"]["computed_live"] is True
-    assert payload["cohort_context"]["selected_geography"] == "zip:20850"
-    assert payload["cohort_context"]["selected_cohort_level"] == "L0"
-    assert payload["cohort_context"]["peer_count"] == 44
-    assert payload["cohort_context"]["specialty_key"] == "cardiology"
-    assert payload["cohort_context"]["taxonomy_code"] == "207RC0000X"
-    assert payload["cohort_context"]["procedure_match_threshold"] == 0.3
-    assert payload["score_method"] == "direct"
-    assert payload["confidence_band"] == "high"
-    assert payload["cost_source"] == "direct"
-    assert payload["evidence_profile"]["has_claims"] is True
+    pricing_response = json.loads(response.body)
+    assert pricing_response["benchmark_mode"] == "zip"
+    assert pricing_response["tier"] == "acceptable"
+    assert pricing_response["score_0_100"] == 50.0
+    assert pricing_response["available_benchmark_modes"] == ["zip"]
+    assert pricing_response["scores_by_benchmark_mode"]["zip"] is not None
+    assert pricing_response["scores_by_benchmark_mode"]["state"] is None
+    assert pricing_response["scores_by_benchmark_mode"]["national"] is None
+    assert pricing_response["cohort_context"]["computed_live"] is True
+    assert pricing_response["cohort_context"]["selected_geography"] == "zip:20850"
+    assert pricing_response["cohort_context"]["selected_cohort_level"] == "L0"
+    assert pricing_response["cohort_context"]["peer_count"] == 44
+    assert pricing_response["cohort_context"]["specialty_key"] == "cardiology"
+    assert pricing_response["cohort_context"]["taxonomy_code"] == "207RC0000X"
+    assert pricing_response["cohort_context"]["procedure_match_threshold"] == 0.3
+    assert pricing_response["score_method"] == "direct"
+    assert pricing_response["confidence_band"] == "high"
+    assert pricing_response["cost_source"] == "direct"
+    assert pricing_response["evidence_profile"]["has_claims"] is True
 
 
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_live_override_all_modes_when_benchmark_not_forced():
+    """Apply live overrides across modes when no benchmark is forced."""
     request = make_request(
         [
             FakeResult(
@@ -1242,13 +1245,13 @@ async def test_get_pricing_provider_score_live_override_all_modes_when_benchmark
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["benchmark_mode"] == "zip"
-    assert payload["available_benchmark_modes"] == ["zip", "state", "national"]
-    assert payload["scores_by_benchmark_mode"]["zip"] is not None
-    assert payload["scores_by_benchmark_mode"]["state"] is not None
-    assert payload["scores_by_benchmark_mode"]["national"] is not None
-    assert payload["cohort_context"]["computed_live"] is True
+    pricing_response = json.loads(response.body)
+    assert pricing_response["benchmark_mode"] == "zip"
+    assert pricing_response["available_benchmark_modes"] == ["zip", "state", "national"]
+    assert pricing_response["scores_by_benchmark_mode"]["zip"] is not None
+    assert pricing_response["scores_by_benchmark_mode"]["state"] is not None
+    assert pricing_response["scores_by_benchmark_mode"]["national"] is not None
+    assert pricing_response["cohort_context"]["computed_live"] is True
 
 
 @pytest.mark.asyncio
@@ -1312,6 +1315,7 @@ async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monke
 
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
+    """Estimate a provider score when direct score evidence is absent."""
     async def _fake_profile(_session, *, npi, year):
         assert npi == 1003000126
         assert year == 2023
@@ -1388,15 +1392,15 @@ async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["benchmark_mode"] == "zip"
-    assert payload["score_method"] == "estimated"
-    assert payload["confidence_band"] == "low"
-    assert payload["cost_source"] == "peer_estimated"
-    assert payload["available_benchmark_modes"] == ["zip"]
-    assert payload["cohort_context"]["selected_geography"] == "zip:20850"
-    assert payload["evidence_profile"]["has_claims"] is False
-    assert payload["evidence_profile"]["has_enrollment"] is True
+    pricing_response = json.loads(response.body)
+    assert pricing_response["benchmark_mode"] == "zip"
+    assert pricing_response["score_method"] == "estimated"
+    assert pricing_response["confidence_band"] == "low"
+    assert pricing_response["cost_source"] == "peer_estimated"
+    assert pricing_response["available_benchmark_modes"] == ["zip"]
+    assert pricing_response["cohort_context"]["selected_geography"] == "zip:20850"
+    assert pricing_response["evidence_profile"]["has_claims"] is False
+    assert pricing_response["evidence_profile"]["has_enrollment"] is True
 
 
 @pytest.mark.asyncio
@@ -1432,17 +1436,18 @@ async def test_get_pricing_provider_score_unavailable_when_profile_is_insufficie
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["score_method"] == "unavailable"
-    assert payload["tier"] is None
-    assert payload["score_0_100"] is None
-    assert "missing_specialty_or_taxonomy" in payload["unavailable_reasons"]
-    assert "missing_geography" in payload["unavailable_reasons"]
-    assert payload["available_benchmark_modes"] == []
+    pricing_response = json.loads(response.body)
+    assert pricing_response["score_method"] == "unavailable"
+    assert pricing_response["tier"] is None
+    assert pricing_response["score_0_100"] is None
+    assert "missing_specialty_or_taxonomy" in pricing_response["unavailable_reasons"]
+    assert "missing_geography" in pricing_response["unavailable_reasons"]
+    assert pricing_response["available_benchmark_modes"] == []
 
 
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_variants_scope_provider_returns_variant_cards():
+    """Return score variant cards for provider-scoped requests."""
     request = make_request(
         [
             FakeResult(
@@ -1546,16 +1551,16 @@ async def test_get_pricing_provider_score_variants_scope_provider_returns_varian
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["variants_scope"] == "provider"
-    assert payload["benchmark_mode"] == "zip"
-    assert payload["available_benchmark_modes"] == ["zip", "state", "national"]
-    assert len(payload["variants_by_benchmark_mode"]["zip"]) == 2
-    assert len(payload["variants_by_benchmark_mode"]["state"]) == 1
-    assert len(payload["variants_by_benchmark_mode"]["national"]) == 1
-    assert payload["variants_by_benchmark_mode"]["zip"][0]["benchmark_mode"] == "zip"
-    assert payload["variants_by_benchmark_mode"]["zip"][0]["cohort_context"]["selected_cohort_level"] == "L0"
-    assert payload["variants_by_benchmark_mode"]["zip"][0]["cohort_context"]["computed_live"] is True
+    pricing_response = json.loads(response.body)
+    assert pricing_response["variants_scope"] == "provider"
+    assert pricing_response["benchmark_mode"] == "zip"
+    assert pricing_response["available_benchmark_modes"] == ["zip", "state", "national"]
+    assert len(pricing_response["variants_by_benchmark_mode"]["zip"]) == 2
+    assert len(pricing_response["variants_by_benchmark_mode"]["state"]) == 1
+    assert len(pricing_response["variants_by_benchmark_mode"]["national"]) == 1
+    assert pricing_response["variants_by_benchmark_mode"]["zip"][0]["benchmark_mode"] == "zip"
+    assert pricing_response["variants_by_benchmark_mode"]["zip"][0]["cohort_context"]["selected_cohort_level"] == "L0"
+    assert pricing_response["variants_by_benchmark_mode"]["zip"][0]["cohort_context"]["computed_live"] is True
 
 
 @pytest.mark.asyncio
@@ -1615,15 +1620,15 @@ async def test_list_provider_prescriptions_success():
     )
 
     response = await list_provider_prescriptions(request, "1003000126")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["prescription_code_system"] == "HP_RX_CODE"
-    assert payload["items"][0]["prescription_code"] == "12345"
-    assert payload["items"][0]["prescription_name"] == "Atorvastatin"
-    assert payload["items"][0]["total_prescriptions"] == 100
-    assert payload["items"][0]["total_allowed_amount"] == 1200.0
-    assert payload["items"][0]["preferred_prescription_code_system"] == "HP_RX_CODE"
-    assert payload["items"][0]["preferred_prescription_code"] == "12345"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["prescription_code_system"] == "HP_RX_CODE"
+    assert pricing_response["items"][0]["prescription_code"] == "12345"
+    assert pricing_response["items"][0]["prescription_name"] == "Atorvastatin"
+    assert pricing_response["items"][0]["total_prescriptions"] == 100
+    assert pricing_response["items"][0]["total_allowed_amount"] == 1200.0
+    assert pricing_response["items"][0]["preferred_prescription_code_system"] == "HP_RX_CODE"
+    assert pricing_response["items"][0]["preferred_prescription_code"] == "12345"
 
 
 @pytest.mark.asyncio
@@ -1669,12 +1674,12 @@ async def test_list_provider_prescriptions_prefers_ndc_then_rxnorm():
     )
 
     response = await list_provider_prescriptions(request, "1003000126")
-    payload = json.loads(response.body)
-    item = payload["items"][0]
-    assert item["ndc_code"] == "00071015523"
-    assert item["rxnorm_id"] == "83367"
-    assert item["preferred_prescription_code_system"] == "NDC"
-    assert item["preferred_prescription_code"] == "00071015523"
+    pricing_response = json.loads(response.body)
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["ndc_code"] == "00071015523"
+    assert pricing_item["rxnorm_id"] == "83367"
+    assert pricing_item["preferred_prescription_code_system"] == "NDC"
+    assert pricing_item["preferred_prescription_code"] == "00071015523"
 
 
 @pytest.mark.asyncio
@@ -1700,11 +1705,11 @@ async def test_get_provider_prescription_success():
     )
 
     response = await get_provider_prescription(request, "1003000126", "HP_RX_CODE", "12345")
-    payload = json.loads(response.body)
-    assert payload["prescription_code"] == "12345"
-    assert payload["prescription_name"] == "Atorvastatin"
-    assert payload["total_prescriptions"] == 50
-    assert payload["total_allowed_amount"] == 600.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["prescription_code"] == "12345"
+    assert pricing_response["prescription_name"] == "Atorvastatin"
+    assert pricing_response["total_prescriptions"] == 50
+    assert pricing_response["total_allowed_amount"] == 600.0
 
 
 @pytest.mark.asyncio
@@ -1729,11 +1734,11 @@ async def test_list_prescription_providers_success():
     )
 
     response = await list_prescription_providers(request, "HP_RX_CODE", "12345")
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["items"][0]["total_prescriptions"] == 80
-    assert payload["items"][0]["total_allowed_amount"] == 900.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["items"][0]["total_prescriptions"] == 80
+    assert pricing_response["items"][0]["total_allowed_amount"] == 900.0
 
 
 @pytest.mark.asyncio
@@ -1773,11 +1778,11 @@ async def test_get_prescription_benchmarks_success():
     )
 
     response = await get_prescription_benchmarks(request, "NDC", "0001")
-    payload = json.loads(response.body)
-    assert payload["query"]["input_code"]["code_system"] == "NDC"
-    assert payload["benchmark"]["provider_count"] == 5
-    assert payload["benchmark"]["total_prescriptions"] == 300.0
-    assert payload["benchmark"]["total_allowed_amount"] == 2500.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["query"]["input_code"]["code_system"] == "NDC"
+    assert pricing_response["benchmark"]["provider_count"] == 5
+    assert pricing_response["benchmark"]["total_prescriptions"] == 300.0
+    assert pricing_response["benchmark"]["total_allowed_amount"] == 2500.0
 
 
 @pytest.mark.asyncio
@@ -1817,12 +1822,12 @@ async def test_autocomplete_procedures_dedupes_terms_across_systems():
     )
 
     response = await autocomplete_procedures(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    item = payload["items"][0]
-    assert item["term"] == "Magnetic resonance imaging"
-    assert set(item["code_systems"]) == {"CPT", "HCPCS", "HP_PROCEDURE_CODE"}
-    assert "123456" in item["internal_codes"]
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["term"] == "Magnetic resonance imaging"
+    assert set(pricing_item["code_systems"]) == {"CPT", "HCPCS", "HP_PROCEDURE_CODE"}
+    assert "123456" in pricing_item["internal_codes"]
 
 
 @pytest.mark.asyncio
@@ -1851,17 +1856,17 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
     )
 
     response = await autocomplete_prescriptions(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    item = payload["items"][0]
-    assert item["generic_name"] == "Lisinopril"
-    assert item["brand_name"] == "Prinivil"
-    assert item["display_label"] == "Lisinopril / Prinivil"
-    assert item["total_prescriptions"] == 500
-    assert item["prescription_code_system"] == "HP_RX_CODE"
-    assert item["prescription_code"] == "ABC123"
-    assert item["preferred_prescription_code_system"] == "HP_RX_CODE"
-    assert item["preferred_prescription_code"] == "ABC123"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["generic_name"] == "Lisinopril"
+    assert pricing_item["brand_name"] == "Prinivil"
+    assert pricing_item["display_label"] == "Lisinopril / Prinivil"
+    assert pricing_item["total_prescriptions"] == 500
+    assert pricing_item["prescription_code_system"] == "HP_RX_CODE"
+    assert pricing_item["prescription_code"] == "ABC123"
+    assert pricing_item["preferred_prescription_code_system"] == "HP_RX_CODE"
+    assert pricing_item["preferred_prescription_code"] == "ABC123"
 
 
 @pytest.mark.asyncio
@@ -1906,13 +1911,13 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
     )
 
     response = await autocomplete_prescriptions(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    item = payload["items"][0]
-    assert item["ndc_code"] == "00093015001"
-    assert item["rxnorm_id"] == "29046"
-    assert item["preferred_prescription_code_system"] == "NDC"
-    assert item["preferred_prescription_code"] == "00093015001"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["ndc_code"] == "00093015001"
+    assert pricing_item["rxnorm_id"] == "29046"
+    assert pricing_item["preferred_prescription_code_system"] == "NDC"
+    assert pricing_item["preferred_prescription_code"] == "00093015001"
 
 
 @pytest.mark.asyncio
@@ -1948,17 +1953,17 @@ async def test_list_providers_by_procedure_with_q():
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["query"]["q"] == "mri"
-    assert payload["query"]["state"] == "MD"
-    assert payload["query"]["include_sources"] is True
-    assert payload["query"]["include_evidence"] is True
-    assert payload["sources"][0]["source_importer"] == "claims-pricing"
-    assert payload["sources"][0]["serving_tables"] == ["pricing_provider", "pricing_provider_procedure"]
-    assert payload["evidence"]["matched_provider_location_count"] == 1
-    assert payload["evidence"]["filters"]["state"] == "MD"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["query"]["q"] == "mri"
+    assert pricing_response["query"]["state"] == "MD"
+    assert pricing_response["query"]["include_sources"] is True
+    assert pricing_response["query"]["include_evidence"] is True
+    assert pricing_response["sources"][0]["source_importer"] == "claims-pricing"
+    assert pricing_response["sources"][0]["serving_tables"] == ["pricing_provider", "pricing_provider_procedure"]
+    assert pricing_response["evidence"]["matched_provider_location_count"] == 1
+    assert pricing_response["evidence"]["filters"]["state"] == "MD"
 
 
 @pytest.mark.asyncio
@@ -2006,19 +2011,19 @@ async def test_list_provider_specialties_filters_by_procedure_and_geo():
     )
 
     response = await list_provider_specialties(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 2
-    assert payload["items"][0] == {
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 2
+    assert pricing_response["items"][0] == {
         "specialty": "Family Medicine",
         "specialty_key": "family medicine",
         "provider_count": 12,
         "total_services": 345.0,
     }
-    assert payload["items"][1]["specialty"] == "Internal Medicine"
-    assert payload["query"]["code"] == "99214"
-    assert payload["query"]["zip5"] == "10001"
-    assert payload["query"]["q"] == "medicine"
-    assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in payload["query"][
+    assert pricing_response["items"][1]["specialty"] == "Internal Medicine"
+    assert pricing_response["query"]["code"] == "99214"
+    assert pricing_response["query"]["zip5"] == "10001"
+    assert pricing_response["query"]["q"] == "medicine"
+    assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in pricing_response["query"][
         "resolved_codes"
     ]
 
@@ -2056,12 +2061,12 @@ async def test_resolve_procedure_taxonomy_em_code_needs_intent(monkeypatch):
     request = make_request([], args={"code": "99214", "code_system": "CPT", "year": "2023"})
 
     response = await resolve_procedure_taxonomy(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["resolution"]["status"] == "ambiguous"
-    assert payload["resolution"]["recommended_mode"] == "ambiguous"
-    assert payload["resolution"]["needs_intent"] is True
-    assert payload["resolution"]["provider_filter"] is None
+    assert pricing_response["resolution"]["status"] == "ambiguous"
+    assert pricing_response["resolution"]["recommended_mode"] == "ambiguous"
+    assert pricing_response["resolution"]["needs_intent"] is True
+    assert pricing_response["resolution"]["provider_filter"] is None
 
 
 @pytest.mark.asyncio
@@ -2083,14 +2088,14 @@ async def test_resolve_procedure_taxonomy_acl_uses_soft_ortho_boost(monkeypatch)
     request = make_request([], args={"code": "29888", "code_system": "CPT", "year": "2023"})
 
     response = await resolve_procedure_taxonomy(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["resolution"]["status"] == "resolved"
-    assert payload["resolution"]["recommended_mode"] == "soft_boost"
-    assert payload["resolution"]["safe_for_hard_filter"] is False
-    assert "207X00000X" in payload["resolution"]["taxonomy_codes"]
-    assert payload["resolution"]["provider_boost"]["primary_only"] is False
-    assert "procedure_is_known_to_skew_younger_than_medicare_ffs" in payload["evidence"]["bias_notes"]
+    assert pricing_response["resolution"]["status"] == "resolved"
+    assert pricing_response["resolution"]["recommended_mode"] == "soft_boost"
+    assert pricing_response["resolution"]["safe_for_hard_filter"] is False
+    assert "207X00000X" in pricing_response["resolution"]["taxonomy_codes"]
+    assert pricing_response["resolution"]["provider_boost"]["primary_only"] is False
+    assert "procedure_is_known_to_skew_younger_than_medicare_ffs" in pricing_response["evidence"]["bias_notes"]
 
 
 @pytest.mark.asyncio
@@ -2123,20 +2128,20 @@ async def test_resolve_procedure_taxonomy_requires_explicit_hard_filter_opt_in(m
 
     request = make_request([], args={"code": "70551", "code_system": "CPT", "year": "2023"})
     response = await resolve_procedure_taxonomy(request)
-    payload = json.loads(response.body)
-    assert payload["resolution"]["safe_for_hard_filter"] is True
-    assert payload["resolution"]["recommended_mode"] == "soft_boost"
-    assert payload["resolution"]["provider_filter"] is None
+    pricing_response = json.loads(response.body)
+    assert pricing_response["resolution"]["safe_for_hard_filter"] is True
+    assert pricing_response["resolution"]["recommended_mode"] == "soft_boost"
+    assert pricing_response["resolution"]["provider_filter"] is None
 
     request = make_request(
         [],
         args={"code": "70551", "code_system": "CPT", "year": "2023", "allow_hard_filter": "true"},
     )
     response = await resolve_procedure_taxonomy(request)
-    payload = json.loads(response.body)
-    assert payload["resolution"]["recommended_mode"] == "hard_filter"
-    assert "2085R0202X" in payload["resolution"]["provider_filter"]["taxonomy_codes"]
-    assert payload["resolution"]["provider_filter"]["primary_only"] is False
+    pricing_response = json.loads(response.body)
+    assert pricing_response["resolution"]["recommended_mode"] == "hard_filter"
+    assert "2085R0202X" in pricing_response["resolution"]["provider_filter"]["taxonomy_codes"]
+    assert pricing_response["resolution"]["provider_filter"]["primary_only"] is False
 
 
 @pytest.mark.asyncio
@@ -2189,10 +2194,10 @@ async def test_load_procedure_taxonomy_evidence_uses_cache(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatch):
-    seen_args = {}
-
+    """Pass plan filters through the PTG provider search path."""
+    seen_argument_map = {}
     async def fake_search(_session, args, pagination):
-        seen_args.update(args)
+        seen_argument_map.update(args)
         return {
             "items": [{"npi": 1234567890, "tic_prices": [{"negotiated_rate": "450.00"}]}],
             "pagination": {
@@ -2203,7 +2208,6 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             },
             "query": {"source": "ptg2", "plan_id": args["plan_id"]},
         }
-
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [FakeResult(scalar=1)],
@@ -2226,28 +2230,27 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             "radius_miles": "10",
         },
     )
-
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
-    assert payload["query"]["source"] == "ptg2"
-    assert seen_args["plan_market_type"] == "group"
-    assert seen_args["source_key"] == "example_dental"
-    assert seen_args["include_providers"] == "true"
-    assert seen_args["include_code_details"] == "true"
-    assert seen_args["include_sources"] == "true"
-    assert seen_args["include_unverified_addresses"] == "true"
-    assert seen_args["include_details"] is None
-    assert seen_args["classification"] == "Internal Medicine"
-    assert seen_args["taxonomy_codes"] == "207R00000X"
-    assert seen_args["include_subspecialties"] == "false"
-    assert seen_args["primary_only"] == "false"
-    assert seen_args["order_by"] == "total_allowed_amount"
-    assert seen_args["order"] == "asc"
-    assert seen_args["lat"] == 29.7604
-    assert seen_args["long"] == -95.3698
-    assert seen_args["radius_miles"] == 10.0
+    assert pricing_response["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
+    assert pricing_response["query"]["source"] == "ptg2"
+    assert seen_argument_map["plan_market_type"] == "group"
+    assert seen_argument_map["source_key"] == "example_dental"
+    assert seen_argument_map["include_providers"] == "true"
+    assert seen_argument_map["include_code_details"] == "true"
+    assert seen_argument_map["include_sources"] == "true"
+    assert seen_argument_map["include_unverified_addresses"] == "true"
+    assert seen_argument_map["include_details"] is None
+    assert seen_argument_map["classification"] == "Internal Medicine"
+    assert seen_argument_map["taxonomy_codes"] == "207R00000X"
+    assert seen_argument_map["include_subspecialties"] == "false"
+    assert seen_argument_map["primary_only"] == "false"
+    assert seen_argument_map["order_by"] == "total_allowed_amount"
+    assert seen_argument_map["order"] == "asc"
+    assert seen_argument_map["lat"] == 29.7604
+    assert seen_argument_map["long"] == -95.3698
+    assert seen_argument_map["radius_miles"] == 10.0
 
 
 @pytest.mark.asyncio
@@ -2274,9 +2277,9 @@ async def test_list_providers_by_procedure_infers_ptg_code_system(monkeypatch):
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["query"]["source"] == "ptg2"
+    assert pricing_response["query"]["source"] == "ptg2"
     assert observed_search_args_by_name["code_system"] == "CPT"
 
 
@@ -2319,13 +2322,13 @@ async def test_list_providers_by_procedure_falls_back_to_allowed_amount_evidence
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["result_state"] == "allowed_amounts_found"
-    assert payload["pricing_scope"] == "plan_scoped_allowed_amounts"
-    assert payload["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
-    assert payload["items"][0]["prices"][0]["source"] == "allowed_amounts"
-    assert payload["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
+    assert pricing_response["result_state"] == "allowed_amounts_found"
+    assert pricing_response["pricing_scope"] == "plan_scoped_allowed_amounts"
+    assert pricing_response["items"][0]["network_status"] == "out_of_network_or_not_confirmed_in_network"
+    assert pricing_response["items"][0]["prices"][0]["source"] == "allowed_amounts"
+    assert pricing_response["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
 
 
 @pytest.mark.asyncio
@@ -2364,11 +2367,11 @@ async def test_allowed_amount_empty_ptg_fallback(monkeypatch):
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["result_state"] == "allowed_amounts_found"
-    assert payload["items"][0]["allowed_amount_min"] == 133.0
-    assert payload["query"]["source"] == "ptg_allowed_amounts"
+    assert pricing_response["result_state"] == "allowed_amounts_found"
+    assert pricing_response["items"][0]["allowed_amount_min"] == 133.0
+    assert pricing_response["query"]["source"] == "ptg_allowed_amounts"
 
 
 @pytest.mark.asyncio
@@ -2559,11 +2562,11 @@ async def test_list_providers_by_procedure_can_disable_allowed_amount_fallback(m
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["items"] == []
-    assert payload["result_state"] == "no_snapshot_for_plan"
-    assert payload["query"]["source"] == "ptg2"
+    assert pricing_response["items"] == []
+    assert pricing_response["result_state"] == "no_snapshot_for_plan"
+    assert pricing_response["query"]["source"] == "ptg2"
 
 
 @pytest.mark.asyncio
@@ -2593,10 +2596,10 @@ async def test_list_providers_by_procedure_rejects_broad_group_plan_office_visit
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_office_visit(monkeypatch):
-    observed_search_args = {}
+    observed_search_argument_map = {}
 
     async def fake_search(_session, args, pagination):
-        observed_search_args.update(args)
+        observed_search_argument_map.update(args)
         return {
             "items": [],
             "pagination": {
@@ -2624,19 +2627,19 @@ async def test_list_providers_by_procedure_allows_taxonomy_scoped_group_plan_off
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["query"]["source"] == "ptg2"
-    assert observed_search_args["classification"] == "Family Medicine"
-    assert observed_search_args["include_providers"] == "true"
+    assert pricing_response["query"]["source"] == "ptg2"
+    assert observed_search_argument_map["classification"] == "Family Medicine"
+    assert observed_search_argument_map["include_providers"] == "true"
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(monkeypatch):
-    seen_args = {}
+async def test_procedure_provider_search_uses_default_zip_radius(monkeypatch):
+    seen_argument_map = {}
 
     async def fake_search(_session, args, pagination):
-        seen_args.update(args)
+        seen_argument_map.update(args)
         return {
             "items": [],
             "pagination": {
@@ -2674,22 +2677,22 @@ async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["query"]["zip_radius_miles"] == 10.0
-    assert seen_args["zip5"] == "62401"
-    assert seen_args["zip_radius_miles"] == 10.0
-    assert seen_args["lat"] == 39.1200
-    assert seen_args["long"] == -88.5434
-    assert seen_args["radius_miles"] == 10.0
+    assert pricing_response["query"]["zip_radius_miles"] == 10.0
+    assert seen_argument_map["zip5"] == "62401"
+    assert seen_argument_map["zip_radius_miles"] == 10.0
+    assert seen_argument_map["lat"] == 39.1200
+    assert seen_argument_map["long"] == -88.5434
+    assert seen_argument_map["radius_miles"] == 10.0
 
 
 @pytest.mark.asyncio
-async def test_list_providers_by_procedure_allows_100_mile_zip_radius_to_ptg2(monkeypatch):
-    seen_args = {}
+async def test_procedure_provider_search_allows_100_mile_radius(monkeypatch):
+    seen_argument_map = {}
 
     async def fake_search(_session, args, pagination):
-        seen_args.update(args)
+        seen_argument_map.update(args)
         return {
             "items": [],
             "pagination": {
@@ -2727,11 +2730,11 @@ async def test_list_providers_by_procedure_allows_100_mile_zip_radius_to_ptg2(mo
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["query"]["zip_radius_miles"] == 100.0
-    assert seen_args["zip_radius_miles"] == 100.0
-    assert seen_args["radius_miles"] == 100.0
+    assert pricing_response["query"]["zip_radius_miles"] == 100.0
+    assert seen_argument_map["zip_radius_miles"] == 100.0
+    assert seen_argument_map["radius_miles"] == 100.0
 
 
 @pytest.mark.asyncio
@@ -2752,14 +2755,14 @@ async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_ma
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["items"] == []
-    assert payload["pagination"]["total"] == 0
-    assert payload["result_state"] == "no_matching_rates"
-    assert payload["pricing_scope"] == "plan_scoped_ptg"
-    assert payload["query"]["source"] == "ptg2"
-    assert payload["query"]["status"] == "no_match"
+    assert pricing_response["items"] == []
+    assert pricing_response["pagination"]["total"] == 0
+    assert pricing_response["result_state"] == "no_matching_rates"
+    assert pricing_response["pricing_scope"] == "plan_scoped_ptg"
+    assert pricing_response["query"]["source"] == "ptg2"
+    assert pricing_response["query"]["status"] == "no_match"
 
 
 @pytest.mark.asyncio
@@ -2780,17 +2783,17 @@ async def test_list_providers_by_procedure_no_ptg_route_reports_reason(monkeypat
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload["resolved"] is False
-    assert payload["result_state"] == "no_snapshot_for_plan"
-    assert payload["pricing_scope"] == "plan_scoped_ptg"
-    assert payload["reason"] == "no published serving snapshot for this plan_id + market_type"
-    assert payload["pagination"]["total"] == 0
-    assert payload["query"]["status"] == "no_route"
-    assert payload["query"]["plan_id_type"] == "ein"
-    assert payload["query"]["ignored_params"] == ["year"]
-    assert payload["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
+    assert pricing_response["resolved"] is False
+    assert pricing_response["result_state"] == "no_snapshot_for_plan"
+    assert pricing_response["pricing_scope"] == "plan_scoped_ptg"
+    assert pricing_response["reason"] == "no published serving snapshot for this plan_id + market_type"
+    assert pricing_response["pagination"]["total"] == 0
+    assert pricing_response["query"]["status"] == "no_route"
+    assert pricing_response["query"]["plan_id_type"] == "ein"
+    assert pricing_response["query"]["ignored_params"] == ["year"]
+    assert pricing_response["query"]["year_semantics"] == "ignored_for_plan_scoped_ptg_rates"
 
 
 @pytest.mark.asyncio
@@ -2853,20 +2856,20 @@ async def test_list_providers_by_procedure_cost_index_with_code_and_zip5():
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["items"][0]["cost_index"] == 250.0
-    assert payload["items"][0]["avg_submitted_charge"] == 300.0
-    assert payload["items"][0]["avg_allowed_amount"] == 250.0
-    assert "charge_per_service_avg" not in payload["items"][0]
-    assert "medicare_avg_submitted_charge_per_service" not in payload["items"][0]
-    assert "medicare_avg_allowed_amount_per_service" not in payload["items"][0]
-    assert "medicare_average_price_per_service" not in payload["items"][0]
-    assert "average_price" not in payload["items"][0]
-    assert payload["query"]["order_by"] == "cost_index"
-    assert payload["query"]["code"] == "123"
-    assert payload["query"]["zip5"] == "20814"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["items"][0]["cost_index"] == 250.0
+    assert pricing_response["items"][0]["avg_submitted_charge"] == 300.0
+    assert pricing_response["items"][0]["avg_allowed_amount"] == 250.0
+    assert "charge_per_service_avg" not in pricing_response["items"][0]
+    assert "medicare_avg_submitted_charge_per_service" not in pricing_response["items"][0]
+    assert "medicare_avg_allowed_amount_per_service" not in pricing_response["items"][0]
+    assert "medicare_average_price_per_service" not in pricing_response["items"][0]
+    assert "average_price" not in pricing_response["items"][0]
+    assert pricing_response["query"]["order_by"] == "cost_index"
+    assert pricing_response["query"]["code"] == "123"
+    assert pricing_response["query"]["zip5"] == "20814"
 
 
 @pytest.mark.asyncio
@@ -2914,14 +2917,14 @@ async def test_list_providers_by_procedure_zip_radius_expands_candidates():
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
-    item = payload["items"][0]
-    assert item["zip5"] == "20816"
-    assert item["distance_miles"] == 6.5
-    assert item["distance_bucket"] == "within_10mi"
-    assert item["anchor_zip5"] == "20814"
-    assert payload["query"]["zip_radius_miles"] == 30.0
-    assert payload["query"]["zip_candidate_count"] == 2
+    pricing_response = json.loads(response.body)
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["zip5"] == "20816"
+    assert pricing_item["distance_miles"] == 6.5
+    assert pricing_item["distance_bucket"] == "within_10mi"
+    assert pricing_item["anchor_zip5"] == "20814"
+    assert pricing_response["query"]["zip_radius_miles"] == 30.0
+    assert pricing_response["query"]["zip_candidate_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -2957,6 +2960,7 @@ async def test_postal_radius_cache_avoids_repeated_geo_lookup(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats():
+    """Enrich procedure provider results with peer cost statistics."""
     request = make_request(
         [
             FakeResult(scalar=1),
@@ -3030,12 +3034,12 @@ async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats()
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
-    item = payload["items"][0]
+    pricing_response = json.loads(response.body)
+    pricing_item = pricing_response["items"][0]
 
-    assert item["cost_index"] == "$$$"
-    assert item["estimated_cost_level"] == "$$$"
-    assert item["avg_allowed_amount"] == 250.0
+    assert pricing_item["cost_index"] == "$$$"
+    assert pricing_item["estimated_cost_level"] == "$$$"
+    assert pricing_item["avg_allowed_amount"] == 250.0
 
 
 @pytest.mark.asyncio
@@ -3074,15 +3078,15 @@ async def test_list_providers_by_procedure_cost_index_with_legacy_aliases_opt_in
     )
 
     response = await list_providers_by_procedure(request)
-    payload = json.loads(response.body)
-    item = payload["items"][0]
-    assert item["avg_submitted_charge"] == 300.0
-    assert item["avg_allowed_amount"] == 250.0
-    assert item["charge_per_service_avg"] == 300.0
-    assert item["medicare_avg_submitted_charge_per_service"] == 300.0
-    assert item["medicare_avg_allowed_amount_per_service"] == 250.0
-    assert item["medicare_average_price_per_service"] == 250.0
-    assert item["average_price"] == 250.0
+    pricing_response = json.loads(response.body)
+    pricing_item = pricing_response["items"][0]
+    assert pricing_item["avg_submitted_charge"] == 300.0
+    assert pricing_item["avg_allowed_amount"] == 250.0
+    assert pricing_item["charge_per_service_avg"] == 300.0
+    assert pricing_item["medicare_avg_submitted_charge_per_service"] == 300.0
+    assert pricing_item["medicare_avg_allowed_amount_per_service"] == 250.0
+    assert pricing_item["medicare_average_price_per_service"] == 250.0
+    assert pricing_item["average_price"] == 250.0
 
 
 @pytest.mark.asyncio
@@ -3113,15 +3117,16 @@ async def test_list_providers_by_prescription_with_q():
     )
 
     response = await list_providers_by_prescription(request)
-    payload = json.loads(response.body)
-    assert payload["pagination"]["total"] == 1
-    assert payload["items"][0]["npi"] == 1003000126
-    assert payload["items"][0]["total_prescriptions"] == 60.0
-    assert payload["query"]["q"] == "atorvastatin"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["pagination"]["total"] == 1
+    assert pricing_response["items"][0]["npi"] == 1003000126
+    assert pricing_response["items"][0]["total_prescriptions"] == 60.0
+    assert pricing_response["query"]["q"] == "atorvastatin"
 
 
 @pytest.mark.asyncio
 async def test_get_provider_procedure_estimated_cost_level_success():
+    """Return an estimated cost level from available benchmark data."""
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
@@ -3177,25 +3182,26 @@ async def test_get_provider_procedure_estimated_cost_level_success():
     )
 
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
-    payload = json.loads(response.body)
-    assert payload["npi"] == 1003000126
-    assert payload["provider"]["procedure_code"] == 123
-    assert payload["peer_group"]["provider_count"] == 250
-    assert payload["peer_group"]["typical_range"]["p10"] == 150.0
-    assert payload["peer_group"]["typical_range"]["p90"] == 900.0
-    assert payload["peer_group"]["cohort_type"] == "national"
-    assert payload["peer_group"]["specialty_scope"] == "specialty_specific"
-    assert payload["estimated_cost_level"] == "$$$"
-    assert payload["confidence"] == "medium"
-    assert payload["procedure"]["code_system"] == "HP_PROCEDURE_CODE"
-    assert payload["procedure"]["code"] == "123"
-    assert payload["procedure"]["name"] == "Magnetic resonance imaging, brain"
-    assert payload["procedure"]["reported_code"] == "70553"
-    assert payload["procedure"]["reported_code_system"] == "CPT"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["npi"] == 1003000126
+    assert pricing_response["provider"]["procedure_code"] == 123
+    assert pricing_response["peer_group"]["provider_count"] == 250
+    assert pricing_response["peer_group"]["typical_range"]["p10"] == 150.0
+    assert pricing_response["peer_group"]["typical_range"]["p90"] == 900.0
+    assert pricing_response["peer_group"]["cohort_type"] == "national"
+    assert pricing_response["peer_group"]["specialty_scope"] == "specialty_specific"
+    assert pricing_response["estimated_cost_level"] == "$$$"
+    assert pricing_response["confidence"] == "medium"
+    assert pricing_response["procedure"]["code_system"] == "HP_PROCEDURE_CODE"
+    assert pricing_response["procedure"]["code"] == "123"
+    assert pricing_response["procedure"]["name"] == "Magnetic resonance imaging, brain"
+    assert pricing_response["procedure"]["reported_code"] == "70553"
+    assert pricing_response["procedure"]["reported_code_system"] == "CPT"
 
 
 @pytest.mark.asyncio
 async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
+    """Use the ZIP-ring fallback when local benchmark data is sparse."""
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
@@ -3268,18 +3274,19 @@ async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
     )
 
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
-    payload = json.loads(response.body)
-    assert payload["peer_group"]["geography_scope"] == "zip5"
-    assert payload["peer_group"]["geography_value"] == "20816"
-    assert payload["peer_group"]["cohort_type"] == "zip"
-    assert payload["peer_group"]["specialty_scope"] == "specialty_specific"
-    assert payload["peer_group"]["distance_miles"] == 6.5
-    assert payload["peer_group"]["distance_bucket"] == "within_10mi"
-    assert payload["query"]["zip_radius_miles"] == 30.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["peer_group"]["geography_scope"] == "zip5"
+    assert pricing_response["peer_group"]["geography_value"] == "20816"
+    assert pricing_response["peer_group"]["cohort_type"] == "zip"
+    assert pricing_response["peer_group"]["specialty_scope"] == "specialty_specific"
+    assert pricing_response["peer_group"]["distance_miles"] == 6.5
+    assert pricing_response["peer_group"]["distance_bucket"] == "within_10mi"
+    assert pricing_response["query"]["zip_radius_miles"] == 30.0
 
 
 @pytest.mark.asyncio
 async def test_get_provider_procedure_estimated_cost_level_near_dynamic():
+    """Use nearby dynamic peers for the estimated cost level."""
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
@@ -3411,19 +3418,20 @@ async def test_get_provider_procedure_estimated_cost_level_near_dynamic():
     )
 
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
-    payload = json.loads(response.body)
-    assert payload["peer_group"]["geography_scope"] == "zip_radius"
-    assert payload["peer_group"]["geography_value"] == "20814|30mi"
-    assert payload["peer_group"]["provider_count"] == 12
-    assert payload["peer_group"]["cohort_type"] == "zip_radius"
-    assert payload["peer_group"]["specialty_scope"] == "specialty_specific"
-    assert payload["peer_group"]["cohort_strategy_used"] == "near_dynamic"
-    assert payload["query"]["cohort_strategy"] == "near_dynamic"
-    assert payload["query"]["cohort_strategy_used"] == "near_dynamic"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["peer_group"]["geography_scope"] == "zip_radius"
+    assert pricing_response["peer_group"]["geography_value"] == "20814|30mi"
+    assert pricing_response["peer_group"]["provider_count"] == 12
+    assert pricing_response["peer_group"]["cohort_type"] == "zip_radius"
+    assert pricing_response["peer_group"]["specialty_scope"] == "specialty_specific"
+    assert pricing_response["peer_group"]["cohort_strategy_used"] == "near_dynamic"
+    assert pricing_response["query"]["cohort_strategy"] == "near_dynamic"
+    assert pricing_response["query"]["cohort_strategy_used"] == "near_dynamic"
 
 
 @pytest.mark.asyncio
 async def test_get_provider_procedure_estimated_cost_level_near_dynamic_fallbacks_to_precomputed():
+    """Fall back to precomputed peers when dynamic peers are insufficient."""
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
@@ -3503,14 +3511,14 @@ async def test_get_provider_procedure_estimated_cost_level_near_dynamic_fallback
     )
 
     response = await get_provider_procedure_estimated_cost_level_internal(request, "1003000126", "123")
-    payload = json.loads(response.body)
-    assert payload["peer_group"]["geography_scope"] == "zip5"
-    assert payload["peer_group"]["geography_value"] == "20816"
-    assert payload["peer_group"]["cohort_type"] == "zip"
-    assert payload["peer_group"]["specialty_scope"] == "specialty_specific"
-    assert payload["peer_group"]["cohort_strategy_used"] == "precomputed"
-    assert payload["query"]["cohort_strategy"] == "near_dynamic"
-    assert payload["query"]["cohort_strategy_used"] == "precomputed"
+    pricing_response = json.loads(response.body)
+    assert pricing_response["peer_group"]["geography_scope"] == "zip5"
+    assert pricing_response["peer_group"]["geography_value"] == "20816"
+    assert pricing_response["peer_group"]["cohort_type"] == "zip"
+    assert pricing_response["peer_group"]["specialty_scope"] == "specialty_specific"
+    assert pricing_response["peer_group"]["cohort_strategy_used"] == "precomputed"
+    assert pricing_response["query"]["cohort_strategy"] == "near_dynamic"
+    assert pricing_response["query"]["cohort_strategy_used"] == "precomputed"
 
 
 @pytest.mark.asyncio
@@ -3574,11 +3582,11 @@ async def test_get_procedure_geo_benchmarks_success():
     )
 
     response = await get_procedure_geo_benchmarks(request, "CPT", "70553")
-    payload = json.loads(response.body)
-    assert payload["query"]["input_code"]["code_system"] == "CPT"
-    assert payload["benchmarks"]["national"]["total_services"] == 1000.0
-    assert payload["benchmarks"]["state"]["geography_value"] == "MD"
-    assert payload["benchmarks"]["state"]["avg_submitted_charge"] == 460.0
+    pricing_response = json.loads(response.body)
+    assert pricing_response["query"]["input_code"]["code_system"] == "CPT"
+    assert pricing_response["benchmarks"]["national"]["total_services"] == 1000.0
+    assert pricing_response["benchmarks"]["state"]["geography_value"] == "MD"
+    assert pricing_response["benchmarks"]["state"]["avg_submitted_charge"] == 460.0
 
 
 @pytest.mark.asyncio
@@ -3591,9 +3599,9 @@ async def test_pricing_statistics_success():
     ])
 
     response = await pricing_statistics(request)
-    payload = json.loads(response.body)
+    pricing_response = json.loads(response.body)
 
-    assert payload == {
+    assert pricing_response == {
         "medicare_individual_providers": 321000,
         "providers_with_procedure_history": 845000,
         "procedure_codes_tracked": 6123,
