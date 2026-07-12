@@ -30,7 +30,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "provider_directory_address_overlay AS overlay" in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
-    assert "dataset.import_run_id = overlay.last_seen_run_id" in sql
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id" in sql
     assert "FROM phone_candidates AS phone_match" in sql
     assert "CROSS JOIN LATERAL" in sql
     assert "candidate_address.address_key = phone_match.address_key" in sql

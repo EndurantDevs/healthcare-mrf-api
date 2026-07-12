@@ -2546,7 +2546,7 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
             ON dataset.endpoint_id = source.endpoint_id
            AND dataset.is_current IS TRUE
            AND dataset.status = 'published'
-           AND dataset.import_run_id = overlay.last_seen_run_id
+           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id
          WHERE overlay.phone_number = :phone_digits
            AND overlay.npi IS NOT NULL
            AND overlay.address_key IS NOT NULL
