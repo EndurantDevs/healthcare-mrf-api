@@ -47,7 +47,7 @@ def _logical_network_key_sql(pointer_alias: str, snapshot_alias: str) -> str:
 def _source_effective_month_sql(pointer_alias: str, snapshot_alias: str) -> str:
     """Prefer the month encoded in a source URL over the orchestration month."""
     source_url = f"{snapshot_alias}.manifest->'successful_files'->0->>'url'"
-    source_month = f"substring({source_url} FROM '(20[0-9]{{2}}-(?:0[1-9]|1[0-2]))')"
+    source_month = f"substring({source_url} FROM '(20[0-9]{{2}}-(0[1-9]|1[0-2]))')"
     return f"COALESCE(({source_month} || '-01')::date, {pointer_alias}.import_month)"
 
 
