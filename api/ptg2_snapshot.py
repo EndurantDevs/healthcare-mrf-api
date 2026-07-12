@@ -35,6 +35,22 @@ def _serving_relation_available_sql(snapshot_alias: str) -> str:
     return f"to_regclass({_serving_relation_name_sql(snapshot_alias)}) IS NOT NULL"
 
 
+def _logical_network_key_sql(pointer_alias: str, snapshot_alias: str) -> str:
+    """Group dated source files that publish the same logical plan network."""
+    network_names = f"{snapshot_alias}.manifest->'serving_index'->>'network_names'"
+    return (
+        f"COALESCE(NULLIF(NULLIF({network_names}, ''), '[]'), "
+        f"{pointer_alias}.source_key)"
+    )
+
+
+def _source_effective_month_sql(pointer_alias: str, snapshot_alias: str) -> str:
+    """Prefer the month encoded in a source URL over the orchestration month."""
+    source_url = f"{snapshot_alias}.manifest->'successful_files'->0->>'url'"
+    source_month = f"substring({source_url} FROM '(20[0-9]{{2}}-(?:0[1-9]|1[0-2]))')"
+    return f"COALESCE(({source_month} || '-01')::date, {pointer_alias}.import_month)"
+
+
 def _snapshot_cache_enabled(session) -> bool:
     return hasattr(session, "sync_session")
 
@@ -137,6 +153,7 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     if source_key:
         params["source_key"] = source_key
         source_sql = "AND cps.source_key = :source_key"
+    effective_month_sql = _source_effective_month_sql("cps", "s")
     try:
         result = await session.execute(
             text(
@@ -149,7 +166,9 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
                    {source_sql}
                    AND s.status = 'published'
                    AND {_serving_relation_available_sql('s')}
-                 ORDER BY cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
+                 ORDER BY {effective_month_sql} DESC NULLS LAST,
+                          cps.import_month DESC NULLS LAST,
+                          cps.updated_at DESC NULLS LAST
                  LIMIT 1
                 """
             ),
@@ -171,18 +190,12 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
 async def current_source_snapshot_ids_for_plan(
     session, args: dict[str, object]
 ) -> list[tuple[str, str]]:
-    """Resolve the newest *materialized* serving snapshot for EACH network of a plan.
+    """Resolve the newest materialized snapshot for each logical plan network.
 
-    A group plan can be served by several networks/sources at once (e.g. a dental
-    C2 network plus a PPO carrier feed). ``current_source_snapshot_id_for_plan``
-    collapses those to a single snapshot via ``LIMIT 1``, which silently drops
-    every other network's pricing -- so a procedure only priced in one network
-    returns 0 results whenever a different network happens to own the newest
-    snapshot. This plural variant returns one ``(source_key, snapshot_id)`` pair
-    per network -- the newest snapshot whose serving table is actually
-    materialized (mirroring the single-plan resolver's ``to_regclass`` tiebreaker
-    so an unloaded newer network does not win and contribute 0 rows) -- letting
-    callers fan out across all of a plan's networks and combine the results.
+    Dated files receive different source keys, so source key alone cannot identify
+    a network across months. Manifest network names define that stable grouping;
+    the source URL month selects its newest retained snapshot. Sources without
+    either metadata retain the source-key and orchestration-month fallback.
     """
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     if not requested_plan:
@@ -201,21 +214,33 @@ async def current_source_snapshot_ids_for_plan(
     if source_key:
         params["source_key"] = source_key
         source_sql = "AND cps.source_key = :source_key"
+    logical_network_sql = _logical_network_key_sql("cps", "s")
+    effective_month_sql = _source_effective_month_sql("cps", "s")
     try:
         result = await session.execute(
             text(
                 f"""
-                 SELECT DISTINCT ON (cps.source_key) cps.source_key, cps.snapshot_id
-                  FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
-                  JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
-                 WHERE cps.plan_id = ANY(CAST(:plan_ids AS text[]))
-                   {market_sql}
-                   {source_sql}
-                   AND s.status = 'published'
-                   AND {_serving_relation_available_sql('s')}
-                 -- One available snapshot per network (source_key), newest first.
-                 ORDER BY cps.source_key,
-                          cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
+                 WITH candidate_snapshots AS (
+                     SELECT cps.source_key,
+                            cps.snapshot_id,
+                            {logical_network_sql} AS logical_network_key,
+                            {effective_month_sql} AS source_effective_month,
+                            cps.import_month,
+                            cps.updated_at
+                       FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
+                       JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
+                      WHERE cps.plan_id = ANY(CAST(:plan_ids AS text[]))
+                        {market_sql}
+                        {source_sql}
+                        AND s.status = 'published'
+                        AND {_serving_relation_available_sql('s')}
+                 )
+                 SELECT DISTINCT ON (logical_network_key) source_key, snapshot_id
+                   FROM candidate_snapshots
+                  ORDER BY logical_network_key,
+                           source_effective_month DESC NULLS LAST,
+                           import_month DESC NULLS LAST,
+                           updated_at DESC NULLS LAST
                 """
             ),
             params,
