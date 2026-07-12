@@ -148,6 +148,39 @@ def test_same_provider_address_backfill_only_uses_same_npi_and_address_key():
     assert "ABS(target_row.lat) < 0.0000001" in sql
 
 
+def test_unified_contact_aggregation_prefers_present_lower_priority_evidence():
+    materialization_queries = [
+        entity_address_unified._materialize_from_raw_sql(
+            "mrf",
+            "entity_address_unified_stage_test",
+            "entity_address_unified_raw_test",
+        ),
+        entity_address_unified._materialize_sql(
+            "mrf",
+            "entity_address_unified_stage_test",
+            ["SELECT * FROM entity_address_source_test"],
+        ),
+    ]
+
+    for materialization_sql in materialization_queries:
+        for column_name in (
+            "telephone_number",
+            "phone_number",
+            "phone_extension",
+            "fax_number",
+            "fax_number_digits",
+            "fax_extension",
+        ):
+            assert (
+                f"ARRAY_AGG({column_name} ORDER BY ({column_name} IS NULL), "
+                "source_priority ASC"
+            ) in materialization_sql
+            assert (
+                f"ARRAY_AGG({column_name} ORDER BY source_priority ASC, "
+                f"({column_name} IS NULL)"
+            ) not in materialization_sql
+
+
 def test_provider_directory_source_selects_precompute_primary_npi_attributes():
     available = _provider_directory_available()
     available["npi_address"] = True
