@@ -2524,7 +2524,7 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
     if not _address_table_is_unified(address_table_sql):
         return None
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
-    service_types = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
+    service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
     return f"""
     phone_candidates AS MATERIALIZED (
         SELECT DISTINCT
@@ -2564,13 +2564,13 @@ def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = No
 
 
 def _sql_with_prefix_ctes(*ctes: str | None) -> str:
-    available = [cte.strip() for cte in ctes if cte and cte.strip()]
-    return f"WITH {',\n'.join(available)},\n" if available else "WITH "
+    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
+    return f"WITH {',\n'.join(available_ctes)},\n" if available_ctes else "WITH "
 
 
 def _sql_with_ctes(*ctes: str | None) -> str:
-    available = [cte.strip() for cte in ctes if cte and cte.strip()]
-    return f"WITH {',\n'.join(available)}\n" if available else ""
+    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
+    return f"WITH {',\n'.join(available_ctes)}\n" if available_ctes else ""
 
 
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
