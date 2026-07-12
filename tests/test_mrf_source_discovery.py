@@ -71,6 +71,7 @@ class _RecordingBrowserFallbackSession:
 
 
 def test_source_urls_are_loaded_from_registry_file():
+    """Verify this source-discovery regression contract."""
     config = discovery._source_config()
 
     assert config["default_providers"] == ["master-list"]
@@ -354,6 +355,7 @@ def test_source_urls_are_loaded_from_registry_file():
 
 
 def test_classify_hosting_platform_recognizes_public_adapter_pages():
+    """Verify this source-discovery regression contract."""
     assert (
         discovery.classify_hosting_platform(
             "https://www.anthem.com/machine-readable-file/search/"
@@ -877,6 +879,7 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
 
 
 def test_midlandschoice_resolver_preserves_network_labels():
+    """Verify this source-discovery regression contract."""
     html = """
     <table>
       <tr>
@@ -1269,6 +1272,7 @@ def test_candidate_text_filter_matches_public_aliases():
 
 
 def test_candidate_query_expansion_keeps_searchable_platform_sources():
+    """Verify this source-discovery regression contract."""
     sapphire = discovery.SourceCandidate(
         payer_name="BCBS Louisiana",
         provider="master-list",
@@ -1430,6 +1434,7 @@ def test_query_expansion_ranking_keeps_targeted_sources_before_generic_pages():
 async def test_private_query_context_expands_supported_public_sources(
     tmp_path, monkeypatch
 ):
+    """Verify this source-discovery regression contract."""
     master_list_path = tmp_path / "master.md"
     master_list_path.write_text(
         "\n".join(
@@ -1950,6 +1955,7 @@ def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
 
 
 def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "src_aetna",
         "display_name": "Aetna",
@@ -2243,6 +2249,7 @@ def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
 
 
 def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "src_aetna",
         "display_name": "Example Carrier",
@@ -2651,6 +2658,7 @@ def test_master_list_coverage_evidence_metadata_is_stored_on_source_rows():
 
 
 def test_master_list_public_gap_sources_classify_supported_platforms():
+    """Verify this source-discovery regression contract."""
     markdown = """
 | Payer | Type | Public MRF TOC / landing URL | Notes |
 |---|---|---|---|
@@ -3084,6 +3092,7 @@ async def test_master_list_uses_current_public_source_urls_for_selected_payers()
 
 @pytest.mark.asyncio
 async def test_master_list_keeps_high_value_public_aliases():
+    """Verify this source-discovery regression contract."""
     candidates = await discovery._load_candidates(
         "master-list", test_mode=True, limit=2000
     )
@@ -4230,6 +4239,7 @@ async def test_master_list_keeps_high_value_public_aliases():
 
 @pytest.mark.asyncio
 async def test_master_list_public_alias_queries_match_expected_candidates():
+    """Verify this source-discovery regression contract."""
     candidates = await discovery._load_candidates(
         "master-list", test_mode=True, limit=2000
     )
@@ -5006,6 +5016,7 @@ def test_import_control_snapshot_company_fallback_from_index_url():
 
 @pytest.mark.asyncio
 async def test_import_control_snapshot_items_keep_medical_rate_files(monkeypatch):
+    """Verify this source-discovery regression contract."""
     call_count_map = {"all": 0}
 
     async def fake_all(_stmt):
@@ -5241,6 +5252,7 @@ def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():
 
 
 def test_classify_hosting_platforms():
+    """Verify this source-discovery regression contract."""
     assert (
         discovery.classify_hosting_platform("https://transparency-in-coverage.uhc.com/")
         == "uhc_public_blobs"
@@ -6558,6 +6570,7 @@ async def test_html_bluebook_direct_nested_error(
 
 @pytest.mark.asyncio
 async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeypatch):
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_vhp",
         "payer_id": "payer_vhp",
@@ -7261,6 +7274,7 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
 
 
 def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
+    """Verify this source-discovery regression contract."""
     source = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
     employer = {
         "slug": "sample-employer-network-varipro-77100",
@@ -7400,6 +7414,7 @@ async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeat
 
 @pytest.mark.asyncio
 async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypatch):
+    """Verify this source-discovery regression contract."""
     calls = []
 
     async def fake_subscribe_collect(
@@ -7920,6 +7935,7 @@ def test_magnacare_result_rows_extract_download_metadata():
 async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     fetched_result_urls = []
     fetched_download_urls = []
 
@@ -8139,6 +8155,7 @@ async def test_uhc_blob_query_finds_late_match_before_target_limit(monkeypatch):
 
 
 def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -8564,6 +8581,7 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
 
 
 def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
+    """Verify this source-discovery regression contract."""
     source = {"source_id": "source_1", "payer_id": "payer_1"}
     metadata_url = (
         "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/latest_metadata.json"
@@ -8865,6 +8883,7 @@ async def test_hs_metadata_fallback_landing(
 
 @pytest.mark.asyncio
 async def test_providence_resolver_reads_config_and_expands_group_tocs(monkeypatch):
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -9361,6 +9380,7 @@ def test_import_control_source_identity_key_keeps_context_scoped_generic_urls():
 
 @pytest.mark.asyncio
 async def test_push_import_control_catalog_marks_successful_seed_promoted(monkeypatch):
+    """Verify this source-discovery regression contract."""
     calls = []
     source_upsert_count_map = {"created": 0}
 
@@ -9485,6 +9505,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
 async def test_push_import_control_catalog_syncs_coverage_evidence_without_preview(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     calls = []
 
     class FakeResponse:
@@ -9833,6 +9854,7 @@ def _catalog_existing_public_snapshot_fake_session(captured_calls, captured_time
 async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     calls = []
 
     class FakeResponse:
@@ -10623,6 +10645,7 @@ async def test_push_import_control_catalog_skips_snapshots_for_coverage_evidence
 async def test_push_import_control_catalog_preserves_registry_stale_status(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     calls = []
 
     class FakeResponse:
@@ -10721,6 +10744,7 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
 async def test_push_import_control_catalog_keeps_failed_source_internal_and_reports_error(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     calls = []
     source_ids = iter(["ic_source_ok", "ic_source_fail"])
 
@@ -11174,6 +11198,7 @@ def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():
 
 
 def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
+    """Verify this source-discovery regression contract."""
     html = """
     <a href="/mrf/2026-06-01_example_index.json">TOC</a>
     <a href="/mrf/hmo_ha_hii_arkbluecross_index">No-extension TOC</a>
@@ -11614,6 +11639,7 @@ def test_parse_html_mrf_links_accepts_plan_named_tic_index_under_mrf_path():
 
 
 def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
+    """Verify this source-discovery regression contract."""
     html = """
     <h2>Alliance Group Care Price Transparency Machine-Readable Files</h2>
     <p>The files below detail costs for items and services.</p>
@@ -11887,6 +11913,7 @@ def test_parse_html_mrf_links_extracts_price_transparency_index_suffix():
 
 
 def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
+    """Verify this source-discovery regression contract."""
     html = """
     <a href="/docs/default-source/price-transparency/2026-06-tableofcontents.zip">
       Table of Contents
@@ -11954,6 +11981,7 @@ def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
 
 
 def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
+    """Verify this source-discovery regression contract."""
     html = """
     <p>
       <a href="/getmedia/fa7482cb-b902-415a-8779-f4abfa2f6bd5/2024-06-03_group-health-cooperative-of-eau-claire_medicaid_in-network-rates.json">
@@ -12644,6 +12672,7 @@ def test_healthspace_session_id_from_html_extracts_public_session():
 
 
 def test_healthspace_soap_targets_extract_mrf_files_only():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -12714,6 +12743,7 @@ def test_healthspace_soap_targets_extract_mrf_files_only():
 
 @pytest.mark.asyncio
 async def test_healthspace_resolver_posts_execute_soap_and_caps_targets(monkeypatch):
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -13274,6 +13304,7 @@ def test_bcbs_global_solutions_extracts_toc_links():
 async def test_bcbs_global_solutions_resolver_follows_landing_and_skips_stale_tocs(
     monkeypatch,
 ):
+    """Verify this source-discovery regression contract."""
     public_landing = "https://bcbsglobalsolutions.com/transparency-in-coverage/"
     group_landing = (
         "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage.cfm"
@@ -13794,6 +13825,7 @@ def test_azure_mrf_listing_targets_from_xml_extracts_group_health_coop_files():
 
 
 def test_triples_mtt_targets_keep_latest_month_files():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -13919,6 +13951,7 @@ async def test_resolve_triples_mtt_api_fetches_latest_select_month(monkeypatch):
 
 
 def test_payercompass_targets_from_structure_use_file_list_download_ids():
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -14104,6 +14137,7 @@ async def test_pc_resolver_file_list_wrapper(
 
 @pytest.mark.asyncio
 async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatch):
+    """Verify this source-discovery regression contract."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -14563,6 +14597,7 @@ async def test_resolve_crawl_targets_times_out_slow_source(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
+    """Verify this source-discovery regression contract."""
     progress = []
 
     source_rows = [
@@ -14741,6 +14776,7 @@ async def test_crawl_table_of_contents_metadata_times_out_slow_target(monkeypatc
 
 @pytest.mark.asyncio
 async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch):
+    """Verify this source-discovery regression contract."""
     pushed_batches = []
     source_rows = [
         {
@@ -15447,6 +15483,7 @@ async def test_sync_import_control_can_skip_catalog_push(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_direct_discovery_run_emits_import_control_visible_state(monkeypatch):
+    """Verify this source-discovery regression contract."""
     pushed = []
     events = []
     progress = []
