@@ -9,10 +9,11 @@
         "evidence": {
           "blocking_resource": "PractitionerRole",
           "bulk_status": "upstream_pending",
-          "completed_resource_rows": 6659493
+          "completed_resource_rows": 6659493,
+          "pagination_attempt": 10
         },
-        "observed_at": "2026-07-12T09:48:40Z",
-        "run_id": "run_cce27bc1f57f4e95b512f90a98e2b2d0",
+        "observed_at": "2026-07-12T11:32:21Z",
+        "run_id": "run_3b3eb46f43e240d8bafa4e30b2bf965a",
         "run_status": "running",
         "state_status": "running"
       },
@@ -28,7 +29,7 @@
             "source_rows": 6659493
           }
         },
-        "observed_at": "2026-07-12T09:48:40Z",
+        "observed_at": "2026-07-12T11:32:21Z",
         "unified_api_state": "not_ready"
       },
       "run_id": null,
@@ -215,6 +216,17 @@
     "arkansas": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "current_observation": {
+        "observed_at": "2026-07-12T11:19:44Z",
+        "run_id": "run_6f434cd416804bd9b13e2cf66bd2fcf6",
+        "run_status": "running",
+        "state_status": "running"
+      },
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "observed_at": "2026-07-12T11:19:44Z",
+        "unified_api_state": "not_ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -779,7 +791,7 @@
             "role_to_plan_refs": "present"
           }
         },
-        "observed_at": "2026-07-12T09:57:30Z",
+        "observed_at": "2026-07-12T10:42:27Z",
         "unified_api_state": "ready"
       },
       "entry_spec_sha256": "118e03de4598326b3e2367ca238a9ec9d63cf822362bf7ed34df78f0f23501df",
@@ -926,14 +938,17 @@
       "access_verification": "not_recorded",
       "checked_at": null,
       "current_observation": {
-        "observed_at": "2026-07-12T09:20:04Z",
-        "run_id": "run_67aaccb070a545d891b595500e6a8227",
-        "run_status": "running",
-        "state_status": "running"
+        "evidence": {
+          "pagination_attempt": 28
+        },
+        "observed_at": "2026-07-12T11:06:29Z",
+        "run_id": "run_f3dcaf472ada4c0999bcc7056ce1c64f",
+        "run_status": "failed",
+        "state_status": "failed"
       },
       "publication_readiness": {
         "derived_artifact_state": "not_promoted",
-        "observed_at": "2026-07-12T09:20:04Z",
+        "observed_at": "2026-07-12T11:06:29Z",
         "unified_api_state": "not_ready"
       },
       "run_id": null,
@@ -1324,10 +1339,98 @@
       "terminal_status": "succeeded"
     },
     "maine": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
-      "run_id": null,
-      "terminal_status": null
+      "access_verification": "verified",
+      "checked_at": "2026-07-12T10:13:10Z",
+      "current_observation": {
+        "evidence": {
+          "resource_outcomes": {
+            "Location": 22177,
+            "Organization": 22178,
+            "OrganizationAffiliation": 22170,
+            "Practitioner": 28945,
+            "PractitionerRole": 44665
+          },
+          "source_ids": [
+            "pdfhir_59350503a7be3498a85d8cf2"
+          ]
+        },
+        "observed_at": "2026-07-12T10:13:10Z",
+        "run_id": "run_8ff6695cdcf84bd294007b33628cea72",
+        "run_status": "succeeded",
+        "state_status": "succeeded"
+      },
+      "entry_spec_sha256": "c9879ece492d5101d97fb558fffeea4d2c183aa24f33071c575e506af53cfd81",
+      "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "not_promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 0,
+            "address_rows": 22177,
+            "coordinate_rows": 0,
+            "location_rows": 22177,
+            "phone_rows": 22172,
+            "role_to_plan_refs": 0,
+            "source_rows": 140135
+          },
+          "signals": {
+            "address_keys": "absent",
+            "address_overlay": "absent",
+            "addresses": "present",
+            "coordinates": "absent",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T10:13:10Z",
+        "unified_api_state": "not_ready"
+      },
+      "run_id": "run_8ff6695cdcf84bd294007b33628cea72",
+      "terminal_evidence": {
+        "acquisition_rows": 140135,
+        "resource_outcomes": {
+          "Location": {
+            "rows_fetched": 22177,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_failed": 0
+          },
+          "Organization": {
+            "rows_fetched": 22178,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_failed": 0
+          },
+          "OrganizationAffiliation": {
+            "rows_fetched": 22170,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_failed": 0
+          },
+          "Practitioner": {
+            "rows_fetched": 28945,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_failed": 0
+          },
+          "PractitionerRole": {
+            "rows_fetched": 44665,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_failed": 0
+          }
+        },
+        "source_ids": [
+          "pdfhir_59350503a7be3498a85d8cf2"
+        ]
+      },
+      "terminal_status": "succeeded"
     },
     "michigan": {
       "access_verification": "not_recorded",
@@ -1402,8 +1505,8 @@
           "legacy_rows_are_not_current": true,
           "plan_graph_state": "incomplete"
         },
-        "observed_at": "2026-07-12T09:48:39Z",
-        "run_id": "run_9c0952f5a0904679b4ec158377515f8a",
+        "observed_at": "2026-07-12T11:19:44Z",
+        "run_id": "run_976340566d83450f917db41a4925093b",
         "run_status": "running",
         "state_status": "running"
       },
@@ -1419,7 +1522,7 @@
             "role_to_plan_refs": "absent"
           }
         },
-        "observed_at": "2026-07-12T09:48:39Z",
+        "observed_at": "2026-07-12T11:19:44Z",
         "unified_api_state": "not_ready"
       },
       "run_id": null,
