@@ -4349,9 +4349,13 @@ async def test_source_fetch_honors_retry_after_for_429(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_source_fetch_honors_delta_seconds_retry_after_for_503(monkeypatch):
+@pytest.mark.parametrize("status_code", [423, 503])
+async def test_source_fetch_honors_delta_seconds_retry_after_for_transient_status(
+    monkeypatch,
+    status_code,
+):
     responses = [
-        (503, {importer.SOURCE_RETRY_AFTER_FIELD: "4"}, None, 1),
+        (status_code, {importer.SOURCE_RETRY_AFTER_FIELD: "4"}, None, 1),
         (200, {"resourceType": "Bundle", "entry": []}, None, 1),
     ]
     sleep_mock = AsyncMock()
@@ -4393,9 +4397,7 @@ def test_source_fetch_honors_http_date_retry_after_for_503():
 
 
 @pytest.mark.asyncio
-async def test_terminal_503_redacts_fetch_diagnostic(
-    monkeypatch,
-):
+async def test_terminal_503_redacts_fetch_diagnostic(monkeypatch):
     """Persist only retry facts that cannot expose a cursor or response body."""
     source_lookup = {
         "source_id": "source_a",
@@ -4453,11 +4455,38 @@ async def test_terminal_503_redacts_fetch_diagnostic(
     assert "private-response" not in json.dumps(resource_diagnostic)
 
 
-def test_terminal_503_uses_bounded_fallback():
+@pytest.mark.asyncio
+async def test_terminal_423_redacts_fetch_diagnostic(monkeypatch):
+    source_lookup = {"source_id": "source_a", "api_base": "https://payer.example/fhir"}
+    request_url = "https://payer.example/fhir/Practitioner?_continuationToken=private"
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json_once",
+        AsyncMock(return_value=(423, {"diagnostics": "private-response"}, None, 7)),
+    )
+    monkeypatch.setattr(importer, "_source_fetch_retry_attempts", lambda: 2)
+    monkeypatch.setattr(importer.asyncio, "sleep", AsyncMock())
+
+    fetch_result = await importer._fetch_source_json(source_lookup, request_url, timeout=3)
+    fetch_diagnostic = importer._terminal_source_fetch_diagnostic(source_lookup, request_url)
+
+    assert fetch_result == (423, {"diagnostics": "private-response"}, None, 14)
+    assert fetch_diagnostic == {
+        "status": 423,
+        "url_hash": hashlib.sha256(request_url.encode("utf-8")).hexdigest(),
+        "retry_count": 1,
+        "elapsed_ms": 14,
+        "response_class": "transient_locked",
+    }
+    assert "private" not in json.dumps(fetch_diagnostic)
+
+
+@pytest.mark.parametrize("status_code", [423, 503])
+def test_terminal_transient_response_uses_bounded_fallback(status_code):
     current_time = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.UTC)
 
     assert importer._transient_source_retry_not_before(
-        503,
+        status_code,
         {"diagnostics": "private-response"},
         None,
         retry_count=2,

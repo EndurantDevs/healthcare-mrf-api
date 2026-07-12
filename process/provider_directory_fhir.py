@@ -786,6 +786,7 @@ SOURCE_FETCH_DIAGNOSTIC_FIELD = "_healthporta_source_fetch_diagnostic"
 SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
+SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
     r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
@@ -11785,7 +11786,7 @@ def _is_transient_source_fetch_failure(
             AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
             SOURCE_QUOTA_EXHAUSTED_ERROR,
         }
-    return status_code in {429, 500, 502, 503, 504}
+    return status_code in SOURCE_TRANSIENT_HTTP_STATUSES
 
 
 def _fhir_collection_search_resource_type(
@@ -11833,6 +11834,8 @@ def _source_fetch_response_class(
 ) -> str | None:
     if fetch_error:
         return "transient_transport_error"
+    if status_code == 423:
+        return "transient_locked"
     if status_code == 429:
         return "transient_rate_limited"
     if status_code is not None and 500 <= status_code < 600:
@@ -12026,7 +12029,7 @@ def _transient_source_retry_not_before(
         return None
     retry_after_seconds = (
         _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
-        if status_code == 429 or (status_code is not None and 500 <= status_code < 600)
+        if status_code in SOURCE_TRANSIENT_HTTP_STATUSES
         else None
     )
     delay_seconds = (
@@ -12139,7 +12142,7 @@ def _source_fetch_attempt_delay(
         ]
     retry_after_seconds = (
         _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
-        if status_code == 429 or (status_code is not None and 500 <= status_code < 600)
+        if status_code in SOURCE_TRANSIENT_HTTP_STATUSES
         else None
     )
     return (
