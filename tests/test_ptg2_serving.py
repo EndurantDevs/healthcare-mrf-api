@@ -4399,6 +4399,7 @@ async def test_current_ptg2_snapshot_prefers_loaded_serving_table():
     assert "to_regclass(COALESCE(" in sql
     assert "NULLIF(s.manifest->'serving_index'->>'table', '')" in sql
     # Recency selects among snapshots whose retained serving relation exists.
+    assert "successful_files" in sql
     assert "cps.import_month DESC NULLS LAST" in sql
 
 
@@ -4455,6 +4456,24 @@ async def test_current_plan_source_network_list_is_not_memory_cached():
     assert first_networks == [("ppo", "snap-ppo")]
     assert second_networks == [("ppo", "snap-ppo"), ("c2", "snap-c2")]
     assert len(session.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_current_plan_source_network_list_groups_dated_files_by_manifest_network():
+    session = FakeSession([FakeResult(rows=[("current-source", "current-snapshot")])])
+
+    snapshot_pairs = await ptg2_snapshot.current_source_snapshot_ids_for_plan(
+        session,
+        {"plan_id": "TESTPLAN001", "plan_market_type": "group"},
+    )
+
+    assert snapshot_pairs == [("current-source", "current-snapshot")]
+    query_sql = str(session.calls[0][0][0])
+    assert "AS logical_network_key" in query_sql
+    assert "network_names" in query_sql
+    assert "successful_files" in query_sql
+    assert "source_effective_month DESC NULLS LAST" in query_sql
+    assert "DISTINCT ON (logical_network_key)" in query_sql
 
 
 def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
