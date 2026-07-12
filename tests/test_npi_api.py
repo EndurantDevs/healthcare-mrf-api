@@ -329,12 +329,12 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
     assert rows == []
     assert "lat,\n            long," in captured_sql_statements[0]
     assert "address_precision, lat, long" in captured_sql_statements[0]
-    assert "LEFT JOIN mrf.provider_directory_source AS directory_source" in captured_sql_statements[0]
-    assert "directory_source.canonical_api_base" in captured_sql_statements[0]
+    assert "mrf.provider_directory_source AS source" in captured_sql_statements[0]
+    assert "source.canonical_api_base" in captured_sql_statements[0]
 
 
 @pytest.mark.asyncio
-async def test_provider_directory_overlay_falls_back_to_alias_count_without_source_table(
+async def test_provider_directory_overlay_fails_closed_without_visibility_tables(
     monkeypatch,
 ):
     captured_sql_statements: list[str] = []
@@ -357,11 +357,7 @@ async def test_provider_directory_overlay_falls_back_to_alias_count_without_sour
     rows = await npi_module._fetch_provider_directory_address_overlay(1588616783)
 
     assert rows == []
-    assert "LEFT JOIN mrf.provider_directory_source" not in captured_sql_statements[0]
-    assert (
-        "COUNT(DISTINCT overlay.source_id)::integer AS independent_source_count"
-        in captured_sql_statements[0]
-    )
+    assert captured_sql_statements == []
 
 
 @pytest.mark.asyncio
@@ -386,6 +382,22 @@ async def test_provider_directory_overlay_fetch_tolerates_old_overlay_schema(mon
     assert "NULL::numeric AS lat" in captured_sql_statements[0]
     assert "NULL::numeric AS long" in captured_sql_statements[0]
     assert "address_precision, lat, long" not in captured_sql_statements[0]
+
+
+def test_provider_directory_overlay_keeps_old_current_dataset_during_replacement():
+    sql = npi_module._provider_directory_overlay_query_sql({"lat", "long"})
+
+    assert "dataset.is_current IS TRUE" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
+    assert "dataset.superseded_at IS NULL" in sql
+    assert "HAVING COUNT(*) = 1" in sql
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in sql
+    assert "resource.dataset_id = dataset.dataset_id" in sql
+    assert "current_resource.resource_type = overlay.resource_type" in sql
+    assert "current_resource.resource_id = overlay.resource_id" in sql
+    assert "overlay.last_seen_run_id = current_resource.run_id" in sql
+    assert "ORDER BY dataset.created_at" not in sql
 
 
 def test_validate_section_filters_requires_classification_or_codes():

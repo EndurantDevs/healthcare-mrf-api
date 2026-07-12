@@ -197,8 +197,10 @@ def test_provider_directory_partial_scope_selects_only_current_published_dataset
     assert "mrf.provider_directory_address_overlay AS overlay" in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "HAVING COUNT(*) = 1" in sql
+    assert "ORDER BY dataset.created_at" not in sql
 
 
 @pytest.mark.asyncio
@@ -250,6 +252,7 @@ def test_full_projection_replaces_compatibility_fhir_with_current_overlay():
     assert "source.source_id = ANY(" not in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
     assert "overlay.last_seen_run_id = dataset.run_id" in sql
     assert "dataset_resource.resource_id = overlay.resource_id" in sql
     assert "LIMIT 17" in sql

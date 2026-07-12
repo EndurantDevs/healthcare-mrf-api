@@ -101,8 +101,16 @@ class _EvidenceSession:
 def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
 
+    assert "dataset.is_current IS TRUE" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
+    assert "resource.dataset_id = dataset.dataset_id" in sql
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
+    assert "current_role.resource_type = 'PractitionerRole'" in sql
+    assert "role.last_seen_run_id = current_role.run_id" in sql
+    assert "current_insurance_plan.resource_type = 'InsurancePlan'" in sql
+    assert "insurance_plan.last_seen_run_id = current_insurance_plan.run_id" in sql
     assert "role.active IS DISTINCT FROM false" in sql
     assert "role_organization.active IS DISTINCT FROM false" in sql
     assert "affiliation.active IS DISTINCT FROM false" in sql
@@ -299,6 +307,9 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypat
     assert "provider_directory_network_catalog" not in query_sql
     assert "FROM direct_plans AS direct_plan" in query_sql
     assert checked_table_names == [
+        "provider_directory_source",
+        "provider_directory_endpoint_dataset",
+        "provider_directory_dataset_resource",
         "provider_directory_practitioner_role",
         "provider_directory_insurance_plan",
         "provider_directory_organization",

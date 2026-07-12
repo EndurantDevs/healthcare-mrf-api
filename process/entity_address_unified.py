@@ -156,6 +156,7 @@ WITH requested_sources AS MATERIALIZED (
         ON current_endpoint.endpoint_id = dataset.endpoint_id
      WHERE dataset.is_current IS TRUE
        AND dataset.status = 'published'
+       AND dataset.published_at IS NOT NULL
        AND dataset.superseded_at IS NULL
        AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
 ), current_overlay AS MATERIALIZED (

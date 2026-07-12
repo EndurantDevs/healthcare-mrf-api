@@ -1233,6 +1233,7 @@ def test_latest_provider_directory_partial_scope_sql_uses_current_published_data
     assert "FROM mrf.provider_directory_endpoint_dataset AS dataset" in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "HAVING COUNT(*) = 1" in sql
     assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id" in sql

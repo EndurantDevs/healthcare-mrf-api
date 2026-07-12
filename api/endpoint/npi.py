@@ -635,6 +635,13 @@ def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], va
     )
 
 
+PROVIDER_DIRECTORY_VISIBILITY_TABLES = (
+    "provider_directory_source",
+    "provider_directory_endpoint_dataset",
+    "provider_directory_dataset_resource",
+)
+
+
 # A handful of reference labs / large health systems carry 1k+ service locations.
 # Returning every address inline produces multi-MB responses and 90ms+ build times
 # (one geocode-enrichment task per address). Page the address_list by default so the
@@ -950,11 +957,63 @@ def _insurance_plan_active_sql(alias: str) -> str:
     return f"COALESCE(NULLIF(LOWER(BTRIM({alias}.status)), ''), 'active') = 'active'"
 
 
+def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
+    """Resolve resources through the one current, fully published endpoint dataset."""
+    return f"""
+    current_endpoint_counts AS MATERIALIZED (
+        SELECT dataset.endpoint_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+         WHERE dataset.is_current IS TRUE
+      GROUP BY dataset.endpoint_id
+        HAVING COUNT(*) = 1
+    ), current_datasets AS MATERIALIZED (
+        SELECT dataset.endpoint_id, dataset.dataset_id,
+               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+          JOIN current_endpoint_counts AS current_endpoint
+            ON current_endpoint.endpoint_id = dataset.endpoint_id
+         WHERE dataset.is_current IS TRUE
+           AND dataset.status = 'published'
+           AND dataset.published_at IS NOT NULL
+           AND dataset.superseded_at IS NULL
+           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
+    ), current_resources AS MATERIALIZED (
+        SELECT source.source_id, source.canonical_api_base,
+               dataset.dataset_id, dataset.run_id,
+               resource.resource_type, resource.resource_id
+          FROM {schema}.provider_directory_source AS source
+          JOIN current_datasets AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+          JOIN {schema}.provider_directory_dataset_resource AS resource
+            ON resource.dataset_id = dataset.dataset_id
+    )
+    """
+
+
+def _provider_directory_current_resource_join_sql(
+    resource_alias: str,
+    resource_type: str,
+    current_alias: str,
+) -> str:
+    return f"""
+          JOIN current_resources AS {current_alias}
+            ON {current_alias}.source_id = {resource_alias}.source_id
+           AND {current_alias}.resource_type = '{resource_type}'
+           AND {current_alias}.resource_id = {resource_alias}.resource_id
+           AND {resource_alias}.last_seen_run_id = {current_alias}.run_id
+    """
+
+
 def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
     organization_join = (
+        "LEFT JOIN current_resources AS current_network_organization "
+        "ON current_network_organization.source_id = network.source_id "
+        "AND current_network_organization.resource_type = 'Organization' "
+        "AND current_network_organization.resource_id = network.resource_id "
         f"LEFT JOIN {schema}.provider_directory_organization AS network_organization "
         "ON network_organization.source_id = network.source_id "
         "AND network_organization.resource_id = network.resource_id "
+        "AND network_organization.last_seen_run_id = current_network_organization.run_id "
         "AND network_organization.active IS DISTINCT FROM false"
     )
     if not has_catalog:
@@ -1004,6 +1063,7 @@ def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliatio
             ON role_organization.source_id = role.source_id
            AND role_organization.resource_id = {role_organization_id}
            AND role_organization.active IS DISTINCT FROM false
+          {_provider_directory_current_resource_join_sql("role_organization", "Organization", "current_role_organization")}
     ), affiliation_organization_candidates AS MATERIALIZED (
         SELECT DISTINCT role_organization.source_id, role_organization.role_id,
                organization_candidate.reference
@@ -1026,6 +1086,7 @@ def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliatio
             ON affiliation.source_id = organization_candidate.source_id
            AND affiliation.participating_organization_ref = organization_candidate.reference
            AND affiliation.active IS DISTINCT FROM false
+          {_provider_directory_current_resource_join_sql("affiliation", "OrganizationAffiliation", "current_affiliation")}
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
          ) AS affiliation_network_ref(value)
@@ -1108,6 +1169,9 @@ def _catalog_derived_plan_cte_sql(schema: str) -> str:
             ON insurance_plan.source_id = plan_candidate.source_id
            AND insurance_plan.resource_id = plan_candidate.resource_id
            AND {insurance_plan_active}
+          {_provider_directory_current_resource_join_sql(
+              "insurance_plan", "InsurancePlan", "current_insurance_plan"
+          )}
          WHERE plan_candidate.resource_id IS NOT NULL
            AND NOT EXISTS (
                SELECT 1
@@ -1175,6 +1239,11 @@ def _provider_directory_network_plan_ctes_sql(
             ON role_network_organization.source_id = role_network.source_id
            AND role_network_organization.resource_id = role_network.resource_id
            AND role_network_organization.active IS DISTINCT FROM false
+          {_provider_directory_current_resource_join_sql(
+              "role_network_organization",
+              "Organization",
+              "current_role_network_organization",
+          )}
          WHERE role_network.resource_id IS NOT NULL
     ), {plan_ctes_sql}
     """
@@ -1194,6 +1263,9 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
           FROM requested_roles AS requested
           JOIN {schema}.provider_directory_practitioner_role AS role
             ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
+          {_provider_directory_current_resource_join_sql(
+              "role", "PractitionerRole", "current_role"
+          )}
          WHERE role.active IS DISTINCT FROM false
     ), direct_plans AS MATERIALIZED (
         SELECT role.source_id, role.role_id, insurance_plan.resource_id,
@@ -1207,6 +1279,9 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
             ON insurance_plan.source_id = role.source_id
            AND insurance_plan.resource_id = {plan_id}
            AND {insurance_plan_active}
+          {_provider_directory_current_resource_join_sql(
+              "insurance_plan", "InsurancePlan", "current_insurance_plan"
+          )}
     )
     """
 
@@ -1350,8 +1425,9 @@ def _provider_directory_role_evidence_sql(
         has_catalog,
     )
     evidence_union_sql = _provider_directory_evidence_union_sql(schema, has_catalog)
+    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
     return f"""
-    WITH {role_ctes_sql}, evidence AS (
+    WITH {current_resource_ctes_sql}, {role_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
     SELECT source_id, role_id, evidence_type, resource_id, identifier, name, reference, provenance,
@@ -1486,6 +1562,7 @@ async def _fetch_provider_directory_role_evidence_map(
     required_tables = [
         await _table_exists(table_name, session=session)
         for table_name in (
+            *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
             "provider_directory_practitioner_role",
             "provider_directory_insurance_plan",
             "provider_directory_organization",
@@ -7091,32 +7168,25 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
-def _provider_directory_overlay_source_join_sql(
-    source_table_exists: bool,
-) -> tuple[str, str]:
-    if not source_table_exists:
-        return "", "overlay.source_id"
-    source_table_sql = _schema_cache_key(ProviderDirectorySource.__tablename__)
-    source_table_join = (
-        f"LEFT JOIN {source_table_sql} AS directory_source "
-        "ON directory_source.source_id = overlay.source_id"
-    )
-    independent_source_expression = (
-        "COALESCE(NULLIF(directory_source.canonical_api_base, ''), overlay.source_id)"
-    )
-    return source_table_join, independent_source_expression
-
-
 def _provider_directory_overlay_query_sql(
     overlay_columns: set[str],
-    source_table_join: str,
-    independent_source_expression: str,
 ) -> str:
     lat_select = "lat" if "lat" in overlay_columns else "NULL::numeric AS lat"
     long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
     coordinate_group_by = ", lat, long" if {"lat", "long"}.issubset(overlay_columns) else ""
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
     return f"""
+        WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
+            SELECT overlay.*, current_resource.canonical_api_base
+              FROM {overlay_table_sql} AS overlay
+              JOIN current_resources AS current_resource
+                ON current_resource.source_id = overlay.source_id
+               AND current_resource.resource_type = overlay.resource_type
+               AND current_resource.resource_id = overlay.resource_id
+               AND overlay.last_seen_run_id = current_resource.run_id
+        )
         SELECT
             npi,
             'practice'::varchar AS type,
@@ -7138,11 +7208,10 @@ def _provider_directory_overlay_query_sql(
             ARRAY['provider_directory_fhir']::varchar[] AS address_sources,
             ARRAY_AGG(overlay.source_record_id ORDER BY overlay.source_record_id)::varchar[] AS source_record_ids,
             COUNT(DISTINCT overlay.source_id)::integer AS source_count,
-            COUNT(DISTINCT {independent_source_expression})::integer AS independent_source_count,
-            (COUNT(DISTINCT {independent_source_expression}) > 1)::boolean AS multi_source_confirmed,
+            COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id))::integer AS independent_source_count,
+            (COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id)) > 1)::boolean AS multi_source_confirmed,
             MAX(source_updated_at) AS updated_at
-          FROM {overlay_table_sql} AS overlay
-          {source_table_join}
+          FROM visible_overlay AS overlay
          WHERE overlay.npi = :npi
       GROUP BY
             npi, first_line, second_line, city_name, state_name, state_code,
@@ -7160,19 +7229,16 @@ async def _fetch_provider_directory_address_overlay(
     """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
     if not await _table_exists(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
         return []
+    visibility_table_states = [
+        await _table_exists(table_name, session=session)
+        for table_name in PROVIDER_DIRECTORY_VISIBILITY_TABLES
+    ]
+    if not all(visibility_table_states):
+        return []
     overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
-    source_table_exists = await _table_exists(
-        ProviderDirectorySource.__tablename__,
-        session=session,
-    )
-    source_table_join, independent_source_expression = (
-        _provider_directory_overlay_source_join_sql(source_table_exists)
-    )
     overlay_query = text(
         _provider_directory_overlay_query_sql(
             overlay_columns,
-            source_table_join,
-            independent_source_expression,
         )
     )
     overlay_result = await _execute_stmt(overlay_query, session=session, params={"npi": int(npi)})
