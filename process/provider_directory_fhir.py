@@ -622,6 +622,11 @@ AMERIHEALTH_CARITAS_DOC_URL = "https://developer.amerihealthcaritas.com/dvp/v1/a
 AMERIHEALTH_CARITAS_DOC_URL_ENV = "HLTHPRT_PROVIDER_DIRECTORY_AMERIHEALTH_CARITAS_CATALOG_URL"
 AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX = "https://api-ext.amerihealthcaritas.com"
 AMERIHEALTH_CARITAS_STALE_GENERIC_BASE = "https://fhir.amerihealthcaritas.com/provider-directory"
+AMERIHEALTH_CARITAS_CARRIER_ACQUISITION_PLAN_CODE = "0900"
+AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE = (
+    f"{AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX}/"
+    f"{AMERIHEALTH_CARITAS_CARRIER_ACQUISITION_PLAN_CODE}/provider-api"
+)
 CONTRA_COSTA_PROVIDER_DIRECTORY_DOC_URL = (
     "https://www.cchealth.org/health-insurance/about-cchp-managed-care/apis-for-developers"
 )
@@ -3862,7 +3867,59 @@ def _amerihealth_caritas_provider_directory_base(plan_code: str) -> str:
     return f"{AMERIHEALTH_CARITAS_PROVIDER_API_PREFIX}/{plan_code}/provider-api"
 
 
+def _amerihealth_caritas_override_metadata(
+    seed_row: dict[str, Any],
+    plan_code: str,
+    alias_base: str,
+    *,
+    is_carrier_acquisition: bool,
+) -> dict[str, Any]:
+    """Build provenance while keeping carrier acquisition plan-neutral."""
+    supported_resources = list(AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES)
+    metadata = {
+        "provider_directory_override": "amerihealth_caritas_api_ext_provider_api",
+        "provider_directory_override_reason": (
+            "AmeriHealth Caritas publishes plan-specific public Provider Directory FHIR bases "
+            "at api-ext.amerihealthcaritas.com; seed rows can point at stale Availity or "
+            "fhir.amerihealthcaritas.com paths."
+        ),
+        "provider_directory_previous_api_base": _clean_text(seed_row.get("api_base")),
+        "provider_directory_confirmed_base": alias_base,
+        "provider_directory_confirmed_metadata_url": f"{alias_base}/metadata",
+        "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
+        "provider_directory_plan_code": (
+            None if is_carrier_acquisition else plan_code
+        ),
+        "provider_directory_supported_resources": supported_resources,
+        "provider_directory_fully_enumerable_resources": (
+            supported_resources if is_carrier_acquisition else []
+        ),
+        "provider_directory_coverage_mode": (
+            "carrier_directory" if is_carrier_acquisition else "probe_only"
+        ),
+    }
+    if not is_carrier_acquisition:
+        metadata["provider_directory_acquisition_blocked_reason"] = (
+            "Exhaustive equivalence with the 0900 carrier directory is not "
+            "established; this plan alias remains catalog/probe-only."
+        )
+        return metadata
+    metadata.update(
+        {
+            "provider_directory_directory_scope": "carrier",
+            "provider_directory_plan_provenance_neutralized": True,
+            "provider_directory_original_alias": {
+                "plan_code": plan_code,
+                "plan_name": _clean_text(seed_row.get("plan_name")),
+                "api_base": alias_base,
+            },
+        }
+    )
+    return metadata
+
+
 def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve a catalog alias without assigning graph rows to its product."""
     api_base = _canonical_base(row.get("api_base"))
     portal_url = (_clean_text(row.get("portal_url")) or "").lower()
     source_url = (_clean_text(row.get("source_url")) or "").lower()
@@ -3883,37 +3940,27 @@ def _amerihealth_caritas_provider_directory_override(row: dict[str, Any]) -> dic
     if not should_override:
         return None
     provider_base = _amerihealth_caritas_provider_directory_base(plan_code)
+    is_carrier_acquisition = (
+        plan_code == AMERIHEALTH_CARITAS_CARRIER_ACQUISITION_PLAN_CODE
+    )
     return {
         "api_base": provider_base,
         "canonical_api_base": provider_base,
+        "plan_name": (
+            None if is_carrier_acquisition else _clean_text(row.get("plan_name"))
+        ),
         "requires_registration": False,
         "auth_type": "none",
-        "last_validated_status": "shared_backend_unverified",
+        "last_validated_status": (
+            "valid" if is_carrier_acquisition else "probe_only"
+        ),
         "endpoints": _source_override_endpoint_fields(provider_base),
-        "metadata": {
-            "provider_directory_override": "amerihealth_caritas_api_ext_provider_api",
-            "provider_directory_override_reason": (
-                "AmeriHealth Caritas publishes plan-specific public Provider Directory FHIR bases "
-                "at api-ext.amerihealthcaritas.com; seed rows can point at stale Availity or "
-                "fhir.amerihealthcaritas.com paths."
-            ),
-            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
-            "provider_directory_confirmed_base": provider_base,
-            "provider_directory_confirmed_metadata_url": f"{provider_base}/metadata",
-            "provider_directory_confirmed_catalog_url": AMERIHEALTH_CARITAS_DOC_URL,
-            "provider_directory_plan_code": plan_code,
-            "provider_directory_supported_resources": list(
-                AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES
-            ),
-            "provider_directory_fully_enumerable_resources": [],
-            "provider_directory_coverage_mode": "probe_only",
-            "provider_directory_acquisition_blocked_reason": (
-                "Worker-pod probes can page anonymously, but all configured plan-code "
-                "bases expose the same first Practitioner hash and identical prior "
-                "counts; one canonical lane and shared-backend identity must be proven "
-                "before acquisition is enabled."
-            ),
-        },
+        "metadata": _amerihealth_caritas_override_metadata(
+            row,
+            plan_code,
+            provider_base,
+            is_carrier_acquisition=is_carrier_acquisition,
+        ),
     }
 
 
@@ -4377,7 +4424,11 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         "source_id": source_id,
         "org_tin": _clean_text(row.get("org_tin")),
         "org_name": _clean_text(row.get("org_name")) or "Unknown payer",
-        "plan_name": _clean_text(row.get("plan_name")),
+        "plan_name": (
+            override.get("plan_name")
+            if override and "plan_name" in override
+            else _clean_text(row.get("plan_name"))
+        ),
         "portal_url": _clean_text(row.get("portal_url")),
         "api_base": api_base,
         "canonical_api_base": canonical_api_base,

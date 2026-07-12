@@ -177,6 +177,12 @@
       },
       "terminal_status": "external_completed"
     },
+    "amerihealth-caritas-carrier": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "run_id": null,
+      "terminal_status": null
+    },
     "amerihealth-dc": {
       "access_verification": "not_recorded",
       "checked_at": null,
@@ -196,12 +202,6 @@
       "terminal_status": null
     },
     "amerihealth-nc": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
-      "run_id": null,
-      "terminal_status": null
-    },
-    "amerihealth-nh": {
       "access_verification": "not_recorded",
       "checked_at": null,
       "run_id": null,

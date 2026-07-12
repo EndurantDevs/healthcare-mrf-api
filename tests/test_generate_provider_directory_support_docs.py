@@ -32,14 +32,14 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
     assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | None | Probe | None configured" in rendered_document
-    assert "AmeriHealth Caritas NH (`amerihealth-nh`) | Probe-only | None | Probe | None configured" in rendered_document
-    assert "worker-pod probes return HTTP 200" in rendered_document
-    assert "identical 21,809,233-resource totals" in rendered_document
-    assert "canonical transport identity preserves plan-code provenance" in rendered_document
+    assert "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
+    assert "AmeriHealth Caritas DC (`amerihealth-dc`) | Probe-only" in rendered_document
+    assert "clears plan_name and does not claim NH product membership" in rendered_document
+    assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 17 |" in rendered_document
+    assert "| Acquisition-configured | 18 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
-    assert "| Probe-only | 10 |" in rendered_document
+    assert "| Probe-only | 9 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 31 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
@@ -338,7 +338,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("hap", "throttles requests to 20 seconds"),
         ("washington", "Attempt 25 failed while resuming pagination"),
         ("wyoming", "PractitionerRole pagination was revalidated"),
-        ("amerihealth-nh", "shared unverified backend"),
+        ("amerihealth-caritas-carrier", "clears plan_name"),
         ("texas-tmhp", "stable _id sorting and offset pagination"),
         ("nebraska", "Endpoint is excluded because it returns HTTP 404"),
         ("uhc", "requires two identical graph snapshots"),
@@ -358,33 +358,32 @@ def test_support_metadata_retains_audited_source_details(entry_id, expected_deta
     assert expected_detail in limitation
 
 
-def test_amerihealth_plan_code_sources_are_probe_only_and_not_importable():
+def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
     support_by_entry = manifest["support_documentation"]["entry_support"]
-    amerihealth_entry_ids = {
-        "amerihealth-nh",
-        "amerihealth-de",
-        "amerihealth-la",
-        "amerihealth-nc",
-        "amerihealth-dc",
-        "amerihealth-pa",
-    }
-
     entries_by_id = {
         entry["entry_id"]: entry
         for entry in manifest["entries"]
-        if entry["entry_id"] in amerihealth_entry_ids
+        if entry["entry_id"].startswith("amerihealth-")
     }
+    carrier = entries_by_id.pop("amerihealth-caritas-carrier")
 
-    assert set(entries_by_id) == amerihealth_entry_ids
-    for entry_id, entry in entries_by_id.items():
-        assert entry["classification"] == "probe_only"
-        assert entry["resource_profile"] == "NONE"
-        assert entry["resources"] == []
-        assert support_by_entry[entry_id]["support_level"] == "probe-only"
-        assert support_by_entry[entry_id]["method"] == "probe"
-        assert "canonical transport identity" in support_by_entry[entry_id]["limitation"]
-        assert "terminal crawl" in support_by_entry[entry_id]["limitation"]
+    assert carrier["classification"] == "acquisition"
+    assert carrier["resource_profile"] == "A6"
+    assert carrier["canonical_base"].endswith("/0900/provider-api")
+    assert carrier["source_ids"] == ["pdfhir_3e8f8d73e9f63b41f4f3fca5"]
+    assert set(entries_by_id) == {
+        "amerihealth-de", "amerihealth-la", "amerihealth-nc",
+        "amerihealth-dc", "amerihealth-pa",
+    }
+    assert all(entry["classification"] == "probe_only" for entry in entries_by_id.values())
+    assert all(entry["resources"] == [] for entry in entries_by_id.values())
+    support = support_by_entry[carrier["entry_id"]]
+    assert support["support_level"] == "acquisition-configured"
+    assert support["method"] == "rest"
+    assert "Exhaustive equivalence" in support["limitation"]
+    assert "no resource evidence is fanned out" in support["limitation"]
+    assert "No terminal full-acquisition" in support["limitation"]
 
 
 def test_documentation_metadata_does_not_change_entry_execution_fingerprints():

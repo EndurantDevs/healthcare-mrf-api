@@ -459,7 +459,7 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
     assert row["canonical_api_base"] == expected_base
     assert row["requires_registration"] is False
     assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "shared_backend_unverified"
+    assert row["last_validated_status"] == "probe_only"
     assert row["endpoint_practitioner"] == f"{expected_base}/Practitioner"
     assert row["endpoint_location"] == f"{expected_base}/Location"
     assert row["metadata_json"]["provider_directory_override"] == "amerihealth_caritas_api_ext_provider_api"
@@ -481,7 +481,7 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
     assert selection_metrics["source_import_skipped_blocked_source"] == 1
     assert (
         selection_metrics[
-            "source_import_skipped_blocked_source_shared_backend_unverified"
+            "source_import_skipped_blocked_source_coverage_mode_probe_only"
         ]
         == 1
     )
@@ -489,6 +489,37 @@ def test_source_row_from_seed_overrides_amerihealth_caritas_plan_base_and_endpoi
         [row],
         list(importer.DEFAULT_RESOURCES),
     ) == []
+
+
+def test_amerihealth_0900_acquisition_is_carrier_level_and_plan_neutral():
+    row = importer._source_row_from_seed(
+        {
+            "id": "amerihealth-caritas-0900",
+            "org_name": "AmeriHealth Caritas",
+            "plan_name": "AmeriHealth Caritas NH",
+            "api_base": "https://api-ext.amerihealthcaritas.com/0900/provider-api",
+            "auth_type": "none",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert row["canonical_api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert row["plan_name"] is None
+    assert row["last_validated_status"] == "valid"
+    metadata = row["metadata_json"]
+    assert metadata["provider_directory_directory_scope"] == "carrier"
+    assert metadata["provider_directory_plan_code"] is None
+    assert metadata["provider_directory_plan_provenance_neutralized"] is True
+    assert metadata["provider_directory_original_alias"] == {
+        "plan_code": "0900",
+        "plan_name": "AmeriHealth Caritas NH",
+        "api_base": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE,
+    }
+    selected_sources, _metrics = importer._select_resource_import_sources(
+        [row], valid_source_ids=None, open_only=True, include_auth_required=False
+    )
+    assert selected_sources == [row]
 
 
 def test_source_row_from_seed_does_not_guess_ambiguous_amerihealth_caritas_retest_base():
@@ -1970,65 +2001,65 @@ def test_selection_blocks_non_acquisition_sources_after_live_probe(
 
 
 @pytest.mark.asyncio
-async def test_process_data_probes_all_amerihealth_aliases_without_resource_acquisition(
+async def test_process_data_acquires_only_neutral_0900_without_alias_fanout(
     monkeypatch,
 ):
-    amerihealth_plan_codes = ("0900", "7100", "2100", "1200", "5400", "0500")
-    source_ids = [f"amerihealth-{plan_code}" for plan_code in amerihealth_plan_codes]
-
-    def source_row_from_seed(seed_row):
-        plan_code = seed_row["id"].removeprefix("amerihealth-")
-        return {
-            "source_id": seed_row["id"],
+    plan_name_by_code = {
+        "0500": "AmeriHealth Caritas PA",
+        "0900": "AmeriHealth Caritas NH",
+        "1200": "AmeriHealth Caritas North Carolina",
+        "2100": "AmeriHealth Caritas Louisiana",
+        "5400": "AmeriHealth Caritas DC",
+        "7100": "AmeriHealth Caritas DE",
+    }
+    seed_rows = [
+        {
+            "id": f"amerihealth-{plan_code}",
             "org_name": "AmeriHealth Caritas",
-            "api_base": f"https://api-ext.amerihealthcaritas.com/{plan_code}/provider-api",
-            "canonical_api_base": f"https://api-ext.amerihealthcaritas.com/{plan_code}/provider-api",
+            "plan_name": plan_name_by_code[plan_code],
+            "api_base": importer._amerihealth_caritas_provider_directory_base(plan_code),
             "auth_type": "none",
-            "last_validated_status": "shared_backend_unverified",
-            "metadata_json": {
-                "provider_directory_coverage_mode": "probe_only",
-                "provider_directory_fully_enumerable_resources": [],
-            },
+            "source": "provider-directory-db",
         }
-
-    probe_sources = AsyncMock(return_value=(6, 6, set(source_ids)))
+        for plan_code in ("0500", "0900", "1200", "2100", "5400", "7100")
+    ]
+    resolved_rows = [importer._source_row_from_seed(seed) for seed in seed_rows]
+    source_ids = {
+        resolved_source["source_id"] for resolved_source in resolved_rows
+    }
+    probe_sources = AsyncMock(return_value=(6, 6, source_ids))
     import_resources = AsyncMock(return_value={"Practitioner": 1})
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "_resolve_seed_db", lambda *_args, **_kwargs: ("fixture.db", None))
-    monkeypatch.setattr(
-        importer,
-        "_seed_rows_from_sqlite",
-        lambda *_args, **_kwargs: [{"id": source_id} for source_id in source_ids],
-    )
-    monkeypatch.setattr(importer, "_source_row_from_seed", source_row_from_seed)
+    monkeypatch.setattr(importer, "_seed_rows_from_sqlite", lambda *_args, **_kwargs: seed_rows)
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=6))
     monkeypatch.setattr(importer, "_probe_sources", probe_sources)
     monkeypatch.setattr(importer, "_import_resources", import_resources)
 
-    metrics = await importer.process_data(
+    audit_metrics = await importer.process_data(
         {"context": {}},
         {
             "seed_db_path": "fixture.db",
             "probe": True,
             "import_resources": True,
-            "resources": ",".join(importer.DEFAULT_RESOURCES),
+            "resources": ",".join(importer.AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES),
             "publish_artifacts": False,
+            "provider_directory_endpoint_scope": importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE,
         },
     )
 
-    probe_sources.assert_awaited_once()
-    import_resources.assert_not_awaited()
-    assert metrics["sources_probed"] == 6
-    assert metrics["valid_capability_sources"] == 6
-    assert metrics["source_import_sources_selected"] == 0
-    assert metrics["source_import_skipped_blocked_source"] == 6
-    assert metrics[
-        "source_import_skipped_blocked_source_shared_backend_unverified"
-    ] == 6
-
-
+    imported_sources = import_resources.await_args.args[0]
+    assert len(imported_sources) == 1
+    assert imported_sources[0]["api_base"] == importer.AMERIHEALTH_CARITAS_CARRIER_PROVIDER_API_BASE
+    assert imported_sources[0]["plan_name"] is None
+    assert imported_sources[0]["metadata_json"]["provider_directory_original_alias"]["plan_name"] == "AmeriHealth Caritas NH"
+    assert audit_metrics["source_import_sources_selected"] == 1
+    assert audit_metrics["source_import_skipped_blocked_source"] == 5
+    assert audit_metrics["source_import_groups_attempted"] == 1
+    assert audit_metrics["source_import_duplicate_sources_collapsed"] == 0
+    assert "amerihealth_shared_backend_preflight" not in audit_metrics
 def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
     retest_path = tmp_path / "retest_results.json"
     retest_path.write_text(
