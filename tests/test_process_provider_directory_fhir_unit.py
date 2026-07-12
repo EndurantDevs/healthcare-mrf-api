@@ -10050,6 +10050,37 @@ def test_michigan_source_profile_is_probe_only_and_acquisition_blocked():
     ) is None
 
 
+def test_washington_source_profile_is_probe_only_and_acquisition_blocked():
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "washington",
+            "org_name": "Community Health Plan of Washington",
+            "api_base": importer.WASHINGTON_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+
+    assert source_row["last_validated_status"] == "valid"
+    assert source_row["metadata_json"]["provider_directory_supported_resources"] == (
+        list(importer.DEFAULT_RESOURCES)
+    )
+    assert source_row["metadata_json"][
+        "provider_directory_fully_enumerable_resources"
+    ] == []
+    assert source_row["metadata_json"]["provider_directory_coverage_mode"] == (
+        "probe_only"
+    )
+    assert (
+        source_row["metadata_json"]["provider_directory_acquisition_enabled"]
+        is False
+    )
+    assert "checkpoint progress regresses" in source_row["metadata_json"][
+        "provider_directory_acquisition_blocked_reason"
+    ]
+    assert importer._resource_acquisition_blocked_reason(source_row) == (
+        "coverage_mode_probe_only"
+    )
+
+
 def test_resource_start_url_uses_metadata_resource_page_count_cap():
     url = importer._resource_start_url(
         {

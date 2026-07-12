@@ -4113,6 +4113,48 @@ def _michigan_provider_directory_override(
     }
 
 
+def _washington_provider_directory_override(
+    source_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Keep Washington probeable without restarting its opaque cursor lineage."""
+    api_base = _canonical_base(source_row.get("api_base"))
+    if api_base != WASHINGTON_PROVIDER_DIRECTORY_BASE:
+        return None
+    return {
+        "api_base": WASHINGTON_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": WASHINGTON_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "endpoints": _source_override_endpoint_fields(
+            WASHINGTON_PROVIDER_DIRECTORY_BASE
+        ),
+        "metadata": {
+            "provider_directory_override": "washington_probe_only",
+            "provider_directory_override_reason": (
+                "Washington exposes public FHIR samples, but its opaque HAPI cursor "
+                "expires during full traversal and HealthcareService times out."
+            ),
+            "provider_directory_previous_api_base": _clean_text(
+                source_row.get("api_base")
+            ),
+            "provider_directory_confirmed_base": WASHINGTON_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_metadata_url": (
+                f"{WASHINGTON_PROVIDER_DIRECTORY_BASE}/metadata"
+            ),
+            "provider_directory_supported_resources": list(DEFAULT_RESOURCES),
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_acquisition_enabled": False,
+            "provider_directory_acquisition_blocked_reason": (
+                "Opaque cursors expire and restart from page one, checkpoint progress "
+                "regresses, Bundle.total is unusable, and HealthcareService returns "
+                "HTTP 504 even at _count=1. No exhaustive acquisition is verified."
+            ),
+        },
+    }
+
+
 def _state_public_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
     api_base = _canonical_base(row.get("api_base"))
     if api_base == TMHP_PROVIDER_DIRECTORY_BASE:
@@ -4393,6 +4435,7 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         or _molina_provider_directory_override(row)
         or _uhc_provider_directory_override(row)
         or _michigan_provider_directory_override(row)
+        or _washington_provider_directory_override(row)
         or _state_public_provider_directory_override(row)
         or _maine_provider_directory_override(row)
         or _hap_provider_directory_override(row)
