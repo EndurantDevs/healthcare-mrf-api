@@ -1223,12 +1223,13 @@ stored status/manifest checkpoint instead of creating a mixed snapshot.
 The importer may cap `_count` below the schedule-level `page_count` for a
 specific payer/resource when the live FHIR server is known to misbehave at
 larger page sizes. Aetna Commercial caps all seven supported collections at 30.
-Another confirmed case is Michigan InteropStation
-`PractitionerRole`, where `_count>=50` returns an empty Bundle while `_count=25`
-returns rows and a next link. That canonical HAPI next link currently returns
-HTTP 403 from the worker network even when cookies are preserved, so Michigan
-full acquisition fails closed until a stateless continuation is proven. Future
-source-specific caps can also be carried
+Michigan InteropStation `PractitionerRole` returns rows and a next link at
+`_count=25`, but that canonical HAPI next link returns HTTP 403 through the
+relay. Synthetic `_getpagesoffset` continuation is disabled because live
+comparison proved that offset 25 skips canonical page two, and offset zero can
+return a false-empty Bundle. Michigan therefore remains probe-only until the
+vendor provides a byte-for-byte usable cursor, documented stable offset
+contract, or complete Bulk/file export. Future source-specific caps can also be carried
 in source `metadata_json.provider_directory_resource_page_count_caps` without
 changing the monthly schedule.
 `import-control` also schedules a follow-up artifact-only Provider Directory

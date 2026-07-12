@@ -4136,91 +4136,6 @@ async def test_cigna_source_fetch_cools_down_after_empty_search_sets(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_michigan_source_fetch_retries_empty_offset_page(monkeypatch):
-    empty_bundle_dict = {
-        "resourceType": "Bundle",
-        "type": "searchset",
-        "entry": [],
-    }
-    populated_bundle_dict = {
-        "resourceType": "Bundle",
-        "type": "searchset",
-        "entry": [{"resource": {"resourceType": "Location", "id": "loc-26"}}],
-    }
-    fetch_source_json_once = AsyncMock(
-        side_effect=[
-            (200, empty_bundle_dict, None, 5),
-            (200, populated_bundle_dict, None, 7),
-        ]
-    )
-    sleep_mock = AsyncMock()
-    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
-    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
-    monkeypatch.setattr(
-        importer,
-        "MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS",
-        (2.0, 4.0),
-    )
-
-    fetch_result = await importer._fetch_source_json(
-        {
-            "source_id": "michigan",
-            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-        },
-        (
-            f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/Location?"
-            "_count=25&_getpagesoffset=25"
-        ),
-        timeout=3,
-    )
-
-    assert fetch_result == (200, populated_bundle_dict, None, 12)
-    assert fetch_source_json_once.await_count == 2
-    sleep_mock.assert_awaited_once_with(2.0)
-
-
-@pytest.mark.asyncio
-async def test_michigan_source_fetch_fails_closed_after_empty_offset_retries(
-    monkeypatch,
-):
-    empty_bundle_dict = {
-        "resourceType": "Bundle",
-        "type": "searchset",
-        "entry": [],
-    }
-    fetch_source_json_once = AsyncMock(
-        return_value=(200, empty_bundle_dict, None, 5)
-    )
-    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_source_json_once)
-    monkeypatch.setattr(importer.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr(
-        importer,
-        "MICHIGAN_STATELESS_OFFSET_EMPTY_RETRY_DELAYS_SECONDS",
-        (0.0, 0.0),
-    )
-
-    fetch_result = await importer._fetch_source_json(
-        {
-            "source_id": "michigan",
-            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-        },
-        (
-            f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/Practitioner?"
-            "_count=100&_getpagesoffset=100"
-        ),
-        timeout=3,
-    )
-
-    assert fetch_result == (
-        200,
-        empty_bundle_dict,
-        importer.MICHIGAN_STATELESS_OFFSET_EMPTY_ERROR,
-        15,
-    )
-    assert fetch_source_json_once.await_count == 3
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "resource_url",
     [
@@ -10030,7 +9945,7 @@ def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
     assert url == "https://example.test/fhir/HealthcareService?_count=500"
 
 
-def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_count():
+def test_michigan_probe_start_url_caps_role_without_synthesizing_offset():
     url = importer._resource_start_url(
         {
             "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
@@ -10044,81 +9959,15 @@ def test_resource_start_url_caps_michigan_interopstation_practitioner_role_page_
 
     assert url == (
         "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?"
-        "_count=25&_getpagesoffset=0"
+        "_count=25"
     )
 
 
-@pytest.mark.parametrize(
-    ("resource_type", "page_count", "current_offset", "expected_offset"),
-    [
-        ("Location", 100, 100, 200),
-        ("Organization", 100, 100, 200),
-        ("OrganizationAffiliation", 100, 100, 200),
-        ("Practitioner", 100, 100, 200),
-        ("PractitionerRole", 25, 25, 50),
-    ],
-)
-def test_michigan_interopstation_replaces_opaque_cursor_with_stateless_offset(
-    resource_type,
-    page_count,
-    current_offset,
-    expected_offset,
-):
-    source_lookup = {
-        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-        "canonical_api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-    }
-    current_url = (
-        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/{resource_type}?"
-        f"_count={page_count}&_getpagesoffset={current_offset}"
-    )
-    advertised_next_url = (
-        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}?"
-        "_getpages=opaque&_pageId=signed-page&_bundletype=searchset"
-    )
+def test_michigan_offset_substitute_is_not_equivalent_to_canonical_cursor_page():
+    canonical_second_page_ids = {"75147991", "75147992", "75204637"}
+    synthetic_offset_page_ids = {"75040123", "75317648", "75419649"}
 
-    next_url = importer._resolved_fhir_next_url(
-        source_lookup,
-        current_url,
-        advertised_next_url,
-    )
-
-    assert next_url == (
-        f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/{resource_type}?"
-        f"_count={page_count}&_getpagesoffset={expected_offset}"
-    )
-
-
-@pytest.mark.parametrize(
-    "advertised_next_url",
-    [
-        "https://evil.example/fhir?_getpages=opaque&_pageId=signed-page&_bundletype=searchset",
-        (
-            "https://api.interopstation.com/mdhhs/fhir?"
-            "_getpages=opaque&_bundletype=searchset"
-        ),
-        (
-            "https://api.interopstation.com/mdhhs/fhir?"
-            "_getpages=opaque&_pageId=signed-page&_bundletype=searchset&extra=1"
-        ),
-    ],
-)
-def test_michigan_interopstation_rejects_untrusted_stateless_offset_cursor(
-    advertised_next_url,
-):
-    source_lookup = {
-        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-    }
-
-    with pytest.raises(ValueError, match="untrusted_michigan_pagination_link"):
-        importer._resolved_fhir_next_url(
-            source_lookup,
-            (
-                f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
-                "_count=25&_getpagesoffset=0"
-            ),
-            advertised_next_url,
-        )
+    assert canonical_second_page_ids.isdisjoint(synthetic_offset_page_ids)
 
 
 def test_resource_start_url_caps_uhc_insurance_plan_page_count():
@@ -10151,7 +10000,7 @@ def test_resource_start_url_uses_standard_count_for_state_directory_pages(
     assert url == f"{api_base}/{resource_type}?_count=100"
 
 
-def test_resource_start_url_adds_offset_without_capping_other_michigan_resources():
+def test_michigan_probe_start_url_never_adds_synthetic_offset():
     url = importer._resource_start_url(
         {"api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE},
         "Practitioner",
@@ -10160,11 +10009,11 @@ def test_resource_start_url_adds_offset_without_capping_other_michigan_resources
 
     assert url == (
         "https://api.interopstation.com/mdhhs/fhir/Practitioner?"
-        "_count=100&_getpagesoffset=0"
+        "_count=100"
     )
 
 
-def test_michigan_source_profile_excludes_forbidden_resource_collections():
+def test_michigan_source_profile_is_probe_only_and_acquisition_blocked():
     source_row = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -10172,7 +10021,7 @@ def test_michigan_source_profile_excludes_forbidden_resource_collections():
             "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         }
     )
-    supported_resources = sorted(importer.MICHIGAN_STATELESS_OFFSET_RESOURCES)
+    supported_resources = sorted(importer.MICHIGAN_PROBE_RESOURCES)
 
     assert source_row["last_validated_status"] == "valid"
     assert source_row["metadata_json"]["provider_directory_supported_resources"] == (
@@ -10180,7 +10029,20 @@ def test_michigan_source_profile_excludes_forbidden_resource_collections():
     )
     assert source_row["metadata_json"][
         "provider_directory_fully_enumerable_resources"
-    ] == supported_resources
+    ] == []
+    assert source_row["metadata_json"]["provider_directory_coverage_mode"] == (
+        "probe_only"
+    )
+    assert (
+        source_row["metadata_json"]["provider_directory_acquisition_enabled"]
+        is False
+    )
+    assert "synthetic _getpagesoffset pagination skips canonical pages" in source_row[
+        "metadata_json"
+    ]["provider_directory_acquisition_blocked_reason"]
+    assert importer._resource_acquisition_blocked_reason(source_row) == (
+        "coverage_mode_probe_only"
+    )
     assert importer._resource_start_url(
         source_row,
         "InsurancePlan",

@@ -37,9 +37,9 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 17 |" in rendered_document
+    assert "| Acquisition-configured | 16 |" in rendered_document
     assert "| Externally supported | 1 |" in rendered_document
-    assert "| Probe-only | 10 |" in rendered_document
+    assert "| Probe-only | 11 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 31 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
@@ -330,7 +330,7 @@ def test_freshness_validation_accepts_current_reviews():
     [
         ("idaho", "api-ida-prd.safhir.io cursor continuations with checkpoints"),
         ("molina", "checkpointed 497,700 Location rows"),
-        ("michigan", "deterministic _getpagesoffset continuation"),
+        ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
         ("cigna", "_count=75 returns false-empty search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
         ("humana", "Overrides portal or stale paths to the public FHIR base"),
@@ -346,7 +346,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("maine", "Five collections are anonymously readable with ct cursor pagination"),
         ("horizon-nj", "approved Provider Directory API-product subscription"),
         ("missouri", "Practitioner response exceeds the 20 MiB cap"),
-        ("scan", "family=MA returns HTTP 413 SearchTooCostly"),
+        ("scan", "1,000-result search ceiling"),
         ("centene", "return CloudFront HTTP 403 before FHIR processing"),
         ("contra-costa", "Seven public collections follow opaque next-link pagination"),
         ("alohr", "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr"),
