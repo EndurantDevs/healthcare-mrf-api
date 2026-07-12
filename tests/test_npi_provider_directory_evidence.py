@@ -108,8 +108,9 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "current_resources AS NOT MATERIALIZED" in sql
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
-    assert "current_role.resource_type = 'PractitionerRole'" in sql
-    assert "role.last_seen_run_id = current_role.run_id" in sql
+    assert "visible_role_resource.resource_type = 'PractitionerRole'" in sql
+    assert "role.last_seen_run_id = visible_role_resource.run_id" in sql
+    assert "JOIN current_resources AS current_role\n" not in sql
     assert "current_insurance_plan.resource_type = 'InsurancePlan'" in sql
     assert "insurance_plan.last_seen_run_id = current_insurance_plan.run_id" in sql
     assert "role.active IS DISTINCT FROM false" in sql

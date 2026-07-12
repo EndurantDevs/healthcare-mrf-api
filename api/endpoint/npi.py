@@ -1264,7 +1264,7 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
           JOIN {schema}.provider_directory_practitioner_role AS role
             ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
           {_provider_directory_current_resource_join_sql(
-              "role", "PractitionerRole", "current_role"
+              "role", "PractitionerRole", "visible_role_resource"
           )}
          WHERE role.active IS DISTINCT FROM false
     ), direct_plans AS MATERIALIZED (
