@@ -111,6 +111,35 @@ PLAN_NET_NETWORK_REFERENCE_EXTENSION_URLS = frozenset(
         ),
     }
 )
+PLAN_NET_NEW_PATIENTS_EXTENSION_URLS = frozenset(
+    url.lower()
+    for url in {
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/newpatients"
+        ),
+        (
+            "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/newpatients"
+        ),
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/plannet-NewPatients-extension"
+        ),
+        (
+            "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/plannet-NewPatients-extension"
+        ),
+    }
+)
+PLAN_NET_ACCEPTING_PATIENTS_CODES = frozenset(
+    {
+        "nopt",
+        "newpt",
+        "existptonly",
+        "existptfam",
+    }
+)
 _PUBLISH_SCOPE_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
     resource_type.lower() for resource_type in DEFAULT_RESOURCES
@@ -748,8 +777,10 @@ SOURCE_REQUEST_INTERVAL_SECONDS_BY_BASE = {
     HAP_PROVIDER_DIRECTORY_BASE: 20.0,
 }
 SOURCE_RETRY_AFTER_FIELD = "_healthporta_retry_after"
+SOURCE_FETCH_DIAGNOSTIC_FIELD = "_healthporta_source_fetch_diagnostic"
 SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
+SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
     r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
@@ -861,6 +892,7 @@ class ResourceFetchResult:
     fetch_mode: str = "paged"
     deadline_reached: bool = False
     retry_not_before: str | None = None
+    fetch_diagnostic: dict[str, Any] | None = None
 
     @property
     def bounded(self) -> bool:
@@ -2108,6 +2140,11 @@ def _source_supported_resource_types(source: dict[str, Any]) -> set[str] | None:
         "provider_directory_supported_resources"
     )
     if not isinstance(configured_resources, list):
+        api_base = _canonical_base(
+            source.get("canonical_api_base") or source.get("api_base")
+        )
+        if api_base == MAINE_PROVIDER_DIRECTORY_BASE:
+            return set(MAINE_SUPPORTED_RESOURCES)
         return None
     return {
         resource_type
@@ -4536,6 +4573,50 @@ def _network_references(resource: dict[str, Any]) -> list[str]:
     return references
 
 
+def _plan_net_accepting_patient_entry(extension: Any) -> dict[str, str] | None:
+    """Normalize one Plan-Net NewPatients extension into its safe stored fields."""
+
+    if not isinstance(extension, dict):
+        return None
+    extension_url = (_clean_text(extension.get("url")) or "").split("|", 1)[0]
+    if extension_url.rstrip("/").lower() not in PLAN_NET_NEW_PATIENTS_EXTENSION_URLS:
+        return None
+    accepting_patient_code: str | None = None
+    network_reference: str | None = None
+    for nested_extension in extension.get("extension") or []:
+        if not isinstance(nested_extension, dict):
+            continue
+        nested_url = _clean_text(nested_extension.get("url"))
+        if nested_url == "acceptingPatients":
+            codeable_concept = nested_extension.get("valueCodeableConcept")
+            codings = codeable_concept.get("coding") if isinstance(codeable_concept, dict) else []
+            for coding in codings or []:
+                if not isinstance(coding, dict):
+                    continue
+                code = (_clean_text(coding.get("code")) or "").lower()
+                if code in PLAN_NET_ACCEPTING_PATIENTS_CODES:
+                    accepting_patient_code = code
+                    break
+        elif nested_url == "fromNetwork":
+            network_reference = _first_reference(nested_extension.get("valueReference"))
+    if not accepting_patient_code:
+        return None
+    normalized_entry_dict = {"code": accepting_patient_code}
+    if network_reference:
+        normalized_entry_dict["from_network_ref"] = network_reference
+    return normalized_entry_dict
+
+
+def _plan_net_accepting_patients(resource: dict[str, Any]) -> list[dict[str, str]]:
+    """Return normalized Plan-Net NewPatients values without retaining arbitrary extensions."""
+
+    return [
+        normalized_entry
+        for extension in resource.get("extension") or []
+        if (normalized_entry := _plan_net_accepting_patient_entry(extension)) is not None
+    ]
+
+
 def _first_reference(value: Any) -> str | None:
     refs = _references(value)
     return refs[0] if refs else None
@@ -4576,13 +4657,27 @@ def _identifier_value(
 
 
 def _npi(resource: dict[str, Any]) -> int | None:
-    value = _identifier_value(resource, "us-npi", "npi")
-    if not value:
-        return None
-    digits = "".join(ch for ch in value if ch.isdigit())
-    if len(digits) != 10:
-        return None
-    return int(digits)
+    recognized_system = "http://hl7.org/fhir/sid/us-npi"
+    best_candidate: tuple[int, int, int] | None = None
+    for index, identifier in enumerate(resource.get("identifier") or []):
+        if not isinstance(identifier, dict):
+            continue
+        value = _clean_text(identifier.get("value"))
+        if not value or not any(
+            token in _identifier_descriptor(identifier) for token in ("us-npi", "npi")
+        ):
+            continue
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if len(digits) != 10:
+            continue
+        priority = int(
+            (_clean_text(identifier.get("system")) or "").lower()
+            != recognized_system
+        )
+        candidate = (priority, index, int(digits))
+        if best_candidate is None or candidate < best_candidate:
+            best_candidate = candidate
+    return best_candidate[2] if best_candidate is not None else None
 
 
 def _npi_from_resource_id(resource_id: str | None) -> int | None:
@@ -4977,6 +5072,9 @@ def parse_fhir_resource(
     if resource_type == "HealthcareService":
         row = {
             **base,
+            "provided_by_ref": _first_reference(resource.get("providedBy")),
+            "accepting_patients": _plan_net_accepting_patients(resource),
+            "npi": _npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
             "name": _clean_text(resource.get("name")),
             "type_codes": _codings(resource.get("type")),
@@ -11724,6 +11822,19 @@ def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
     return min(2.0, 0.25 * (2**max(0, attempt_index)))
 
 
+def _source_fetch_response_class(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> str | None:
+    if fetch_error:
+        return "transient_transport_error"
+    if status_code == 429:
+        return "transient_rate_limited"
+    if status_code is not None and 500 <= status_code < 600:
+        return "transient_server_error"
+    return None
+
+
 def _cigna_empty_collection_retry_delays(
     source_record: dict[str, Any],
     request_url: str,
@@ -11897,6 +12008,35 @@ def _source_retry_after_seconds(
     )
 
 
+def _transient_source_retry_not_before(
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+    fetch_error: str | None,
+    *,
+    retry_count: int,
+    now_utc: datetime.datetime | None = None,
+) -> str | None:
+    """Return a bounded, generic defer time after a terminal transient fetch."""
+    if not _is_transient_source_fetch_failure(status_code, fetch_error):
+        return None
+    retry_after_seconds = (
+        _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
+        if status_code == 429 or (status_code is not None and 500 <= status_code < 600)
+        else None
+    )
+    delay_seconds = (
+        retry_after_seconds
+        if retry_after_seconds is not None
+        else max(
+            SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS,
+            _source_fetch_retry_delay_seconds(retry_count),
+        )
+    )
+    current_time = now_utc or datetime.datetime.now(datetime.UTC)
+    retry_at = current_time + datetime.timedelta(seconds=math.ceil(delay_seconds))
+    return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _molina_quota_retry_not_before(
     source_record: dict[str, Any],
     status_code: int | None,
@@ -11986,14 +12126,15 @@ def _source_fetch_attempt_delay(
     attempt_index: int,
     empty_collection_retry_delays: tuple[float, ...],
     should_retry_empty_collection: bool,
+    now_utc: datetime.datetime | None = None,
 ) -> float:
     if should_retry_empty_collection:
         return empty_collection_retry_delays[
             min(attempt_index, len(empty_collection_retry_delays) - 1)
         ]
     retry_after_seconds = (
-        _source_retry_after_seconds(fhir_payload)
-        if status_code == 429
+        _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
+        if status_code == 429 or (status_code is not None and 500 <= status_code < 600)
         else None
     )
     return (
@@ -12066,23 +12207,29 @@ def _fail_closed_on_michigan_empty_offset(
     )
 
 
+def _source_fetch_result_with_elapsed(
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+    elapsed_ms: int,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Replace one fetch result's elapsed value with its aggregate duration."""
+    return fetch_result[0], fetch_result[1], fetch_result[2], elapsed_ms
+
+
 async def _fetch_source_json_candidate(
     source_record: dict[str, Any],
     candidate_url: str,
     *,
     timeout: int,
     is_last_candidate: bool,
-) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool]:
+) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool, int]:
     """Fetch one page-size candidate and report whether to try a smaller page."""
     empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
         source_record,
         candidate_url,
     ) or _michigan_empty_collection_retry_delays(source_record, candidate_url)
-    attempt_count = max(
-        _source_fetch_retry_attempts(),
-        len(empty_collection_retry_delays) + 1,
-    )
+    attempt_count = max(_source_fetch_retry_attempts(), len(empty_collection_retry_delays) + 1)
     total_elapsed_ms = 0
+    retry_count = 0
     fetch_result = (None, None, "request_not_attempted", 0)
     for attempt_index in range(attempt_count):
         (
@@ -12100,11 +12247,13 @@ async def _fetch_source_json_candidate(
         total_elapsed_ms += elapsed_ms
         if should_try_smaller_page and not is_last_candidate:
             return (
-                (status_code, fhir_payload, fetch_error, total_elapsed_ms),
+                _source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms),
                 True,
+                retry_count,
             )
         if not should_retry_fetch or attempt_index + 1 >= attempt_count:
             break
+        retry_count += 1
         await asyncio.sleep(
             _source_fetch_attempt_delay(
                 status_code,
@@ -12120,9 +12269,46 @@ async def _fetch_source_json_candidate(
         fetch_result,
     )
     return (
-        (fetch_result[0], fetch_result[1], fetch_result[2], total_elapsed_ms),
+        _source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms),
         False,
+        retry_count,
     )
+
+
+def _record_terminal_source_fetch_diagnostic(
+    source_record: dict[str, Any],
+    request_url: str,
+    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
+    *,
+    retry_count: int,
+) -> None:
+    """Keep only safe terminal transient-fetch facts for resource diagnostics."""
+    source_record.pop(SOURCE_FETCH_DIAGNOSTIC_FIELD, None)
+    status_code, _fhir_payload, fetch_error, elapsed_ms = fetch_result
+    if not _is_transient_source_fetch_failure(status_code, fetch_error):
+        return
+    response_class = _source_fetch_response_class(status_code, fetch_error)
+    if response_class is None:
+        return
+    source_record[SOURCE_FETCH_DIAGNOSTIC_FIELD] = {
+        "status": status_code,
+        "url_hash": _pagination_url_hash(request_url),
+        "retry_count": retry_count,
+        "elapsed_ms": elapsed_ms,
+        "response_class": response_class,
+    }
+
+
+def _terminal_source_fetch_diagnostic(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> dict[str, Any] | None:
+    diagnostic = source_record.get(SOURCE_FETCH_DIAGNOSTIC_FIELD)
+    if not isinstance(diagnostic, dict):
+        return None
+    if diagnostic.get("url_hash") != _pagination_url_hash(request_url):
+        return None
+    return dict(diagnostic)
 
 
 async def _fetch_source_json(
@@ -12140,22 +12326,32 @@ async def _fetch_source_json(
         0,
     )
     candidate_urls = _source_fetch_candidate_urls(url)
+    retry_count = 0
     for candidate_index, candidate_url in enumerate(candidate_urls):
-        fetch_result, should_try_smaller_page = await _fetch_source_json_candidate(
+        (
+            fetch_result,
+            should_try_smaller_page,
+            candidate_retry_count,
+        ) = await _fetch_source_json_candidate(
             source_record,
             candidate_url,
             timeout=timeout,
             is_last_candidate=candidate_index == len(candidate_urls) - 1,
         )
+        retry_count += candidate_retry_count
         total_elapsed_ms += fetch_result[3]
-        fetch_result = (
-            fetch_result[0],
-            fetch_result[1],
-            fetch_result[2],
+        fetch_result = _source_fetch_result_with_elapsed(
+            fetch_result,
             total_elapsed_ms,
         )
         if not should_try_smaller_page:
-            return fetch_result
+            break
+    _record_terminal_source_fetch_diagnostic(
+        source_record,
+        url,
+        fetch_result,
+        retry_count=retry_count,
+    )
     return fetch_result
 
 
@@ -17017,6 +17213,7 @@ async def _fetch_resource_rows(
     next_url_remaining = False
     error_message: str | None = None
     retry_not_before: str | None = None
+    fetch_diagnostic: dict[str, Any] | None = None
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     source_api_base = _canonical_base(
@@ -17135,10 +17332,16 @@ async def _fetch_resource_rows(
                     has_restart_attempted = True
                     url = checkpoint_start_url
                     continue
+                fetch_diagnostic = _terminal_source_fetch_diagnostic(source, url)
                 retry_not_before = _molina_quota_retry_not_before(
                     source,
                     status_code,
                     payload,
+                ) or _transient_source_retry_not_before(
+                    status_code,
+                    payload,
+                    error,
+                    retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
                 )
                 current_error = error or f"http_{status_code}"
                 if partitioned_fetch:
@@ -17283,6 +17486,7 @@ async def _fetch_resource_rows(
         fetch_mode="checkpointed_paged" if checkpoint_context else "paged",
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
+        fetch_diagnostic=fetch_diagnostic,
     )
 
 
@@ -18888,6 +19092,7 @@ def _resource_fetch_diagnostic(
         "deadline_reached": result.deadline_reached,
         "next_url_remaining": result.next_url_remaining,
         "retry_not_before": result.retry_not_before,
+        "source_fetch": result.fetch_diagnostic,
     }
 
 

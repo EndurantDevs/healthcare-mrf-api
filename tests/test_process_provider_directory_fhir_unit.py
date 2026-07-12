@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import csv
 import datetime
+import email.utils
 import hashlib
 import io
 import json
@@ -28,6 +29,7 @@ from db.models import (
     ProviderDirectoryCanonicalResource,
     ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
+    ProviderDirectoryHealthcareService,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
     ProviderDirectoryPractitioner,
@@ -2360,6 +2362,62 @@ def test_organization_npi_falls_back_to_numeric_resource_id():
     assert row["npi"] == 1000053922
 
 
+def test_npi_skips_invalid_edifecs_identifier_before_valid_us_npi():
+    assert importer._npi(
+        {
+            "identifier": [
+                {
+                    "system": "https://www.edifecs.com/fhir/identifier/id-npi",
+                    "value": "12345678901",
+                },
+                {
+                    "system": "http://hl7.org/fhir/sid/us-npi",
+                    "value": "1234567893",
+                },
+            ]
+        }
+    ) == 1234567893
+
+
+def test_npi_returns_none_when_all_npi_identifiers_are_invalid():
+    assert importer._npi(
+        {
+            "identifier": [
+                {
+                    "system": "https://www.edifecs.com/fhir/identifier/id-npi",
+                    "value": "12345678901",
+                },
+                {
+                    "system": "http://hl7.org/fhir/sid/us-npi",
+                    "value": "not-an-npi",
+                },
+            ]
+        }
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"},
+        {"system": "https://example.test/fhir/npi", "value": "1234567893"},
+    ],
+)
+def test_npi_accepts_ordinary_valid_compatible_identifiers(identifier):
+    assert importer._npi({"identifier": [identifier]}) == 1234567893
+
+
+def test_npi_prefers_exact_us_npi_system_over_earlier_compatible_match():
+    assert importer._npi(
+        {
+            "identifier": [
+                {"system": "https://example.test/fhir/npi", "value": "1234567893"},
+                {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1588616783"},
+            ]
+        }
+    ) == 1588616783
+
+
 def test_provider_directory_location_normalizes_valid_coordinates():
     model, row = importer.parse_fhir_resource(
         "source_a",
@@ -4245,6 +4303,152 @@ async def test_source_fetch_honors_retry_after_for_429(monkeypatch):
     sleep_mock.assert_awaited_once_with(3.0)
 
 
+@pytest.mark.asyncio
+async def test_source_fetch_honors_delta_seconds_retry_after_for_503(monkeypatch):
+    responses = [
+        (503, {importer.SOURCE_RETRY_AFTER_FIELD: "4"}, None, 1),
+        (200, {"resourceType": "Bundle", "entry": []}, None, 1),
+    ]
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json_once",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: responses.pop(0)),
+    )
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    fetch_result = await importer._fetch_source_json(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/Practitioner?_count=1",
+        timeout=3,
+    )
+
+    assert fetch_result[0] == 200
+    sleep_mock.assert_awaited_once_with(4.0)
+
+
+def test_source_fetch_honors_http_date_retry_after_for_503():
+    current_time = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.UTC)
+    retry_at = current_time + datetime.timedelta(seconds=90)
+    payload = {
+        importer.SOURCE_RETRY_AFTER_FIELD: email.utils.format_datetime(
+            retry_at,
+            usegmt=True,
+        )
+    }
+
+    assert importer._source_fetch_attempt_delay(
+        503,
+        payload,
+        0,
+        (),
+        False,
+        now_utc=current_time,
+    ) == 90.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_503_redacts_fetch_diagnostic(
+    monkeypatch,
+):
+    """Persist only retry facts that cannot expose a cursor or response body."""
+    source_lookup = {
+        "source_id": "source_a",
+        "api_base": "https://payer.example/fhir",
+    }
+    request_url = (
+        "https://payer.example/fhir/Practitioner?"
+        "_continuationToken=private-cursor-token"
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json_once",
+        AsyncMock(return_value=(503, {"diagnostics": "private-response"}, None, 7)),
+    )
+    monkeypatch.setattr(importer, "_source_fetch_retry_attempts", lambda: 3)
+    monkeypatch.setattr(importer.asyncio, "sleep", AsyncMock())
+
+    fetch_result = await importer._fetch_source_json(
+        source_lookup,
+        request_url,
+        timeout=3,
+    )
+    fetch_diagnostic = importer._terminal_source_fetch_diagnostic(
+        source_lookup,
+        request_url,
+    )
+    assert fetch_result == (503, {"diagnostics": "private-response"}, None, 21)
+    assert fetch_diagnostic == {
+        "status": 503,
+        "url_hash": hashlib.sha256(request_url.encode("utf-8")).hexdigest(),
+        "retry_count": 2,
+        "elapsed_ms": 21,
+        "response_class": "transient_server_error",
+    }
+    resource_diagnostic = importer._resource_fetch_diagnostic(
+        importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitioner,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=True,
+            error="http_503",
+            fetch_diagnostic=fetch_diagnostic,
+        ),
+        rows_written=0,
+    )
+
+    assert resource_diagnostic["source_fetch"] == fetch_diagnostic
+    assert "private-cursor-token" not in json.dumps(resource_diagnostic)
+    assert "private-response" not in json.dumps(resource_diagnostic)
+
+
+def test_terminal_503_uses_bounded_fallback():
+    current_time = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.UTC)
+
+    assert importer._transient_source_retry_not_before(
+        503,
+        {"diagnostics": "private-response"},
+        None,
+        retry_count=2,
+        now_utc=current_time,
+    ) == "2026-07-12T12:05:00Z"
+
+
+@pytest.mark.asyncio
+async def test_source_fetch_keeps_generic_403_out_of_transient_defer_handling(
+    monkeypatch,
+):
+    source_lookup = {
+        "source_id": "source_a",
+        "api_base": "https://payer.example/fhir",
+    }
+    request_url = "https://payer.example/fhir/Practitioner?_continuationToken=private"
+    fetch_once = AsyncMock(return_value=(403, {"resourceType": "OperationOutcome"}, None, 1))
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_once)
+
+    fetch_result = await importer._fetch_source_json(
+        source_lookup,
+        request_url,
+        timeout=3,
+    )
+
+    assert fetch_result[0] == 403
+    fetch_once.assert_awaited_once()
+    assert importer._terminal_source_fetch_diagnostic(source_lookup, request_url) is None
+    assert importer._transient_source_retry_not_before(
+        403,
+        fetch_result[1],
+        fetch_result[2],
+        retry_count=0,
+    ) is None
+
+
 def test_molina_quota_response_is_deferred_without_reclassifying_generic_403():
     quota_payload_dict = {
         "statusCode": 403,
@@ -5269,6 +5473,134 @@ def test_contra_costa_affiliation_telecom_preserves_phone_and_fax_in_dataset_pay
     assert endpoint_dataset_rows[0]["payload_json"]["telecom"] == contra_costa_affiliation_payload_dict[
         "telecom"
     ]
+
+
+def _healthcare_service_plan_net_payload(new_patients_url):
+    """Return a service fixture with accepted and discarded extension content."""
+
+    return {
+        "resourceType": "HealthcareService",
+        "id": "service-1",
+        "providedBy": {"reference": "Organization/org-1"},
+        "identifier": [
+            {
+                "system": "http://hl7.org/fhir/sid/us-npi",
+                "value": "1588616783",
+            }
+        ],
+        "extension": [
+            {
+                "url": new_patients_url,
+                "extension": [
+                    {
+                        "url": "acceptingPatients",
+                        "valueCodeableConcept": {
+                            "coding": [{"code": "newpt"}, {"code": "not-a-plan-net-code"}]
+                        },
+                    },
+                    {
+                        "url": "fromNetwork",
+                        "valueReference": {"reference": "Organization/network-1"},
+                    },
+                    {"url": "implementation-detail", "valueString": "discarded"},
+                ],
+            },
+            {
+                "url": "https://example.test/extension/not-plan-net",
+                "extension": [
+                    {
+                        "url": "acceptingPatients",
+                        "valueCodeableConcept": {"coding": [{"code": "nopt"}]},
+                    }
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "new_patients_url",
+    [
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/newpatients"
+        ),
+        (
+            "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/plannet-NewPatients-extension"
+        ),
+    ],
+)
+def test_healthcare_service_preserves_controlled_plan_net_context_in_artifact_payloads(
+    new_patients_url,
+):
+    service_payload = _healthcare_service_plan_net_payload(new_patients_url)
+    parsed_model, parsed_row = importer.parse_fhir_resource(
+        "source_a",
+        service_payload,
+        run_id="run_1",
+    )
+
+    canonical_artifacts = importer._canonical_resource_rows(
+        parsed_model,
+        [parsed_row],
+        canonical_api_base="https://payer.example/fhir",
+        run_id="run_1",
+    )
+    dataset_artifacts = importer._endpoint_dataset_resource_rows(
+        parsed_model,
+        [parsed_row],
+        dataset_id="dataset_1",
+    )
+
+    expected_accepting_patients = [
+        {"code": "newpt", "from_network_ref": "Organization/network-1"}
+    ]
+    assert parsed_model is ProviderDirectoryHealthcareService
+    assert parsed_row["provided_by_ref"] == "Organization/org-1"
+    assert parsed_row["npi"] == 1588616783
+    assert parsed_row["accepting_patients"] == expected_accepting_patients
+    assert canonical_artifacts[0]["payload_json"]["provided_by_ref"] == "Organization/org-1"
+    assert canonical_artifacts[0]["payload_json"]["accepting_patients"] == expected_accepting_patients
+    assert canonical_artifacts[0]["payload_json"]["npi"] == 1588616783
+    assert dataset_artifacts[0]["payload_json"] == importer._canonical_resource_payload(parsed_row)
+    assert dataset_artifacts[0]["payload_json"]["accepting_patients"] == expected_accepting_patients
+
+
+def test_healthcare_service_discards_unrecognized_new_patient_extensions_and_codes():
+    parsed_model, parsed_row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "HealthcareService",
+            "id": "service-1",
+            "extension": [
+                {
+                    "url": "https://example.test/StructureDefinition/newpatients",
+                    "extension": [
+                        {
+                            "url": "acceptingPatients",
+                            "valueCodeableConcept": {"coding": [{"code": "newpt"}]},
+                        }
+                    ],
+                },
+                {
+                    "url": (
+                        "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/newpatients"
+                    ),
+                    "extension": [
+                        {
+                            "url": "acceptingPatients",
+                            "valueCodeableConcept": {"coding": [{"code": "unknown"}]},
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert parsed_model is ProviderDirectoryHealthcareService
+    assert parsed_row["accepting_patients"] == []
 
 
 def test_identifier_mapping_accepts_type_coded_npi_and_systemless_plan_ids():
@@ -7397,6 +7729,149 @@ def test_aetna_endpoint_dataset_selection_requires_fully_enumerable_resources():
         [medicaid_source],
         requested_resources,
     ) == []
+
+
+def _maine_endpoint_source_record():
+    return {
+        "source_id": "maine",
+        "endpoint_id": "endpoint_maine",
+        "api_base": importer.MAINE_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.MAINE_PROVIDER_DIRECTORY_BASE,
+    }
+
+
+def _mock_maine_endpoint_candidate_storage(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "_select_endpoint_dataset_candidate",
+        AsyncMock(
+            return_value=importer.EndpointDatasetCandidateSelection(
+                dataset_id="dataset_maine",
+                acquisition_root_run_id="run_maine",
+                previous_dataset_id=None,
+                reused_from_checkpoint=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(importer, "_ensure_endpoint_dataset_candidate", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_uses_selected_maine_public_resource_scope(monkeypatch):
+    """Treat the verified five public Maine collections as the complete profile."""
+    selected_resource_names = list(importer.MAINE_SUPPORTED_RESOURCES)
+    _mock_maine_endpoint_candidate_storage(monkeypatch)
+
+    candidate = await importer._prepare_endpoint_dataset_candidate(
+        [_maine_endpoint_source_record()],
+        selected_resource_names,
+        run_id="run_maine",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        checkpoint_context=None,
+    )
+
+    assert candidate is not None
+    assert candidate.selected_resources == tuple(sorted(selected_resource_names))
+    assert candidate.expected_resources == tuple(sorted(selected_resource_names))
+    assert importer._is_endpoint_dataset_publishable(
+        candidate,
+        {
+            resource_type: {
+                "complete": True,
+                "error": None,
+                "bounded": False,
+                "next_url_remaining": False,
+            }
+            for resource_type in selected_resource_names
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_rejects_partial_maine_public_resource_scope(monkeypatch):
+    _mock_maine_endpoint_candidate_storage(monkeypatch)
+
+    partial_candidate = await importer._prepare_endpoint_dataset_candidate(
+        [_maine_endpoint_source_record()],
+        ["Location"],
+        run_id="run_maine",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        checkpoint_context=None,
+    )
+
+    assert partial_candidate is not None
+    assert partial_candidate.selected_resources == ("Location",)
+    assert partial_candidate.expected_resources == tuple(
+        sorted(importer.MAINE_SUPPORTED_RESOURCES)
+    )
+    assert importer._is_endpoint_dataset_publishable(
+        partial_candidate,
+        {
+            "Location": {
+                "complete": True,
+                "error": None,
+                "bounded": False,
+                "next_url_remaining": False,
+            }
+        },
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "diagnostic_by_field",
+    [
+        {
+            "complete": True,
+            "error": "provider_directory_resource_fetch_incomplete",
+            "bounded": False,
+            "next_url_remaining": False,
+        },
+        {
+            "complete": True,
+            "error": None,
+            "bounded": True,
+            "next_url_remaining": False,
+        },
+        {
+            "complete": True,
+            "error": None,
+            "bounded": False,
+            "next_url_remaining": True,
+        },
+        None,
+    ],
+)
+def test_endpoint_dataset_rejects_incomplete_selected_resource(
+    diagnostic_by_field,
+):
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_maine",
+        dataset_id="dataset_maine",
+        acquisition_root_run_id="run_maine",
+        source_ids=("maine",),
+        selected_resources=("Location", "PractitionerRole"),
+        import_run_id="run_maine",
+        previous_dataset_id=None,
+        expected_resources=("Location", "PractitionerRole"),
+    )
+
+    diagnostics_by_resource = {
+        "Location": {
+            "complete": True,
+            "error": None,
+            "bounded": False,
+            "next_url_remaining": False,
+        }
+    }
+    if diagnostic_by_field is not None:
+        diagnostics_by_resource["PractitionerRole"] = diagnostic_by_field
+
+    assert importer._is_endpoint_dataset_publishable(
+        candidate,
+        diagnostics_by_resource,
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -16004,6 +16479,21 @@ def test_address_overlay_sql_scope():
     assert "/ 1000000" in sql
     assert "ABS(" in sql
     assert "lat,\n        long," in sql
+    assert "'HealthcareService'::varchar AS resource_type" not in sql
+    assert "healthcare_service.npi" not in sql
+
+
+def test_address_projection_stays_role_and_affiliation_driven_when_services_have_npis():
+    sql = importer.provider_directory_address_overlay_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+    )
+
+    assert "provider_directory_fhir:practitioner_role:" in sql
+    assert "provider_directory_fhir:organization_affiliation:" in sql
+    assert "provider_directory_fhir:healthcare_service:" not in sql
+    assert "'HealthcareService'::varchar AS resource_type" not in sql
+    assert "healthcare_service.npi" not in sql
 
 
 def test_address_overlay_table_sql_includes_coordinates():
