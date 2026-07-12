@@ -1,6 +1,6 @@
 {
   "campaign_id": "provider-directory-canonical-acquisition-2026-07-10-v2",
-  "checked_at": "2026-07-11T23:15:23Z",
+  "checked_at": "2026-07-12T22:27:09Z",
   "entries": {
     "aetna-commercial-medicare": {
       "access_verification": "not_recorded",
@@ -110,6 +110,31 @@
       },
       "entry_spec_sha256": "8db17ad892410f2d62a2478659751a105ef9c377abbc4fb10c8e3f720ed5eb23",
       "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 36981,
+            "address_rows": 177712,
+            "coordinate_rows": 62412,
+            "location_rows": 119267,
+            "phone_rows": 165733,
+            "role_to_plan_refs": 0,
+            "source_rows": 357802
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
+      },
       "run_id": "run_17baae4934f54639bd748d50554a9cbd",
       "terminal_evidence": {
         "effective_acquisition": {
@@ -214,21 +239,409 @@
       "terminal_status": null
     },
     "arkansas": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
+      "access_verification": "verified",
+      "checked_at": "2026-07-12T22:27:09Z",
       "current_observation": {
-        "observed_at": "2026-07-12T11:50:43Z",
+        "evidence": {
+          "effective_acquisition": {
+            "bulk_export": {
+              "checkpoint_blocked_resource_fetches": 0,
+              "effective": false,
+              "effective_resource_fetches": 0,
+              "ineligible_resource_fetches": 0,
+              "requested": false,
+              "requested_resource_fetches": 0,
+              "rest_fallback_resource_fetches": 0
+            },
+            "completed_source_ids": {
+              "Endpoint": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "HealthcareService": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "InsurancePlan": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "Location": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "Organization": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "OrganizationAffiliation": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "Practitioner": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ],
+              "PractitionerRole": [
+                "pdfhir_d6b52e94ddf5ca7b9faafe17"
+              ]
+            },
+            "selected_groups": 1,
+            "selected_sources": 1,
+            "sources_probed": 1
+          },
+          "resource_outcomes": {
+            "Endpoint": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "HealthcareService": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "InsurancePlan": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "Location": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1602,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 160127,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Organization": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 114,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 11368,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "OrganizationAffiliation": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "Practitioner": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1161,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 116091,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "PractitionerRole": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1685,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 168499,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            }
+          },
+          "source_ids": [
+            "pdfhir_d6b52e94ddf5ca7b9faafe17"
+          ]
+        },
+        "observed_at": "2026-07-12T22:27:09Z",
         "run_id": "run_6f434cd416804bd9b13e2cf66bd2fcf6",
-        "run_status": "running",
-        "state_status": "running"
+        "run_status": "succeeded",
+        "state_status": "succeeded"
       },
+      "entry_spec_sha256": "bb5d01586017c2a61bb120acf20156bbdb8afca923e009efca5ebd4486ac45ef",
+      "proof_state": "current",
       "publication_readiness": {
-        "derived_artifact_state": "not_promoted",
-        "observed_at": "2026-07-12T11:19:44Z",
-        "unified_api_state": "not_ready"
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 7622,
+            "address_rows": 36949,
+            "coordinate_rows": 28515,
+            "location_rows": 160127,
+            "phone_rows": 36934,
+            "role_to_plan_refs": 0,
+            "source_rows": 456085
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
       },
-      "run_id": null,
-      "terminal_status": null
+      "run_id": "run_6f434cd416804bd9b13e2cf66bd2fcf6",
+      "terminal_evidence": {
+        "effective_acquisition": {
+          "bulk_export": {
+            "checkpoint_blocked_resource_fetches": 0,
+            "effective": false,
+            "effective_resource_fetches": 0,
+            "ineligible_resource_fetches": 0,
+            "requested": false,
+            "requested_resource_fetches": 0,
+            "rest_fallback_resource_fetches": 0
+          },
+          "completed_source_ids": {
+            "Endpoint": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "HealthcareService": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "InsurancePlan": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "Location": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "Organization": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "OrganizationAffiliation": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "Practitioner": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ],
+            "PractitionerRole": [
+              "pdfhir_d6b52e94ddf5ca7b9faafe17"
+            ]
+          },
+          "selected_groups": 1,
+          "selected_sources": 1,
+          "sources_probed": 1
+        },
+        "resource_outcomes": {
+          "Endpoint": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "HealthcareService": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "InsurancePlan": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "Location": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1602,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 160127,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Organization": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 114,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 11368,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "OrganizationAffiliation": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "Practitioner": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1161,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 116091,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "PractitionerRole": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1685,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 168499,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          }
+        },
+        "source_ids": [
+          "pdfhir_d6b52e94ddf5ca7b9faafe17"
+        ]
+      },
+      "terminal_status": "succeeded"
     },
     "centene": {
       "access_verification": "not_recorded",
@@ -430,6 +843,31 @@
       },
       "entry_spec_sha256": "1882a7cacd9738e0a14260e91580914a775623e7ca7d77ecd90b17d632f31a13",
       "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 345292,
+            "address_rows": 468165,
+            "coordinate_rows": 282428,
+            "location_rows": 1190600,
+            "phone_rows": 466442,
+            "role_to_plan_refs": 1155277,
+            "source_rows": 3481955
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "present"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
+      },
       "run_id": "run_4a49506bf1904738bccc1c94d7fa784e",
       "terminal_evidence": {
         "effective_acquisition": {
@@ -617,31 +1055,369 @@
       "terminal_status": "succeeded"
     },
     "contra-costa": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
+      "access_verification": "verified",
+      "checked_at": "2026-07-12T22:27:09Z",
       "current_observation": {
-        "observed_at": "2026-07-12T09:20:04Z",
-        "run_id": "run_a088c72538b54043a960b8d06f55ee29",
-        "run_status": "running",
-        "state_status": "running"
-      },
-      "publication_readiness": {
-        "derived_artifact_state": "not_promoted",
         "evidence": {
+          "effective_acquisition": {
+            "bulk_export": {
+              "checkpoint_blocked_resource_fetches": 0,
+              "effective": false,
+              "effective_resource_fetches": 0,
+              "ineligible_resource_fetches": 0,
+              "requested": false,
+              "requested_resource_fetches": 0,
+              "rest_fallback_resource_fetches": 0
+            },
+            "completed_source_ids": {
+              "HealthcareService": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "InsurancePlan": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "Location": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "Organization": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "OrganizationAffiliation": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "Practitioner": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ],
+              "PractitionerRole": [
+                "pdfhir_8ee2865f928f1d67b8a86090"
+              ]
+            },
+            "selected_groups": 1,
+            "selected_sources": 1,
+            "sources_probed": 1
+          },
+          "resource_outcomes": {
+            "HealthcareService": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 4846,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 484544,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "InsurancePlan": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 3,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Location": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 815,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 81429,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Organization": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 819,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 81811,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "OrganizationAffiliation": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 2647,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 264673,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Practitioner": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 62,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 6178,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "PractitionerRole": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 319,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 31897,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            }
+          },
+          "source_ids": [
+            "pdfhir_8ee2865f928f1d67b8a86090"
+          ]
+        },
+        "observed_at": "2026-07-12T22:27:09Z",
+        "run_id": "run_600d3643ad2f40898ed4826713484629",
+        "run_status": "succeeded",
+        "state_status": "succeeded"
+      },
+      "entry_spec_sha256": "acb2b888ba6b969523393ae380c843acc8891a1c55fa980f5f71b01735656530",
+      "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 65585,
+            "address_rows": 340410,
+            "coordinate_rows": 311351,
+            "location_rows": 81429,
+            "phone_rows": 340258,
+            "role_to_plan_refs": 31897,
+            "source_rows": 950535
+          },
           "signals": {
-            "address_keys": "absent",
-            "address_overlay": "absent",
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
             "coordinates": "present",
             "locations": "present",
             "phones": "present",
-            "role_to_plan_refs": "absent"
+            "role_to_plan_refs": "present"
           }
         },
-        "observed_at": "2026-07-12T09:20:04Z",
-        "unified_api_state": "not_ready"
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
       },
-      "run_id": null,
-      "terminal_status": null
+      "run_id": "run_600d3643ad2f40898ed4826713484629",
+      "terminal_evidence": {
+        "effective_acquisition": {
+          "bulk_export": {
+            "checkpoint_blocked_resource_fetches": 0,
+            "effective": false,
+            "effective_resource_fetches": 0,
+            "ineligible_resource_fetches": 0,
+            "requested": false,
+            "requested_resource_fetches": 0,
+            "rest_fallback_resource_fetches": 0
+          },
+          "completed_source_ids": {
+            "HealthcareService": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "InsurancePlan": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "Location": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "Organization": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "OrganizationAffiliation": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "Practitioner": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ],
+            "PractitionerRole": [
+              "pdfhir_8ee2865f928f1d67b8a86090"
+            ]
+          },
+          "selected_groups": 1,
+          "selected_sources": 1,
+          "sources_probed": 1
+        },
+        "resource_outcomes": {
+          "HealthcareService": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 4846,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 484544,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "InsurancePlan": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 3,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Location": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 815,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 81429,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Organization": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 819,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 81811,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "OrganizationAffiliation": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 2647,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 264673,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Practitioner": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 62,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 6178,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "PractitionerRole": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 319,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 31897,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          }
+        },
+        "source_ids": [
+          "pdfhir_8ee2865f928f1d67b8a86090"
+        ]
+      },
+      "terminal_status": "succeeded"
     },
     "hap": {
       "access_verification": "verified",
@@ -775,10 +1551,18 @@
         "run_status": "succeeded",
         "state_status": "succeeded"
       },
+      "entry_spec_sha256": "118e03de4598326b3e2367ca238a9ec9d63cf822362bf7ed34df78f0f23501df",
+      "proof_state": "current",
       "publication_readiness": {
         "derived_artifact_state": "promoted",
         "evidence": {
           "counts": {
+            "address_keys": 25005,
+            "address_rows": 147591,
+            "coordinate_rows": 92372,
+            "location_rows": 147591,
+            "phone_rows": 147228,
+            "role_to_plan_refs": 470010,
             "source_rows": 344868
           },
           "signals": {
@@ -791,11 +1575,9 @@
             "role_to_plan_refs": "present"
           }
         },
-        "observed_at": "2026-07-12T10:42:27Z",
+        "observed_at": "2026-07-12T23:53:00Z",
         "unified_api_state": "ready"
       },
-      "entry_spec_sha256": "118e03de4598326b3e2367ca238a9ec9d63cf822362bf7ed34df78f0f23501df",
-      "proof_state": "current",
       "run_id": "run_b6fd87aad3854911bfc45498dd3ef9df",
       "terminal_evidence": {
         "effective_acquisition": {
@@ -925,6 +1707,31 @@
     "health-partners-plans": {
       "access_verification": "not_recorded",
       "checked_at": null,
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 19253,
+            "address_rows": 1335430,
+            "coordinate_rows": 754706,
+            "location_rows": 132329,
+            "phone_rows": 1319079,
+            "role_to_plan_refs": 606274,
+            "source_rows": 1517314
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "present"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
+      },
       "run_id": null,
       "terminal_status": null
     },
@@ -1132,6 +1939,31 @@
       },
       "entry_spec_sha256": "8ce12e2c07d34249fcb041b99fa5d4d25917cd1f5e8c72501fd3f1168e627f3c",
       "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 40887,
+            "address_rows": 280857,
+            "coordinate_rows": 173496,
+            "location_rows": 280847,
+            "phone_rows": 248847,
+            "role_to_plan_refs": 0,
+            "source_rows": 1273520
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
+      },
       "run_id": "run_1a53124361e74021a072e576408b84dd",
       "terminal_evidence": {
         "effective_acquisition": {
@@ -1314,20 +2146,29 @@
       "entry_spec_sha256": "2125d2d42db5445ea4702a5cb2356bc433232f5ef21b84f7720e2f9cc64682c5",
       "proof_state": "current",
       "publication_readiness": {
-        "derived_artifact_state": "stale",
+        "derived_artifact_state": "promoted",
         "evidence": {
           "counts": {
-            "address_keys": 36249,
-            "address_rows": 36251,
-            "coordinate_rows": 0,
+            "address_keys": 5304,
+            "address_rows": 98995,
+            "coordinate_rows": 40538,
             "location_rows": 36252,
-            "phone_rows": 0,
-            "role_to_plan_refs": 0,
+            "phone_rows": 94982,
+            "role_to_plan_refs": 72133,
             "source_rows": 458671
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "present"
           }
         },
-        "observed_at": "2026-07-12T09:20:04Z",
-        "unified_api_state": "not_ready"
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
       },
       "run_id": "run_776b413cb661434d8916243715573d1f",
       "terminal_evidence": {
@@ -1362,29 +2203,29 @@
       "entry_spec_sha256": "c9879ece492d5101d97fb558fffeea4d2c183aa24f33071c575e506af53cfd81",
       "proof_state": "current",
       "publication_readiness": {
-        "derived_artifact_state": "not_promoted",
+        "derived_artifact_state": "promoted",
         "evidence": {
           "counts": {
-            "address_keys": 0,
-            "address_rows": 22177,
-            "coordinate_rows": 0,
+            "address_keys": 4281,
+            "address_rows": 116067,
+            "coordinate_rows": 87144,
             "location_rows": 22177,
-            "phone_rows": 22172,
+            "phone_rows": 116067,
             "role_to_plan_refs": 0,
             "source_rows": 140135
           },
           "signals": {
-            "address_keys": "absent",
-            "address_overlay": "absent",
+            "address_keys": "present",
+            "address_overlay": "present",
             "addresses": "present",
-            "coordinates": "absent",
+            "coordinates": "present",
             "locations": "present",
             "phones": "present",
             "role_to_plan_refs": "absent"
           }
         },
-        "observed_at": "2026-07-12T10:13:10Z",
-        "unified_api_state": "not_ready"
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
       },
       "run_id": "run_8ff6695cdcf84bd294007b33628cea72",
       "terminal_evidence": {
@@ -1502,8 +2343,8 @@
       "current_observation": {
         "evidence": {
           "current_dataset_resource_rows": 0,
-          "legacy_rows_are_not_current": true,
           "failure_code": "provider_directory_uhc_plan_graph_incomplete",
+          "legacy_rows_are_not_current": true,
           "plan_graph_state": "cap_exhausted",
           "publication_policy": "probe_only"
         },
@@ -1552,18 +2393,417 @@
       "terminal_status": null
     },
     "wyoming": {
-      "access_verification": "not_recorded",
-      "checked_at": null,
-      "run_id": null,
-      "terminal_status": null
+      "access_verification": "verified",
+      "checked_at": "2026-07-12T22:27:09Z",
+      "current_observation": {
+        "evidence": {
+          "effective_acquisition": {
+            "bulk_export": {
+              "checkpoint_blocked_resource_fetches": 0,
+              "effective": false,
+              "effective_resource_fetches": 0,
+              "ineligible_resource_fetches": 0,
+              "requested": false,
+              "requested_resource_fetches": 0,
+              "rest_fallback_resource_fetches": 0
+            },
+            "completed_source_ids": {
+              "Endpoint": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "HealthcareService": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "InsurancePlan": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "Location": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "Organization": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "OrganizationAffiliation": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "Practitioner": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ],
+              "PractitionerRole": [
+                "pdfhir_72257bf04f7fb816c0ad6fb9"
+              ]
+            },
+            "selected_groups": 1,
+            "selected_sources": 1,
+            "sources_probed": 1
+          },
+          "resource_outcomes": {
+            "Endpoint": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "HealthcareService": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 32,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 3177,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "InsurancePlan": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 1,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 0,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 1,
+              "sources_failed": 0
+            },
+            "Location": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 240,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 23989,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Organization": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 11,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 1020,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "OrganizationAffiliation": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 419,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 41800,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "Practitioner": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 268,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 26713,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            },
+            "PractitionerRole": {
+              "bulk_export_checkpoint_blocked_sources": 0,
+              "bulk_export_eligible_sources": 0,
+              "bulk_export_ineligible_sources": 0,
+              "bulk_export_requested_sources": 0,
+              "bulk_export_rest_fallback_sources": 0,
+              "bulk_export_sources": 0,
+              "collection_complete_sources": 1,
+              "pages_fetched": 217,
+              "plan_graph_complete_sources": 0,
+              "rows_fetched": 21678,
+              "sources_attempted": 1,
+              "sources_bounded": 0,
+              "sources_completed": 1,
+              "sources_empty": 0,
+              "sources_failed": 0
+            }
+          },
+          "source_ids": [
+            "pdfhir_72257bf04f7fb816c0ad6fb9"
+          ]
+        },
+        "observed_at": "2026-07-12T22:27:09Z",
+        "run_id": "run_48dc59adf9484c0c98730752bf6925c6",
+        "run_status": "succeeded",
+        "state_status": "succeeded"
+      },
+      "entry_spec_sha256": "ebfe5bc65c137f05365037b2db87264bfd4adb87db9f3b02fa9d770062295bb9",
+      "proof_state": "current",
+      "publication_readiness": {
+        "derived_artifact_state": "promoted",
+        "evidence": {
+          "counts": {
+            "address_keys": 4820,
+            "address_rows": 47957,
+            "coordinate_rows": 25294,
+            "location_rows": 23989,
+            "phone_rows": 47956,
+            "role_to_plan_refs": 0,
+            "source_rows": 102682
+          },
+          "signals": {
+            "address_keys": "present",
+            "address_overlay": "present",
+            "addresses": "present",
+            "coordinates": "present",
+            "locations": "present",
+            "phones": "present",
+            "role_to_plan_refs": "absent"
+          }
+        },
+        "observed_at": "2026-07-12T23:53:00Z",
+        "unified_api_state": "ready"
+      },
+      "run_id": "run_48dc59adf9484c0c98730752bf6925c6",
+      "terminal_evidence": {
+        "effective_acquisition": {
+          "bulk_export": {
+            "checkpoint_blocked_resource_fetches": 0,
+            "effective": false,
+            "effective_resource_fetches": 0,
+            "ineligible_resource_fetches": 0,
+            "requested": false,
+            "requested_resource_fetches": 0,
+            "rest_fallback_resource_fetches": 0
+          },
+          "completed_source_ids": {
+            "Endpoint": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "HealthcareService": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "InsurancePlan": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "Location": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "Organization": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "OrganizationAffiliation": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "Practitioner": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ],
+            "PractitionerRole": [
+              "pdfhir_72257bf04f7fb816c0ad6fb9"
+            ]
+          },
+          "selected_groups": 1,
+          "selected_sources": 1,
+          "sources_probed": 1
+        },
+        "resource_outcomes": {
+          "Endpoint": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "HealthcareService": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 32,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 3177,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "InsurancePlan": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 1,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 0,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 1,
+            "sources_failed": 0
+          },
+          "Location": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 240,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 23989,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Organization": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 11,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 1020,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "OrganizationAffiliation": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 419,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 41800,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "Practitioner": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 268,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 26713,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          },
+          "PractitionerRole": {
+            "bulk_export_checkpoint_blocked_sources": 0,
+            "bulk_export_eligible_sources": 0,
+            "bulk_export_ineligible_sources": 0,
+            "bulk_export_requested_sources": 0,
+            "bulk_export_rest_fallback_sources": 0,
+            "bulk_export_sources": 0,
+            "collection_complete_sources": 1,
+            "pages_fetched": 217,
+            "plan_graph_complete_sources": 0,
+            "rows_fetched": 21678,
+            "sources_attempted": 1,
+            "sources_bounded": 0,
+            "sources_completed": 1,
+            "sources_empty": 0,
+            "sources_failed": 0
+          }
+        },
+        "source_ids": [
+          "pdfhir_72257bf04f7fb816c0ad6fb9"
+        ]
+      },
+      "terminal_status": "succeeded"
     }
   },
   "environment": "healthporta-dev",
   "report_identity": {
-    "generated_at": "2026-07-11T23:15:23Z",
-    "manifest_sha256": "d4990717602b37153b673466fcce70ae522b9db4d9f7bc983d20e7c96ea02409",
+    "generated_at": "2026-07-12T22:27:09Z",
+    "manifest_sha256": "daf8843182026067102db179d2d6585bc113fd7eef99470e457e7061b74f9c48",
     "mode": "apply",
-    "report_sha256": "cd71365374594978495fc090f1b84d965a3508c463cb85d9660dc5dc51394ba4",
+    "report_sha256": "942123085221bd675ebacd6ac09bbff980aea0cbabd3e48ff1591b40eca20737",
     "schema_version": 1
   },
   "schema_version": 1

@@ -54,8 +54,8 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Not required | 2026-07-10 | 2026-08-24 | Sequential REST pagination" in rendered_document
     assert "## Observed Live Verification" in rendered_document
     assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
-    assert "| ALOHR (`alohr`) | Current | External Completed | Complete | Not recorded | Not recorded | Not recorded |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded |" in rendered_document
+    assert "| ALOHR (`alohr`) | Current | External Completed | Complete | Promoted | Ready |" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
     assert "scripts/update_provider_directory_verification.py" in rendered_document
     assert "## Known Not Importable" in rendered_document
     assert "Chorus Community Health Plans" in rendered_document
@@ -70,8 +70,8 @@ def test_rendered_live_proof_summarizes_resource_rows():
     rendered_document = generator.render_markdown(manifest)
 
     assert "| Rows by resource |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_" in rendered_document
-    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_" in rendered_document
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
+    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
     assert "HealthcareService: 1,108,600" in rendered_document
     assert "Location: 280,847" in rendered_document
 

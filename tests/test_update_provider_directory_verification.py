@@ -15,6 +15,8 @@ def _manifest_and_snapshot():
     snapshot = copy.deepcopy(
         generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
     )
+    for verification_record in snapshot["entries"].values():
+        verification_record.pop("publication_readiness", None)
     snapshot["checked_at"] = "2026-07-10T17:19:26Z"
     snapshot.pop("report_identity", None)
     return manifest, snapshot
