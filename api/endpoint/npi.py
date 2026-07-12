@@ -2563,6 +2563,19 @@ def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = No
     """
 
 
+def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
+    return f"""
+          FROM phone_candidates AS phone_match
+         CROSS JOIN LATERAL (
+               SELECT candidate_address.*
+                 FROM {address_table_sql} AS candidate_address
+                WHERE candidate_address.address_key = phone_match.address_key
+                  AND COALESCE(candidate_address.npi, candidate_address.inferred_npi) = phone_match.provider_npi
+                OFFSET 0
+         ) AS {alias}
+    """
+
+
 def _sql_with_prefix_ctes(*ctes: str | None) -> str:
     available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
     return f"WITH {',\n'.join(available_ctes)},\n" if available_ctes else "WITH "
@@ -3859,12 +3872,12 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             selected_locator_name = locator_name
             break
     phone_candidates_cte = None
-    phone_candidates_join = ""
+    address_from_sql = f"FROM {address_table_sql} AS a"
     if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
-        phone_candidates_join = _address_phone_candidates_join(
+        address_from_sql = _address_phone_candidates_lateral_from(
+            address_table_sql,
             "a",
-            columns["provider_npi"],
         )
         selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
@@ -3980,8 +3993,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    ({address_key_match})::boolean AS address_key_matched,
                    ({phone_match})::boolean AS phone_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
-              FROM {address_table_sql} AS a
-              {phone_candidates_join}
+              {address_from_sql}
              WHERE {' AND '.join(address_where)}
           ORDER BY {columns['provider_npi']},
                    address_site_key_matched DESC,
@@ -4059,7 +4071,7 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
     query, query_params = _match_candidate_query(params, address_table_sql)
     try:
         result = await asyncio.wait_for(
-            _execute_stmt(query, session=session, params=query_params),
+            _execute_match_candidate_query(query, query_params, session),
             timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
         )
     except asyncio.TimeoutError:
@@ -4073,6 +4085,12 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
         mapping = getattr(row, "_mapping", row)
         rows.append(dict(mapping))
     return rows
+
+
+async def _execute_match_candidate_query(query: Any, query_params: dict[str, Any], session: Any) -> Any:
+    if session is not None:
+        await _execute_stmt(text("SET LOCAL jit = off"), session=session)
+    return await _execute_stmt(query, session=session, params=query_params)
 
 
 async def _rollback_match_candidate_session(session: Any) -> None:
