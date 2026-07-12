@@ -325,4 +325,7 @@ jobs:
       - name: Build Rust scanner for parity tests
         run: cargo build --manifest-path support/ptg2_scanner/Cargo.toml
       - name: Run address canonical DB tests
-        run: python -m pytest -q tests/test_address_canonical_db.py
+        run: >
+          python -m pytest -q
+          tests/test_address_canonical_db.py
+          tests/test_npi_provider_directory_role_evidence_db.py
