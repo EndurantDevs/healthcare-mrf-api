@@ -7,7 +7,8 @@ import pytest
 from api.endpoint import npi as npi_module
 
 
-def test_match_candidate_phone_lookup_includes_current_provider_directory_evidence():
+def _provider_directory_phone_match_query():
+    """Build one representative Provider Directory phone-match query."""
     query_inputs_dict = {
         "address_site_key": None,
         "address_key": None,
@@ -22,11 +23,15 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
         "specialty_filter": None,
         "limit": 5,
     }
-
-    query, query_params = npi_module._match_candidate_query(
+    return npi_module._match_candidate_query(
         query_inputs_dict,
         "mrf.entity_address_unified",
     )
+
+
+def test_match_candidate_phone_lookup_includes_current_provider_directory_evidence():
+    """Phone search must bound unique providers without dropping service rows."""
+    query, query_params = _provider_directory_phone_match_query()
     sql = str(query)
 
     assert query_params["phone_digits"] == "4192517960"
@@ -34,6 +39,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "matching_provider_directory_phone_rows AS MATERIALIZED" in sql
     assert "phone_candidate_rows AS MATERIALIZED" in sql
     assert "phone_candidates_unranked AS MATERIALIZED" in sql
+    assert "phone_candidate_best_addresses AS MATERIALIZED" in sql
     assert "phone_candidates AS MATERIALIZED" in sql
     assert "phone_provider_directory_evidence AS MATERIALIZED" in sql
     assert "provider_directory_address_overlay AS overlay" in sql
@@ -47,6 +53,8 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "overlay.source_id::varchar" in sql
     assert "overlay.source_record_id::varchar" in sql
     assert "MAX(candidate.source_count) AS source_count" in sql
+    assert "SELECT DISTINCT ON (candidate.provider_npi)" in sql
+    assert "FROM phone_candidate_best_addresses AS candidate" in sql
     assert "candidate.provider_directory_matched DESC" in sql
     assert "candidate.source_count DESC NULLS LAST" in sql
     assert "LIMIT :candidate_limit" in sql
@@ -58,6 +66,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "LEFT JOIN phone_provider_directory_evidence AS phone_evidence" in sql
     assert "CROSS JOIN LATERAL" in sql
     assert "candidate_address.address_key = phone_match.address_key" in sql
+    assert "candidate_address.type IN ('primary', 'secondary', 'practice', 'site')" in sql
     assert "candidate_address.source_count DESC NULLS LAST" in sql
     assert "LIMIT 1 OFFSET 0" in sql
     assert "OFFSET 0" in sql

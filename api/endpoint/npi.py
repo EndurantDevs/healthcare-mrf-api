@@ -3368,10 +3368,19 @@ phone_candidates_unranked AS MATERIALIZED (
            MAX(candidate.source_count) AS source_count
       FROM phone_candidate_rows AS candidate
   GROUP BY candidate.provider_npi, candidate.address_key
+), phone_candidate_best_addresses AS MATERIALIZED (
+    SELECT DISTINCT ON (candidate.provider_npi)
+           candidate.provider_npi, candidate.address_key,
+           candidate.provider_directory_matched, candidate.source_count
+      FROM phone_candidates_unranked AS candidate
+  ORDER BY candidate.provider_npi,
+           candidate.provider_directory_matched DESC,
+           candidate.source_count DESC NULLS LAST,
+           candidate.address_key
 ), phone_candidates AS MATERIALIZED (
     SELECT candidate.provider_npi, candidate.address_key,
            candidate.provider_directory_matched
-      FROM phone_candidates_unranked AS candidate
+      FROM phone_candidate_best_addresses AS candidate
   ORDER BY candidate.provider_directory_matched DESC,
            candidate.source_count DESC NULLS LAST,
            candidate.provider_npi,
@@ -3429,6 +3438,11 @@ def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = No
 
 def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
     exact_phone = _address_phone_digits_filter("candidate_address", address_table_sql)
+    service_location = _provider_list_address_type_clause(
+        "candidate_address",
+        address_table_sql,
+        include_service_locations=True,
+    )
     return f"""
           FROM phone_candidates AS phone_match
      LEFT JOIN phone_provider_directory_evidence AS phone_evidence
@@ -3438,6 +3452,7 @@ def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -
                  FROM {address_table_sql} AS candidate_address
                 WHERE candidate_address.address_key = phone_match.address_key
                   AND COALESCE(candidate_address.npi, candidate_address.inferred_npi) = phone_match.provider_npi
+                  AND {service_location}
              ORDER BY ({exact_phone}) DESC,
                       candidate_address.source_count DESC NULLS LAST,
                       candidate_address.location_key
