@@ -609,6 +609,8 @@ def _primary_total_cache_set(value: int) -> int:
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS = 256
 MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE = 512
 MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS = 8192
+MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_VALUES = 32
+MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_TEXT_LENGTH = 2048
 _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR = "_healthporta_provider_directory_role_jit_disabled"
 
 
@@ -1188,6 +1190,25 @@ def _role_catalog_status_cte_sql(schema: str) -> str:
     """
 
 
+def _scoped_current_insurance_plan_ctes_sql(
+    source_cte_name: str,
+    scope_name: str,
+) -> str:
+    """Fence current InsurancePlan rows to the requested evidence sources first."""
+    return f"""
+    {scope_name}_sources AS MATERIALIZED (
+        SELECT DISTINCT source_id
+          FROM {source_cte_name}
+    ), {scope_name} AS MATERIALIZED (
+        SELECT current_plan.source_id, current_plan.resource_id, current_plan.run_id
+          FROM {scope_name}_sources AS requested_source
+          JOIN current_resources AS current_plan
+            ON current_plan.source_id = requested_source.source_id
+           AND current_plan.resource_type = 'InsurancePlan'
+    )
+    """
+
+
 def _network_derived_role_plans_cte_sql(schema: str) -> str:
     """Derive role plans from current InsurancePlan network references."""
     insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
@@ -1196,8 +1217,12 @@ def _network_derived_role_plans_cte_sql(schema: str) -> str:
         "role_network.resource_id",
         "role_network.reference",
     )
+    scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
+        "roles",
+        "current_role_insurance_plans",
+    )
     return f"""
-    network_derived_plans AS MATERIALIZED (
+    {scoped_plan_ctes_sql}, network_derived_plans AS MATERIALIZED (
         SELECT role_network.source_id, role_network.role_id,
                insurance_plan.resource_id,
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
@@ -1206,16 +1231,17 @@ def _network_derived_role_plans_cte_sql(schema: str) -> str:
                     ELSE 'organization-affiliation-network-derived'::varchar
                 END AS provenance
           FROM valid_role_networks AS role_network
+          JOIN current_role_insurance_plans AS current_insurance_plan
+            ON current_insurance_plan.source_id = role_network.source_id
           JOIN role_catalog_status AS catalog_status
             ON catalog_status.source_id = role_network.source_id
            AND catalog_status.role_id = role_network.role_id
            AND catalog_status.catalog_complete
           JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
             ON insurance_plan.source_id = role_network.source_id
+           AND insurance_plan.resource_id = current_insurance_plan.resource_id
+           AND insurance_plan.last_seen_run_id = current_insurance_plan.run_id
            AND {insurance_plan_active}
-          {_provider_directory_current_resource_join_sql(
-              "insurance_plan", "InsurancePlan", "current_insurance_plan"
-          )}
          WHERE EXISTS (
                SELECT 1
                  FROM jsonb_array_elements_text(
@@ -1309,7 +1335,24 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                AS requested(source_id, role_id)
     ), roles AS MATERIALIZED (
         SELECT role.source_id, role.resource_id AS role_id, role.organization_ref,
-               role.insurance_plan_refs::jsonb, role.network_refs::jsonb
+               role.insurance_plan_refs::jsonb, role.network_refs::jsonb,
+               role.active AS role_active,
+               role.healthcare_service_refs::jsonb AS role_healthcare_service_refs,
+               role.endpoint_refs::jsonb AS role_endpoint_refs,
+               role.specialty_codes::jsonb AS role_specialty_codes,
+               role.code_codes::jsonb AS role_code_codes,
+               role.telecom::jsonb AS role_telecom,
+               role.period_start AS role_period_start,
+               role.period_end AS role_period_end,
+               role.available_time::jsonb AS role_available_time,
+               role.not_available::jsonb AS role_not_available,
+               role.availability_exceptions AS role_availability_exceptions,
+               role.new_patient_acceptance::jsonb AS role_new_patient_acceptance,
+               role.telehealth AS role_telehealth,
+               role.fhir_meta::jsonb AS role_fhir_meta,
+               role.fhir_self_url AS role_fhir_self_url,
+               role.fhir_fetch_url AS role_fhir_fetch_url,
+               role.fhir_fetch_mode AS role_fhir_fetch_mode
           FROM requested_roles AS requested
           JOIN {schema}.provider_directory_practitioner_role AS role
             ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
@@ -1389,6 +1432,38 @@ def _provider_directory_plan_cap_ctes_sql() -> str:
     """
 
 
+def _returned_plan_details_cte_sql(schema: str) -> str:
+    """Project current normalized plan details without changing the capped plan set."""
+    return f"""
+    returned_plan_details AS MATERIALIZED (
+        SELECT returned_plan.source_id, returned_plan.role_id,
+               returned_plan.resource_id,
+               insurance_plan.status AS plan_status,
+               insurance_plan.name AS plan_name,
+               insurance_plan.aliases::jsonb AS plan_aliases,
+               insurance_plan.type_codes::jsonb AS plan_type_codes,
+               insurance_plan.owned_by_ref AS plan_owned_by_ref,
+               insurance_plan.administered_by_ref AS plan_administered_by_ref,
+               insurance_plan.period_start AS plan_period_start,
+               insurance_plan.period_end AS plan_period_end,
+               insurance_plan.product_identifiers::jsonb AS plan_product_identifiers,
+               insurance_plan.plan_backbones::jsonb AS plan_backbones,
+               insurance_plan.coverage::jsonb AS plan_coverage,
+               insurance_plan.fhir_meta::jsonb AS plan_fhir_meta,
+               insurance_plan.fhir_self_url AS plan_fhir_self_url,
+               insurance_plan.fhir_fetch_url AS plan_fhir_fetch_url,
+               insurance_plan.fhir_fetch_mode AS plan_fhir_fetch_mode
+          FROM returned_plans AS returned_plan
+          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+            ON insurance_plan.source_id = returned_plan.source_id
+           AND insurance_plan.resource_id = returned_plan.resource_id
+          {_provider_directory_current_resource_join_sql(
+              "insurance_plan", "InsurancePlan", "returned_insurance_plan"
+          )}
+    )
+    """
+
+
 def _provider_directory_role_ctes_sql(
     schema: str,
     has_affiliations: bool,
@@ -1402,6 +1477,7 @@ def _provider_directory_role_ctes_sql(
         has_catalog,
     )
     plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
+    returned_plan_details_cte_sql = _returned_plan_details_cte_sql(schema)
     evidence_network_id = _provider_directory_reference_resource_id_sql(
         "network_ref.reference",
         "Organization",
@@ -1410,6 +1486,7 @@ def _provider_directory_role_ctes_sql(
     {requested_role_ctes_sql},
     {network_plan_ctes_sql},
     {plan_cap_ctes_sql},
+    {returned_plan_details_cte_sql},
     network_references AS (
         SELECT role_network.source_id, role_network.role_id, role_network.reference,
                role_network.evidence_provenance
@@ -1480,12 +1557,35 @@ def _provider_directory_role_evidence_sql(
     WITH {current_resource_ctes_sql}, {role_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
-    SELECT source_id, role_id, evidence_type, resource_id, identifier, name, reference, provenance,
-           plan_returned, plan_total, plan_truncated, catalog_complete,
+    SELECT evidence.source_id, evidence.role_id, evidence.evidence_type,
+           evidence.resource_id, evidence.identifier, evidence.name, evidence.reference,
+           evidence.provenance, evidence.plan_returned, evidence.plan_total,
+           evidence.plan_truncated, evidence.catalog_complete,
+           role.role_active, role.organization_ref AS role_organization_ref,
+           role.role_healthcare_service_refs, role.role_endpoint_refs,
+           role.role_specialty_codes, role.role_code_codes, role.role_telecom,
+           role.role_period_start, role.role_period_end, role.role_available_time,
+           role.role_not_available, role.role_availability_exceptions,
+           role.role_new_patient_acceptance, role.role_telehealth, role.role_fhir_meta,
+           role.role_fhir_self_url, role.role_fhir_fetch_url, role.role_fhir_fetch_mode,
+           plan.plan_status, plan.plan_name, plan.plan_aliases, plan.plan_type_codes,
+           plan.plan_owned_by_ref, plan.plan_administered_by_ref, plan.plan_period_start,
+           plan.plan_period_end, plan.plan_product_identifiers, plan.plan_backbones,
+           plan.plan_coverage, plan.plan_fhir_meta, plan.plan_fhir_self_url,
+           plan.plan_fhir_fetch_url, plan.plan_fhir_fetch_mode,
            COUNT(*) OVER ()::bigint AS evidence_row_total
       FROM evidence
+ LEFT JOIN roles AS role
+        ON evidence.evidence_type = 'role'
+       AND role.source_id = evidence.source_id
+       AND role.role_id = evidence.role_id
+ LEFT JOIN returned_plan_details AS plan
+        ON evidence.evidence_type = 'insurance_plan'
+       AND plan.source_id = evidence.source_id
+       AND plan.role_id = evidence.role_id
+       AND plan.resource_id = evidence.resource_id
   ORDER BY CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END,
-           source_id, role_id, evidence_type, resource_id
+           evidence.source_id, evidence.role_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
     """
 
@@ -1509,6 +1609,152 @@ def _provider_directory_plan_metadata(mapping: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _provider_directory_period(mapping: Mapping[str, Any], prefix: str) -> dict[str, Any] | None:
+    period_map = {
+        key: mapping.get(f"{prefix}_period_{key}")
+        for key in ("start", "end")
+        if mapping.get(f"{prefix}_period_{key}") is not None
+    }
+    return period_map or None
+
+
+def _bounded_provider_directory_fhir_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_TEXT_LENGTH]
+
+
+def _provider_directory_fhir_url_identity(value: Any) -> str | None:
+    text_value = _bounded_provider_directory_fhir_text(value)
+    if not text_value:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(text_value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.hostname:
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, "", parsed.path, "", "")
+        )
+    hostname = parsed.hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path, "", "")
+    )
+
+
+def _bounded_provider_directory_fhir_codings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    codings: list[dict[str, Any]] = []
+    for raw_coding in value[:MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_VALUES]:
+        if not isinstance(raw_coding, Mapping):
+            continue
+        coding_map: dict[str, Any] = {}
+        for key in ("system", "version", "code", "display"):
+            text_value = _bounded_provider_directory_fhir_text(raw_coding.get(key))
+            if text_value is not None:
+                coding_map[key] = text_value
+        if isinstance(raw_coding.get("userSelected"), bool):
+            coding_map["user_selected"] = raw_coding["userSelected"]
+        if coding_map:
+            codings.append(coding_map)
+    return codings
+
+
+def _bounded_provider_directory_fhir_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        bounded_value
+        for raw_value in value[:MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_VALUES]
+        if (bounded_value := _bounded_provider_directory_fhir_text(raw_value))
+    ]
+
+
+def _provider_directory_fhir_meta(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            value = json.loads(value)
+    if not isinstance(value, Mapping):
+        return None
+    meta_map: dict[str, Any] = {}
+    for key, normalized_key in (
+        ("versionId", "version_id"),
+        ("lastUpdated", "last_updated"),
+    ):
+        text_value = _bounded_provider_directory_fhir_text(value.get(key))
+        if text_value is not None:
+            meta_map[normalized_key] = text_value
+    source = _provider_directory_fhir_url_identity(value.get("source"))
+    if source is not None:
+        meta_map["source"] = source
+    profiles = _bounded_provider_directory_fhir_strings(value.get("profile"))
+    if profiles:
+        meta_map["profiles"] = profiles
+    for key, normalized_key in (("security", "security"), ("tag", "tags")):
+        codings = _bounded_provider_directory_fhir_codings(value.get(key))
+        if codings:
+            meta_map[normalized_key] = codings
+    return meta_map or None
+
+
+def _provider_directory_fhir_provenance(
+    mapping: Mapping[str, Any],
+    prefix: str,
+) -> dict[str, Any] | None:
+    provenance_map: dict[str, Any] = {}
+    meta = _provider_directory_fhir_meta(mapping.get(f"{prefix}_fhir_meta"))
+    if meta is not None:
+        provenance_map["meta"] = meta
+    for field_name in ("self_url", "fetch_url", "fetch_mode"):
+        field_value = mapping.get(f"{prefix}_fhir_{field_name}")
+        if field_value is not None:
+            normalized_value = (
+                _provider_directory_fhir_url_identity(field_value)
+                if field_name.endswith("_url")
+                else _bounded_provider_directory_fhir_text(field_value)
+            )
+            if normalized_value is not None:
+                provenance_map[field_name] = normalized_value
+    return provenance_map or None
+
+
+def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    role_detail_map = {
+        "resource_type": "PractitionerRole",
+        "source_id": mapping["source_id"],
+        "resource_id": mapping["resource_id"],
+    }
+    for field_name in (
+        "active",
+        "organization_ref",
+        "healthcare_service_refs",
+        "endpoint_refs",
+        "specialty_codes",
+        "code_codes",
+        "telecom",
+        "available_time",
+        "not_available",
+        "availability_exceptions",
+        "new_patient_acceptance",
+        "telehealth",
+    ):
+        field_value = mapping.get(f"role_{field_name}")
+        if field_value is not None:
+            role_detail_map[field_name] = field_value
+    period = _provider_directory_period(mapping, "role")
+    if period is not None:
+        role_detail_map["period"] = period
+    provenance = _provider_directory_fhir_provenance(mapping, "role")
+    if provenance is not None:
+        role_detail_map["fhir_provenance"] = provenance
+    return role_detail_map
+
+
 def _append_provider_directory_plan_evidence(
     mapping: Mapping[str, Any],
     role_evidence: dict[str, Any],
@@ -1524,6 +1770,28 @@ def _append_provider_directory_plan_evidence(
         "organization-affiliation-network-derived",
     }:
         plan_detail_map["provenance"] = mapping["provenance"]
+    for field_name in (
+        "status",
+        "name",
+        "aliases",
+        "type_codes",
+        "owned_by_ref",
+        "administered_by_ref",
+        "product_identifiers",
+        "backbones",
+        "coverage",
+    ):
+        source_field = f"plan_{field_name}"
+        output_field = "plan_backbones" if field_name == "backbones" else field_name
+        field_value = mapping.get(source_field)
+        if field_value is not None:
+            plan_detail_map[output_field] = field_value
+    period = _provider_directory_period(mapping, "plan")
+    if period is not None:
+        plan_detail_map["period"] = period
+    provenance = _provider_directory_fhir_provenance(mapping, "plan")
+    if provenance is not None:
+        plan_detail_map["fhir_provenance"] = provenance
     plan_fields = tuple(
         plan_detail_map.get(key)
         for key in ("resource_type", "resource_id", "identifier", "provenance")
@@ -1576,6 +1844,7 @@ def _map_provider_directory_role_evidence(
             plan_metadata = _provider_directory_plan_metadata(mapping)
             if plan_metadata is not None:
                 role_evidence["insurance_plan_metadata"] = plan_metadata
+            role_evidence["practitioner_role"] = _provider_directory_role_detail(mapping)
         elif evidence_type == "insurance_plan":
             plan_keys = plan_keys_by_role.setdefault(role_key, set())
             _append_provider_directory_plan_evidence(mapping, role_evidence, plan_keys)
@@ -1696,20 +1965,25 @@ def _affiliation_plan_resolution_cte_sql(schema: str) -> str:
         "affiliation_network.resource_id",
         "affiliation_network.reference",
     )
+    scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
+        "affiliations",
+        "current_affiliation_insurance_plans",
+    )
     return f"""
-    affiliation_plans AS MATERIALIZED (
+    {scoped_plan_ctes_sql}, affiliation_plans AS MATERIALIZED (
         SELECT DISTINCT affiliation_network.source_id,
                affiliation_network.affiliation_id,
                insurance_plan.resource_id,
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
                'organization-affiliation-network-derived'::varchar AS provenance
           FROM valid_affiliation_networks AS affiliation_network
+          JOIN current_affiliation_insurance_plans AS current_insurance_plan
+            ON current_insurance_plan.source_id = affiliation_network.source_id
           JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
             ON insurance_plan.source_id = affiliation_network.source_id
+           AND insurance_plan.resource_id = current_insurance_plan.resource_id
+           AND insurance_plan.last_seen_run_id = current_insurance_plan.run_id
            AND {insurance_plan_active}
-          {_provider_directory_current_resource_join_sql(
-              "insurance_plan", "InsurancePlan", "current_insurance_plan"
-          )}
          WHERE EXISTS (
                SELECT 1
                  FROM jsonb_array_elements_text(
@@ -1818,13 +2092,32 @@ def _provider_directory_affiliation_evidence_sql(
          {plan_resolution_cte_sql}, {plan_cap_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
-    SELECT source_id, affiliation_id, evidence_type, resource_id, identifier,
-           name, reference, provenance, plan_returned, plan_total,
-           plan_truncated, catalog_complete,
+    SELECT evidence.source_id, evidence.affiliation_id, evidence.evidence_type,
+           evidence.resource_id, evidence.identifier, evidence.name, evidence.reference,
+           evidence.provenance, evidence.plan_returned, evidence.plan_total,
+           evidence.plan_truncated, evidence.catalog_complete,
+           plan.status AS plan_status, plan.name AS plan_name,
+           plan.aliases::jsonb AS plan_aliases, plan.type_codes::jsonb AS plan_type_codes,
+           plan.owned_by_ref AS plan_owned_by_ref,
+           plan.administered_by_ref AS plan_administered_by_ref,
+           plan.period_start AS plan_period_start, plan.period_end AS plan_period_end,
+           plan.product_identifiers::jsonb AS plan_product_identifiers,
+           plan.plan_backbones::jsonb AS plan_backbones, plan.coverage::jsonb AS plan_coverage,
+           plan.fhir_meta::jsonb AS plan_fhir_meta, plan.fhir_self_url AS plan_fhir_self_url,
+           plan.fhir_fetch_url AS plan_fhir_fetch_url,
+           plan.fhir_fetch_mode AS plan_fhir_fetch_mode,
            COUNT(*) OVER ()::bigint AS evidence_row_total
       FROM evidence
-  ORDER BY CASE WHEN evidence_type = 'affiliation' THEN 0 ELSE 1 END,
-           source_id, affiliation_id, evidence_type, resource_id
+ LEFT JOIN current_affiliation_insurance_plans AS current_insurance_plan
+        ON evidence.evidence_type = 'insurance_plan'
+       AND current_insurance_plan.source_id = evidence.source_id
+       AND current_insurance_plan.resource_id = evidence.resource_id
+ LEFT JOIN {schema}.provider_directory_insurance_plan AS plan
+        ON plan.source_id = current_insurance_plan.source_id
+       AND plan.resource_id = current_insurance_plan.resource_id
+       AND plan.last_seen_run_id = current_insurance_plan.run_id
+  ORDER BY CASE WHEN evidence.evidence_type = 'affiliation' THEN 0 ELSE 1 END,
+           evidence.source_id, evidence.affiliation_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
     """
 
@@ -2087,6 +2380,22 @@ def _merge_provider_directory_role_evidence(
     )
 
 
+def _provider_directory_practitioner_role_details(
+    matching_role_evidence_list: Sequence[tuple[tuple[str, str], Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            dict(role_detail)
+            for _role_key, role_evidence in matching_role_evidence_list
+            if isinstance(
+                role_detail := role_evidence.get("practitioner_role"),
+                Mapping,
+            )
+        ),
+        key=lambda detail: (str(detail["source_id"]), str(detail["resource_id"])),
+    )
+
+
 def _provider_directory_role_evidence_fields(
     source_ids: Sequence[str],
     role_keys: Sequence[tuple[str, str]],
@@ -2118,6 +2427,11 @@ def _provider_directory_role_evidence_fields(
             {role_key[1] for role_key, _role_evidence in matching_role_evidence_list}
         ),
     }
+    practitioner_roles = _provider_directory_practitioner_role_details(
+        matching_role_evidence_list
+    )
+    if practitioner_roles:
+        field_map["practitioner_roles"] = practitioner_roles
     plan_list, network_list, role_plan_metadata_list, evidence_metadata_list = (
         _merge_provider_directory_role_evidence(matching_role_evidence_list)
     )
