@@ -25,6 +25,17 @@ MONTHLY_FULL_FORBIDDEN_MODE_NAMES = (
     "publish_artifacts_only",
     "seed_only",
 )
+SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
+LAST_UPDATED_PROOF_METRIC_NAMES = (
+    "last_updated_unfiltered_pre",
+    "last_updated_ranged_root_pre",
+    "last_updated_exact_leaf_count_sum",
+    "last_updated_pass1_unique",
+    "last_updated_pass2_unique",
+    "last_updated_staged_candidate_count",
+    "last_updated_ranged_root_post",
+    "last_updated_unfiltered_post",
+)
 
 
 def _is_import_param_match(
@@ -181,6 +192,46 @@ class ImportControlHttpClient:
         return self._request_json("/v1/runs", method="POST", body=request_body)
 
 
+def _last_updated_completeness_errors(
+    entry: dict[str, Any],
+    resource_type: str,
+    resource_stats: dict[str, Any],
+) -> list[str]:
+    canonical_base = str(entry.get("canonical_base") or "").rstrip("/")
+    partition_source_count = resource_stats.get("last_updated_partition_sources")
+    is_proof_required = (
+        canonical_base == SCAN_PROVIDER_DIRECTORY_BASE
+        or partition_source_count not in (None, 0)
+    )
+    if not is_proof_required:
+        return []
+    expected_source_count = len(entry["source_ids"])
+    errors: list[str] = []
+    if partition_source_count != expected_source_count:
+        errors.append(
+            f"{resource_type} lacks exact last-updated partition source metrics"
+        )
+    if (
+        resource_stats.get("last_updated_completeness_verified_sources")
+        != expected_source_count
+    ):
+        errors.append(
+            f"{resource_type} lacks verified last-updated completeness proof"
+        )
+    proof_values = [
+        resource_stats.get(metric_name)
+        for metric_name in LAST_UPDATED_PROOF_METRIC_NAMES
+    ]
+    if any(
+        isinstance(proof_value, bool) or not isinstance(proof_value, int)
+        for proof_value in proof_values
+    ) or len(set(proof_values)) != 1:
+        errors.append(
+            f"{resource_type} last-updated completeness counts do not reconcile"
+        )
+    return errors
+
+
 def acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
     """Validate exact completion metrics for one REST acquisition entry."""
 
@@ -204,6 +255,14 @@ def acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) ->
             errors.append(f"{resource_type} lacks completed fetch metrics")
         elif resource_stats.get("sources_bounded", 0) or resource_stats.get("sources_failed", 0):
             errors.append(f"{resource_type} was bounded or failed")
+        if isinstance(resource_stats, dict):
+            errors.extend(
+                _last_updated_completeness_errors(
+                    entry,
+                    resource_type,
+                    resource_stats,
+                )
+            )
     return errors
 
 

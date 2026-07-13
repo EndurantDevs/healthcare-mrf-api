@@ -12029,6 +12029,35 @@ async def test_generic_rest_failure_with_checkpoint_requires_resume():
     assert resume_required_entries == {"source_a:Location"}
 
 
+@pytest.mark.asyncio
+async def test_last_updated_census_mismatch_is_terminal_not_resumable():
+    source_lookup = _last_updated_partition_test_source()
+    source_lookup["_pagination_checkpoint_context"] = (
+        _last_updated_partition_test_context()
+    )
+    resume_required_entries: set[str] = set()
+    blocked_error = (
+        f"{importer.LAST_UPDATED_PARTITION_BLOCKED_ERROR}:"
+        "census_unfiltered_post_mismatch:1!=2"
+    )
+
+    with pytest.raises(RuntimeError, match="census_unfiltered_post_mismatch"):
+        await importer._finalize_source_pagination_checkpoints(
+            source_lookup,
+            {
+                "Practitioner": {
+                    "complete": False,
+                    "fetch_mode": importer.LAST_UPDATED_PARTITION_FETCH_MODE,
+                    "bounded": False,
+                    "error": blocked_error,
+                }
+            },
+            resume_required_entries,
+        )
+
+    assert resume_required_entries == set()
+
+
 def _failed_uhc_plan_graph_summary(resource_types: list[str]):
     """Build a failed graph result for branch-integration tests."""
     failed_diagnostics_by_resource = {
@@ -18301,6 +18330,28 @@ def _last_updated_partition_test_bundle(resources, *, total=None):
     return payload
 
 
+def _last_updated_partition_expected_proof(resource_count, cutoff):
+    return {
+        "strategy_version": importer.LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+        "cutoff": cutoff,
+        "verified": True,
+        "failure": None,
+        **{
+            field_name: resource_count
+            for field_name in (
+                "unfiltered_pre",
+                "ranged_root_pre",
+                "exact_leaf_count_sum",
+                "pass1_unique",
+                "pass2_unique",
+                "staged_candidate_count",
+                "ranged_root_post",
+                "unfiltered_post",
+            )
+        },
+    }
+
+
 def _new_last_updated_partition_resume(partition_config):
     """Build the initial durable state for a partition acquisition."""
     return importer.LastUpdatedPartitionResume(
@@ -18456,6 +18507,14 @@ def test_last_updated_partition_validates_resource_window(
         )
         == expected_error
     )
+
+
+@pytest.mark.parametrize("resource", [{}, {"meta": {}}])
+def test_last_updated_partition_rejects_rows_missing_last_updated(resource):
+    assert importer._last_updated_partition_resource_window_error(
+        resource,
+        _last_updated_partition_test_window(),
+    ) in {"resource_meta_missing", "resource_last_updated_invalid"}
 
 
 @pytest.mark.asyncio
@@ -18623,6 +18682,25 @@ class _LastUpdatedPartitionFetchHarness:
         )
         return len(output_rows), written_count
 
+    async def _proof_counts(
+        self,
+        _context,
+        _resource_type,
+        partition_plan,
+    ):
+        expected_count = sum(
+            partition_window.count or 0
+            for partition_window in partition_plan.leaf_windows()
+        )
+        return importer.LastUpdatedPartitionProofCounts(
+            leaf_count_sum=expected_count,
+            pass1_unique=expected_count,
+            pass2_unique=expected_count,
+            staged_candidate_count=len(self.staged_resources_by_id),
+            invalid_candidate_count=0,
+            orphan_proof_count=0,
+        )
+
     async def _write_rows(self, _model, output_rows):
         self.written_resource_ids.extend(
             output_row["resource_id"] for output_row in output_rows
@@ -18716,6 +18794,11 @@ class _LastUpdatedPartitionFetchHarness:
             importer,
             "_stream_last_updated_partition_staged_rows",
             self._stream_staged,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_assert_last_updated_partition_candidate_proof",
+            self._proof_counts,
         )
 
     async def _fetch_resource_rows(
@@ -18822,6 +18905,83 @@ async def test_last_updated_partition_transient_count_remains_resumable(monkeypa
     assert written_resource_ids == []
 
 
+class _CensusSequenceResponder:
+    def __init__(self, counts):
+        self.counts = iter(counts)
+        self.requested_urls = []
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        self.requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=next(self.counts)),
+                None,
+                1,
+            )
+        return (
+            200,
+            _last_updated_partition_test_bundle(
+                [_last_updated_partition_test_resource("prac-1")]
+            ),
+            None,
+            1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_blocks_pre_census_mismatch(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    responder = _CensusSequenceResponder([2, 1])
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is False
+    assert "census_ranged_root_pre_mismatch:2!=1" in fetch_outcome.error
+    assert fetch_outcome.fetch_diagnostic["unfiltered_pre"] == 2
+    assert fetch_outcome.fetch_diagnostic["ranged_root_pre"] == 1
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("counts", "failure_name"),
+    [
+        ([1, 1, 2], "census_ranged_root_post_mismatch"),
+        ([1, 1, 1, 2], "census_unfiltered_post_mismatch"),
+    ],
+)
+async def test_last_updated_partition_blocks_post_census_drift(
+    monkeypatch,
+    counts,
+    failure_name,
+):
+    directory_source = _last_updated_partition_test_source()
+    responder = _CensusSequenceResponder(counts)
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is False
+    assert failure_name in fetch_outcome.error
+    assert set(staged_resources_by_id) == {"prac-1"}
+    assert written_resource_ids == []
+
+
 @pytest.mark.asyncio
 async def test_last_updated_partition_transient_page_remains_resumable(monkeypatch):
     directory_source = _last_updated_partition_test_source()
@@ -18859,7 +19019,12 @@ async def test_last_updated_partition_transient_page_remains_resumable(monkeypat
     assert fetch_outcome.next_url_remaining is True
     assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in fetch_outcome.error
     assert fetch_outcome.retry_not_before is not None
-    assert saved_plan_statuses == ["acquiring", "acquiring"]
+    assert saved_plan_statuses == [
+        "counting",
+        "counting",
+        "acquiring",
+        "acquiring",
+    ]
     assert staged_resources_by_id == {}
     assert written_resource_ids == []
 
@@ -18906,6 +19071,103 @@ async def test_last_updated_partition_deadline_remains_resumable(monkeypatch):
     fetch_source_json.assert_not_awaited()
 
 
+class _CensusResumeRecorder:
+    def __init__(self):
+        self.persisted_resume = None
+
+    async def _save(
+        self,
+        _context,
+        _resource_type,
+        partition_config,
+        partition_plan,
+        **checkpoint_fields,
+    ):
+        census = checkpoint_fields["census"]
+        checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
+            partition_config,
+            partition_plan,
+            census,
+        )
+        restored_resume = importer._last_updated_partition_resume_from_checkpoint(
+            checkpoint_payload,
+            partition_config,
+        )
+        self.persisted_resume = dataclasses.replace(
+            restored_resume,
+            pages_processed=checkpoint_fields["pages_processed"],
+            rows_processed=checkpoint_fields["rows_processed"],
+        )
+
+
+class _TransientCensusResponder:
+    def __init__(self):
+        self.first_requested_urls = []
+        self.resumed_requested_urls = []
+
+    async def first_fetch(self, _source, request_url, *, timeout):
+        self.first_requested_urls.append(request_url)
+        if "_lastUpdated" not in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=1), None, 1
+        return 503, {"resourceType": "OperationOutcome"}, None, 1
+
+    async def resumed_fetch(self, _source, request_url, *, timeout):
+        self.resumed_requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=1), None, 1
+        return (
+            200,
+            _last_updated_partition_test_bundle(
+                [_last_updated_partition_test_resource("prac-1")]
+            ),
+            None,
+            1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_resumes_transient_ranged_census(monkeypatch):
+    """Reuse the saved cutoff and unfiltered pre-count after a transient."""
+    directory_source = _last_updated_partition_test_source()
+    responder = _TransientCensusResponder()
+    resume_recorder = _CensusResumeRecorder()
+    first_outcome, _staged, _written = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder.first_fetch,
+            save_plan_callback=resume_recorder._save,
+        )
+    )
+
+    assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in first_outcome.error
+    assert resume_recorder.persisted_resume is not None
+    assert resume_recorder.persisted_resume.census.unfiltered_pre == 1
+    assert resume_recorder.persisted_resume.census.ranged_root_pre is None
+    assert len(responder.first_requested_urls) == 2
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder.resumed_fetch,
+            partition_resume=resume_recorder.persisted_resume,
+        )
+    )
+
+    assert fetch_outcome.complete is True
+    assert "_lastUpdated" in responder.resumed_requested_urls[0]
+    assert all(
+        not (
+            "_summary=count" in request_url
+            and "_lastUpdated" not in request_url
+        )
+        for request_url in responder.resumed_requested_urls[:-1]
+    )
+    assert set(staged_resources_by_id) == {"prac-1"}
+    assert written_resource_ids == ["prac-1"]
+
+
 class _PartitionResumeRecorder:
     """Persist the first pass and interrupt before its verification pass."""
 
@@ -18918,23 +19180,23 @@ class _PartitionResumeRecorder:
         _resource_type,
         partition_config,
         partition_plan,
-        *,
-        pages_processed,
-        rows_processed,
-        database_connection=None,
+        **checkpoint_fields,
     ):
+        census = checkpoint_fields["census"]
         checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
             partition_config,
             partition_plan,
+            census,
         )
-        restored_plan = importer._last_updated_partition_plan_from_checkpoint(
+        restored_resume = importer._last_updated_partition_resume_from_checkpoint(
             checkpoint_payload,
             partition_config,
         )
         self.persisted_resume = importer.LastUpdatedPartitionResume(
-            restored_plan,
-            pages_processed=pages_processed,
-            rows_processed=rows_processed,
+            restored_resume.plan,
+            census=restored_resume.census,
+            pages_processed=checkpoint_fields["pages_processed"],
+            rows_processed=checkpoint_fields["rows_processed"],
         )
         has_unverified_first_pass = any(
             1 in partition_window.passes and 2 not in partition_window.passes
@@ -18970,11 +19232,18 @@ async def test_last_updated_partition_acquisition_resumes_after_pass_one(monkeyp
         )
 
     assert resume_recorder.persisted_resume is not None
-    assert len(first_requested_urls) == 2
+    assert len(first_requested_urls) == 3
     resumed_requested_urls = []
 
     async def resumed_fetch(_source, request_url, *, timeout):
         resumed_requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=1),
+                None,
+                1,
+            )
         return 200, _last_updated_partition_test_bundle(
             [practitioner_resource]
         ), None, 1
@@ -18993,8 +19262,10 @@ async def test_last_updated_partition_acquisition_resumes_after_pass_one(monkeyp
     assert fetch_outcome.fetch_mode == importer.LAST_UPDATED_PARTITION_FETCH_MODE
     assert set(staged_resources_by_id) == {"prac-1"}
     assert written_resource_ids == ["prac-1"]
-    assert len(resumed_requested_urls) == 1
+    assert len(resumed_requested_urls) == 3
     assert "_summary=count" not in resumed_requested_urls[0]
+    assert "_lastUpdated" in resumed_requested_urls[1]
+    assert "_lastUpdated" not in resumed_requested_urls[2]
 
 
 @pytest.mark.asyncio
@@ -19139,13 +19410,18 @@ class _DeterministicPartitionResponder:
         query_lookup = urllib.parse.parse_qs(
             urllib.parse.urlsplit(request_url).query
         )
-        partition_bounds = tuple(query_lookup["_lastUpdated"])
         if query_lookup.get("_summary") == ["count"]:
-            partition_count = self._count_for_bounds(partition_bounds)
+            partition_bounds = tuple(query_lookup.get("_lastUpdated", ()))
+            partition_count = (
+                self._count_for_bounds(partition_bounds)
+                if partition_bounds
+                else 3
+            )
             return 200, _last_updated_partition_test_bundle(
                 [],
                 total=partition_count,
             ), None, 1
+        partition_bounds = tuple(query_lookup["_lastUpdated"])
         practitioner_resources = self._resources_for_bounds(partition_bounds)
         return 200, _last_updated_partition_test_bundle(
             practitioner_resources
@@ -19154,6 +19430,7 @@ class _DeterministicPartitionResponder:
 
 @pytest.mark.asyncio
 async def test_last_updated_partition_acquisition_succeeds_deterministically(monkeypatch):
+    """Prove every census, leaf, pass, and staging count is identical."""
     directory_source = _last_updated_partition_test_source(
         ceiling=2,
         page_count=2,
@@ -19178,6 +19455,12 @@ async def test_last_updated_partition_acquisition_succeeds_deterministically(mon
 
     assert fetch_outcome.complete is True
     assert fetch_outcome.rows_fetched == 3
+    assert fetch_outcome.fetch_diagnostic == (
+        _last_updated_partition_expected_proof(
+            3,
+            "2024-01-03T00:00:00.000000Z",
+        )
+    )
     assert set(staged_resources_by_id) == {
         "prac-left",
         "prac-right-1",
@@ -19187,13 +19470,109 @@ async def test_last_updated_partition_acquisition_succeeds_deterministically(mon
     count_windows = [
         urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["_lastUpdated"]
         for url in responder.requested_urls
-        if "_summary=count" in url
+        if "_summary=count" in url and "_lastUpdated" in url
     ]
     assert count_windows == [
         ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-03T00:00:00.000000Z"],
         ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-02T00:00:00.000000Z"],
         ["ge2024-01-02T00:00:00.000000Z", "lt2024-01-03T00:00:00.000000Z"],
+        ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-03T00:00:00.000000Z"],
     ]
+    assert sum(
+        "_summary=count" in url and "_lastUpdated" not in url
+        for url in responder.requested_urls
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_empty_resource_has_complete_zero_proof(
+    monkeypatch,
+):
+    directory_source = _last_updated_partition_test_source()
+
+    async def fetch_empty(_source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=0), None, 1
+        return 200, _last_updated_partition_test_bundle([]), None, 1
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_empty,
+        )
+    )
+
+    assert fetch_outcome.complete is True
+    assert fetch_outcome.rows_fetched == 0
+    assert fetch_outcome.fetch_diagnostic["verified"] is True
+    assert {
+        fetch_outcome.fetch_diagnostic[field_name]
+        for field_name in (
+            "unfiltered_pre",
+            "ranged_root_pre",
+            "exact_leaf_count_sum",
+            "pass1_unique",
+            "pass2_unique",
+            "staged_candidate_count",
+            "ranged_root_post",
+            "unfiltered_post",
+        )
+    } == {0}
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+def test_last_updated_partition_proof_is_exposed_in_resource_metrics():
+    proof_count = 5
+    proof_by_field = {
+        "verified": True,
+        **{
+            field_name: proof_count
+            for field_name in (
+                "unfiltered_pre",
+                "ranged_root_pre",
+                "exact_leaf_count_sum",
+                "pass1_unique",
+                "pass2_unique",
+                "staged_candidate_count",
+                "ranged_root_post",
+                "unfiltered_post",
+            )
+        },
+    }
+    fetch_result = importer.ResourceFetchResult(
+        model=ProviderDirectoryPractitioner,
+        rows=[],
+        rows_fetched=proof_count,
+        rows_written=proof_count,
+        pages_fetched=4,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+        fetch_mode=importer.LAST_UPDATED_PARTITION_FETCH_MODE,
+        fetch_diagnostic=proof_by_field,
+    )
+    stats_by_resource = {}
+
+    importer._record_resource_fetch_stats(
+        stats_by_resource,
+        "Practitioner",
+        fetch_result,
+    )
+    diagnostic = importer._resource_fetch_diagnostic(
+        fetch_result,
+        rows_written=proof_count,
+    )
+
+    practitioner_stats = stats_by_resource["Practitioner"]
+    assert practitioner_stats["last_updated_partition_sources"] == 1
+    assert practitioner_stats["last_updated_completeness_verified_sources"] == 1
+    assert practitioner_stats["last_updated_unfiltered_post"] == proof_count
+    assert diagnostic["last_updated_completeness"] == proof_by_field
+    assert diagnostic["source_fetch"] is None
 
 
 def test_last_updated_partition_checkpoint_omits_resource_fingerprints():
@@ -19228,6 +19607,50 @@ def test_last_updated_partition_checkpoint_omits_resource_fingerprints():
     assert json.loads(checkpoint_payload)["control"]["windows"][0][
         "completed_passes"
     ] == [1]
+
+
+def test_last_updated_partition_checkpoint_replays_census_immutably():
+    directory_source = _last_updated_partition_test_source()
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+    partition_plan = importer.PartitionPlan.create(
+        partition_config.start,
+        partition_config.end,
+        ceiling=partition_config.ceiling,
+        minimum_width=partition_config.minimum_width,
+        volatile_metadata_paths=partition_config.volatile_metadata_paths,
+    )
+    census = importer.LastUpdatedCompletenessCensus(
+        unfiltered_pre=4,
+        ranged_root_pre=4,
+    )
+    checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
+        partition_config,
+        partition_plan,
+        census,
+    )
+
+    restored = importer._last_updated_partition_resume_from_checkpoint(
+        checkpoint_payload,
+        partition_config,
+    )
+
+    assert restored.census == census
+    assert importer._last_updated_partition_checkpoint_payload(
+        partition_config,
+        restored.plan,
+        restored.census,
+    ) == checkpoint_payload
+    conflicting_checkpoint = json.loads(checkpoint_payload)
+    conflicting_checkpoint["control"]["census"]["ranged_root_pre"] = 3
+    with pytest.raises(RuntimeError, match="checkpoint_invalid"):
+        importer._last_updated_partition_resume_from_checkpoint(
+            json.dumps(conflicting_checkpoint),
+            partition_config,
+        )
 
 
 @pytest.mark.asyncio
@@ -19558,6 +19981,10 @@ def _atomic_partition_pass_state_and_stage():
     state = importer.LastUpdatedPartitionState(
         context=_last_updated_partition_test_context(),
         plan=partition_plan,
+        census=importer.LastUpdatedCompletenessCensus(
+            unfiltered_pre=2,
+            ranged_root_pre=2,
+        ),
         start_url="https://example.test/fhir/Practitioner",
         pages_fetched=2,
         rows_fetched=2,
@@ -19670,10 +20097,11 @@ async def test_last_updated_partition_staged_rows_stream_with_keyset(monkeypatch
         importer.db,
         "first",
         AsyncMock(
-            return_value={
-                "candidate_count": 2,
-                "proof_count": 2,
-                "invalid_candidate_count": 0,
+                return_value={
+                    "candidate_count": 2,
+                    "pass1_count": 2,
+                    "pass2_count": 2,
+                    "invalid_candidate_count": 0,
                 "orphan_proof_count": 0,
             }
         ),

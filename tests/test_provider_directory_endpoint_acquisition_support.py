@@ -1,0 +1,80 @@
+import pytest
+
+from scripts.research import provider_directory_endpoint_acquisition_support as support
+
+
+def _scan_acquisition_entry():
+    return {
+        "canonical_base": support.SCAN_PROVIDER_DIRECTORY_BASE,
+        "classification": "acquisition",
+        "source_ids": ["pdfhir_736ccaa7958218d4daeaf2e6"],
+        "resources": ["Practitioner"],
+    }
+
+
+def _scan_success_metrics(entry):
+    source_ids = list(entry["source_ids"])
+    return {
+        "source_ids": source_ids,
+        "source_import_sources_selected": len(source_ids),
+        "source_import_groups_attempted": 1,
+        "resource_fetch_completed_source_ids": {
+            "Practitioner": source_ids,
+        },
+        "resource_fetch_stats": {
+            "Practitioner": {
+                "sources_completed": 1,
+                "sources_bounded": 0,
+                "sources_failed": 0,
+            }
+        },
+    }
+
+
+def _add_last_updated_proof(resource_stats, count):
+    resource_stats.update(
+        {
+            "last_updated_partition_sources": 1,
+            "last_updated_completeness_verified_sources": 1,
+            **{
+                metric_name: count
+                for metric_name in support.LAST_UPDATED_PROOF_METRIC_NAMES
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("resource_count", [0, 17])
+def test_scan_metrics_require_reconciled_last_updated_proof(resource_count):
+    entry = _scan_acquisition_entry()
+    metrics = _scan_success_metrics(entry)
+    _add_last_updated_proof(
+        metrics["resource_fetch_stats"]["Practitioner"],
+        resource_count,
+    )
+
+    assert support.acquisition_metric_errors(entry, metrics) == []
+
+
+def test_scan_metrics_reject_missing_or_drifted_last_updated_proof():
+    entry = _scan_acquisition_entry()
+    metrics = _scan_success_metrics(entry)
+
+    missing_errors = support.acquisition_metric_errors(entry, metrics)
+
+    assert any(
+        "lacks verified last-updated completeness proof" in error
+        for error in missing_errors
+    )
+    _add_last_updated_proof(
+        metrics["resource_fetch_stats"]["Practitioner"],
+        17,
+    )
+    metrics["resource_fetch_stats"]["Practitioner"][
+        "last_updated_unfiltered_post"
+    ] = 18
+
+    assert (
+        "Practitioner last-updated completeness counts do not reconcile"
+        in support.acquisition_metric_errors(entry, metrics)
+    )

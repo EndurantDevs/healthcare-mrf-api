@@ -867,7 +867,7 @@ PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
 LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
-    "provider-directory-fhir-last-updated-v2"
+    "provider-directory-fhir-last-updated-v3"
 )
 LAST_UPDATED_PARTITION_METADATA_KEY = (
     "provider_directory_last_updated_partition_acquisition"
@@ -1042,6 +1042,17 @@ class LastUpdatedCountFetch:
     retry_not_before: str | None = None
 
 
+@dataclass
+class LastUpdatedCompletenessCensus:
+    """Durable exact-count observations around one partition acquisition."""
+
+    unfiltered_pre: int | None = None
+    ranged_root_pre: int | None = None
+    ranged_root_post: int | None = None
+    unfiltered_post: int | None = None
+    failure: str | None = None
+
+
 @dataclass(frozen=True)
 class LastUpdatedWindowPage:
     resources: tuple[dict[str, Any], ...]
@@ -1054,6 +1065,9 @@ class LastUpdatedWindowPage:
 @dataclass(frozen=True)
 class LastUpdatedPartitionResume:
     plan: PartitionPlan
+    census: LastUpdatedCompletenessCensus = field(
+        default_factory=LastUpdatedCompletenessCensus
+    )
     pages_processed: int = 0
     rows_processed: int = 0
 
@@ -1073,10 +1087,18 @@ class LastUpdatedPartitionFetchOptions:
     pagination_checkpoint: PaginationCheckpointContext | None
 
 
+@dataclass(frozen=True)
+class LastUpdatedCensusRequest:
+    field_name: str
+    request_url: str
+    expected_count: int | None
+
+
 @dataclass
 class LastUpdatedPartitionState:
     context: PaginationCheckpointContext
     plan: PartitionPlan
+    census: LastUpdatedCompletenessCensus
     start_url: str
     pages_fetched: int
     rows_fetched: int
@@ -1252,6 +1274,16 @@ class LastUpdatedPartitionInitialization:
 class LastUpdatedPartitionStage:
     rows: tuple[dict[str, Any], ...]
     candidate_hashes_by_id: dict[str, str]
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionProofCounts:
+    leaf_count_sum: int
+    pass1_unique: int
+    pass2_unique: int
+    staged_candidate_count: int
+    invalid_candidate_count: int
+    orphan_proof_count: int
 
 
 @dataclass(frozen=True)
@@ -18163,7 +18195,9 @@ def _last_updated_partition_checkpoint_resource_type(resource_type: str) -> str:
 def _last_updated_partition_checkpoint_payload(
     config: LastUpdatedPartitionConfig,
     plan: PartitionPlan,
+    census: LastUpdatedCompletenessCensus | None = None,
 ) -> str:
+    census = census or LastUpdatedCompletenessCensus()
     planner_checkpoint = plan.to_dict()
     control_windows = [
         {
@@ -18180,12 +18214,19 @@ def _last_updated_partition_checkpoint_payload(
     ]
     return json.dumps(
         {
-            "version": 1,
+            "version": 2,
             "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
             "config": config.identity(),
             "control": {
                 "windows": control_windows,
                 "failure": planner_checkpoint["failure"],
+                "census": {
+                    "unfiltered_pre": census.unfiltered_pre,
+                    "ranged_root_pre": census.ranged_root_pre,
+                    "ranged_root_post": census.ranged_root_post,
+                    "unfiltered_post": census.unfiltered_post,
+                    "failure": census.failure,
+                },
             },
         },
         sort_keys=True,
@@ -18202,7 +18243,7 @@ def _partition_checkpoint_control(
         raise ValueError("checkpoint identity mismatch")
     control_dict = checkpoint_dict.get("control")
     if (
-        checkpoint_dict.get("version") != 1
+        checkpoint_dict.get("version") != 2
         or checkpoint_dict.get("strategy_version")
         != LAST_UPDATED_PARTITION_STRATEGY_VERSION
         or checkpoint_dict.get("config") != config.identity()
@@ -18210,6 +18251,53 @@ def _partition_checkpoint_control(
     ):
         raise ValueError("checkpoint identity mismatch")
     return control_dict
+
+
+def _partition_census_from_control(
+    control_dict: dict[str, Any],
+) -> LastUpdatedCompletenessCensus:
+    census_dict = control_dict.get("census")
+    if not isinstance(census_dict, dict):
+        raise ValueError("checkpoint census missing")
+    count_names = (
+        "unfiltered_pre",
+        "ranged_root_pre",
+        "ranged_root_post",
+        "unfiltered_post",
+    )
+    count_by_name = {
+        count_name: census_dict.get(count_name) for count_name in count_names
+    }
+    if any(
+        count_value is not None
+        and (
+            isinstance(count_value, bool)
+            or not isinstance(count_value, int)
+            or count_value < 0
+        )
+        for count_value in count_by_name.values()
+    ):
+        raise ValueError("checkpoint census count invalid")
+    failure = census_dict.get("failure")
+    if failure is not None and (not isinstance(failure, str) or not failure):
+        raise ValueError("checkpoint census failure invalid")
+    if count_by_name["ranged_root_pre"] is not None and count_by_name["unfiltered_pre"] is None:
+        raise ValueError("checkpoint ranged pre census lacks unfiltered pre")
+    if count_by_name["ranged_root_post"] is not None and count_by_name["ranged_root_pre"] is None:
+        raise ValueError("checkpoint ranged post census lacks ranged pre")
+    if count_by_name["unfiltered_post"] is not None and count_by_name["ranged_root_post"] is None:
+        raise ValueError("checkpoint unfiltered post census lacks ranged post")
+    observed_counts = [
+        count_value
+        for count_value in count_by_name.values()
+        if count_value is not None
+    ]
+    if failure is None and len(set(observed_counts)) > 1:
+        raise ValueError("checkpoint census counts conflict without failure")
+    return LastUpdatedCompletenessCensus(
+        **count_by_name,
+        failure=failure,
+    )
 
 
 def _partition_checkpoint_windows(
@@ -18291,6 +18379,16 @@ def _last_updated_partition_plan_from_checkpoint(
     checkpoint_payload: str | None,
     config: LastUpdatedPartitionConfig,
 ) -> PartitionPlan:
+    return _last_updated_partition_resume_from_checkpoint(
+        checkpoint_payload,
+        config,
+    ).plan
+
+
+def _last_updated_partition_resume_from_checkpoint(
+    checkpoint_payload: str | None,
+    config: LastUpdatedPartitionConfig,
+) -> LastUpdatedPartitionResume:
     try:
         control_dict = _partition_checkpoint_control(checkpoint_payload, config)
         planner_windows, completed_passes_by_window = (
@@ -18301,14 +18399,29 @@ def _last_updated_partition_plan_from_checkpoint(
             planner_windows,
             config,
         )
-        return _restore_partition_pass_markers(
-            restored_plan,
-            completed_passes_by_window,
+        return LastUpdatedPartitionResume(
+            plan=_restore_partition_pass_markers(
+                restored_plan,
+                completed_passes_by_window,
+            ),
+            census=_partition_census_from_control(control_dict),
         )
     except (json.JSONDecodeError, TypeError, ValueError, PartitionPlanError) as exc:
         raise RuntimeError(
             "provider_directory_last_updated_partition_checkpoint_invalid"
         ) from exc
+
+
+def _is_last_updated_partition_census_complete(
+    census: LastUpdatedCompletenessCensus,
+) -> bool:
+    return (
+        census.failure is None
+        and census.unfiltered_pre is not None
+        and census.ranged_root_pre is not None
+        and census.ranged_root_post is not None
+        and census.unfiltered_post is not None
+    )
 
 
 def _last_updated_partition_start_hash(
@@ -18387,11 +18500,12 @@ async def _resume_partition_plan(
             checkpoint,
             start_hash,
         )
-    return LastUpdatedPartitionResume(
-        plan=_last_updated_partition_plan_from_checkpoint(
+    checkpoint_resume = _last_updated_partition_resume_from_checkpoint(
             _clean_text(checkpoint.get("next_url")),
             config,
-        ),
+        )
+    return replace(
+        checkpoint_resume,
         pages_processed=int(checkpoint.get("pages_processed") or 0),
         rows_processed=int(checkpoint.get("rows_processed") or 0),
     )
@@ -18460,21 +18574,11 @@ async def _load_partition_plan(
     )
 
 
-async def _save_last_updated_partition_plan(
-    context: PaginationCheckpointContext,
-    resource_type: str,
-    config: LastUpdatedPartitionConfig,
-    plan: PartitionPlan,
-    *,
-    pages_processed: int,
-    rows_processed: int,
-    database_connection: Any | None = None,
-) -> None:
-    checkpoint_resource_type = _last_updated_partition_checkpoint_resource_type(
-        resource_type
-    )
-    database_executor = database_connection or db
-    updated = await database_executor.status(
+async def _update_last_updated_partition_checkpoint(
+    database_executor: Any,
+    checkpoint_by_field: dict[str, Any],
+) -> Any:
+    return await database_executor.status(
         f"""
         UPDATE {_pagination_checkpoint_table_ref()}
            SET next_url = :checkpoint_payload,
@@ -18492,25 +18596,52 @@ async def _save_last_updated_partition_plan(
            AND dataset_id IS NOT DISTINCT FROM :dataset_id
            AND source_ids::jsonb = CAST(:source_ids AS jsonb);
         """,
-        checkpoint_payload=_last_updated_partition_checkpoint_payload(
+        **checkpoint_by_field,
+    )
+
+
+async def _save_last_updated_partition_plan(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    plan: PartitionPlan,
+    *,
+    census: LastUpdatedCompletenessCensus,
+    pages_processed: int,
+    rows_processed: int,
+    database_connection: Any | None = None,
+) -> None:
+    """Save planner and census state under the acquired checkpoint owner."""
+    is_complete = _is_last_updated_partition_census_complete(census) and (
+        plan.status is PlanStatus.SUCCEEDED
+    )
+    checkpoint_by_field = {
+        "checkpoint_payload": _last_updated_partition_checkpoint_payload(
             config,
             plan,
+            census,
         ),
-        state=(
+        "state": (
             PAGINATION_CHECKPOINT_COMPLETE
-            if plan.status is PlanStatus.SUCCEEDED
+            if is_complete
             else PAGINATION_CHECKPOINT_ACTIVE
         ),
-        pages_processed=pages_processed,
-        rows_processed=rows_processed,
-        is_complete=plan.status is PlanStatus.SUCCEEDED,
-        canonical_api_base=context.canonical_api_base,
-        resource_type=checkpoint_resource_type,
-        source_scope_hash=context.source_scope_hash,
-        acquisition_root_run_id=context.acquisition_root_run_id,
-        owner_run_id=context.owner_run_id,
-        dataset_id=context.dataset_id,
-        source_ids=json.dumps(context.source_ids),
+        "pages_processed": pages_processed,
+        "rows_processed": rows_processed,
+        "is_complete": is_complete,
+        "canonical_api_base": context.canonical_api_base,
+        "resource_type": _last_updated_partition_checkpoint_resource_type(
+            resource_type
+        ),
+        "source_scope_hash": context.source_scope_hash,
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "owner_run_id": context.owner_run_id,
+        "dataset_id": context.dataset_id,
+        "source_ids": json.dumps(context.source_ids),
+    }
+    updated = await _update_last_updated_partition_checkpoint(
+        database_connection or db,
+        checkpoint_by_field,
     )
     if _coerce_rowcount(updated) <= 0:
         raise RuntimeError(
@@ -18588,6 +18719,40 @@ def _last_updated_partition_url(
     )
 
 
+def _last_updated_partition_unfiltered_count_url(start_url: str) -> str:
+    parsed = urllib.parse.urlsplit(start_url)
+    replaced_names = {
+        "_count",
+        "_lastUpdated",
+        "_sort",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (key, query_value)
+        for key, query_value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key not in replaced_names
+    ]
+    query_items.extend(
+        (
+            ("_summary", "count"),
+            ("_total", "accurate"),
+        )
+    )
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query_items, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
 def _is_fhir_searchset_bundle(payload: Any) -> bool:
     return (
         isinstance(payload, dict)
@@ -18654,6 +18819,12 @@ async def _fetch_last_updated_partition_count(
                 else None
             ),
         )
+    return _validate_last_updated_partition_count_payload(response_payload)
+
+
+def _validate_last_updated_partition_count_payload(
+    response_payload: dict[str, Any] | None,
+) -> LastUpdatedCountFetch:
     if not _is_fhir_searchset_bundle(response_payload):
         return LastUpdatedCountFetch(
             CountObservation.unknown(
@@ -19358,9 +19529,13 @@ async def _stage_last_updated_partition_window(
 async def _last_updated_partition_candidate_proof_counts(
     context: PaginationCheckpointContext,
     resource_type: str,
-) -> tuple[int, int, int, int]:
-    """Count staged candidates and immutable pass-two proof mismatches."""
-    proof_resource_type = _last_updated_partition_fingerprint_resource_type(
+) -> LastUpdatedPartitionProofCounts:
+    """Count staged candidates and both immutable pass proofs."""
+    pass1_resource_type = _last_updated_partition_fingerprint_resource_type(
+        resource_type,
+        1,
+    )
+    pass2_resource_type = _last_updated_partition_fingerprint_resource_type(
         resource_type,
         2,
     )
@@ -19370,12 +19545,14 @@ async def _last_updated_partition_candidate_proof_counts(
           (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
             WHERE dataset_id = :dataset_id AND resource_type = :resource_type) AS candidate_count,
           (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-            WHERE dataset_id = :dataset_id AND resource_type = :proof_resource_type) AS proof_count,
+            WHERE dataset_id = :dataset_id AND resource_type = :pass1_resource_type) AS pass1_count,
+          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+            WHERE dataset_id = :dataset_id AND resource_type = :pass2_resource_type) AS pass2_count,
           (SELECT COUNT(*)
              FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} candidate
              LEFT JOIN {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} proof
                ON proof.dataset_id = candidate.dataset_id
-              AND proof.resource_type = :proof_resource_type
+              AND proof.resource_type = :pass2_resource_type
               AND proof.resource_id = candidate.resource_id
             WHERE candidate.dataset_id = :dataset_id
               AND candidate.resource_type = :resource_type
@@ -19389,22 +19566,24 @@ async def _last_updated_partition_candidate_proof_counts(
               AND candidate.resource_type = :resource_type
               AND candidate.resource_id = proof.resource_id
             WHERE proof.dataset_id = :dataset_id
-              AND proof.resource_type = :proof_resource_type
+              AND proof.resource_type = :pass2_resource_type
               AND candidate.resource_id IS NULL) AS orphan_proof_count;
         """,
         dataset_id=context.dataset_id,
         resource_type=resource_type,
-        proof_resource_type=proof_resource_type,
+        pass1_resource_type=pass1_resource_type,
+        pass2_resource_type=pass2_resource_type,
     )
     count_map = _pagination_checkpoint_row_mapping(count_row)
-    return tuple(
-        int(count_map.get(count_name) or 0)
-        for count_name in (
-            "candidate_count",
-            "proof_count",
-            "invalid_candidate_count",
-            "orphan_proof_count",
-        )
+    return LastUpdatedPartitionProofCounts(
+        leaf_count_sum=0,
+        pass1_unique=int(count_map.get("pass1_count") or 0),
+        pass2_unique=int(count_map.get("pass2_count") or 0),
+        staged_candidate_count=int(count_map.get("candidate_count") or 0),
+        invalid_candidate_count=int(
+            count_map.get("invalid_candidate_count") or 0
+        ),
+        orphan_proof_count=int(count_map.get("orphan_proof_count") or 0),
     )
 
 
@@ -19412,25 +19591,25 @@ async def _assert_last_updated_partition_candidate_proof(
     context: PaginationCheckpointContext,
     resource_type: str,
     plan: PartitionPlan,
-) -> int:
+) -> LastUpdatedPartitionProofCounts:
     """Require exact candidate/proof counts and immutable payload hashes."""
     expected_count = sum(window.count or 0 for window in plan.leaf_windows())
-    candidate_count, proof_count, invalid_count, orphan_count = (
-        await _last_updated_partition_candidate_proof_counts(
-            context,
-            resource_type,
-        )
+    observed_counts = await _last_updated_partition_candidate_proof_counts(
+        context,
+        resource_type,
     )
+    proof_counts = replace(observed_counts, leaf_count_sum=expected_count)
     if (
-        candidate_count != expected_count
-        or proof_count != expected_count
-        or invalid_count
-        or orphan_count
+        proof_counts.staged_candidate_count != expected_count
+        or proof_counts.pass1_unique != expected_count
+        or proof_counts.pass2_unique != expected_count
+        or proof_counts.invalid_candidate_count
+        or proof_counts.orphan_proof_count
     ):
         raise RuntimeError(
             "provider_directory_last_updated_partition_staged_dataset_mismatch"
         )
-    return expected_count
+    return proof_counts
 
 
 def _partition_output_rows(
@@ -19473,11 +19652,12 @@ async def _stream_last_updated_partition_staged_rows(
     row_batch_size: int,
 ) -> tuple[int, int]:
     """Verify proof, then keyset-stream staged rows to the normal writer."""
-    expected_count = await _assert_last_updated_partition_candidate_proof(
+    proof_counts = await _assert_last_updated_partition_candidate_proof(
         context,
         resource_type,
         plan,
     )
+    expected_count = proof_counts.leaf_count_sum
     written_count = 0
     streamed_count = 0
     after_resource_id = ""
@@ -19522,6 +19702,8 @@ def _last_updated_partition_failure_result(
     pages_fetched: int = 0,
     rows_fetched: int = 0,
     bounded: bool = False,
+    terminal: bool = False,
+    fetch_diagnostic: dict[str, Any] | None = None,
 ) -> ResourceFetchResult:
     failure = plan.failure if plan is not None else None
     failure_error = (
@@ -19539,10 +19721,11 @@ def _last_updated_partition_failure_result(
         row_limit_reached=False,
         page_limit_reached=False,
         hard_page_limit_reached=bounded,
-        next_url_remaining=not bool(failure),
+        next_url_remaining=not (terminal or bool(failure)),
         error=f"{LAST_UPDATED_PARTITION_BLOCKED_ERROR}:{failure_error}",
         fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
         deadline_reached=error == "deadline_reached",
+        fetch_diagnostic=fetch_diagnostic,
     )
 
 
@@ -19569,7 +19752,41 @@ def _last_updated_partition_retry_result(
         fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
         deadline_reached=deadline_reached,
         retry_not_before=retry_not_before,
+        fetch_diagnostic=_last_updated_partition_completeness_diagnostic(state),
     )
+
+
+def _last_updated_partition_completeness_diagnostic(
+    state: LastUpdatedPartitionState,
+    proof_counts: LastUpdatedPartitionProofCounts | None = None,
+    *,
+    verified: bool = False,
+) -> dict[str, Any]:
+    root_window = state.plan.windows["root"]
+    return {
+        "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+        "cutoff": _format_last_updated_partition_instant(root_window.end),
+        "unfiltered_pre": state.census.unfiltered_pre,
+        "ranged_root_pre": state.census.ranged_root_pre,
+        "exact_leaf_count_sum": (
+            proof_counts.leaf_count_sum if proof_counts is not None else None
+        ),
+        "pass1_unique": (
+            proof_counts.pass1_unique if proof_counts is not None else None
+        ),
+        "pass2_unique": (
+            proof_counts.pass2_unique if proof_counts is not None else None
+        ),
+        "staged_candidate_count": (
+            proof_counts.staged_candidate_count
+            if proof_counts is not None
+            else None
+        ),
+        "ranged_root_post": state.census.ranged_root_post,
+        "unfiltered_post": state.census.unfiltered_post,
+        "verified": verified,
+        "failure": state.census.failure,
+    }
 
 
 def _partition_preflight_failure(
@@ -19628,17 +19845,10 @@ async def _prepare_partition_state(
         resource_type,
         config,
     )
-    if resume.plan.status is PlanStatus.FAILED:
-        return _last_updated_partition_failure_result(
-            model,
-            resume.plan,
-            "planner_failed",
-            pages_fetched=resume.pages_processed,
-            rows_fetched=resume.rows_processed,
-        )
-    return LastUpdatedPartitionState(
+    state = LastUpdatedPartitionState(
         context=checkpoint_context,
         plan=resume.plan,
+        census=resume.census,
         start_url=start_url,
         pages_fetched=resume.pages_processed,
         rows_fetched=resume.rows_processed,
@@ -19649,6 +19859,13 @@ async def _prepare_partition_state(
             else None
         ),
     )
+    if resume.plan.status is PlanStatus.FAILED or resume.census.failure:
+        return _partition_failure_from_state(
+            model,
+            state,
+            resume.census.failure or "planner_failed",
+        )
+    return state
 
 
 def _partition_failure_from_state(
@@ -19665,6 +19882,8 @@ def _partition_failure_from_state(
         pages_fetched=state.pages_fetched,
         rows_fetched=state.rows_fetched,
         bounded=bounded,
+        terminal=bool(state.census.failure),
+        fetch_diagnostic=_last_updated_partition_completeness_diagnostic(state),
     )
 
 
@@ -19683,6 +19902,7 @@ async def _saved_partition_retry_result(
         resource_type,
         config,
         state.plan,
+        census=state.census,
         pages_processed=state.pages_fetched,
         rows_processed=state.rows_fetched,
     )
@@ -19693,6 +19913,27 @@ async def _saved_partition_retry_result(
         retry_not_before=retry_not_before,
         deadline_reached=deadline_reached,
     )
+
+
+async def _saved_partition_terminal_result(
+    model: type,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    failure: str,
+) -> ResourceFetchResult:
+    if state.census.failure is None:
+        state.census.failure = failure
+    await _save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        census=state.census,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    return _partition_failure_from_state(model, state, state.census.failure)
 
 
 def _last_updated_partition_count_url(
@@ -19706,6 +19947,255 @@ def _last_updated_partition_count_url(
         page_count=config.page_count,
         count_only=True,
     )
+
+
+async def _observe_partition_census_value(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+    census_request: LastUpdatedCensusRequest,
+) -> ResourceFetchResult | None:
+    """Fetch and durably record one exact census observation."""
+    if getattr(state.census, census_request.field_name) is not None:
+        return None
+    if (
+        state.deadline_at is not None
+        and _last_updated_partition_monotonic() >= state.deadline_at
+    ):
+        return await _saved_partition_retry_result(
+            model,
+            resource_type,
+            config,
+            state,
+            "deadline_reached",
+            deadline_reached=True,
+        )
+    count_fetch = await _fetch_last_updated_partition_count(
+        source_record,
+        census_request.request_url,
+        timeout=fetch_options.timeout,
+    )
+    return await _record_partition_census_fetch(
+        resource_type,
+        model,
+        config,
+        state,
+        census_request,
+        count_fetch,
+    )
+
+
+async def _record_partition_census_fetch(
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    census_request: LastUpdatedCensusRequest,
+    count_fetch: LastUpdatedCountFetch,
+) -> ResourceFetchResult | None:
+    field_name = census_request.field_name
+    state.pages_fetched += count_fetch.pages_fetched
+    if count_fetch.transient:
+        return await _saved_partition_retry_result(
+            model,
+            resource_type,
+            config,
+            state,
+            f"census_{field_name}:{count_fetch.error or 'transient'}",
+            retry_not_before=count_fetch.retry_not_before,
+        )
+    observed_count = (
+        count_fetch.observation.count
+        if count_fetch.observation is not None
+        else None
+    )
+    if observed_count is None:
+        return await _saved_partition_terminal_result(
+            model,
+            resource_type,
+            config,
+            state,
+            f"census_{field_name}_invalid:"
+            f"{count_fetch.error or 'count_unknown'}",
+        )
+    setattr(state.census, field_name, observed_count)
+    if (
+        census_request.expected_count is not None
+        and observed_count != census_request.expected_count
+    ):
+        return await _saved_partition_terminal_result(
+            model,
+            resource_type,
+            config,
+            state,
+            f"census_{field_name}_mismatch:"
+            f"{census_request.expected_count}!={observed_count}",
+        )
+    await _save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        census=state.census,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    return None
+
+
+async def _seed_partition_root_count(
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+) -> ResourceFetchResult | None:
+    ranged_root_pre = state.census.ranged_root_pre
+    assert ranged_root_pre is not None
+    root_window = state.plan.windows["root"]
+    if root_window.count is not None:
+        if root_window.count == ranged_root_pre:
+            return None
+        return await _saved_partition_terminal_result(
+            model,
+            resource_type,
+            config,
+            state,
+            "census_ranged_root_pre_checkpoint_mismatch",
+        )
+    state.plan.observe_count(
+        root_window.window_id,
+        CountObservation.exact(ranged_root_pre),
+    )
+    await _save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        census=state.census,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    return None
+
+
+async def _observe_partition_pre_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    """Establish immutable unfiltered and ranged counts before acquisition."""
+    root_window = state.plan.windows["root"]
+    census_requests = (
+        LastUpdatedCensusRequest(
+            field_name="unfiltered_pre",
+            request_url=_last_updated_partition_unfiltered_count_url(
+                state.start_url
+            ),
+            expected_count=None,
+        ),
+        LastUpdatedCensusRequest(
+            field_name="ranged_root_pre",
+            request_url=_last_updated_partition_count_url(
+                state,
+                config,
+                root_window,
+            ),
+            expected_count=state.census.unfiltered_pre,
+        ),
+    )
+    for census_request in census_requests:
+        if census_request.field_name == "ranged_root_pre":
+            census_request = replace(
+                census_request,
+                expected_count=state.census.unfiltered_pre,
+            )
+        failure = await _observe_partition_census_value(
+            source_record,
+            resource_type,
+            model,
+            config,
+            state,
+            fetch_options,
+            census_request,
+        )
+        if failure is not None:
+            return failure
+    return await _seed_partition_root_count(
+        resource_type,
+        model,
+        config,
+        state,
+    )
+
+
+async def _reconcile_partition_leaf_counts(
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+) -> ResourceFetchResult | None:
+    leaf_count_sum = sum(
+        window.count or 0 for window in state.plan.leaf_windows()
+    )
+    if leaf_count_sum == state.census.ranged_root_pre:
+        return None
+    return await _saved_partition_terminal_result(
+        model,
+        resource_type,
+        config,
+        state,
+        "exact_leaf_count_sum_mismatch:"
+        f"{state.census.ranged_root_pre}!={leaf_count_sum}",
+    )
+
+
+async def _observe_next_partition_count(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    window = state.plan.pending_count_windows()[0]
+    count_fetch = await _fetch_last_updated_partition_count(
+        source_record,
+        _last_updated_partition_count_url(state, config, window),
+        timeout=fetch_options.timeout,
+    )
+    state.pages_fetched += count_fetch.pages_fetched
+    if count_fetch.transient:
+        return await _saved_partition_retry_result(
+            model,
+            resource_type,
+            config,
+            state,
+            count_fetch.error or "count_fetch_transient",
+            retry_not_before=count_fetch.retry_not_before,
+        )
+    if count_fetch.observation is None:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_count_result_invalid"
+        )
+    state.plan.observe_count(window.window_id, count_fetch.observation)
+    await _save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        census=state.census,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    if state.plan.status is PlanStatus.FAILED:
+        return _partition_failure_from_state(model, state, "count_failed")
+    return None
 
 
 async def _observe_partition_counts(
@@ -19730,43 +20220,22 @@ async def _observe_partition_counts(
                 "deadline_reached",
                 deadline_reached=True,
             )
-        window = state.plan.pending_count_windows()[0]
-        count_url = _last_updated_partition_count_url(state, config, window)
-        count_fetch = await _fetch_last_updated_partition_count(
+        count_failure = await _observe_next_partition_count(
             source_record,
-            count_url,
-            timeout=fetch_options.timeout,
-        )
-        state.pages_fetched += count_fetch.pages_fetched
-        if count_fetch.transient:
-            return await _saved_partition_retry_result(
-                model,
-                resource_type,
-                config,
-                state,
-                count_fetch.error or "count_fetch_transient",
-                retry_not_before=count_fetch.retry_not_before,
-            )
-        if count_fetch.observation is None:
-            raise RuntimeError(
-                "provider_directory_last_updated_partition_count_result_invalid"
-            )
-        state.plan.observe_count(window.window_id, count_fetch.observation)
-        await _save_last_updated_partition_plan(
-            state.context,
             resource_type,
+            model,
             config,
-            state.plan,
-            pages_processed=state.pages_fetched,
-            rows_processed=state.rows_fetched,
+            state,
+            fetch_options,
         )
-        if state.plan.status is PlanStatus.FAILED:
-            return _partition_failure_from_state(
-                model,
-                state,
-                "count_failed",
-            )
-    return None
+        if count_failure is not None:
+            return count_failure
+    return await _reconcile_partition_leaf_counts(
+        resource_type,
+        model,
+        config,
+        state,
+    )
 
 
 async def _restore_pass_one_proof(
@@ -19854,6 +20323,7 @@ async def _persist_partition_pass(
             resource_type,
             config,
             state.plan,
+            census=state.census,
             pages_processed=state.pages_fetched,
             rows_processed=state.rows_fetched,
             database_connection=connection,
@@ -19993,15 +20463,98 @@ async def _fetch_partition_passes(
     return None
 
 
-async def _finish_partition_fetch(
+async def _observe_partition_post_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    expected_count = state.census.ranged_root_pre
+    assert expected_count is not None
+    root_window = state.plan.windows["root"]
+    census_requests = (
+        LastUpdatedCensusRequest(
+            field_name="ranged_root_post",
+            request_url=_last_updated_partition_count_url(
+                state,
+                config,
+                root_window,
+            ),
+            expected_count=expected_count,
+        ),
+        LastUpdatedCensusRequest(
+            field_name="unfiltered_post",
+            request_url=_last_updated_partition_unfiltered_count_url(
+                state.start_url
+            ),
+            expected_count=expected_count,
+        ),
+    )
+    for census_request in census_requests:
+        failure = await _observe_partition_census_value(
+            source_record,
+            resource_type,
+            model,
+            config,
+            state,
+            fetch_options,
+            census_request,
+        )
+        if failure is not None:
+            return failure
+    return None
+
+
+async def _verified_partition_proof_counts(
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+) -> LastUpdatedPartitionProofCounts | ResourceFetchResult:
+    try:
+        proof_counts = await _assert_last_updated_partition_candidate_proof(
+            state.context,
+            resource_type,
+            state.plan,
+        )
+    except RuntimeError as exc:
+        return await _saved_partition_terminal_result(
+            model,
+            resource_type,
+            config,
+            state,
+            str(exc),
+        )
+    expected_count = state.census.ranged_root_pre
+    observed_counts = (
+        proof_counts.leaf_count_sum,
+        proof_counts.pass1_unique,
+        proof_counts.pass2_unique,
+        proof_counts.staged_candidate_count,
+    )
+    if expected_count is not None and all(
+        observed_count == expected_count for observed_count in observed_counts
+    ):
+        return proof_counts
+    return await _saved_partition_terminal_result(
+        model,
+        resource_type,
+        config,
+        state,
+        "provider_directory_last_updated_partition_completeness_proof_mismatch",
+    )
+
+
+async def _completed_partition_fetch_result(
     source_record: dict[str, Any],
     resource_type: str,
     model: type,
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
+    proof_counts: LastUpdatedPartitionProofCounts,
 ) -> ResourceFetchResult:
-    if state.plan.status is not PlanStatus.SUCCEEDED:
-        return _partition_failure_from_state(model, state, "proof_incomplete")
     row_batch_handler = fetch_options.row_batch_handler
     run_id = fetch_options.run_id
     assert row_batch_handler is not None and run_id is not None
@@ -20027,6 +20580,50 @@ async def _finish_partition_fetch(
         hard_page_limit_reached=False,
         next_url_remaining=False,
         fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
+        fetch_diagnostic=_last_updated_partition_completeness_diagnostic(
+            state,
+            proof_counts,
+            verified=True,
+        ),
+    )
+
+
+async def _finish_partition_fetch(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult:
+    """Verify durable rows and post-census before releasing staged output."""
+    if state.plan.status is not PlanStatus.SUCCEEDED:
+        return _partition_failure_from_state(model, state, "proof_incomplete")
+    proof_counts = await _verified_partition_proof_counts(
+        resource_type,
+        model,
+        config,
+        state,
+    )
+    if isinstance(proof_counts, ResourceFetchResult):
+        return proof_counts
+    census_failure = await _observe_partition_post_census(
+        source_record,
+        resource_type,
+        model,
+        config,
+        state,
+        fetch_options,
+    )
+    if census_failure is not None:
+        return census_failure
+    return await _completed_partition_fetch_result(
+        source_record,
+        resource_type,
+        model,
+        state,
+        fetch_options,
+        proof_counts,
     )
 
 
@@ -20049,6 +20646,16 @@ async def _fetch_last_updated_partition_resource_rows(
     )
     if isinstance(prepared_state, ResourceFetchResult):
         return prepared_state
+    census_failure = await _observe_partition_pre_census(
+        source_record,
+        resource_type,
+        model,
+        config,
+        prepared_state,
+        fetch_options,
+    )
+    if census_failure is not None:
+        return census_failure
     count_failure = await _observe_partition_counts(
         source_record,
         resource_type,
@@ -20073,6 +20680,7 @@ async def _fetch_last_updated_partition_resource_rows(
         source_record,
         resource_type,
         model,
+        config,
         prepared_state,
         fetch_options,
     )
@@ -22105,6 +22713,16 @@ def _empty_resource_stats() -> dict[str, Any]:
         "pagination_cooldown_recovered_sources": 0,
         "pagination_cooldown_exhausted_sources": 0,
         "pagination_cooldown_deadline_blocked_sources": 0,
+        "last_updated_partition_sources": 0,
+        "last_updated_completeness_verified_sources": 0,
+        "last_updated_unfiltered_pre": 0,
+        "last_updated_ranged_root_pre": 0,
+        "last_updated_exact_leaf_count_sum": 0,
+        "last_updated_pass1_unique": 0,
+        "last_updated_pass2_unique": 0,
+        "last_updated_staged_candidate_count": 0,
+        "last_updated_ranged_root_post": 0,
+        "last_updated_unfiltered_post": 0,
     }
 
 
@@ -22169,6 +22787,35 @@ def _record_pagination_cooldown_stats(
         resource_stats["pagination_cooldown_deadline_blocked_sources"] += 1
 
 
+def _record_last_updated_partition_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    if fetch_result.fetch_mode != LAST_UPDATED_PARTITION_FETCH_MODE:
+        return
+    resource_stats["last_updated_partition_sources"] += 1
+    completeness_proof = fetch_result.fetch_diagnostic
+    if (
+        not isinstance(completeness_proof, dict)
+        or completeness_proof.get("verified") is not True
+    ):
+        return
+    resource_stats["last_updated_completeness_verified_sources"] += 1
+    for proof_field in (
+        "unfiltered_pre",
+        "ranged_root_pre",
+        "exact_leaf_count_sum",
+        "pass1_unique",
+        "pass2_unique",
+        "staged_candidate_count",
+        "ranged_root_post",
+        "unfiltered_post",
+    ):
+        proof_value = completeness_proof.get(proof_field)
+        if isinstance(proof_value, int) and not isinstance(proof_value, bool):
+            resource_stats[f"last_updated_{proof_field}"] += proof_value
+
+
 def _record_resource_fetch_stats(
     resource_stats_by_type: dict[str, dict[str, Any]],
     resource_type: str,
@@ -22194,6 +22841,7 @@ def _record_resource_fetch_stats(
         resource_stats["sources_failed"] += 1
     if fetch_result.complete and fetch_result.rows_fetched == 0:
         resource_stats["sources_empty"] += 1
+    _record_last_updated_partition_stats(resource_stats, fetch_result)
     if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
         resource_stats["bulk_export_sources"] += 1
     if bulk_export_selection in {
@@ -22257,7 +22905,16 @@ def _resource_fetch_diagnostic(
         "deadline_reached": fetch_result.deadline_reached,
         "next_url_remaining": fetch_result.next_url_remaining,
         "retry_not_before": fetch_result.retry_not_before,
-        "source_fetch": fetch_result.fetch_diagnostic,
+        "source_fetch": (
+            None
+            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            else fetch_result.fetch_diagnostic
+        ),
+        "last_updated_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            else None
+        ),
         "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
         "pagination_cooldown_wait_seconds": (
             fetch_result.pagination_cooldown_wait_seconds
@@ -24361,6 +25018,77 @@ async def _clear_pagination_checkpoints(
     return _coerce_rowcount(deleted)
 
 
+def _last_updated_partition_terminal_failure_details(
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+) -> str | None:
+    terminal_resource_types = [
+        resource_type
+        for resource_type in incomplete_resource_types
+        if diagnostics_by_resource[resource_type].get("fetch_mode")
+        == LAST_UPDATED_PARTITION_FETCH_MODE
+        and str(
+            diagnostics_by_resource[resource_type].get("error") or ""
+        ).startswith(LAST_UPDATED_PARTITION_BLOCKED_ERROR)
+    ]
+    if not terminal_resource_types:
+        return None
+    return ",".join(
+        f"{resource_type}={diagnostics_by_resource[resource_type].get('error')}"
+        for resource_type in terminal_resource_types
+    )
+
+
+def _handle_incomplete_source_pagination(
+    source_record: dict[str, Any],
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+    resume_required_entries: set[str] | None,
+    require_complete_resources: bool,
+) -> None:
+    terminal_failure_details = _last_updated_partition_terminal_failure_details(
+        diagnostics_by_resource,
+        incomplete_resource_types,
+    )
+    if terminal_failure_details:
+        raise RuntimeError(terminal_failure_details)
+    graph_failures = [
+        resource_type
+        for resource_type in incomplete_resource_types
+        if diagnostics_by_resource[resource_type].get("fetch_mode")
+        == UHC_PLAN_GRAPH_FETCH_MODE
+    ]
+    if graph_failures:
+        failure_details = ",".join(
+            f"{resource_type}="
+            f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
+            for resource_type in graph_failures
+        )
+        raise RuntimeError(
+            f"{UHC_PLAN_GRAPH_INCOMPLETE_ERROR}:{failure_details}"
+        )
+    context = source_record.get("_pagination_checkpoint_context")
+    if (
+        isinstance(context, PaginationCheckpointContext)
+        and resume_required_entries is not None
+    ):
+        resume_required_entries.update(
+            f"{source_record['source_id']}:{resource_type}"
+            for resource_type in incomplete_resource_types
+        )
+        return
+    if require_complete_resources:
+        source_id = _clean_text(source_record.get("source_id")) or "unknown-source"
+        failure_details = ",".join(
+            f"{resource_type}="
+            f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
+            for resource_type in incomplete_resource_types
+        )
+        raise RuntimeError(
+            f"{RESOURCE_FETCH_INCOMPLETE_ERROR}:{source_id}:{failure_details}"
+        )
+
+
 async def _finalize_source_pagination_checkpoints(
     source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
@@ -24368,6 +25096,7 @@ async def _finalize_source_pagination_checkpoints(
     *,
     require_complete_resources: bool = False,
 ) -> None:
+    """Clear complete checkpoints or classify incomplete work for the caller."""
     incomplete_resource_types = [
         resource_type
         for resource_type, diagnostic in diagnostics_by_resource.items()
@@ -24376,36 +25105,13 @@ async def _finalize_source_pagination_checkpoints(
         or diagnostic.get("bounded")
     ]
     if incomplete_resource_types:
-        graph_failures = [
-            resource_type
-            for resource_type in incomplete_resource_types
-            if diagnostics_by_resource[resource_type].get("fetch_mode")
-            == UHC_PLAN_GRAPH_FETCH_MODE
-        ]
-        if graph_failures:
-            failure_details = ",".join(
-                f"{resource_type}="
-                f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
-                for resource_type in graph_failures
-            )
-            raise RuntimeError(f"{UHC_PLAN_GRAPH_INCOMPLETE_ERROR}:{failure_details}")
-        context = source_record.get("_pagination_checkpoint_context")
-        if isinstance(context, PaginationCheckpointContext) and resume_required_entries is not None:
-            resume_required_entries.update(
-                f"{source_record['source_id']}:{resource_type}"
-                for resource_type in incomplete_resource_types
-            )
-            return
-        if require_complete_resources:
-            source_id = _clean_text(source_record.get("source_id")) or "unknown-source"
-            failure_details = ",".join(
-                f"{resource_type}="
-                f"{diagnostics_by_resource[resource_type].get('error') or 'incomplete'}"
-                for resource_type in incomplete_resource_types
-            )
-            raise RuntimeError(
-                f"{RESOURCE_FETCH_INCOMPLETE_ERROR}:{source_id}:{failure_details}"
-            )
+        _handle_incomplete_source_pagination(
+            source_record,
+            diagnostics_by_resource,
+            incomplete_resource_types,
+            resume_required_entries,
+            require_complete_resources,
+        )
         return
     context = source_record.get("_pagination_checkpoint_context")
     if not isinstance(context, PaginationCheckpointContext):
