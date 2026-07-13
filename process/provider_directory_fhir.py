@@ -5657,8 +5657,8 @@ def _profile_text(value: Any, *, max_length: int = 2048) -> str | None:
     return text[:max_length] if text else None
 
 
-def _normalized_human_names(value: Any) -> list[dict[str, Any]]:
-    names = [value] if isinstance(value, dict) else value
+def _normalized_human_names(name_value: Any) -> list[dict[str, Any]]:
+    names = [name_value] if isinstance(name_value, dict) else name_value
     if not isinstance(names, list):
         return []
     normalized_names: list[dict[str, Any]] = []
@@ -5666,40 +5666,40 @@ def _normalized_human_names(value: Any) -> list[dict[str, Any]]:
         if not isinstance(name, dict):
             continue
         period = name.get("period") if isinstance(name.get("period"), dict) else {}
-        normalized = {
+        profile_by_field = {
             "use": _profile_text(name.get("use"), max_length=32),
             "text": _profile_text(name.get("text"), max_length=512),
             "family": _profile_text(name.get("family"), max_length=256),
             "given": [
                 text
-                for item in name.get("given") or []
-                if (text := _profile_text(item, max_length=256))
+                for given_value in name.get("given") or []
+                if (text := _profile_text(given_value, max_length=256))
             ],
             "prefix": [
                 text
-                for item in name.get("prefix") or []
-                if (text := _profile_text(item, max_length=64))
+                for prefix_value in name.get("prefix") or []
+                if (text := _profile_text(prefix_value, max_length=64))
             ],
             "suffix": [
                 text
-                for item in name.get("suffix") or []
-                if (text := _profile_text(item, max_length=64))
+                for suffix_value in name.get("suffix") or []
+                if (text := _profile_text(suffix_value, max_length=64))
             ],
             "period_start": _profile_text(period.get("start"), max_length=64),
             "period_end": _profile_text(period.get("end"), max_length=64),
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            normalized_names.append(cleaned)
+        if cleaned_by_field:
+            normalized_names.append(cleaned_by_field)
     return normalized_names
 
 
-def _normalized_fhir_addresses(value: Any) -> list[dict[str, Any]]:
-    addresses = [value] if isinstance(value, dict) else value
+def _normalized_fhir_addresses(address_value: Any) -> list[dict[str, Any]]:
+    addresses = [address_value] if isinstance(address_value, dict) else address_value
     if not isinstance(addresses, list):
         return []
     normalized_addresses: list[dict[str, Any]] = []
@@ -5707,14 +5707,14 @@ def _normalized_fhir_addresses(value: Any) -> list[dict[str, Any]]:
         if not isinstance(address, dict):
             continue
         period = address.get("period") if isinstance(address.get("period"), dict) else {}
-        normalized = {
+        profile_by_field = {
             "use": _profile_text(address.get("use"), max_length=32),
             "type": _profile_text(address.get("type"), max_length=32),
             "text": _profile_text(address.get("text"), max_length=1024),
             "line": [
                 text
-                for item in address.get("line") or []
-                if (text := _profile_text(item, max_length=512))
+                for line_value in address.get("line") or []
+                if (text := _profile_text(line_value, max_length=512))
             ],
             "city": _profile_text(address.get("city"), max_length=256),
             "district": _profile_text(address.get("district"), max_length=256),
@@ -5724,21 +5724,21 @@ def _normalized_fhir_addresses(value: Any) -> list[dict[str, Any]]:
             "period_start": _profile_text(period.get("start"), max_length=64),
             "period_end": _profile_text(period.get("end"), max_length=64),
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            normalized_addresses.append(cleaned)
+        if cleaned_by_field:
+            normalized_addresses.append(cleaned_by_field)
     return normalized_addresses
 
 
-def _normalized_qualifications(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
+def _normalized_qualifications(qualification_value: Any) -> list[dict[str, Any]]:
+    if not isinstance(qualification_value, list):
         return []
     qualifications: list[dict[str, Any]] = []
-    for qualification in value:
+    for qualification in qualification_value:
         if not isinstance(qualification, dict):
             continue
         period = (
@@ -5751,7 +5751,7 @@ def _normalized_qualifications(value: Any) -> list[dict[str, Any]]:
             if isinstance(qualification.get("issuer"), dict)
             else {}
         )
-        normalized = {
+        profile_by_field = {
             "identifiers": _normalized_identifiers(
                 qualification.get("identifier")
             ),
@@ -5767,13 +5767,13 @@ def _normalized_qualifications(value: Any) -> list[dict[str, Any]]:
             "issuer_ref": _profile_text(issuer.get("reference"), max_length=2048),
             "issuer_display": _profile_text(issuer.get("display"), max_length=512),
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            qualifications.append(cleaned)
+        if cleaned_by_field:
+            qualifications.append(cleaned_by_field)
     return qualifications
 
 
@@ -5790,20 +5790,20 @@ def _normalized_communications(value: Any) -> list[dict[str, Any]]:
             if isinstance(communication.get("language"), dict)
             else communication
         )
-        normalized = {
+        profile_by_field = {
             "codes": _codings(concept),
             "text": _profile_text(concept.get("text"), max_length=256),
             "preferred": communication.get("preferred")
             if isinstance(communication.get("preferred"), bool)
             else None,
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            normalized_communications.append(cleaned)
+        if cleaned_by_field:
+            normalized_communications.append(cleaned_by_field)
     return normalized_communications
 
 
@@ -5832,7 +5832,7 @@ def _normalized_photo_metadata(value: Any) -> list[dict[str, Any]]:
     for attachment in attachments:
         if not isinstance(attachment, dict):
             continue
-        normalized = {
+        profile_by_field = {
             "content_type": _profile_text(
                 attachment.get("contentType"), max_length=128
             ),
@@ -5845,13 +5845,13 @@ def _normalized_photo_metadata(value: Any) -> list[dict[str, Any]]:
             and 0 <= attachment["size"] <= 100_000_000
             else None,
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            photos.append(cleaned)
+        if cleaned_by_field:
+            photos.append(cleaned_by_field)
     return photos
 
 
@@ -5863,7 +5863,7 @@ def _normalized_organization_contacts(value: Any) -> list[dict[str, Any]]:
     for contact in contacts:
         if not isinstance(contact, dict):
             continue
-        normalized = {
+        profile_by_field = {
             "purpose_codes": _codings(contact.get("purpose")),
             "name": _normalized_human_names(contact.get("name")),
             "telecom": [
@@ -5873,13 +5873,13 @@ def _normalized_organization_contacts(value: Any) -> list[dict[str, Any]]:
             ],
             "address": _normalized_fhir_addresses(contact.get("address")),
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            normalized_contacts.append(cleaned)
+        if cleaned_by_field:
+            normalized_contacts.append(cleaned_by_field)
     return normalized_contacts
 
 
@@ -5891,18 +5891,23 @@ def _normalized_service_eligibility(value: Any) -> list[dict[str, Any]]:
     for entry in eligibility:
         if not isinstance(entry, dict):
             continue
-        normalized = {
+        profile_by_field = {
             "code_codes": _codings(entry.get("code")),
             "comment": _profile_text(entry.get("comment"), max_length=2048),
         }
-        cleaned = {
-            key: item
-            for key, item in normalized.items()
-            if item not in (None, [], {})
+        cleaned_by_field = {
+            key: field_value
+            for key, field_value in profile_by_field.items()
+            if field_value not in (None, [], {})
         }
-        if cleaned:
-            rows.append(cleaned)
+        if cleaned_by_field:
+            rows.append(cleaned_by_field)
     return rows
+
+
+def _administrative_gender(resource: dict[str, Any]) -> str | None:
+    gender = _clean_text(resource.get("gender"))
+    return gender if gender in {"male", "female", "other", "unknown"} else None
 
 
 def _period(resource: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -6071,9 +6076,6 @@ def parse_fhir_resource(
         return ProviderDirectoryInsurancePlan, row
     if resource_type == "Practitioner":
         family, given, full_name = _name(resource)
-        administrative_gender = _clean_text(resource.get("gender"))
-        if administrative_gender not in {"male", "female", "other", "unknown"}:
-            administrative_gender = None
         row = {
             **base,
             "npi": _resource_npi(resource),
@@ -6083,7 +6085,7 @@ def parse_fhir_resource(
             "family_name": family,
             "given_names": given,
             "full_name": full_name,
-            "administrative_gender": administrative_gender,
+            "administrative_gender": _administrative_gender(resource),
             "telecom": _telecom(resource),
             "addresses": _normalized_fhir_addresses(resource.get("address")),
             "qualification_codes": _codings([item.get("code") for item in resource.get("qualification") or [] if isinstance(item, dict)]),
