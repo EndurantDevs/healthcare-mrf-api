@@ -3320,6 +3320,7 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
                COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
                phone_address.address_key,
                false AS provider_directory_matched,
+               NULL::varchar AS source_id,
                NULL::varchar AS source_record_id
           FROM {address_table_sql} AS phone_address
          WHERE phone_address.type IN ({service_types})
@@ -3331,6 +3332,7 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
                overlay.npi::bigint AS provider_npi,
                overlay.address_key,
                true AS provider_directory_matched,
+               overlay.source_id::varchar,
                overlay.source_record_id::varchar
           FROM mrf.provider_directory_address_overlay AS overlay
           JOIN mrf.provider_directory_source AS source
@@ -3349,13 +3351,19 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
           FROM phone_candidate_rows AS candidate
       GROUP BY candidate.provider_npi, candidate.address_key
     ), phone_provider_directory_evidence AS MATERIALIZED (
-        SELECT candidate.provider_npi,
-               ARRAY_AGG(DISTINCT candidate.source_record_id ORDER BY candidate.source_record_id)
+        SELECT evidence.provider_npi,
+               ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)
                    AS source_record_ids
-          FROM phone_candidate_rows AS candidate
-         WHERE candidate.provider_directory_matched
-           AND candidate.source_record_id IS NOT NULL
-      GROUP BY candidate.provider_npi
+          FROM (
+                SELECT candidate.provider_npi, candidate.source_id,
+                       MIN(candidate.source_record_id) AS source_record_id
+                  FROM phone_candidate_rows AS candidate
+                 WHERE candidate.provider_directory_matched
+                   AND candidate.source_id IS NOT NULL
+                   AND candidate.source_record_id IS NOT NULL
+              GROUP BY candidate.provider_npi, candidate.source_id
+          ) AS evidence
+      GROUP BY evidence.provider_npi
     )
     """
 

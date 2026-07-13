@@ -39,8 +39,11 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id" in sql
     assert "false AS provider_directory_matched" in sql
     assert "true AS provider_directory_matched" in sql
+    assert "overlay.source_id::varchar" in sql
     assert "overlay.source_record_id::varchar" in sql
-    assert "ARRAY_AGG(DISTINCT candidate.source_record_id" in sql
+    assert "MIN(candidate.source_record_id) AS source_record_id" in sql
+    assert "GROUP BY candidate.provider_npi, candidate.source_id" in sql
+    assert "ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)" in sql
     assert "FROM phone_candidates AS phone_match" in sql
     assert "LEFT JOIN phone_provider_directory_evidence AS phone_evidence" in sql
     assert "CROSS JOIN LATERAL" in sql
