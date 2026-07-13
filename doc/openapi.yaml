@@ -2534,6 +2534,12 @@ paths:
           schema:
             type: boolean
           description: Include total address count metadata when address_list is paged
+        - name: address_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Return only the exact canonical provider address UUID
       responses:
         '200':
           description: NPI detail payload
