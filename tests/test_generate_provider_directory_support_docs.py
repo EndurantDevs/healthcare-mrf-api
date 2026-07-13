@@ -333,7 +333,7 @@ def test_freshness_validation_accepts_current_reviews():
         ("michigan", "Synthetic _getpagesoffset continuation is not equivalent"),
         ("cigna", "_count=75 returns false-empty search sets"),
         ("aetna-commercial-medicare", "OAuth2 client credentials and Bulk"),
-        ("humana", "Overrides portal or stale paths to the public FHIR base"),
+        ("humana", "catalog product aliases are neutralized"),
         ("iehp", "Normalizes portal and resource paths"),
         ("arkansas", "synthetic _skip pagination with stable _id sorting"),
         ("hap", "throttles requests to 20 seconds"),

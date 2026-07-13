@@ -4716,9 +4716,17 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
     )
     if not should_override:
         return None
+    supported_resources = [
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    ]
     return {
         "api_base": HUMANA_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": HUMANA_PROVIDER_DIRECTORY_BASE,
+        "plan_name": None,
         "requires_registration": False,
         "auth_type": "none",
         "last_validated_status": "valid",
@@ -4726,19 +4734,24 @@ def _humana_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] |
         "metadata": {
             "provider_directory_override": "humana_public_fhir_api",
             "provider_directory_override_reason": (
-                "Humana publishes public R4 Provider Directory metadata and resource search "
-                "collections at fhir.humana.com/api; seed rows can retain stale OAuth labels."
+                "Humana publishes a carrier-wide public R4 Provider Directory at "
+                "fhir.humana.com/api; seed rows can retain stale OAuth labels or a single "
+                "state/product label that must not be assigned to the shared graph."
             ),
             "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
             "provider_directory_confirmed_base": HUMANA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": HUMANA_PROVIDER_DIRECTORY_METADATA_URL,
-            "provider_directory_supported_resources": [
-                "InsurancePlan",
-                "Location",
-                "Organization",
-                "Practitioner",
-                "PractitionerRole",
-            ],
+            "provider_directory_supported_resources": supported_resources,
+            "provider_directory_fully_enumerable_resources": supported_resources,
+            "provider_directory_coverage_mode": "carrier_directory",
+            "provider_directory_directory_scope": "carrier",
+            "provider_directory_plan_provenance_neutralized": True,
+            "provider_directory_acquisition_enabled": True,
+            "provider_directory_original_alias": {
+                "org_name": _clean_text(row.get("org_name")),
+                "plan_name": _clean_text(row.get("plan_name")),
+                "api_base": _canonical_base(row.get("api_base")),
+            },
         },
     }
 

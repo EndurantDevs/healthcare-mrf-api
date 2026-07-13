@@ -1153,7 +1153,7 @@ def test_source_resource_timeout_uses_uhc_floor():
 
 
 def test_source_row_from_seed_overrides_humana_stale_oauth_label():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "humana-1",
             "org_name": "Humana Inc.",
@@ -1165,18 +1165,46 @@ def test_source_row_from_seed_overrides_humana_stale_oauth_label():
         }
     )
 
-    assert row["api_base"] == importer.HUMANA_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.HUMANA_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "valid"
-    assert row["metadata_json"]["provider_directory_override"] == "humana_public_fhir_api"
-    assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.HUMANA_PROVIDER_DIRECTORY_METADATA_URL
-    assert importer._resource_start_url(row, "InsurancePlan", page_count=100) == (
+    assert source_row["api_base"] == importer.HUMANA_PROVIDER_DIRECTORY_BASE
+    assert source_row["canonical_api_base"] == importer.HUMANA_PROVIDER_DIRECTORY_BASE
+    assert source_row["requires_registration"] is False
+    assert source_row["auth_type"] == "none"
+    assert source_row["last_validated_status"] == "valid"
+    assert source_row["plan_name"] is None
+    metadata = source_row["metadata_json"]
+    assert metadata["provider_directory_override"] == "humana_public_fhir_api"
+    assert (
+        metadata["provider_directory_confirmed_metadata_url"]
+        == importer.HUMANA_PROVIDER_DIRECTORY_METADATA_URL
+    )
+    assert metadata["provider_directory_directory_scope"] == "carrier"
+    assert metadata["provider_directory_coverage_mode"] == "carrier_directory"
+    assert metadata["provider_directory_plan_provenance_neutralized"] is True
+    assert metadata["provider_directory_fully_enumerable_resources"] == [
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    ]
+    assert metadata["provider_directory_original_alias"] == {
+        "org_name": "Humana Inc.",
+        "plan_name": "Humana Medicare Advantage",
+        "api_base": "https://fhir.humana.com/api/provider-directory",
+    }
+    assert importer._resource_start_url(source_row, "InsurancePlan", page_count=100) == (
         f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?_count=100"
     )
-    assert importer._resource_start_url(row, "OrganizationAffiliation", page_count=100) is None
-    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
+    assert (
+        importer._resource_start_url(
+            source_row, "OrganizationAffiliation", page_count=100
+        )
+        is None
+    )
+    assert (
+        importer._resource_start_url(source_row, "Endpoint", page_count=100)
+        is None
+    )
 
 
 def test_source_row_from_seed_normalizes_iehp_double_slash_endpoints():
