@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 
 import aiohttp
 import asyncpg
@@ -971,6 +971,7 @@ REQUESTED_SOURCE_IMPORT_EMPTY_ERROR = (
 ENDPOINT_DATASET_ACQUIRING = "acquiring"
 ENDPOINT_DATASET_INCOMPLETE = "incomplete"
 ENDPOINT_DATASET_FAILED = "failed"
+ENDPOINT_DATASET_VALIDATED = "validated"
 ENDPOINT_DATASET_PUBLISHED = "published"
 ENDPOINT_DATASET_SUPERSEDED = "superseded"
 FHIR_CONTINUATION_QUERY_NAMES = frozenset(
@@ -1310,6 +1311,8 @@ class EndpointDatasetCandidate:
     checkpoint_context: PaginationCheckpointContext | None = None
     reused_from_checkpoint: bool = False
     repair_empty_orphan: bool = False
+    already_validated: bool = False
+    validated_metadata: dict[str, Any] | None = None
     already_published: bool = False
     published_metadata: dict[str, Any] | None = None
 
@@ -1321,6 +1324,8 @@ class EndpointDatasetCandidateSelection:
     previous_dataset_id: str | None
     reused_from_checkpoint: bool
     repair_empty_orphan: bool = False
+    already_validated: bool = False
+    validated_metadata: dict[str, Any] | None = None
     already_published: bool = False
     published_metadata: dict[str, Any] | None = None
 
@@ -7385,12 +7390,13 @@ class ProviderDirectoryArtifactBundle:
             for stage in self.stages
         }
 
-    async def promote(self) -> None:
+    async def promote(self) -> int:
         """Atomically promote every registered serving stage."""
         if self.stages:
             await _retry_provider_directory_artifact_bundle_promotion(
                 tuple(self.stages)
             )
+        return len(self.stages)
 
     async def cleanup(self) -> None:
         """Remove every stage name that was not consumed by promotion."""
@@ -7545,8 +7551,9 @@ async def _capture_provider_directory_artifact_promotion_identities(
 
 async def _is_provider_directory_artifact_promotion_committed(
     identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...],
+    dataset_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> bool:
-    """Confirm that every prepared stage became its logged live target."""
+    """Confirm exact relation identities and the matching dataset pointers."""
 
     if not identities:
         return False
@@ -7576,7 +7583,77 @@ async def _is_provider_directory_artifact_promotion_committed(
             or target_persistence != "p"
         ):
             return False
+    if dataset_fence is None:
+        return True
+    return await _is_provider_directory_dataset_cutover_committed(
+        dataset_fence
+    )
+
+
+async def _is_provider_directory_dataset_cutover_committed(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> bool:
+    """Confirm that every selected pointer matches the committed cutover."""
+    dataset_rows = await _artifact_fence_dataset_rows(
+        fence,
+        db,
+        for_update=False,
+    )
+    dataset_rows_by_id = {
+        dataset_id: dataset_row_map
+        for dataset_row in dataset_rows
+        if (
+            dataset_row_map := _pagination_checkpoint_row_mapping(dataset_row)
+        )
+        and (dataset_id := _clean_text(dataset_row_map.get("dataset_id")))
+    }
+    for dataset in _unique_artifact_datasets(fence):
+        selected_row = dataset_rows_by_id.get(dataset.dataset_id)
+        if selected_row is None:
+            return False
+        expected_published_dataset = (
+            replace(
+                dataset,
+                status=ENDPOINT_DATASET_PUBLISHED,
+                is_current=True,
+            )
+            if dataset.promote_on_cutover
+            else dataset
+        )
+        if not _is_artifact_fence_dataset_row_exact(
+            expected_published_dataset,
+            selected_row,
+        ):
+            return False
+        current_dataset_ids = _current_published_artifact_dataset_ids(
+            dataset_rows_by_id.values(),
+            dataset.endpoint_id,
+        )
+        if current_dataset_ids != [dataset.dataset_id]:
+            return False
+        if not _is_artifact_incumbent_superseded(
+            dataset,
+            dataset_rows_by_id,
+        ):
+            return False
     return True
+
+
+def _is_artifact_incumbent_superseded(
+    dataset: ProviderDirectoryArtifactDataset,
+    dataset_rows_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    incumbent_dataset_id = dataset.expected_incumbent_dataset_id
+    if not dataset.promote_on_cutover or not incumbent_dataset_id:
+        return True
+    incumbent_row = dataset_rows_by_id.get(incumbent_dataset_id)
+    return bool(
+        incumbent_row is not None
+        and incumbent_row.get("is_current") is not True
+        and _clean_text(incumbent_row.get("status"))
+        == ENDPOINT_DATASET_SUPERSEDED
+        and incumbent_row.get("superseded_at") is not None
+    )
 
 
 async def _provider_directory_relation_attribute(
@@ -7725,6 +7802,79 @@ async def _finish_provider_directory_prepared_stage(
     )
 
 
+async def _promote_provider_directory_artifact_datasets(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Flip validated candidates only after every serving relation is installed."""
+    for dataset in fence.promotion_datasets:
+        await _supersede_artifact_dataset_incumbent(dataset)
+        await _publish_validated_artifact_dataset(dataset)
+
+
+async def _supersede_artifact_dataset_incumbent(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> None:
+    incumbent_dataset_id = dataset.expected_incumbent_dataset_id
+    if not incumbent_dataset_id:
+        return
+    superseded_count = await db.status(
+        f"""
+        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+           SET status = :superseded_status,
+               is_current = false,
+               superseded_at = now()
+         WHERE dataset_id = :incumbent_dataset_id
+           AND endpoint_id = :endpoint_id
+           AND status = :published_status
+           AND is_current = true
+           AND superseded_at IS NULL;
+        """,
+        incumbent_dataset_id=incumbent_dataset_id,
+        endpoint_id=dataset.endpoint_id,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+        superseded_status=ENDPOINT_DATASET_SUPERSEDED,
+    )
+    if _coerce_rowcount(superseded_count) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_current_changed"
+        )
+
+
+async def _publish_validated_artifact_dataset(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> None:
+    promoted_count = await db.status(
+        f"""
+            UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+               SET status = :published_status,
+                   is_current = true,
+                   published_at = now(),
+                   superseded_at = NULL
+             WHERE dataset_id = :dataset_id
+               AND endpoint_id = :endpoint_id
+               AND COALESCE(acquisition_root_run_id, import_run_id)
+                   IS NOT DISTINCT FROM :evidence_run_id
+               AND previous_dataset_id IS NOT DISTINCT FROM :incumbent_dataset_id
+               AND dataset_hash IS NOT DISTINCT FROM :dataset_hash
+               AND status = :validated_status
+               AND is_current = false
+               AND validated_at IS NOT NULL
+               AND superseded_at IS NULL;
+        """,
+        dataset_id=dataset.dataset_id,
+        endpoint_id=dataset.endpoint_id,
+        evidence_run_id=dataset.evidence_run_id,
+        incumbent_dataset_id=dataset.expected_incumbent_dataset_id,
+        dataset_hash=dataset.dataset_hash,
+        validated_status=ENDPOINT_DATASET_VALIDATED,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+    )
+    if _coerce_rowcount(promoted_count) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_candidate_changed"
+        )
+
+
 async def _promote_provider_directory_artifact_stage_transaction(
     schema: str,
     stage_table: str,
@@ -7754,6 +7904,8 @@ async def _promote_provider_directory_artifact_stage_transaction(
         )
         await _install_provider_directory_prepared_stage(prepared_stage)
         await _finish_provider_directory_prepared_stage(prepared_stage)
+        if active_fence is not None:
+            await _promote_provider_directory_artifact_datasets(active_fence)
 
 
 def _ordered_provider_directory_artifact_bundle(
@@ -7812,6 +7964,8 @@ async def _promote_provider_directory_artifact_bundle_transaction(
             await _install_provider_directory_prepared_stage(stage)
         for stage in ordered_stages:
             await _finish_provider_directory_prepared_stage(stage)
+        if active_fence is not None:
+            await _promote_provider_directory_artifact_datasets(active_fence)
 
 
 async def _promote_provider_directory_artifact_bundle(
@@ -7822,6 +7976,7 @@ async def _promote_provider_directory_artifact_bundle(
     promotion_identities = (
         await _capture_provider_directory_artifact_promotion_identities(stages)
     )
+    dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     try:
         async with asyncio.timeout(
             PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
@@ -7829,7 +7984,8 @@ async def _promote_provider_directory_artifact_bundle(
             await _promote_provider_directory_artifact_bundle_transaction(stages)
     except TimeoutError:
         if await _is_provider_directory_artifact_promotion_committed(
-            promotion_identities
+            promotion_identities,
+            dataset_fence,
         ):
             LOGGER.warning(
                 "Provider Directory artifact cutover timed out after commit; "
@@ -7893,6 +8049,7 @@ async def _promote_provider_directory_artifact_stage(
     promotion_identities = (
         await _capture_provider_directory_artifact_promotion_identities((stage,))
     )
+    dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     try:
         async with asyncio.timeout(
             PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
@@ -7906,7 +8063,8 @@ async def _promote_provider_directory_artifact_stage(
             )
     except TimeoutError:
         if await _is_provider_directory_artifact_promotion_committed(
-            promotion_identities
+            promotion_identities,
+            dataset_fence,
         ):
             LOGGER.warning(
                 "Provider Directory artifact cutover timed out after commit; "
@@ -8739,19 +8897,56 @@ class ProviderDirectoryArtifactDataset:
     selected_resources: tuple[str, ...] = ()
     expected_resources: tuple[str, ...] = ()
     recorded_expected_resources: tuple[str, ...] | None = None
+    status: str = ENDPOINT_DATASET_PUBLISHED
+    is_current: bool = True
+    previous_dataset_id: str | None = None
+    expected_incumbent_dataset_id: str | None = None
+    promote_on_cutover: bool = False
+    dataset_hash: str | None = None
+    resource_count: int | None = None
+    validated_at: str | None = None
+    publication_metadata_hash: str | None = None
 
 
 @dataclass(frozen=True)
 class ProviderDirectoryArtifactDatasetFence:
     datasets: tuple[ProviderDirectoryArtifactDataset, ...]
+    should_select_validated_candidates: bool = False
 
     @property
     def dataset_id_by_endpoint_id(self) -> dict[str, str]:
-        """Return the immutable dataset expected at each endpoint cutover."""
+        """Return the immutable dataset selected for each endpoint."""
         return {
             dataset.endpoint_id: dataset.dataset_id
             for dataset in self.datasets
         }
+
+    @property
+    def incumbent_dataset_ids(
+        self,
+    ) -> dict[str, str | None]:
+        """Return the current pointer expected before each cutover."""
+        return {
+            dataset.endpoint_id: (
+                dataset.expected_incumbent_dataset_id
+                if dataset.promote_on_cutover
+                else dataset.dataset_id
+            )
+            for dataset in self.datasets
+        }
+
+    @property
+    def promotion_datasets(self) -> list[ProviderDirectoryArtifactDataset]:
+        """Return one promotion candidate per endpoint in lock order."""
+        candidates_by_endpoint_id = {
+            dataset.endpoint_id: dataset
+            for dataset in self.datasets
+            if dataset.promote_on_cutover
+        }
+        return [
+            candidates_by_endpoint_id[endpoint_id]
+            for endpoint_id in sorted(candidates_by_endpoint_id)
+        ]
 
     @property
     def source_endpoint_dataset_tuples(self) -> tuple[tuple[str, str, str], ...]:
@@ -8763,6 +8958,16 @@ class ProviderDirectoryArtifactDatasetFence:
                     dataset.endpoint_id,
                     dataset.dataset_id,
                 )
+                for dataset in self.datasets
+            )
+        )
+
+    @property
+    def source_endpoint_tuples(self) -> tuple[tuple[str, str], ...]:
+        """Return the complete alias mapping selected for publication."""
+        return tuple(
+            sorted(
+                (dataset.source_id, dataset.endpoint_id)
                 for dataset in self.datasets
             )
         )
@@ -8780,17 +8985,95 @@ class ProviderDirectoryArtifactDatasetFence:
 
 def _provider_directory_artifact_dataset_selection_sql(
     source_ids: list[str] | tuple[str, ...] | None,
+    *,
+    should_select_validated_candidates: bool = False,
 ) -> str:
-    """Select explicit alias families or the unambiguous published endpoint set."""
+    """Select one immutable dataset per endpoint with explicit fallback rules."""
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     selection_sql = (
         _artifact_dataset_explicit_selection_sql(source_ref)
         if source_ids
-        else _artifact_dataset_all_source_selection_sql(source_ref, dataset_ref)
+        else _artifact_dataset_all_source_selection_sql(source_ref)
     )
+    options_sql = _artifact_dataset_options_cte(dataset_ref)
+    ranking_sql = _artifact_dataset_ranking_cte()
+    projection_sql = _artifact_dataset_projection_sql()
     return f"""
-        {selection_sql}
+        WITH {options_sql}, {ranking_sql}, {selection_sql}
+        {projection_sql}
+    """
+
+
+def _artifact_dataset_options_cte(dataset_ref: str) -> str:
+    return f"""
+        dataset_options AS MATERIALIZED (
+        SELECT dataset.*,
+               count(*) FILTER (
+                   WHERE dataset.is_current = true
+                     AND dataset.status = :published_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS current_dataset_count,
+               max(dataset.dataset_id) FILTER (
+                   WHERE dataset.is_current = true
+                     AND dataset.status = :published_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS current_dataset_id,
+               count(*) FILTER (
+                   WHERE dataset.is_current = false
+                     AND dataset.status = :validated_status
+                     AND dataset.superseded_at IS NULL
+               ) OVER (PARTITION BY dataset.endpoint_id)
+                   AS validated_candidate_count
+          FROM {dataset_ref} AS dataset
+         WHERE (
+                dataset.is_current = true
+            AND dataset.status = :published_status
+            AND dataset.superseded_at IS NULL
+         ) OR (
+                dataset.is_current = false
+            AND dataset.status = :validated_status
+            AND dataset.superseded_at IS NULL
+         )
+        )
+    """
+
+
+def _artifact_dataset_ranking_cte() -> str:
+    return """
+        ranked_datasets AS MATERIALIZED (
+        SELECT dataset_options.*,
+               row_number() OVER (
+                   PARTITION BY dataset_options.endpoint_id
+                   ORDER BY
+                       CASE
+                           WHEN CAST(:select_validated_candidates AS boolean)
+                            AND dataset_options.is_current = false
+                            AND dataset_options.status = :validated_status
+                           THEN 0
+                           ELSE 1
+                       END,
+                       dataset_options.dataset_id
+               ) AS selection_rank
+          FROM dataset_options
+         WHERE (
+                dataset_options.is_current = true
+            AND dataset_options.status = :published_status
+            AND dataset_options.superseded_at IS NULL
+         ) OR (
+                CAST(:select_validated_candidates AS boolean)
+            AND dataset_options.is_current = false
+            AND dataset_options.status = :validated_status
+            AND dataset_options.superseded_at IS NULL
+         )
+        )
+    """
+
+
+def _artifact_dataset_projection_sql() -> str:
+    return """
         SELECT selected.source_id,
                selected.endpoint_id,
                selected.source_record_json,
@@ -8804,20 +9087,33 @@ def _provider_directory_artifact_dataset_selection_sql(
                    '[]'::jsonb
                ) AS selected_resources,
                dataset.publication_metadata_json::jsonb -> 'expected_resources'
-                   AS recorded_expected_resources
+                   AS recorded_expected_resources,
+               dataset.status,
+               dataset.is_current,
+               dataset.previous_dataset_id,
+               dataset.dataset_hash,
+               dataset.resource_count,
+               dataset.validated_at,
+               dataset.publication_metadata_json,
+               dataset.current_dataset_count,
+               dataset.current_dataset_id,
+               dataset.validated_candidate_count,
+               (
+                   CAST(:select_validated_candidates AS boolean)
+                   AND dataset.is_current = false
+                   AND dataset.status = :validated_status
+               ) AS promote_on_cutover
           FROM selected_sources AS selected
-          LEFT JOIN {dataset_ref} AS dataset
+          LEFT JOIN ranked_datasets AS dataset
             ON dataset.endpoint_id = selected.endpoint_id
-           AND dataset.is_current = true
-           AND dataset.status = :published_status
-           AND dataset.superseded_at IS NULL
+           AND dataset.selection_rank = 1
          ORDER BY selected.source_id, dataset.dataset_id;
     """
 
 
 def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
     return f"""
-        WITH requested_sources AS MATERIALIZED (
+        requested_sources AS MATERIALIZED (
             SELECT source_id, endpoint_id, to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
              WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
@@ -8838,23 +9134,18 @@ def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
 
 def _artifact_dataset_all_source_selection_sql(
     source_ref: str,
-    dataset_ref: str,
 ) -> str:
     return f"""
-        WITH published_endpoints AS MATERIALIZED (
+        selected_endpoints AS MATERIALIZED (
             SELECT dataset.endpoint_id
-              FROM {dataset_ref} AS dataset
-             WHERE dataset.is_current = true
-               AND dataset.status = :published_status
-               AND dataset.superseded_at IS NULL
-             GROUP BY dataset.endpoint_id
-            HAVING COUNT(*) = 1
+              FROM ranked_datasets AS dataset
+             WHERE dataset.selection_rank = 1
         ), selected_sources AS MATERIALIZED (
             SELECT source.source_id,
                    source.endpoint_id,
                    to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
-              JOIN published_endpoints AS endpoint
+              JOIN selected_endpoints AS endpoint
                 ON endpoint.endpoint_id = source.endpoint_id
         )
     """
@@ -8892,6 +9183,7 @@ def _artifact_dataset_resource_profile(
 def _provider_directory_artifact_dataset_from_row(
     dataset_row: Any,
 ) -> ProviderDirectoryArtifactDataset | None:
+    """Build one immutable artifact selection from a query result."""
     dataset_row_map = _pagination_checkpoint_row_mapping(dataset_row)
     value_by_name = {
         key: _clean_text(dataset_row_map.get(key))
@@ -8900,6 +9192,30 @@ def _provider_directory_artifact_dataset_from_row(
     if not all(value_by_name.values()):
         return None
     dataset_id = value_by_name["dataset_id"] or ""
+    selected_resources, expected_resources, recorded_expected_resources = (
+        _artifact_dataset_profiles_from_row(dataset_row_map, dataset_id)
+    )
+    selection_state = _artifact_dataset_state_from_row(
+        dataset_row_map,
+        dataset_id,
+        value_by_name["endpoint_id"] or "",
+    )
+    return ProviderDirectoryArtifactDataset(
+        source_id=value_by_name["source_id"] or "",
+        endpoint_id=value_by_name["endpoint_id"] or "",
+        dataset_id=dataset_id,
+        evidence_run_id=value_by_name["evidence_run_id"] or "",
+        selected_resources=selected_resources,
+        expected_resources=expected_resources,
+        recorded_expected_resources=recorded_expected_resources,
+        **selection_state,
+    )
+
+
+def _artifact_dataset_profiles_from_row(
+    dataset_row_map: dict[str, Any],
+    dataset_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...] | None]:
     selected_resources = _artifact_dataset_resource_profile(
         dataset_row_map.get("selected_resources"),
         dataset_id=dataset_id,
@@ -8919,20 +9235,159 @@ def _provider_directory_artifact_dataset_from_row(
             field_name="expected_resources",
         )
         expected_resources = recorded_expected_resources
-    return ProviderDirectoryArtifactDataset(
-        source_id=value_by_name["source_id"] or "",
-        endpoint_id=value_by_name["endpoint_id"] or "",
-        dataset_id=dataset_id,
-        evidence_run_id=value_by_name["evidence_run_id"] or "",
-        selected_resources=selected_resources,
-        expected_resources=expected_resources,
-        recorded_expected_resources=recorded_expected_resources,
+    return (
+        selected_resources,
+        expected_resources,
+        recorded_expected_resources,
     )
+
+
+def _artifact_dataset_state_from_row(
+    dataset_row_map: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+) -> dict[str, Any]:
+    selection_state = _artifact_dataset_selection_from_row(
+        dataset_row_map,
+        dataset_id,
+        endpoint_id,
+    )
+    should_promote_on_cutover = selection_state[
+        "should_promote_on_cutover"
+    ]
+    publication_metadata = _json_object(
+        dataset_row_map.get("publication_metadata_json")
+    )
+    dataset_hash = _clean_text(dataset_row_map.get("dataset_hash"))
+    validated_at_value = dataset_row_map.get("validated_at")
+    validated_at = (
+        str(validated_at_value) if validated_at_value is not None else None
+    )
+    if should_promote_on_cutover and (
+        not dataset_hash
+        or validated_at is None
+        or not publication_metadata
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_validated_candidate_proof_invalid:"
+            + dataset_id
+        )
+    return {
+        "status": selection_state["status"],
+        "is_current": selection_state["is_current"],
+        "previous_dataset_id": selection_state["previous_dataset_id"],
+        "expected_incumbent_dataset_id": (
+            selection_state["current_dataset_id"]
+            if should_promote_on_cutover
+            else None
+        ),
+        "promote_on_cutover": should_promote_on_cutover,
+        "dataset_hash": dataset_hash,
+        "resource_count": (
+            int(dataset_row_map.get("resource_count"))
+            if dataset_row_map.get("resource_count") is not None
+            else None
+        ),
+        "validated_at": validated_at,
+        "publication_metadata_hash": _identity_hash(publication_metadata),
+    }
+
+
+def _artifact_dataset_selection_from_row(
+    dataset_row_map: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+) -> dict[str, Any]:
+    status = (
+        _clean_text(dataset_row_map.get("status"))
+        or ENDPOINT_DATASET_PUBLISHED
+    )
+    is_current = dataset_row_map.get("is_current")
+    if not isinstance(is_current, bool):
+        is_current = status == ENDPOINT_DATASET_PUBLISHED
+    should_promote_on_cutover = bool(
+        dataset_row_map.get("promote_on_cutover")
+    )
+    current_dataset_count = int(
+        dataset_row_map.get("current_dataset_count")
+        if dataset_row_map.get("current_dataset_count") is not None
+        else (1 if is_current else 0)
+    )
+    current_dataset_id = _clean_text(
+        dataset_row_map.get("current_dataset_id")
+    )
+    if current_dataset_id is None and is_current:
+        current_dataset_id = dataset_id
+    validated_candidate_count = int(
+        dataset_row_map.get("validated_candidate_count")
+        if dataset_row_map.get("validated_candidate_count") is not None
+        else (1 if should_promote_on_cutover else 0)
+    )
+    previous_dataset_id = _clean_text(
+        dataset_row_map.get("previous_dataset_id")
+    )
+    selection_state_map = {
+        "status": status,
+        "is_current": is_current,
+        "should_promote_on_cutover": should_promote_on_cutover,
+        "current_dataset_count": current_dataset_count,
+        "current_dataset_id": current_dataset_id,
+        "validated_candidate_count": validated_candidate_count,
+        "previous_dataset_id": previous_dataset_id,
+    }
+    _assert_artifact_dataset_selection_state(
+        selection_state_map,
+        dataset_id,
+        endpoint_id,
+    )
+    return selection_state_map
+
+
+def _assert_artifact_dataset_selection_state(
+    selection_state: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+) -> None:
+    if selection_state["should_promote_on_cutover"]:
+        if selection_state["validated_candidate_count"] != 1:
+            raise RuntimeError(
+                "provider_directory_artifact_validated_candidate_ambiguous:"
+                + endpoint_id
+            )
+        if (
+            selection_state["status"] != ENDPOINT_DATASET_VALIDATED
+            or selection_state["is_current"]
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_validated_candidate_invalid:"
+                + dataset_id
+            )
+        if (
+            selection_state["current_dataset_count"] > 1
+            or selection_state["previous_dataset_id"]
+            != selection_state["current_dataset_id"]
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_expected_incumbent_mismatch:"
+                + dataset_id
+            )
+        return
+    if (
+        selection_state["status"] != ENDPOINT_DATASET_PUBLISHED
+        or not selection_state["is_current"]
+        or selection_state["current_dataset_count"] != 1
+        or selection_state["current_dataset_id"] != dataset_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_current_dataset_invalid:" + dataset_id
+        )
 
 
 def _validate_provider_directory_artifact_datasets(
     dataset_rows: list[Any],
     requested_source_ids: list[str],
+    *,
+    should_select_validated_candidates: bool = False,
 ) -> ProviderDirectoryArtifactDatasetFence:
     """Turn a current-dataset query result into one exact alias fence."""
     rows_by_source_id = _artifact_dataset_rows_by_source(dataset_rows)
@@ -8945,7 +9400,12 @@ def _validate_provider_directory_artifact_datasets(
         for source_id in selected_source_ids
     ]
     _assert_artifact_endpoint_consistency(selected_datasets)
-    return ProviderDirectoryArtifactDatasetFence(tuple(selected_datasets))
+    return ProviderDirectoryArtifactDatasetFence(
+        tuple(selected_datasets),
+        should_select_validated_candidates=(
+            should_select_validated_candidates
+        ),
+    )
 
 
 def _artifact_dataset_rows_by_source(
@@ -9010,70 +9470,82 @@ def _artifact_dataset_for_source(
 def _assert_artifact_endpoint_consistency(
     selected_datasets: list[ProviderDirectoryArtifactDataset],
 ) -> None:
-    dataset_id_by_endpoint_id: dict[str, str] = {}
-    selected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
-    expected_resources_by_endpoint_id: dict[str, tuple[str, ...]] = {}
-    recorded_expected_resources_by_endpoint_id: dict[
-        str,
-        tuple[str, ...] | None,
-    ] = {}
+    """Require every alias of an endpoint to carry one exact selection."""
+    identity_by_endpoint_id: dict[str, tuple[Any, ...]] = {}
     for dataset in selected_datasets:
-        incumbent_dataset_id = dataset_id_by_endpoint_id.setdefault(
+        selection_identity = _artifact_endpoint_selection_identity(dataset)
+        incumbent_identity = identity_by_endpoint_id.setdefault(
             dataset.endpoint_id,
-            dataset.dataset_id,
+            selection_identity,
         )
-        if incumbent_dataset_id != dataset.dataset_id:
+        if incumbent_identity == selection_identity:
+            continue
+        if incumbent_identity[0] != dataset.dataset_id:
             raise RuntimeError(
                 "provider_directory_artifact_endpoint_dataset_ambiguous:"
                 + dataset.endpoint_id
             )
-        incumbent_selected_resources = selected_resources_by_endpoint_id.setdefault(
-            dataset.endpoint_id,
-            dataset.selected_resources,
+        raise RuntimeError(
+            "provider_directory_artifact_endpoint_metadata_ambiguous:"
+            + dataset.endpoint_id
         )
-        if incumbent_selected_resources != dataset.selected_resources:
-            raise RuntimeError(
-                "provider_directory_artifact_endpoint_metadata_ambiguous:"
-                + dataset.endpoint_id
-            )
-        incumbent_expected_resources = expected_resources_by_endpoint_id.setdefault(
-            dataset.endpoint_id,
-            dataset.expected_resources,
-        )
-        if incumbent_expected_resources != dataset.expected_resources:
-            raise RuntimeError(
-                "provider_directory_artifact_endpoint_expected_metadata_ambiguous:"
-                + dataset.endpoint_id
-            )
-        incumbent_recorded_expected_resources = (
-            recorded_expected_resources_by_endpoint_id.setdefault(
-                dataset.endpoint_id,
-                dataset.recorded_expected_resources,
-            )
-        )
-        if (
-            incumbent_recorded_expected_resources
-            != dataset.recorded_expected_resources
-        ):
-            raise RuntimeError(
-                "provider_directory_artifact_endpoint_recorded_metadata_ambiguous:"
-                + dataset.endpoint_id
-            )
+
+
+def _artifact_endpoint_selection_identity(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> tuple[Any, ...]:
+    return (
+        dataset.dataset_id,
+        dataset.selected_resources,
+        dataset.expected_resources,
+        dataset.recorded_expected_resources,
+        dataset.status,
+        dataset.is_current,
+        dataset.previous_dataset_id,
+        dataset.expected_incumbent_dataset_id,
+        dataset.promote_on_cutover,
+        dataset.dataset_hash,
+        dataset.resource_count,
+        dataset.validated_at,
+        dataset.publication_metadata_hash,
+    )
 
 
 async def _resolve_provider_directory_artifact_datasets(
     source_ids: list[str] | tuple[str, ...] | None,
+    *,
+    should_select_validated_candidates: bool = False,
 ) -> ProviderDirectoryArtifactDatasetFence:
     cleaned_source_ids = _clean_source_id_list(source_ids)
     dataset_rows = await db.all(
-        _provider_directory_artifact_dataset_selection_sql(cleaned_source_ids),
+        _provider_directory_artifact_dataset_selection_sql(
+            cleaned_source_ids,
+            should_select_validated_candidates=(
+                should_select_validated_candidates
+            ),
+        ),
         published_status=ENDPOINT_DATASET_PUBLISHED,
+        validated_status=ENDPOINT_DATASET_VALIDATED,
+        select_validated_candidates=should_select_validated_candidates,
         **({"source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
     )
     return _validate_provider_directory_artifact_datasets(
         dataset_rows,
         cleaned_source_ids,
+        should_select_validated_candidates=should_select_validated_candidates,
     )
+
+
+def _should_select_validated_artifacts(
+    publish_artifacts_targets: set[str] | None,
+) -> bool:
+    """Return whether an artifact run may atomically publish validated data."""
+    if publish_artifacts_targets is None:
+        return True
+    base_targets = set(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS) - {
+        "corroboration"
+    }
+    return base_targets.issubset(publish_artifacts_targets)
 
 
 def _provider_directory_dataset_artifact_targets(
@@ -9563,37 +10035,12 @@ async def _materialize_provider_directory_artifact_resource_scope(
 async def _verify_provider_directory_artifact_dataset_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> None:
-    expected_dataset_id_by_endpoint_id = fence.dataset_id_by_endpoint_id
-    current_dataset_rows = await db.all(
-        f"""
-        SELECT endpoint_id, dataset_id
-          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
-           AND is_current = true
-           AND status = :published_status
-           AND superseded_at IS NULL
-         ORDER BY endpoint_id, dataset_id;
-        """,
-        endpoint_ids=sorted(expected_dataset_id_by_endpoint_id),
-        published_status=ENDPOINT_DATASET_PUBLISHED,
+    dataset_rows = await _artifact_fence_dataset_rows(
+        fence,
+        db,
+        for_update=False,
     )
-    current_dataset_row_maps = [
-        _pagination_checkpoint_row_mapping(dataset_row)
-        for dataset_row in current_dataset_rows
-    ]
-    actual_dataset_id_by_endpoint_id = {
-        _clean_text(dataset_row_map.get("endpoint_id")): _clean_text(
-            dataset_row_map.get("dataset_id")
-        )
-        for dataset_row_map in current_dataset_row_maps
-    }
-    if (
-        len(current_dataset_row_maps) != len(expected_dataset_id_by_endpoint_id)
-        or actual_dataset_id_by_endpoint_id != expected_dataset_id_by_endpoint_id
-    ):
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_endpoint_dataset_current_changed"
-        )
+    _assert_locked_artifact_fence_datasets(fence, dataset_rows)
 
 
 async def _lock_and_verify_artifact_dataset_fence(
@@ -9605,11 +10052,17 @@ async def _lock_and_verify_artifact_dataset_fence(
         return
     query_executor = executor or db
     await _lock_artifact_fence_endpoints(fence, query_executor)
-    locked_tuple_rows = await _lock_artifact_fence_tuples(
+    locked_alias_rows = await _lock_artifact_fence_aliases(
         fence,
         query_executor,
     )
-    _assert_locked_artifact_fence_tuples(fence, locked_tuple_rows)
+    _assert_locked_artifact_fence_aliases(fence, locked_alias_rows)
+    locked_dataset_rows = await _artifact_fence_dataset_rows(
+        fence,
+        query_executor,
+        for_update=True,
+    )
+    _assert_locked_artifact_fence_datasets(fence, locked_dataset_rows)
 
 
 async def _lock_artifact_fence_endpoints(
@@ -9627,7 +10080,7 @@ async def _lock_artifact_fence_endpoints(
           FROM {endpoint_ref}
          WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
          ORDER BY endpoint_id
-         FOR SHARE;
+         FOR UPDATE;
         """,
         endpoint_ids=fence.endpoint_ids,
     )
@@ -9644,101 +10097,247 @@ async def _lock_artifact_fence_endpoints(
         )
 
 
-async def _lock_artifact_fence_tuples(
+async def _lock_artifact_fence_aliases(
     fence: ProviderDirectoryArtifactDatasetFence,
     executor: Any,
 ) -> list[Any]:
-    """Lock every selected alias and its current published dataset."""
+    """Lock and return every alias currently attached to selected endpoints."""
     source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
-    dataset_ref = _unscoped_qt(
-        _schema(),
-        ProviderDirectoryEndpointDataset.__tablename__,
-    )
     await executor.status(f"LOCK TABLE {source_ref} IN SHARE MODE;")
     return await executor.all(
         f"""
         SELECT source.source_id,
                source.endpoint_id,
-               to_jsonb(source) AS source_record_json,
-               dataset.dataset_id,
-               COALESCE(
-                   dataset.acquisition_root_run_id,
-                   dataset.import_run_id
-               ) AS evidence_run_id,
-               COALESCE(
-                   dataset.publication_metadata_json::jsonb -> 'selected_resources',
-                   '[]'::jsonb
-               ) AS selected_resources,
-               dataset.publication_metadata_json::jsonb -> 'expected_resources'
-                   AS recorded_expected_resources
+               to_jsonb(source) AS source_record_json
           FROM {source_ref} AS source
-          JOIN {dataset_ref} AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
          WHERE source.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
-           AND dataset.is_current = true
-           AND dataset.status = :published_status
-           AND dataset.superseded_at IS NULL
-         ORDER BY source.source_id, source.endpoint_id, dataset.dataset_id
-         FOR SHARE OF source, dataset;
+         ORDER BY source.source_id, source.endpoint_id
+         FOR SHARE OF source;
         """,
         endpoint_ids=fence.endpoint_ids,
-        published_status=ENDPOINT_DATASET_PUBLISHED,
     )
 
 
-def _assert_locked_artifact_fence_tuples(
+def _assert_locked_artifact_fence_aliases(
     fence: ProviderDirectoryArtifactDatasetFence,
-    locked_tuple_rows: list[Any],
+    locked_alias_rows: list[Any],
 ) -> None:
-    """Ensure the held source, endpoint, and dataset tuples remain exact."""
-    actual_datasets = [
-        dataset
-        for tuple_row in locked_tuple_rows
+    """Ensure the complete held alias family remains exact."""
+    alias_rows_by_source_id = {
+        source_id: alias_row_map
+        for alias_row in locked_alias_rows
         if (
-            dataset := _provider_directory_artifact_dataset_from_row(
-                tuple_row
-            )
+            alias_row_map := _pagination_checkpoint_row_mapping(alias_row)
         )
-        is not None
-    ]
-    actual_by_tuple = {
-        (dataset.source_id, dataset.endpoint_id, dataset.dataset_id): dataset
-        for dataset in actual_datasets
+        and (source_id := _clean_text(alias_row_map.get("source_id")))
     }
-    if tuple(sorted(actual_by_tuple)) != fence.source_endpoint_dataset_tuples:
+    actual_source_endpoint_tuples = tuple(
+        sorted(
+            (
+                source_id,
+                _clean_text(alias_row_map.get("endpoint_id")) or "",
+            )
+            for source_id, alias_row_map in alias_rows_by_source_id.items()
+        )
+    )
+    if actual_source_endpoint_tuples != fence.source_endpoint_tuples:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_source_endpoint_dataset_changed"
         )
     for dataset in fence.datasets:
-        expected_tuple = (
-            dataset.source_id,
-            dataset.endpoint_id,
-            dataset.dataset_id,
-        )
-        actual_dataset = actual_by_tuple[expected_tuple]
-        if actual_dataset.evidence_run_id != dataset.evidence_run_id:
-            raise ProviderDirectoryArtifactBuildStale(
-                "provider_directory_endpoint_dataset_evidence_run_changed"
-            )
+        if dataset.recorded_expected_resources is not None:
+            continue
+        alias_row_map = alias_rows_by_source_id[dataset.source_id]
+        source_record = _json_object(alias_row_map.get("source_record_json"))
         if (
-            actual_dataset.selected_resources != dataset.selected_resources
-        ):
-            raise ProviderDirectoryArtifactBuildStale(
-                "provider_directory_endpoint_dataset_metadata_changed"
-            )
-        if (
-            actual_dataset.expected_resources != dataset.expected_resources
+            _endpoint_dataset_expected_resources([source_record])
+            != dataset.expected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_expected_metadata_changed"
             )
+
+
+def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
+    lock_sql = "FOR UPDATE" if for_update else ""
+    return f"""
+        SELECT dataset_id,
+               endpoint_id,
+               import_run_id,
+               acquisition_root_run_id,
+               previous_dataset_id,
+               dataset_hash,
+               status,
+               is_current,
+               resource_count,
+               validated_at,
+               published_at,
+               superseded_at,
+               publication_metadata_json
+          FROM {_unscoped_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
+         ORDER BY dataset_id
+         {lock_sql};
+    """
+
+
+async def _artifact_fence_dataset_rows(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
+    *,
+    for_update: bool,
+) -> list[Any]:
+    return await executor.all(
+        _artifact_fence_dataset_rows_sql(for_update=for_update),
+        endpoint_ids=fence.endpoint_ids,
+    )
+
+
+def _artifact_fence_dataset_row_identity(
+    dataset_row_map: dict[str, Any],
+) -> tuple[Any, ...]:
+    validated_at = dataset_row_map.get("validated_at")
+    return (
+        _clean_text(dataset_row_map.get("endpoint_id")),
+        _clean_text(dataset_row_map.get("acquisition_root_run_id"))
+        or _clean_text(dataset_row_map.get("import_run_id")),
+        _clean_text(dataset_row_map.get("status")),
+        dataset_row_map.get("is_current") is True,
+        _clean_text(dataset_row_map.get("previous_dataset_id")),
+        _clean_text(dataset_row_map.get("dataset_hash")),
+        (
+            int(dataset_row_map.get("resource_count"))
+            if dataset_row_map.get("resource_count") is not None
+            else None
+        ),
+        str(validated_at) if validated_at is not None else None,
+        _identity_hash(
+            _json_object(dataset_row_map.get("publication_metadata_json"))
+        ),
+    )
+
+
+def _expected_artifact_fence_dataset_identity(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> tuple[Any, ...]:
+    return (
+        dataset.endpoint_id,
+        dataset.evidence_run_id,
+        dataset.status,
+        dataset.is_current,
+        dataset.previous_dataset_id,
+        dataset.dataset_hash,
+        dataset.resource_count,
+        dataset.validated_at,
+        dataset.publication_metadata_hash,
+    )
+
+
+def _is_artifact_fence_dataset_row_exact(
+    dataset: ProviderDirectoryArtifactDataset,
+    dataset_row_map: dict[str, Any],
+) -> bool:
+    actual_identity = _artifact_fence_dataset_row_identity(dataset_row_map)
+    expected_identity = _expected_artifact_fence_dataset_identity(dataset)
+    for field_index, (actual_value, expected_value) in enumerate(
+        zip(actual_identity, expected_identity)
+    ):
+        if field_index >= 5 and expected_value is None:
+            continue
+        if actual_value != expected_value:
+            return False
+    return True
+
+
+def _current_published_artifact_dataset_ids(
+    dataset_row_maps: Iterable[dict[str, Any]],
+    endpoint_id: str,
+) -> list[str]:
+    return sorted(
+        _clean_text(dataset_row_map.get("dataset_id")) or ""
+        for dataset_row_map in dataset_row_maps
+        if _clean_text(dataset_row_map.get("endpoint_id")) == endpoint_id
+        and dataset_row_map.get("is_current") is True
+        and _clean_text(dataset_row_map.get("status"))
+        == ENDPOINT_DATASET_PUBLISHED
+        and dataset_row_map.get("superseded_at") is None
+    )
+
+
+def _validated_artifact_dataset_ids(
+    dataset_row_maps: Iterable[dict[str, Any]],
+) -> list[str]:
+    return sorted(
+        _clean_text(dataset_row_map.get("dataset_id")) or ""
+        for dataset_row_map in dataset_row_maps
+        if dataset_row_map.get("is_current") is not True
+        and _clean_text(dataset_row_map.get("status"))
+        == ENDPOINT_DATASET_VALIDATED
+        and dataset_row_map.get("superseded_at") is None
+    )
+
+
+def _assert_locked_artifact_fence_datasets(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    locked_dataset_rows: list[Any],
+) -> None:
+    """Reverify selected datasets, candidates, and expected incumbents."""
+    dataset_rows_by_id = {
+        dataset_id: dataset_row_map
+        for dataset_row in locked_dataset_rows
         if (
-            actual_dataset.recorded_expected_resources
-            != dataset.recorded_expected_resources
+            dataset_row_map := _pagination_checkpoint_row_mapping(dataset_row)
+        )
+        and (dataset_id := _clean_text(dataset_row_map.get("dataset_id")))
+    }
+    rows_by_endpoint_id: dict[str, list[dict[str, Any]]] = {}
+    for dataset_row_map in dataset_rows_by_id.values():
+        endpoint_id = _clean_text(dataset_row_map.get("endpoint_id"))
+        if endpoint_id:
+            rows_by_endpoint_id.setdefault(endpoint_id, []).append(
+                dataset_row_map
+            )
+    for dataset in _unique_artifact_datasets(fence):
+        endpoint_dataset_rows = rows_by_endpoint_id.get(
+            dataset.endpoint_id,
+            [],
+        )
+        actual_current_ids = _current_published_artifact_dataset_ids(
+            endpoint_dataset_rows,
+            dataset.endpoint_id,
+        )
+        expected_incumbent_id = (
+            dataset.expected_incumbent_dataset_id
+            if dataset.promote_on_cutover
+            else dataset.dataset_id
+        )
+        expected_current_ids = (
+            [expected_incumbent_id] if expected_incumbent_id else []
+        )
+        if actual_current_ids != expected_current_ids:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_current_changed"
+            )
+        if fence.should_select_validated_candidates:
+            actual_validated_ids = _validated_artifact_dataset_ids(
+                endpoint_dataset_rows
+            )
+            expected_validated_ids = (
+                [dataset.dataset_id] if dataset.promote_on_cutover else []
+            )
+            if actual_validated_ids != expected_validated_ids:
+                raise ProviderDirectoryArtifactBuildStale(
+                    "provider_directory_endpoint_dataset_candidate_changed"
+                )
+        selected_row = dataset_rows_by_id.get(dataset.dataset_id)
+        if selected_row is None or not _is_artifact_fence_dataset_row_exact(
+            dataset,
+            selected_row,
         ):
             raise ProviderDirectoryArtifactBuildStale(
-                "provider_directory_endpoint_dataset_recorded_metadata_changed"
+                "provider_directory_endpoint_dataset_metadata_changed"
             )
+
 
 @contextlib.asynccontextmanager
 async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIterator[None]:
@@ -9748,8 +10347,7 @@ async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIter
         yield
         return
     async with db.transaction():
-        await _lock_artifact_fence_endpoints(fence, db)
-        await _verify_provider_directory_artifact_dataset_fence(fence)
+        await _lock_and_verify_artifact_dataset_fence(fence, db)
         yield
 
 
@@ -10006,7 +10604,10 @@ def _artifact_fence_for_dataset(
             dataset
             for dataset in fence.datasets
             if dataset.dataset_id == dataset_id
-        )
+        ),
+        should_select_validated_candidates=(
+            fence.should_select_validated_candidates
+        ),
     )
 
 
@@ -10040,18 +10641,26 @@ async def _record_current_dataset_serving_relation_proof(
            )
          WHERE dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
-           AND is_current = true
-           AND status = :published_status
+           AND COALESCE(acquisition_root_run_id, import_run_id)
+               IS NOT DISTINCT FROM :evidence_run_id
+           AND previous_dataset_id IS NOT DISTINCT FROM :previous_dataset_id
+           AND dataset_hash IS NOT DISTINCT FROM :dataset_hash
+           AND is_current = :is_current
+           AND status = :expected_status
            AND superseded_at IS NULL;
         """,
         proof_json=json.dumps(proof, sort_keys=True, default=_json_default),
         dataset_id=dataset.dataset_id,
         endpoint_id=dataset.endpoint_id,
-        published_status=ENDPOINT_DATASET_PUBLISHED,
+        evidence_run_id=dataset.evidence_run_id,
+        previous_dataset_id=dataset.previous_dataset_id,
+        dataset_hash=dataset.dataset_hash,
+        is_current=dataset.is_current,
+        expected_status=dataset.status,
     )
     if _coerce_rowcount(updated) != 1:
         raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_endpoint_dataset_current_changed"
+            "provider_directory_endpoint_dataset_metadata_changed"
         )
 
 
@@ -10289,6 +10898,50 @@ def _is_dataset_relation_only_artifact_target(
     )
 
 
+def _artifact_fence_selection_identity(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> tuple[Any, ...]:
+    """Return immutable selection fields that relation-proof refresh may not alter."""
+    return (
+        fence.should_select_validated_candidates,
+        tuple(
+            sorted(
+                (
+                    dataset.source_id,
+                    dataset.endpoint_id,
+                    dataset.dataset_id,
+                    dataset.evidence_run_id,
+                    dataset.selected_resources,
+                    dataset.expected_resources,
+                    dataset.recorded_expected_resources,
+                    dataset.status,
+                    dataset.is_current,
+                    dataset.previous_dataset_id,
+                    dataset.expected_incumbent_dataset_id,
+                    dataset.promote_on_cutover,
+                    dataset.dataset_hash,
+                    dataset.resource_count,
+                    dataset.validated_at,
+                )
+                for dataset in fence.datasets
+            )
+        ),
+    )
+
+
+def _assert_artifact_fence_selection_unchanged(
+    expected_fence: ProviderDirectoryArtifactDatasetFence,
+    refreshed_fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    if (
+        _artifact_fence_selection_identity(expected_fence)
+        != _artifact_fence_selection_identity(refreshed_fence)
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_dataset_selection_changed"
+        )
+
+
 async def _publish_provider_directory_dataset_artifacts(
     *,
     run_id: str | None,
@@ -10297,7 +10950,51 @@ async def _publish_provider_directory_dataset_artifacts(
     publish_corroboration: bool,
     publish_artifacts_targets: set[str] | None,
 ) -> dict[str, Any]:
-    fence = await _resolve_provider_directory_artifact_datasets(source_ids)
+    """Build one selected dataset bundle and atomically publish its pointers."""
+    should_select_validated_candidates = (
+        _should_select_validated_artifacts(publish_artifacts_targets)
+    )
+    fence = await _prepare_artifact_publication_fence(
+        source_ids,
+        run_id=run_id,
+        metrics=metrics,
+        publish_artifacts_targets=publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+        should_select_validated_candidates=should_select_validated_candidates,
+    )
+    if _is_dataset_relation_only_artifact_target(publish_artifacts_targets):
+        metrics["publish_artifacts_targets"] = sorted(
+            publish_artifacts_targets or ()
+        )
+        return metrics
+    artifact_resource_types = _provider_directory_artifact_resource_types(
+        publish_artifacts_targets,
+        publish_corroboration=publish_corroboration,
+    )
+    return await _publish_artifact_bundle_from_fence(
+        fence,
+        run_id=run_id,
+        metrics=metrics,
+        source_ids=source_ids,
+        publish_corroboration=publish_corroboration,
+        publish_artifacts_targets=publish_artifacts_targets,
+        artifact_resource_types=artifact_resource_types,
+    )
+
+
+async def _prepare_artifact_publication_fence(
+    source_ids: list[str] | tuple[str, ...] | None,
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    publish_artifacts_targets: set[str] | None,
+    publish_corroboration: bool,
+    should_select_validated_candidates: bool,
+) -> ProviderDirectoryArtifactDatasetFence:
+    fence = await _resolve_provider_directory_artifact_datasets(
+        source_ids,
+        should_select_validated_candidates=should_select_validated_candidates,
+    )
     _assert_provider_directory_artifact_target_dependencies(
         fence,
         publish_artifacts_targets=publish_artifacts_targets,
@@ -10309,15 +11006,195 @@ async def _publish_provider_directory_dataset_artifacts(
         metrics=metrics,
         publish_artifacts_targets=publish_artifacts_targets,
     )
-    if _is_dataset_relation_only_artifact_target(publish_artifacts_targets):
-        metrics["publish_artifacts_targets"] = sorted(
-            publish_artifacts_targets or ()
-        )
-        return metrics
-    artifact_resource_types = _provider_directory_artifact_resource_types(
-        publish_artifacts_targets,
-        publish_corroboration=publish_corroboration,
+    refreshed_fence = await _resolve_provider_directory_artifact_datasets(
+        source_ids,
+        should_select_validated_candidates=should_select_validated_candidates,
     )
+    _assert_artifact_fence_selection_unchanged(fence, refreshed_fence)
+    return refreshed_fence
+
+
+_CANDIDATE_ARTIFACT_METRIC_BY_TARGET = {
+    "dataset_network_plan": PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+    "dataset_affiliation_organization": (
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
+    ),
+    "location_contacts": "location_contacts_backfilled",
+    "location_coordinates": "location_coordinates_backfilled",
+    "resource_id_npis": "resource_id_npis_backfilled",
+    "location_address_keys": "location_address_keys_stamped",
+    "location_archive": "location_archive",
+    "address_overlay": "address_overlay",
+    "profile": "profile",
+    "network_catalog": "network_catalog",
+}
+
+
+def _candidate_artifact_skip_reason(value: Any) -> str | None:
+    if not isinstance(value, dict) or value.get("skipped") is not True:
+        return None
+    return _clean_text(value.get("reason")) or "unspecified"
+
+
+def _candidate_artifact_deferred_relations(
+    enabled_targets: set[str],
+    publish_metrics_by_name: dict[str, Any],
+) -> set[str]:
+    relations: set[str] = set()
+    if "address_overlay" in enabled_targets:
+        relations.add(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    if (
+        "profile" in enabled_targets
+        and _candidate_artifact_skip_reason(
+            publish_metrics_by_name.get("profile")
+        )
+        is None
+    ):
+        relations.update(
+            {
+                profile_artifact.PROFILE_EVIDENCE_TABLE,
+                profile_artifact.PROFILE_TABLE,
+            }
+        )
+    if "network_catalog" in enabled_targets:
+        relations.add(PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE)
+    if "corroboration" in enabled_targets:
+        relations.add(PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW)
+    return relations
+
+
+def _assert_candidate_artifact_metrics_complete(
+    enabled_targets: set[str],
+    publish_metrics_by_name: dict[str, Any],
+) -> None:
+    for artifact_target_name in sorted(enabled_targets - {"corroboration"}):
+        metric_name = _CANDIDATE_ARTIFACT_METRIC_BY_TARGET.get(
+            artifact_target_name
+        )
+        if metric_name is None or metric_name not in publish_metrics_by_name:
+            raise RuntimeError(
+                "provider_directory_candidate_artifact_metric_missing:"
+                + artifact_target_name
+            )
+        skip_reason = _candidate_artifact_skip_reason(
+            publish_metrics_by_name[metric_name]
+        )
+        if skip_reason is None:
+            continue
+        if (
+            artifact_target_name == "profile"
+            and skip_reason == "no_profile_enabled_sources_in_scope"
+        ):
+            continue
+        raise RuntimeError(
+            "provider_directory_candidate_artifact_skipped:"
+            f"{artifact_target_name}:{skip_reason}"
+        )
+    if "corroboration" in enabled_targets and publish_metrics_by_name.get(
+        "ptg_corroboration_view_published"
+    ) is not True:
+        raise RuntimeError(
+            "provider_directory_candidate_artifact_skipped:corroboration"
+        )
+
+
+def _assert_candidate_artifact_stage_relations_complete(
+    enabled_targets: set[str],
+    publish_metrics_by_name: dict[str, Any],
+    artifact_bundle: ProviderDirectoryArtifactBundle,
+) -> None:
+    expected_relations = _candidate_artifact_deferred_relations(
+        enabled_targets,
+        publish_metrics_by_name,
+    )
+    actual_relations = {
+        stage.target_relation for stage in artifact_bundle.stages
+    }
+    if actual_relations != expected_relations:
+        missing_relations = sorted(expected_relations - actual_relations)
+        unexpected_relations = sorted(actual_relations - expected_relations)
+        raise RuntimeError(
+            "provider_directory_candidate_artifact_bundle_incomplete:"
+            f"missing={','.join(missing_relations) or '-'}:"
+            f"unexpected={','.join(unexpected_relations) or '-'}"
+        )
+
+
+def _assert_candidate_artifact_bundle_complete(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    publish_metrics_by_name: dict[str, Any],
+    artifact_bundle: ProviderDirectoryArtifactBundle,
+    *,
+    publish_corroboration: bool,
+    publish_artifacts_targets: set[str] | None,
+) -> None:
+    """Fail closed before a validated dataset can outpace its serving bundle."""
+    if not fence.promotion_datasets:
+        return
+    enabled_targets = set(
+        _provider_directory_dataset_artifact_targets(
+            publish_artifacts_targets,
+            publish_corroboration=publish_corroboration,
+        )
+    )
+    _assert_candidate_artifact_metrics_complete(
+        enabled_targets,
+        publish_metrics_by_name,
+    )
+    _assert_candidate_artifact_stage_relations_complete(
+        enabled_targets,
+        publish_metrics_by_name,
+        artifact_bundle,
+    )
+
+
+async def _record_artifact_promotion_metrics(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    publish_metrics_by_name: dict[str, Any],
+    promoted_stage_count: int,
+) -> dict[str, Any]:
+    """Record pointer promotion and best-effort retry-state cleanup."""
+    publish_metrics_by_name["artifact_promoted_dataset_ids"] = (
+        sorted(
+            dataset.dataset_id for dataset in fence.promotion_datasets
+        )
+        if promoted_stage_count > 0
+        else []
+    )
+    retry_cleanup_expected_ids = (
+        sorted({dataset.dataset_id for dataset in fence.datasets})
+        if promoted_stage_count > 0
+        and fence.should_select_validated_candidates
+        else []
+    )
+    retry_cleanup_cleared_ids = (
+        await _clear_promoted_endpoint_dataset_retry_state(fence)
+        if retry_cleanup_expected_ids
+        else []
+    )
+    publish_metrics_by_name["artifact_retry_state_cleared_dataset_ids"] = (
+        retry_cleanup_cleared_ids
+    )
+    publish_metrics_by_name["artifact_retry_state_pending_dataset_ids"] = (
+        sorted(
+            set(retry_cleanup_expected_ids)
+            - set(retry_cleanup_cleared_ids)
+        )
+    )
+    return publish_metrics_by_name
+
+
+async def _publish_artifact_bundle_from_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    source_ids: list[str] | tuple[str, ...] | None,
+    publish_corroboration: bool,
+    publish_artifacts_targets: set[str] | None,
+    artifact_resource_types: frozenset[str],
+) -> dict[str, Any]:
+    """Build one immutable serving bundle and publish it behind its fence."""
     async with _provider_directory_artifact_dataset_scope(
         run_id=run_id,
         source_ids=source_ids,
@@ -10341,8 +11218,19 @@ async def _publish_provider_directory_dataset_artifacts(
                 publish_corroboration=publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
             )
-            await artifact_bundle.promote()
-            return publish_metrics
+            _assert_candidate_artifact_bundle_complete(
+                fence,
+                publish_metrics,
+                artifact_bundle,
+                publish_corroboration=publish_corroboration,
+                publish_artifacts_targets=publish_artifacts_targets,
+            )
+            promoted_stage_count = await artifact_bundle.promote()
+            return await _record_artifact_promotion_metrics(
+                fence,
+                publish_metrics,
+                promoted_stage_count,
+            )
 
 
 async def _publish_selected_provider_directory_artifacts(
@@ -10414,6 +11302,86 @@ def _collect_provider_directory_artifact_stage(
                 artifact_bundle.add(stage)
             return metrics
     raise RuntimeError("provider_directory_artifact_stage_result_invalid")
+
+
+async def _locked_finalized_retry_cleanup_dataset_ids(
+    selected_dataset_ids: list[str],
+) -> list[str]:
+    finalized_rows = await db.all(
+        f"""
+        SELECT dataset_id
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
+           AND status = ANY(CAST(:finalized_statuses AS varchar[]))
+         ORDER BY dataset_id
+         FOR UPDATE;
+        """,
+        dataset_ids=selected_dataset_ids,
+        finalized_statuses=[
+            ENDPOINT_DATASET_PUBLISHED,
+            ENDPOINT_DATASET_SUPERSEDED,
+        ],
+    )
+    return sorted(
+        dataset_id
+        for finalized_row in finalized_rows
+        if (
+            dataset_id := _clean_text(
+                _pagination_checkpoint_row_mapping(finalized_row).get(
+                    "dataset_id"
+                )
+            )
+        )
+    )
+
+
+async def _delete_endpoint_dataset_retry_state(
+    selected_dataset_ids: list[str],
+) -> None:
+    await db.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
+           AND resource_type LIKE 'LU:%:pass:%';
+        """,
+        dataset_ids=selected_dataset_ids,
+    )
+    await db.status(
+        f"""
+        DELETE FROM {_pagination_checkpoint_table_ref()}
+         WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]));
+        """,
+        dataset_ids=selected_dataset_ids,
+    )
+
+
+async def _clear_promoted_endpoint_dataset_retry_state(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> list[str]:
+    """Atomically clear retry state for selected datasets once finalized."""
+    selected_dataset_ids = sorted(
+        {dataset.dataset_id for dataset in fence.datasets}
+    )
+    if not selected_dataset_ids:
+        return []
+    try:
+        async with db.transaction():
+            finalized_dataset_ids = (
+                await _locked_finalized_retry_cleanup_dataset_ids(
+                    selected_dataset_ids
+                )
+            )
+            if finalized_dataset_ids != selected_dataset_ids:
+                return []
+            await _delete_endpoint_dataset_retry_state(selected_dataset_ids)
+    except Exception:
+        LOGGER.warning(
+            "Provider Directory retry-state cleanup remains pending for %s",
+            ",".join(selected_dataset_ids),
+            exc_info=True,
+        )
+        return []
+    return selected_dataset_ids
 
 
 async def _is_provider_directory_corroboration_artifact_published(
@@ -25420,6 +26388,7 @@ async def _checkpoint_candidate_dataset_id(
             ENDPOINT_DATASET_ACQUIRING,
             ENDPOINT_DATASET_INCOMPLETE,
             ENDPOINT_DATASET_FAILED,
+            ENDPOINT_DATASET_VALIDATED,
         ],
         selected_resources=json.dumps(selected_resources),
     )
@@ -25432,7 +26401,8 @@ async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
     row = await db.first(
         f"""
         SELECT endpoint_id, import_run_id, acquisition_root_run_id, status,
-               is_current, previous_dataset_id, published_at,
+               is_current, previous_dataset_id, dataset_hash, resource_count,
+               validated_at, published_at,
                publication_metadata_json
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id;
@@ -25488,7 +26458,11 @@ async def _assert_locked_endpoint_candidate(
     if existing_candidate_map and (
         existing_candidate_map.get("is_current") is True
         or _clean_text(existing_candidate_map.get("status"))
-        in {ENDPOINT_DATASET_PUBLISHED, ENDPOINT_DATASET_SUPERSEDED}
+        in {
+            ENDPOINT_DATASET_VALIDATED,
+            ENDPOINT_DATASET_PUBLISHED,
+            ENDPOINT_DATASET_SUPERSEDED,
+        }
         or _clean_text(existing_candidate_map.get("acquisition_root_run_id"))
         != candidate.acquisition_root_run_id
     ):
@@ -25579,6 +26553,7 @@ async def _assert_no_conflicting_endpoint_candidate(
         active_statuses=[
             ENDPOINT_DATASET_ACQUIRING,
             ENDPOINT_DATASET_INCOMPLETE,
+            ENDPOINT_DATASET_VALIDATED,
         ],
     )
     if conflicting_candidate is not None:
@@ -25604,7 +26579,11 @@ def _endpoint_dataset_candidate_upsert_sql() -> str:
             ),
             status = CASE
                 WHEN candidate.is_current
-                  OR candidate.status IN (:published_status, :superseded_status)
+                  OR candidate.status IN (
+                      :validated_status,
+                      :published_status,
+                      :superseded_status
+                  )
                 THEN candidate.status
                 ELSE EXCLUDED.status
             END,
@@ -25629,6 +26608,7 @@ async def _upsert_endpoint_dataset_candidate(
         acquisition_root_run_id=candidate.acquisition_root_run_id,
         previous_dataset_id=candidate.previous_dataset_id,
         status=ENDPOINT_DATASET_ACQUIRING,
+        validated_status=ENDPOINT_DATASET_VALIDATED,
         published_status=ENDPOINT_DATASET_PUBLISHED,
         superseded_status=ENDPOINT_DATASET_SUPERSEDED,
         publication_metadata_json=json.dumps(metadata, sort_keys=True),
@@ -25769,6 +26749,7 @@ def _should_repair_empty_endpoint_dataset_orphan(
         raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
     existing_status = _clean_text(existing_dataset_map.get("status"))
     if existing_dataset_map.get("is_current") is True or existing_status in {
+        ENDPOINT_DATASET_VALIDATED,
         ENDPOINT_DATASET_PUBLISHED,
         ENDPOINT_DATASET_SUPERSEDED,
     }:
@@ -25823,6 +26804,52 @@ def _published_endpoint_dataset_selection(
     )
 
 
+def _validated_endpoint_dataset_selection(
+    existing_dataset_map: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+    acquisition_root_run_id: str | None,
+) -> EndpointDatasetCandidateSelection | None:
+    """Return a completed non-current root without reopening acquisition."""
+    if not existing_dataset_map:
+        return None
+    existing_status = _clean_text(existing_dataset_map.get("status"))
+    if existing_status != ENDPOINT_DATASET_VALIDATED:
+        return None
+    if existing_dataset_map.get("is_current") is True:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_finalized_state_invalid"
+        )
+    if (
+        _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
+        or _clean_text(existing_dataset_map.get("acquisition_root_run_id"))
+        != acquisition_root_run_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
+    validated_metadata = existing_dataset_map.get("publication_metadata_json")
+    if not isinstance(validated_metadata, dict):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_validated_metadata_invalid"
+        )
+    if (
+        not _clean_text(existing_dataset_map.get("dataset_hash"))
+        or existing_dataset_map.get("validated_at") is None
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_validated_proof_invalid"
+        )
+    return EndpointDatasetCandidateSelection(
+        dataset_id=dataset_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+        previous_dataset_id=_clean_text(
+            existing_dataset_map.get("previous_dataset_id")
+        ),
+        reused_from_checkpoint=False,
+        already_validated=True,
+        validated_metadata=validated_metadata,
+    )
+
+
 async def _previous_endpoint_dataset_id(
     existing_dataset_map: dict[str, Any],
     endpoint_id: str,
@@ -25861,6 +26888,14 @@ async def _select_endpoint_dataset_candidate(
         owner_key,
     )
     existing_dataset_map = await _endpoint_dataset_state(dataset_id)
+    validated_selection = _validated_endpoint_dataset_selection(
+        existing_dataset_map,
+        dataset_id,
+        endpoint_id,
+        acquisition_root_run_id,
+    )
+    if validated_selection is not None:
+        return validated_selection
     published_selection = _published_endpoint_dataset_selection(
         existing_dataset_map,
         dataset_id,
@@ -25925,13 +26960,21 @@ async def _select_resumable_endpoint_dataset_candidate(
     )
 
 
-def _assert_published_endpoint_dataset_replay(
+def _finalized_endpoint_dataset_metadata(
+    candidate: EndpointDatasetCandidate,
+) -> tuple[dict[str, Any] | None, str]:
+    if candidate.already_validated:
+        return candidate.validated_metadata, "validated"
+    return candidate.published_metadata, "published"
+
+
+def _assert_finalized_endpoint_dataset_replay(
     candidate: EndpointDatasetCandidate,
 ) -> None:
-    metadata = candidate.published_metadata
+    metadata, state_name = _finalized_endpoint_dataset_metadata(candidate)
     if not isinstance(metadata, dict):
         raise RuntimeError(
-            "provider_directory_endpoint_dataset_published_metadata_invalid"
+            f"provider_directory_endpoint_dataset_{state_name}_metadata_invalid"
         )
     expected_identity_by_field = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
@@ -25944,12 +26987,19 @@ def _assert_published_endpoint_dataset_replay(
         for key, expected_field_value in expected_identity_by_field.items()
     ):
         raise RuntimeError(
-            "provider_directory_endpoint_dataset_published_identity_mismatch"
+            f"provider_directory_endpoint_dataset_{state_name}_identity_mismatch"
         )
     if not isinstance(metadata.get("resource_diagnostics"), dict):
         raise RuntimeError(
-            "provider_directory_endpoint_dataset_published_diagnostics_invalid"
+            f"provider_directory_endpoint_dataset_{state_name}_diagnostics_invalid"
         )
+
+
+def _assert_published_endpoint_dataset_replay(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Retain the published-replay helper used by focused callers."""
+    _assert_finalized_endpoint_dataset_replay(candidate)
 
 
 def _candidate_partition_initializations(
@@ -26022,6 +27072,8 @@ def _build_endpoint_dataset_candidate(
         checkpoint_context=bound_checkpoint_context,
         reused_from_checkpoint=selection.reused_from_checkpoint,
         repair_empty_orphan=selection.repair_empty_orphan,
+        already_validated=selection.already_validated,
+        validated_metadata=selection.validated_metadata,
         already_published=selection.already_published,
         published_metadata=selection.published_metadata,
     )
@@ -26074,8 +27126,8 @@ async def _prepare_endpoint_dataset_candidate(
         run_id,
         checkpoint_context,
     )
-    if candidate.already_published:
-        _assert_published_endpoint_dataset_replay(candidate)
+    if candidate.already_validated or candidate.already_published:
+        _assert_finalized_endpoint_dataset_replay(candidate)
         return candidate
     partition_initializations = _candidate_partition_initializations(
         source_records,
@@ -28396,13 +29448,18 @@ async def _mark_endpoint_dataset_candidate(
            AND dataset.endpoint_id = :endpoint_id
            AND dataset.acquisition_root_run_id IS NOT DISTINCT FROM :acquisition_root_run_id
            AND dataset.is_current = false
-           AND dataset.status NOT IN (:published_status, :superseded_status);
+           AND dataset.status NOT IN (
+               :validated_status,
+               :published_status,
+               :superseded_status
+           );
         """,
         status=status,
         publication_metadata_json=json.dumps(metadata, sort_keys=True, default=_json_default),
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
         acquisition_root_run_id=candidate.acquisition_root_run_id,
+        validated_status=ENDPOINT_DATASET_VALIDATED,
         published_status=ENDPOINT_DATASET_PUBLISHED,
         superseded_status=ENDPOINT_DATASET_SUPERSEDED,
     )
@@ -28546,7 +29603,7 @@ def _assert_endpoint_dataset_bulk_freshness(
             raise RuntimeError("provider_directory_bulk_snapshot_older_than_current")
 
 
-async def _lock_endpoint_dataset_for_promotion(
+async def _lock_endpoint_dataset_for_validation(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> str | None:
@@ -28557,7 +29614,7 @@ async def _lock_endpoint_dataset_for_promotion(
         endpoint_id=candidate.endpoint_id,
     )
     if endpoint_record is None:
-        raise RuntimeError("provider_directory_api_endpoint_missing_during_promotion")
+        raise RuntimeError("provider_directory_api_endpoint_missing_during_validation")
     candidate_record = await connection.first(
         f"""
         SELECT dataset_id, acquisition_root_run_id, is_current, status,
@@ -28602,30 +29659,7 @@ async def _lock_endpoint_dataset_for_promotion(
     return current_dataset_id
 
 
-async def _supersede_endpoint_dataset(
-    connection: Any,
-    candidate: EndpointDatasetCandidate,
-    previous_dataset_id: str | None,
-) -> None:
-    if not previous_dataset_id:
-        return
-    await connection.status(
-        f"""
-        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-           SET status = :status,
-               is_current = false,
-               superseded_at = now()
-         WHERE dataset_id = :previous_dataset_id
-           AND endpoint_id = :endpoint_id
-           AND is_current = true;
-        """,
-        status=ENDPOINT_DATASET_SUPERSEDED,
-        previous_dataset_id=previous_dataset_id,
-        endpoint_id=candidate.endpoint_id,
-    )
-
-
-async def _publish_endpoint_dataset(
+async def _store_validated_endpoint_dataset(
     connection: Any,
     candidate: EndpointDatasetCandidate,
     previous_dataset_id: str | None,
@@ -28633,27 +29667,31 @@ async def _publish_endpoint_dataset(
     resource_count: int,
     metadata: dict[str, Any],
 ) -> None:
-    promoted_count = await connection.status(
+    validated_count = await connection.status(
         f"""
         UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
            SET previous_dataset_id = :previous_dataset_id,
                dataset_hash = :dataset_hash,
                status = :status,
-               is_current = true,
+               is_current = false,
                resource_count = :resource_count,
                validated_at = now(),
-               published_at = now(),
+               published_at = NULL,
                superseded_at = NULL,
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
          WHERE dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
            AND acquisition_root_run_id IS NOT DISTINCT FROM :acquisition_root_run_id
            AND is_current = false
-           AND status NOT IN (:published_status, :superseded_status);
+           AND status NOT IN (
+               :validated_status,
+               :published_status,
+               :superseded_status
+           );
         """,
         previous_dataset_id=previous_dataset_id,
         dataset_hash=dataset_hash,
-        status=ENDPOINT_DATASET_PUBLISHED,
+        status=ENDPOINT_DATASET_VALIDATED,
         resource_count=resource_count,
         publication_metadata_json=json.dumps(
             metadata,
@@ -28663,11 +29701,12 @@ async def _publish_endpoint_dataset(
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
         acquisition_root_run_id=candidate.acquisition_root_run_id,
+        validated_status=ENDPOINT_DATASET_VALIDATED,
         published_status=ENDPOINT_DATASET_PUBLISHED,
         superseded_status=ENDPOINT_DATASET_SUPERSEDED,
     )
-    if _coerce_rowcount(promoted_count) <= 0:
-        raise RuntimeError("provider_directory_endpoint_dataset_promotion_lost")
+    if _coerce_rowcount(validated_count) <= 0:
+        raise RuntimeError("provider_directory_endpoint_dataset_validation_lost")
 
 
 async def _validated_endpoint_bulk_transaction_times(
@@ -28690,41 +29729,6 @@ async def _validated_endpoint_bulk_transaction_times(
         previous_transaction_times,
     )
     return candidate_transaction_times
-
-
-async def _clear_published_endpoint_partition_state(
-    connection: Any,
-    candidate: EndpointDatasetCandidate,
-) -> None:
-    checkpoint_context = candidate.checkpoint_context
-    if not isinstance(checkpoint_context, PaginationCheckpointContext):
-        return
-    await connection.status(
-        f"""
-        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-         WHERE dataset_id = :dataset_id
-           AND resource_type LIKE 'LU:%:pass:%';
-        """,
-        dataset_id=candidate.dataset_id,
-    )
-    await connection.status(
-        f"""
-        DELETE FROM {_pagination_checkpoint_table_ref()}
-         WHERE dataset_id = :dataset_id
-           AND canonical_api_base = :canonical_api_base
-           AND source_scope_hash = :source_scope_hash
-           AND acquisition_root_run_id = :acquisition_root_run_id
-           AND resource_type = ANY(CAST(:resource_types AS varchar[]));
-        """,
-        dataset_id=candidate.dataset_id,
-        canonical_api_base=checkpoint_context.canonical_api_base,
-        source_scope_hash=checkpoint_context.source_scope_hash,
-        acquisition_root_run_id=checkpoint_context.acquisition_root_run_id,
-        resource_types=[
-            _last_updated_partition_checkpoint_resource_type(resource_type)
-            for resource_type in candidate.selected_resources
-        ],
-    )
 
 
 async def _build_endpoint_dataset_serving_relations(
@@ -28758,16 +29762,16 @@ async def _build_endpoint_dataset_serving_relations(
     }
 
 
-async def _promote_endpoint_dataset_candidate(
+async def _validate_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Atomically replace the current endpoint dataset with a fresher candidate."""
+    """Persist immutable completion proof without changing the serving pointer."""
     async with db.acquire() as connection:
         await connection.status(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
         )
-        current_dataset_id = await _lock_endpoint_dataset_for_promotion(
+        current_dataset_id = await _lock_endpoint_dataset_for_validation(
             connection,
             candidate,
         )
@@ -28796,12 +29800,7 @@ async def _promote_endpoint_dataset_candidate(
             bulk_transaction_times=candidate_transaction_times,
             **relation_proof_by_name,
         )
-        await _supersede_endpoint_dataset(
-            connection,
-            candidate,
-            current_dataset_id,
-        )
-        await _publish_endpoint_dataset(
+        await _store_validated_endpoint_dataset(
             connection,
             candidate,
             previous_dataset_id,
@@ -28809,14 +29808,15 @@ async def _promote_endpoint_dataset_candidate(
             resource_count,
             metadata,
         )
-        await _clear_published_endpoint_partition_state(connection, candidate)
     return {
         "dataset_id": candidate.dataset_id,
         "previous_dataset_id": previous_dataset_id,
         "dataset_hash": dataset_hash,
         "resource_count": resource_count,
         **relation_proof_by_name,
-        "published": True,
+        "status": ENDPOINT_DATASET_VALIDATED,
+        "validated": True,
+        "published": False,
     }
 
 
@@ -28827,7 +29827,7 @@ async def _finalize_endpoint_dataset_candidate(
     if candidate is None:
         return None
     if _is_endpoint_dataset_publishable(candidate, diagnostics):
-        return await _promote_endpoint_dataset_candidate(
+        return await _validate_endpoint_dataset_candidate(
             candidate,
             diagnostics,
         )
@@ -28928,14 +29928,16 @@ ResourceImportGroupResult = tuple[
 ]
 
 
-def _published_endpoint_dataset_import_summary(
+def _finalized_endpoint_dataset_import_summary(
     candidate: EndpointDatasetCandidate,
+    resource_completion: dict[str, set[str]] | None = None,
 ) -> ResourceImportGroupResult:
-    _assert_published_endpoint_dataset_replay(candidate)
-    assert candidate.published_metadata is not None
-    persisted_diagnostics = candidate.published_metadata[
-        "resource_diagnostics"
-    ]
+    _assert_finalized_endpoint_dataset_replay(candidate)
+    finalized_metadata, state_name = _finalized_endpoint_dataset_metadata(
+        candidate
+    )
+    assert finalized_metadata is not None
+    persisted_diagnostics = finalized_metadata["resource_diagnostics"]
     diagnostics_by_resource = {
         resource_type: dict(persisted_diagnostics[resource_type])
         for resource_type in candidate.selected_resources
@@ -28943,8 +29945,19 @@ def _published_endpoint_dataset_import_summary(
     }
     if set(diagnostics_by_resource) != set(candidate.selected_resources):
         raise RuntimeError(
-            "provider_directory_endpoint_dataset_published_diagnostics_incomplete"
+            "provider_directory_endpoint_dataset_"
+            f"{state_name}_diagnostics_incomplete"
         )
+    if not _is_endpoint_dataset_publishable(candidate, diagnostics_by_resource):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_"
+            f"{state_name}_completion_proof_invalid"
+        )
+    if resource_completion is not None:
+        for resource_type in candidate.selected_resources:
+            resource_completion.setdefault(resource_type, set()).update(
+                candidate.source_ids
+            )
     return (
         list(candidate.source_ids),
         diagnostics_by_resource,
@@ -28954,6 +29967,22 @@ def _published_endpoint_dataset_import_summary(
         {},
         {},
     )
+
+
+def _is_finalized_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate | None,
+) -> bool:
+    return bool(
+        candidate is not None
+        and (candidate.already_validated or candidate.already_published)
+    )
+
+
+def _published_endpoint_dataset_import_summary(
+    candidate: EndpointDatasetCandidate,
+) -> ResourceImportGroupResult:
+    """Retain the published-only helper name for focused callers."""
+    return _finalized_endpoint_dataset_import_summary(candidate)
 
 
 async def _mark_failed_endpoint_dataset_without_masking(
@@ -29674,9 +30703,11 @@ async def _import_resources(
                             ),
                         )
                     )
-                    if candidate is not None and candidate.already_published:
-                        return _published_endpoint_dataset_import_summary(
-                            candidate
+                    if _is_finalized_endpoint_dataset_candidate(candidate):
+                        assert candidate is not None
+                        return _finalized_endpoint_dataset_import_summary(
+                            candidate,
+                            resource_completion,
                         )
                     try:
                         import_summary = await import_one_group(

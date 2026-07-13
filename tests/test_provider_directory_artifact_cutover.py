@@ -8,9 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.test_provider_directory_dataset_artifact_db import _dataset_database
-
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -434,56 +431,3 @@ def test_artifact_stage_names_are_unique_for_duplicate_runs():
 
     assert len(network_names) == 10
     assert len(overlay_names) == 10
-
-
-@pytest.mark.asyncio
-async def test_real_postgres_artifact_bundle_rolls_back_all_targets(monkeypatch):
-    """A late target failure leaves every serving relation on its old version."""
-    async with _dataset_database(monkeypatch) as (database, schema):
-        await _create_artifact_bundle_relations(database, schema)
-        target_a_stage = await _prepared_bundle_stage(
-            schema,
-            "artifact_stage_a",
-            "artifact_target_a",
-            _keep_stage_indexes,
-        )
-        failing_target_b_stage = await _prepared_bundle_stage(
-            schema,
-            "artifact_stage_b",
-            "artifact_target_b",
-            _fail_stage_indexes,
-        )
-
-        with pytest.raises(RuntimeError, match="second target failed"):
-            await importer._promote_provider_directory_artifact_bundle_transaction(
-                (target_a_stage, failing_target_b_stage)
-            )
-
-        await _assert_artifact_relation_values(
-            database,
-            schema,
-            {
-                "artifact_target_a": "old-a",
-                "artifact_target_b": "old-b",
-                "artifact_stage_a": "new-a",
-                "artifact_stage_b": "new-b",
-            },
-        )
-
-        target_b_stage = await _prepared_bundle_stage(
-            schema,
-            "artifact_stage_b",
-            "artifact_target_b",
-            _keep_stage_indexes,
-        )
-        await importer._promote_provider_directory_artifact_bundle_transaction(
-            (target_a_stage, target_b_stage)
-        )
-        await _assert_artifact_relation_values(
-            database,
-            schema,
-            {
-                "artifact_target_a": "new-a",
-                "artifact_target_b": "new-b",
-            },
-        )

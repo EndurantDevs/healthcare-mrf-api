@@ -6772,26 +6772,34 @@ async def test_alias_group_writes_one_compatibility_copy(monkeypatch):
 
 def _artifact_dataset(
     source_id: str = "source_a",
-    *,
-    endpoint_id: str = "endpoint_1",
-    dataset_id: str = "dataset_current",
-    evidence_run_id: str = "acquisition_root",
-    selected_resources: tuple[str, ...] = (),
-    expected_resources: tuple[str, ...] | None = None,
-    recorded_expected_resources: tuple[str, ...] | None = None,
+    **dataset_overrides: Any,
 ) -> importer.ProviderDirectoryArtifactDataset:
+    dataset_field_map = {
+        "endpoint_id": "endpoint_1",
+        "dataset_id": "dataset_current",
+        "evidence_run_id": "acquisition_root",
+        "selected_resources": (),
+        "recorded_expected_resources": None,
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+        "previous_dataset_id": None,
+        "expected_incumbent_dataset_id": None,
+        "promote_on_cutover": False,
+        "dataset_hash": None,
+        "resource_count": None,
+        "validated_at": None,
+        "publication_metadata_hash": None,
+    }
+    expected_resources = dataset_overrides.pop("expected_resources", None)
+    dataset_field_map.update(dataset_overrides)
     return importer.ProviderDirectoryArtifactDataset(
         source_id=source_id,
-        endpoint_id=endpoint_id,
-        dataset_id=dataset_id,
-        evidence_run_id=evidence_run_id,
-        selected_resources=selected_resources,
         expected_resources=(
-            selected_resources
+            dataset_field_map["selected_resources"]
             if expected_resources is None
             else expected_resources
         ),
-        recorded_expected_resources=recorded_expected_resources,
+        **dataset_field_map,
     )
 
 
@@ -6959,9 +6967,181 @@ async def test_artifact_dataset_selection_expands_aliases_and_filters_all_source
     ]
     assert "requested_sources AS MATERIALIZED" in explicit_sql
     assert "sibling.endpoint_id = requested.endpoint_id" in explicit_sql
-    assert "published_endpoints AS MATERIALIZED" in all_sql
-    assert "HAVING COUNT(*) = 1" in all_sql
+    assert "selected_endpoints AS MATERIALIZED" in all_sql
+    assert "ranked_datasets AS MATERIALIZED" in all_sql
+    assert "validated_candidate_count" in all_sql
     assert "dataset.superseded_at IS NULL" in all_sql
+
+
+def _artifact_selection_row(
+    source_id: str,
+    endpoint_id: str,
+    dataset_id: str,
+    **selection_overrides: Any,
+) -> dict[str, Any]:
+    selection_field_map = {
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+        "previous_dataset_id": None,
+        "current_dataset_id": dataset_id,
+        "validated_candidate_count": 0,
+        "promote_on_cutover": False,
+    }
+    selection_field_map.update(selection_overrides)
+    metadata = {
+        "selected_resources": ["Location"],
+        "expected_resources": ["Location"],
+        "resource_diagnostics": {"Location": {"complete": True}},
+    }
+    return {
+        "source_id": source_id,
+        "endpoint_id": endpoint_id,
+        "source_record_json": _artifact_source_record(
+            source_id,
+            ("Location",),
+        ),
+        "dataset_id": dataset_id,
+        "evidence_run_id": f"root_{endpoint_id}",
+        "selected_resources": ["Location"],
+        "recorded_expected_resources": ["Location"],
+        "status": selection_field_map["status"],
+        "is_current": selection_field_map["is_current"],
+        "previous_dataset_id": selection_field_map["previous_dataset_id"],
+        "dataset_hash": "a" * 64,
+        "resource_count": 1,
+        "validated_at": "2026-07-13T10:00:00",
+        "publication_metadata_json": metadata,
+        "current_dataset_count": (
+            1 if selection_field_map["current_dataset_id"] else 0
+        ),
+        "current_dataset_id": selection_field_map["current_dataset_id"],
+        "validated_candidate_count": selection_field_map[
+            "validated_candidate_count"
+        ],
+        "promote_on_cutover": selection_field_map["promote_on_cutover"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_full_artifact_selection_prefers_validated_and_falls_back_to_current(
+    monkeypatch,
+):
+    lookup = AsyncMock(
+        return_value=[
+            _artifact_selection_row(
+                "source_candidate",
+                "endpoint_candidate",
+                "dataset_candidate",
+                status=importer.ENDPOINT_DATASET_VALIDATED,
+                is_current=False,
+                previous_dataset_id="dataset_incumbent",
+                current_dataset_id="dataset_incumbent",
+                validated_candidate_count=1,
+                promote_on_cutover=True,
+            ),
+            _artifact_selection_row(
+                "source_current",
+                "endpoint_current",
+                "dataset_current",
+                status=importer.ENDPOINT_DATASET_PUBLISHED,
+                is_current=True,
+                previous_dataset_id="dataset_older",
+                current_dataset_id="dataset_current",
+                validated_candidate_count=0,
+                promote_on_cutover=False,
+            ),
+        ]
+    )
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    fence = await importer._resolve_provider_directory_artifact_datasets(
+        None,
+        should_select_validated_candidates=True,
+    )
+
+    assert fence.should_select_validated_candidates is True
+    assert [dataset.dataset_id for dataset in fence.promotion_datasets] == [
+        "dataset_candidate"
+    ]
+    assert fence.incumbent_dataset_ids == {
+        "endpoint_candidate": "dataset_incumbent",
+        "endpoint_current": "dataset_current",
+    }
+    assert (
+        lookup.await_args.kwargs["select_validated_candidates"] is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_targeted_artifact_selection_remains_current_only(monkeypatch):
+    lookup = AsyncMock(
+        return_value=[
+            _artifact_selection_row(
+                "source_a",
+                "endpoint_1",
+                "dataset_current",
+                status=importer.ENDPOINT_DATASET_PUBLISHED,
+                is_current=True,
+                previous_dataset_id="dataset_older",
+                current_dataset_id="dataset_current",
+                validated_candidate_count=1,
+                promote_on_cutover=False,
+            )
+        ]
+    )
+    monkeypatch.setattr(importer.db, "all", lookup)
+
+    fence = await importer._resolve_provider_directory_artifact_datasets(
+        ["source_a"],
+        should_select_validated_candidates=False,
+    )
+
+    assert fence.dataset_id_by_endpoint_id == {
+        "endpoint_1": "dataset_current"
+    }
+    assert fence.promotion_datasets == []
+    assert (
+        lookup.await_args.kwargs["select_validated_candidates"] is False
+    )
+
+
+def test_full_artifact_selection_fails_closed_on_multiple_validated_candidates():
+    ambiguous_row = _artifact_selection_row(
+        "source_a",
+        "endpoint_1",
+        "dataset_candidate_a",
+        status=importer.ENDPOINT_DATASET_VALIDATED,
+        is_current=False,
+        previous_dataset_id="dataset_current",
+        current_dataset_id="dataset_current",
+        validated_candidate_count=2,
+        promote_on_cutover=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_artifact_validated_candidate_ambiguous",
+    ):
+        importer._validate_provider_directory_artifact_datasets(
+            [ambiguous_row],
+            ["source_a"],
+            should_select_validated_candidates=True,
+        )
+
+
+def test_only_full_base_artifact_publication_can_promote_candidates():
+    all_targets = set(importer.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS)
+
+    assert importer._should_select_validated_artifacts(None)
+    assert importer._should_select_validated_artifacts(
+        all_targets
+    )
+    assert not importer._should_select_validated_artifacts(
+        {"corroboration"}
+    )
+    assert not importer._should_select_validated_artifacts(
+        all_targets - {"profile"}
+    )
 
 
 def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
@@ -7378,13 +7558,13 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
         )
 
     endpoint_lock_sql = lookup.await_args_list[0].args[0]
-    tuple_lock_sql = lookup.await_args_list[1].args[0]
-    assert "FOR SHARE" in endpoint_lock_sql
+    alias_lock_sql = lookup.await_args_list[1].args[0]
+    assert "FOR UPDATE" in endpoint_lock_sql
     assert "provider_directory_api_endpoint" in endpoint_lock_sql
     assert status.await_args.args[0].startswith("LOCK TABLE")
-    assert "FOR SHARE OF source, dataset" in tuple_lock_sql
-    assert "source.endpoint_id = ANY" in tuple_lock_sql
-    assert "dataset.superseded_at IS NULL" in tuple_lock_sql
+    assert "FOR SHARE OF source" in alias_lock_sql
+    assert "source.endpoint_id = ANY" in alias_lock_sql
+    assert "provider_directory_endpoint_dataset" not in alias_lock_sql
 
 
 def test_artifact_target_dependencies_fail_before_an_unsafe_target_build():
@@ -7520,7 +7700,9 @@ async def test_dataset_artifact_bundle_promotes_after_complete_stage_build(monke
     )
     scope_options_by_name: dict[str, Any] = {}
     events: list[str] = []
-    promote_bundle = AsyncMock(side_effect=lambda: events.append("promote"))
+    promote_bundle = AsyncMock(
+        side_effect=lambda: events.append("promote") or 1
+    )
 
     @contextlib.asynccontextmanager
     async def dataset_scope(**kwargs):
@@ -7569,6 +7751,202 @@ async def test_dataset_artifact_bundle_promotes_after_complete_stage_build(monke
     assert importer._PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get() is None
     assert scope_options_by_name["resource_types"] == frozenset(
         {"Location", "Organization", "Practitioner"}
+    )
+
+
+def _validated_artifact_candidate_fence():
+    metadata_hash = importer._identity_hash(
+        {
+            "selected_resources": ["Location"],
+            "expected_resources": ["Location"],
+        }
+    )
+    candidate = _artifact_dataset(
+        dataset_id="dataset_candidate",
+        status=importer.ENDPOINT_DATASET_VALIDATED,
+        is_current=False,
+        previous_dataset_id="dataset_current",
+        expected_incumbent_dataset_id="dataset_current",
+        promote_on_cutover=True,
+        dataset_hash="a" * 64,
+        resource_count=1,
+        validated_at="2026-07-13T10:00:00",
+        publication_metadata_hash=metadata_hash,
+        selected_resources=("Location",),
+    )
+    return importer.ProviderDirectoryArtifactDatasetFence(
+        (candidate,),
+        should_select_validated_candidates=True,
+    )
+
+
+def _complete_candidate_artifact_metrics():
+    return {
+        importer.PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY: {
+            "published": True
+        },
+        importer.PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY: {
+            "published": True
+        },
+        "location_contacts_backfilled": {"rows": 0},
+        "location_coordinates_backfilled": 0,
+        "resource_id_npis_backfilled": 0,
+        "location_address_keys_stamped": 0,
+        "location_archive": {"inserted": 0},
+        "address_overlay": {"published": True},
+        "profile": {"profile_rows": 0},
+        "network_catalog": {"published": True},
+    }
+
+
+def _complete_candidate_artifact_bundle():
+    keep_indexes = AsyncMock()
+    return importer.ProviderDirectoryArtifactBundle(
+        stages=[
+            importer.ProviderDirectoryPreparedArtifactStage(
+                "mrf",
+                f"stage_{relation_name}",
+                relation_name,
+                keep_indexes,
+            )
+            for relation_name in (
+                importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                importer.profile_artifact.PROFILE_EVIDENCE_TABLE,
+                importer.profile_artifact.PROFILE_TABLE,
+                importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE,
+            )
+        ]
+    )
+
+
+def test_candidate_artifact_bundle_fails_closed_on_skipped_required_target():
+    metrics = _complete_candidate_artifact_metrics()
+    metrics["network_catalog"] = {
+        "skipped": True,
+        "reason": "provider_directory_insurance_plan_unavailable",
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_candidate_artifact_skipped:network_catalog",
+    ):
+        importer._assert_candidate_artifact_bundle_complete(
+            _validated_artifact_candidate_fence(),
+            metrics,
+            _complete_candidate_artifact_bundle(),
+            publish_corroboration=False,
+            publish_artifacts_targets=None,
+        )
+
+
+def test_candidate_artifact_bundle_requires_every_deferred_relation():
+    artifact_bundle = _complete_candidate_artifact_bundle()
+    artifact_bundle.stages = [
+        stage
+        for stage in artifact_bundle.stages
+        if stage.target_relation
+        != importer.PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_candidate_artifact_bundle_incomplete",
+    ):
+        importer._assert_candidate_artifact_bundle_complete(
+            _validated_artifact_candidate_fence(),
+            _complete_candidate_artifact_metrics(),
+            artifact_bundle,
+            publish_corroboration=False,
+            publish_artifacts_targets=None,
+        )
+
+
+def _install_confirmed_promotion_harness(monkeypatch, fence, events):
+    """Install deterministic build, promotion, and cleanup collaborators."""
+    resolve = AsyncMock(return_value=fence)
+    @contextlib.asynccontextmanager
+    async def dataset_scope(**_kwargs):
+        yield fence
+
+    async def publish_artifacts(**kwargs):
+        events.append("build")
+        return kwargs["metrics"]
+
+    async def promote_bundle(_bundle):
+        events.append("promote")
+        return 1
+
+    async def clear_retry_state(_fence):
+        events.append("clear")
+        return ["dataset_candidate"]
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        resolve,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_provider_directory_artifact_target_dependencies",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_current_dataset_relation_artifacts",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_dataset_scope",
+        dataset_scope,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_artifacts",
+        publish_artifacts,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_candidate_artifact_bundle_complete",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        importer.ProviderDirectoryArtifactBundle,
+        "promote",
+        promote_bundle,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_clear_promoted_endpoint_dataset_retry_state",
+        clear_retry_state,
+    )
+    return resolve
+
+
+@pytest.mark.asyncio
+async def test_full_bundle_clears_retry_state_only_after_confirmed_promotion(
+    monkeypatch,
+):
+    fence = _validated_artifact_candidate_fence()
+    events: list[str] = []
+    resolve = _install_confirmed_promotion_harness(
+        monkeypatch,
+        fence,
+        events,
+    )
+
+    metrics = await importer._publish_provider_directory_dataset_artifacts(
+        run_id="publish-run",
+        metrics={},
+        source_ids=["source_a"],
+        publish_corroboration=False,
+        publish_artifacts_targets=None,
+    )
+
+    assert events == ["build", "promote", "clear"]
+    assert metrics["artifact_promoted_dataset_ids"] == ["dataset_candidate"]
+    assert all(
+        call.kwargs["should_select_validated_candidates"] is True
+        for call in resolve.await_args_list
     )
 
 
@@ -7822,9 +8200,9 @@ def test_endpoint_dataset_metadata_has_versioned_completion_proof():
 @pytest.mark.asyncio
 async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatch):
     mark_candidate = AsyncMock()
-    promote_candidate = AsyncMock()
+    validate_candidate = AsyncMock()
     monkeypatch.setattr(importer, "_mark_endpoint_dataset_candidate", mark_candidate)
-    monkeypatch.setattr(importer, "_promote_endpoint_dataset_candidate", promote_candidate)
+    monkeypatch.setattr(importer, "_validate_endpoint_dataset_candidate", validate_candidate)
     diagnostics_by_resource = {
         "Practitioner": {
             "complete": False,
@@ -7849,7 +8227,50 @@ async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatc
         importer.ENDPOINT_DATASET_INCOMPLETE,
         diagnostics_by_resource,
     )
-    promote_candidate.assert_not_awaited()
+    validate_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_endpoint_dataset_candidate_does_not_change_current_pointer(
+    monkeypatch,
+):
+    mark_candidate = AsyncMock()
+    validate_candidate = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_mark_endpoint_dataset_candidate",
+        mark_candidate,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_validate_endpoint_dataset_candidate",
+        validate_candidate,
+    )
+    diagnostics_by_resource = {
+        "Practitioner": {
+            "complete": False,
+            "bounded": False,
+            "error": "upstream_failed",
+            "next_url_remaining": False,
+        }
+    }
+
+    summary = await importer._finalize_endpoint_dataset_candidate(
+        _endpoint_dataset_candidate(),
+        diagnostics_by_resource,
+    )
+
+    assert summary == {
+        "dataset_id": "dataset_new",
+        "status": importer.ENDPOINT_DATASET_FAILED,
+        "published": False,
+    }
+    mark_candidate.assert_awaited_once_with(
+        _endpoint_dataset_candidate(),
+        importer.ENDPOINT_DATASET_FAILED,
+        diagnostics_by_resource,
+    )
+    validate_candidate.assert_not_awaited()
 
 
 class _EndpointDatasetPromotionHarness:
@@ -7915,23 +8336,15 @@ class _EndpointDatasetPromotionHarness:
         sql_text = str(sql)
         if sql_text.startswith("SET TRANSACTION"):
             self.events.append("set_snapshot")
-        elif "superseded_at = now()" in sql_text:
-            self.events.append("supersede")
-            self.datasets[params["previous_dataset_id"]].update(
-                is_current=False,
-                status=params["status"],
-            )
-        elif "resource_type LIKE 'LU:%:pass:%'" in sql_text:
-            self.events.append("clear_partition_proof")
-        elif "provider_directory_pagination_checkpoint" in sql_text:
-            self.events.append("clear_partition_checkpoint")
-        else:
-            self.events.append("publish")
-            self.datasets[params["dataset_id"]].update(
-                is_current=True,
-                status=params["status"],
-                previous_dataset_id=params["previous_dataset_id"],
-            )
+            return 1
+        if params.get("status") != importer.ENDPOINT_DATASET_VALIDATED:
+            raise AssertionError(f"unexpected validation SQL: {sql_text}")
+        self.events.append("validate")
+        self.datasets[params["dataset_id"]].update(
+            is_current=False,
+            status=params["status"],
+            previous_dataset_id=params["previous_dataset_id"],
+        )
         return 1
 
 
@@ -7954,7 +8367,7 @@ def _mock_endpoint_dataset_serving_builds(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_endpoint_dataset_publication_atomically_supersedes_current(monkeypatch):
+async def test_endpoint_dataset_completion_validates_without_superseding_current(monkeypatch):
     harness = _EndpointDatasetPromotionHarness()
     monkeypatch.setattr(importer.db, "acquire", lambda: harness)
     monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 2)
@@ -7968,7 +8381,7 @@ async def test_endpoint_dataset_publication_atomically_supersedes_current(monkey
         }
     }
 
-    publication_summary_map = await importer._finalize_endpoint_dataset_candidate(
+    validation_summary_map = await importer._finalize_endpoint_dataset_candidate(
         _endpoint_dataset_candidate(),
         diagnostics_by_resource,
     )
@@ -7982,18 +8395,20 @@ async def test_endpoint_dataset_publication_atomically_supersedes_current(monkey
         "lock_current",
         "read_resources",
         "read_resources",
-        "supersede",
-        "publish",
+        "validate",
         "commit",
     ]
     assert harness.datasets["dataset_old"] == {
         "dataset_id": "dataset_old",
-        "is_current": False,
-        "status": importer.ENDPOINT_DATASET_SUPERSEDED,
+        "is_current": True,
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
     }
     assert harness.datasets["dataset_new"]["previous_dataset_id"] == "dataset_old"
-    assert harness.datasets["dataset_new"]["is_current"] is True
-    assert publication_summary_map["resource_count"] == 3
+    assert harness.datasets["dataset_new"]["is_current"] is False
+    assert harness.datasets["dataset_new"]["status"] == importer.ENDPOINT_DATASET_VALIDATED
+    assert validation_summary_map["resource_count"] == 3
+    assert validation_summary_map["published"] is False
+    assert validation_summary_map["validated"] is True
     assert harness.max_batch_rows == 2
     expected_hash_input = "\n".join(
         importer._stable_identity_json(identity)
@@ -8006,13 +8421,13 @@ async def test_endpoint_dataset_publication_atomically_supersedes_current(monkey
             for dataset_resource in harness.resources
         )
     )
-    assert publication_summary_map["dataset_hash"] == hashlib.sha256(
+    assert validation_summary_map["dataset_hash"] == hashlib.sha256(
         expected_hash_input.encode("utf-8")
     ).hexdigest()
 
 
 @pytest.mark.asyncio
-async def test_endpoint_dataset_publication_cleans_partition_state_atomically(
+async def test_endpoint_dataset_validation_preserves_partition_state(
     monkeypatch,
 ):
     harness = _EndpointDatasetPromotionHarness()
@@ -8046,13 +8461,12 @@ async def test_endpoint_dataset_publication_cleans_partition_state_atomically(
         diagnostics_by_resource,
     )
 
-    assert publication_summary["published"] is True
+    assert publication_summary["published"] is False
+    assert publication_summary["validated"] is True
     assert harness.committed is True
-    assert harness.events[-3:] == [
-        "clear_partition_proof",
-        "clear_partition_checkpoint",
-        "commit",
-    ]
+    assert "clear_partition_proof" not in harness.events
+    assert "clear_partition_checkpoint" not in harness.events
+    assert harness.events[-2:] == ["validate", "commit"]
 
 
 @pytest.mark.asyncio
@@ -8428,6 +8842,17 @@ def _published_endpoint_dataset_source_record():
     }
 
 
+def _assert_validated_replay_completion(candidate):
+    completions_by_resource = {"Practitioner": {"fresh_source"}}
+    assert importer._finalized_endpoint_dataset_import_summary(
+        candidate,
+        completions_by_resource,
+    )[2] == {"Practitioner": 0}
+    assert completions_by_resource == {
+        "Practitioner": {"fresh_source", "source_a"}
+    }
+
+
 def _install_published_endpoint_dataset_mocks(monkeypatch):
     checkpoint_lookup = AsyncMock()
     monkeypatch.setattr(
@@ -8487,6 +8912,64 @@ async def test_endpoint_dataset_published_root_is_idempotent(monkeypatch):
     assert importer._published_endpoint_dataset_import_summary(candidate)[2] == {
         "Practitioner": 0
     }
+    checkpoint_lookup.assert_not_awaited()
+    ensure_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_validated_root_is_idempotent(monkeypatch):
+    """A retry replays validated diagnostics without refetch or downgrade."""
+    checkpoint_context = _published_endpoint_dataset_test_context()
+    dataset_id = importer._endpoint_dataset_candidate_id(
+        "endpoint_1",
+        ("Practitioner",),
+        "run_original",
+    )
+    checkpoint_lookup = AsyncMock()
+    ensure_candidate = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_checkpoint_candidate_dataset_id",
+        checkpoint_lookup,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(
+            return_value={
+                "endpoint_id": "endpoint_1",
+                "acquisition_root_run_id": "run_original",
+                "status": importer.ENDPOINT_DATASET_VALIDATED,
+                "is_current": False,
+                "previous_dataset_id": "dataset_current",
+                "dataset_hash": "a" * 64,
+                "validated_at": "2026-07-13T10:00:00",
+                "publication_metadata_json": (
+                    _published_endpoint_dataset_metadata_by_field()
+                ),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_ensure_endpoint_dataset_candidate",
+        ensure_candidate,
+    )
+
+    candidate = await importer._prepare_endpoint_dataset_candidate(
+        [_published_endpoint_dataset_source_record()],
+        ["Practitioner"],
+        run_id="run_retry",
+        retry_of_run_id="run_original",
+        pagination_root_run_id="run_original",
+        checkpoint_context=checkpoint_context,
+    )
+
+    assert candidate is not None
+    assert candidate.dataset_id == dataset_id
+    assert candidate.already_validated is True
+    assert candidate.already_published is False
+    _assert_validated_replay_completion(candidate)
     checkpoint_lookup.assert_not_awaited()
     ensure_candidate.assert_not_awaited()
 
@@ -9458,7 +9941,7 @@ async def test_publish_provider_directory_location_archive_resolves_and_cleans_s
 
 @pytest.mark.asyncio
 async def test_location_archive_holds_active_dataset_fence_through_resolve(monkeypatch):
-    """Archive mutation keeps endpoint identity stable without a source-table lock."""
+    """Archive mutation keeps the complete dataset fence through resolve."""
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset(selected_resources=("Location", "Organization")),)
     )
@@ -9468,19 +9951,17 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
         inserted = 1
         provenance_updates = 0
 
-    endpoint_lock = AsyncMock(side_effect=lambda *_args: events.append("endpoint_lock"))
-    fence_verify = AsyncMock(side_effect=lambda *_args: events.append("verify"))
+    fence_lock = AsyncMock(side_effect=lambda *_args: events.append("fence_lock"))
     resolve = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("resolve") or Stats())
     backfill = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("backfill") or 2)
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "transaction", lambda: _recording_transaction(events))
-    monkeypatch.setattr(importer, "_lock_artifact_fence_endpoints", endpoint_lock)
     monkeypatch.setattr(
         importer,
-        "_verify_provider_directory_artifact_dataset_fence",
-        fence_verify,
+        "_lock_and_verify_artifact_dataset_fence",
+        fence_lock,
     )
     monkeypatch.setattr(importer, "resolve_into_archive", resolve)
     monkeypatch.setattr(importer, "_backfill_archive_openaddresses_coordinates", backfill)
@@ -9496,14 +9977,12 @@ async def test_location_archive_holds_active_dataset_fence_through_resolve(monke
     assert archive_metrics["openaddresses_coordinate_backfill_rows"] == 2
     assert events == [
         "transaction-enter",
-        "endpoint_lock",
-        "verify",
+        "fence_lock",
         "resolve",
         "backfill",
         "transaction-exit",
     ]
-    endpoint_lock.assert_awaited_once_with(fence, importer.db)
-    fence_verify.assert_awaited_once_with(fence)
+    fence_lock.assert_awaited_once_with(fence, importer.db)
 
 
 @pytest.mark.asyncio

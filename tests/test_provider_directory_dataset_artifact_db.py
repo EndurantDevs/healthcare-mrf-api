@@ -51,8 +51,11 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "endpoint_id varchar(64) NOT NULL, "
         "import_run_id varchar(64), "
         "acquisition_root_run_id varchar(64), "
+        "previous_dataset_id varchar(96), "
+        "dataset_hash varchar(64), "
         "status varchar(32) NOT NULL, "
         "is_current boolean NOT NULL, "
+        "resource_count bigint NOT NULL DEFAULT 0, "
         "superseded_at timestamp, "
         "created_at timestamp, "
         "validated_at timestamp, "
@@ -224,6 +227,67 @@ async def _insert_next_shared_dataset(database: Database, schema: str) -> None:
     )
 
 
+async def _insert_validated_shared_dataset(
+    database: Database,
+    schema: str,
+    *,
+    dataset_id: str = "dataset_candidate",
+    root_run_id: str = "root-candidate",
+) -> None:
+    metadata = json.dumps(
+        {
+            "acquisition_root_run_id": root_run_id,
+            "selected_resources": ["Location"],
+            "expected_resources": ["Location"],
+            "source_ids": ["source_primary", "source_sibling"],
+            "resource_diagnostics": {
+                "Location": {
+                    "complete": True,
+                    "bounded": False,
+                    "error": None,
+                    "next_url_remaining": False,
+                }
+            },
+        }
+    )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
+        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
+        "previous_dataset_id, dataset_hash, status, is_current, "
+        "resource_count, validated_at, publication_metadata_json"
+        ") VALUES ("
+        ":dataset_id, 'endpoint_shared', 'run-candidate', :root_run_id, "
+        "'dataset_shared', :dataset_hash, :validated_status, false, "
+        "1, now(), CAST(:metadata AS json)"
+        ");",
+        dataset_id=dataset_id,
+        root_run_id=root_run_id,
+        dataset_hash="e" * 64,
+        validated_status=importer.ENDPOINT_DATASET_VALIDATED,
+        metadata=metadata,
+    )
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
+        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
+        ") VALUES ("
+        ":dataset_id, 'Location', 'location-candidate', :payload_hash, "
+        "CAST(:payload_json AS json)"
+        ");",
+        dataset_id=dataset_id,
+        payload_hash="f" * 64,
+        payload_json=json.dumps(
+            {
+                "status": "active",
+                "name": "Candidate Clinic",
+                "first_line": "2 Scope Way",
+                "city_name": "Austin",
+                "state_code": "TX",
+                "postal_code": "78702",
+            }
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_dataset_scope_expands_aliases_materializes_and_cleans(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
@@ -311,7 +375,7 @@ async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_cha
         )
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
-            match="provider_directory_source_endpoint_dataset_changed",
+            match="provider_directory_endpoint_dataset_current_changed",
         ):
             await importer._lock_and_verify_artifact_dataset_fence(fence)
 
