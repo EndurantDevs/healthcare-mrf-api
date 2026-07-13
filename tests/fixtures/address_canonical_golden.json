@@ -3736,6 +3736,19 @@
       "expected_premise_key": "80a48be7-cb1f-3d9f-f6b9-a1cd5c0dfd3a"
     },
     {
+      "id": "repeated-line2-bare-single-letter-unit-value",
+      "first_line": "2227 HALTOM RD STE F",
+      "second_line": "F",
+      "city": "HALTOM CITY",
+      "state": "TX",
+      "zip": "76117",
+      "country": "US",
+      "expected_identity_key": "v2|2227haltomrd|stef||TX|76117|US|street",
+      "expected_address_key": "cfcd4ada-89b0-2259-95a5-96c266aa1baa",
+      "expected_premise_identity_key": "v2|2227haltomrd|||TX|76117|US|street",
+      "expected_premise_key": "21550f2e-9e0a-febf-f08e-681ce311f250"
+    },
+    {
       "id": "repeated-line2-bare-office",
       "first_line": "2100 STANTONSBURG RD GME OFFICE",
       "second_line": "GME OFFICE",

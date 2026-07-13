@@ -24,6 +24,7 @@ FUNCTION_NAMES = (
     "addr_unit_value_valid_v1",
     "addr_floor_value_norm_v1",
     "addr_strip_duplicate_tail_unit_v1",
+    "addr_repeated_bare_line2_unit_v1",
     "addr_unit_norm_v1",
     "addr_street_token_norm_v1",
     "addr_street_token_is_suffix_v1",

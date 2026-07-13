@@ -349,6 +349,57 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION {qschema}.addr_repeated_bare_line2_unit_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+    l1 text := lower({qschema}.addr_space_norm_v1(line1));
+    l2 text := lower({qschema}.addr_space_norm_v1(line2));
+    bare_value text;
+    m text[];
+    prefix text;
+    unit_value text;
+    unit_value_raw text;
+    has_spaced_suffix boolean;
+BEGIN
+    IF l1 = '' OR l2 = '' OR right(l1, length(l2) + 1) <> ' ' || l2 THEN
+        RETURN NULL;
+    END IF;
+
+    bare_value := regexp_replace(l2, '[^a-z0-9]', '', 'g');
+    IF bare_value = '' THEN
+        RETURN NULL;
+    END IF;
+
+    m := regexp_match(' ' || l1 || ' ',
+        '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
+    IF m IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    prefix := {qschema}.addr_unit_prefix_v1(m[2]);
+    unit_value_raw := COALESCE(m[4], '');
+    has_spaced_suffix := unit_value_raw ~ '\s';
+    unit_value := regexp_replace(lower(unit_value_raw), '[^a-z0-9]', '', 'g');
+    IF prefix IS NULL
+       OR unit_value = ''
+       OR unit_value <> bare_value
+       OR (has_spaced_suffix AND prefix NOT IN ({spaced_unit_suffix_prefixes}))
+       OR NOT (
+            {qschema}.addr_unit_value_valid_v1(unit_value)
+            OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+       )
+    THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN prefix || unit_value;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION {qschema}.addr_unit_norm_v1(line1 text, line2 text)
 RETURNS text
 LANGUAGE plpgsql
@@ -411,6 +462,11 @@ BEGIN
         END IF;
 
         RETURN prefix || unit_value;
+    END IF;
+
+    unit_value := {qschema}.addr_repeated_bare_line2_unit_v1(line1, line2);
+    IF unit_value IS NOT NULL THEN
+        RETURN unit_value;
     END IF;
 
     m := regexp_match(' ' || lower(COALESCE(line1, '')) || ' ' || lower(COALESCE(line2, '')) || ' ',
@@ -587,6 +643,13 @@ BEGIN
             ELSE
                 raw := ' ' || l1 || ' ' || l2 || ' ';
             END IF;
+        END IF;
+    END IF;
+
+    IF raw IS NULL THEN
+        unit_value := {qschema}.addr_repeated_bare_line2_unit_v1(l1, l2);
+        IF unit_value IS NOT NULL THEN
+            raw := {qschema}.addr_strip_duplicate_tail_unit_v1(' ' || l1 || ' ', unit_value);
         END IF;
     END IF;
 
@@ -1158,6 +1221,7 @@ def downgrade() -> None:
         ("addr_street_token_is_suffix_v1", "text"),
         ("addr_street_token_norm_v1", "text"),
         ("addr_unit_norm_v1", "text, text"),
+        ("addr_repeated_bare_line2_unit_v1", "text, text"),
         ("addr_strip_duplicate_tail_unit_v1", "text, text"),
         ("addr_floor_value_norm_v1", "text"),
         ("addr_unit_value_valid_v1", "text"),

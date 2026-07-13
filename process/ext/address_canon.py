@@ -48,12 +48,13 @@ ADDRESS_ZIP_RESTORE_REQUIRED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_REQUIRED"
 ADDRESS_ZIP_RESTORE_SHARDS_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_SHARDS"
 CURRENT_ADDRESS_IDENTITY_VERSION = 2
 CURRENT_ADDRESS_IDENTITY_PREFIX = f"v{CURRENT_ADDRESS_IDENTITY_VERSION}"
-CURRENT_ADDRESS_CANON_RULESET_VERSION = 3
+CURRENT_ADDRESS_CANON_RULESET_VERSION = 4
 _RUST_CANON_VERSION_CACHE: dict[str, bool] = {}
 _LATITUDE_COLUMN_CANDIDATES = ("lat", "latitude")
 _LONGITUDE_COLUMN_CANDIDATES = ("long", "lng", "longitude")
 EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES = frozenset({"apt", "ste", "unit"})
 SPACED_UNIT_SUFFIX_PREFIXES = frozenset({"ste"})
+CANONICAL_UNIT_PREFIXES = frozenset(PUB28_UNIT_DESIGNATOR_MAP.values())
 
 
 UNIT_DESIGNATOR_PATTERN = "|".join(
@@ -272,6 +273,29 @@ def _repeated_line2_suffix_decision(l1: str, l2: str) -> _UnitDecision | None:
     return _UnitDecision(unit=unit, street_text=street_text)
 
 
+def _repeated_bare_line2_unit_decision(l1: str, l2: str) -> _UnitDecision | None:
+    l1_clean = re.sub(r"\s+", " ", l1.strip())
+    l2_clean = re.sub(r"\s+", " ", l2.strip())
+    if not l1_clean or not l2_clean or not l1_clean.endswith(f" {l2_clean}"):
+        return None
+
+    bare_value = re.sub(r"[^a-z0-9]", "", l2_clean.lower())
+    if not bare_value:
+        return None
+
+    street_text = f" {l1_clean} "
+    tail = _tail_unit(street_text)
+    if not tail:
+        return None
+    unit = tail[0]
+    if not any(unit == f"{prefix}{bare_value}" for prefix in CANONICAL_UNIT_PREFIXES):
+        return None
+    return _UnitDecision(
+        unit=unit,
+        street_text=_strip_duplicate_tail_unit(street_text, unit),
+    )
+
+
 def _unit_decision(line1: str | None, line2: str | None) -> _UnitDecision:
     l1 = (line1 or "").lower()
     l2 = (line2 or "").lower()
@@ -289,6 +313,10 @@ def _unit_decision(line1: str | None, line2: str | None) -> _UnitDecision:
             street_text = _strip_duplicate_tail_unit(f" {l1} ", unit)
             return _UnitDecision(unit=unit, street_text=street_text)
         return _UnitDecision(unit="", street_text=f" {l1} {l2} ")
+
+    repeated_bare_unit = _repeated_bare_line2_unit_decision(l1, l2)
+    if repeated_bare_unit:
+        return repeated_bare_unit
 
     repeated_suffix = _repeated_line2_suffix_decision(l1, l2)
     if repeated_suffix:

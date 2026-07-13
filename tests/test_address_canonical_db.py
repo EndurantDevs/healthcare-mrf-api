@@ -117,6 +117,7 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
             "addr_street_token_norm_v1",
             "addr_floor_value_norm_v1",
             "addr_strip_duplicate_tail_unit_v1",
+            "addr_repeated_bare_line2_unit_v1",
             "addr_unit_norm_v1",
             "addr_unit_prefix_v1",
             "addr_unit_range_required_v1",
@@ -167,6 +168,28 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert await db.scalar(
         f"SELECT {schema}.addr_unit_norm_v1('123 Main St Suite 100', 'Suite 100');"
     ) == "ste100"
+    assert await db.scalar(
+        f"SELECT {schema}.addr_repeated_bare_line2_unit_v1('2227 HALTOM RD STE F', 'F');"
+    ) == "stef"
+    assert await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('2227 HALTOM RD STE F', 'F');"
+    ) == "2227haltomrd"
+    assert await db.scalar(
+        f"SELECT {schema}.addr_unit_norm_v1('2227 HALTOM RD STE F', 'F');"
+    ) == "stef"
+    assert await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '2227 HALTOM RD STE F', 'F', 'HALTOM CITY', 'TX', '76117', 'US'
+        );
+        """
+    ) == await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '2227 HALTOM RD STE F', '', 'HALTOM CITY', 'TX', '76117', 'US'
+        );
+        """
+    )
     assert await db.scalar(
         f"""
         SELECT {schema}.addr_identity_key_v1(

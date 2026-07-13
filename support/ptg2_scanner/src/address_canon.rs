@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 const PUB28_SOURCE: &str = include_str!("../../../process/ext/address_pub28.py");
 pub const ADDRESS_IDENTITY_VERSION: u8 = 2;
 pub const ADDRESS_IDENTITY_PREFIX: &str = "v2";
-pub const ADDRESS_CANON_RULESET_VERSION: u8 = 3;
+pub const ADDRESS_CANON_RULESET_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalAddress {
@@ -656,6 +656,31 @@ fn repeated_line2_suffix_decision(l1: &str, l2: &str) -> Option<UnitDecision> {
     Some(UnitDecision { unit, street_text })
 }
 
+fn repeated_bare_line2_unit_decision(l1: &str, l2: &str) -> Option<UnitDecision> {
+    let l1_clean = collapse_spaces_lower(l1);
+    let l2_clean = collapse_spaces_lower(l2);
+    if l1_clean.is_empty() || l2_clean.is_empty() || !l1_clean.ends_with(&format!(" {l2_clean}")) {
+        return None;
+    }
+
+    let bare_value = ascii_alnum_lower(&l2_clean);
+    if bare_value.is_empty() {
+        return None;
+    }
+
+    let street_text = format!(" {l1_clean} ");
+    let (unit, _) = tail_unit(&street_text)?;
+    let matches_tail_value = tables().unit.values().any(|prefix| {
+        unit.strip_prefix(prefix.as_str())
+            .is_some_and(|value| value == bare_value)
+    });
+    if !matches_tail_value {
+        return None;
+    }
+    let street_text = strip_duplicate_tail_unit(street_text, &unit);
+    Some(UnitDecision { unit, street_text })
+}
+
 fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
     let l1 = line1.unwrap_or("").to_lowercase();
     let l2 = line2.unwrap_or("").to_lowercase();
@@ -677,6 +702,10 @@ fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
             unit: String::new(),
             street_text: format!(" {l1} {l2} "),
         };
+    }
+
+    if let Some(decision) = repeated_bare_line2_unit_decision(&l1, &l2) {
+        return decision;
     }
 
     if let Some(decision) = repeated_line2_suffix_decision(&l1, &l2) {
