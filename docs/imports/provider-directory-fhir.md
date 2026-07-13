@@ -352,6 +352,46 @@ An explicit empty list therefore allows typed/source/canonical evidence writes
 without creating or promoting a full/current endpoint dataset. This is the
 guard used for Aetna Medicaid's targeted coverage mode.
 
+## Typed Directory Evidence API Contract
+
+The NPI detail response can expose the normalized Provider Directory evidence
+that supports an address. Request `include_sources=true&include_evidence=true`
+to opt into the full evidence shape. It adds typed `practitioner_roles` and
+`insurance_plans` entries beneath the address's `provider_directory_sources`
+entry. `include_sources=true` by itself is the compact provenance mode: it
+returns source and catalog-alias context but does not resolve role, network, or
+plan evidence. Clients that need the typed fields must request
+`include_evidence=true` as well; compact responses are intentionally cheaper
+and are not a partial representation of the full evidence contract.
+
+Each returned `PractitionerRole` preserves the normalized operational fields
+when supplied by the directory: `available_time`, `not_available`,
+`availability_exceptions`, `new_patient_acceptance`, and `telehealth`, along
+with identity, active status, organization/service/endpoint references,
+specialty and code codings, telecom, and period. Each returned
+`InsurancePlan` preserves its product-level identifiers in
+`product_identifiers`, plan backbone structures in `plan_backbones`, and
+`coverage`, in addition to the existing plan identity, status, names, type,
+owner/administrator references, and period. A plan can be useful even when it
+has no identifier, so consumers must not discard a typed plan solely because
+`identifier` is null.
+
+Both resource shapes can include `fhir_provenance`. This is a bounded,
+sanitized projection for debugging and traceability, not the source FHIR
+resource: it may contain selected `meta` values, `self_url`, `fetch_url`, and
+`fetch_mode`. URL values are reduced to an identity form without credentials,
+query parameters, or fragments. Repeated metadata collections are capped at
+32 values and exposed text is capped at 2,048 characters; malformed or empty
+values are omitted. Treat this as diagnostic provenance, not as a URL to
+replay or an authorization artifact.
+
+Plan resolution is source-scoped and current-dataset scoped. For a requested
+role or affiliation, the resolver first restricts `InsurancePlan` candidates
+to the same source IDs, then uses only resources in that source's current,
+published endpoint dataset. Direct plan references and Plan-Net/network-derived
+plans therefore cannot pull a historical plan row or a plan belonging to a
+different source alias into the evidence response.
+
 Provider, plan, network, and location references are retained as raw FHIR
 references first. Address canonical linkage can be filled later through
 `provider_directory_location.address_key`. Network references are resolved to

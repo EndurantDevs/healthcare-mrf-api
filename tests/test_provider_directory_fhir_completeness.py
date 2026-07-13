@@ -2,6 +2,7 @@
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -426,3 +427,22 @@ def test_graphql_call_site_records_graphql_mode_without_fhir_self_url():
     assert practitioner_row["fhir_self_url"] is None
     assert practitioner_row["fhir_fetch_url"] == importer.ALOHR_GRAPHQL_URL
     assert practitioner_row["fhir_fetch_mode"] == "graphql"
+
+
+def test_provider_directory_guide_documents_typed_evidence_contract():
+    guide = (
+        Path(__file__).resolve().parents[1]
+        / "docs/imports/provider-directory-fhir.md"
+    ).read_text(encoding="utf-8")
+    for expected_text in (
+        "Typed Directory Evidence API Contract",
+        "include_sources=true&include_evidence=true",
+        "compact provenance mode",
+        "product_identifiers",
+        "plan_backbones",
+        "available_time",
+        "new_patient_acceptance",
+        "fhir_provenance",
+        "source-scoped and current-dataset scoped",
+    ):
+        assert expected_text in guide
