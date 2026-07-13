@@ -286,6 +286,38 @@ def test_arkansas_completed_empty_proof_completes_declared_affiliation():
     assert summary_map["mapped_evidence_completion"] == "pass"
 
 
+def test_positive_standalone_affiliation_is_not_a_provider_surface_gap():
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    row = _completed_empty_row()
+    row["dataset_resource_count"] = 7
+    row["provider_surface_evidence_present"] = False
+
+    proof = evidence_db._completion_proof_from_row(
+        row, SOURCE_A, "OrganizationAffiliation"
+    )
+
+    assert proof == {
+        "state": "provider_surface_not_applicable",
+        "dataset_id": "dataset-arkansas",
+        "dataset_resource_count": 7,
+    }
+
+
+def test_positive_affiliation_with_provider_evidence_stays_strict():
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    row = _completed_empty_row()
+    row["dataset_resource_count"] = 7
+    row["provider_surface_evidence_present"] = True
+
+    proof = evidence_db._completion_proof_from_row(
+        row, SOURCE_A, "OrganizationAffiliation"
+    )
+
+    assert proof["state"] == "positive"
+
+
 def test_current_legacy_metadata_is_accepted_only_with_complete_empty_diagnostics():
     from scripts.research import provider_directory_api_evidence_db as evidence_db
 

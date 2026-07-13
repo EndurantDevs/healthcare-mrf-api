@@ -65,7 +65,8 @@ def mapped_completion_summary(
         if capability_map["declared"]
     ]
     completed_capability_count = sum(
-        capability_map["state"] in {"pass", "completed_empty"}
+        capability_map["state"]
+        in {"pass", "completed_empty", "provider_surface_not_applicable"}
         for capability_map in declared_capability_list
     )
     is_inconclusive = bool(

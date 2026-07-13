@@ -71,7 +71,19 @@ def current_dataset_completion_sql(schema: str) -> str:
                      FROM {quoted_schema}.provider_directory_dataset_resource AS resource
                     WHERE resource.dataset_id = dataset.dataset_id
                       AND resource.resource_type = requested.resource_type
-               ) AS dataset_resource_count
+               ) AS dataset_resource_count,
+               CASE
+                   WHEN requested.resource_type = 'OrganizationAffiliation'
+                   THEN EXISTS (
+                       SELECT 1
+                         FROM {quoted_schema}.provider_directory_address_overlay AS overlay
+                        WHERE overlay.source_id = requested.source_id
+                          AND overlay.last_seen_run_id = dataset.acquisition_root_run_id
+                          AND overlay.resource_type = requested.resource_type
+                          AND overlay.npi IS NOT NULL
+                   )
+                   ELSE NULL::boolean
+               END AS provider_surface_evidence_present
           FROM requested_resources AS requested
           JOIN current_datasets AS dataset
             ON dataset.source_id = requested.source_id
@@ -267,6 +279,15 @@ def _completion_proof_from_row(
     if resource_count is None:
         return {"state": "unproven"}
     if resource_count > 0:
+        if (
+            resource_type == "OrganizationAffiliation"
+            and row_map.get("provider_surface_evidence_present") is False
+        ):
+            return {
+                "state": "provider_surface_not_applicable",
+                "dataset_id": str(row_map.get("dataset_id") or ""),
+                "dataset_resource_count": resource_count,
+            }
         return {
             "state": "positive",
             "dataset_id": str(row_map.get("dataset_id") or ""),

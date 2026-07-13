@@ -331,7 +331,10 @@ def _mapped_resource_capability(
         return capability_map
     if not resource_witnesses:
         capability_map["state"] = (
-            "completed_empty" if completion_state == "completed_empty" else "not_observed"
+            completion_state
+            if completion_state
+            in {"completed_empty", "provider_surface_not_applicable"}
+            else "not_observed"
         )
         if context.completion_probe_error:
             capability_map["reason"] = "current_dataset_completion_probe_failed"

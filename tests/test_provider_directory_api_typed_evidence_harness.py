@@ -181,6 +181,10 @@ def test_current_dataset_completion_query_fences_one_dataset_per_source():
     assert "dataset.superseded_at IS NULL" in sql
     assert 'LEFT JOIN "mrf".import_run AS terminal_run' in sql
     assert "resource.dataset_id = dataset.dataset_id" in sql
+    assert "provider_surface_evidence_present" in sql
+    assert "overlay.source_id = requested.source_id" in sql
+    assert "overlay.last_seen_run_id = dataset.acquisition_root_run_id" in sql
+    assert "overlay.resource_type = requested.resource_type" in sql
 
 
 @pytest.mark.asyncio
@@ -326,3 +330,35 @@ def test_declared_empty_and_undeclared_capability_states_do_not_fail_baseline():
     capability_by_name = source_result["mapped_evidence_capabilities"]
     assert capability_by_name["practitioner_role"]["state"] == "not_observed"
     assert capability_by_name["organization_affiliation"]["state"] == "not_applicable"
+
+
+def test_standalone_affiliation_completion_is_not_required_on_provider_surface():
+    selection = support.SourceSelection(
+        "acquired", SOURCE_A, "acquisition", True, ("OrganizationAffiliation",)
+    )
+
+    source_result = support.evaluate_source(
+        selection,
+        [support.OverlaySample(SOURCE_A, 1234567890, None)],
+        TypedEvidenceClient(),
+        support.SourceEvaluationContext(5, 40.0),
+        completion_proofs={
+            "OrganizationAffiliation": {
+                "state": "provider_surface_not_applicable"
+            }
+        },
+    )
+
+    capability = source_result["mapped_evidence_capabilities"][
+        "organization_affiliation"
+    ]
+    summary = harness.mapped_completion_summary(
+        require_mapped_evidence=True,
+        source_result_list=[source_result],
+        witness_list_by_source={SOURCE_A: []},
+        witness_probe_error=None,
+    )
+
+    assert capability["state"] == "provider_surface_not_applicable"
+    assert summary["mapped_evidence_completion"] == "pass"
+    assert summary["completion_inconclusive"] is False
