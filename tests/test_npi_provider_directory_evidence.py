@@ -169,7 +169,8 @@ def test_role_plan_cap_prioritizes_direct_plans_and_reports_both_bounds():
     )
     assert direct_first in sql
     assert f"WHERE plan_rank <= {cap}" in sql
-    assert f"LEAST(COUNT(unique_plan_key.resource_id), {cap})" in sql
+    assert "plan_counts_by_role AS MATERIALIZED" in sql
+    assert f"LEAST(COALESCE(plan_count.plan_total, 0), {cap})" in sql
     assert "CASE WHEN catalog_status.catalog_complete" in sql
     assert "evidence_count AS MATERIALIZED" in sql
     assert "CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END" in sql

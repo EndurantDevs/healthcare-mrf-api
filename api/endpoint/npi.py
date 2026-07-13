@@ -1964,6 +1964,8 @@ def _provider_directory_plan_cap_ctes_sql() -> str:
           FROM network_derived_plan_keys AS derived_plan
     ), unique_plan_keys AS MATERIALIZED (
         SELECT DISTINCT source_id, role_id, resource_id FROM all_plan_keys
+    ), plan_counts_by_role AS MATERIALIZED (
+        SELECT source_id, role_id, COUNT(resource_id)::bigint AS plan_total FROM unique_plan_keys GROUP BY source_id, role_id
     ), plan_candidates AS MATERIALIZED (
         SELECT direct_plan.source_id, direct_plan.role_id, direct_plan.resource_id,
                direct_plan.identifier,
@@ -1995,22 +1997,20 @@ def _provider_directory_plan_cap_ctes_sql() -> str:
          WHERE plan_rank <= {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
     ), role_plan_metadata AS MATERIALIZED (
         SELECT role.source_id, role.role_id,
-               LEAST(COUNT(unique_plan_key.resource_id), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
+               LEAST(COALESCE(plan_count.plan_total, 0), {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE})::bigint
                    AS plan_returned,
                CASE WHEN catalog_status.catalog_complete
-                    THEN COUNT(unique_plan_key.resource_id)::bigint END AS plan_total,
+                    THEN COALESCE(plan_count.plan_total, 0) END AS plan_total,
                CASE WHEN catalog_status.catalog_complete
-                    THEN COUNT(unique_plan_key.resource_id) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
+                    THEN COALESCE(plan_count.plan_total, 0) > {MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE}
                 END AS plan_truncated,
                catalog_status.catalog_complete
           FROM roles AS role
           JOIN role_catalog_status AS catalog_status
             ON catalog_status.source_id = role.source_id
            AND catalog_status.role_id = role.role_id
-          LEFT JOIN unique_plan_keys AS unique_plan_key
-            ON unique_plan_key.source_id = role.source_id
-           AND unique_plan_key.role_id = role.role_id
-      GROUP BY role.source_id, role.role_id, catalog_status.catalog_complete
+          LEFT JOIN plan_counts_by_role AS plan_count ON plan_count.source_id = role.source_id
+           AND plan_count.role_id = role.role_id
     )
     """
 
