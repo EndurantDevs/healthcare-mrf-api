@@ -77,6 +77,7 @@ jobs:
           tests/test_control_workers.py
           tests/test_archive_unit.py
           tests/test_process_provider_directory_fhir_unit.py
+          tests/test_provider_directory_time_partition.py
           tests/test_provider_directory_fhir_bulk_security.py
           tests/test_provider_directory_fhir_completeness.py
           tests/test_provider_directory_fhir_completeness_schema.py
