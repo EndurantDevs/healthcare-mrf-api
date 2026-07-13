@@ -42,12 +42,13 @@ Current address-unified paths require source-local rows:
 This means source-level tables are still the compatibility layer for current API
 serving, address archive publication, and PTG corroboration.
 
-## Target Shape
+## Current Shape
 
-Add canonical remote-resource storage beside the current source-level tables.
-The source-level tables remain available until every consumer is migrated.
+Canonical remote-resource storage now exists beside the current source-level
+tables. The source-level tables remain available until every consumer is
+migrated.
 
-Proposed tables:
+Current tables:
 
 - `provider_directory_canonical_resource`
   - `canonical_api_base`
@@ -55,7 +56,8 @@ Proposed tables:
   - `resource_id`
   - `resource_url`
   - `payload_hash`
-  - normalized payload columns or a `payload_json`
+  - normalized identity and payload hash columns
+  - `payload_json` for legacy/non-dataset imports
   - `first_seen_run_id`
   - `last_seen_run_id`
   - `observed_at`
@@ -71,6 +73,22 @@ Proposed tables:
 
 The alias edge table preserves provenance without copying the same canonical
 resource body once per source alias.
+
+Endpoint-dataset acquisitions keep the normalized payload in
+`provider_directory_dataset_resource`, which is the immutable publication and
+artifact-replay authority. Their `provider_directory_canonical_resource` row
+keeps the canonical identity, acquisition metadata, and payload hash but does
+not write a second payload body. Existing canonical payload bodies remain in
+place when the hash is unchanged; a changed compact row clears an old payload
+instead of leaving payload content that no longer matches its hash. Imports
+without an endpoint dataset retain the canonical payload for compatibility.
+
+This split is important for carrier-scale directories. Aetna Commercial exposes
+roughly 380 million `PractitionerRole` resources, so retaining the same payload
+in both tables would consume storage twice without adding publication or API
+evidence. Serving continues to use the typed Provider Directory tables and
+published unified-address artifacts; it does not read canonical payload bodies
+on the request path.
 
 ## Migration Strategy
 

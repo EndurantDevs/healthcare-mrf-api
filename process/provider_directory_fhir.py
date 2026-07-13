@@ -10775,6 +10775,20 @@ def _location_address_key_update_sql(
 
 def _effective_update_expression(table, statement, column: str):
     excluded_value = getattr(statement.excluded, column)
+    if (
+        table.name == ProviderDirectoryCanonicalResource.__tablename__
+        and column == "payload_json"
+    ):
+        return case(
+            (excluded_value.isnot(None), excluded_value),
+            (
+                table.c.payload_hash.is_distinct_from(
+                    statement.excluded.payload_hash
+                ),
+                None,
+            ),
+            else_=table.c.payload_json,
+        )
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
         return func.coalesce(table.c.first_seen_run_id, excluded_value)
     if (
@@ -10816,6 +10830,20 @@ def _effective_update_expression(table, statement, column: str):
 
 
 def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
+    if (
+        table.name == ProviderDirectoryCanonicalResource.__tablename__
+        and column == "payload_json"
+    ):
+        payload_json = _q("payload_json")
+        payload_hash = _q("payload_hash")
+        return (
+            "CASE "
+            f"WHEN {incoming_prefix}.{payload_json} IS NOT NULL "
+            f"THEN {incoming_prefix}.{payload_json} "
+            f"WHEN {target_prefix}.{payload_hash} IS DISTINCT FROM "
+            f"{incoming_prefix}.{payload_hash} THEN NULL "
+            f"ELSE {target_prefix}.{payload_json} END"
+        )
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
     if (
@@ -10995,6 +11023,7 @@ def _canonical_resource_rows(
     *,
     canonical_api_base: str | None,
     run_id: str | None,
+    store_payload: bool = True,
 ) -> list[dict[str, Any]]:
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     api_base = _canonical_base(canonical_api_base)
@@ -11020,7 +11049,7 @@ def _canonical_resource_rows(
             "fhir_fetch_url": row.get("fhir_fetch_url"),
             "fhir_fetch_mode": row.get("fhir_fetch_mode"),
             "payload_hash": payload_hash,
-            "payload_json": payload,
+            "payload_json": payload if store_payload else None,
             "first_seen_run_id": run_id,
             "last_seen_run_id": run_id,
             "observed_at": observed_at,
@@ -22271,6 +22300,7 @@ async def _upsert_resource_rows(
             rows,
             canonical_api_base=canonical_api_base,
             run_id=run_id,
+            store_payload=not bool(dataset_id),
         )
         if canonical_rows:
             await _upsert_rows(

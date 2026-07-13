@@ -2981,6 +2981,45 @@ def test_provider_directory_source_seed_upsert_preserves_existing_probe_state():
     ) == sql
 
 
+def test_canonical_resource_compact_payload_update_preserves_only_matching_payload():
+    table = ProviderDirectoryCanonicalResource.__table__
+    sql = importer._effective_update_sql(
+        table,
+        "payload_json",
+        target_prefix="target_row",
+        incoming_prefix="stage_row",
+    )
+
+    assert sql == (
+        'CASE WHEN stage_row."payload_json" IS NOT NULL '
+        'THEN stage_row."payload_json" '
+        'WHEN target_row."payload_hash" IS DISTINCT FROM stage_row."payload_hash" '
+        'THEN NULL ELSE target_row."payload_json" END'
+    )
+
+    statement = importer.pg_insert(table).values(
+        canonical_api_base="https://payer.example/fhir",
+        resource_type="PractitionerRole",
+        resource_id="role-1",
+        payload_hash="new-hash",
+        payload_json=None,
+    )
+    expression = importer._effective_update_expression(
+        table,
+        statement,
+        "payload_json",
+    )
+    expression_sql = str(
+        expression.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "payload_hash IS DISTINCT FROM excluded.payload_hash" in expression_sql
+    assert "ELSE" in expression_sql
+
+
 def test_provider_directory_source_seed_upsert_merges_metadata_json():
     sql = importer._effective_update_sql(
         ProviderDirectorySource.__table__,
@@ -3581,6 +3620,49 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 
     assert upsert_calls[2] == (ProviderDirectoryLocation, rows, {"skip_unchanged": True})
     assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1", {"seen_table": None})]
+
+
+@pytest.mark.asyncio
+async def test_dataset_backed_upsert_keeps_payload_only_in_endpoint_dataset(monkeypatch):
+    upsert_calls = []
+
+    async def fake_upsert(model, rows, **kwargs):
+        upsert_calls.append((model, rows, kwargs))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "role-1",
+            "resource_url": "https://payer.example/fhir/PractitionerRole/role-1",
+            "practitioner_ref": "Practitioner/practitioner-1",
+            "last_seen_run_id": "run_1",
+        }
+    ]
+
+    written = await importer._upsert_resource_rows(
+        ProviderDirectoryPractitionerRole,
+        rows,
+        run_id="run_1",
+        track_seen=False,
+        canonical_api_base="https://payer.example/fhir",
+        source_ids=["source_a"],
+        dataset_id="dataset_1",
+    )
+
+    assert written == 1
+    dataset_call = upsert_calls[0]
+    canonical_call = upsert_calls[1]
+    assert dataset_call[0] is ProviderDirectoryDatasetResource
+    assert dataset_call[1][0]["payload_json"]["practitioner_ref"] == (
+        "Practitioner/practitioner-1"
+    )
+    assert canonical_call[0] is ProviderDirectoryCanonicalResource
+    assert canonical_call[1][0]["payload_json"] is None
+    assert canonical_call[1][0]["payload_hash"] == dataset_call[1][0]["payload_hash"]
+    assert upsert_calls[-1][0] is ProviderDirectoryPractitionerRole
 
 
 @pytest.mark.asyncio
