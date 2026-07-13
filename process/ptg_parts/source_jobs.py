@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from process.ptg_parts.canonical import (
@@ -99,13 +99,15 @@ def _filter_reporting_plans(
     plan_ids: list[str] | None = None,
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
+    plan_predicate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
-    if not any((plan_ids, plan_name_contains, plan_market_types)):
+    if not any((plan_ids, plan_name_contains, plan_market_types, plan_predicate)):
         return plans
     return [
         plan
         for plan in plans
         if _plan_matches_filters(plan, plan_ids, plan_name_contains, plan_market_types)
+        and (plan_predicate is None or plan_predicate(plan))
     ]
 
 
@@ -236,12 +238,32 @@ def _toc_body_source_type(
     return default_source_type, PTG2_DOMAIN_IN_NETWORK
 
 
+def _merge_duplicate_catalog_entries(entries: list[PTG2SourceCatalogEntry]) -> list[PTG2SourceCatalogEntry]:
+    """Merge plan metadata for duplicate file locations in linear work."""
+    entries_by_key: dict[tuple[str, str, str], PTG2SourceCatalogEntry] = {}
+    plans_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    plan_identities_by_key: dict[tuple[str, str, str], set[str]] = {}
+    for entry in entries:
+        entry_key = (entry.source_type, entry.domain, entry.canonical_url)
+        entries_by_key[entry_key] = entry
+        merged_plans = plans_by_key.setdefault(entry_key, [])
+        seen_plan_identities = plan_identities_by_key.setdefault(entry_key, set())
+        for plan in entry.plan_info:
+            plan_identity = canonical_json_dumps(plan)
+            if plan_identity in seen_plan_identities:
+                continue
+            seen_plan_identities.add(plan_identity)
+            merged_plans.append(plan)
+    return [replace(entry, plan_info=tuple(plans_by_key[entry_key])) for entry_key, entry in entries_by_key.items()]
+
+
 def parse_toc_catalog_entries(
     toc_content: dict[str, Any],
     toc_url: str,
     plan_ids: list[str] | None = None,
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
+    plan_predicate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[PTG2SourceCatalogEntry]:
     """Return filtered PTG source catalog entries parsed from a TOC payload."""
     if _is_provider_directory_index_payload(toc_content):
@@ -284,6 +306,7 @@ def parse_toc_catalog_entries(
             plan_ids=plan_ids,
             plan_name_contains=plan_name_contains,
             plan_market_types=plan_market_types,
+            plan_predicate=plan_predicate,
         )
         if not plans:
             continue
@@ -371,19 +394,7 @@ def parse_toc_catalog_entries(
                             plan_info=plan_tuple,
                         )
                     )
-    deduped: dict[tuple[str, str, str], PTG2SourceCatalogEntry] = {}
-    for entry in entries:
-        key = (entry.source_type, entry.domain, entry.canonical_url)
-        existing = deduped.get(key)
-        if existing is None:
-            deduped[key] = entry
-            continue
-        plans_by_identity = {
-            canonical_json_dumps(plan): plan
-            for plan in (*existing.plan_info, *entry.plan_info)
-        }
-        deduped[key] = replace(entry, plan_info=tuple(plans_by_identity.values()))
-    return list(deduped.values())
+    return _merge_duplicate_catalog_entries(entries)
 
 
 def _load_toc_urls_from_file(path: str) -> list[str]:

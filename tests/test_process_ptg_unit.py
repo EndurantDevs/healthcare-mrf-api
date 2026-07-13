@@ -2185,11 +2185,116 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
         "https://payer.test/toc.json",
         plan_ids=["TESTPLAN001"],
     )
-    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
+    in_network_entries = [
+        entry for entry in entries if entry.source_type == "in-network"
+    ]
 
     assert len(in_network_entries) == 1
     assert in_network_entries[0].canonical_url == "https://cdn.test/rates.json.gz?foo=1"
     assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Example Sponsor Co"
+
+
+def test_ptg2_toc_parser_applies_plan_predicate_before_file_expansion(monkeypatch):
+    toc_payload_dict = {
+        "reporting_entity_name": "Cigna",
+        "reporting_entity_type": "payer",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "OAP",
+                        "plan_id": "111111111",
+                        "plan_sponsor_name": "Unrelated Employer",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {"location": "https://cdn.test/unrelated-rates.json.gz"}
+                ],
+            },
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "OAP",
+                        "plan_id": "831960637",
+                        "plan_sponsor_name": "OpenAI OpCo, LLC",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {"location": "https://cdn.test/openai-rates.json.gz"}
+                ],
+            },
+        ],
+    }
+    expanded_locations = []
+    original_source_type = ptg_source_jobs._toc_body_source_type
+
+    def tracked_source_type(default_source_type, location, description=None):
+        expanded_locations.append(location)
+        return original_source_type(default_source_type, location, description)
+
+    monkeypatch.setattr(
+        ptg_source_jobs,
+        "_toc_body_source_type",
+        tracked_source_type,
+    )
+
+    entries = process_ptg.parse_toc_catalog_entries(
+        toc_payload_dict,
+        "https://payer.test/toc.json",
+        plan_predicate=lambda plan: "openai" in plan["plan_sponsor_name"].lower(),
+    )
+
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
+    assert expanded_locations == ["https://cdn.test/openai-rates.json.gz"]
+    assert [entry.original_url for entry in in_network_entries] == [
+        "https://cdn.test/openai-rates.json.gz"
+    ]
+
+
+def test_ptg2_toc_parser_merges_shared_file_plans_in_linear_work(monkeypatch):
+    plan_count = 250
+    shared_url = "https://cdn.test/shared-rates.json.gz"
+    toc_payload_dict = {
+        "reporting_entity_name": "Cigna",
+        "reporting_entity_type": "payer",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": f"Plan {index}",
+                        "plan_id": str(index),
+                        "plan_sponsor_name": f"Employer {index}",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [{"location": shared_url}],
+            }
+            for index in range(plan_count)
+        ],
+    }
+    original_dumps = ptg_source_jobs.canonical_json_dumps
+    serialized_plans = []
+
+    def tracked_dumps(value):
+        serialized_plans.append(value)
+        return original_dumps(value)
+
+    monkeypatch.setattr(ptg_source_jobs, "canonical_json_dumps", tracked_dumps)
+
+    entries = process_ptg.parse_toc_catalog_entries(
+        toc_payload_dict,
+        "https://payer.test/toc.json",
+    )
+
+    in_network_entries = [
+        entry for entry in entries if entry.source_type == "in-network"
+    ]
+    [in_network_entry] = in_network_entries
+    assert in_network_entry.original_url == shared_url
+    assert len(in_network_entry.plan_info) == plan_count
+    assert len(serialized_plans) == plan_count
 
 
 def test_ptg2_toc_parser_accepts_list_shaped_file_fields():

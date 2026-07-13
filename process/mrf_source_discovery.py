@@ -2158,6 +2158,128 @@ async def _fetch_json(
     return data
 
 
+class _BoundedAsyncReader:
+    """Expose an async reader while enforcing the discovery byte limit."""
+
+    def __init__(self, reader: Any, max_bytes: int):
+        self._reader = reader
+        self._max_bytes = max(1, int(max_bytes))
+        self._bytes_read = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        """Read one bounded chunk from the wrapped response stream."""
+        chunk = await self._reader.read(size)
+        self._bytes_read += len(chunk)
+        if self._bytes_read > self._max_bytes:
+            raise ValueError(
+                f"response exceeds {self._max_bytes} byte discovery limit"
+            )
+        return chunk
+
+
+async def _read_query_matching_structures(
+    response: aiohttp.ClientResponse,
+    *,
+    target_query: str,
+    max_bytes: int,
+) -> list[dict[str, Any]]:
+    """Stream one TOC response and retain structures matching the query."""
+    import ijson
+
+    if response.status >= 400:
+        raise ValueError(f"TOC request failed with HTTP {response.status}")
+    content_length = _as_int(response.headers.get("Content-Length"))
+    if content_length and content_length > max_bytes:
+        raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+
+    matching_structures: list[dict[str, Any]] = []
+    bounded_reader = _BoundedAsyncReader(response.content, max_bytes)
+    scanned_structure_count = 0
+    async for structure in ijson.items_async(
+        bounded_reader,
+        "reporting_structure.item",
+        use_float=True,
+    ):
+        if not isinstance(structure, dict):
+            continue
+        matching_plans = [
+            plan
+            for plan in (structure.get("reporting_plans") or [])
+            if isinstance(plan, dict)
+            and _is_plan_info_query_match(plan, target_query)
+        ]
+        if matching_plans:
+            structure["reporting_plans"] = matching_plans
+            matching_structures.append(structure)
+        scanned_structure_count += 1
+        if scanned_structure_count % 1000 == 0:
+            await asyncio.sleep(0)
+    return matching_structures
+
+
+def _query_filtered_toc_document(
+    target_metadata: dict[str, Any],
+    matching_structures: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the minimal TOC document consumed by the catalog parser."""
+    toc_document_dict = {
+        "reporting_entity_name": target_metadata.get("reporting_entity_name"),
+        "reporting_entity_type": target_metadata.get("reporting_entity_type"),
+        "last_updated_on": target_metadata.get("last_updated_on"),
+        "version": target_metadata.get("version"),
+        "reporting_structure": matching_structures,
+    }
+    return {
+        metadata_key: metadata_value
+        for metadata_key, metadata_value in toc_document_dict.items()
+        if metadata_value not in (None, "")
+    }
+
+
+async def _fetch_query_filtered_toc(
+    crawl_target: CrawlTarget,
+    *,
+    max_bytes: int,
+    session: aiohttp.ClientSession | None = None,
+) -> dict[str, Any]:
+    """Stream a carrier-wide TOC and retain only target-query structures."""
+    target_query = _source_target_payer_query(crawl_target.source)
+    if not target_query:
+        raise ValueError("target payer query is required for filtered TOC streaming")
+    await _assert_fetch_url_allowed(crawl_target.url)
+    if session is None:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
+        connector = _tcp_connector(limit=0)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _fetch_query_filtered_toc(
+                crawl_target,
+                max_bytes=max_bytes,
+                session=owned_session,
+            )
+
+    async with session.get(
+        crawl_target.url,
+        allow_redirects=True,
+        **_request_ssl_kwargs(crawl_target.url),
+    ) as response:
+        await _assert_fetch_url_allowed(str(response.url))
+        matching_structures = await _read_query_matching_structures(
+            response,
+            target_query=target_query,
+            max_bytes=max_bytes,
+        )
+    return _query_filtered_toc_document(
+        dict(crawl_target.metadata or {}), matching_structures
+    )
+
+
 async def _post_form_json_value(
     url: str,
     form_fields: dict[str, Any],
@@ -3028,9 +3150,19 @@ def _toc_rows_from_content(
         return _healthsparq_rows_from_metadata(source, url, toc)
     plan_rows: list[dict[str, Any]] = []
     file_rows: list[dict[str, Any]] = []
-    entries = parse_toc_catalog_entries(toc, str(url))
-    schema_version = _truncate_text(toc.get("version"), 32)
     target_query = _source_target_payer_query(source)
+    plan_predicate = None
+    if filter_to_target_query and target_query:
+        plan_predicate = lambda plan: _is_plan_info_query_match(plan, target_query)
+    if plan_predicate is None:
+        entries = parse_toc_catalog_entries(toc, str(url))
+    else:
+        entries = parse_toc_catalog_entries(
+            toc,
+            str(url),
+            plan_predicate=plan_predicate,
+        )
+    schema_version = _truncate_text(toc.get("version"), 32)
     for entry in entries:
         plan_info = _query_expanded_plan_info(
             entry.plan_info or (),
@@ -13306,7 +13438,13 @@ async def _crawl_toc_metadata(
                     toc_values = [
                         (
                             Path(urlsplit(target.url).path).name,
-                            await _fetch_json(
+                            await _fetch_query_filtered_toc(
+                                target,
+                                max_bytes=target_max_bytes,
+                                session=session,
+                            )
+                            if should_filter_to_target_query
+                            else await _fetch_json(
                                 target.url,
                                 max_bytes=target_max_bytes,
                                 session=session,
@@ -13368,9 +13506,16 @@ async def _crawl_toc_metadata(
                     target.source, target.url, text
                 )
             else:
-                toc = await _fetch_json(
-                    target.url, max_bytes=target_max_bytes, session=session
-                )
+                if should_filter_to_target_query:
+                    toc = await _fetch_query_filtered_toc(
+                        target,
+                        max_bytes=target_max_bytes,
+                        session=session,
+                    )
+                else:
+                    toc = await _fetch_json(
+                        target.url, max_bytes=target_max_bytes, session=session
+                    )
                 if should_filter_to_target_query:
                     plan_rows, file_rows = _toc_rows_from_content(
                         target.source,

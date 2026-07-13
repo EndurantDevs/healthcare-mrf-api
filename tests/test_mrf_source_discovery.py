@@ -18,9 +18,23 @@ discovery = importlib.import_module("process.mrf_source_discovery")
 class _FakeChunkedContent:
     def __init__(self, body: bytes):
         self._body = body
+        self._offset = 0
 
     async def iter_chunked(self, _size):
         yield self._body
+
+    async def read(self, size=-1):
+        if size == 0:
+            return b""
+        if self._offset >= len(self._body):
+            return b""
+        if size is None or size < 0:
+            end = len(self._body)
+        else:
+            end = min(self._offset + size, len(self._body))
+        chunk = self._body[self._offset : end]
+        self._offset = end
+        return chunk
 
 
 class _FakeFetchResponse:
@@ -1952,6 +1966,98 @@ def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
     assert [plan_row["plan_id"] for plan_row in plan_rows] == ["111111111"]
     assert [file_row["url"] for file_row in file_rows] == [shared_url]
     assert file_rows[0]["plan_ids"] == ["111111111"]
+
+
+@pytest.mark.asyncio
+async def test_query_filtered_toc_stream_retains_only_matching_structures(monkeypatch):
+    discovery_source = _synthetic_query_source()
+    toc_payload = _synthetic_toc_payload(
+        (
+            "Sample Employer Choice Plan",
+            "111111111",
+            "https://example.test/matching-rates.json.gz",
+        ),
+        (
+            "Unrelated Employer Choice Plan",
+            "222222222",
+            "https://example.test/unrelated-rates.json.gz",
+        ),
+    )
+    crawl_target = discovery.CrawlTarget(
+        source=discovery_source,
+        url="https://example.test/carrier-index.json",
+        label="Carrier index",
+        metadata={
+            "reporting_entity_name": "Example Carrier",
+            "reporting_entity_type": "Health Insurance Issuer",
+            "last_updated_on": "2026-07-01",
+        },
+    )
+    response = _FakeFetchResponse(
+        status=200,
+        body=json.dumps(toc_payload).encode(),
+        content_type="application/json",
+        url=crawl_target.url,
+    )
+
+    class FakeSession:
+        def get(self, url, **_kwargs):
+            assert url == crawl_target.url
+            return response
+
+    async def allow_url(_url):
+        return None
+
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
+
+    filtered_toc = await discovery._fetch_query_filtered_toc(
+        crawl_target,
+        max_bytes=4096,
+        session=FakeSession(),
+    )
+
+    assert filtered_toc["reporting_entity_name"] == "Example Carrier"
+    assert filtered_toc["last_updated_on"] == "2026-07-01"
+    [matching_structure] = filtered_toc["reporting_structure"]
+    assert [
+        plan["plan_id"] for plan in matching_structure["reporting_plans"]
+    ] == ["111111111"]
+    assert [
+        file_item["location"]
+        for file_item in matching_structure["in_network_files"]
+    ] == ["https://example.test/matching-rates.json.gz"]
+
+
+@pytest.mark.asyncio
+async def test_query_filtered_toc_stream_enforces_byte_limit(monkeypatch):
+    source = _synthetic_query_source()
+    target = discovery.CrawlTarget(
+        source=source,
+        url="https://example.test/carrier-index.json",
+        label="Carrier index",
+    )
+    response = _FakeFetchResponse(
+        status=200,
+        body=json.dumps(_synthetic_toc_payload()).encode(),
+        content_type="application/json",
+        url=target.url,
+    )
+
+    class FakeSession:
+        def get(self, _url, **_kwargs):
+            return response
+
+    async def allow_url(_url):
+        return None
+
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allow_url)
+
+    with pytest.raises(ValueError, match="response exceeds 16 byte"):
+        await discovery._fetch_query_filtered_toc(
+            target,
+            max_bytes=16,
+            session=FakeSession(),
+        )
 
 
 def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
