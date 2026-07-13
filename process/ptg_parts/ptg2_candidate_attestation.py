@@ -237,7 +237,7 @@ def validate_candidate_release_audit_report(
         seconds=PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS
     ):
         raise ValueError("audit report completion time is in the future")
-    if completed_at < evaluation_time - _audit_report_max_age():
+    if completed_at <= evaluation_time - _audit_report_max_age():
         raise ValueError("audit report is too old for candidate activation")
     if report_map.get("schema_version") != 2:
         raise ValueError("audit report schema is unsupported")
@@ -309,6 +309,7 @@ def validate_candidate_release_audit_report(
         "tool_version": tool_version,
         "report_digest": hashlib.sha256(report_bytes).digest(),
         "report_json": report_bytes.decode("utf-8"),
+        "completed_at": completed_at,
         "audit_sample_digest": audit_sample_digest,
         "checks": observed_checks,
         "standard_api_actual_http_requests": standard_http_requests,
@@ -495,7 +496,12 @@ async def record_candidate_audit_attestation(
             plan_market_type=normalized_market_type,
             evaluated_at=now,
         )
-        expires_at = now + datetime.timedelta(hours=_attestation_ttl_hours())
+        expires_at = min(
+            now + datetime.timedelta(hours=_attestation_ttl_hours()),
+            evidence["completed_at"] + _audit_report_max_age(),
+        )
+        if expires_at <= now:
+            raise ValueError("audit report is too old for candidate activation")
         identity = await _locked_candidate_identity(
             session,
             schema_name=schema_name,
@@ -531,9 +537,14 @@ async def record_candidate_audit_attestation(
                     attested_at = EXCLUDED.attested_at,
                     expires_at = EXCLUDED.expires_at
                 WHERE attestation.snapshot_key = EXCLUDED.snapshot_key
+                  AND attestation.source_key = EXCLUDED.source_key
+                  AND attestation.plan_id = EXCLUDED.plan_id
+                  AND attestation.plan_market_type = EXCLUDED.plan_market_type
                   AND attestation.coverage_scope_id = EXCLUDED.coverage_scope_id
                   AND attestation.source_set_digest = EXCLUDED.source_set_digest
                   AND attestation.audit_sample_digest = EXCLUDED.audit_sample_digest
+                  AND attestation.contract = EXCLUDED.contract
+                  AND attestation.tool_name = EXCLUDED.tool_name
                   AND attestation.activated_at IS NULL
                 RETURNING report_digest
                 """

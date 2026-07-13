@@ -713,6 +713,48 @@ async def _stage_ptg2_source_candidate(
     }
 
 
+async def _locked_snapshot_publication_row(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    result = await session.execute(
+        db.text(
+            f"""
+            SELECT snapshot.snapshot_id,
+                   snapshot.import_run_id,
+                   snapshot.import_month,
+                   snapshot.status,
+                   snapshot.created_at,
+                   snapshot.validated_at,
+                   snapshot.published_at,
+                   snapshot.previous_snapshot_id,
+                   snapshot.manifest
+              FROM {_quote_ident(schema_name)}.ptg2_snapshot AS snapshot
+             WHERE snapshot.snapshot_id = :snapshot_id
+             FOR UPDATE OF snapshot
+            """
+        ),
+        {"snapshot_id": snapshot_id},
+    )
+    row = result.first()
+    if row is None:
+        raise ValueError("PTG snapshot is unavailable for publication")
+    return _row_mapping(row)
+
+
+def _requires_audited_candidate_activation(snapshot: dict[str, Any]) -> bool:
+    activation = _manifest_mapping(
+        _manifest_mapping(snapshot.get("manifest")).get("activation")
+    )
+    return (
+        str(snapshot.get("status") or "").strip().lower()
+        == PTG2_STATUS_VALIDATED
+        and activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT
+    )
+
+
 async def _locked_candidate_activation_row(
     session: Any,
     *,
@@ -830,97 +872,114 @@ async def activate_ptg2_source_candidate(
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
-        candidate = await _locked_candidate_activation_row(
+        return await _activate_ptg2_source_candidate_in_transaction(
             session,
             schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
-        )
-        identity = _validated_activation_identity(
-            candidate,
             source_key=normalized_source_key,
+            snapshot_id=normalized_snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
         )
-        activated_at = await _database_utc_timestamp(session)
-        import_month = candidate.get("import_month")
-        if not isinstance(import_month, datetime.date):
-            raise ValueError("validated candidate has no import month")
-        plan_pointer_entries = [
-            _plan_pointer_entry(
-                plan_id=identity["plan_id"],
-                plan_market_type=identity["plan_market_type"],
-                import_month=import_month,
-                source_key=normalized_source_key,
-                snapshot_id=normalized_snapshot_id,
-                previous_snapshot_id=identity["previous_snapshot_id"],
-                updated_at=activated_at,
-            )
-        ]
-        audit_report_digest = await verify_candidate_audit_attestation_in_transaction(
-            session,
-            schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
-            snapshot_key=identity["snapshot_key"],
-            source_key=normalized_source_key,
+
+
+async def _activate_ptg2_source_candidate_in_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None,
+) -> dict[str, Any]:
+    candidate = await _locked_candidate_activation_row(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+    )
+    identity = _validated_activation_identity(
+        candidate,
+        source_key=source_key,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+    )
+    activated_at = await _database_utc_timestamp(session)
+    import_month = candidate.get("import_month")
+    if not isinstance(import_month, datetime.date):
+        raise ValueError("validated candidate has no import month")
+    plan_pointer_entries = [
+        _plan_pointer_entry(
             plan_id=identity["plan_id"],
             plan_market_type=identity["plan_market_type"],
-            coverage_scope_id=identity["coverage_scope_id"],
-        )
-        await _compare_and_swap_source_pointer(
-            session,
-            schema_name=schema_name,
-            source_key=normalized_source_key,
-            snapshot_id=normalized_snapshot_id,
-            previous_snapshot_id=identity["previous_snapshot_id"],
             import_month=import_month,
-            updated_at=activated_at,
-            allow_already_current=False,
-        )
-        candidate_attributes = {
-            key: candidate.get(key)
-            for key in (
-                "snapshot_id",
-                "import_run_id",
-                "import_month",
-                "status",
-                "created_at",
-                "validated_at",
-                "published_at",
-                "previous_snapshot_id",
-                "manifest",
-            )
-        }
-        await _publish_snapshot_in_pointer_transaction(
-            session,
-            schema_name=schema_name,
-            snapshot_attributes=activated_snapshot_attributes(
-                candidate_attributes,
-                activated_at=activated_at,
-                activation_mode="audited_control",
-            ),
-        )
-        await _reconcile_global_snapshot_pointer(
-            session,
-            schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=identity["previous_snapshot_id"],
             updated_at=activated_at,
         )
-        await _replace_source_plan_pointers(
-            session,
-            schema_name=schema_name,
-            source_key=normalized_source_key,
-            plan_pointer_entries=plan_pointer_entries,
+    ]
+    audit_report_digest = await verify_candidate_audit_attestation_in_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        snapshot_key=identity["snapshot_key"],
+        source_key=source_key,
+        plan_id=identity["plan_id"],
+        plan_market_type=identity["plan_market_type"],
+        coverage_scope_id=identity["coverage_scope_id"],
+    )
+    await _compare_and_swap_source_pointer(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        previous_snapshot_id=identity["previous_snapshot_id"],
+        import_month=import_month,
+        updated_at=activated_at,
+        allow_already_current=False,
+    )
+    candidate_attributes = {
+        key: candidate.get(key)
+        for key in (
+            "snapshot_id",
+            "import_run_id",
+            "import_month",
+            "status",
+            "created_at",
+            "validated_at",
+            "published_at",
+            "previous_snapshot_id",
+            "manifest",
         )
-        await consume_candidate_audit_attestation_in_transaction(
-            session,
-            schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
-            report_digest=audit_report_digest,
+    }
+    await _publish_snapshot_in_pointer_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_attributes=activated_snapshot_attributes(
+            candidate_attributes,
             activated_at=activated_at,
-        )
+            activation_mode="audited_control",
+        ),
+    )
+    await _reconcile_global_snapshot_pointer(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        updated_at=activated_at,
+    )
+    await _replace_source_plan_pointers(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        plan_pointer_entries=plan_pointer_entries,
+    )
+    await consume_candidate_audit_attestation_in_transaction(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        report_digest=audit_report_digest,
+        activated_at=activated_at,
+    )
     return {
         "status": "promoted",
-        "source_key": normalized_source_key,
-        "snapshot_id": normalized_snapshot_id,
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
         "previous_snapshot_id": identity["previous_snapshot_id"],
         "plan_source_count": 1,
         "global_pointer": "reconciled",
@@ -943,32 +1002,43 @@ async def _publish_ptg2_source_pointers(
 ) -> dict[str, Any]:
     """Publish or activate source pointers under the strict audit contract."""
 
-    activation = _manifest_mapping(
-        _manifest_mapping((snapshot_attributes or {}).get("manifest")).get("activation")
-    )
-    strict_candidate_activation = (
-        activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT
-        and activation.get("state") == "activated"
-    )
-    if require_audit_attestation or strict_candidate_activation:
-        return await activate_ptg2_source_candidate(
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            expected_current_snapshot_id=previous_snapshot_id,
-        )
+    normalized_source_key = str(source_key or "").strip().lower()
+    normalized_snapshot_id = str(snapshot_id or "").strip()
+    if not normalized_source_key or not normalized_snapshot_id:
+        raise ValueError("source_key and snapshot_id are required")
+    if snapshot_attributes is not None and (
+        str(snapshot_attributes.get("snapshot_id") or "").strip()
+        != normalized_snapshot_id
+    ):
+        raise ValueError("snapshot attributes do not match the requested snapshot")
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        authoritative_snapshot = await _locked_snapshot_publication_row(
+            session,
+            schema_name=schema_name,
+            snapshot_id=normalized_snapshot_id,
+        )
+        if require_audit_attestation or _requires_audited_candidate_activation(
+            authoritative_snapshot
+        ):
+            return await _activate_ptg2_source_candidate_in_transaction(
+                session,
+                schema_name=schema_name,
+                source_key=normalized_source_key,
+                snapshot_id=normalized_snapshot_id,
+                expected_current_snapshot_id=previous_snapshot_id,
+            )
         if shared_snapshot_key is not None:
             await bind_snapshot_to_shared_layout(
                 session,
                 schema_name=schema_name,
-                snapshot_id=snapshot_id,
+                snapshot_id=normalized_snapshot_id,
                 snapshot_key=int(shared_snapshot_key),
             )
         plan_pointer_entries = await _source_plan_rows(
-            snapshot_id=snapshot_id,
-            source_key=source_key,
+            snapshot_id=normalized_snapshot_id,
+            source_key=normalized_source_key,
             import_month=import_month,
             previous_snapshot_id=previous_snapshot_id,
             updated_at=updated_at,
@@ -979,34 +1049,24 @@ async def _publish_ptg2_source_pointers(
             await _bind_snapshot_coverage_scope(
                 session,
                 schema_name=schema_name,
-                snapshot_id=snapshot_id,
+                snapshot_id=normalized_snapshot_id,
                 coverage_scope_id=coverage_scope_id,
                 coverage_plan_id=str(coverage_plan_id or ""),
                 coverage_plan_market_type=str(coverage_plan_market_type or ""),
                 plan_pointer_entries=plan_pointer_entries,
             )
-        if snapshot_attributes is None:
-            published_result = await session.execute(
-                db.text(
-                    f"""
-                    SELECT snapshot_id
-                      FROM {_quote_ident(schema_name)}.ptg2_snapshot
-                     WHERE snapshot_id = :snapshot_id
-                       AND status = 'published'
-                     FOR UPDATE
-                    """
-                ),
-                {"snapshot_id": snapshot_id},
+        if snapshot_attributes is None and (
+            str(authoritative_snapshot.get("status") or "").strip().lower()
+            != PTG2_STATUS_PUBLISHED
+        ):
+            raise ValueError(
+                "source-pointer repoint requires an already published snapshot"
             )
-            if not _has_result_row(published_result):
-                raise ValueError(
-                    "source-pointer repoint requires an already published snapshot"
-                )
         await _compare_and_swap_source_pointer(
             session,
             schema_name=schema_name,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
+            source_key=normalized_source_key,
+            snapshot_id=normalized_snapshot_id,
             previous_snapshot_id=previous_snapshot_id,
             import_month=import_month,
             updated_at=updated_at,
@@ -1020,19 +1080,19 @@ async def _publish_ptg2_source_pointers(
             await _reconcile_global_snapshot_pointer(
                 session,
                 schema_name=schema_name,
-                snapshot_id=snapshot_id,
+                snapshot_id=normalized_snapshot_id,
                 updated_at=updated_at,
             )
         await _replace_source_plan_pointers(
             session,
             schema_name=schema_name,
-            source_key=source_key,
+            source_key=normalized_source_key,
             plan_pointer_entries=plan_pointer_entries,
         )
     return {
         "status": "promoted",
-        "source_key": source_key,
-        "snapshot_id": snapshot_id,
+        "source_key": normalized_source_key,
+        "snapshot_id": normalized_snapshot_id,
         "previous_snapshot_id": previous_snapshot_id,
         "plan_source_count": len(plan_pointer_entries),
         "global_pointer": "reconciled" if snapshot_attributes is not None else "not_requested",
@@ -1049,15 +1109,23 @@ async def _publish_ptg2_global_snapshot_pointer(
     snapshot_id = str(snapshot_attributes.get("snapshot_id") or "").strip()
     if not snapshot_id:
         raise ValueError("Global snapshot-pointer promotion requires a snapshot id")
-    activation = _manifest_mapping(
-        _manifest_mapping(snapshot_attributes.get("manifest")).get("activation")
-    )
-    if activation.get("contract") == PTG2_CANDIDATE_ACTIVATION_CONTRACT:
-        raise ValueError(
-            "strict V3 candidates must be activated through the audited source-pointer transaction"
-        )
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        authoritative_snapshot = await _locked_snapshot_publication_row(
+            session,
+            schema_name=schema_name,
+            snapshot_id=snapshot_id,
+        )
+        authoritative_activation = _manifest_mapping(
+            _manifest_mapping(authoritative_snapshot.get("manifest")).get("activation")
+        )
+        if (
+            authoritative_activation.get("contract")
+            == PTG2_CANDIDATE_ACTIVATION_CONTRACT
+        ):
+            raise ValueError(
+                "strict V3 candidates must be activated through the audited source-pointer transaction"
+            )
         if shared_snapshot_key is not None:
             await bind_snapshot_to_shared_layout(
                 session,

@@ -4874,7 +4874,10 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed.append((str(statement), params or {}))
+            sql = str(statement)
+            executed.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(first=lambda: snapshot_by_field)
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4906,7 +4909,8 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
     assert "incumbent.published_at >=" in joined
     assert "DELETE FROM \"mrf\".ptg2_current_plan_source WHERE source_key = :source_key" in joined
     assert "INSERT INTO \"mrf\".ptg2_current_plan_source" in joined
-    assert len(executed) == 6
+    assert len(executed) == 7
+    assert "FOR UPDATE OF snapshot" in executed[1][0]
 
 
 def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolution_fails(monkeypatch):
@@ -4920,7 +4924,16 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(
+                    first=lambda: {
+                        "snapshot_id": "snap",
+                        "status": "published",
+                        "manifest": {},
+                    }
+                )
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4945,7 +4958,7 @@ def test_ptg2_source_pointer_publish_does_not_advance_source_when_plan_resolutio
         )
 
     assert transaction_started_map["value"] is True
-    assert len(executed_statements) == 1
+    assert len(executed_statements) == 2
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
@@ -4962,7 +4975,10 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(first=lambda: snapshot_attributes)
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -4985,10 +5001,11 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
         "snapshot_id": "snap",
         "global_pointer": "reconciled",
     }
-    assert len(executed_statements) == 3
+    assert len(executed_statements) == 4
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
-    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[1][0]
-    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[2][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
+    assert "UPDATE \"mrf\".ptg2_snapshot" in executed_statements[2][0]
+    assert "INSERT INTO \"mrf\".ptg2_current_snapshot" in executed_statements[3][0]
     assert executed_statements[0][1] == {
         "publish_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
     }
@@ -4999,7 +5016,16 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(mo
 
     class FakeSession:
         async def execute(self, statement, params=None):
-            executed_statements.append((str(statement), params or {}))
+            sql = str(statement)
+            executed_statements.append((sql, params or {}))
+            if "FOR UPDATE OF snapshot" in sql:
+                return SimpleNamespace(
+                    first=lambda: {
+                        "snapshot_id": "snap",
+                        "status": "validated",
+                        "manifest": {},
+                    }
+                )
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -5018,8 +5044,9 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(mo
             )
         )
 
-    assert len(executed_statements) == 1
+    assert len(executed_statements) == 2
     assert "pg_advisory_xact_lock" in executed_statements[0][0]
+    assert "FOR UPDATE OF snapshot" in executed_statements[1][0]
 
 
 def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():

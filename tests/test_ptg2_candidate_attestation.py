@@ -153,6 +153,51 @@ def test_release_report_cannot_refresh_attestation_after_freshness_window():
         )
 
 
+def test_record_candidate_attestation_rechecks_freshness_after_lock(monkeypatch):
+    report = _release_report()
+    completed_at = datetime.datetime.fromisoformat(report["completed_at"])
+    session = _Session()
+    locked_identity = AsyncMock()
+    monkeypatch.setenv(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV,
+        "30",
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation.db,
+        "transaction",
+        lambda: _Transaction(session),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "acquire_ptg2_lifecycle_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_database_timestamp",
+        AsyncMock(return_value=completed_at + datetime.timedelta(minutes=31)),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        locked_identity,
+    )
+
+    with pytest.raises(ValueError, match="too old"):
+        asyncio.run(
+            ptg2_candidate_attestation.record_candidate_audit_attestation(
+                snapshot_id="snap_new",
+                source_key="source_a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                report=report,
+            )
+        )
+
+    locked_identity.assert_not_awaited()
+    assert session.calls == []
+
+
 def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     raw_container_digest = b"x" * 32
     source_set = ptg2_candidate_attestation.shared_source_set_metadata(
@@ -284,6 +329,9 @@ class _Result:
     def first(self):
         return self._row
 
+    def one_or_none(self):
+        return self._row
+
 
 class _Session:
     def __init__(self, result=None):
@@ -360,6 +408,66 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     assert params["expires_at"] > params["attested_at"]
 
 
+def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
+    report = _release_report()
+    completed_at = datetime.datetime.fromisoformat(report["completed_at"])
+    database_now = completed_at + datetime.timedelta(minutes=10)
+    session = _Session()
+    identity = {
+        "snapshot_key": 17,
+        "source_key": "source_a",
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "coverage_scope_id": b"c" * 32,
+        "source_set_digest": b"s" * 32,
+        "audit_sample_digest": bytes.fromhex("ab" * 32),
+    }
+    monkeypatch.setenv(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV,
+        "30",
+    )
+    monkeypatch.setenv(
+        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV,
+        "24",
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_locked_candidate_identity",
+        AsyncMock(return_value=identity),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation.db,
+        "transaction",
+        lambda: _Transaction(session),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "acquire_ptg2_lifecycle_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_candidate_attestation,
+        "_database_timestamp",
+        AsyncMock(return_value=database_now),
+    )
+
+    asyncio.run(
+        ptg2_candidate_attestation.record_candidate_audit_attestation(
+            snapshot_id="snap_new",
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            report=report,
+        )
+    )
+
+    sql, params = session.calls[0]
+    assert params["attested_at"] == database_now
+    assert params["expires_at"] == completed_at + datetime.timedelta(minutes=30)
+    assert "attestation.source_key = EXCLUDED.source_key" in sql
+    assert "attestation.plan_id = EXCLUDED.plan_id" in sql
+
+
 def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     session = _Session(_Result((b"r" * 32,)))
     identity = {
@@ -394,6 +502,7 @@ def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     sql, params = session.calls[0]
     assert "expires_at > clock_timestamp()" in sql
     assert "expires_at > now()" not in sql
+    assert "source_set_digest = :source_set_digest" in sql
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
 
 
@@ -482,12 +591,46 @@ def test_non_candidate_publication_cannot_rewrite_a_strict_candidate():
     )
 
 
-def test_generic_publish_delegates_strict_activation_to_authoritative_path(monkeypatch):
+def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(monkeypatch):
+    session = object()
     activate = AsyncMock(return_value={"status": "promoted"})
+    source_plan_rows = AsyncMock(side_effect=AssertionError("legacy path was selected"))
+    monkeypatch.setattr(
+        source_pointers.db,
+        "transaction",
+        lambda: _Transaction(session),
+    )
     monkeypatch.setattr(
         source_pointers,
-        "activate_ptg2_source_candidate",
+        "_acquire_source_pointer_gc_lock",
+        AsyncMock(),
+    )
+    locked_snapshot = AsyncMock(
+        return_value={
+            "snapshot_id": "snap_new",
+            "status": "validated",
+            "manifest": {
+                "activation": {
+                    "contract": "ptg2_candidate_activation_v1",
+                    "state": "validated",
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_locked_snapshot_publication_row",
+        locked_snapshot,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_activate_ptg2_source_candidate_in_transaction",
         activate,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_source_plan_rows",
+        source_plan_rows,
     )
 
     result = asyncio.run(
@@ -500,22 +643,86 @@ def test_generic_publish_delegates_strict_activation_to_authoritative_path(monke
             snapshot_attributes={
                 "snapshot_id": "snap_new",
                 "status": "published",
-                "manifest": {
-                    "activation": {
-                        "contract": "ptg2_candidate_activation_v1",
-                        "state": "activated",
-                    }
-                },
+                "manifest": {},
             },
         )
     )
 
     assert result == {"status": "promoted"}
+    locked_snapshot.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_id="snap_new",
+    )
     activate.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
         source_key="source_a",
         snapshot_id="snap_new",
         expected_current_snapshot_id="snap_old",
     )
+    source_plan_rows.assert_not_awaited()
+
+
+def test_candidate_metadata_is_reread_from_postgres_under_row_lock():
+    candidate = {
+        "snapshot_id": "snap_new",
+        "import_run_id": "run_1",
+        "import_month": datetime.date(2026, 7, 1),
+        "status": "validated",
+        "created_at": datetime.datetime(2026, 7, 13, 8, 0, 0),
+        "validated_at": datetime.datetime(2026, 7, 13, 8, 30, 0),
+        "published_at": None,
+        "previous_snapshot_id": "snap_old",
+        "manifest": {"activation": {"state": "validated"}},
+        "snapshot_key": 17,
+        "plan_id": "12-3456789",
+        "plan_market_type": "group",
+        "coverage_scope_id": b"c" * 32,
+    }
+    session = _Session(_Result(candidate))
+
+    observed = asyncio.run(
+        source_pointers._locked_candidate_activation_row(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap_new",
+        )
+    )
+
+    assert observed == candidate
+    sql, params = session.calls[0]
+    assert "FOR UPDATE OF snapshot" in sql
+    assert "snapshot.import_run_id" in sql
+    assert "snapshot.import_month" in sql
+    assert "snapshot.previous_snapshot_id" in sql
+    assert "snapshot.manifest" in sql
+    assert "binding.snapshot_key" in sql
+    assert "scope.coverage_scope_id" in sql
+    assert params == {"snapshot_id": "snap_new"}
+
+
+def test_activation_cas_does_not_accept_candidate_already_current():
+    session = _Session(_Result(None))
+
+    with pytest.raises(source_pointers.PTG2SourcePointerConflict):
+        asyncio.run(
+            source_pointers._compare_and_swap_source_pointer(
+                session,
+                schema_name="mrf",
+                source_key="source_a",
+                snapshot_id="snap_new",
+                previous_snapshot_id="snap_old",
+                import_month=datetime.date(2026, 7, 1),
+                updated_at=datetime.datetime(2026, 7, 13, 9, 0, 0),
+                allow_already_current=False,
+            )
+        )
+
+    sql, params = session.calls[0]
+    assert "current_pointer.snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id" in sql
+    assert "current_pointer.snapshot_id = :snapshot_id" in sql
+    assert params["allow_already_current"] is False
 
 
 def test_strict_candidate_activation_verifies_and_consumes_attestation_atomically(monkeypatch):
@@ -628,3 +835,124 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
         "consume",
     ]
     assert cas_calls[0]["allow_already_current"] is False
+
+
+def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeypatch):
+    session = object()
+    state = {
+        "source_pointer": "snap_old",
+        "snapshot_status": "validated",
+        "global_pointer": "snap_old",
+        "plan_pointer": "snap_old",
+        "attestation_consumed": False,
+    }
+    original_state = dict(state)
+
+    class RollbackTransaction:
+        exit_type = None
+
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exit_type = exc_type
+            if exc_type is not None:
+                state.clear()
+                state.update(original_state)
+            return False
+
+    transaction = RollbackTransaction()
+    monkeypatch.setattr(source_pointers.db, "transaction", lambda: transaction)
+    monkeypatch.setattr(
+        source_pointers,
+        "_acquire_source_pointer_gc_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_locked_candidate_activation_row",
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_new",
+                "import_run_id": "run_1",
+                "import_month": datetime.date(2026, 7, 1),
+                "status": "validated",
+                "created_at": datetime.datetime(2026, 7, 13, 8, 0, 0),
+                "validated_at": datetime.datetime(2026, 7, 13, 8, 30, 0),
+                "published_at": None,
+                "previous_snapshot_id": "snap_old",
+                "manifest": {
+                    "activation": {
+                        "contract": "ptg2_candidate_activation_v1",
+                        "state": "validated",
+                        "source_key": "source_a",
+                        "expected_previous_snapshot_id": "snap_old",
+                    }
+                },
+                "snapshot_key": 17,
+                "plan_id": "12-3456789",
+                "plan_market_type": "group",
+                "coverage_scope_id": b"c" * 32,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_database_utc_timestamp",
+        AsyncMock(return_value=datetime.datetime(2026, 7, 13, 9, 0, 0)),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "verify_candidate_audit_attestation_in_transaction",
+        AsyncMock(return_value=b"r" * 32),
+    )
+
+    async def source_cas(*_args, **_kwargs):
+        state["source_pointer"] = "snap_new"
+
+    async def publish(*_args, **_kwargs):
+        state["snapshot_status"] = "published"
+
+    async def global_pointer(*_args, **_kwargs):
+        state["global_pointer"] = "snap_new"
+
+    async def plan_pointer(*_args, **_kwargs):
+        state["plan_pointer"] = "snap_new"
+
+    async def consume(*_args, **_kwargs):
+        state["attestation_consumed"] = True
+        raise RuntimeError("attestation changed during activation")
+
+    monkeypatch.setattr(source_pointers, "_compare_and_swap_source_pointer", source_cas)
+    monkeypatch.setattr(
+        source_pointers,
+        "_publish_snapshot_in_pointer_transaction",
+        publish,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_reconcile_global_snapshot_pointer",
+        global_pointer,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_replace_source_plan_pointers",
+        plan_pointer,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "consume_candidate_audit_attestation_in_transaction",
+        consume,
+    )
+
+    with pytest.raises(RuntimeError, match="attestation changed"):
+        asyncio.run(
+            source_pointers.activate_ptg2_source_candidate(
+                source_key="source_a",
+                snapshot_id="snap_new",
+                expected_current_snapshot_id="snap_old",
+            )
+        )
+
+    assert transaction.exit_type is RuntimeError
+    assert state == original_state
