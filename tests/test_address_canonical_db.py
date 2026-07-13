@@ -178,6 +178,12 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
         f"SELECT {schema}.addr_unit_norm_v1('2227 HALTOM RD STE F', 'F');"
     ) == "stef"
     assert await db.scalar(
+        f"SELECT {schema}.addr_unit_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');"
+    ) == ""
+    assert await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');"
+    ) == "209shoustonavedeptdepartment"
+    assert await db.scalar(
         f"""
         SELECT {schema}.addr_identity_key_v1(
             '2227 HALTOM RD STE F', 'F', 'HALTOM CITY', 'TX', '76117', 'US'

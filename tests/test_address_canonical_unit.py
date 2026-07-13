@@ -3665,3 +3665,15 @@ def test_repeated_bare_line2_unit_value_matches_inline_unit():
     assert repeated == inline == "v2|2227haltomrd|stef||TX|76117|US|street"
     assert address_canon.street_norm("2227 HALTOM RD STE F", "F") == "2227haltomrd"
     assert address_canon.unit_norm("2227 HALTOM RD STE F", "F") == "stef"
+
+
+def test_incomplete_line2_unit_designator_stays_address_text():
+    identity = address_canon.identity_key_v1(
+        "209 S HOUSTON AVE DEPT", "DEPARTMENT", "CAMERON", "TX", "76520", ""
+    )
+
+    assert identity == "v2|209shoustonavedeptdepartment|||TX|76520|US|street"
+    assert address_canon.street_norm(
+        "209 S HOUSTON AVE DEPT", "DEPARTMENT"
+    ) == "209shoustonavedeptdepartment"
+    assert address_canon.unit_norm("209 S HOUSTON AVE DEPT", "DEPARTMENT") == ""

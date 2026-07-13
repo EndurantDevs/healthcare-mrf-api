@@ -610,6 +610,7 @@ DECLARE
     unit_value text;
     unit_value_raw text;
     has_spaced_suffix boolean;
+    line2_unit_matched boolean := false;
 BEGIN
     m := regexp_match(l2,
         '^\s*{floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
@@ -624,6 +625,7 @@ BEGIN
         m := regexp_match(l2,
             '^\s*{unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
         IF m IS NOT NULL THEN
+            line2_unit_matched := true;
             prefix := {qschema}.addr_unit_prefix_v1(m[1]);
             unit_value_raw := COALESCE(m[3], '');
             has_spaced_suffix := unit_value_raw ~ '\s';
@@ -675,7 +677,10 @@ BEGIN
         END IF;
     END IF;
 
-    IF raw IS NOT NULL AND raw = ' ' || l1 || ' ' || l2 || ' ' THEN
+    IF raw IS NOT NULL
+       AND NOT line2_unit_matched
+       AND raw = ' ' || l1 || ' ' || l2 || ' '
+    THEN
         m := regexp_match(raw,
             '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
         IF m IS NOT NULL THEN

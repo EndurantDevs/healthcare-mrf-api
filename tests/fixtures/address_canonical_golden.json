@@ -3775,6 +3775,19 @@
       "expected_premise_key": "c8672eb0-5a08-a039-1800-7d6991c08a18"
     },
     {
+      "id": "incomplete-line2-unit-designator",
+      "first_line": "209 S HOUSTON AVE DEPT",
+      "second_line": "DEPARTMENT",
+      "city": "CAMERON",
+      "state": "TX",
+      "zip": "76520",
+      "country": "",
+      "expected_identity_key": "v2|209shoustonavedeptdepartment|||TX|76520|US|street",
+      "expected_address_key": "aaa451ef-e522-a07b-6e8c-d51984456a0e",
+      "expected_premise_identity_key": "v2|209shoustonavedeptdepartment|||TX|76520|US|street",
+      "expected_premise_key": "aaa451ef-e522-a07b-6e8c-d51984456a0e"
+    },
+    {
       "id": "joined-line-continuation-split",
       "first_line": "123 Main St Ste 200",
       "second_line": "West Wing",
