@@ -18,13 +18,13 @@ try:
     from scripts.research.provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry, reject_polled_run_identity_change
     from scripts.research.provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from scripts.research.provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
-    from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
+    from scripts.research.provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors, run_param_errors
 except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_adoption import AdoptionManager, parse_adopt_runs
     from provider_directory_endpoint_acquisition_concurrency import campaign_state_lock, is_active_run_conflicting_with_entry, reject_polled_run_identity_change
     from provider_directory_endpoint_acquisition_reporting import _has_bounded_metrics, _run_summary
     from provider_directory_endpoint_acquisition_restart import ACTIVE_STATUSES, TERMINAL_STATUSES, HarnessConflict, archive_restart, archived_run_ids, clear_launch_lineage, fresh_root_generation, restart_lineage, validate_restart_run
-    from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors
+    from provider_directory_endpoint_acquisition_support import ImportControlHttpClient, acquisition_metric_errors, bulk_acquisition_metric_errors, external_run_errors, run_param_errors
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 DEFAULT_STATE = ROOT / "reports/provider-directory-endpoint-acquisition/state.json"
@@ -206,21 +206,14 @@ def _load_state(state_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     state["manifest_sha256"] = _json_hash(manifest)
     state["campaign_id"] = manifest["campaign_id"]
     return state
+
+
 def _run_param_errors(manifest: dict[str, Any], entry: dict[str, Any], run_record: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if run_record.get("importer") != manifest["importer"]:
         errors.append("run importer does not match provider-directory-fhir")
     actual_params = run_record.get("params") if isinstance(run_record.get("params"), dict) else {}
-    for param_name, expected_value in entry_params(manifest, entry).items():
-        if actual_params.get(param_name) != expected_value:
-            errors.append(f"params.{param_name} does not match the manifest")
-    actual_endpoint_scope = str(actual_params.get("provider_directory_endpoint_scope") or "").rstrip("/")
-    if actual_endpoint_scope and actual_endpoint_scope != str(entry["canonical_base"]).rstrip("/"):
-        errors.append("params.provider_directory_endpoint_scope does not match the manifest")
-    if entry["classification"] == "probe_only":
-        forbidden_keys = sorted(PROBE_OMITTED_KEYS.intersection(actual_params))
-        if forbidden_keys:
-            errors.append(f"probe-only run contains resource/pagination params: {','.join(forbidden_keys)}")
+    errors.extend(run_param_errors(entry, actual_params, entry_params(manifest, entry), PROBE_OMITTED_KEYS))
     return errors
 
 

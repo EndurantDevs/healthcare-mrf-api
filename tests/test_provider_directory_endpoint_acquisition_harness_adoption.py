@@ -10,16 +10,32 @@ from tests.test_provider_directory_endpoint_acquisition_harness import (
 )
 
 
-def _adoption_config(tmp_path, run_id):
+def _adoption_config(tmp_path, run_id, entry_id="idaho"):
     return harness.HarnessConfig(
         tmp_path / "state.json",
         tmp_path / "report.json",
         apply=True,
-        selected_entry_ids=frozenset({"idaho"}),
+        selected_entry_ids=frozenset({entry_id}),
         poll_interval_seconds=0,
         retry_wait_seconds=0,
-        adopt_run_ids=(("idaho", run_id),),
+        adopt_run_ids=((entry_id, run_id),),
     )
+
+
+def _monthly_schedule_run(manifest, entry, run_id="run_nebraska", status="succeeded"):
+    run_record = _run_record(manifest, entry, run_id, status)
+    run_record["params"].update(
+        {
+            "refresh_preset": "monthly-full",
+            "concurrency": 12,
+            "open_only": False,
+            "include_auth_required": True,
+            "linked_resource_deadline_seconds": 1800,
+        }
+    )
+    for omitted_param in ("probe", "resources", "retest_results_url"):
+        run_record["params"].pop(omitted_param)
+    return run_record
 
 
 def test_adopt_run_attaches_exact_manual_retry_tip(tmp_path):
@@ -72,6 +88,106 @@ def test_adopt_run_rejects_manifest_mismatch(tmp_path):
             control,
             _adoption_config(tmp_path, "run_wrong"),
         ).execute_campaign()
+
+
+def test_adopt_run_accepts_exact_nonpublishing_monthly_schedule_profile(tmp_path):
+    manifest = harness.load_manifest()
+    entry = _manifest_entry(manifest, "nebraska")
+    monthly_run = _monthly_schedule_run(manifest, entry)
+    control = FakeImportControl(runs=[monthly_run])
+
+    state = harness.AcquisitionHarness(
+        manifest,
+        control,
+        _adoption_config(tmp_path, "run_nebraska", "nebraska"),
+        sleeper=lambda _seconds: None,
+    ).execute_campaign()
+
+    assert state["entries"]["nebraska"]["action"] == "adopt"
+    assert state["entries"]["nebraska"]["status"] == "succeeded"
+
+
+def test_monthly_preset_adoption_accepts_importer_alias_and_explicit_resource_list():
+    manifest = harness.load_manifest()
+    entry = _manifest_entry(manifest, "nebraska")
+    monthly_run = _monthly_schedule_run(manifest, entry)
+    monthly_run["params"].update(
+        {
+            "refresh_preset": "monthly_full",
+            "concurrency": "12",
+            "resources": list(entry["resources"]),
+        }
+    )
+
+    assert harness._run_param_errors(manifest, entry, monthly_run) == []
+
+
+def test_monthly_adoption_without_resources_still_requires_exact_terminal_completion():
+    manifest = harness.load_manifest()
+    entry = _manifest_entry(manifest, "nebraska")
+    monthly_run = _monthly_schedule_run(manifest, entry)
+    monthly_run["metrics"]["resource_fetch_completed_source_ids"].pop(
+        "PractitionerRole"
+    )
+
+    errors = harness.terminal_metric_errors(manifest, entry, monthly_run)
+
+    assert "PractitionerRole did not complete for the exact source" in errors
+
+
+def test_monthly_preset_adoption_rejects_unknown_preset_and_missing_safety_value():
+    manifest = harness.load_manifest()
+    entry = _manifest_entry(manifest, "nebraska")
+    unknown_preset_run = _monthly_schedule_run(manifest, entry, "run_unknown")
+    unknown_preset_run["params"]["refresh_preset"] = "weekly"
+
+    assert harness._run_param_errors(manifest, entry, unknown_preset_run) == [
+        "params.refresh_preset is not the audited monthly-full preset"
+    ]
+
+    unsafe_monthly_run = _monthly_schedule_run(manifest, entry, "run_unsafe")
+    unsafe_monthly_run["params"]["stale_cleanup"] = None
+
+    assert any(
+        "params.stale_cleanup" in error
+        for error in harness._run_param_errors(manifest, entry, unsafe_monthly_run)
+    )
+
+
+@pytest.mark.parametrize(
+    ("param_name", "bad_value"),
+    [
+        ("source_ids", ["pdfhir_111111111111111111111111"]),
+        ("provider_directory_endpoint_scope", "https://example.invalid/fhir"),
+        ("resources", ["InsurancePlan", "Practitioner"]),
+        ("retest_results_url", "https://example.invalid/retest.json"),
+        ("concurrency", 1),
+        ("open_only", True),
+        ("include_auth_required", False),
+        ("linked_resource_deadline_seconds", 0),
+        ("page_limit", 1),
+        ("resource_limit", 1),
+        ("source_concurrency", 2),
+        ("bulk_export", True),
+        ("stale_cleanup", True),
+        ("publish_artifacts", True),
+        ("publish_after_acquisition", True),
+        ("publish_corroboration", True),
+        ("seed_only", True),
+    ],
+)
+def test_monthly_preset_adoption_keeps_audited_scope_profile_and_safety_strict(
+    param_name,
+    bad_value,
+):
+    manifest = harness.load_manifest()
+    entry = _manifest_entry(manifest, "nebraska")
+    monthly_run = _monthly_schedule_run(manifest, entry, "run_monthly")
+    monthly_run["params"][param_name] = bad_value
+
+    errors = harness._run_param_errors(manifest, entry, monthly_run)
+
+    assert any(param_name in error for error in errors)
 
 
 def test_adopt_run_rejects_non_tip(tmp_path):

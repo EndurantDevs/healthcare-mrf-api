@@ -10,6 +10,129 @@ import urllib.request
 from typing import Any
 
 
+MONTHLY_FULL_REFRESH_PRESET = "monthly-full"
+# Keep these explicit values aligned with import-control's audited monthly schedule.
+MONTHLY_FULL_ADOPTION_OVERRIDES_BY_NAME = {
+    "concurrency": 12,
+    "open_only": False,
+    "include_auth_required": True,
+    "linked_resource_deadline_seconds": 1800,
+}
+MONTHLY_FULL_OPTIONAL_PARAM_NAMES = ("probe", "resources", "retest_results_url")
+MONTHLY_FULL_FORBIDDEN_MODE_NAMES = (
+    "canonical_backfill_only",
+    "contact_backfill_only",
+    "publish_artifacts_only",
+    "seed_only",
+)
+
+
+def _is_import_param_match(
+    param_name: str,
+    actual_value: Any,
+    expected_value: Any,
+) -> bool:
+    """Compare stored import-control values using accepted importer forms."""
+    if param_name == "resources" and isinstance(actual_value, list):
+        return actual_value == expected_value.split(",")
+    if isinstance(expected_value, int) and not isinstance(expected_value, bool):
+        if isinstance(actual_value, bool):
+            return False
+        try:
+            return int(actual_value) == expected_value
+        except (TypeError, ValueError):
+            return False
+    return actual_value == expected_value
+
+
+def _monthly_full_run_param_errors(
+    entry: dict[str, Any],
+    actual_params_by_name: dict[str, Any],
+    expected_params_by_name: dict[str, Any],
+) -> list[str]:
+    """Validate the exact nonpublishing monthly acquisition schedule shape."""
+    if entry["classification"] not in {"acquisition", "bulk_acquisition"}:
+        return ["params.refresh_preset is not valid for this manifest entry"]
+    raw_preset = actual_params_by_name.get("refresh_preset")
+    normalized_preset = (
+        raw_preset.strip().lower().replace("_", "-")
+        if isinstance(raw_preset, str)
+        else ""
+    )
+    if normalized_preset != MONTHLY_FULL_REFRESH_PRESET:
+        return ["params.refresh_preset is not the audited monthly-full preset"]
+
+    required_params_by_name = dict(expected_params_by_name)
+    optional_params_by_name = {
+        param_name: required_params_by_name.pop(param_name)
+        for param_name in MONTHLY_FULL_OPTIONAL_PARAM_NAMES
+    }
+    required_params_by_name.update(MONTHLY_FULL_ADOPTION_OVERRIDES_BY_NAME)
+    required_params_by_name["refresh_preset"] = MONTHLY_FULL_REFRESH_PRESET
+    errors = [
+        f"params.{param_name} does not match the audited monthly acquisition profile"
+        for param_name, expected_value in required_params_by_name.items()
+        if not _is_import_param_match(
+            param_name,
+            normalized_preset
+            if param_name == "refresh_preset"
+            else actual_params_by_name.get(param_name),
+            expected_value,
+        )
+    ]
+    for param_name, expected_value in optional_params_by_name.items():
+        actual_value = actual_params_by_name.get(param_name)
+        if actual_value not in (None, "") and not _is_import_param_match(
+            param_name,
+            actual_value,
+            expected_value,
+        ):
+            errors.append(
+                f"params.{param_name} does not match the audited monthly acquisition profile"
+            )
+    return errors
+
+
+def run_param_errors(
+    entry: dict[str, Any],
+    actual_params_by_name: dict[str, Any],
+    expected_params_by_name: dict[str, Any],
+    probe_omitted_keys: set[str],
+) -> list[str]:
+    """Validate campaign or monthly run parameters against one manifest entry."""
+    if actual_params_by_name.get("refresh_preset") is not None:
+        errors = _monthly_full_run_param_errors(
+            entry,
+            actual_params_by_name,
+            expected_params_by_name,
+        )
+    else:
+        errors = [
+            f"params.{param_name} does not match the manifest"
+            for param_name, expected_value in expected_params_by_name.items()
+            if actual_params_by_name.get(param_name) != expected_value
+        ]
+    actual_endpoint_scope = str(
+        actual_params_by_name.get("provider_directory_endpoint_scope") or ""
+    ).rstrip("/")
+    expected_endpoint_scope = str(entry["canonical_base"]).rstrip("/")
+    if actual_endpoint_scope and actual_endpoint_scope != expected_endpoint_scope:
+        errors.append("params.provider_directory_endpoint_scope does not match the manifest")
+    if actual_params_by_name.get("refresh_preset") is not None and not actual_endpoint_scope:
+        errors.append("params.provider_directory_endpoint_scope is required for monthly adoption")
+    if entry["classification"] == "probe_only":
+        forbidden_keys = sorted(probe_omitted_keys.intersection(actual_params_by_name))
+        if forbidden_keys:
+            errors.append(
+                "probe-only run contains resource/pagination params: "
+                + ",".join(forbidden_keys)
+            )
+    for param_name in MONTHLY_FULL_FORBIDDEN_MODE_NAMES:
+        if actual_params_by_name.get("refresh_preset") is not None and actual_params_by_name.get(param_name):
+            errors.append(f"params.{param_name} is incompatible with acquisition")
+    return errors
+
+
 class ImportControlHttpClient:
     """Minimal credential-safe import-control JSON client."""
 
