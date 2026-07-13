@@ -77,6 +77,9 @@ jobs:
           tests/test_control_workers.py
           tests/test_archive_unit.py
           tests/test_process_provider_directory_fhir_unit.py
+          tests/test_provider_directory_dataset_network_plan.py
+          tests/test_provider_directory_dataset_network_plan_schema.py
+          tests/test_provider_directory_dataset_serving_relations_races.py
           tests/test_provider_directory_time_partition.py
           tests/test_provider_directory_fhir_bulk_security.py
           tests/test_provider_directory_fhir_completeness.py
@@ -332,3 +335,4 @@ jobs:
         run: |
           python -m pytest -q tests/test_address_canonical_db.py
           python -m pytest -q tests/test_npi_provider_directory_role_evidence_db.py
+          python -m pytest -q tests/test_provider_directory_dataset_serving_relations_db.py

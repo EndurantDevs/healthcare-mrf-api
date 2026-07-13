@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 from contextlib import asynccontextmanager
+import asyncio
 import importlib
 import json
 import uuid
@@ -29,7 +30,8 @@ async def _create_tables(database: Database, schema: str) -> None:
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
         "dataset_id varchar(96) PRIMARY KEY, "
-        "acquisition_root_run_id varchar(64)"
+        "acquisition_root_run_id varchar(64), "
+        "import_run_id varchar(64) NOT NULL"
         ");"
     )
     await database.status(
@@ -46,9 +48,6 @@ async def _create_tables(database: Database, schema: str) -> None:
         "dataset_id varchar(96) NOT NULL, "
         "network_resource_id varchar(256) NOT NULL, "
         "insurance_plan_resource_id varchar(256) NOT NULL, "
-        "acquisition_root_run_id varchar(64), "
-        "build_run_id varchar(64), "
-        "built_at timestamp NOT NULL, "
         "PRIMARY KEY (dataset_id, network_resource_id, insurance_plan_resource_id)"
         ");"
     )
@@ -57,9 +56,6 @@ async def _create_tables(database: Database, schema: str) -> None:
         "dataset_id varchar(96) NOT NULL, "
         "participating_organization_resource_id varchar(256) NOT NULL, "
         "affiliation_resource_id varchar(256) NOT NULL, "
-        "acquisition_root_run_id varchar(64), "
-        "build_run_id varchar(64), "
-        "built_at timestamp NOT NULL, "
         "PRIMARY KEY (dataset_id, participating_organization_resource_id, "
         "affiliation_resource_id)"
         ");"
@@ -92,9 +88,11 @@ async def _insert_endpoint_dataset_fixtures(
 ) -> None:
     await database.status(
         f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
-        "(dataset_id, acquisition_root_run_id) VALUES "
-        "('dataset-a', 'root-a'), ('dataset-b', 'root-b'), "
-        "('dataset-zero', 'root-zero');"
+        "(dataset_id, acquisition_root_run_id, import_run_id) VALUES "
+        "('dataset-a', 'root-a', 'import-a'), "
+        "('dataset-b', 'root-b', 'import-b'), "
+        "('dataset-zero', 'root-zero', 'import-zero'), "
+        "('dataset-legacy', NULL, 'legacy-import');"
     )
 
 
@@ -120,6 +118,14 @@ async def _insert_plan_fixtures(database: Database, schema: str) -> None:
             resource_id,
             plan_payload,
         )
+    await _insert_resource(
+        database,
+        schema,
+        "dataset-legacy",
+        "InsurancePlan",
+        "legacy-plan",
+        {"network_refs": ["Organization/legacy-network"]},
+    )
 
 
 async def _insert_affiliation_fixtures(
@@ -166,13 +172,11 @@ async def _insert_sentinel_relation_fixtures(
 ) -> None:
     await database.status(
         f"INSERT INTO {schema}.provider_directory_dataset_network_plan "
-        "VALUES ('dataset-b', 'sentinel-network', 'sentinel-plan', "
-        "'root-b', 'old-build', now());"
+        "VALUES ('dataset-b', 'sentinel-network', 'sentinel-plan');"
     )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_dataset_affiliation_organization "
-        "VALUES ('dataset-b', 'sentinel-org', 'sentinel-affiliation', "
-        "'root-b', 'old-build', now());"
+        "VALUES ('dataset-b', 'sentinel-org', 'sentinel-affiliation');"
     )
 
 
@@ -232,8 +236,7 @@ async def _build_dataset_a_relations(database: Database):
 
 async def _dataset_a_relation_rows(database: Database, schema: str):
     network_edge_rows = await database.all(
-        f"SELECT network_resource_id, insurance_plan_resource_id, "
-        f"acquisition_root_run_id, build_run_id FROM {schema}."
+        f"SELECT network_resource_id, insurance_plan_resource_id FROM {schema}."
         "provider_directory_dataset_network_plan "
         "WHERE dataset_id = 'dataset-a' ORDER BY 1, 2;"
     )
@@ -250,15 +253,11 @@ def _assert_network_edges(network_proof, network_edge_rows) -> None:
     assert network_proof["edge_count"] == 3
     assert network_proof["duplicate_network_reference_count"] == 2
     assert network_proof["zero_network_reference_plan_count"] == 1
-    assert [tuple(edge_row)[:2] for edge_row in network_edge_rows] == [
+    assert [tuple(edge_row) for edge_row in network_edge_rows] == [
         ("net-shared", "plan-a"),
         ("net-shared", "plan-b"),
         ("net-two", "plan-a"),
     ]
-    assert all(
-        tuple(edge_row)[2:] == ("root-a", "retry-child")
-        for edge_row in network_edge_rows
-    )
 
 
 def _assert_affiliation_edges(affiliation_proof, affiliation_edge_rows) -> None:
@@ -303,11 +302,34 @@ async def test_real_postgres_builds_normalized_relations_and_preserves_other_dat
         await _assert_dataset_b_sentinels(database, schema)
 
 
+async def _build_baseline_dataset_a_relations(database: Database, schema: str):
+    async with database.acquire() as connection:
+        await importer._build_provider_directory_dataset_network_plan(
+            connection,
+            "dataset-a",
+            build_run_id="good-build",
+            expected_acquisition_root_run_id="root-a",
+        )
+        await importer._build_provider_directory_dataset_affiliation_organization(
+            connection,
+            "dataset-a",
+            build_run_id="good-build",
+            expected_acquisition_root_run_id="root-a",
+        )
+    return await _dataset_a_relation_rows(database, schema)
+
+
+async def _assert_dataset_a_relations_unchanged(
+    database: Database,
+    schema: str,
+    expected_rows,
+) -> None:
+    assert await _dataset_a_relation_rows(database, schema) == expected_rows
+
+
 @pytest.mark.asyncio
-async def test_real_postgres_accepts_zero_edges_and_rolls_back_invalid_rebuild(
-    monkeypatch,
-):
-    async with _dataset_database(monkeypatch) as (database, schema):
+async def test_real_postgres_accepts_zero_network_edges(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, _schema_name):
         async with database.acquire() as connection:
             zero_proof = (
                 await importer._build_provider_directory_dataset_network_plan(
@@ -317,12 +339,16 @@ async def test_real_postgres_accepts_zero_edges_and_rolls_back_invalid_rebuild(
                     expected_acquisition_root_run_id="root-zero",
                 )
             )
-            await importer._build_provider_directory_dataset_network_plan(
-                connection,
-                "dataset-a",
-                build_run_id="good-build",
-                expected_acquisition_root_run_id="root-a",
-            )
+
+        assert zero_proof["complete"] is True
+        assert zero_proof["insurance_plan_resource_count"] == 4
+        assert zero_proof["edge_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_invalid_network_refs_preserve_rows(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        original_rows = await _build_baseline_dataset_a_relations(database, schema)
         await database.status(
             f"UPDATE {schema}.provider_directory_dataset_resource "
             "SET payload_json = "
@@ -341,11 +367,100 @@ async def test_real_postgres_accepts_zero_edges_and_rolls_back_invalid_rebuild(
                     expected_acquisition_root_run_id="root-a",
                 )
 
-        assert zero_proof["complete"] is True
-        assert zero_proof["insurance_plan_resource_count"] == 4
-        assert zero_proof["edge_count"] == 0
-        assert await database.scalar(
-            f"SELECT count(*) FROM {schema}."
+        await _assert_dataset_a_relations_unchanged(database, schema, original_rows)
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_invalid_affiliation_refs_preserve_rows(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        original_rows = await _build_baseline_dataset_a_relations(database, schema)
+        await database.status(
+            f"UPDATE {schema}.provider_directory_dataset_resource "
+            "SET payload_json = "
+            "'{\"participating_organization_ref\": "
+            "\"Practitioner/not-an-organization\"}'::jsonb "
+            "WHERE dataset_id = 'dataset-a' "
+            "AND resource_type = 'OrganizationAffiliation' "
+            "AND resource_id = 'affiliation-a';"
+        )
+
+        with pytest.raises(RuntimeError, match="invalid_references"):
+            async with database.acquire() as connection:
+                await importer._build_provider_directory_dataset_affiliation_organization(
+                    connection,
+                    "dataset-a",
+                    build_run_id="bad-build",
+                    expected_acquisition_root_run_id="root-a",
+                )
+
+        await _assert_dataset_a_relations_unchanged(database, schema, original_rows)
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_legacy_null_root_uses_import_run_id(monkeypatch):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        async with database.acquire() as connection:
+            proof = await importer._build_provider_directory_dataset_network_plan(
+                connection,
+                "dataset-legacy",
+                build_run_id="legacy-build",
+                expected_acquisition_root_run_id="legacy-import",
+            )
+
+        relation_rows = await database.all(
+            f"SELECT network_resource_id, insurance_plan_resource_id FROM {schema}."
             "provider_directory_dataset_network_plan "
-            "WHERE dataset_id = 'dataset-a';"
-        ) == 3
+            "WHERE dataset_id = 'dataset-legacy';"
+        )
+        assert proof["acquisition_root_run_id"] == "legacy-import"
+        assert proof["edge_count"] == 1
+        assert [tuple(row) for row in relation_rows] == [
+            ("legacy-network", "legacy-plan")
+        ]
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_serializes_same_dataset_relation_builds():
+    database = Database()
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    second_acquired = asyncio.Event()
+    lock_tasks = []
+
+    async def hold_first_lock():
+        async with database.acquire() as connection:
+            await importer._lock_dataset_serving_relation_build(
+                connection,
+                "dataset-lock-test",
+            )
+            first_acquired.set()
+            await release_first.wait()
+
+    async def wait_for_same_lock():
+        await first_acquired.wait()
+        async with database.acquire() as connection:
+            second_started.set()
+            await importer._lock_dataset_serving_relation_build(
+                connection,
+                "dataset-lock-test",
+            )
+            second_acquired.set()
+
+    try:
+        await database.connect()
+        await _require_disposable_postgres(database)
+        first_task = asyncio.create_task(hold_first_lock())
+        second_task = asyncio.create_task(wait_for_same_lock())
+        lock_tasks = [first_task, second_task]
+        await second_started.wait()
+        await asyncio.sleep(0.1)
+        assert second_acquired.is_set() is False
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+        assert second_acquired.is_set() is True
+    finally:
+        release_first.set()
+        if lock_tasks:
+            await asyncio.gather(*lock_tasks, return_exceptions=True)
+        await database.disconnect()

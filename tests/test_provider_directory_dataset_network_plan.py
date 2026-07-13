@@ -22,7 +22,6 @@ def _network_proof_by_field(**overrides):
         "valid_network_reference_count": 5,
         "invalid_network_reference_count": 0,
         "expected_edge_count": 3,
-        "edge_count": 3,
     }
     proof_by_field.update(overrides)
     return proof_by_field
@@ -39,7 +38,6 @@ def _affiliation_proof_by_field(**overrides):
         "valid_reference_count": 3,
         "invalid_reference_count": 0,
         "expected_edge_count": 3,
-        "edge_count": 3,
     }
     proof_by_field.update(overrides)
     return proof_by_field
@@ -75,9 +73,8 @@ def _network_rebuild_proof():
         dataset_id="dataset-1",
         build_run_id="artifact-run",
         replaced_edge_count=3,
-        expected_acquisition_root_run_id=(
-            importer._DATASET_SERVING_RELATION_ROOT_UNSET
-        ),
+        inserted_edge_count=3,
+        expected_acquisition_root_run_id="root-run",
     )
 
 
@@ -87,9 +84,8 @@ def _affiliation_rebuild_proof():
         dataset_id="dataset-1",
         build_run_id="artifact-run",
         replaced_edge_count=2,
-        expected_acquisition_root_run_id=(
-            importer._DATASET_SERVING_RELATION_ROOT_UNSET
-        ),
+        inserted_edge_count=3,
+        expected_acquisition_root_run_id="root-run",
     )
 
 
@@ -102,16 +98,10 @@ def _mock_artifact_relation_rebuild(monkeypatch):
     affiliation_builder = AsyncMock(return_value=_affiliation_rebuild_proof())
     proof_recorder = AsyncMock()
     monkeypatch.setattr(importer.db, "transaction", transaction)
-    monkeypatch.setattr(
-        importer,
-        "_lock_artifact_fence_endpoints",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_verify_provider_directory_artifact_dataset_fence",
-        AsyncMock(),
-    )
+    fence_lock = AsyncMock()
+    relation_lock = AsyncMock()
+    monkeypatch.setattr(importer, "_lock_and_verify_artifact_dataset_fence", fence_lock)
+    monkeypatch.setattr(importer, "_lock_dataset_serving_relation_build", relation_lock)
     monkeypatch.setattr(
         importer,
         "_build_provider_directory_dataset_network_plan",
@@ -127,7 +117,13 @@ def _mock_artifact_relation_rebuild(monkeypatch):
         "_record_current_dataset_serving_relation_proof",
         proof_recorder,
     )
-    return network_builder, affiliation_builder, proof_recorder
+    return (
+        network_builder,
+        affiliation_builder,
+        proof_recorder,
+        fence_lock,
+        relation_lock,
+    )
 
 
 def _promotion_acquire(transaction_events, connection_executor):
@@ -163,6 +159,7 @@ def _promotion_relation_builders(transaction_events, connection_executor):
             dataset_id=dataset_id,
             build_run_id=build_run_id,
             replaced_edge_count=0,
+            inserted_edge_count=3,
             expected_acquisition_root_run_id=expected_acquisition_root_run_id,
         )
 
@@ -180,6 +177,7 @@ def _promotion_relation_builders(transaction_events, connection_executor):
             dataset_id=dataset_id,
             build_run_id=build_run_id,
             replaced_edge_count=0,
+            inserted_edge_count=3,
             expected_acquisition_root_run_id=expected_acquisition_root_run_id,
         )
 
@@ -232,8 +230,8 @@ def _mock_promotion_dependencies(
     )
 
 
-def test_edge_sql_is_dataset_scoped_insurance_plan_only_and_normalizes_refs():
-    sql = importer._dataset_network_plan_insert_sql(
+def test_network_plan_proof_sql_is_dataset_scoped_and_normalizes_refs():
+    sql = importer._dataset_network_plan_proof_sql(
         should_verify_acquisition_root=True,
     )
 
@@ -244,13 +242,15 @@ def test_edge_sql_is_dataset_scoped_insurance_plan_only_and_normalizes_refs():
     assert "Organization/([A-Za-z0-9.-]{1,64})" in sql
     assert "~ '^[A-Za-z0-9.-]{1,64}$'" in sql
     assert "SELECT DISTINCT insurance_plan_resource_id, network_resource_id" in sql
-    assert "acquisition_root_run_id IS NOT DISTINCT FROM" in sql
+    assert "COALESCE(acquisition_root_run_id, import_run_id)" in sql
+    assert "AS edge_count" not in sql
+    assert "inserted_edges" not in sql
 
 
-def test_affiliation_sql_is_dataset_scoped_and_normalizes_participating_org():
+def test_affiliation_proof_sql_is_dataset_scoped_and_normalizes_org():
     sql = (
         importer
-        ._dataset_affiliation_organization_insert_sql(
+        ._dataset_affiliation_organization_proof_sql(
             should_verify_acquisition_root=True,
         )
     )
@@ -261,7 +261,9 @@ def test_affiliation_sql_is_dataset_scoped_and_normalizes_participating_org():
     assert "Organization/([A-Za-z0-9.-]{1,64})" in sql
     assert "reference_text ~ '^[A-Za-z0-9.-]{1,64}$'" in sql
     assert "InsurancePlan" not in sql
-    assert "acquisition_root_run_id IS NOT DISTINCT FROM" in sql
+    assert "COALESCE(acquisition_root_run_id, import_run_id)" in sql
+    assert "AS edge_count" not in sql
+    assert "inserted_edges" not in sql
 
 
 def test_edge_proof_counts_duplicates_and_accepts_valid_zero_edges():
@@ -270,6 +272,7 @@ def test_edge_proof_counts_duplicates_and_accepts_valid_zero_edges():
         dataset_id="dataset-1",
         build_run_id="retry-child-run",
         replaced_edge_count=2,
+        inserted_edge_count=3,
         expected_acquisition_root_run_id="root-run",
     )
     zero_proof = importer._validated_dataset_network_plan_proof(
@@ -280,11 +283,11 @@ def test_edge_proof_counts_duplicates_and_accepts_valid_zero_edges():
             network_reference_value_count=0,
             valid_network_reference_count=0,
             expected_edge_count=0,
-            edge_count=0,
         ),
         dataset_id="dataset-zero",
         build_run_id="build-zero",
         replaced_edge_count=0,
+        inserted_edge_count=0,
         expected_acquisition_root_run_id="root-run",
     )
 
@@ -300,7 +303,7 @@ def test_edge_proof_counts_duplicates_and_accepts_valid_zero_edges():
     [
         ({"invalid_network_reference_count": 1}, "invalid_references"),
         ({"malformed_network_refs_payload_count": 1}, "invalid_references"),
-        ({"edge_count": 2}, "incomplete"),
+        ({"expected_edge_count": 2}, "incomplete"),
     ],
 )
 def test_edge_proof_fails_closed(overrides, error_fragment):
@@ -310,6 +313,7 @@ def test_edge_proof_fails_closed(overrides, error_fragment):
             dataset_id="dataset-1",
             build_run_id="retry-child-run",
             replaced_edge_count=0,
+            inserted_edge_count=3,
             expected_acquisition_root_run_id="root-run",
         )
 
@@ -320,6 +324,7 @@ def test_affiliation_proof_accepts_empty_refs_and_fails_invalid_nonempty_refs():
         dataset_id="dataset-1",
         build_run_id="retry-child-run",
         replaced_edge_count=1,
+        inserted_edge_count=3,
         expected_acquisition_root_run_id="root-run",
     )
 
@@ -332,6 +337,7 @@ def test_affiliation_proof_accepts_empty_refs_and_fails_invalid_nonempty_refs():
             dataset_id="dataset-1",
             build_run_id="retry-child-run",
             replaced_edge_count=1,
+            inserted_edge_count=3,
             expected_acquisition_root_run_id="root-run",
         )
 
@@ -343,7 +349,13 @@ async def test_artifact_rebuilds_both_relations_once_per_dataset_alias_family(
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset("source-a"), _artifact_dataset("source-b"))
     )
-    network_builder, affiliation_builder, proof_recorder = (
+    (
+        network_builder,
+        affiliation_builder,
+        proof_recorder,
+        fence_lock,
+        relation_lock,
+    ) = (
         _mock_artifact_relation_rebuild(monkeypatch)
     )
 
@@ -358,13 +370,22 @@ async def test_artifact_rebuilds_both_relations_once_per_dataset_alias_family(
         importer.db,
         "dataset-1",
         build_run_id="artifact-run",
+        expected_acquisition_root_run_id="root-run",
     )
     affiliation_builder.assert_awaited_once_with(
         importer.db,
         "dataset-1",
         build_run_id="artifact-run",
+        expected_acquisition_root_run_id="root-run",
     )
     assert proof_recorder.await_count == 2
+    fence_lock.assert_awaited_once_with(
+        importer.ProviderDirectoryArtifactDatasetFence(
+            (_artifact_dataset("source-a"), _artifact_dataset("source-b"))
+        ),
+        importer.db,
+    )
+    relation_lock.assert_awaited_once_with(importer.db, "dataset-1")
     network_aggregate = aggregates["dataset_network_plan"]
     affiliation_aggregate = aggregates["dataset_affiliation_organization"]
     assert network_aggregate["dataset_count"] == 1
@@ -378,7 +399,10 @@ async def test_publication_builds_edges_before_superseding_and_uses_root_identit
     monkeypatch,
 ):
     transaction_events = []
-    connection_executor = types.SimpleNamespace(status=AsyncMock())
+    connection_executor = types.SimpleNamespace(
+        scalar=AsyncMock(),
+        status=AsyncMock(),
+    )
     acquire = _promotion_acquire(transaction_events, connection_executor)
     network_builder, affiliation_builder = _promotion_relation_builders(
         transaction_events,
@@ -409,6 +433,7 @@ async def test_publication_builds_edges_before_superseding_and_uses_root_identit
         "commit",
     ]
     assert publication_summary["dataset_network_plan"]["complete"] is True
+    connection_executor.scalar.assert_awaited_once()
     publish_metadata = importer._publish_endpoint_dataset.await_args.args[-1]
     assert publish_metadata["dataset_network_plan"]["build_run_id"] == (
         "retry-child-run"
@@ -425,7 +450,10 @@ async def test_relation_build_failure_rolls_back_before_current_dataset_changes(
     failing_relation,
 ):
     transaction_events = []
-    connection_executor = types.SimpleNamespace(status=AsyncMock())
+    connection_executor = types.SimpleNamespace(
+        scalar=AsyncMock(),
+        status=AsyncMock(),
+    )
     network_builder = AsyncMock(return_value={"complete": True})
     affiliation_builder = AsyncMock(return_value={"complete": True})
     if failing_relation == "network":

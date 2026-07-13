@@ -34,14 +34,6 @@ def _dataset_foreign_key(
     )
 
 
-def _audit_columns() -> tuple[sa.Column, ...]:
-    return (
-        sa.Column("acquisition_root_run_id", sa.String(length=64), nullable=True),
-        sa.Column("build_run_id", sa.String(length=64), nullable=True),
-        sa.Column("built_at", sa.TIMESTAMP(), nullable=False),
-    )
-
-
 def _create_network_plan_table(schema: str) -> None:
     op.create_table(
         "provider_directory_dataset_network_plan",
@@ -52,7 +44,6 @@ def _create_network_plan_table(schema: str) -> None:
             sa.String(length=256),
             nullable=False,
         ),
-        *_audit_columns(),
         _dataset_foreign_key(
             schema,
             "provider_directory_dataset_network_plan_dataset_id_fkey",
@@ -66,12 +57,12 @@ def _create_network_plan_table(schema: str) -> None:
         schema=schema,
     )
     op.create_index(
-        "provider_directory_dataset_network_plan_lookup_idx",
+        "provider_directory_dataset_network_plan_reverse_lookup_idx",
         "provider_directory_dataset_network_plan",
-        ["dataset_id", "network_resource_id"],
+        ["dataset_id", "insurance_plan_resource_id"],
         unique=False,
         schema=schema,
-        postgresql_include=["insurance_plan_resource_id"],
+        postgresql_include=["network_resource_id"],
     )
 
 
@@ -89,7 +80,6 @@ def _create_affiliation_organization_table(schema: str) -> None:
             sa.String(length=256),
             nullable=False,
         ),
-        *_audit_columns(),
         _dataset_foreign_key(
             schema,
             "pd_dataset_affiliation_org_dataset_id_fkey",
@@ -103,14 +93,6 @@ def _create_affiliation_organization_table(schema: str) -> None:
             ),
         ),
         schema=schema,
-    )
-    op.create_index(
-        "provider_directory_dataset_affiliation_organization_lookup_idx",
-        "provider_directory_dataset_affiliation_organization",
-        ["dataset_id", "participating_organization_resource_id"],
-        unique=False,
-        schema=schema,
-        postgresql_include=["affiliation_resource_id"],
     )
 
 

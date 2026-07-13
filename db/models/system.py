@@ -495,12 +495,11 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
     ]
     __my_additional_indexes__ = [
         {
-            "index_elements": ("dataset_id", "network_resource_id"),
-            "include": ("insurance_plan_resource_id",),
-            "name": "provider_directory_dataset_network_plan_lookup_idx",
+            "index_elements": ("dataset_id", "insurance_plan_resource_id"),
+            "include": ("network_resource_id",),
+            "name": "provider_directory_dataset_network_plan_reverse_lookup_idx",
         },
     ]
-
     dataset_id = Column(
         String(96),
         ForeignKey(
@@ -512,9 +511,6 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
     )
     network_resource_id = Column(String(256), nullable=False)
     insurance_plan_resource_id = Column(String(256), nullable=False)
-    acquisition_root_run_id = Column(String(64))
-    build_run_id = Column(String(64))
-    built_at = Column(TIMESTAMP, nullable=False)
 
 
 class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
@@ -533,19 +529,6 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
         "participating_organization_resource_id",
         "affiliation_resource_id",
     ]
-    __my_additional_indexes__ = [
-        {
-            "index_elements": (
-                "dataset_id",
-                "participating_organization_resource_id",
-            ),
-            "include": ("affiliation_resource_id",),
-            "name": (
-                "provider_directory_dataset_affiliation_organization_lookup_idx"
-            ),
-        },
-    ]
-
     dataset_id = Column(
         String(96),
         ForeignKey(
@@ -560,9 +543,6 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
         nullable=False,
     )
     affiliation_resource_id = Column(String(256), nullable=False)
-    acquisition_root_run_id = Column(String(64))
-    build_run_id = Column(String(64))
-    built_at = Column(TIMESTAMP, nullable=False)
 
 
 class ProviderDirectorySource(Base, JSONOutputMixin):

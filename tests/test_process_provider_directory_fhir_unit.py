@@ -7795,6 +7795,11 @@ class _EndpointDatasetPromotionHarness:
 def _mock_endpoint_dataset_serving_builds(monkeypatch) -> None:
     monkeypatch.setattr(
         importer,
+        "_lock_dataset_serving_relation_build",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
         "_build_provider_directory_dataset_network_plan",
         AsyncMock(return_value={"complete": True, "edge_count": 0}),
     )

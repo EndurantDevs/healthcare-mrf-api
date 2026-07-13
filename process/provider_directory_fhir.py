@@ -9399,22 +9399,25 @@ def _assert_locked_artifact_fence_tuples(
             dataset.endpoint_id,
             dataset.dataset_id,
         )
+        actual_dataset = actual_by_tuple[expected_tuple]
+        if actual_dataset.evidence_run_id != dataset.evidence_run_id:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_endpoint_dataset_evidence_run_changed"
+            )
         if (
-            actual_by_tuple[expected_tuple].selected_resources
-            != dataset.selected_resources
+            actual_dataset.selected_resources != dataset.selected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_metadata_changed"
             )
         if (
-            actual_by_tuple[expected_tuple].expected_resources
-            != dataset.expected_resources
+            actual_dataset.expected_resources != dataset.expected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_expected_metadata_changed"
             )
         if (
-            actual_by_tuple[expected_tuple].recorded_expected_resources
+            actual_dataset.recorded_expected_resources
             != dataset.recorded_expected_resources
         ):
             raise ProviderDirectoryArtifactBuildStale(
@@ -9677,6 +9680,29 @@ def _unique_artifact_datasets(
     return [datasets_by_id[dataset_id] for dataset_id in sorted(datasets_by_id)]
 
 
+def _artifact_fence_for_dataset(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    dataset_id: str,
+) -> ProviderDirectoryArtifactDatasetFence:
+    return ProviderDirectoryArtifactDatasetFence(
+        datasets=tuple(
+            dataset
+            for dataset in fence.datasets
+            if dataset.dataset_id == dataset_id
+        )
+    )
+
+
+async def _lock_dataset_serving_relation_build(
+    executor: Any,
+    dataset_id: str,
+) -> None:
+    await executor.scalar(
+        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0));",
+        lock_key=f"provider-directory-dataset-serving-relations:{dataset_id}",
+    )
+
+
 async def _record_current_dataset_serving_relation_proof(
     dataset: ProviderDirectoryArtifactDataset,
     metadata_key: str,
@@ -9789,6 +9815,7 @@ async def _rebuild_one_current_dataset_relation_set(
             db,
             dataset.dataset_id,
             build_run_id=build_run_id,
+            expected_acquisition_root_run_id=dataset.evidence_run_id,
         )
         proof_by_relation[
             PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY
@@ -9799,6 +9826,7 @@ async def _rebuild_one_current_dataset_relation_set(
                 db,
                 dataset.dataset_id,
                 build_run_id=build_run_id,
+                expected_acquisition_root_run_id=dataset.evidence_run_id,
             )
         )
         proof_by_relation[
@@ -9850,28 +9878,26 @@ async def _rebuild_current_dataset_serving_relations(
     """Refresh selected dataset relations without global-table cutover."""
     selected_datasets = _unique_artifact_datasets(fence)
     proof_list_by_relation: dict[str, list[dict[str, Any]]] = {}
-    if selected_datasets:
+    for dataset in selected_datasets:
+        dataset_fence = _artifact_fence_for_dataset(fence, dataset.dataset_id)
         async with db.transaction():
-            await _lock_artifact_fence_endpoints(fence, db)
-            await _verify_provider_directory_artifact_dataset_fence(fence)
-            for dataset in selected_datasets:
-                proof_by_relation = (
-                    await _rebuild_one_current_dataset_relation_set(
-                        dataset,
-                        build_run_id=build_run_id,
-                        should_rebuild_network_plan=(
-                            should_rebuild_network_plan
-                        ),
-                        should_rebuild_affiliation_organization=(
-                            should_rebuild_affiliation_organization
-                        ),
-                    )
+            await _lock_and_verify_artifact_dataset_fence(dataset_fence, db)
+            await _lock_dataset_serving_relation_build(db, dataset.dataset_id)
+            proof_by_relation = (
+                await _rebuild_one_current_dataset_relation_set(
+                    dataset,
+                    build_run_id=build_run_id,
+                    should_rebuild_network_plan=should_rebuild_network_plan,
+                    should_rebuild_affiliation_organization=(
+                        should_rebuild_affiliation_organization
+                    ),
                 )
-                for relation_name, relation_proof in proof_by_relation.items():
-                    proof_list_by_relation.setdefault(
-                        relation_name,
-                        [],
-                    ).append(relation_proof)
+            )
+            for relation_name, relation_proof in proof_by_relation.items():
+                proof_list_by_relation.setdefault(
+                    relation_name,
+                    [],
+                ).append(relation_proof)
     for relation_name, should_rebuild in (
         (
             PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
@@ -26417,7 +26443,9 @@ def _network_plan_source_ctes(
 ) -> str:
     return f"""
         WITH target_dataset AS MATERIALIZED (
-            SELECT dataset_id, acquisition_root_run_id
+            SELECT dataset_id,
+                   COALESCE(acquisition_root_run_id, import_run_id)
+                       AS acquisition_root_run_id
               FROM {dataset_ref}
              WHERE dataset_id = :dataset_id
                {root_filter}
@@ -26461,7 +26489,6 @@ def _network_plan_source_ctes(
 
 
 def _network_plan_edge_ctes(
-    edge_ref: str,
     organization_reference_pattern: str,
 ) -> str:
     return f"""
@@ -26482,24 +26509,6 @@ def _network_plan_edge_ctes(
             SELECT DISTINCT insurance_plan_resource_id, network_resource_id
               FROM normalized_references
              WHERE network_resource_id IS NOT NULL
-        ), inserted_edges AS (
-            INSERT INTO {edge_ref} (
-                dataset_id,
-                network_resource_id,
-                insurance_plan_resource_id,
-                acquisition_root_run_id,
-                build_run_id,
-                built_at
-            )
-            SELECT dataset.dataset_id,
-                   edge.network_resource_id,
-                   edge.insurance_plan_resource_id,
-                   dataset.acquisition_root_run_id,
-                   :build_run_id,
-                   now()
-              FROM expected_edges AS edge
-             CROSS JOIN target_dataset AS dataset
-            RETURNING network_resource_id, insurance_plan_resource_id
         )
     """
 
@@ -26531,20 +26540,19 @@ def _network_plan_proof_select() -> str:
               WHERE network_resource_id IS NULL)::bigint
                 AS invalid_network_reference_count,
             (SELECT COUNT(*) FROM expected_edges)::bigint
-                AS expected_edge_count,
-            (SELECT COUNT(*) FROM inserted_edges)::bigint AS edge_count;
+                AS expected_edge_count;
     """
 
 
-def _dataset_network_plan_insert_sql(
+def _dataset_network_plan_proof_sql(
     *,
     should_verify_acquisition_root: bool,
 ) -> str:
-    """Build normalized InsurancePlan network edges and return proof counts."""
+    """Count and validate normalized InsurancePlan network edges."""
     schema = _schema()
     root_filter = (
-        "AND acquisition_root_run_id IS NOT DISTINCT FROM "
-        ":acquisition_root_run_id"
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
         if should_verify_acquisition_root
         else ""
     )
@@ -26560,10 +26568,49 @@ def _dataset_network_plan_insert_sql(
                 root_filter,
             ),
             _network_plan_edge_ctes(
-                _qt(schema, PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE),
                 organization_reference_pattern,
             ),
             _network_plan_proof_select(),
+        )
+    )
+
+
+def _dataset_network_plan_edge_insert_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    schema = _schema()
+    root_filter = (
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    organization_reference_pattern = (
+        r"(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})"
+        r"(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$"
+    )
+    edge_ref = _qt(schema, PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE)
+    return "\n".join(
+        (
+            _network_plan_source_ctes(
+                _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                root_filter,
+            ),
+            _network_plan_edge_ctes(organization_reference_pattern),
+            f"""
+            INSERT INTO {edge_ref} (
+                dataset_id,
+                network_resource_id,
+                insurance_plan_resource_id
+            )
+            SELECT dataset.dataset_id,
+                   edge.network_resource_id,
+                   edge.insurance_plan_resource_id
+              FROM expected_edges AS edge
+             CROSS JOIN target_dataset AS dataset;
+            """,
         )
     )
 
@@ -26601,7 +26648,9 @@ def _assert_serving_relation_complete(
     malformed_field: str,
     invalid_field: str,
     error_prefix: str,
-) -> tuple[int, int]:
+    *,
+    actual_edge_count: int | None = None,
+) -> int:
     malformed_count = _dataset_network_plan_count(
         proof_by_field,
         malformed_field,
@@ -26616,13 +26665,12 @@ def _assert_serving_relation_complete(
         proof_by_field,
         "expected_edge_count",
     )
-    edge_count = _dataset_network_plan_count(proof_by_field, "edge_count")
-    if edge_count != expected_count:
+    if actual_edge_count is not None and actual_edge_count != expected_count:
         raise RuntimeError(
             f"{error_prefix}_incomplete:{dataset_id}:"
-            f"expected={expected_count}:actual={edge_count}"
+            f"expected={expected_count}:actual={actual_edge_count}"
         )
-    return expected_count, edge_count
+    return expected_count
 
 
 def _validated_dataset_network_plan_proof(
@@ -26631,6 +26679,7 @@ def _validated_dataset_network_plan_proof(
     dataset_id: str,
     build_run_id: str | None,
     replaced_edge_count: int,
+    inserted_edge_count: int,
     expected_acquisition_root_run_id: str | None | object,
 ) -> dict[str, Any]:
     error_prefix = "provider_directory_dataset_network_plan"
@@ -26640,12 +26689,13 @@ def _validated_dataset_network_plan_proof(
         expected_acquisition_root_run_id,
         error_prefix,
     )
-    expected_edge_count, _edge_count = _assert_serving_relation_complete(
+    expected_edge_count = _assert_serving_relation_complete(
         proof_by_field,
         dataset_id,
         "malformed_network_refs_payload_count",
         "invalid_network_reference_count",
         error_prefix,
+        actual_edge_count=inserted_edge_count,
     )
     valid_reference_count = _dataset_network_plan_count(
         proof_by_field,
@@ -26660,7 +26710,6 @@ def _validated_dataset_network_plan_proof(
         "valid_network_reference_count",
         "invalid_network_reference_count",
         "expected_edge_count",
-        "edge_count",
     )
     return {
         "complete": True,
@@ -26672,11 +26721,72 @@ def _validated_dataset_network_plan_proof(
             field_name: _dataset_network_plan_count(proof_by_field, field_name)
             for field_name in count_fields
         },
+        "edge_count": inserted_edge_count,
         "duplicate_network_reference_count": (
             valid_reference_count - expected_edge_count
         ),
         "replaced_edge_count": replaced_edge_count,
     }
+
+
+def _dataset_serving_relation_query_options(
+    dataset_id: str,
+    expected_acquisition_root_run_id: str | None | object,
+) -> tuple[bool, dict[str, Any]]:
+    should_verify_root = (
+        expected_acquisition_root_run_id
+        is not _DATASET_SERVING_RELATION_ROOT_UNSET
+    )
+    query_params_by_name: dict[str, Any] = {"dataset_id": dataset_id}
+    if should_verify_root:
+        query_params_by_name["acquisition_root_run_id"] = (
+            expected_acquisition_root_run_id
+        )
+    return should_verify_root, query_params_by_name
+
+
+def _validate_dataset_serving_relation_preflight(
+    proof_by_field: dict[str, Any],
+    *,
+    dataset_id: str,
+    expected_acquisition_root_run_id: str | None | object,
+    malformed_field: str,
+    invalid_field: str,
+    error_prefix: str,
+) -> None:
+    _validated_serving_relation_root(
+        proof_by_field,
+        dataset_id,
+        expected_acquisition_root_run_id,
+        error_prefix,
+    )
+    _assert_serving_relation_complete(
+        proof_by_field,
+        dataset_id,
+        malformed_field,
+        invalid_field,
+        error_prefix,
+    )
+
+
+async def _replace_dataset_serving_relation_edges(
+    executor: Any,
+    *,
+    dataset_id: str,
+    edge_ref: str,
+    insert_sql: str,
+    query_params_by_name: dict[str, Any],
+) -> tuple[int, int]:
+    replaced_edge_count = _coerce_rowcount(
+        await executor.status(
+            f"DELETE FROM {edge_ref} WHERE dataset_id = :dataset_id;",
+            dataset_id=dataset_id,
+        )
+    )
+    inserted_edge_count = _coerce_rowcount(
+        await executor.status(insert_sql, **query_params_by_name)
+    )
+    return replaced_edge_count, inserted_edge_count
 
 
 async def _build_provider_directory_dataset_network_plan(
@@ -26689,40 +26799,47 @@ async def _build_provider_directory_dataset_network_plan(
     ),
 ) -> dict[str, Any]:
     """Replace one dataset's edges inside the caller's transaction."""
-    edge_ref = _qt(
-        _schema(),
-        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
-    )
-    replaced_edge_count = _coerce_rowcount(
-        await executor.status(
-            f"DELETE FROM {edge_ref} WHERE dataset_id = :dataset_id;",
-            dataset_id=dataset_id,
+    should_verify_root, query_params_by_name = (
+        _dataset_serving_relation_query_options(
+            dataset_id,
+            expected_acquisition_root_run_id,
         )
     )
-    should_verify_root = (
-        expected_acquisition_root_run_id
-        is not _DATASET_SERVING_RELATION_ROOT_UNSET
-    )
-    query_params_by_name: dict[str, Any] = {
-        "dataset_id": dataset_id,
-        "build_run_id": build_run_id,
-    }
-    if should_verify_root:
-        query_params_by_name["acquisition_root_run_id"] = (
-            expected_acquisition_root_run_id
-        )
     proof_record = await executor.first(
-        _dataset_network_plan_insert_sql(
+        _dataset_network_plan_proof_sql(
             should_verify_acquisition_root=should_verify_root,
         ),
         **query_params_by_name,
     )
     proof_row = _pagination_checkpoint_row_mapping(proof_record)
+    _validate_dataset_serving_relation_preflight(
+        proof_row,
+        dataset_id=dataset_id,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+        malformed_field="malformed_network_refs_payload_count",
+        invalid_field="invalid_network_reference_count",
+        error_prefix="provider_directory_dataset_network_plan",
+    )
+    replaced_edge_count, inserted_edge_count = (
+        await _replace_dataset_serving_relation_edges(
+            executor,
+            dataset_id=dataset_id,
+            edge_ref=_qt(
+                _schema(),
+                PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
+            ),
+            insert_sql=_dataset_network_plan_edge_insert_sql(
+                should_verify_acquisition_root=should_verify_root
+            ),
+            query_params_by_name=query_params_by_name,
+        )
+    )
     return _validated_dataset_network_plan_proof(
         proof_row,
         dataset_id=dataset_id,
         build_run_id=build_run_id,
         replaced_edge_count=replaced_edge_count,
+        inserted_edge_count=inserted_edge_count,
         expected_acquisition_root_run_id=expected_acquisition_root_run_id,
     )
 
@@ -26734,7 +26851,9 @@ def _affiliation_org_source_ctes(
 ) -> str:
     return f"""
         WITH target_dataset AS MATERIALIZED (
-            SELECT dataset_id, acquisition_root_run_id
+            SELECT dataset_id,
+                   COALESCE(acquisition_root_run_id, import_run_id)
+                       AS acquisition_root_run_id
               FROM {dataset_ref}
              WHERE dataset_id = :dataset_id
                {root_filter}
@@ -26779,7 +26898,6 @@ def _affiliation_org_source_ctes(
 
 
 def _affiliation_org_edge_ctes(
-    edge_ref: str,
     organization_reference_pattern: str,
 ) -> str:
     return f"""
@@ -26802,25 +26920,6 @@ def _affiliation_org_edge_ctes(
                    participating_organization_resource_id
               FROM resolved_affiliations
              WHERE participating_organization_resource_id IS NOT NULL
-        ), inserted_edges AS (
-            INSERT INTO {edge_ref} (
-                dataset_id,
-                participating_organization_resource_id,
-                affiliation_resource_id,
-                acquisition_root_run_id,
-                build_run_id,
-                built_at
-            )
-            SELECT dataset.dataset_id,
-                   edge.participating_organization_resource_id,
-                   edge.affiliation_resource_id,
-                   dataset.acquisition_root_run_id,
-                   :build_run_id,
-                   now()
-              FROM expected_edges AS edge
-             CROSS JOIN target_dataset AS dataset
-            RETURNING participating_organization_resource_id,
-                      affiliation_resource_id
         )
     """
 
@@ -26851,20 +26950,19 @@ def _affiliation_org_proof_select() -> str:
                 AND participating_organization_resource_id IS NULL)::bigint
                 AS invalid_reference_count,
             (SELECT COUNT(*) FROM expected_edges)::bigint
-                AS expected_edge_count,
-            (SELECT COUNT(*) FROM inserted_edges)::bigint AS edge_count;
+                AS expected_edge_count;
     """
 
 
-def _dataset_affiliation_organization_insert_sql(
+def _dataset_affiliation_organization_proof_sql(
     *,
     should_verify_acquisition_root: bool,
 ) -> str:
-    """Build normalized OrganizationAffiliation locator edges and counts."""
+    """Count and validate normalized OrganizationAffiliation locator edges."""
     schema = _schema()
     root_filter = (
-        "AND acquisition_root_run_id IS NOT DISTINCT FROM "
-        ":acquisition_root_run_id"
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
         if should_verify_acquisition_root
         else ""
     )
@@ -26880,13 +26978,52 @@ def _dataset_affiliation_organization_insert_sql(
                 root_filter,
             ),
             _affiliation_org_edge_ctes(
-                _qt(
-                    schema,
-                    PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
-                ),
                 organization_reference_pattern,
             ),
             _affiliation_org_proof_select(),
+        )
+    )
+
+
+def _dataset_affiliation_organization_edge_insert_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    schema = _schema()
+    root_filter = (
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    organization_reference_pattern = (
+        r"(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})"
+        r"(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$"
+    )
+    edge_ref = _qt(
+        schema,
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
+    )
+    return "\n".join(
+        (
+            _affiliation_org_source_ctes(
+                _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                root_filter,
+            ),
+            _affiliation_org_edge_ctes(organization_reference_pattern),
+            f"""
+            INSERT INTO {edge_ref} (
+                dataset_id,
+                participating_organization_resource_id,
+                affiliation_resource_id
+            )
+            SELECT dataset.dataset_id,
+                   edge.participating_organization_resource_id,
+                   edge.affiliation_resource_id
+              FROM expected_edges AS edge
+             CROSS JOIN target_dataset AS dataset;
+            """,
         )
     )
 
@@ -26897,6 +27034,7 @@ def _validated_dataset_affiliation_organization_proof(
     dataset_id: str,
     build_run_id: str | None,
     replaced_edge_count: int,
+    inserted_edge_count: int,
     expected_acquisition_root_run_id: str | None | object,
 ) -> dict[str, Any]:
     error_prefix = "provider_directory_dataset_affiliation_organization"
@@ -26912,6 +27050,7 @@ def _validated_dataset_affiliation_organization_proof(
         "malformed_reference_payload_count",
         "invalid_reference_count",
         error_prefix,
+        actual_edge_count=inserted_edge_count,
     )
     count_fields = (
         "affiliation_resource_count",
@@ -26921,7 +27060,6 @@ def _validated_dataset_affiliation_organization_proof(
         "valid_reference_count",
         "invalid_reference_count",
         "expected_edge_count",
-        "edge_count",
     )
     return {
         "complete": True,
@@ -26935,6 +27073,7 @@ def _validated_dataset_affiliation_organization_proof(
             field_name: _dataset_network_plan_count(proof_by_field, field_name)
             for field_name in count_fields
         },
+        "edge_count": inserted_edge_count,
         "replaced_edge_count": replaced_edge_count,
     }
 
@@ -26949,39 +27088,47 @@ async def _build_provider_directory_dataset_affiliation_organization(
     ),
 ) -> dict[str, Any]:
     """Replace one dataset's affiliation locators in the caller transaction."""
-    edge_ref = _qt(
-        _schema(),
-        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
-    )
-    replaced_edge_count = _coerce_rowcount(
-        await executor.status(
-            f"DELETE FROM {edge_ref} WHERE dataset_id = :dataset_id;",
-            dataset_id=dataset_id,
+    should_verify_root, query_params_by_name = (
+        _dataset_serving_relation_query_options(
+            dataset_id,
+            expected_acquisition_root_run_id,
         )
     )
-    should_verify_root = (
-        expected_acquisition_root_run_id
-        is not _DATASET_SERVING_RELATION_ROOT_UNSET
-    )
-    query_params_by_name: dict[str, Any] = {
-        "dataset_id": dataset_id,
-        "build_run_id": build_run_id,
-    }
-    if should_verify_root:
-        query_params_by_name["acquisition_root_run_id"] = (
-            expected_acquisition_root_run_id
-        )
     proof_record = await executor.first(
-        _dataset_affiliation_organization_insert_sql(
+        _dataset_affiliation_organization_proof_sql(
             should_verify_acquisition_root=should_verify_root,
         ),
         **query_params_by_name,
     )
+    proof_row = _pagination_checkpoint_row_mapping(proof_record)
+    _validate_dataset_serving_relation_preflight(
+        proof_row,
+        dataset_id=dataset_id,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+        malformed_field="malformed_reference_payload_count",
+        invalid_field="invalid_reference_count",
+        error_prefix="provider_directory_dataset_affiliation_organization",
+    )
+    replaced_edge_count, inserted_edge_count = (
+        await _replace_dataset_serving_relation_edges(
+            executor,
+            dataset_id=dataset_id,
+            edge_ref=_qt(
+                _schema(),
+                PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
+            ),
+            insert_sql=_dataset_affiliation_organization_edge_insert_sql(
+                should_verify_acquisition_root=should_verify_root
+            ),
+            query_params_by_name=query_params_by_name,
+        )
+    )
     return _validated_dataset_affiliation_organization_proof(
-        _pagination_checkpoint_row_mapping(proof_record),
+        proof_row,
         dataset_id=dataset_id,
         build_run_id=build_run_id,
         replaced_edge_count=replaced_edge_count,
+        inserted_edge_count=inserted_edge_count,
         expected_acquisition_root_run_id=expected_acquisition_root_run_id,
     )
 
@@ -27394,6 +27541,7 @@ async def _build_endpoint_dataset_serving_relations(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, dict[str, Any]]:
+    await _lock_dataset_serving_relation_build(connection, candidate.dataset_id)
     common_options_by_name = {
         "build_run_id": candidate.import_run_id,
         "expected_acquisition_root_run_id": (

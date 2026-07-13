@@ -49,7 +49,7 @@ class _OpRecorder:
         }
 
 
-def test_dataset_network_plan_model_is_logged_dataset_scoped_and_covering():
+def test_dataset_network_plan_model_is_dataset_scoped_with_reverse_lookup():
     table = ProviderDirectoryDatasetNetworkPlan.__table__
     primary_key_columns = tuple(
         column.name for column in table.primary_key.columns
@@ -69,26 +69,26 @@ def test_dataset_network_plan_model_is_logged_dataset_scoped_and_covering():
         "provider_directory_endpoint_dataset.dataset_id"
     )
     assert dataset_foreign_key.ondelete == "CASCADE"
-    assert table.c.built_at.nullable is False
     assert lookup_index == {
-        "index_elements": ("dataset_id", "network_resource_id"),
-        "include": ("insurance_plan_resource_id",),
-        "name": "provider_directory_dataset_network_plan_lookup_idx",
+        "index_elements": ("dataset_id", "insurance_plan_resource_id"),
+        "include": ("network_resource_id",),
+        "name": "provider_directory_dataset_network_plan_reverse_lookup_idx",
     }
+    assert {
+        "acquisition_root_run_id",
+        "build_run_id",
+        "built_at",
+    }.isdisjoint(table.c.keys())
     assert "CREATE TABLE" in ddl
     assert "UNLOGGED" not in ddl
 
 
-def test_dataset_affiliation_organization_model_is_dataset_scoped_and_covering():
+def test_dataset_affiliation_organization_model_is_dataset_scoped_through_pk():
     table = ProviderDirectoryDatasetAffiliationOrganization.__table__
     primary_key_columns = tuple(
         column.name for column in table.primary_key.columns
     )
     dataset_foreign_key = next(iter(table.c.dataset_id.foreign_keys))
-    lookup_index = (
-        ProviderDirectoryDatasetAffiliationOrganization
-        .__my_additional_indexes__[0]
-    )
     ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
 
     assert primary_key_columns == (
@@ -97,17 +97,14 @@ def test_dataset_affiliation_organization_model_is_dataset_scoped_and_covering()
         "affiliation_resource_id",
     )
     assert dataset_foreign_key.ondelete == "CASCADE"
-    assert table.c.built_at.nullable is False
-    assert lookup_index == {
-        "index_elements": (
-            "dataset_id",
-            "participating_organization_resource_id",
-        ),
-        "include": ("affiliation_resource_id",),
-        "name": (
-            "provider_directory_dataset_affiliation_organization_lookup_idx"
-        ),
-    }
+    assert "__my_additional_indexes__" not in (
+        ProviderDirectoryDatasetAffiliationOrganization.__dict__
+    )
+    assert {
+        "acquisition_root_run_id",
+        "build_run_id",
+        "built_at",
+    }.isdisjoint(table.c.keys())
     assert "CREATE TABLE" in ddl
     assert "UNLOGGED" not in ddl
 
@@ -148,23 +145,19 @@ def test_dataset_serving_relations_migration_matches_models(monkeypatch):
             if isinstance(schema_item, sa.ForeignKeyConstraint)
         )
         assert foreign_key.ondelete == "CASCADE"
+    assert set(recorder.indexes) == {
+        "provider_directory_dataset_network_plan_reverse_lookup_idx"
+    }
     lookup_index = recorder.indexes[
-        "provider_directory_dataset_network_plan_lookup_idx"
+        "provider_directory_dataset_network_plan_reverse_lookup_idx"
     ]
     assert lookup_index["table_name"] == (
         "provider_directory_dataset_network_plan"
     )
-    assert lookup_index["columns"] == ["dataset_id", "network_resource_id"]
-    assert lookup_index["postgresql_include"] == [
-        "insurance_plan_resource_id"
-    ]
-    affiliation_lookup_index = recorder.indexes[
-        "provider_directory_dataset_affiliation_organization_lookup_idx"
-    ]
-    assert affiliation_lookup_index["columns"] == [
+    assert lookup_index["columns"] == [
         "dataset_id",
-        "participating_organization_resource_id",
+        "insurance_plan_resource_id",
     ]
-    assert affiliation_lookup_index["postgresql_include"] == [
-        "affiliation_resource_id"
+    assert lookup_index["postgresql_include"] == [
+        "network_resource_id"
     ]
