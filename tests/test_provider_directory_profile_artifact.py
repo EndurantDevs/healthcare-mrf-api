@@ -1,0 +1,255 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+from __future__ import annotations
+
+import contextlib
+import importlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from process import provider_directory_profile as profile
+
+
+importer = importlib.import_module("process.provider_directory_fhir")
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_PROFILE_ENTRY_IDS = {
+    "amerihealth-caritas-carrier",
+    "alohr",
+    "cigna",
+    "contra-costa",
+    "hap",
+    "health-partners-plans",
+    "iehp",
+    "texas-tmhp",
+}
+
+
+def test_profile_source_spec_matches_the_eight_reviewed_manifest_entries():
+    source_spec = profile.load_profile_source_spec()
+    manifest = json.loads(
+        (
+            REPO_ROOT
+            / "specs/provider_directory_endpoint_acquisition_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entries_by_id = {
+        entry["entry_id"]: entry for entry in manifest["entries"]
+    }
+    expected_source_ids = {
+        source_id
+        for entry_id in EXPECTED_PROFILE_ENTRY_IDS
+        for source_id in entries_by_id[entry_id]["source_ids"]
+    }
+
+    assert set(source_spec["entry_ids"]) == EXPECTED_PROFILE_ENTRY_IDS
+    assert set(source_spec["source_ids"]) == expected_source_ids
+    assert all(
+        entries_by_id[entry_id]["classification"]
+        in {"acquisition", "external"}
+        for entry_id in EXPECTED_PROFILE_ENTRY_IDS
+    )
+
+
+def test_profile_tables_and_indexes_are_bounded_and_npi_indexed():
+    profile_sql = profile.profile_table_sql("mrf", "profile_stage")
+    evidence_sql = profile.profile_evidence_table_sql(
+        "mrf",
+        "evidence_stage",
+    )
+    profile_indexes = profile.profile_index_statements(
+        "mrf",
+        "profile_stage",
+        evidence=False,
+    )
+    evidence_indexes = profile.profile_index_statements(
+        "mrf",
+        "evidence_stage",
+        evidence=True,
+    )
+
+    assert "CREATE UNLOGGED TABLE" in profile_sql
+    assert "npi bigint PRIMARY KEY" in profile_sql
+    assert "evidence_json jsonb NOT NULL" in profile_sql
+    assert "CREATE UNLOGGED TABLE" in evidence_sql
+    assert "evidence_key char(32) PRIMARY KEY" in evidence_sql
+    assert any("(generation_id)" in statement for statement in profile_indexes)
+    assert any("(npi, fact_type, fact_key)" in statement for statement in evidence_indexes)
+    assert profile.PROFILE_FACT_LIMIT == 100
+    assert profile.PROFILE_FACT_EVIDENCE_LIMIT == 25
+
+
+def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
+    sql = profile.profile_evidence_insert_sql(
+        target_ref='"fixture"."evidence"',
+        source_ref='"fixture"."source"',
+        practitioner_ref='"fixture"."practitioner"',
+        role_ref='"fixture"."role"',
+        organization_ref='"fixture"."organization"',
+        service_ref='"fixture"."service"',
+    )
+
+    for fact_type in (
+        "age",
+        "years_of_practice",
+        "credential",
+        "taxonomy_qualification",
+        "qualification_detail",
+        "language",
+        "contact",
+        "specialty",
+        "new_patient_acceptance",
+        "telehealth",
+        "organization",
+        "service",
+    ):
+        assert f"'{fact_type}'" in sql
+    assert "practitioner.birth_date" not in sql
+    assert "practitioner.birthDate" not in sql
+    assert "basis_start_date" in sql
+    assert "ON CONFLICT (evidence_key) DO NOTHING" in sql
+
+
+def test_profile_aggregation_is_deterministic_and_evidence_bounded():
+    sql = profile.profile_insert_sql(
+        evidence_ref='"fixture"."evidence"',
+        target_ref='"fixture"."profile"',
+        old_evidence_ref=None,
+        rebuild_all=True,
+    )
+
+    assert "evidence_rank <= 25" in sql
+    assert "fact_rank <= 100" in sql
+    assert "ORDER BY evidence.source_id, evidence.endpoint_id" in sql
+    assert "array_agg(DISTINCT evidence.source_id ORDER BY evidence.source_id)" in sql
+    assert "'api_base', evidence.canonical_api_base" in sql
+
+
+def test_profile_source_dataset_pairs_preserve_sorted_alignment():
+    datasets = [
+        SimpleNamespace(source_id="source_b", dataset_id="dataset_b"),
+        SimpleNamespace(source_id="source_a", dataset_id="dataset_a"),
+    ]
+
+    assert profile.profile_source_dataset_pairs(
+        datasets,
+        ["source_b", "source_a"],
+    ) == (["source_a", "source_b"], ["dataset_a", "dataset_b"])
+
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_dataset_missing:source_c",
+    ):
+        profile.profile_source_dataset_pairs(datasets, ["source_c"])
+
+
+@pytest.mark.asyncio
+async def test_profile_scope_filters_to_current_immutable_dataset_fence(
+    monkeypatch,
+):
+    captured_by_name = {}
+
+    async def fake_all(sql, **params):
+        captured_by_name["sql"] = sql
+        captured_by_name["params"] = params
+        return [
+            {"source_id": "source_allowed"},
+            {"source_id": "source_outside_fence"},
+        ]
+
+    monkeypatch.setattr(
+        profile,
+        "configured_profile_source_ids",
+        lambda: ("source_allowed", "source_outside_fence"),
+    )
+    monkeypatch.setattr(importer.db, "all", fake_all)
+
+    source_ids = await importer._provider_directory_profile_scope_source_ids(
+        "mrf",
+        {"source_allowed"},
+    )
+
+    assert source_ids == ["source_allowed"]
+    assert captured_by_name["params"]["configured_source_ids"] == [
+        "source_allowed",
+        "source_outside_fence",
+    ]
+    assert "endpoint_id" in captured_by_name["sql"]
+
+
+def test_artifact_bundle_collects_profile_and_evidence_stages_together():
+    async def rename_indexes(_schema, _stage):
+        return None
+
+    stages = (
+        importer.ProviderDirectoryPreparedArtifactStage(
+            schema="mrf",
+            stage_table="evidence_stage",
+            target_relation=profile.PROFILE_EVIDENCE_TABLE,
+            rename_stage_indexes=rename_indexes,
+        ),
+        importer.ProviderDirectoryPreparedArtifactStage(
+            schema="mrf",
+            stage_table="profile_stage",
+            target_relation=profile.PROFILE_TABLE,
+            rename_stage_indexes=rename_indexes,
+        ),
+    )
+    bundle = importer.ProviderDirectoryArtifactBundle()
+
+    metrics = importer._collect_provider_directory_artifact_stage(
+        ({"profile_rows": 1}, stages),
+        bundle,
+    )
+
+    assert metrics == {"profile_rows": 1}
+    assert bundle.stages == list(stages)
+
+
+@pytest.mark.asyncio
+async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
+    dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source_a",
+        endpoint_id="endpoint_a",
+        dataset_id="dataset_a",
+        evidence_run_id="run_a",
+        selected_resources=("Practitioner",),
+        expected_resources=("Practitioner",),
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
+
+    @contextlib.asynccontextmanager
+    async def fake_build_guard(_schema, _target):
+        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_scope_source_ids",
+        AsyncMock(return_value=["source_a"]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_artifact_build_guard",
+        fake_build_guard,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_table_exists",
+        AsyncMock(side_effect=[True, False]),
+    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
+        fence
+    )
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="provider_directory_profile_artifact_pair_incomplete",
+        ):
+            await importer.publish_provider_directory_profile()
+    finally:
+        importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)

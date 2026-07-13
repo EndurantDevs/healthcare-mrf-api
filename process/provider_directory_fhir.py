@@ -83,6 +83,7 @@ from process.provider_directory_time_partition import (
     WindowPass,
     parse_utc_instant,
 )
+from process import provider_directory_profile as profile_artifact
 from scripts.provider_directory_support_contract import (
     SupportDocumentationError,
     validate_blocker_registry,
@@ -277,6 +278,7 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = (
     "location_address_keys",
     "location_archive",
     "address_overlay",
+    "profile",
     "network_catalog",
     "corroboration",
 )
@@ -324,6 +326,8 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
         "dataset_affiliation_organization",
         "network_catalog",
     ),
+    "profile_data": ("profile",),
+    "profiles": ("profile",),
     "ptg_corroboration": ("corroboration",),
 }
 PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
@@ -347,6 +351,7 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
         frozenset({"Location", "Organization", "OrganizationAffiliation"}),
         frozenset({"Organization"}),
     ),
+    "profile": (frozenset({"Practitioner"}),),
     "network_catalog": (
         frozenset({"InsurancePlan"}),
         frozenset({"PractitionerRole"}),
@@ -375,6 +380,14 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
             "Location",
             "Organization",
             "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        }
+    ),
+    "profile": frozenset(
+        {
+            "HealthcareService",
+            "Organization",
             "Practitioner",
             "PractitionerRole",
         }
@@ -5696,6 +5709,112 @@ def _profile_text(value: Any, *, max_length: int = 2048) -> str | None:
     return text[:max_length] if text else None
 
 
+def _derived_age(
+    birth_date_value: Any,
+    *,
+    as_of: datetime.date,
+) -> tuple[int | None, str | None]:
+    birth_date_text = _clean_text(birth_date_value)
+    if not birth_date_text or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", birth_date_text):
+        return None, None
+    try:
+        birth_date = datetime.date.fromisoformat(birth_date_text)
+    except ValueError:
+        return None, None
+    age_years = as_of.year - birth_date.year - (
+        (as_of.month, as_of.day) < (birth_date.month, birth_date.day)
+    )
+    if birth_date > as_of or not 0 <= age_years <= 120:
+        return None, None
+    return age_years, as_of.isoformat()
+
+
+def _full_fhir_date(value: Any) -> datetime.date | None:
+    date_text = _clean_text(value)
+    if not date_text:
+        return None
+    matched = re.match(r"^(\d{4}-\d{2}-\d{2})(?:$|T)", date_text)
+    if not matched:
+        return None
+    try:
+        return datetime.date.fromisoformat(matched.group(1))
+    except ValueError:
+        return None
+
+
+def _derived_years_of_practice(
+    qualification_value: Any,
+    *,
+    as_of: datetime.date,
+    birth_date_value: Any = None,
+) -> tuple[int | None, str | None, str | None, str | None]:
+    if not isinstance(qualification_value, list):
+        return None, None, None, None
+    birth_date = _full_fhir_date(birth_date_value)
+    candidate_start_dates: list[datetime.date] = []
+    for qualification in qualification_value:
+        if not isinstance(qualification, dict):
+            continue
+        period = qualification.get("period")
+        if not isinstance(period, dict):
+            continue
+        start_date = _full_fhir_date(period.get("start"))
+        if start_date is None or start_date > as_of:
+            continue
+        if birth_date is not None:
+            age_at_start = start_date.year - birth_date.year - (
+                (start_date.month, start_date.day)
+                < (birth_date.month, birth_date.day)
+            )
+            if age_at_start < 16:
+                continue
+        candidate_start_dates.append(start_date)
+    if not candidate_start_dates:
+        return None, None, None, None
+    earliest_start = min(candidate_start_dates)
+    years = as_of.year - earliest_start.year - (
+        (as_of.month, as_of.day) < (earliest_start.month, earliest_start.day)
+    )
+    if not 0 <= years <= 80:
+        return None, None, None, None
+    return (
+        years,
+        as_of.isoformat(),
+        "FHIR Practitioner.qualification.period.start",
+        earliest_start.isoformat(),
+    )
+
+
+def _practitioner_derived_profile_fields(
+    resource: dict[str, Any],
+    *,
+    as_of: datetime.date,
+) -> dict[str, Any]:
+    """Return privacy-safe age and estimated practice-tenure fields."""
+    age_years, age_as_of = _derived_age(
+        resource.get("birthDate"),
+        as_of=as_of,
+    )
+    (
+        years_of_practice,
+        years_of_practice_as_of,
+        years_of_practice_basis,
+        years_of_practice_start_date,
+    ) = _derived_years_of_practice(
+        resource.get("qualification"),
+        as_of=as_of,
+        birth_date_value=resource.get("birthDate"),
+    )
+    return {
+        "age_years": age_years,
+        "age_as_of": age_as_of,
+        "years_of_practice": years_of_practice,
+        "years_of_practice_as_of": years_of_practice_as_of,
+        "years_of_practice_basis": years_of_practice_basis,
+        "years_of_practice_start_date": years_of_practice_start_date,
+    }
+
+
 def _normalized_human_names(name_value: Any) -> list[dict[str, Any]]:
     names = [name_value] if isinstance(name_value, dict) else name_value
     if not isinstance(names, list):
@@ -6125,6 +6244,10 @@ def parse_fhir_resource(
             "given_names": given,
             "full_name": full_name,
             "administrative_gender": _administrative_gender(resource),
+            **_practitioner_derived_profile_fields(
+                resource,
+                as_of=base["observed_at"].date(),
+            ),
             "telecom": _telecom(resource),
             "addresses": _normalized_fhir_addresses(resource.get("address")),
             "qualification_codes": _codings([item.get("code") for item in resource.get("qualification") or [] if isinstance(item, dict)]),
@@ -10055,6 +10178,26 @@ async def _publish_selected_provider_directory_artifacts(
     )
 
 
+def _collect_provider_directory_artifact_stages(
+    raw_stages: Any,
+) -> tuple[ProviderDirectoryPreparedArtifactStage, ...] | None:
+    stages = (
+        (raw_stages,)
+        if isinstance(raw_stages, ProviderDirectoryPreparedArtifactStage)
+        else raw_stages
+    )
+    if (
+        isinstance(stages, (list, tuple))
+        and stages
+        and all(
+            isinstance(stage, ProviderDirectoryPreparedArtifactStage)
+            for stage in stages
+        )
+    ):
+        return tuple(stages)
+    return None
+
+
 def _collect_provider_directory_artifact_stage(
     publish_result: Any,
     artifact_bundle: ProviderDirectoryArtifactBundle | None,
@@ -10066,14 +10209,13 @@ def _collect_provider_directory_artifact_stage(
         artifact_bundle is not None
         and isinstance(publish_result, tuple)
         and len(publish_result) == 2
-        and isinstance(publish_result[0], dict)
-        and isinstance(
-            publish_result[1],
-            ProviderDirectoryPreparedArtifactStage,
-        )
     ):
-        artifact_bundle.add(publish_result[1])
-        return publish_result[0]
+        metrics, raw_stages = publish_result
+        stages = _collect_provider_directory_artifact_stages(raw_stages)
+        if isinstance(metrics, dict) and stages is not None:
+            for stage in stages:
+                artifact_bundle.add(stage)
+            return metrics
     raise RuntimeError("provider_directory_artifact_stage_result_invalid")
 
 
@@ -10112,6 +10254,541 @@ async def _is_provider_directory_corroboration_artifact_published(
     return True
 
 
+async def _provider_directory_profile_scope_source_ids(
+    schema: str,
+    allowed_source_ids: set[str],
+) -> list[str]:
+    configured_source_ids = list(
+        profile_artifact.configured_profile_source_ids()
+    )
+    source_rows = await db.all(
+        profile_artifact.profile_scope_source_ids_sql(
+            _qt(schema, ProviderDirectorySource.__tablename__)
+        ),
+        configured_source_ids=configured_source_ids,
+    )
+    return sorted(
+        {
+            source_id
+            for source_row in source_rows
+            if (
+                source_id := _clean_text(
+                    _pagination_checkpoint_row_mapping(source_row).get(
+                        "source_id"
+                    )
+                )
+            )
+            and source_id in allowed_source_ids
+        }
+    )
+
+
+async def _create_provider_directory_profile_indexes(
+    schema: str,
+    table_name: str,
+    *,
+    evidence: bool,
+) -> None:
+    for statement in profile_artifact.profile_index_statements(
+        schema,
+        table_name,
+        evidence=evidence,
+    ):
+        await db.status(statement)
+
+
+async def _rename_provider_directory_profile_indexes(
+    schema: str,
+    stage_table: str,
+    *,
+    target_table: str,
+    evidence: bool,
+) -> None:
+    suffixes = (
+        profile_artifact.PROFILE_EVIDENCE_INDEX_SUFFIXES
+        if evidence
+        else profile_artifact.PROFILE_INDEX_SUFFIXES
+    )
+    for suffix in suffixes:
+        stage_index = profile_artifact.profile_index_name(
+            stage_table,
+            suffix,
+        )
+        target_index = profile_artifact.profile_index_name(
+            target_table,
+            suffix,
+        )
+        await db.status(
+            f"ALTER INDEX {_unscoped_qt(schema, stage_index)} "
+            f"RENAME TO {_q(target_index)};"
+        )
+
+
+async def _rename_provider_directory_profile_table_indexes(
+    schema: str,
+    stage_table: str,
+) -> None:
+    await _rename_provider_directory_profile_indexes(
+        schema,
+        stage_table,
+        target_table=profile_artifact.PROFILE_TABLE,
+        evidence=False,
+    )
+
+
+async def _rename_provider_directory_profile_evidence_indexes(
+    schema: str,
+    stage_table: str,
+) -> None:
+    await _rename_provider_directory_profile_indexes(
+        schema,
+        stage_table,
+        target_table=profile_artifact.PROFILE_EVIDENCE_TABLE,
+        evidence=True,
+    )
+
+
+async def _provider_directory_profile_stage_metrics(
+    schema: str,
+    evidence_stage: str,
+    profile_stage: str,
+    source_ids: list[str],
+) -> dict[str, Any]:
+    evidence_ref = _unscoped_qt(schema, evidence_stage)
+    profile_ref = _unscoped_qt(schema, profile_stage)
+    return {
+        "enabled_source_ids": source_ids,
+        "evidence_rows": int(
+            await db.scalar(f"SELECT count(*) FROM {evidence_ref};") or 0
+        ),
+        "selected_evidence_rows": int(
+            await db.scalar(
+                f"""
+                SELECT count(*)
+                  FROM {evidence_ref}
+                 WHERE source_id = ANY(CAST(:source_ids AS varchar[]));
+                """,
+                source_ids=source_ids,
+            )
+            or 0
+        ),
+        "profile_rows": int(
+            await db.scalar(f"SELECT count(*) FROM {profile_ref};") or 0
+        ),
+    }
+
+
+async def _remove_provider_directory_profile_stage_table(
+    schema: str,
+    stage_table: str,
+) -> None:
+    stage_ref = _unscoped_qt(schema, stage_table)
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+    except Exception:  # pragma: no cover - cleanup best effort
+        LOGGER.warning(
+            "Failed to clean Provider Directory profile stage %s",
+            stage_ref,
+            exc_info=True,
+        )
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBuild:
+    schema: str
+    generation_id: str
+    source_ids: tuple[str, ...]
+    dataset_ids: tuple[str, ...]
+    evidence_stage: str
+    profile_stage: str
+
+
+def _provider_directory_profile_build_ref(
+    build: _ProviderDirectoryProfileBuild,
+    table_name: str,
+) -> str:
+    return _unscoped_qt(build.schema, table_name)
+
+
+async def _resolve_provider_directory_profile_build(
+    schema: str,
+    run_id: str | None,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+) -> _ProviderDirectoryProfileBuild | None:
+    selected_source_ids = await _provider_directory_profile_scope_source_ids(
+        schema,
+        {dataset.source_id for dataset in dataset_fence.datasets},
+    )
+    if not selected_source_ids:
+        return None
+    source_ids, dataset_ids = profile_artifact.profile_source_dataset_pairs(
+        dataset_fence.datasets,
+        selected_source_ids,
+    )
+    generation_id = (
+        _clean_text(run_id)
+        or "pdprofile_"
+        + hashlib.sha1(
+            "|".join(dataset_ids).encode("utf-8")
+        ).hexdigest()[:32]
+    )[:64]
+    return _ProviderDirectoryProfileBuild(
+        schema=schema,
+        generation_id=generation_id,
+        source_ids=tuple(source_ids),
+        dataset_ids=tuple(dataset_ids),
+        evidence_stage=profile_artifact.profile_evidence_stage_table_name(
+            generation_id
+        ),
+        profile_stage=profile_artifact.profile_stage_table_name(generation_id),
+    )
+
+
+async def _create_provider_directory_profile_evidence_stage(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_evidence_target: bool,
+) -> None:
+    evidence_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.evidence_stage,
+    )
+    await db.status(
+        profile_artifact.profile_evidence_table_sql(
+            build.schema,
+            build.evidence_stage,
+        )
+    )
+    if has_evidence_target:
+        await db.status(
+            profile_artifact.copy_existing_evidence_sql(
+                source_ref=_provider_directory_profile_build_ref(
+                    build,
+                    profile_artifact.PROFILE_EVIDENCE_TABLE,
+                ),
+                target_ref=evidence_stage_ref,
+            ),
+            source_ids=list(build.source_ids),
+        )
+    await db.status(
+        profile_artifact.profile_evidence_insert_sql(
+            target_ref=evidence_stage_ref,
+            source_ref=_qt(
+                build.schema,
+                ProviderDirectorySource.__tablename__,
+            ),
+            practitioner_ref=_qt(
+                build.schema,
+                ProviderDirectoryPractitioner.__tablename__,
+            ),
+            role_ref=_qt(
+                build.schema,
+                ProviderDirectoryPractitionerRole.__tablename__,
+            ),
+            organization_ref=_qt(
+                build.schema,
+                ProviderDirectoryOrganization.__tablename__,
+            ),
+            service_ref=_qt(
+                build.schema,
+                ProviderDirectoryHealthcareService.__tablename__,
+            ),
+        ),
+        source_ids=list(build.source_ids),
+        dataset_ids=list(build.dataset_ids),
+    )
+    await _create_provider_directory_profile_indexes(
+        build.schema,
+        build.evidence_stage,
+        evidence=True,
+    )
+    await db.status(f"ANALYZE {evidence_stage_ref};")
+
+
+async def _create_provider_directory_profile_compact_stage(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+) -> None:
+    evidence_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.evidence_stage,
+    )
+    profile_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.profile_stage,
+    )
+    evidence_target_ref = _provider_directory_profile_build_ref(
+        build,
+        profile_artifact.PROFILE_EVIDENCE_TABLE,
+    )
+    await db.status(
+        profile_artifact.profile_table_sql(
+            build.schema,
+            build.profile_stage,
+        )
+    )
+    should_rebuild_all_profiles = not has_existing_artifacts
+    if has_existing_artifacts:
+        await db.status(
+            profile_artifact.copy_unaffected_profiles_sql(
+                profile_source_ref=_provider_directory_profile_build_ref(
+                    build,
+                    profile_artifact.PROFILE_TABLE,
+                ),
+                evidence_source_ref=evidence_target_ref,
+                evidence_stage_ref=evidence_stage_ref,
+                profile_stage_ref=profile_stage_ref,
+            ),
+            source_ids=list(build.source_ids),
+        )
+    await db.status(
+        profile_artifact.profile_insert_sql(
+            evidence_ref=evidence_stage_ref,
+            target_ref=profile_stage_ref,
+            old_evidence_ref=(
+                evidence_target_ref if has_existing_artifacts else None
+            ),
+            rebuild_all=should_rebuild_all_profiles,
+        ),
+        source_ids=list(build.source_ids),
+        generation_id=build.generation_id,
+    )
+    await _create_provider_directory_profile_indexes(
+        build.schema,
+        build.profile_stage,
+        evidence=False,
+    )
+    await db.status(f"ANALYZE {profile_stage_ref};")
+
+
+async def _prepare_provider_directory_profile_stages(
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> tuple[
+    ProviderDirectoryPreparedArtifactStage,
+    ProviderDirectoryPreparedArtifactStage,
+]:
+    await _prepare_provider_directory_artifact_stage(
+        build.schema,
+        build.evidence_stage,
+    )
+    await _prepare_provider_directory_artifact_stage(
+        build.schema,
+        build.profile_stage,
+    )
+    return (
+        ProviderDirectoryPreparedArtifactStage(
+            schema=build.schema,
+            stage_table=build.evidence_stage,
+            target_relation=profile_artifact.PROFILE_EVIDENCE_TABLE,
+            rename_stage_indexes=(
+                _rename_provider_directory_profile_evidence_indexes
+            ),
+            build_fence=evidence_build_fence,
+        ),
+        ProviderDirectoryPreparedArtifactStage(
+            schema=build.schema,
+            stage_table=build.profile_stage,
+            target_relation=profile_artifact.PROFILE_TABLE,
+            rename_stage_indexes=(
+                _rename_provider_directory_profile_table_indexes
+            ),
+            build_fence=profile_build_fence,
+        ),
+    )
+
+
+async def _provider_directory_profile_metrics(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    should_rebuild_all_profiles: bool,
+) -> dict[str, Any]:
+    metrics = await _provider_directory_profile_stage_metrics(
+        build.schema,
+        build.evidence_stage,
+        build.profile_stage,
+        list(build.source_ids),
+    )
+    metrics.update(
+        {
+            "generation_id": build.generation_id,
+            "dataset_ids": sorted(set(build.dataset_ids)),
+            "incremental": not should_rebuild_all_profiles,
+        }
+    )
+    return metrics
+
+
+async def _finalize_provider_directory_profile_stages(
+    metrics: dict[str, Any],
+    stages: tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ],
+    *,
+    defer_cutover: bool,
+) -> dict[str, Any] | tuple[
+    dict[str, Any],
+    tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ],
+]:
+    if defer_cutover:
+        return metrics, stages
+    try:
+        await _retry_provider_directory_artifact_bundle_promotion(stages)
+    finally:
+        for stage in reversed(stages):
+            await _remove_provider_directory_artifact_stage(stage)
+    return metrics
+
+
+async def _has_provider_directory_profile_artifacts(schema: str) -> bool:
+    has_evidence_target = await _table_exists(
+        schema,
+        profile_artifact.PROFILE_EVIDENCE_TABLE,
+    )
+    has_profile_target = await _table_exists(
+        schema,
+        profile_artifact.PROFILE_TABLE,
+    )
+    if has_evidence_target != has_profile_target:
+        raise RuntimeError("provider_directory_profile_artifact_pair_incomplete")
+    return has_evidence_target
+
+
+async def _build_provider_directory_profile_stages(
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> tuple[
+    dict[str, Any],
+    tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ],
+]:
+    has_existing_artifacts = await _has_provider_directory_profile_artifacts(
+        build.schema
+    )
+    created_stage_tables: list[str] = []
+    try:
+        await _create_provider_directory_profile_evidence_stage(
+            build,
+            has_evidence_target=has_existing_artifacts,
+        )
+        created_stage_tables.append(build.evidence_stage)
+        should_rebuild_all_profiles = not has_existing_artifacts
+        await _create_provider_directory_profile_compact_stage(
+            build,
+            has_existing_artifacts=has_existing_artifacts,
+        )
+        created_stage_tables.append(build.profile_stage)
+        metrics = await _provider_directory_profile_metrics(
+            build,
+            should_rebuild_all_profiles=should_rebuild_all_profiles,
+        )
+        stages = await _prepare_provider_directory_profile_stages(
+            build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        return metrics, stages
+    except BaseException:
+        for stage_table in reversed(created_stage_tables):
+            await _remove_provider_directory_profile_stage_table(
+                build.schema,
+                stage_table,
+            )
+        raise
+
+
+async def publish_provider_directory_profile(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    defer_cutover: bool = False,
+) -> dict[str, Any] | tuple[
+    dict[str, Any],
+    tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ],
+]:
+    """Build source evidence and compact NPI profiles behind one atomic cutover."""
+    schema = db_schema or _schema()
+    dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+    if dataset_fence is None:
+        return {"skipped": True, "reason": "immutable_dataset_scope_required"}
+    build = await _resolve_provider_directory_profile_build(
+        schema,
+        run_id,
+        dataset_fence,
+    )
+    if build is None:
+        return {
+            "skipped": True,
+            "reason": "no_profile_enabled_sources_in_scope",
+        }
+    async with contextlib.AsyncExitStack() as build_guards:
+        evidence_build_fence = await build_guards.enter_async_context(
+            _provider_directory_artifact_build_guard(
+                schema,
+                profile_artifact.PROFILE_EVIDENCE_TABLE,
+            )
+        )
+        profile_build_fence = await build_guards.enter_async_context(
+            _provider_directory_artifact_build_guard(
+                schema,
+                profile_artifact.PROFILE_TABLE,
+            )
+        )
+        metrics, stages = await _build_provider_directory_profile_stages(
+            build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        return await _finalize_provider_directory_profile_stages(
+            metrics,
+            stages,
+            defer_cutover=defer_cutover,
+        )
+
+
+async def _publish_provider_directory_profile_target(
+    *,
+    run_id: str | None,
+    publish_artifacts_targets: set[str] | None,
+    artifact_bundle: ProviderDirectoryArtifactBundle | None,
+) -> tuple[dict[str, Any], str]:
+    if not is_provider_directory_publish_target_enabled(
+        publish_artifacts_targets,
+        "profile",
+    ):
+        return (
+            _provider_directory_publish_target_skipped(),
+            "skipped Provider Directory doctor profile publish",
+        )
+    profile_options_by_name: dict[str, Any] = {"run_id": run_id}
+    if artifact_bundle is not None:
+        profile_options_by_name["defer_cutover"] = True
+    profile_publish_result = await publish_provider_directory_profile(
+        **profile_options_by_name,
+    )
+    profile_metrics = _collect_provider_directory_artifact_stage(
+        profile_publish_result,
+        artifact_bundle,
+    )
+    return (
+        profile_metrics,
+        "published Provider Directory doctor profiles; "
+        f"rows={profile_metrics.get('profile_rows', 0)}",
+    )
+
+
 async def _publish_provider_directory_artifacts(
     *,
     run_id: str | None,
@@ -10134,7 +10811,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=0,
-        total=6,
+        total=7,
         message="publishing Provider Directory address artifacts",
         metrics=metrics,
     )
@@ -10151,7 +10828,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=1,
-        total=6,
+        total=7,
         message=location_contacts_message,
         metrics=metrics,
     )
@@ -10170,7 +10847,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=2,
-        total=6,
+        total=7,
         message=location_coordinates_message,
         metrics=metrics,
     )
@@ -10178,7 +10855,13 @@ async def _publish_provider_directory_artifacts(
         await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
     should_backfill_resource_id_npis = any(
         is_provider_directory_publish_target_enabled(publish_artifacts_targets, artifact_target_name)
-        for artifact_target_name in ("resource_id_npis", "location_archive", "address_overlay", "corroboration")
+        for artifact_target_name in (
+            "resource_id_npis",
+            "location_archive",
+            "address_overlay",
+            "profile",
+            "corroboration",
+        )
     )
     if should_backfill_resource_id_npis:
         resource_id_npi_backfill_run_id = address_key_run_id if address_key_run_id is not None else None
@@ -10204,7 +10887,7 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=3,
-        total=6,
+        total=7,
         message=location_address_keys_message,
         metrics=metrics,
     )
@@ -10244,8 +10927,23 @@ async def _publish_provider_directory_artifacts(
         run_id,
         phase="provider-directory publishing artifacts",
         done=4,
-        total=6,
+        total=7,
         message=address_artifact_message,
+        metrics=metrics,
+    )
+    metrics["profile"], profile_message = (
+        await _publish_provider_directory_profile_target(
+            run_id=run_id,
+            publish_artifacts_targets=publish_artifacts_targets,
+            artifact_bundle=artifact_bundle,
+        )
+    )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=5,
+        total=7,
+        message=profile_message,
         metrics=metrics,
     )
     if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "network_catalog"):
@@ -10272,8 +10970,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=5,
-        total=6,
+        done=6,
+        total=7,
         message=network_catalog_message,
         metrics=metrics,
     )
@@ -10303,8 +11001,8 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
-        done=6,
-        total=6,
+        done=7,
+        total=7,
         message=message,
         metrics=metrics,
     )

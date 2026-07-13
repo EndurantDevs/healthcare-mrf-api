@@ -5736,6 +5736,18 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert practitioner_row["npi"] == 1234567893
     assert practitioner_row["family_name"] == "Rivera"
     assert practitioner_row["administrative_gender"] == "female"
+    assert practitioner_row["age_years"] is not None
+    assert practitioner_row["age_as_of"] == datetime.datetime.utcnow().date().isoformat()
+    assert practitioner_row["years_of_practice"] == (
+        datetime.datetime.utcnow().date().year - 2001
+    )
+    assert practitioner_row["years_of_practice_as_of"] == (
+        datetime.datetime.utcnow().date().isoformat()
+    )
+    assert practitioner_row["years_of_practice_basis"] == (
+        "FHIR Practitioner.qualification.period.start"
+    )
+    assert practitioner_row["years_of_practice_start_date"] == "2001-01-01"
     assert practitioner_row["names"][0]["prefix"] == ["Dr."]
     assert practitioner_row["addresses"][0]["postal_code"] == "60601"
     assert practitioner_row["qualifications"][0]["issuer_display"] == "Example Medical School"
@@ -5748,6 +5760,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
         },
         {"content_type": "image/jpeg"},
     ]
+    assert "birthDate" not in practitioner_row
     assert "birth_date" not in practitioner_row
     assert "data" not in json.dumps(practitioner_row["photos"])
     assert location_model is ProviderDirectoryLocation
@@ -5769,6 +5782,57 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["address"] == "https://example.test/fhir"
     assert endpoint_row["period_start"] == "2026-01-01"
     assert endpoint_row["last_seen_run_id"] == "run_2"
+
+
+def test_derived_age_requires_safe_full_date_and_rejects_implausible_values():
+    as_of = datetime.date(2026, 7, 13)
+
+    assert importer._derived_age("1970-07-14", as_of=as_of) == (
+        55,
+        "2026-07-13",
+    )
+    assert importer._derived_age("1970", as_of=as_of) == (None, None)
+    assert importer._derived_age("2027-01-01", as_of=as_of) == (None, None)
+    assert importer._derived_age("1800-01-01", as_of=as_of) == (None, None)
+
+
+def test_derived_years_of_practice_uses_earliest_plausible_qualification():
+    as_of = datetime.date(2026, 7, 13)
+    qualifications = [
+        {"period": {"start": "1980-01-01"}},
+        {"period": {"start": "2005-07-14T00:00:00Z"}},
+        {"period": {"start": "2001-01-01"}},
+        {"period": {"start": "2027-01-01"}},
+    ]
+
+    assert importer._derived_years_of_practice(
+        qualifications,
+        as_of=as_of,
+        birth_date_value="1970-01-01",
+    ) == (
+        25,
+        "2026-07-13",
+        "FHIR Practitioner.qualification.period.start",
+        "2001-01-01",
+    )
+
+
+def test_derived_years_of_practice_rejects_unsupported_or_implausible_dates():
+    as_of = datetime.date(2026, 7, 13)
+
+    assert importer._derived_years_of_practice(
+        [
+            {"period": {"start": "1970"}},
+            {"period": {"start": "1980-01-01"}},
+            {"period": {"start": "2027-01-01"}},
+        ],
+        as_of=as_of,
+        birth_date_value="1970-01-01",
+    ) == (None, None, None, None)
+    assert importer._derived_years_of_practice(
+        [{"period": {"start": "1900-01-01"}}],
+        as_of=as_of,
+    ) == (None, None, None, None)
 
 
 def test_contra_costa_affiliation_telecom_preserves_phone_and_fax_in_dataset_payload():

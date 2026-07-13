@@ -53,6 +53,7 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
+from process import provider_directory_profile as profile_artifact
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -671,6 +672,8 @@ def _npi_detail_cache_key(
     lookup_stored_geocode: bool,
     include_sources: bool = False,
     include_evidence: bool = False,
+    include_profile: bool = True,
+    profile_generation: str | None = None,
     address_limit: int | None = None,
     address_offset: int = 0,
     include_address_total: bool = True,
@@ -680,6 +683,10 @@ def _npi_detail_cache_key(
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
     archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
+    profile_mode = (
+        f"profile:{int(include_profile)}|"
+        f"pgen:{profile_generation or 'none'}"
+    )
     page_mode = (
         f"alim:{address_limit if address_limit is not None else 'all'}|"
         f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}"
@@ -687,7 +694,8 @@ def _npi_detail_cache_key(
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
         f"{'chain' if include_chain else 'default'}|"
-        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}|{page_mode}"
+        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}|"
+        f"{profile_mode}|{page_mode}"
     )
 
 
@@ -3332,6 +3340,96 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
         return set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, {str(row[0]) for row in rows if row and row[0]}))
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
         return set()
+
+
+def _provider_directory_profile_json(value: Any) -> dict[str, Any] | None:
+    decoded = value
+    if isinstance(decoded, str):
+        try:
+            decoded = json.loads(decoded)
+        except json.JSONDecodeError:
+            return None
+    return dict(decoded) if isinstance(decoded, Mapping) else None
+
+
+_PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN: set[str] = set()
+
+
+async def _is_provider_directory_profile_table_available(
+    table_ref: str,
+    *,
+    session: Any = None,
+) -> bool:
+    if table_ref in _PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN:
+        return True
+    relation_query_result = await _execute_stmt(
+        text("SELECT to_regclass(:table_ref);"),
+        session=session,
+        params={"table_ref": table_ref},
+    )
+    if relation_query_result.scalar() is None:
+        return False
+    _PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN.add(table_ref)
+    return True
+
+
+async def _fetch_provider_directory_profile_map(
+    npis: Sequence[Any],
+    *,
+    include_evidence: bool = False,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
+    normalized_npis = sorted(
+        {
+            int(npi)
+            for npi in npis
+            if npi is not None and str(npi).isdigit()
+        }
+    )
+    if not normalized_npis:
+        return {}
+    table_ref = _schema_cache_key(profile_artifact.PROFILE_TABLE)
+    if not await _is_provider_directory_profile_table_available(
+        table_ref,
+        session=session,
+    ):
+        return {}
+    evidence_select = ", evidence_json" if include_evidence else ""
+    profile_query_result = await _execute_stmt(
+        text(
+            f"""
+            SELECT npi, profile_json, generation_id, published_at
+                   {evidence_select}
+              FROM {table_ref}
+             WHERE npi = ANY(CAST(:npis AS bigint[]));
+            """
+        ),
+        session=session,
+        params={"npis": normalized_npis},
+    )
+    profiles_by_npi: dict[int, dict[str, Any]] = {}
+    for profile_query_row in profile_query_result.all():
+        mapping = getattr(
+            profile_query_row,
+            "_mapping",
+            profile_query_row,
+        )
+        profile = _provider_directory_profile_json(mapping.get("profile_json"))
+        if profile is None:
+            continue
+        profile["generation_id"] = mapping.get("generation_id")
+        profile["published_at"] = mapping.get("published_at")
+        profile_payload_by_kind: dict[str, Any] = {"profile": profile}
+        if include_evidence:
+            evidence = _provider_directory_profile_json(
+                mapping.get("evidence_json")
+            )
+            if evidence is not None:
+                evidence["generation_id"] = mapping.get("generation_id")
+                evidence["published_at"] = mapping.get("published_at")
+                profile_payload_by_kind["evidence"] = evidence
+        profiles_by_npi[int(mapping["npi"])] = profile_payload_by_kind
+    return profiles_by_npi
 
 
 def _address_serving_unified_requested() -> bool:
@@ -7455,6 +7553,10 @@ async def get_npi(request, npi):
     force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
     include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
     include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
+    include_profile = _parse_bool_arg(
+        request.args.get("include_profile"),
+        default=True,
+    )
     if _parse_bool_arg(request.args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
@@ -7491,6 +7593,23 @@ async def get_npi(request, npi):
         address_offset = 0
     include_address_total = _parse_bool_arg(request.args.get("include_address_total"), default=True)
     npi = int(npi)
+    request_session = _request_session(request)
+    profile_record: dict[str, Any] | None = None
+    if include_profile:
+        try:
+            profile_record = (
+                await _fetch_provider_directory_profile_map(
+                    [npi],
+                    include_evidence=include_evidence,
+                    session=request_session,
+                )
+            ).get(npi)
+        except Exception as exc:  # pragma: no cover - transient publication fallback
+            logger.debug(
+                "Provider Directory profile fetch failed for npi=%s: %s",
+                npi,
+                exc,
+            )
     cache_key = _npi_detail_cache_key(
         npi,
         view=provider_enrichment_view,
@@ -7500,6 +7619,12 @@ async def get_npi(request, npi):
         lookup_stored_geocode=lookup_stored_geocode,
         include_sources=include_sources,
         include_evidence=include_evidence,
+        include_profile=include_profile,
+        profile_generation=(
+            str(profile_record["profile"].get("generation_id"))
+            if profile_record and isinstance(profile_record.get("profile"), Mapping)
+            else None
+        ),
         address_limit=address_limit,
         address_offset=address_offset,
         include_address_total=include_address_total,
@@ -7508,7 +7633,6 @@ async def get_npi(request, npi):
         cached_body = _npi_detail_response_cache_get(cache_key)
         if cached_body is not None:
             return response.raw(cached_body, content_type="application/json")
-    request_session = _request_session(request)
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_archive_cutover = _env_flag("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
     v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
@@ -8052,6 +8176,13 @@ async def get_npi(request, npi):
                 "chain_enrollment_count": 0,
                 "chain_enrollment_ids": [],
             }
+
+    if include_profile and profile_record:
+        data["provider_directory_profile"] = profile_record["profile"]
+        if include_evidence and profile_record.get("evidence") is not None:
+            data["provider_directory_profile_evidence"] = profile_record[
+                "evidence"
+            ]
 
     _redact_internal_address_fields(data)
     response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")

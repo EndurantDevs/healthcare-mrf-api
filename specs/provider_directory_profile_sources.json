@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "release": "current-insurer-directories-v1",
+  "description": "Insurer Provider Directory endpoints enabled for the first unified doctor-profile release. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership.",
+  "entry_ids": [
+    "amerihealth-caritas-carrier",
+    "alohr",
+    "cigna",
+    "contra-costa",
+    "hap",
+    "health-partners-plans",
+    "iehp",
+    "texas-tmhp"
+  ],
+  "source_ids": [
+    "pdfhir_0f81c146991b27031b1ec366",
+    "pdfhir_384bff82e94cf93d2aec8af2",
+    "pdfhir_3e8f8d73e9f63b41f4f3fca5",
+    "pdfhir_46bcb068e81b0bc844e327e9",
+    "pdfhir_56521fb2d273045f2c3b73dc",
+    "pdfhir_569c8c60329e96aefd3e5983",
+    "pdfhir_8ee2865f928f1d67b8a86090",
+    "pdfhir_eee751f2c17d5c473daf3060"
+  ],
+  "excluded_public_fields": [
+    "birthDate",
+    "photo.data",
+    "photo.url_with_credentials_or_query"
+  ],
+  "qualification_policy": "NUCC or taxonomy-shaped qualification values remain taxonomy_qualification evidence; only controlled credential systems or codes become credentials."
+}

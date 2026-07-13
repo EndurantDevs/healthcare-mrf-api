@@ -14,18 +14,18 @@ from db.models import (
 )
 
 
-MIGRATION_PATH = (
+MIGRATIONS_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic"
     / "versions"
-    / "20260713210000_provider_directory_profile_fields.py"
 )
 
 
-def _load_migration():
+def _load_migration(filename):
+    migration_path = MIGRATIONS_PATH / filename
     spec = importlib.util.spec_from_file_location(
-        "provider_directory_profile_fields_migration",
-        MIGRATION_PATH,
+        migration_path.stem,
+        migration_path,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -45,7 +45,7 @@ class _OpRecorder:
         self.dropped_columns.append((table_name, column_name, kwargs))
 
 
-PROFILE_COLUMN_NAMES = {
+BASE_PROFILE_COLUMN_NAMES = {
     ProviderDirectoryPractitioner: {
         "identifiers",
         "names",
@@ -84,6 +84,21 @@ PROFILE_COLUMN_NAMES = {
         "photos",
     },
 }
+DERIVED_PRACTITIONER_COLUMN_NAMES = {
+    "age_years",
+    "age_as_of",
+    "years_of_practice",
+    "years_of_practice_as_of",
+    "years_of_practice_basis",
+    "years_of_practice_start_date",
+}
+PROFILE_COLUMN_NAMES = {
+    **BASE_PROFILE_COLUMN_NAMES,
+    ProviderDirectoryPractitioner: (
+        BASE_PROFILE_COLUMN_NAMES[ProviderDirectoryPractitioner]
+        | DERIVED_PRACTITIONER_COLUMN_NAMES
+    ),
+}
 
 
 def test_profile_models_expose_reviewed_nullable_fields():
@@ -97,6 +112,18 @@ def test_profile_models_expose_reviewed_nullable_fields():
         sa.String,
     )
     assert isinstance(
+        ProviderDirectoryPractitioner.__table__.c.age_years.type,
+        sa.Integer,
+    )
+    assert isinstance(
+        ProviderDirectoryPractitioner.__table__.c.age_as_of.type,
+        sa.String,
+    )
+    assert isinstance(
+        ProviderDirectoryPractitioner.__table__.c.years_of_practice.type,
+        sa.Integer,
+    )
+    assert isinstance(
         ProviderDirectoryHealthcareService.__table__.c.appointment_required.type,
         sa.Boolean,
     )
@@ -104,6 +131,12 @@ def test_profile_models_expose_reviewed_nullable_fields():
         for column_name in column_names:
             if column_name in {
                 "administrative_gender",
+                "age_years",
+                "age_as_of",
+                "years_of_practice",
+                "years_of_practice_as_of",
+                "years_of_practice_basis",
+                "years_of_practice_start_date",
                 "description",
                 "managing_organization_ref",
                 "availability_exceptions",
@@ -116,7 +149,9 @@ def test_profile_models_expose_reviewed_nullable_fields():
 
 
 def test_profile_field_migration_matches_models(monkeypatch):
-    migration = _load_migration()
+    migration = _load_migration(
+        "20260713210000_provider_directory_profile_fields.py"
+    )
     recorder = _OpRecorder()
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.setattr(migration, "op", recorder)
@@ -126,9 +161,9 @@ def test_profile_field_migration_matches_models(monkeypatch):
     assert migration.revision == "20260713210000_provider_directory_profile_fields"
     assert migration.down_revision == "20260713200000_provider_directory_bulk_next_poll"
     assert len(recorder.added_columns) == sum(
-        len(column_names) for column_names in PROFILE_COLUMN_NAMES.values()
+        len(column_names) for column_names in BASE_PROFILE_COLUMN_NAMES.values()
     )
-    for model, expected_column_names in PROFILE_COLUMN_NAMES.items():
+    for model, expected_column_names in BASE_PROFILE_COLUMN_NAMES.items():
         added_column_names = {
             column.name
             for table_name, column, kwargs in recorder.added_columns
@@ -146,3 +181,36 @@ def test_profile_field_migration_matches_models(monkeypatch):
         (table_name, column.name)
         for table_name, column, _ in recorder.added_columns
     }
+
+
+def test_practitioner_derived_profile_migration_matches_models(monkeypatch):
+    migration = _load_migration(
+        "20260713220000_provider_directory_practitioner_derived_profile.py"
+    )
+    recorder = _OpRecorder()
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.upgrade()
+
+    assert migration.revision == (
+        "20260713220000_provider_directory_practitioner_derived_profile"
+    )
+    assert migration.down_revision == (
+        "20260713213000_provider_directory_dataset_serving_relations"
+    )
+    assert {
+        column.name for _, column, _ in recorder.added_columns
+    } == DERIVED_PRACTITIONER_COLUMN_NAMES
+    assert all(
+        table_name == ProviderDirectoryPractitioner.__tablename__
+        and kwargs["schema"] == "mrf"
+        and column.nullable is True
+        for table_name, column, kwargs in recorder.added_columns
+    )
+
+    migration.downgrade()
+
+    assert {
+        column_name for _, column_name, _ in recorder.dropped_columns
+    } == DERIVED_PRACTITIONER_COLUMN_NAMES
