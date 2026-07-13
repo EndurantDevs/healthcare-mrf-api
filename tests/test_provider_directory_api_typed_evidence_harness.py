@@ -8,6 +8,7 @@ from scripts.research import provider_directory_api_evidence_support as support
 
 
 SOURCE_A = "pdfhir_0123456789abcdef01234567"
+ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
 
 
 def _source_summary_map(*, network_name="Example Network"):
@@ -80,6 +81,7 @@ def _typed_witness_list():
             "PractitionerRole",
             "role-1",
             *common_evidence,
+            address_key=ADDRESS_KEY,
         ),
         support.MappedEvidenceWitness(
             SOURCE_A,
@@ -87,6 +89,7 @@ def _typed_witness_list():
             "OrganizationAffiliation",
             "affiliation-1",
             *common_evidence,
+            address_key=ADDRESS_KEY,
         ),
     ]
 
@@ -101,6 +104,7 @@ class SequencedEvidenceConn:
                     "resource_type": "PractitionerRole",
                     "resource_id": "role-1",
                     "npi": 1234567890,
+                    "address_key": ADDRESS_KEY,
                 }
             ],
             [
