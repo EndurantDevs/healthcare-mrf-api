@@ -729,7 +729,8 @@ FHIR_OFFSET_PAGINATION_BASES = frozenset(
 )
 FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset({ARKANSAS_PROVIDER_DIRECTORY_BASE})
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
-MICHIGAN_PROBE_RESOURCES = frozenset(
+MICHIGAN_PROVIDER_DIRECTORY_BASE = "https://mi.fhir.mhbapp.com/pd/api/v1"
+MICHIGAN_SUPPORTED_RESOURCES = frozenset(
     {
         "Location",
         "Organization",
@@ -791,9 +792,6 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
         (SCAN_PROVIDER_DIRECTORY_BASE, resource_type): 100
         for resource_type in DEFAULT_RESOURCES
     },
-    # This HAPI proxy returns an empty PractitionerRole Bundle for _count >= 50,
-    # even though _count=25 returns rows and a next link.
-    (INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE, "PractitionerRole"): 25,
     # UHC/Flex InsurancePlan accepts tiny pages but returns Azure 504s for
     # _count=10/100, so full imports must walk this resource one row at a time.
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
@@ -842,7 +840,6 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
         IEHP_PROVIDER_DIRECTORY_BASE,
-        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         MAINE_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
@@ -4185,44 +4182,50 @@ def _uhc_provider_directory_override(
 def _michigan_provider_directory_override(
     source_row: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Retain Michigan for probing while its advertised cursor is unusable."""
+    """Normalize the Michigan relay and direct endpoint to its public upstream."""
     api_base = _canonical_base(source_row.get("api_base"))
-    if api_base != INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE:
+    if api_base not in {
+        INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        MICHIGAN_PROVIDER_DIRECTORY_BASE,
+    }:
         return None
-    supported_resources = sorted(MICHIGAN_PROBE_RESOURCES)
+    supported_resources = sorted(MICHIGAN_SUPPORTED_RESOURCES)
     return {
-        "api_base": INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-        "canonical_api_base": INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        "api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        "source_identity_api_base": INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         "requires_registration": False,
         "auth_type": "none",
         "last_validated_status": "valid",
-        "endpoints": _source_override_endpoint_fields(
-            INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
-        ),
+        "endpoints": _source_override_endpoint_fields(MICHIGAN_PROVIDER_DIRECTORY_BASE),
         "metadata": {
-            "provider_directory_override": "michigan_public_resource_subset",
+            "provider_directory_override": "michigan_mhbapp_public_provider_directory",
             "provider_directory_override_reason": (
-                "Michigan's relay exposes five public Provider Directory collections, "
-                "but its advertised opaque continuation is blocked and synthetic "
-                "_getpagesoffset requests skip canonical results."
+                "InteropStation relays Michigan's directory, but the public MHB FHIR "
+                "upstream is the canonical endpoint for metadata and resource probes. "
+                "Resource acquisition remains disabled pending an enumerable contract."
             ),
             "provider_directory_previous_api_base": _clean_text(
                 source_row.get("api_base")
             ),
-            "provider_directory_confirmed_base": (
-                INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
-            ),
+            "provider_directory_confirmed_base": MICHIGAN_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": (
-                f"{INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/metadata"
+                f"{MICHIGAN_PROVIDER_DIRECTORY_BASE}/metadata"
             ),
             "provider_directory_supported_resources": supported_resources,
+            "provider_directory_resource_page_count_caps": {
+                resource_type: 25 if resource_type == "PractitionerRole" else 100
+                for resource_type in supported_resources
+            },
             "provider_directory_fully_enumerable_resources": [],
             "provider_directory_coverage_mode": "probe_only",
             "provider_directory_acquisition_enabled": False,
+            "provider_directory_blocked_reason": (
+                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+            ),
             "provider_directory_acquisition_blocked_reason": (
-                "No exhaustive continuation is verified: the canonical HAPI cursor "
-                "returns HTTP 403 through the relay, while synthetic _getpagesoffset "
-                "pagination skips canonical pages and can return false-empty bundles."
+                "The public upstream's advertised HAPI continuation is reachable, but "
+                "checkpoint resume and two matching exhaustive passes are not verified."
             ),
         },
     }
@@ -4582,10 +4585,15 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         )
         api_base = parent_api_base
         canonical_api_base = _canonical_base(parent_api_base)
+    source_identity_api_base = (
+        override.get("source_identity_api_base")
+        if override
+        else None
+    ) or api_base
     source_id = _stable_source_id(
         {
             **row,
-            "api_base": api_base,
+            "api_base": source_identity_api_base,
         }
     )
     return {

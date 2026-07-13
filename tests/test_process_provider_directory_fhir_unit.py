@@ -678,11 +678,14 @@ def test_idaho_medicaid_supports_durable_pagination_checkpoints():
     )
 
 
-def test_michigan_supports_durable_pagination_checkpoints():
-    source_lookup = {
-        "source_id": "michigan",
-        "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-    }
+def test_michigan_probe_only_source_does_not_claim_pagination_checkpoints():
+    source_lookup = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        }
+    )
 
     checkpoint_context = importer._pagination_checkpoint_context(
         source_lookup,
@@ -691,13 +694,13 @@ def test_michigan_supports_durable_pagination_checkpoints():
         retry_of_run_id=None,
     )
 
-    assert importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE in (
+    assert importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE not in (
         importer.PAGINATION_CHECKPOINT_API_BASES
     )
-    assert checkpoint_context is not None
-    assert checkpoint_context.canonical_api_base == (
-        importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
+    assert importer.MICHIGAN_PROVIDER_DIRECTORY_BASE not in (
+        importer.PAGINATION_CHECKPOINT_API_BASES
     )
+    assert checkpoint_context is None
 
 
 def test_contra_costa_catalog_parser_extracts_provider_directory_base_from_external_link():
@@ -10024,21 +10027,22 @@ def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
     assert url == "https://example.test/fhir/HealthcareService?_count=500"
 
 
-def test_michigan_probe_start_url_caps_role_without_synthesizing_offset():
-    url = importer._resource_start_url(
+def test_michigan_direct_probe_caps_role_without_synthesizing_offset():
+    source_row = importer._source_row_from_seed(
         {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
             "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
-            "endpoint_practitioner_role": (
-                f"{importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE}/PractitionerRole"
-            ),
-        },
+        }
+    )
+    url = importer._resource_start_url(
+        source_row,
         "PractitionerRole",
         page_count=100,
     )
 
     assert url == (
-        "https://api.interopstation.com/mdhhs/fhir/PractitionerRole?"
-        "_count=25"
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=25"
     )
 
 
@@ -10079,20 +10083,55 @@ def test_resource_start_url_uses_standard_count_for_state_directory_pages(
     assert url == f"{api_base}/{resource_type}?_count=100"
 
 
-def test_michigan_probe_start_url_never_adds_synthetic_offset():
-    url = importer._resource_start_url(
-        {"api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE},
-        "Practitioner",
-        page_count=100,
+def test_michigan_relay_and_direct_base_have_stable_upstream_identity():
+    relay_row = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+    direct_row = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        }
     )
 
-    assert url == (
-        "https://api.interopstation.com/mdhhs/fhir/Practitioner?"
-        "_count=100"
+    assert relay_row["source_id"] == direct_row["source_id"]
+    assert relay_row["source_id"] == importer._stable_source_id(
+        {
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+    assert relay_row["api_base"] == importer.MICHIGAN_PROVIDER_DIRECTORY_BASE
+    assert relay_row["canonical_api_base"] == importer.MICHIGAN_PROVIDER_DIRECTORY_BASE
+    assert relay_row["metadata_json"]["provider_directory_previous_api_base"] == (
+        importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE
     )
 
 
-def test_michigan_source_profile_is_probe_only_and_acquisition_blocked():
+def test_michigan_direct_base_uses_upstream_for_metadata_and_resource_probes():
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+
+    assert source_row["api_base"] == importer.MICHIGAN_PROVIDER_DIRECTORY_BASE
+    assert source_row["metadata_json"]["provider_directory_confirmed_metadata_url"] == (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/metadata"
+    )
+    assert source_row["endpoint_practitioner_role"] == (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole"
+    )
+
+
+def test_michigan_profile_excludes_non_public_resources_and_records_page_caps():
     source_row = importer._source_row_from_seed(
         {
             "id": "michigan",
@@ -10100,33 +10139,73 @@ def test_michigan_source_profile_is_probe_only_and_acquisition_blocked():
             "api_base": importer.INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
         }
     )
-    supported_resources = sorted(importer.MICHIGAN_PROBE_RESOURCES)
+    metadata = source_row["metadata_json"]
 
-    assert source_row["last_validated_status"] == "valid"
-    assert source_row["metadata_json"]["provider_directory_supported_resources"] == (
-        supported_resources
+    assert metadata["provider_directory_supported_resources"] == sorted(
+        importer.MICHIGAN_SUPPORTED_RESOURCES
     )
-    assert source_row["metadata_json"][
-        "provider_directory_fully_enumerable_resources"
-    ] == []
-    assert source_row["metadata_json"]["provider_directory_coverage_mode"] == (
-        "probe_only"
+    assert metadata["provider_directory_fully_enumerable_resources"] == []
+    assert metadata["provider_directory_coverage_mode"] == "probe_only"
+    assert metadata["provider_directory_acquisition_enabled"] is False
+    assert metadata["provider_directory_resource_page_count_caps"] == {
+        resource_type: 25 if resource_type == "PractitionerRole" else 100
+        for resource_type in sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)
+    }
+    assert importer._resource_start_url(source_row, "InsurancePlan", page_count=100) is None
+    assert importer._resource_start_url(source_row, "Endpoint", page_count=100) is None
+    assert importer._resource_start_url(source_row, "PractitionerRole", page_count=100) == (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=25"
     )
-    assert (
-        source_row["metadata_json"]["provider_directory_acquisition_enabled"]
-        is False
+    assert importer._resource_start_url(source_row, "Location", page_count=500) == (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
     )
-    assert "synthetic _getpagesoffset pagination skips canonical pages" in source_row[
-        "metadata_json"
-    ]["provider_directory_acquisition_blocked_reason"]
-    assert importer._resource_acquisition_blocked_reason(source_row) == (
-        "coverage_mode_probe_only"
+
+
+def test_michigan_preserves_advertised_opaque_next_link_without_offset_synthesis():
+    current_url = (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=25"
     )
-    assert importer._resource_start_url(
-        source_row,
-        "InsurancePlan",
-        page_count=100,
-    ) is None
+    advertised_next_url = (
+        f"{importer.MICHIGAN_PROVIDER_DIRECTORY_BASE}/PractitionerRole?"
+        "_getpages=opaque&_pageId=signed-page&_bundletype=searchset"
+    )
+
+    next_url = importer._resolved_fhir_next_url(
+        {"api_base": importer.MICHIGAN_PROVIDER_DIRECTORY_BASE},
+        current_url,
+        advertised_next_url,
+    )
+
+    assert next_url == advertised_next_url
+    assert "_getpagesoffset" not in next_url
+
+
+@pytest.mark.asyncio
+async def test_michigan_probe_only_source_refuses_resource_acquisition():
+    source_row = importer._source_row_from_seed(
+        {
+            "id": "michigan",
+            "org_name": "Blue Cross Blue Shield of Michigan",
+            "api_base": importer.MICHIGAN_PROVIDER_DIRECTORY_BASE,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"provider_directory_resource_acquisition_blocked:{source_row['source_id']}"
+            rf":{importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON}"
+        ),
+    ):
+        await importer._import_resources(
+            [source_row],
+            resources=list(importer.MICHIGAN_SUPPORTED_RESOURCES),
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=1,
+            run_id=None,
+        )
 
 
 def test_washington_source_profile_is_probe_only_and_acquisition_blocked():
