@@ -124,10 +124,7 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "(role_organization.organization_resource_id::varchar)" in sql
     assert "'Organization/' || role_organization.organization_resource_id" in sql
     assert "affiliation_locator.source_id = organization_candidate.source_id" in sql
-    assert (
-        "affiliation_locator.participating_organization_ref = organization_candidate.reference"
-        in sql
-    )
+    assert "affiliation_locator.participating_organization_ref = organization_candidate.reference" in sql
     assert "JOIN current_affiliations AS affiliation" in sql
     assert "regexp_replace(affiliation.participating_organization_ref" not in sql
     assert "network_catalog.refs" not in sql
@@ -138,9 +135,7 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "plan_network_ref.value = role_network.reference" in sql
     assert "role_network.resource_id" in sql
     assert "FROM (SELECT DISTINCT source_id FROM valid_role_networks)" not in sql
-    active_plan_sql = (
-        "COALESCE(NULLIF(LOWER(BTRIM(insurance_plan.status)), ''), 'active') = 'active'"
-    )
+    active_plan_sql = "COALESCE(NULLIF(LOWER(BTRIM(insurance_plan.status)), ''), 'active') = 'active'"
     assert sql.count(active_plan_sql) == 2
     assert "network_catalog.network_resource_id = role_network.resource_id" in sql
     assert "network_catalog.provider_directory_network_name" in sql
@@ -148,8 +143,6 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "FROM direct_plans AS direct_plan" in sql
     assert "direct_plan.resource_id = insurance_plan.resource_id" in sql
     assert "BOOL_OR(role_network.plan_provenance = 'network-derived')" in sql
-
-
 def test_role_plan_cap_prioritizes_direct_plans_and_reports_both_bounds():
     sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
     cap = npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE
@@ -310,6 +303,8 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypat
         return table_name not in {
             "provider_directory_organization_affiliation",
             "provider_directory_network_catalog",
+            "provider_directory_dataset_network_plan",
+            "provider_directory_dataset_affiliation_organization",
         }
 
     monkeypatch.setattr(npi_module, "_table_exists", is_table_available)
@@ -335,6 +330,8 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypat
         "provider_directory_organization",
         "provider_directory_organization_affiliation",
         "provider_directory_network_catalog",
+        "provider_directory_dataset_network_plan",
+        "provider_directory_dataset_affiliation_organization",
     ]
 
 

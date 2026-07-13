@@ -18,12 +18,36 @@ def _requires_test_database():
 async def test_provider_directory_role_evidence_sql_explains_with_array_binds():
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    sql = npi_module._provider_directory_role_evidence_sql(schema, has_catalog=True)
+    sql = npi_module._provider_directory_role_evidence_sql(
+        schema,
+        has_catalog=True,
+        has_dataset_network_plan=True,
+        has_dataset_affiliation_organization=True,
+    )
 
     plan = await db.all(
         f"EXPLAIN {sql}",
         source_ids=["pdfhir_execution_test"],
         role_ids=["practitioner-role-execution-test"],
+    )
+
+    assert plan
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_provider_directory_affiliation_evidence_sql_explains_with_dataset_relation():
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    sql = npi_module._provider_directory_affiliation_evidence_sql(
+        schema,
+        has_catalog=True,
+        has_dataset_network_plan=True,
+    )
+
+    plan = await db.all(
+        f"EXPLAIN {sql}",
+        source_ids=["pdfhir_execution_test"],
+        affiliation_ids=["organization-affiliation-execution-test"],
     )
 
     assert plan

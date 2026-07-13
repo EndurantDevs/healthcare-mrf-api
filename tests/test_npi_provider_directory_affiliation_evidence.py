@@ -73,6 +73,7 @@ def test_affiliation_evidence_sql_fences_current_networks_and_resolved_plans():
     sql = npi_module._provider_directory_affiliation_evidence_sql(
         "mrf",
         has_catalog=True,
+        has_dataset_network_plan=True,
     )
 
     assert "dataset.is_current IS TRUE" in sql
@@ -88,6 +89,11 @@ def test_affiliation_evidence_sql_fences_current_networks_and_resolved_plans():
     assert "provider_directory_organization_affiliation AS affiliation" not in sql
     assert "JOIN current_organizations AS network_organization" in sql
     assert "JOIN current_affiliation_insurance_plans AS insurance_plan" in sql
+    assert "provider_directory_dataset_network_plan AS network_plan" in sql
+    assert "network_plan.dataset_id = affiliation_network.dataset_id" in sql
+    assert "network_plan.network_resource_id = affiliation_network.resource_id" in sql
+    assert "affiliation_network.dataset_network_plan_complete" in sql
+    assert "NOT affiliation_network.dataset_network_plan_complete" in sql
     assert "insurance_plan.last_seen_run_id" not in sql
     assert "affiliation.active IS DISTINCT FROM false" in sql
     assert "network_organization.active IS DISTINCT FROM false" in sql
@@ -103,6 +109,19 @@ def test_affiliation_evidence_sql_fences_current_networks_and_resolved_plans():
     assert "network_catalog.provider_directory_network_name" in sql
     assert "'organization-affiliation-network-derived'::varchar AS provenance" in sql
     assert "'provider_directory_organization_affiliation'::varchar AS provenance" in sql
+
+
+def test_affiliation_evidence_sql_without_dataset_relation_keeps_json_fallback():
+    sql = npi_module._provider_directory_affiliation_evidence_sql(
+        "mrf",
+        has_catalog=True,
+        has_dataset_network_plan=False,
+    )
+
+    assert "provider_directory_dataset_network_plan AS network_plan" not in sql
+    assert "dataset_network_plan_complete" in sql
+    assert "jsonb_array_elements_text(" in sql
+    assert "COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)" in sql
 
 
 def test_affiliation_evidence_mapper_returns_current_network_and_plan_context():

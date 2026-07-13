@@ -137,6 +137,8 @@ def _asyncpg_role_evidence_sql(schema: str, *, has_affiliations: bool) -> str:
         _quote_identifier(schema, label="database schema"),
         has_catalog=True,
         has_affiliations=has_affiliations,
+        has_dataset_network_plan=True,
+        has_dataset_affiliation_organization=True,
     )
     return sql.replace(":source_ids", "$1").replace(":role_ids", "$2")
 
@@ -147,6 +149,7 @@ def _asyncpg_affiliation_evidence_sql(schema: str) -> str:
     sql = _provider_directory_affiliation_evidence_sql(
         _quote_identifier(schema, label="database schema"),
         has_catalog=True,
+        has_dataset_network_plan=True,
     )
     return sql.replace(":source_ids", "$1").replace(":affiliation_ids", "$2")
 

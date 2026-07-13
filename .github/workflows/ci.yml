@@ -109,7 +109,10 @@ jobs:
           tests/test_process_npi_import.py
           tests/test_npi_api.py
           tests/test_npi_provider_directory_evidence.py
+          tests/test_npi_provider_directory_affiliation_evidence.py
+          tests/test_npi_provider_directory_dataset_relations.py
           tests/test_npi_provider_directory_typed_evidence.py
+          tests/test_provider_directory_api_typed_evidence_harness.py
           tests/test_process_ms_drg_unit.py
           tests/test_process_pharmacy_license_unit.py
           tests/test_pharmacy_license_run_failure_unit.py

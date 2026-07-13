@@ -398,7 +398,8 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "provider_directory_address_overlay AS overlay" in page_sql
     assert "provider_directory_endpoint_dataset AS dataset" in page_sql
     assert "dataset.is_current IS TRUE" in page_sql
-    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id" in page_sql
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in page_sql
+    assert "current_run.run_id = overlay.last_seen_run_id" in page_sql
     assert "JOIN phone_candidates AS phone_match" in page_sql
     assert "c.type = 'primary'" not in page_sql
     assert "LEFT(c.postal_code, 5) = :zip_code" not in page_sql
