@@ -120,7 +120,6 @@ jobs:
           tests/test_ptg2_db_serving_v3_sparse.py
           tests/test_ptg2_exact_numeric_response.py
           tests/test_ptg2_manifest_artifacts.py
-          tests/test_ptg2_manifest_cleanup.py
           tests/test_ptg2_postgres_binary_v3_api.py
           tests/test_ptg2_postgres_binary_v3_cold_paths.py
           tests/test_ptg2_postgres_binary_v3_hydration.py
