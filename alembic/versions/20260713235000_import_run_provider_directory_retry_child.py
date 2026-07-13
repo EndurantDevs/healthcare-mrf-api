@@ -35,6 +35,15 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _table_exists(bind, schema: str) -> bool:
+    return bool(
+        bind.execute(
+            sa.text("SELECT to_regclass(:name)"),
+            {"name": f"{schema}.{TABLE_NAME}"},
+        ).scalar()
+    )
+
+
 def _duplicate_retry_children(bind, schema: str) -> list[dict[str, object]]:
     result = bind.execute(
         sa.text(
@@ -54,7 +63,10 @@ def _duplicate_retry_children(bind, schema: str) -> list[dict[str, object]]:
 
 def upgrade():
     schema = _schema()
-    duplicates = _duplicate_retry_children(op.get_bind(), schema)
+    bind = op.get_bind()
+    if not _table_exists(bind, schema):
+        return
+    duplicates = _duplicate_retry_children(bind, schema)
     if duplicates:
         details = ", ".join(
             f"{row['retry_of_run_id']} ({row['child_count']} children)"

@@ -679,14 +679,17 @@ async def list_import_runs_page(
             )
         )
     stmt = stmt.order_by(ImportRun.created_at.desc(), ImportRun.run_id.desc()).limit(bounded_limit + 1)
-    result = await db.execute(stmt)
-    rows = list(result.scalars().all())
+    query_result = await db.execute(stmt)
+    run_rows = list(query_result.scalars().all())
     next_cursor = None
-    if len(rows) > bounded_limit:
-        next_row = rows[bounded_limit - 1]
+    if len(run_rows) > bounded_limit:
+        next_row = run_rows[bounded_limit - 1]
         next_cursor = _encode_import_run_cursor(next_row.created_at, next_row.run_id)
-        rows = rows[:bounded_limit]
-    return {"items": [normalize_run(row) for row in rows], "next_cursor": next_cursor}
+        run_rows = run_rows[:bounded_limit]
+    return {
+        "items": [normalize_run(run_row) for run_row in run_rows],
+        "next_cursor": next_cursor,
+    }
 
 
 def _encode_import_run_cursor(created_at: dt.datetime | None, run_id: str) -> str | None:
