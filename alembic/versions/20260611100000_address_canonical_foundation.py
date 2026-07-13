@@ -361,9 +361,14 @@ DECLARE
     unit_value text;
     unit_value_raw text;
     has_spaced_suffix boolean;
+    repeated_line2_suffix boolean;
 BEGIN
     line1 := {qschema}.addr_space_norm_v1(line1);
     line2 := {qschema}.addr_space_norm_v1(line2);
+    repeated_line2_suffix := line2 <> '' AND (
+        line1 = line2
+        OR right(line1, length(line2) + 1) = ' ' || line2
+    );
 
     m := regexp_match(lower(COALESCE(line2, '')),
         '^\s*{floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
@@ -432,7 +437,10 @@ BEGIN
 
     unit_value := regexp_replace(lower(COALESCE(unit_value, '')), '[^a-z0-9]', '', 'g');
     IF unit_value = '' THEN
-        IF trim(COALESCE(line2, '')) = '' AND NOT {qschema}.addr_unit_range_required_v1(prefix) THEN
+        IF (
+            trim(COALESCE(line2, '')) = ''
+            OR repeated_line2_suffix
+        ) AND NOT {qschema}.addr_unit_range_required_v1(prefix) THEN
             RETURN prefix;
         END IF;
         RETURN '';
@@ -583,7 +591,7 @@ BEGIN
     END IF;
 
     IF raw IS NULL AND l2 <> '' AND (l1 = l2 OR right(l1, length(l2) + 1) = ' ' || l2) THEN
-        unit_value := {qschema}.addr_unit_norm_v1('', l2);
+        unit_value := {qschema}.addr_unit_norm_v1(l1, l2);
         IF unit_value <> '' THEN
             raw := {qschema}.addr_strip_duplicate_tail_unit_v1(' ' || l1 || ' ', unit_value);
         END IF;

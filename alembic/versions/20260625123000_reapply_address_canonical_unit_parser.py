@@ -135,6 +135,14 @@ def _unit_parser_current(bind, foundation, schema: str) -> bool:
                     '78701',
                     'US'
                 )
+                AND {qschema}.addr_unit_norm_v1(
+                    '2100 STANTONSBURG RD GME OFFICE',
+                    'GME OFFICE'
+                ) = 'ofc'
+                AND {qschema}.addr_street_norm_v1(
+                    '2100 STANTONSBURG RD GME OFFICE',
+                    'GME OFFICE'
+                ) = '2100stantonsburgrdgme'
                 AND {qschema}.addr_unit_norm_v1('100 Main Street', 'Suite Road') = '';
             """
         ).scalar()

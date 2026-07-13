@@ -3736,6 +3736,19 @@
       "expected_premise_key": "80a48be7-cb1f-3d9f-f6b9-a1cd5c0dfd3a"
     },
     {
+      "id": "repeated-line2-bare-office",
+      "first_line": "2100 STANTONSBURG RD GME OFFICE",
+      "second_line": "GME OFFICE",
+      "city": "GREENVILLE",
+      "state": "NC",
+      "zip": "27834-2818",
+      "country": "US",
+      "expected_identity_key": "v2|2100stantonsburgrdgme|ofc||NC|27834|US|street",
+      "expected_address_key": "e73ebcbd-8fc0-59b9-d6c7-bb8620407a5f",
+      "expected_premise_identity_key": "v2|2100stantonsburgrdgme|||NC|27834|US|street",
+      "expected_premise_key": "e41354c5-9b38-cfc6-e105-660d8fb51034"
+    },
+    {
       "id": "unit-line2-bare-suite",
       "first_line": "123 Main St Ste 200",
       "second_line": "Suite",
