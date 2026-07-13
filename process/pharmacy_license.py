@@ -515,6 +515,7 @@ class StateNpiResolver:
         city: str | None,
         zip_code: str | None,
     ) -> int | None:
+        """Resolve a license row to an NPI using ordered state-specific evidence."""
         normalized_license = _normalize_license_for_match(license_number)
         if normalized_license:
             mapped = self.by_license.get(normalized_license)
@@ -573,6 +574,7 @@ class _HtmlTableParser(HTMLParser):
         self.rows: list[list[str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Track rows and cells inside the configured HTML table."""
         attrs_dict = dict(attrs)
         lower_tag = tag.lower()
         if lower_tag == "table":
@@ -597,10 +599,12 @@ class _HtmlTableParser(HTMLParser):
             self._cell_chunks = []
 
     def handle_data(self, data: str) -> None:
+        """Collect text fragments for the active target-table cell."""
         if self._inside_target_table and self._inside_cell:
             self._cell_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize cells, rows, and nested table state as tags close."""
         lower_tag = tag.lower()
         if lower_tag == "table" and self._inside_target_table:
             self._table_depth -= 1
@@ -774,9 +778,11 @@ def _to_date(value: Any) -> datetime.date | None:
         return None
     candidate = text.split("T", 1)[0].split(" ", 1)[0]
     try:
-        return datetime.date.fromisoformat(candidate)
+        iso_date = datetime.date.fromisoformat(candidate)
     except ValueError:
-        pass
+        iso_date = None
+    if iso_date is not None:
+        return iso_date
     for date_format in ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y"):
         try:
             return datetime.datetime.strptime(candidate, date_format).date()
@@ -1095,6 +1101,7 @@ async def _find_table_schema(table_name: str, preferred_schema: str | None = Non
 
 
 async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
+    """Build state-scoped license and name indexes for NPI resolution."""
     normalized_state = (state_code or "").strip().upper()
     if not normalized_state:
         return None
@@ -1535,6 +1542,7 @@ async def _load_rows_from_socrata_source(
     where_clause: str,
     page_size: int,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any], str | None]:
+    """Page through a configured Socrata pharmacy-license dataset."""
     metadata: dict[str, Any] = {
         "adapter": _STATE_ADAPTER_SOCRATA,
         "source_url": source_url,
@@ -1606,6 +1614,7 @@ async def _load_rows_from_ny_rosa_source(
     query_terms: tuple[str, ...],
     page_size: int,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any], str | None]:
+    """Query New York ROSA terms and deduplicate registration records."""
     metadata: dict[str, Any] = {
         "adapter": _STATE_ADAPTER_NY_ROSA_API,
         "source_url": base_url,
@@ -1806,6 +1815,7 @@ async def _load_rows_from_aspnet_search_state(
     state_source: StateSource,
     spec: AspNetStateAdapterSpec,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any], str | None]:
+    """Submit and parse one state's ASP.NET license search workflow."""
     metadata: dict[str, Any] = {"adapter": _STATE_ADAPTER_ASPNET_SEARCH}
     rows: list[dict[str, Any]] = []
 
@@ -2180,6 +2190,7 @@ def _normalize_stage_row(
     imported_at: datetime.datetime,
     npi_resolver: StateNpiResolver | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize one board row into the staging schema or a skip reason."""
     indexed = _row_index(row)
 
     license_number = _pick_license_number(indexed)
@@ -2313,6 +2324,7 @@ async def _import_state_source(
     snapshot_id: str,
     test_mode: bool,
 ) -> StateImportStats:
+    """Fetch, normalize, and stage one state's pharmacy-license source."""
     imported_at = datetime.datetime.utcnow()
 
     raw_rows: list[dict[str, Any]] = []
@@ -2584,6 +2596,7 @@ async def _truncate_stage_table(schema: str) -> None:
 
 
 async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> int:
+    """Promote staged licenses into canonical and historical snapshot tables."""
     stage_table = f"{schema}.{PharmacyLicenseRecordStage.__tablename__}"
     canonical_table = f"{schema}.{PharmacyLicenseRecord.__tablename__}"
     history_table = f"{schema}.{PharmacyLicenseRecordHistory.__tablename__}"
@@ -3032,6 +3045,7 @@ async def _upsert_coverage(payload: dict[str, Any]) -> None:
 
 
 async def pharmacy_license_start(ctx, task=None):
+    """Run one pharmacy-license import and publish its control state."""
     del ctx
     task = task or {}
     run_id = _normalize_run_id(task.get("run_id"))
@@ -3355,6 +3369,7 @@ async def pharmacy_license_start(ctx, task=None):
 
 
 async def pharmacy_license_finalize(_ctx, task=None):  # pragma: no cover
+    """Mark an externally orchestrated pharmacy-license run complete."""
     task = task or {}
     run_id = _normalize_run_id(task.get("run_id"))
     import_id = _normalize_import_id(task.get("import_id"))
@@ -3373,6 +3388,7 @@ async def pharmacy_license_finalize(_ctx, task=None):  # pragma: no cover
 
 
 async def main(test_mode: bool = False, import_id: str | None = None):  # pragma: no cover
+    """Queue a pharmacy-license import and return its generated run ID."""
     run_id = _normalize_run_id(None)
     normalized_import_id = _normalize_import_id(import_id)
     redis = await create_pool(
@@ -3410,6 +3426,7 @@ async def finish_main(
     test_mode: bool = False,
     manifest_path: str | None = None,
 ):  # pragma: no cover
+    """Queue the compatibility finalizer for a completed import run."""
     del manifest_path
     normalized_run_id = _normalize_run_id(run_id)
     normalized_import_id = _normalize_import_id(import_id)
@@ -3442,8 +3459,10 @@ async def finish_main(
 
 
 async def startup(_ctx):  # pragma: no cover
+    """Initialize database access for ARQ worker startup."""
     await db_startup(_ctx)
 
 
 async def shutdown(_ctx):  # pragma: no cover
+    """Provide the ARQ shutdown hook required by worker settings."""
     return None

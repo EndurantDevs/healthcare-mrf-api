@@ -1705,28 +1705,28 @@ def test_monthly_toc_query_expansion_scans_reporting_plan_identity():
     assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
 
 
-def _synthetic_private_query_source():
-    """Build a source carrying fictional private employer identity variants."""
+def _synthetic_scoped_query_source():
+    """Build a source carrying fictional scoped employer identity variants."""
     query_source_dict = _synthetic_query_source()
     query_source_dict["metadata_json"]["raw"].update(
         {
             "target_payer_query": "Sample Holdings, LLC",
-            "private_context_employer_name": "Sample Holdings, LLC",
-            "private_context_employer_aliases": [
+            "query_context_employer_name": "Sample Holdings, LLC",
+            "query_context_employer_aliases": [
                 "Sample Employer",
                 "Sample Holdings",
             ],
-            "private_context_employer_ein": "12-3456789",
-            "private_context_carrier_policy_number": "POL-654321",
+            "query_context_employer_ein": "12-3456789",
+            "query_context_carrier_policy_number": "POL-654321",
         }
     )
     return query_source_dict
 
 
-def test_private_query_identities_include_alias_and_identifier_variants():
-    """Private identity extraction preserves names and normalized identifiers."""
+def test_scoped_query_identities_include_alias_and_identifier_variants():
+    """Scoped identity extraction preserves names and normalized identifiers."""
     assert discovery._source_target_payer_queries(
-        _synthetic_private_query_source()
+        _synthetic_scoped_query_source()
     ) == (
         "Sample Holdings, LLC",
         "Sample Employer",
@@ -1738,9 +1738,39 @@ def test_private_query_identities_include_alias_and_identifier_variants():
     )
 
 
-def test_private_query_identities_filter_alias_and_policy_plan_matches():
-    """Private aliases and stable identifiers find differently labeled plans."""
-    query_source_dict = _synthetic_private_query_source()
+def test_target_payer_query_reads_top_level_generic_context():
+    """Generic top-level context must work without a nested raw payload."""
+    assert discovery._source_target_payer_query(
+        {"metadata_json": {"target_payer_query": "Example Employer"}}
+    ) == "Example Employer"
+
+
+def test_scoped_query_identities_preserve_legacy_context_rows():
+    """Rows stored before the generic-key migration must remain searchable."""
+    legacy_source_dict = {
+        "metadata_json": {
+            "raw": {
+                "private_context_employer_name": "Legacy Example LLC",
+                "private_context_employer_aliases": ["Legacy Example"],
+                "private_context_employer_ein": "98-7654321",
+                "private_context_carrier_policy_number": "POL-123456",
+            }
+        }
+    }
+
+    assert discovery._source_target_payer_queries(legacy_source_dict) == (
+        "Legacy Example LLC",
+        "Legacy Example",
+        "98-7654321",
+        "987654321",
+        "POL-123456",
+        "123456",
+    )
+
+
+def test_scoped_query_identities_filter_alias_and_policy_plan_matches():
+    """Scoped aliases and stable identifiers find differently labeled plans."""
+    query_source_dict = _synthetic_scoped_query_source()
     toc_payload = _synthetic_toc_payload(
         (
             "Sample Employer Choice Plan",
@@ -1836,7 +1866,7 @@ def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
 
 @pytest.mark.asyncio
 async def test_query_filtered_toc_stream_retains_only_matching_structures(monkeypatch):
-    discovery_source = _synthetic_private_query_source()
+    discovery_source = _synthetic_scoped_query_source()
     toc_payload = _synthetic_toc_payload(
         (
             "Sample Employer Choice Plan",
@@ -10952,13 +10982,25 @@ def _example_anthem_employer_result() -> dict[str, object]:
     }
 
 
+def _example_anthem_lookup_context() -> discovery.AnthemLookupContext:
+    return discovery.AnthemLookupContext(
+        base_url="https://files.example.test/",
+        prefix="anthem",
+        catalog_url=(
+            "https://files.example.test/anthem/2026-07-01_anthem_index.json.gz"
+        ),
+        resolver_by_key={"max_targets": 10},
+        source_url="https://www.anthem.example.test/machine-readable-file/search/",
+        session=None,
+    )
+
+
 def test_anthem_employer_result_builds_importable_company_targets():
     crawl_targets = discovery._anthem_s3_employer_targets(
         _example_anthem_employer_source_row(),
         _example_anthem_employer_result(),
         lookup_url="https://files.example.test/anthem/123456789.json",
-        resolver_by_key={"max_targets": 10},
-        source_url="https://www.anthem.com/ca/machine-readable-file/search/",
+        lookup_context=_example_anthem_lookup_context(),
     )
 
     assert [
@@ -10987,6 +11029,28 @@ def test_anthem_employer_result_builds_importable_company_targets():
     ]
 
 
+def test_anthem_employer_target_uses_current_resolved_identity():
+    """Current name-index identity must replace stale configured scalars."""
+    crawl_targets = discovery._anthem_s3_employer_targets(
+        _example_anthem_employer_source_row(),
+        _example_anthem_employer_result(),
+        lookup_url="https://files.example.test/anthem/987654321.json",
+        lookup_context=_example_anthem_lookup_context(),
+        matched_employer_name="Example Employer Services LLC",
+        matched_ein="987654321",
+        name_index_url="https://files.example.test/namesearch/e.json",
+    )
+
+    metadata = crawl_targets[0].metadata
+    assert metadata["company_name"] == "Example Employer Services LLC"
+    assert metadata["employer_name"] == "Example Employer Services LLC"
+    assert metadata["ein"] == "987654321"
+    assert metadata["anthem_requested_ein"] == "12-3456789"
+    assert metadata["plan_info"][0]["plan_name"] == (
+        "Example Employer Services LLC"
+    )
+
+
 @pytest.mark.asyncio
 async def test_anthem_employer_lookup_gets_object_when_head_is_denied(
     monkeypatch,
@@ -11003,12 +11067,8 @@ async def test_anthem_employer_lookup_gets_object_when_head_is_denied(
 
     crawl_targets = await discovery._resolve_anthem_s3_employer_files(
         _example_anthem_employer_source_row(),
-        base_url="https://files.example.test/",
-        prefix="anthem",
         employer_ein="12-3456789",
-        resolver_by_key={},
-        source_url="https://www.anthem.com/ca/machine-readable-file/search/",
-        session=None,
+        lookup_context=_example_anthem_lookup_context(),
     )
 
     head_url.assert_not_awaited()
@@ -11018,6 +11078,209 @@ async def test_anthem_employer_lookup_gets_object_when_head_is_denied(
         session=None,
     )
     assert len(crawl_targets) == 2
+
+
+def test_anthem_name_index_matches_private_aliases_and_valid_eins():
+    name_index = {
+        "namesearch": [
+            {"ein": "98-7654321", "name": "example employer services llc"},
+            {"ein": "invalid", "name": "example employer legacy plan"},
+            {"ein": "11-1223333", "name": "unrelated sample company"},
+        ]
+    }
+
+    matches = discovery._anthem_s3_name_index_matches(
+        name_index,
+        ("Example Employer", "Example Holdings"),
+        index_url="https://files.example.test/namesearch/e.json",
+    )
+
+    assert matches == [
+        {
+            "ein": "987654321",
+            "name": "example employer services llc",
+            "name_index_url": "https://files.example.test/namesearch/e.json",
+        }
+    ]
+    assert discovery._anthem_s3_name_index_key("Example Employer") == "e"
+    assert discovery._anthem_s3_name_index_key("123 Sample") == "others"
+
+
+def _assert_merged_anthem_context_target(crawl_target, name_index_url):
+    """Check complete multi-employer identity on one shared MRF target."""
+    metadata = crawl_target.metadata
+    assert {
+        plan["plan_id"] for plan in metadata["plan_info"]
+    } == {"987654321", "111223333"}
+    assert {
+        match["name"] for match in metadata["anthem_employer_matches"]
+    } == {
+        "example employer services llc",
+        "example holdings benefits llc",
+    }
+    assert metadata["anthem_matched_eins"] == ["987654321", "111223333"]
+    assert "ein" not in metadata
+    assert metadata["company_name"] == "Example Employer LLC"
+    assert metadata["anthem_employer_lookup_urls"] == [
+        "https://files.example.test/anthem/987654321.json",
+        "https://files.example.test/anthem/111223333.json",
+    ]
+    assert metadata["anthem_name_index_url"] == name_index_url
+    assert metadata["anthem_catalog_url"].endswith(
+        "2026-07-01_anthem_index.json.gz"
+    )
+    assert crawl_target.resolved_from_url.endswith(
+        "2026-07-01_anthem_index.json.gz"
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthem_context_uses_name_index_and_merges_shared_company_files(
+    monkeypatch,
+):
+    """Name lookup must merge duplicate URLs without losing plan identities."""
+    name_index_url = "https://files.example.test/namesearch/e.json"
+    employer_result = _example_anthem_employer_result()
+    fetched_urls = []
+
+    async def fake_fetch_json(url, **_kwargs):
+        fetched_urls.append(url)
+        if url == name_index_url:
+            return {
+                "namesearch": [
+                    {
+                        "ein": "98-7654321",
+                        "name": "example employer services llc",
+                    },
+                    {
+                        "ein": "11-1223333",
+                        "name": "example holdings benefits llc",
+                    },
+                ]
+            }
+        if url.endswith(("/987654321.json", "/111223333.json")):
+            return employer_result
+        raise ValueError("missing employer object")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    crawl_targets = await discovery._resolve_anthem_s3_context(
+        _example_anthem_employer_source_row(),
+        employer_ein="12-3456789",
+        employer_names=("Example Employer", "Example Holdings"),
+        lookup_context=_example_anthem_lookup_context(),
+    )
+
+    assert fetched_urls == [
+        "https://files.example.test/anthem/123456789.json",
+        name_index_url,
+        "https://files.example.test/anthem/987654321.json",
+        "https://files.example.test/anthem/111223333.json",
+    ]
+    assert len(crawl_targets) == 2
+    _assert_merged_anthem_context_target(crawl_targets[0], name_index_url)
+
+
+@pytest.mark.asyncio
+async def test_anthem_name_index_failure_aborts_context_resolution(monkeypatch):
+    """A failed name shard must not look like a complete empty result."""
+    monkeypatch.setattr(
+        discovery,
+        "_fetch_json",
+        AsyncMock(
+            side_effect=discovery.aiohttp.ClientConnectionError("unavailable")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Anthem name index fetch failed"):
+        await discovery._fetch_anthem_s3_name_matches(
+            "https://files.example.test/",
+            ("Example Employer",),
+            {"name_index_max_bytes": 1024},
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthem_direct_ein_survives_name_index_failure(monkeypatch):
+    """A current trusted EIN remains usable during a name-shard outage."""
+
+    async def fake_fetch_json(url, **_kwargs):
+        if url.endswith("/123456789.json"):
+            return _example_anthem_employer_result()
+        raise ValueError("temporary name-index failure")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    crawl_targets = await discovery._resolve_anthem_s3_context(
+        _example_anthem_employer_source_row(),
+        employer_ein="12-3456789",
+        employer_names=("Example Employer",),
+        lookup_context=_example_anthem_lookup_context(),
+    )
+
+    assert len(crawl_targets) == 2
+    assert all(
+        target.metadata["anthem_name_index_status"]
+        == "unavailable_direct_ein_fallback"
+        for target in crawl_targets
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthem_name_index_match_limit_aborts_partial_resolution(monkeypatch):
+    """A bounded lookup must fail rather than truncate employer matches."""
+    monkeypatch.setattr(
+        discovery,
+        "_fetch_json",
+        AsyncMock(
+            return_value={
+                "namesearch": [
+                    {"ein": "98-7654321", "name": "example employer one"},
+                    {"ein": "11-1223333", "name": "example employer two"},
+                ]
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds configured match limit"):
+        await discovery._fetch_anthem_s3_name_matches(
+            "https://files.example.test/",
+            ("Example Employer",),
+            {"max_name_matches": 1},
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthem_context_rejects_partial_indexed_employer_results(monkeypatch):
+    """One broken indexed employer object must fail the bounded refresh."""
+    name_index_url = "https://files.example.test/namesearch/e.json"
+
+    async def fake_fetch_json(url, **_kwargs):
+        if url == name_index_url:
+            return {
+                "namesearch": [
+                    {"ein": "98-7654321", "name": "example employer one"},
+                    {"ein": "11-1223333", "name": "example employer two"},
+                ]
+            }
+        if url.endswith("/987654321.json"):
+            return _example_anthem_employer_result()
+        raise ValueError("temporary employer-object failure")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    with pytest.raises(
+        ValueError,
+        match="Anthem name-index employer result could not be resolved",
+    ):
+        await discovery._resolve_anthem_s3_context(
+            _example_anthem_employer_source_row(),
+            employer_ein="",
+            employer_names=("Example Employer",),
+            lookup_context=_example_anthem_lookup_context(),
+        )
 
 
 @pytest.mark.asyncio
@@ -11033,12 +11296,8 @@ async def test_anthem_missing_employer_result_does_not_fallback_to_national_toc(
     ):
         await discovery._resolve_anthem_s3_employer_files(
             {"source_id": "source_1"},
-            base_url="https://files.example.test/",
-            prefix="anthem",
             employer_ein="12-3456789",
-            resolver_by_key={},
-            source_url="https://www.anthem.com/ca/machine-readable-file/search/",
-            session=None,
+            lookup_context=_example_anthem_lookup_context(),
         )
 
     fetch_json.assert_awaited_once()

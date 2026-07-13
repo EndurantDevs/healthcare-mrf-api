@@ -345,6 +345,7 @@ def _source_catalog_retest_coverage(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Compare retest outcomes with current catalog source identities."""
     results = retest_payload.get("results") if isinstance(retest_payload, dict) else retest_payload
     if not isinstance(results, list):
         return {"available": False, "reason": "invalid retest results payload", "missing_result_count": 0}
@@ -577,25 +578,33 @@ def _load_credentials_config(*, credential_config_file: str | None = None) -> tu
             return {}, "argument_file_invalid"
         return {}, "argument_file_invalid"
     path = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV))
+    is_path_invalid = False
     if path:
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 config.update(payload)
+                is_path_invalid = not config
+            else:
+                is_path_invalid = True
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
+            is_path_invalid = True
     raw = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
+    is_raw_invalid = False
     if raw:
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 config.update(payload)
+                is_raw_invalid = not config
+            else:
+                is_raw_invalid = True
         except json.JSONDecodeError:
-            pass
+            is_raw_invalid = True
     if raw:
-        return config, "environment_json" if config else "environment_json_invalid"
+        return config, "environment_json_invalid" if is_raw_invalid else "environment_json"
     if path:
-        return config, "environment_file" if config else "environment_file_invalid"
+        return config, "environment_file_invalid" if is_path_invalid else "environment_file"
     return config, None
 
 
@@ -895,6 +904,7 @@ async def _probe_timeout_summary(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Group timed-out source probes by host and authentication mode."""
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False, "timeout_source_count": 0, "groups": []}
     limit = max(1, sample_limit)
@@ -986,6 +996,7 @@ async def _credential_onboarding_backlog(
     sample_limit: int,
     credential_config_file: str | None = None,
 ) -> dict[str, Any]:
+    """Summarize sources blocked on endpoint discovery or credentials."""
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False, "blocked_source_count": 0, "groups": []}
     gateway_hosts = _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS)
@@ -1311,6 +1322,7 @@ async def _credential_onboarding_backlog(
 
 
 def _credential_backlog_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Normalize credential backlog groups for JSON export."""
     backlog = report.get("credential_onboarding_backlog") or {}
     groups = []
     for group in backlog.get("groups") or []:
@@ -1477,6 +1489,7 @@ def _credential_template_rule_for_group(group: dict[str, Any], env_prefix: str) 
 
 
 def _credential_config_template_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Build reviewable host and API-base credential rule templates."""
     backlog = _credential_backlog_export(report)
     backlog_groups = backlog.get("groups") or []
     groups_by_host: dict[str, list[dict[str, Any]]] = {}
@@ -1572,6 +1585,7 @@ def _credential_config_template_export(report: dict[str, Any]) -> dict[str, Any]
 
 
 def _credential_api_base_targets_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Flatten credential work into API-base-specific onboarding targets."""
     backlog = report.get("credential_onboarding_backlog") or {}
     targets: list[dict[str, Any]] = []
     for group in backlog.get("groups") or []:
@@ -1645,6 +1659,7 @@ def _extend_unique_samples(target: list[Any], values: list[Any], *, limit: int =
 
 
 def _credential_priority_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Rank credential onboarding hosts by affected regulated sources."""
     backlog = _credential_backlog_export(report)
     template = _credential_config_template_export(report)
     templates_by_host = (template.get("credential_config_template") or {}).get("hosts") or {}
@@ -1932,6 +1947,7 @@ async def _resource_summary(
     *,
     use_estimates: bool = False,
 ) -> dict[str, Any]:
+    """Summarize imported provider-directory rows by resource table."""
     summary: dict[str, Any] = {}
     metadata_summary = await _resource_import_metadata_summary(conn, schema)
     resource_type_by_table = {
@@ -2011,6 +2027,7 @@ async def _unified_summary(
     *,
     fast_probe: bool = False,
 ) -> dict[str, Any]:
+    """Measure provider-directory projection into unified address serving."""
     if await _relation_exists(conn, schema, "provider_directory_address_overlay"):
         if fast_probe:
             row = await _fetch_mapping(
@@ -2251,6 +2268,7 @@ async def _source_resource_coverage_summary(
     sample_limit: int,
     include_unified: bool,
 ) -> dict[str, Any]:
+    """Compare source catalog coverage with materialized resource rows."""
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False, "samples": []}
 
@@ -3701,6 +3719,7 @@ async def _practitioner_role_reimport_gap_summary(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Find sources whose practitioner-role links need reimport or projection."""
     required_tables = (
         "provider_directory_source",
         "provider_directory_practitioner",
@@ -3850,6 +3869,7 @@ async def _ptg_summary(
     force_live_view_scans: bool = False,
     fast_probe: bool = False,
 ) -> dict[str, Any]:
+    """Measure PTG address corroboration and network-name overlap."""
     summary: dict[str, Any] = {}
     view = "provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
@@ -3979,6 +3999,7 @@ def _skipped_ptg_summary() -> dict[str, Any]:
 
 
 def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> str:
+    """Build the shared SQL CTE for provider and PTG network-name pairs."""
     view = "provider_directory_address_corroboration"
     pd_name_key = _network_name_key_sql("pd_network_name.value")
     ptg_name_key = _network_name_key_sql("ptg_network_name.value")
@@ -4062,6 +4083,7 @@ async def _ptg_network_name_overlap_summary(
     sample_limit: int,
     force_live_view_scans: bool,
 ) -> dict[str, Any]:
+    """Measure exact normalized network-name overlap for matched plans."""
     view = "provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
     if view_kind == "view" and not force_live_view_scans:
@@ -4149,6 +4171,7 @@ async def _ptg_network_name_overlap_summary(
 
 
 async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, sample_limit: int) -> dict[str, Any]:
+    """Measure resolution of network references to organization records."""
     required = (
         "provider_directory_practitioner_role",
         "provider_directory_organization_affiliation",
@@ -4240,6 +4263,7 @@ async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, 
 
 
 def _plan_network_context_cte_sql(schema: str) -> str:
+    """Build SQL that resolves plan network references within each source."""
     ref_resource_id = _sql_fhir_reference_resource_id("refs_raw.ref", "Organization")
     return f"""
         WITH insurance_plans AS (
@@ -4357,6 +4381,7 @@ async def _plan_network_context_summary(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Summarize plan network references and resolved organization names."""
     required = (
         "provider_directory_source",
         "provider_directory_insurance_plan",
@@ -4657,6 +4682,7 @@ async def _advertised_resource_gap_summary(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Compare advertised FHIR resources with imported resource coverage."""
     if not await _relation_exists(conn, schema, "provider_directory_capability"):
         return {"available": False, "resources": []}
     if not await _column_exists(conn, schema, "provider_directory_capability", "supported_resources"):
@@ -4817,6 +4843,7 @@ async def _valid_sources_without_resource_rows(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
+    """Find valid source endpoints that produced no resource records."""
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False, "source_count": 0, "samples": []}
     existing_tables = [
@@ -4905,6 +4932,7 @@ async def _valid_sources_without_resource_rows(
 
 
 def _derive_gaps(report: dict[str, Any]) -> list[str]:
+    """Translate report metrics into prioritized human-readable gap statements."""
     gaps: list[str] = []
     source_summary = report.get("source_summary") or {}
     if source_summary.get("available"):
@@ -5152,6 +5180,7 @@ def _readiness_check(
 
 
 def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """Condense audit sections into serving-readiness gates and blockers."""
     source = report.get("source_summary") or {}
     source_coverage = report.get("source_resource_coverage_summary") or {}
     resource_summary = report.get("resource_summary") or {}
@@ -5339,6 +5368,7 @@ def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
 
 
 async def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect database, catalog, and serving evidence into one audit report."""
     schema = _validate_identifier(args.schema, label="schema")
     semantic_source_selection = None
     if args.semantic_source_entry_id or args.semantic_source_id:
@@ -5597,6 +5627,7 @@ async def _selected_semantic_audit_report(
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    """Render the structured audit report as an operator-facing document."""
     source = report.get("source_summary") or {}
     unified = report.get("unified_summary") or {}
     network = report.get("network_resolution_summary") or {}
@@ -6198,6 +6229,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse database, evidence, output, and probe-scope options."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
     parser.add_argument("--port", type=int, default=_env_int("HLTHPRT_DB_PORT", 5440))
@@ -6378,6 +6410,7 @@ def _serving_readiness_exit_code(report: dict[str, Any], *, require_serving_read
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Build the audit and write requested JSON and Markdown outputs."""
     args = parse_args(argv)
     report = asyncio.run(build_report(args))
     if args.format == "markdown":

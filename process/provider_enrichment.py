@@ -510,6 +510,7 @@ def _collect_csv_distributions(dataset_obj: dict[str, Any]) -> list[dict[str, An
 
 
 async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list[str]]:
+    """Discover registered CMS enrollment datasets and unmapped catalog titles."""
     payload = await download_it(CATALOG_URL)
     catalog = json.loads(payload)
     datasets = catalog.get("dataset") or []
@@ -519,6 +520,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
     seen_urls: set[str] = set()
 
     async def _discover_ffs_resource_bundle() -> None:
+        """Expand the latest FFS resource bundle into registered source files."""
         ffs_dataset = None
         for dataset in datasets:
             if not isinstance(dataset, dict):
@@ -750,6 +752,7 @@ def _build_enrollment_row_payload(
     source: dict[str, Any],
     model_columns: set[str],
 ) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize one enrollment source row for its destination model."""
     canonical: dict[str, Any] = {}
     for field in spec["fields"]:
         canonical[field["name"]] = _resolve_header(row, tuple(field["aliases"]))
@@ -1028,6 +1031,7 @@ async def _prepare_staging_tables(import_date: str, db_schema: str) -> None:
 
 
 async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Audit current NPPES headers for fields missing from enrichment models."""
     report = {
         "checked": False,
         "source_zip": None,
@@ -1115,6 +1119,7 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def process_data(ctx, task=None):  # pragma: no cover
+    """Discover, download, normalize, and stage provider-enrichment datasets."""
     task = task or {}
     ctx.setdefault("context", {})
     context = ctx["context"]
@@ -1180,6 +1185,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
     )
 
     async def enqueue_or_flush(coros: list, coro) -> None:
+        """Bound concurrent staging writes by flushing a full task batch."""
         coros.append(asyncio.create_task(coro))
         if len(coros) >= max_pending_save_tasks:
             await asyncio.gather(*coros)
@@ -1288,6 +1294,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
 
 async def startup(ctx):  # pragma: no cover
+    """Initialize worker state and provider-enrichment staging tables."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -1305,6 +1312,7 @@ async def startup(ctx):  # pragma: no cover
 
 
 async def _materialize_summary(import_date: str, db_schema: str, nppes_report: dict[str, Any]) -> None:
+    """Build the per-NPI enrichment summary from staged source tables."""
     table_map = {
         cls.__main_table__: make_class(cls, import_date)
         for cls in PROCESSING_CLASSES
@@ -1553,6 +1561,7 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
 
 
 async def shutdown(ctx):  # pragma: no cover
+    """Validate staged data and atomically publish enrichment tables."""
     import_date = ctx["import_date"]
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -1567,6 +1576,7 @@ async def shutdown(ctx):  # pragma: no cover
     processing_classes = PROCESSING_CLASSES
 
     async def archive_index(index_name: str) -> str:
+        """Rename an existing canonical index before table cutover."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
         await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};")
@@ -1687,6 +1697,7 @@ async def shutdown(ctx):  # pragma: no cover
                     await db.status(create_index_sql)
 
     async def analyze_table(obj):
+        """Refresh planner statistics after rebuilding table indexes."""
         print(f"Post-Index ANALYZE {db_schema}.{obj.__tablename__};")
         await db.execute_ddl(f"ANALYZE {db_schema}.{obj.__tablename__};")
 
@@ -1745,6 +1756,7 @@ async def shutdown(ctx):  # pragma: no cover
 
 
 async def save_provider_enrichment_data(ctx, task):
+    """Persist one normalized provider-enrichment task payload."""
     import_date = ctx["import_date"]
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     await ensure_database(test_mode)
@@ -1765,6 +1777,7 @@ async def save_provider_enrichment_data(ctx, task):
 
 
 async def main(test_mode: bool = False):  # pragma: no cover
+    """Queue a provider-enrichment worker job."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,

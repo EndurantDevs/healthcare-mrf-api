@@ -5615,16 +5615,31 @@ async def _resolve_anthem_s3_context_files(
     employer_ein = _source_query_context_text(
         source_row, "query_context_employer_ein"
     )
-    if not employer_ein:
+    employer_names = _anthem_s3_employer_name_queries(source_row)
+    if not employer_ein and not employer_names:
         return None
-    return await _resolve_anthem_s3_employer_files(
+    current_catalog_targets = _anthem_s3_toc_targets(
         source_row,
+        base_url,
+        toc_patterns,
+        {**resolver_by_key, "month_offsets": [0]},
+        source_url=source_url,
+    )
+    lookup_context = AnthemLookupContext(
         base_url=base_url,
         prefix=toc_patterns[0][0] if toc_patterns else "anthem",
-        employer_ein=employer_ein,
+        catalog_url=(
+            current_catalog_targets[0].url if current_catalog_targets else None
+        ),
         resolver_by_key=resolver_by_key,
         source_url=source_url,
         session=session,
+    )
+    return await _resolve_anthem_s3_context(
+        source_row,
+        employer_ein=employer_ein,
+        employer_names=employer_names,
+        lookup_context=lookup_context,
     )
 
 
@@ -8856,22 +8871,51 @@ def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[
     return urls
 
 
-def _source_query_context_text(source: dict[str, Any], key: str) -> str:
+_LEGACY_SOURCE_QUERY_CONTEXT_KEYS = {
+    "query_context_employer_name": "private_context_employer_name",
+    "query_context_employer_aliases": "private_context_employer_aliases",
+    "query_context_employer_ein": "private_context_employer_ein",
+    "query_context_erisa_plan_number": "private_context_erisa_plan_number",
+    "query_context_carrier_policy_number": (
+        "private_context_carrier_policy_number"
+    ),
+    "query_context_carrier_region": "private_context_carrier_region",
+    "query_context_lookup_type": "private_context_lookup_type",
+    "query_context_evidence_plan_year": "private_context_evidence_plan_year",
+    "query_context_verification_status": "private_context_verification_status",
+}
+
+
+def _source_query_context_value(source: dict[str, Any], key: str) -> Any:
+    """Read a generic context value with compatibility for legacy rows."""
     metadata = dict((source or {}).get("metadata_json") or {})
     raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-    return _clean_text(metadata.get(key) or raw.get(key))
+    for candidate_key in (key, _LEGACY_SOURCE_QUERY_CONTEXT_KEYS.get(key)):
+        if not candidate_key:
+            continue
+        context_value = metadata.get(candidate_key)
+        if context_value in (None, ""):
+            context_value = raw.get(candidate_key)
+        if context_value not in (None, ""):
+            return context_value
+    return None
+
+
+def _source_query_context_text(source: dict[str, Any], key: str) -> str:
+    """Return one normalized source context scalar."""
+    return _clean_text(_source_query_context_value(source, key))
 
 
 def _source_private_context_values(
     source: dict[str, Any], key: str
 ) -> tuple[str, ...]:
-    """Return normalized list values from one private source-context field."""
-    metadata = dict((source or {}).get("metadata_json") or {})
-    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-    value = metadata.get(key)
-    if value in (None, ""):
-        value = raw.get(key)
-    values = value if isinstance(value, (list, tuple, set)) else [value]
+    """Return normalized list values from one source-context field."""
+    context_value = _source_query_context_value(source, key)
+    values = (
+        context_value
+        if isinstance(context_value, (list, tuple, set))
+        else [context_value]
+    )
     return tuple(
         dict.fromkeys(_clean_text(item) for item in values if _clean_text(item))
     )
@@ -8879,9 +8923,6 @@ def _source_private_context_values(
 
 def _source_query_context_metadata(source: dict[str, Any]) -> dict[str, Any]:
     """Expose generic operator-supplied lookup context to source resolvers."""
-
-    metadata = dict((source or {}).get("metadata_json") or {})
-    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
     output_key_by_source_key = {
         "target_payer_query": "target_payer_query",
         "query_context_employer_name": "employer_name",
@@ -8896,9 +8937,7 @@ def _source_query_context_metadata(source: dict[str, Any]) -> dict[str, Any]:
     }
     context_by_key: dict[str, Any] = {}
     for source_key, output_key in output_key_by_source_key.items():
-        context_value = metadata.get(source_key)
-        if context_value is None:
-            context_value = raw.get(source_key)
+        context_value = _source_query_context_value(source, source_key)
         if isinstance(context_value, str):
             context_value = _clean_text(context_value)
         if context_value not in (None, ""):
@@ -8907,6 +8946,18 @@ def _source_query_context_metadata(source: dict[str, Any]) -> dict[str, Any]:
     if employer_aliases:
         context_by_key["aliases"] = employer_aliases
     return context_by_key
+
+
+@dataclass(frozen=True)
+class AnthemLookupContext:
+    """Runtime URLs and limits shared by one employer lookup."""
+
+    base_url: str
+    prefix: str
+    catalog_url: str | None
+    resolver_by_key: dict[str, Any]
+    source_url: str
+    session: aiohttp.ClientSession | None
 
 
 def _anthem_s3_employer_file_type(section_name: str) -> str | None:
@@ -8918,8 +8969,126 @@ def _anthem_s3_employer_file_type(section_name: str) -> str | None:
     return None
 
 
+def _anthem_s3_employer_name_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
+    """Return private employer names suitable for Anthem's name index."""
+    query_values = [
+        _source_target_payer_query(source_row),
+        _source_query_context_text(
+            source_row, "query_context_employer_name"
+        ),
+        *_source_private_context_values(
+            source_row, "query_context_employer_aliases"
+        ),
+    ]
+    queries_by_key: dict[str, str] = {}
+    for query_value in query_values:
+        query = _clean_text(query_value)
+        if query:
+            queries_by_key.setdefault(query.lower(), query)
+    return tuple(queries_by_key.values())
+
+
+def _anthem_s3_name_index_key(query: str) -> str:
+    normalized_query = _clean_text(query).lower()
+    if normalized_query and "a" <= normalized_query[0] <= "z":
+        return normalized_query[0]
+    return "others"
+
+
+def _anthem_s3_name_index_matches(
+    name_index: dict[str, Any],
+    queries: Iterable[str],
+    *,
+    index_url: str,
+) -> list[dict[str, str]]:
+    """Select valid EIN records using Anthem's case-insensitive substring rule."""
+    normalized_queries = tuple(
+        query
+        for query in (
+            _clean_text(query_value).lower() for query_value in queries
+        )
+        if query
+    )
+    matches_by_ein: dict[str, dict[str, str]] = {}
+    for raw_record in name_index.get("namesearch") or []:
+        if not isinstance(raw_record, dict):
+            continue
+        employer_name = _clean_text(raw_record.get("name"))
+        normalized_name = employer_name.lower()
+        if not employer_name or not any(
+            query in normalized_name for query in normalized_queries
+        ):
+            continue
+        ein_digits = "".join(
+            character
+            for character in _clean_text(raw_record.get("ein"))
+            if character.isdigit()
+        )
+        if len(ein_digits) != 9:
+            continue
+        matches_by_ein.setdefault(
+            ein_digits,
+            {
+                "ein": ein_digits,
+                "name": employer_name,
+                "name_index_url": index_url,
+            },
+        )
+    return list(matches_by_ein.values())
+
+
+async def _fetch_anthem_s3_name_matches(
+    base_url: str,
+    employer_names: Iterable[str],
+    resolver_by_key: dict[str, Any],
+    session: aiohttp.ClientSession | None,
+) -> list[dict[str, str]]:
+    minimum_length = _as_int(resolver_by_key.get("name_query_min_length")) or 3
+    queries_by_index: dict[str, list[str]] = {}
+    for employer_name in employer_names:
+        normalized_name = _clean_text(employer_name)
+        if len(normalized_name) < minimum_length:
+            continue
+        index_key = _anthem_s3_name_index_key(normalized_name)
+        queries_by_index.setdefault(index_key, []).append(normalized_name)
+
+    max_bytes = _as_int(resolver_by_key.get("name_index_max_bytes")) or 5 * 1024 * 1024
+    max_matches = _as_int(resolver_by_key.get("max_name_matches")) or 50
+    matches_by_ein: dict[str, dict[str, str]] = {}
+    for index_key, index_queries in queries_by_index.items():
+        index_url = urljoin(
+            base_url.rstrip("/") + "/", f"namesearch/{index_key}.json"
+        )
+        try:
+            name_index = await _fetch_json(
+                index_url,
+                max_bytes=max_bytes,
+                session=session,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            raise ValueError(
+                f"Anthem name index fetch failed for {index_url}"
+            ) from exc
+        for match in _anthem_s3_name_index_matches(
+            name_index,
+            index_queries,
+            index_url=index_url,
+        ):
+            if match["ein"] in matches_by_ein:
+                continue
+            if len(matches_by_ein) >= max_matches:
+                raise ValueError(
+                    "Anthem name index result exceeds configured match limit"
+                )
+            matches_by_ein[match["ein"]] = match
+    return list(matches_by_ein.values())
+
+
 def _anthem_s3_employer_identity(
     source_row: dict[str, Any],
+    *,
+    matched_employer_name: str | None = None,
+    matched_ein: str | None = None,
 ) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
     context_by_key = _source_query_context_metadata(source_row)
     employer_name = _clean_text(
@@ -8933,18 +9102,67 @@ def _anthem_s3_employer_identity(
             source_row, "query_context_employer_ein"
         )
     )
-    plan_id = "".join(character for character in employer_ein if character.isdigit())
+    resolved_employer_name = _clean_text(matched_employer_name) or employer_name
+    resolved_ein = _clean_text(matched_ein) or employer_ein
+    plan_id = "".join(character for character in resolved_ein if character.isdigit())
     plan_records = [
         {
             "plan_id": plan_id or None,
             "plan_id_type": "ein" if plan_id else None,
             "plan_market_type": "group",
-            "plan_name": employer_name,
-            "plan_sponsor_name": employer_name,
+            "plan_name": resolved_employer_name,
+            "plan_sponsor_name": resolved_employer_name,
             "issuer_name": source_row.get("display_name"),
         }
     ]
     return context_by_key, employer_name, employer_ein, plan_records
+
+
+def _anthem_s3_employer_target_metadata(
+    source_row: dict[str, Any],
+    employer_result: dict[str, Any],
+    *,
+    lookup_url: str,
+    lookup_context: AnthemLookupContext,
+    matched_employer_name: str | None = None,
+    matched_ein: str | None = None,
+    name_index_url: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    context_by_key, employer_name, employer_ein, plan_records = (
+        _anthem_s3_employer_identity(
+            source_row,
+            matched_employer_name=matched_employer_name,
+            matched_ein=matched_ein,
+        )
+    )
+    resolved_employer_name = _clean_text(matched_employer_name) or employer_name
+    resolved_ein = _clean_text(matched_ein) or employer_ein
+    employer_match_by_key = {
+        "name": resolved_employer_name,
+        "ein": resolved_ein,
+        "lookup_url": lookup_url,
+        "name_index_url": name_index_url,
+    }
+    target_metadata_by_key = {
+        **context_by_key,
+        "resolver": "anthem_s3_employer_ein",
+        "target_kind": "file_reference",
+        "anthem_employer_lookup_url": lookup_url,
+        "anthem_name_index_url": name_index_url,
+        "anthem_catalog_url": lookup_context.catalog_url,
+        "anthem_landing_url": lookup_context.source_url,
+        "anthem_last_updated": employer_result.get("lastupdated"),
+        "anthem_matched_employer_name": resolved_employer_name,
+        "anthem_matched_ein": resolved_ein,
+        "anthem_requested_employer_name": employer_name,
+        "anthem_requested_ein": employer_ein,
+        "anthem_employer_matches": [employer_match_by_key],
+        "company_name": resolved_employer_name,
+        "employer_name": resolved_employer_name,
+        "ein": resolved_ein,
+        "plan_info": plan_records,
+    }
+    return target_metadata_by_key, employer_name
 
 
 def _anthem_s3_employer_targets(
@@ -8952,14 +9170,22 @@ def _anthem_s3_employer_targets(
     employer_result: dict[str, Any],
     *,
     lookup_url: str,
-    resolver_by_key: dict[str, Any],
-    source_url: str,
+    lookup_context: AnthemLookupContext,
+    matched_employer_name: str | None = None,
+    matched_ein: str | None = None,
+    name_index_url: str | None = None,
 ) -> list[CrawlTarget]:
     """Build employer-scoped MRF targets from an Anthem EIN lookup result."""
-    context_by_key, employer_name, employer_ein, plan_records = (
-        _anthem_s3_employer_identity(source_row)
+    target_metadata_by_key, employer_name = _anthem_s3_employer_target_metadata(
+        source_row,
+        employer_result,
+        lookup_url=lookup_url,
+        lookup_context=lookup_context,
+        matched_employer_name=matched_employer_name,
+        matched_ein=matched_ein,
+        name_index_url=name_index_url,
     )
-    max_targets = _as_int(resolver_by_key.get("max_targets")) or 1000
+    max_targets = _as_int(lookup_context.resolver_by_key.get("max_targets")) or 1000
     crawl_targets: list[CrawlTarget] = []
     seen_urls: set[str] = set()
     for section_name, raw_items in employer_result.items():
@@ -8986,19 +9212,10 @@ def _anthem_s3_employer_targets(
                     label=label or employer_name,
                     resolved_from_url=lookup_url,
                     metadata={
-                        "resolver": "anthem_s3_employer_ein",
-                        "target_kind": "file_reference",
+                        **target_metadata_by_key,
                         "target_file_type": file_type,
                         "container_format": _container_format(target_url),
-                        "anthem_employer_lookup_url": lookup_url,
-                        "anthem_landing_url": source_url,
                         "anthem_result_section": section_name,
-                        "anthem_last_updated": employer_result.get("lastupdated"),
-                        "company_name": employer_name,
-                        "employer_name": employer_name,
-                        "ein": employer_ein,
-                        "plan_info": plan_records,
-                        **context_by_key,
                     },
                 )
             )
@@ -9010,12 +9227,10 @@ def _anthem_s3_employer_targets(
 async def _resolve_anthem_s3_employer_files(
     source_row: dict[str, Any],
     *,
-    base_url: str,
-    prefix: str,
     employer_ein: str,
-    resolver_by_key: dict[str, Any],
-    source_url: str,
-    session: aiohttp.ClientSession,
+    lookup_context: AnthemLookupContext,
+    matched_employer_name: str | None = None,
+    name_index_url: str | None = None,
 ) -> list[CrawlTarget]:
     ein_digits = "".join(
         character for character in employer_ein if character.isdigit()
@@ -9023,13 +9238,16 @@ async def _resolve_anthem_s3_employer_files(
     if len(ein_digits) != 9:
         raise ValueError(f"invalid Anthem employer EIN: {employer_ein!r}")
     lookup_url = urljoin(
-        base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{ein_digits}.json"
+        lookup_context.base_url.rstrip("/") + "/",
+        f"{lookup_context.prefix.strip('/')}/{ein_digits}.json",
     )
     try:
         employer_result = await _fetch_json(
             lookup_url,
-            max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
-            session=session,
+            max_bytes=int(
+                lookup_context.resolver_by_key.get("max_bytes") or 1024 * 1024
+            ),
+            session=lookup_context.session,
         )
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
         raise ValueError(
@@ -9039,14 +9257,263 @@ async def _resolve_anthem_s3_employer_files(
         source_row,
         employer_result,
         lookup_url=lookup_url,
-        resolver_by_key=resolver_by_key,
-        source_url=source_url,
+        lookup_context=lookup_context,
+        matched_employer_name=matched_employer_name,
+        matched_ein=ein_digits,
+        name_index_url=name_index_url,
     )
     if not crawl_targets:
         raise ValueError(
             f"Anthem employer MRF result for EIN {employer_ein} has no file links"
         )
     return crawl_targets
+
+
+def _merge_anthem_plan_records(
+    existing_records: Iterable[Any], incoming_records: Iterable[Any]
+) -> list[dict[str, Any]]:
+    """Merge plan records by their stable employer identity fields."""
+    plan_records = [record for record in existing_records if isinstance(record, dict)]
+    plan_keys = {
+        (
+            plan.get("plan_id"),
+            plan.get("plan_name"),
+            plan.get("plan_sponsor_name"),
+        )
+        for plan in plan_records
+    }
+    for plan in incoming_records:
+        if not isinstance(plan, dict):
+            continue
+        plan_key = (
+            plan.get("plan_id"),
+            plan.get("plan_name"),
+            plan.get("plan_sponsor_name"),
+        )
+        if plan_key not in plan_keys:
+            plan_records.append(plan)
+            plan_keys.add(plan_key)
+    return plan_records
+
+
+def _merge_anthem_employer_matches(
+    existing_matches: Iterable[Any], incoming_matches: Iterable[Any]
+) -> list[dict[str, Any]]:
+    """Merge employer match records by current EIN."""
+    employer_matches = [
+        match for match in existing_matches if isinstance(match, dict)
+    ]
+    known_match_eins = {match.get("ein") for match in employer_matches}
+    for employer_match in incoming_matches:
+        if not isinstance(employer_match, dict):
+            continue
+        if employer_match.get("ein") not in known_match_eins:
+            employer_matches.append(employer_match)
+            known_match_eins.add(employer_match.get("ein"))
+    return employer_matches
+
+
+def _anthem_employer_match_values(
+    employer_matches: Iterable[dict[str, Any]], key: str
+) -> list[str]:
+    """Return distinct non-empty values from employer match records."""
+    return list(
+        dict.fromkeys(
+            _clean_text(match.get(key))
+            for match in employer_matches
+            if _clean_text(match.get(key))
+        )
+    )
+
+
+def _apply_anthem_merged_identity(
+    metadata_by_key: dict[str, Any], employer_matches: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Replace first-match scalars with complete merged identity metadata."""
+    match_names = _anthem_employer_match_values(employer_matches, "name")
+    match_eins = _anthem_employer_match_values(employer_matches, "ein")
+    lookup_urls = _anthem_employer_match_values(employer_matches, "lookup_url")
+    name_index_urls = _anthem_employer_match_values(
+        employer_matches, "name_index_url"
+    )
+    metadata_by_key["anthem_matched_employer_names"] = match_names
+    metadata_by_key["anthem_matched_eins"] = match_eins
+    metadata_by_key["anthem_employer_lookup_urls"] = lookup_urls
+    metadata_by_key["anthem_name_index_urls"] = name_index_urls
+    if len(match_names) == 1:
+        metadata_by_key["anthem_matched_employer_name"] = match_names[0]
+        metadata_by_key["company_name"] = match_names[0]
+        metadata_by_key["employer_name"] = match_names[0]
+    else:
+        metadata_by_key.pop("anthem_matched_employer_name", None)
+        requested_name = _clean_text(
+            metadata_by_key.get("anthem_requested_employer_name")
+        )
+        for name_key in ("company_name", "employer_name"):
+            if requested_name:
+                metadata_by_key[name_key] = requested_name
+            else:
+                metadata_by_key.pop(name_key, None)
+    if len(match_eins) == 1:
+        metadata_by_key["anthem_matched_ein"] = match_eins[0]
+        metadata_by_key["ein"] = match_eins[0]
+    else:
+        metadata_by_key.pop("anthem_matched_ein", None)
+        metadata_by_key.pop("ein", None)
+    for scalar_key, scalar_values in (
+        ("anthem_employer_lookup_url", lookup_urls),
+        ("anthem_name_index_url", name_index_urls),
+    ):
+        if len(scalar_values) == 1:
+            metadata_by_key[scalar_key] = scalar_values[0]
+        else:
+            metadata_by_key.pop(scalar_key, None)
+    return metadata_by_key
+
+
+def _merge_anthem_target_metadata(
+    existing_metadata: dict[str, Any], incoming_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge plans and identity provenance for one shared MRF URL."""
+    metadata_by_key = dict(existing_metadata)
+    plan_records = _merge_anthem_plan_records(
+        metadata_by_key.get("plan_info") or [],
+        incoming_metadata.get("plan_info") or [],
+    )
+    employer_matches = _merge_anthem_employer_matches(
+        metadata_by_key.get("anthem_employer_matches") or [],
+        incoming_metadata.get("anthem_employer_matches") or [],
+    )
+    metadata_by_key["plan_info"] = plan_records
+    metadata_by_key["anthem_employer_matches"] = employer_matches
+    return _apply_anthem_merged_identity(metadata_by_key, employer_matches)
+
+
+def _merge_anthem_s3_employer_targets(
+    crawl_targets: Iterable[CrawlTarget],
+) -> list[CrawlTarget]:
+    """Merge shared carrier files without discarding matched employer plans."""
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for crawl_target in crawl_targets:
+        target_key = _canonical_or_none(crawl_target.url) or crawl_target.url
+        existing_target = targets_by_url.get(target_key)
+        if existing_target is None:
+            targets_by_url[target_key] = crawl_target
+            continue
+        metadata_by_key = _merge_anthem_target_metadata(
+            dict(existing_target.metadata or {}),
+            dict(crawl_target.metadata or {}),
+        )
+        targets_by_url[target_key] = CrawlTarget(
+            source=existing_target.source,
+            url=existing_target.url,
+            label=existing_target.label,
+            resolved_from_url=(
+                metadata_by_key.get("anthem_catalog_url")
+                or metadata_by_key.get("anthem_landing_url")
+                or existing_target.resolved_from_url
+            ),
+            metadata=metadata_by_key,
+        )
+    return list(targets_by_url.values())
+
+
+async def _resolve_configured_anthem_s3_targets(
+    source_row: dict[str, Any],
+    employer_ein: str,
+    lookup_context: AnthemLookupContext,
+) -> list[CrawlTarget]:
+    """Resolve a trusted configured EIN when it is valid and current."""
+    configured_ein = "".join(
+        character for character in employer_ein if character.isdigit()
+    )
+    if len(configured_ein) != 9:
+        return []
+    try:
+        return await _resolve_anthem_s3_employer_files(
+            source_row,
+            employer_ein=configured_ein,
+            lookup_context=lookup_context,
+        )
+    except ValueError:
+        return []
+
+
+def _mark_anthem_name_index_fallback(
+    crawl_targets: Iterable[CrawlTarget],
+) -> list[CrawlTarget]:
+    """Mark direct-EIN results used while the optional name index was unavailable."""
+    return [
+        replace(
+            crawl_target,
+            metadata={
+                **dict(crawl_target.metadata or {}),
+                "anthem_name_index_status": "unavailable_direct_ein_fallback",
+            },
+        )
+        for crawl_target in crawl_targets
+    ]
+
+
+async def _resolve_anthem_s3_context(
+    source_row: dict[str, Any],
+    *,
+    employer_ein: str,
+    employer_names: Iterable[str],
+    lookup_context: AnthemLookupContext,
+) -> list[CrawlTarget]:
+    """Resolve current employer EIN objects from Anthem's public name index."""
+    direct_targets = await _resolve_configured_anthem_s3_targets(
+        source_row,
+        employer_ein,
+        lookup_context,
+    )
+    candidates_by_ein: dict[str, dict[str, str | None]] = {}
+    configured_ein = "".join(
+        character for character in employer_ein if character.isdigit()
+    )
+    try:
+        name_matches = await _fetch_anthem_s3_name_matches(
+            lookup_context.base_url,
+            employer_names,
+            lookup_context.resolver_by_key,
+            lookup_context.session,
+        )
+    except ValueError:
+        if direct_targets:
+            return _mark_anthem_name_index_fallback(direct_targets)
+        raise
+    for name_match in name_matches:
+        candidates_by_ein[name_match["ein"]] = name_match
+    indexed_eins = {name_match["ein"] for name_match in name_matches}
+    if not candidates_by_ein and not direct_targets:
+        if employer_ein:
+            raise ValueError("no current Anthem employer MRF results matched context")
+        raise ValueError("no current Anthem employer name-index match")
+
+    resolved_targets = (
+        list(direct_targets) if configured_ein not in indexed_eins else []
+    )
+    for candidate in candidates_by_ein.values():
+        try:
+            candidate_targets = await _resolve_anthem_s3_employer_files(
+                source_row,
+                employer_ein=str(candidate["ein"] or ""),
+                lookup_context=lookup_context,
+                matched_employer_name=candidate.get("name"),
+                name_index_url=candidate.get("name_index_url"),
+            )
+        except ValueError as exc:
+            if candidate["ein"] in indexed_eins:
+                raise ValueError(
+                    "Anthem name-index employer result could not be resolved"
+                ) from exc
+            continue
+        resolved_targets.extend(candidate_targets)
+    if not resolved_targets:
+        raise ValueError("no current Anthem employer MRF results matched context")
+    max_targets = _as_int(lookup_context.resolver_by_key.get("max_targets")) or 1000
+    return _merge_anthem_s3_employer_targets(resolved_targets)[:max_targets]
 
 
 def _anthem_s3_status_urls_from_script(script_text: str) -> list[str]:
@@ -12383,32 +12850,31 @@ def _crawl_ok_observation(
 def _source_target_payer_query(source: dict[str, Any]) -> str | None:
     metadata = dict((source or {}).get("metadata_json") or {})
     raw = metadata.get("raw")
-    if isinstance(raw, dict):
-        query = _clean_text(raw.get("target_payer_query"))
-        if query:
-            return query
-    return None
+    raw = raw if isinstance(raw, dict) else {}
+    return _clean_text(
+        metadata.get("target_payer_query") or raw.get("target_payer_query")
+    ) or None
 
 
 def _source_target_payer_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
-    """Return private employer names and stable identifiers used to scan TOCs."""
+    """Return scoped employer names and stable identifiers used to scan TOCs."""
     query_values: list[str] = []
     canonical_query = _source_target_payer_query(source_row)
     if canonical_query:
         query_values.append(canonical_query)
     employer_name = _source_query_context_text(
-        source_row, "private_context_employer_name"
+        source_row, "query_context_employer_name"
     )
     if employer_name:
         query_values.append(employer_name)
     query_values.extend(
         _source_private_context_values(
-            source_row, "private_context_employer_aliases"
+            source_row, "query_context_employer_aliases"
         )
     )
     for identifier_key in (
-        "private_context_employer_ein",
-        "private_context_carrier_policy_number",
+        "query_context_employer_ein",
+        "query_context_carrier_policy_number",
     ):
         identifier = _source_query_context_text(source_row, identifier_key)
         if not identifier:
