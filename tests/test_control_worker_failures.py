@@ -20,7 +20,7 @@ def test_worker_state_reports_failed_kubernetes_pod_termination(monkeypatch):
         return {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
-    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 

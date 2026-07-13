@@ -75,6 +75,7 @@ jobs:
           tests/test_control_failure_metrics.py
           tests/test_control_imports_api.py
           tests/test_control_workers.py
+          tests/test_mrf_discovery_worker_targeting.py
           tests/test_archive_unit.py
           tests/test_process_provider_directory_fhir_unit.py
           tests/test_provider_directory_dataset_network_plan.py

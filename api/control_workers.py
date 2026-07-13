@@ -198,11 +198,8 @@ def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
-    state_dir = _state_dir()
-    log_dir = _log_dir()
-    state_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = _log_path(spec)
+    for directory in (_state_dir(), _log_dir()):
+        directory.mkdir(parents=True, exist_ok=True)
     cmd = _worker_command(sys.executable, spec)
     env = os.environ.copy()
     env["HLTHPRT_ACTIVE_WORKER_CLASS"] = spec.worker_class
@@ -213,7 +210,9 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     run_id = str(payload.get("run_id") or "").strip()
     if run_id:
         env["HLTHPRT_CONTROL_RUN_ID"] = run_id
-    with log_path.open("ab") as log_handle:
+    if _uses_single_job_worker(spec):
+        env["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] = _single_job_worker_target(spec, payload) or ""
+    with _log_path(spec).open("ab") as log_handle:
         process = subprocess.Popen(
             cmd,
             cwd=str(_repo_root()),
@@ -338,7 +337,7 @@ def delete_kubernetes_worker_jobs(cancel_request: dict[str, Any]) -> dict[str, A
         return {"enabled": True, "deleted": 0, "reason": "no matching worker spec"}
 
     namespace = _kubernetes_namespace()
-    if not _kubernetes_configured():
+    if not _is_kubernetes_configured():
         return {
             "enabled": True,
             "namespace": namespace,
@@ -449,7 +448,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = 
         "launcher": "kubernetes",
         "command": " ".join(_worker_command(_worker_python(), spec)),
     }
-    if not _kubernetes_configured():
+    if not _is_kubernetes_configured():
         return {**state_base_dict, "job_name": _worker_job_name(spec, payload or {}), "job_status": "unconfigured"}
 
     selector = _kubernetes_label_selector(spec, payload or {})
@@ -850,7 +849,8 @@ def _worker_python() -> str:
 def _uses_single_job_worker(spec: WorkerSpec) -> bool:
     return spec.role == "start" and (
         spec.worker_class.startswith("process.PTG")
-        or spec.worker_class == "process.ProviderDirectoryFHIR"
+        or spec.worker_class
+        in {"process.MRFSourceDiscovery", "process.ProviderDirectoryFHIR"}
     )
 
 
@@ -885,7 +885,7 @@ def _kubernetes_namespace() -> str:
         return "default"
 
 
-def _kubernetes_configured() -> bool:
+def _is_kubernetes_configured() -> bool:
     return bool(os.getenv("KUBERNETES_SERVICE_HOST")) and _K8S_API_TOKEN.exists()
 
 

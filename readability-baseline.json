@@ -2,7 +2,7 @@
   "issue_counts": {
     "ambiguous_function_names": 40,
     "ambiguous_variable_names": 1968,
-    "boolean_name_mismatch": 534,
+    "boolean_name_mismatch": 533,
     "builtin_shadowing": 2,
     "class_name_shape": 2,
     "collection_name_mismatch": 1747,
@@ -2041,7 +2041,6 @@
       "boolean_name_mismatch:api/control_imports.py:ensure_import_run_table:_IMPORT_RUN_ENSURED:assignment",
       "boolean_name_mismatch:api/control_imports.py:request_cancel:pending_adapter:assignment",
       "boolean_name_mismatch:api/control_imports.py:request_cancel:queued_arq:assignment",
-      "boolean_name_mismatch:api/control_workers.py:_kubernetes_configured:function",
       "boolean_name_mismatch:api/control_workers.py:_matches_current_node:function",
       "boolean_name_mismatch:api/control_workers.py:_pid_matches_current_node:function",
       "boolean_name_mismatch:api/control_workers.py:_pid_matches_spec:function",
