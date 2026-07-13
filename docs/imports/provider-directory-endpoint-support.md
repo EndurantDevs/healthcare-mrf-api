@@ -6,7 +6,7 @@ The live catalog and curated support matrix are distinct: the catalog inventory 
 
 `None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.
 
-A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.
+A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.
 
 Freshness policy: catalog confirmation expires after `45` days, source reviews after `45` days, and current terminal proof after `45` days. CI rejects expired evidence.
 
@@ -79,6 +79,40 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 | Centene (`centene`) | Probe-only | None | Probe | None configured | https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory | pdfhir_00d0fb813f25b5d699a18eaa | Not required | 2026-07-13 | 2026-08-27 | The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified. |
 | Contra Costa (`contra-costa`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod | pdfhir_8ee2865f928f1d67b8a86090 | Not required | 2026-07-13 | 2026-08-27 | Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot. |
 | ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4 | pdfhir_0f81c146991b27031b1ec366 | Required | 2026-07-13 | 2026-08-27 | FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The source does not expose organization-affiliation relationships, so the connector does not invent self-referential OrganizationAffiliation resources. |
+
+## Current Published Dataset Audit
+
+Audit as of `2026-07-13`. A current published dataset is distinct from configured acquisition capability, terminal campaign proof, and downstream publication readiness. `Snapshot-ready` means the separate verification snapshot records readiness; `Not proven` means no downstream publication proof is asserted here.
+
+| Source | Dataset state | Resources | Downstream evidence | Audit note |
+| --- | --- | ---: | --- | --- |
+| Idaho (`idaho`) | Current published (`pdds_fc4faaf27524...`) | 1,273,520 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| Molina (`molina`) | No current dataset | - | Not applicable | The endpoint returned HTTP 403; no current dataset is claimed. |
+| Michigan (`michigan`) | Probe-only | - | Not applicable | Completeness remains unproven. |
+| Cigna (`cigna`) | Current published (`pdds_945621a497c4...`) | 3,481,955 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| Aetna Commercial and Medicare (`aetna-commercial-medicare`) | Acquisition active | - | Not proven | The full acquisition campaign is checkpointing on PractitionerRole; no current published dataset is claimed. |
+| Humana Carrier Directory (`humana`) | No current dataset | - | Not proven | The checkpointed acquisition campaign has not completed or published a current dataset. |
+| IEHP (`iehp`) | Current published (`pdds_915b4554db3c...`) | 458,671 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| Arkansas Medicaid (`arkansas`) | Current published (`pdds_d90903861218...`) | 456,085 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| HAP (`hap`) | Current published (`pdds_41063cefc3b0...`) | 344,868 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| Washington (`washington`) | Probe-only | - | Not applicable | Completeness remains unproven. |
+| Wyoming Medicaid (`wyoming`) | Current published (`pdds_653f5138c4d5...`) | 102,682 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| Health Partners Plans (`health-partners-plans`) | Current published (`pdds_4aab6a2cc524...`) | 1,517,314 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Current published (`pdds_cc537c823b81...`) | 2,837,808 | Not proven | A current dataset exists, but downstream publication proof is not recorded. |
+| AmeriHealth Caritas DE/LA/NC/DC/PA aliases (`amerihealth-de`, `amerihealth-la`, `amerihealth-nc`, `amerihealth-dc`, `amerihealth-pa`) | Probe-only | - | Not applicable | Shared-backend equivalence and product membership are unproven. |
+| Horizon NJ (`horizon-nj`) | Probe-only | - | Not applicable | Credentialed production pagination is unverified. |
+| Texas TMHP (`texas-tmhp`) | Current published (`pdds_87113f97f3f9...`) | 782,642 | Not proven | A current dataset exists, but downstream publication proof is not recorded. |
+| Nebraska Medicaid (`nebraska`) | Current published (`pdds_5e8abd1c87c4...`) | 387,119 | Not proven | A current dataset exists, but downstream publication proof is not recorded. |
+| UHC (`uhc`) | Probe-only | - | Not applicable | The collection ceiling prevents exhaustive acquisition. |
+| Missouri (`missouri`) | Probe-only | - | Not applicable | No stable exhaustive acquisition contract is verified. |
+| Maine Medicaid (`maine`) | Current published (`pdds_7e06e00b590f...`) | 140,135 | Snapshot-ready | The tracked verification snapshot records promoted address artifacts and ready unified/API evidence. |
+| SCAN (`scan`) | Probe-only | - | Not applicable | Live completeness proof is not yet recorded. |
+| Centene (`centene`) | Probe-only | - | Not applicable | Stable exhaustive pagination remains unverified. |
+| Contra Costa (`contra-costa`) | Current published (`pdds_6653e89e2f6f...`) | 950,535 | Snapshot-ready | A current dataset exists and a replacement acquisition is active. |
+| ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch | The connector contract and live dataset require reconciliation before downstream evidence is treated as source-contract proof. |
+| Chorus Community Health Plans | Not importable | - | Not applicable | The documented service is unreachable. |
+| First Medical Health Plan, Inc. | Not importable | - | Not applicable | A user token and production approval are required. |
+| Puerto Rico Medicaid FFS | Not importable | - | Not applicable | No production Provider Directory is published. |
 
 ## Known Not Importable
 

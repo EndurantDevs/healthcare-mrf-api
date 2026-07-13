@@ -27,6 +27,14 @@ Keep these authorities separate when reviewing Provider Directory coverage:
   caller supplies broad resource names. They remain eligible for cataloging and
   capability probing. Explicit targeted-query paths retain their own constraints
   and are not a way to enable a generic crawl.
+- The generated matrix's [Current Published Dataset Audit](../../specs/provider_directory_current_dataset_audit.json)
+  is a dated operational record, not an acquisition capability or a
+  downstream-serving assertion.
+  `Current published` therefore does not establish a terminal campaign,
+  derived artifact promotion, unified-address refresh, or API evidence.
+  Conversely, `Snapshot-ready` is the separately reviewed readiness state in
+  the verification snapshot. `Not proven` and `Contract/live mismatch` are
+  explicit reasons not to infer downstream readiness from a current dataset.
 - Known non-importable coverage is maintained in the [blocker registry](../../specs/provider_directory_blocker_registry.json).
   Its required access, registration flag, operational state, review date, and
   primary evidence are rendered in the matrix as `Not supported`. The registry

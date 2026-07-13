@@ -464,6 +464,7 @@ def update_files(
         manifest,
         generator.load_blocker_registry(blocker_path),
         snapshot,
+        generator.load_current_dataset_audit(generator.DEFAULT_CURRENT_DATASET_AUDIT),
     )
     if output_path == snapshot_path:
         raise VerificationUpdateError("snapshot and documentation paths must be distinct")

@@ -3,15 +3,20 @@
 """Render the concise inventory portion of Provider Directory support docs."""
 from __future__ import annotations
 
+import datetime as dt
+import json
+from pathlib import Path
 from typing import Any, Callable
 
 try:
     from scripts.provider_directory_support_contract import (
+        SupportDocumentationError,
         parse_review_date,
         review_valid_through,
     )
 except ModuleNotFoundError:
     from provider_directory_support_contract import (
+        SupportDocumentationError,
         parse_review_date,
         review_valid_through,
     )
@@ -19,11 +24,216 @@ except ModuleNotFoundError:
 
 DisplayValue = Callable[[str], str]
 NOT_RECORDED_DISPLAY = "Not recorded"
+CURRENT_DATASET_STATES = {
+    "current-published": "Current published",
+    "no-current-dataset": "No current dataset",
+    "acquisition-active": "Acquisition active",
+    "probe-only": "Probe-only",
+    "not-importable": "Not importable",
+}
+DOWNSTREAM_EVIDENCE_STATES = {
+    "snapshot-ready": "Snapshot-ready",
+    "not-proven": "Not proven",
+    "contract-live-mismatch": "Contract/live mismatch",
+    "not-applicable": "Not applicable",
+}
+CURRENT_DATASET_REQUIRED_FIELDS = {
+    "source", "dataset_state", "downstream_evidence", "note"
+}
+CURRENT_DATASET_ALLOWED_FIELDS = CURRENT_DATASET_REQUIRED_FIELDS | {
+    "dataset_id", "entry_id", "entry_ids", "observed_at", "resource_count"
+}
 
 
 def _markdown_cell(value: str) -> str:
     """Escape text for a single Markdown table cell."""
     return value.replace("|", "\\|").replace("\n", "<br>")
+
+
+def load_current_dataset_audit(audit_path: Path) -> dict[str, Any]:
+    """Load the dated operational dataset audit independently of acquisition config."""
+    decoded = json.loads(audit_path.read_text(encoding="utf-8"))
+    if not isinstance(decoded, dict):
+        raise SupportDocumentationError(f"{audit_path} must contain a JSON object")
+    return decoded
+
+
+def _validated_audit_entry_ids(
+    audit_record: dict[str, Any],
+    manifest_entry_ids: set[str],
+) -> list[str]:
+    """Validate and return manifest entries represented by one audit record."""
+    entry_id = audit_record.get("entry_id")
+    entry_ids = audit_record.get("entry_ids")
+    if entry_id is not None and entry_ids is not None:
+        raise SupportDocumentationError("current dataset audit record cannot use entry_id and entry_ids")
+    represented_entry_ids = [entry_id] if entry_id is not None else entry_ids or []
+    if not isinstance(represented_entry_ids, list) or any(
+        not isinstance(item, str) or item not in manifest_entry_ids
+        for item in represented_entry_ids
+    ):
+        source_label = audit_record.get("source", "unknown source")
+        raise SupportDocumentationError(f"invalid audit entry_id for {source_label}")
+    if len(represented_entry_ids) != len(set(represented_entry_ids)):
+        raise SupportDocumentationError("duplicate entry_id within current dataset audit record")
+    return represented_entry_ids
+
+
+def _validate_snapshot_ready_record(
+    audit_record: dict[str, Any],
+    represented_entry_ids: list[str],
+    verification_snapshot: dict[str, Any] | None,
+) -> None:
+    """Require promoted artifacts and API readiness behind snapshot-ready claims."""
+    if audit_record["downstream_evidence"] != "snapshot-ready" or verification_snapshot is None:
+        return
+    if len(represented_entry_ids) != 1:
+        raise SupportDocumentationError("snapshot-ready audit records must map to one entry_id")
+    readiness = verification_snapshot.get("entries", {}).get(
+        represented_entry_ids[0], {}
+    ).get("publication_readiness", {})
+    if readiness.get("derived_artifact_state") != "promoted" or readiness.get(
+        "unified_api_state"
+    ) != "ready":
+        raise SupportDocumentationError(
+            f"snapshot-ready audit record lacks ready verification for {represented_entry_ids[0]}"
+        )
+
+
+def _validate_current_dataset_record_shape(audit_record: Any) -> str:
+    """Validate scalar fields for one current-dataset observation."""
+    if not isinstance(audit_record, dict) or set(audit_record) - CURRENT_DATASET_ALLOWED_FIELDS:
+        raise SupportDocumentationError("current dataset audit has unsupported fields")
+    if not all(
+        isinstance(audit_record.get(field_name), str)
+        and audit_record[field_name].strip()
+        for field_name in CURRENT_DATASET_REQUIRED_FIELDS
+    ):
+        raise SupportDocumentationError("current dataset audit has missing fields")
+    source_label = audit_record["source"]
+    if audit_record["dataset_state"] not in CURRENT_DATASET_STATES:
+        raise SupportDocumentationError(f"invalid dataset state for {source_label}")
+    if audit_record["downstream_evidence"] not in DOWNSTREAM_EVIDENCE_STATES:
+        raise SupportDocumentationError(f"invalid evidence state for {source_label}")
+    if audit_record["dataset_state"] != "current-published":
+        return source_label
+    if not str(audit_record.get("dataset_id", "")).startswith("pdds_"):
+        raise SupportDocumentationError(
+            f"current dataset audit lacks dataset_id for {source_label}"
+        )
+    if not isinstance(audit_record.get("resource_count"), int) or audit_record[
+        "resource_count"
+    ] < 0:
+        raise SupportDocumentationError(
+            f"current dataset audit lacks resource_count for {source_label}"
+        )
+    try:
+        dt.datetime.fromisoformat(str(audit_record.get("observed_at", "")))
+    except ValueError as exc:
+        raise SupportDocumentationError(
+            f"current dataset audit lacks observed_at for {source_label}"
+        ) from exc
+    return source_label
+
+
+def _validated_current_dataset_audit_records(
+    current_dataset_audit: dict[str, Any],
+    acquisition_manifest: dict[str, Any],
+    verification_snapshot: dict[str, Any] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Validate one dated operational snapshot independently of acquisition config."""
+    if current_dataset_audit.get("schema_version") != 1:
+        raise SupportDocumentationError("current dataset audit schema_version must be 1")
+    audit_date = current_dataset_audit.get("as_of")
+    try:
+        dt.date.fromisoformat(audit_date)
+    except (TypeError, ValueError) as exc:
+        raise SupportDocumentationError("current dataset audit as_of must be an ISO date") from exc
+    audit_records = current_dataset_audit.get("records")
+    if not isinstance(audit_records, list) or not audit_records:
+        raise SupportDocumentationError("current dataset audit records must be non-empty")
+    manifest_entry_ids = {
+        entry["entry_id"] for entry in acquisition_manifest["entries"]
+    }
+    source_labels = set()
+    represented_manifest_entry_ids: set[str] = set()
+    for audit_record in audit_records:
+        source_label = _validate_current_dataset_record_shape(audit_record)
+        if source_label in source_labels:
+            raise SupportDocumentationError(f"duplicate current dataset source {source_label!r}")
+        source_labels.add(source_label)
+        represented_entry_ids = _validated_audit_entry_ids(
+            audit_record, manifest_entry_ids
+        )
+        duplicate_entry_ids = represented_manifest_entry_ids.intersection(
+            represented_entry_ids
+        )
+        if duplicate_entry_ids:
+            raise SupportDocumentationError(
+                f"duplicate current dataset entry_id {sorted(duplicate_entry_ids)[0]}"
+            )
+        represented_manifest_entry_ids.update(represented_entry_ids)
+        _validate_snapshot_ready_record(
+            audit_record, represented_entry_ids, verification_snapshot
+        )
+    missing_entry_ids = manifest_entry_ids - represented_manifest_entry_ids
+    if missing_entry_ids:
+        raise SupportDocumentationError(
+            "current dataset audit misses manifest entry_ids: "
+            + ", ".join(sorted(missing_entry_ids))
+        )
+    return audit_date, audit_records
+
+
+def render_current_dataset_audit_section(
+    current_dataset_audit: dict[str, Any],
+    acquisition_manifest: dict[str, Any],
+    verification_snapshot: dict[str, Any] | None = None,
+) -> list[str]:
+    """Render dated dataset observations without changing acquisition support."""
+    audit_date, audit_records = _validated_current_dataset_audit_records(
+        current_dataset_audit, acquisition_manifest, verification_snapshot
+    )
+    audit_lines = [
+        "",
+        "## Current Published Dataset Audit",
+        "",
+        f"Audit as of `{audit_date}`. A current published dataset is distinct from configured acquisition capability, terminal campaign proof, and downstream publication readiness. `Snapshot-ready` means the separate verification snapshot records readiness; `Not proven` means no downstream publication proof is asserted here.",
+        "",
+        "| Source | Dataset state | Resources | Downstream evidence | Audit note |",
+        "| --- | --- | ---: | --- | --- |",
+    ]
+    for audit_record in audit_records:
+        source_label = audit_record["source"]
+        represented_entry_ids = audit_record.get("entry_ids") or [
+            audit_record.get("entry_id")
+        ]
+        represented_entry_ids = [entry_id for entry_id in represented_entry_ids if entry_id]
+        if represented_entry_ids:
+            source_label += " (" + ", ".join(
+                f"`{entry_id}`" for entry_id in represented_entry_ids
+            ) + ")"
+        dataset_state = CURRENT_DATASET_STATES[audit_record["dataset_state"]]
+        resource_count = audit_record.get("resource_count")
+        if audit_record.get("dataset_id"):
+            dataset_state += f" (`{audit_record['dataset_id'][:17]}...`)"
+        audit_lines.append(
+            "| "
+            + " | ".join(
+                _markdown_cell(cell)
+                for cell in (
+                    source_label,
+                    dataset_state,
+                    f"{resource_count:,}" if resource_count is not None else "-",
+                    DOWNSTREAM_EVIDENCE_STATES[
+                        audit_record["downstream_evidence"]
+                    ],
+                    audit_record["note"],
+                )
+            )
+            + " |"
+        )
+    return audit_lines
 
 
 def _credential_row(

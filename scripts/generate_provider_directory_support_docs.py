@@ -28,7 +28,8 @@ try:
         validate_support_freshness,
     )
     from scripts.provider_directory_support_inventory import (
-        render_blocked_support_section,
+        load_current_dataset_audit, render_blocked_support_section,
+        render_current_dataset_audit_section,
         render_inventory_summary,
         resource_completion_display,
     )
@@ -59,7 +60,8 @@ except ModuleNotFoundError:
         validate_support_freshness,
     )
     from provider_directory_support_inventory import (
-        render_blocked_support_section,
+        load_current_dataset_audit, render_blocked_support_section,
+        render_current_dataset_audit_section,
         render_inventory_summary,
         resource_completion_display,
     )
@@ -75,6 +77,7 @@ DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifes
 DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 DEFAULT_BLOCKER_REGISTRY = ROOT / "specs/provider_directory_blocker_registry.json"
 DEFAULT_VERIFICATION_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
+DEFAULT_CURRENT_DATASET_AUDIT = ROOT / "specs/provider_directory_current_dataset_audit.json"
 METHODS = {"rest", "bulk", "graphql", "probe"}
 DISPLAY_VALUES = {
     "supported": "Supported",
@@ -247,7 +250,7 @@ def _support_document_header(manifest: dict[str, Any]) -> list[str]:
         "",
         "`None` access means the configuration expects public access, not that the endpoint is currently reachable. `Probe-only` entries have no resource acquisition configured and must not be treated as imported.",
         "",
-        "A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
+        "A canonical base identifies acquisition transport; its source IDs retain product or plan provenance. Shared endpoint aliases must not be collapsed into one published product result merely because they share a transport base. Access configuration, current published dataset state, terminal acquisition proof, derived artifact state, and unified/API readiness are separate claims.",
         "",
         "Freshness policy: catalog confirmation expires after `"
         + str(policy["catalog_confirmation_max_age_days"])
@@ -399,6 +402,7 @@ def render_markdown(
     manifest: dict[str, Any],
     blocker_registry: dict[str, Any] | None = None,
     verification_snapshot: dict[str, Any] | None = None,
+    current_dataset_audit: dict[str, Any] | None = None,
 ) -> str:
     """Render stable Markdown from manifest entries and support metadata."""
     snapshot = verification_snapshot
@@ -414,6 +418,12 @@ def render_markdown(
     markdown_lines.extend(_catalog_inventory_snapshot(manifest, blockers))
     markdown_lines.extend(render_inventory_summary(manifest, support_by_entry, blockers, _display))
     markdown_lines.extend(_configured_support_rows(manifest, support_by_entry))
+    if current_dataset_audit is not None:
+        markdown_lines.extend(
+            render_current_dataset_audit_section(
+                current_dataset_audit, manifest, snapshot
+            )
+        )
     markdown_lines.extend(
         render_blocked_support_section(
             blockers,
@@ -431,6 +441,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--blocker-registry", type=Path, default=None)
     parser.add_argument("--verification-snapshot", type=Path, default=None)
+    parser.add_argument(
+        "--current-dataset-audit",
+        type=Path,
+        default=DEFAULT_CURRENT_DATASET_AUDIT,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true", help="Fail when the generated document is missing or stale.")
     parser.add_argument(
@@ -440,16 +455,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Freshness date for --check (defaults to current UTC date).",
     )
     return parser.parse_args(argv)
+def _render_requested_document(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    blocker_path: Path,
+    verification_path: Path,
+) -> str:
+    """Load independent evidence inputs and render one support document."""
+    return render_markdown(
+        manifest,
+        load_blocker_registry(blocker_path),
+        load_verification_snapshot(verification_path),
+        load_current_dataset_audit(args.current_dataset_audit),
+    )
 def main(argv: list[str] | None = None) -> int:
     """Write the support matrix or check it for drift."""
     args = parse_args(argv)
     manifest = load_manifest(args.manifest)
     blocker_path = args.blocker_registry or ROOT / manifest["support_documentation"]["blocker_registry"]
     verification_path = args.verification_snapshot or ROOT / manifest["support_documentation"]["verification_snapshot"]
-    rendered = render_markdown(
-        manifest,
-        load_blocker_registry(blocker_path),
-        load_verification_snapshot(verification_path),
+    rendered = _render_requested_document(
+        args, manifest, blocker_path, verification_path
     )
     blockers = validate_blocker_registry(load_blocker_registry(blocker_path))
     current = args.output.read_text(encoding="utf-8") if args.output.exists() else None

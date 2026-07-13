@@ -135,6 +135,14 @@ def test_unknown_manifest_hash_is_rejected():
 
 def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp_path, monkeypatch):
     manifest, snapshot = _manifest_and_snapshot()
+    tracked_entries = generator.load_verification_snapshot(
+        generator.DEFAULT_VERIFICATION_SNAPSHOT
+    )["entries"]
+    for entry_id, verification_record in snapshot["entries"].items():
+        if "publication_readiness" in tracked_entries[entry_id]:
+            verification_record["publication_readiness"] = copy.deepcopy(
+                tracked_entries[entry_id]["publication_readiness"]
+            )
     report = _report(manifest)
     report_path, report = _persist_harness_report(tmp_path, monkeypatch, manifest, report)
     snapshot_path = tmp_path / "verification.json"
@@ -176,11 +184,12 @@ def test_successful_update_records_safe_terminal_fields_and_regenerates_docs(tmp
     assert "SECRET" not in serialized_snapshot
     assert "SECRET" not in serialized_docs
     assert '"error"' not in serialized_snapshot
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Not recorded | Not recorded | Not recorded | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
+    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready | 2026-07-12T23:53:00Z | run_idaho | Succeeded (`run_idaho`)" in serialized_docs
     assert '"InsurancePlan": {' in serialized_snapshot
     assert '"sources_bounded": 0' in serialized_snapshot
     assert "| Rows by resource |" in serialized_docs
     assert "| Evidence recorded |" in serialized_docs
+    assert "## Current Published Dataset Audit" in serialized_docs
     assert '"InsurancePlan": {' not in serialized_docs
     assert "| Molina (`molina`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded" in serialized_docs
 
