@@ -184,17 +184,17 @@ def _promotion_relation_builders(transaction_events, connection_executor):
     return build_network_plan, build_affiliations
 
 
-def _mock_promotion_dependencies(
+def _mock_validation_dependencies(
     monkeypatch,
     acquire,
     network_builder,
     affiliation_builder,
-    supersede_dataset,
+    store_validated_dataset,
 ):
     monkeypatch.setattr(importer.db, "acquire", acquire)
     monkeypatch.setattr(
         importer,
-        "_lock_endpoint_dataset_for_promotion",
+        "_lock_endpoint_dataset_for_validation",
         AsyncMock(return_value="dataset-old"),
     )
     monkeypatch.setattr(
@@ -219,14 +219,8 @@ def _mock_promotion_dependencies(
     )
     monkeypatch.setattr(
         importer,
-        "_supersede_endpoint_dataset",
-        supersede_dataset,
-    )
-    monkeypatch.setattr(importer, "_publish_endpoint_dataset", AsyncMock())
-    monkeypatch.setattr(
-        importer,
-        "_clear_published_endpoint_partition_state",
-        AsyncMock(),
+        "_store_validated_endpoint_dataset",
+        store_validated_dataset,
     )
 
 
@@ -395,7 +389,7 @@ async def test_artifact_rebuilds_both_relations_once_per_dataset_alias_family(
 
 
 @pytest.mark.asyncio
-async def test_publication_builds_edges_before_superseding_and_uses_root_identity(
+async def test_validation_builds_edges_before_storing_and_uses_root_identity(
     monkeypatch,
 ):
     transaction_events = []
@@ -409,18 +403,19 @@ async def test_publication_builds_edges_before_superseding_and_uses_root_identit
         connection_executor,
     )
 
-    async def supersede(*_args):
-        transaction_events.append("supersede")
+    async def store_validated(*_args):
+        transaction_events.append("store-validated")
 
-    _mock_promotion_dependencies(
+    validated_store = AsyncMock(side_effect=store_validated)
+    _mock_validation_dependencies(
         monkeypatch,
         acquire,
         network_builder,
         affiliation_builder,
-        supersede,
+        validated_store,
     )
 
-    publication_summary = await importer._promote_endpoint_dataset_candidate(
+    validation_summary = await importer._validate_endpoint_dataset_candidate(
         _candidate(),
         {"InsurancePlan": {"complete": True}},
     )
@@ -429,23 +424,25 @@ async def test_publication_builds_edges_before_superseding_and_uses_root_identit
         "begin",
         "build-edges",
         "build-affiliations",
-        "supersede",
+        "store-validated",
         "commit",
     ]
-    assert publication_summary["dataset_network_plan"]["complete"] is True
+    assert validation_summary["dataset_network_plan"]["complete"] is True
+    assert validation_summary["status"] == importer.ENDPOINT_DATASET_VALIDATED
+    assert validation_summary["published"] is False
     connection_executor.scalar.assert_awaited_once()
-    publish_metadata = importer._publish_endpoint_dataset.await_args.args[-1]
-    assert publish_metadata["dataset_network_plan"]["build_run_id"] == (
+    validation_metadata = validated_store.await_args.args[-1]
+    assert validation_metadata["dataset_network_plan"]["build_run_id"] == (
         "retry-child-run"
     )
-    assert publish_metadata["dataset_affiliation_organization"][
+    assert validation_metadata["dataset_affiliation_organization"][
         "acquisition_root_run_id"
     ] == "root-run"
 
 
 @pytest.mark.parametrize("failing_relation", ["network", "affiliation"])
 @pytest.mark.asyncio
-async def test_relation_build_failure_rolls_back_before_current_dataset_changes(
+async def test_relation_build_failure_rolls_back_before_candidate_validation(
     monkeypatch,
     failing_relation,
 ):
@@ -460,21 +457,20 @@ async def test_relation_build_failure_rolls_back_before_current_dataset_changes(
         network_builder.side_effect = RuntimeError("edge build failed")
     else:
         affiliation_builder.side_effect = RuntimeError("edge build failed")
-    supersede_dataset = AsyncMock()
-    _mock_promotion_dependencies(
+    validated_store = AsyncMock()
+    _mock_validation_dependencies(
         monkeypatch,
         _promotion_acquire(transaction_events, connection_executor),
         network_builder,
         affiliation_builder,
-        supersede_dataset,
+        validated_store,
     )
 
     with pytest.raises(RuntimeError, match="edge build failed"):
-        await importer._promote_endpoint_dataset_candidate(
+        await importer._validate_endpoint_dataset_candidate(
             _candidate(),
             {"InsurancePlan": {"complete": True}},
         )
 
     assert transaction_events == ["begin", "rollback"]
-    supersede_dataset.assert_not_awaited()
-    importer._publish_endpoint_dataset.assert_not_awaited()
+    validated_store.assert_not_awaited()

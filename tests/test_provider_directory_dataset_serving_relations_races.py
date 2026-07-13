@@ -117,19 +117,19 @@ def test_artifact_fence_rejects_evidence_run_drift():
         (_artifact_dataset("source-a"),)
     )
     drifted_dataset_by_field = {
-        "source_id": "source-a",
         "endpoint_id": "endpoint-1",
         "dataset_id": "dataset-1",
-        "evidence_run_id": "changed-root-run",
-        "selected_resources": ["InsurancePlan"],
-        "recorded_expected_resources": ["InsurancePlan"],
+        "acquisition_root_run_id": "changed-root-run",
+        "status": importer.ENDPOINT_DATASET_PUBLISHED,
+        "is_current": True,
+        "superseded_at": None,
     }
 
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
-        match="evidence_run_changed",
+        match="metadata_changed",
     ):
-        importer._assert_locked_artifact_fence_tuples(
+        importer._assert_locked_artifact_fence_datasets(
             fence,
             [drifted_dataset_by_field],
         )
