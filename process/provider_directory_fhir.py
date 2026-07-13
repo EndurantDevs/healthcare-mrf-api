@@ -5652,6 +5652,259 @@ def _name(resource: dict[str, Any]) -> tuple[str | None, list[str], str | None]:
     return family, given, text
 
 
+def _profile_text(value: Any, *, max_length: int = 2048) -> str | None:
+    text = _clean_text(value)
+    return text[:max_length] if text else None
+
+
+def _normalized_human_names(value: Any) -> list[dict[str, Any]]:
+    names = [value] if isinstance(value, dict) else value
+    if not isinstance(names, list):
+        return []
+    normalized_names: list[dict[str, Any]] = []
+    for name in names:
+        if not isinstance(name, dict):
+            continue
+        period = name.get("period") if isinstance(name.get("period"), dict) else {}
+        normalized = {
+            "use": _profile_text(name.get("use"), max_length=32),
+            "text": _profile_text(name.get("text"), max_length=512),
+            "family": _profile_text(name.get("family"), max_length=256),
+            "given": [
+                text
+                for item in name.get("given") or []
+                if (text := _profile_text(item, max_length=256))
+            ],
+            "prefix": [
+                text
+                for item in name.get("prefix") or []
+                if (text := _profile_text(item, max_length=64))
+            ],
+            "suffix": [
+                text
+                for item in name.get("suffix") or []
+                if (text := _profile_text(item, max_length=64))
+            ],
+            "period_start": _profile_text(period.get("start"), max_length=64),
+            "period_end": _profile_text(period.get("end"), max_length=64),
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            normalized_names.append(cleaned)
+    return normalized_names
+
+
+def _normalized_fhir_addresses(value: Any) -> list[dict[str, Any]]:
+    addresses = [value] if isinstance(value, dict) else value
+    if not isinstance(addresses, list):
+        return []
+    normalized_addresses: list[dict[str, Any]] = []
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        period = address.get("period") if isinstance(address.get("period"), dict) else {}
+        normalized = {
+            "use": _profile_text(address.get("use"), max_length=32),
+            "type": _profile_text(address.get("type"), max_length=32),
+            "text": _profile_text(address.get("text"), max_length=1024),
+            "line": [
+                text
+                for item in address.get("line") or []
+                if (text := _profile_text(item, max_length=512))
+            ],
+            "city": _profile_text(address.get("city"), max_length=256),
+            "district": _profile_text(address.get("district"), max_length=256),
+            "state": _profile_text(address.get("state"), max_length=128),
+            "postal_code": _profile_text(address.get("postalCode"), max_length=32),
+            "country": _profile_text(address.get("country"), max_length=128),
+            "period_start": _profile_text(period.get("start"), max_length=64),
+            "period_end": _profile_text(period.get("end"), max_length=64),
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            normalized_addresses.append(cleaned)
+    return normalized_addresses
+
+
+def _normalized_qualifications(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    qualifications: list[dict[str, Any]] = []
+    for qualification in value:
+        if not isinstance(qualification, dict):
+            continue
+        period = (
+            qualification.get("period")
+            if isinstance(qualification.get("period"), dict)
+            else {}
+        )
+        issuer = (
+            qualification.get("issuer")
+            if isinstance(qualification.get("issuer"), dict)
+            else {}
+        )
+        normalized = {
+            "identifiers": _normalized_identifiers(
+                qualification.get("identifier")
+            ),
+            "code_codes": _codings(qualification.get("code")),
+            "code_text": _profile_text(
+                qualification.get("code", {}).get("text")
+                if isinstance(qualification.get("code"), dict)
+                else None,
+                max_length=512,
+            ),
+            "period_start": _profile_text(period.get("start"), max_length=64),
+            "period_end": _profile_text(period.get("end"), max_length=64),
+            "issuer_ref": _profile_text(issuer.get("reference"), max_length=2048),
+            "issuer_display": _profile_text(issuer.get("display"), max_length=512),
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            qualifications.append(cleaned)
+    return qualifications
+
+
+def _normalized_communications(value: Any) -> list[dict[str, Any]]:
+    communications = [value] if isinstance(value, dict) else value
+    if not isinstance(communications, list):
+        return []
+    normalized_communications: list[dict[str, Any]] = []
+    for communication in communications:
+        if not isinstance(communication, dict):
+            continue
+        concept = (
+            communication.get("language")
+            if isinstance(communication.get("language"), dict)
+            else communication
+        )
+        normalized = {
+            "codes": _codings(concept),
+            "text": _profile_text(concept.get("text"), max_length=256),
+            "preferred": communication.get("preferred")
+            if isinstance(communication.get("preferred"), bool)
+            else None,
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            normalized_communications.append(cleaned)
+    return normalized_communications
+
+
+def _safe_profile_photo_url(value: Any) -> str | None:
+    url = _profile_text(value, max_length=2048)
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return url
+
+
+def _normalized_photo_metadata(value: Any) -> list[dict[str, Any]]:
+    attachments = [value] if isinstance(value, dict) else value
+    if not isinstance(attachments, list):
+        return []
+    photos: list[dict[str, Any]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        normalized = {
+            "content_type": _profile_text(
+                attachment.get("contentType"), max_length=128
+            ),
+            "language": _profile_text(attachment.get("language"), max_length=64),
+            "url": _safe_profile_photo_url(attachment.get("url")),
+            "title": _profile_text(attachment.get("title"), max_length=512),
+            "creation": _profile_text(attachment.get("creation"), max_length=64),
+            "size": attachment.get("size")
+            if isinstance(attachment.get("size"), int)
+            and 0 <= attachment["size"] <= 100_000_000
+            else None,
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            photos.append(cleaned)
+    return photos
+
+
+def _normalized_organization_contacts(value: Any) -> list[dict[str, Any]]:
+    contacts = [value] if isinstance(value, dict) else value
+    if not isinstance(contacts, list):
+        return []
+    normalized_contacts: list[dict[str, Any]] = []
+    for contact in contacts:
+        if not isinstance(contact, dict):
+            continue
+        normalized = {
+            "purpose_codes": _codings(contact.get("purpose")),
+            "name": _normalized_human_names(contact.get("name")),
+            "telecom": [
+                item
+                for item in contact.get("telecom") or []
+                if isinstance(item, dict)
+            ],
+            "address": _normalized_fhir_addresses(contact.get("address")),
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            normalized_contacts.append(cleaned)
+    return normalized_contacts
+
+
+def _normalized_service_eligibility(value: Any) -> list[dict[str, Any]]:
+    eligibility = [value] if isinstance(value, dict) else value
+    if not isinstance(eligibility, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for entry in eligibility:
+        if not isinstance(entry, dict):
+            continue
+        normalized = {
+            "code_codes": _codings(entry.get("code")),
+            "comment": _profile_text(entry.get("comment"), max_length=2048),
+        }
+        cleaned = {
+            key: item
+            for key, item in normalized.items()
+            if item not in (None, [], {})
+        }
+        if cleaned:
+            rows.append(cleaned)
+    return rows
+
+
 def _period(resource: dict[str, Any]) -> tuple[str | None, str | None]:
     period = resource.get("period")
     if not isinstance(period, dict):
@@ -5818,16 +6071,30 @@ def parse_fhir_resource(
         return ProviderDirectoryInsurancePlan, row
     if resource_type == "Practitioner":
         family, given, full_name = _name(resource)
+        administrative_gender = _clean_text(resource.get("gender"))
+        if administrative_gender not in {"male", "female", "other", "unknown"}:
+            administrative_gender = None
         row = {
             **base,
             "npi": _resource_npi(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+            "identifiers": _normalized_identifiers(resource.get("identifier")),
+            "names": _normalized_human_names(resource.get("name")),
             "family_name": family,
             "given_names": given,
             "full_name": full_name,
+            "administrative_gender": administrative_gender,
             "telecom": _telecom(resource),
+            "addresses": _normalized_fhir_addresses(resource.get("address")),
             "qualification_codes": _codings([item.get("code") for item in resource.get("qualification") or [] if isinstance(item, dict)]),
+            "qualifications": _normalized_qualifications(
+                resource.get("qualification")
+            ),
             "communication_codes": _codings(resource.get("communication")),
+            "communications": _normalized_communications(
+                resource.get("communication")
+            ),
+            "photos": _normalized_photo_metadata(resource.get("photo")),
         }
         return ProviderDirectoryPractitioner, row
     if resource_type == "Organization":
@@ -5836,11 +6103,14 @@ def parse_fhir_resource(
             "npi": _resource_npi(resource),
             "tax_id": _tin(resource),
             "active": resource.get("active") if isinstance(resource.get("active"), bool) else None,
+            "identifiers": _normalized_identifiers(resource.get("identifier")),
             "name": _clean_text(resource.get("name")),
             "aliases": resource.get("alias") or [],
             "type_codes": _codings(resource.get("type")),
             "telecom": _telecom(resource),
             "address_json": resource.get("address") or [],
+            "contacts": _normalized_organization_contacts(resource.get("contact")),
+            "part_of_ref": _first_reference(resource.get("partOf")),
             "endpoint_refs": _references(resource.get("endpoint")),
         }
         return ProviderDirectoryOrganization, row
@@ -5853,11 +6123,26 @@ def parse_fhir_resource(
             **base,
             "status": _clean_text(resource.get("status")),
             "name": _clean_text(resource.get("name")),
+            "description": _profile_text(resource.get("description")),
             "mode": _clean_text(resource.get("mode")),
             "type_codes": _codings(resource.get("type")),
+            "physical_type_codes": _codings(resource.get("physicalType")),
+            "managing_organization_ref": _first_reference(
+                resource.get("managingOrganization")
+            ),
             "telephone_number": telephone_number,
             "fax_number": fax_number,
             "telecom": telecom,
+            "addresses": _normalized_fhir_addresses(resource.get("address")),
+            "hours_of_operation": [
+                item
+                for item in resource.get("hoursOfOperation") or []
+                if isinstance(item, dict)
+            ],
+            "availability_exceptions": _profile_text(
+                resource.get("availabilityExceptions")
+            ),
+            "photos": _normalized_photo_metadata(resource.get("photo")),
             **{key: value for key, value in address.items() if key != "address_json"},
         }
         if normalize_location_contacts:
@@ -5895,10 +6180,38 @@ def parse_fhir_resource(
             "type_codes": _codings(resource.get("type")),
             "category_codes": _codings(resource.get("category")),
             "specialty_codes": _codings(resource.get("specialty")),
+            "program_codes": _codings(resource.get("program")),
+            "characteristic_codes": _codings(resource.get("characteristic")),
+            "communication_codes": _codings(resource.get("communication")),
+            "referral_method_codes": _codings(resource.get("referralMethod")),
+            "service_provision_codes": _codings(
+                resource.get("serviceProvisionCode")
+            ),
+            "eligibility": _normalized_service_eligibility(
+                resource.get("eligibility")
+            ),
+            "appointment_required": resource.get("appointmentRequired")
+            if isinstance(resource.get("appointmentRequired"), bool)
+            else None,
             "location_refs": _references(resource.get("location")),
             "endpoint_refs": _references(resource.get("endpoint")),
             "telecom": _telecom(resource),
             "coverage_area_refs": _references(resource.get("coverageArea")),
+            "available_time": [
+                item
+                for item in resource.get("availableTime") or []
+                if isinstance(item, dict)
+            ],
+            "not_available": [
+                item
+                for item in resource.get("notAvailable") or []
+                if isinstance(item, dict)
+            ],
+            "availability_exceptions": _profile_text(
+                resource.get("availabilityExceptions")
+            ),
+            "extra_details": _profile_text(resource.get("extraDetails")),
+            "photos": _normalized_photo_metadata(resource.get("photo")),
         }
         return ProviderDirectoryHealthcareService, row
     if resource_type == "OrganizationAffiliation":

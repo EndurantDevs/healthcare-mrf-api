@@ -5564,8 +5564,81 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
         {
             "resourceType": "Practitioner",
             "id": "prac-1",
-            "identifier": [{"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"}],
-            "name": [{"family": "Rivera", "given": ["Alex"]}],
+            "identifier": [
+                {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"},
+                {
+                    "system": "https://example.test/license",
+                    "value": "IL-1234",
+                },
+            ],
+            "name": [
+                {
+                    "use": "official",
+                    "family": "Rivera",
+                    "given": ["Alex", "Morgan"],
+                    "prefix": ["Dr."],
+                    "suffix": ["MD"],
+                }
+            ],
+            "gender": "female",
+            "birthDate": "1970-01-01",
+            "address": [
+                {
+                    "use": "work",
+                    "line": ["100 Main St", "Suite 2"],
+                    "city": "Chicago",
+                    "state": "IL",
+                    "postalCode": "60601",
+                }
+            ],
+            "qualification": [
+                {
+                    "identifier": [
+                        {
+                            "system": "https://example.test/license",
+                            "value": "IL-1234",
+                        }
+                    ],
+                    "code": {
+                        "coding": [
+                            {
+                                "system": "http://terminology.hl7.org/CodeSystem/v2-0360",
+                                "code": "MD",
+                                "display": "Doctor of Medicine",
+                            }
+                        ]
+                    },
+                    "period": {"start": "2001-01-01"},
+                    "issuer": {
+                        "reference": "Organization/medical-school-1",
+                        "display": "Example Medical School",
+                    },
+                }
+            ],
+            "communication": [
+                {
+                    "coding": [
+                        {
+                            "system": "urn:ietf:bcp:47",
+                            "code": "es",
+                            "display": "Spanish",
+                        }
+                    ],
+                    "text": "Spanish",
+                }
+            ],
+            "photo": [
+                {
+                    "contentType": "image/jpeg",
+                    "url": "https://images.example.test/practitioner/prac-1.jpg",
+                    "data": "must-not-be-retained",
+                    "title": "Portrait",
+                },
+                {
+                    "contentType": "image/jpeg",
+                    "url": "https://images.example.test/private.jpg?token=secret",
+                },
+            ],
         },
     )
     location_model, location_row = importer.parse_fhir_resource(
@@ -5662,6 +5735,21 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert practitioner_model is ProviderDirectoryPractitioner
     assert practitioner_row["npi"] == 1234567893
     assert practitioner_row["family_name"] == "Rivera"
+    assert practitioner_row["administrative_gender"] == "female"
+    assert practitioner_row["names"][0]["prefix"] == ["Dr."]
+    assert practitioner_row["addresses"][0]["postal_code"] == "60601"
+    assert practitioner_row["qualifications"][0]["issuer_display"] == "Example Medical School"
+    assert practitioner_row["communications"][0]["codes"][0]["code"] == "es"
+    assert practitioner_row["photos"] == [
+        {
+            "content_type": "image/jpeg",
+            "url": "https://images.example.test/practitioner/prac-1.jpg",
+            "title": "Portrait",
+        },
+        {"content_type": "image/jpeg"},
+    ]
+    assert "birth_date" not in practitioner_row
+    assert "data" not in json.dumps(practitioner_row["photos"])
     assert location_model is ProviderDirectoryLocation
     assert location_row["zip5"] == "60601"
     assert location_row["state_code"] == "IL"
@@ -5813,6 +5901,57 @@ def test_healthcare_service_preserves_controlled_plan_net_context_in_artifact_pa
     assert canonical_artifacts[0]["payload_json"]["npi"] == 1588616783
     assert dataset_artifacts[0]["payload_json"] == importer._canonical_resource_payload(parsed_row)
     assert dataset_artifacts[0]["payload_json"]["accepting_patients"] == expected_accepting_patients
+
+
+def test_healthcare_service_preserves_reviewed_profile_context():
+    parsed_model, parsed_row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "HealthcareService",
+            "id": "service-profile-1",
+            "program": [{"text": "Diabetes education"}],
+            "characteristic": [{"text": "Wheelchair accessible"}],
+            "communication": [
+                {
+                    "coding": [
+                        {"system": "urn:ietf:bcp:47", "code": "en"}
+                    ]
+                }
+            ],
+            "referralMethod": [{"text": "Phone"}],
+            "serviceProvisionCode": [{"text": "No referral required"}],
+            "eligibility": [
+                {"code": {"text": "Adults"}, "comment": "Age 18 and older"}
+            ],
+            "appointmentRequired": True,
+            "availableTime": [{"daysOfWeek": ["mon"], "allDay": True}],
+            "notAvailable": [
+                {"description": "Holiday", "during": {"start": "2026-12-25"}}
+            ],
+            "availabilityExceptions": "Closed on federal holidays",
+            "extraDetails": "Call the office before arrival.",
+            "photo": [
+                {
+                    "contentType": "image/png",
+                    "url": "https://images.example.test/services/1.png",
+                }
+            ],
+        },
+    )
+
+    assert parsed_model is ProviderDirectoryHealthcareService
+    assert parsed_row["program_codes"] == [{"text": "Diabetes education"}]
+    assert parsed_row["characteristic_codes"] == [
+        {"text": "Wheelchair accessible"}
+    ]
+    assert parsed_row["communication_codes"][0]["code"] == "en"
+    assert parsed_row["appointment_required"] is True
+    assert parsed_row["eligibility"] == [
+        {"code_codes": [{"text": "Adults"}], "comment": "Age 18 and older"}
+    ]
+    assert parsed_row["available_time"][0]["daysOfWeek"] == ["mon"]
+    assert parsed_row["availability_exceptions"] == "Closed on federal holidays"
+    assert parsed_row["photos"][0]["url"].endswith("/services/1.png")
 
 
 def test_healthcare_service_discards_unrecognized_new_patient_extensions_and_codes():
