@@ -5,6 +5,7 @@
     "sapphire",
     "aetna_health1",
     "anthem_s3_mrf",
+    "kaiser_hawaii_monthly_toc",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
     "mymedicalshopper_talon_bounded",
@@ -81,7 +82,15 @@
       "type": "anthem_s3_mrf",
       "script_path": "/machine-readable-file/search/script.js",
       "month_offsets": [0, -1],
-      "max_bytes": 1048576
+      "max_bytes": 1048576,
+      "max_targets": 1000
+    },
+    "kaiser_hawaii_monthly_toc": {
+      "type": "monthly_toc_templates",
+      "base_url": "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/",
+      "file_templates": ["{month_start}_KFHP-HI_index.json"],
+      "month_offsets": [0, -1],
+      "toc_max_bytes": 5242880
     },
     "hcsc_asomrf_landing": {
       "type": "hcsc_asomrf_landing",

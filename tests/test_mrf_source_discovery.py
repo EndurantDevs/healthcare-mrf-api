@@ -121,6 +121,10 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["sapphire"]["max_static_queries"] == 8
     assert config["platform_resolvers"]["anthem_s3_mrf"]["type"] == "anthem_s3_mrf"
     assert (
+        config["platform_resolvers"]["kaiser_hawaii_monthly_toc"]["type"]
+        == "monthly_toc_templates"
+    )
+    assert (
         config["platform_resolvers"]["hcsc_asomrf_landing"]["type"]
         == "hcsc_asomrf_landing"
     )
@@ -375,6 +379,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://www.anthem.com/machine-readable-file/search/"
         )
         == "anthem_s3_mrf"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable"
+        )
+        == "kaiser_hawaii_monthly_toc"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -1564,6 +1574,61 @@ async def test_private_query_context_expands_supported_public_sources(
         entity_types=(),
         payer_query="Example Packaging",
     )
+
+
+def test_private_context_preserves_employer_and_carrier_evidence(
+    tmp_path, monkeypatch
+):
+    private_path = tmp_path / "private-context.csv"
+    private_path.write_text(
+        (
+            "EMPLOYER_NAME,EMPLOYER_ALIASES,EIN,ERISA_PLAN_NUMBER,"
+            "MEDICAL_CARRIERS,MEDICAL_POLICY_NUMBERS,"
+            "MEDICAL_CARRIER_REGIONS,MEDICAL_LOOKUP_TYPES,"
+            "EVIDENCE_PLAN_YEAR,CURRENT_VERIFICATION_STATUS\n"
+            '"Example Employer LLC","Example Employer; Example Holdings",'
+            '"12-3456789","501","Example Blue; Example Regional Health",'
+            '"POLICY-A; POLICY-B","California; Hawaii",'
+            '"employer_ein; regional_toc","2023",'
+            '"historical_current_unconfirmed"\n'
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_path)
+    )
+
+    entries = [
+        entry
+        for entry in discovery._private_query_context_entries()
+        if entry["target_payer_query"] == "Example Employer LLC"
+    ]
+
+    assert [entry["carrier_query"] for entry in entries] == [
+        "Example Blue",
+        "Example Regional Health",
+    ]
+    assert [
+        entry["private_context_carrier_policy_number"] for entry in entries
+    ] == ["POLICY-A", "POLICY-B"]
+    assert [entry["private_context_carrier_region"] for entry in entries] == [
+        "California",
+        "Hawaii",
+    ]
+    assert [entry["private_context_lookup_type"] for entry in entries] == [
+        "employer_ein",
+        "regional_toc",
+    ]
+    assert entries[0]["private_context_employer_ein"] == "12-3456789"
+    assert entries[0]["private_context_erisa_plan_number"] == "501"
+    assert entries[0]["private_context_evidence_plan_year"] == "2023"
+    assert entries[0]["private_context_current_verification_status"] == (
+        "historical_current_unconfirmed"
+    )
+    assert entries[0]["private_context_employer_aliases"] == [
+        "Example Employer",
+        "Example Holdings",
+    ]
 
 
 def _write_private_context_config(
@@ -7141,6 +7206,7 @@ def test_auxiant_directory_parser_extracts_data_available_networks():
 
 
 def test_auxiant_page_link_parser_extracts_external_and_direct_files():
+    """Verify Auxiant pages yield delegated and directly hosted MRF targets."""
     html = """
     <div class="entry-content">
       <p><a href="https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&amp;brandCode=ASA/machine-readable-transparency-in-coverage">Aetna hosted files</a></p>
@@ -7153,7 +7219,6 @@ def test_auxiant_page_link_parser_extracts_external_and_direct_files():
       <p><a href="https://transparency.auxiant.com/directory-of-data-sources/">Return to list of networks...</a></p>
     </div><!-- .entry-content -->
     """
-
     links = discovery._parse_auxiant_page_links(
         html, base_url="https://transparency.auxiant.com/healthsmart/"
     )
@@ -11198,6 +11263,7 @@ def test_parse_sapphire_static_query_toc_links_recurses_gatsby_nodes():
 
 @pytest.mark.asyncio
 async def test_sapphire_resolver_falls_back_to_gatsby_static_queries(monkeypatch):
+    """Verify Sapphire resolution uses bounded Gatsby queries after API failure."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -11232,7 +11298,6 @@ async def test_sapphire_resolver_falls_back_to_gatsby_static_queries(monkeypatch
         "https://healthcomp.sapphiremrfhub.com/page-data/index/page-data.json": page_data,
         "https://healthcomp.sapphiremrfhub.com/page-data/sq/d/254433488.json": static_query,
     }
-
     async def fake_fetch_text(url, **_kwargs):
         return html_by_url[url]
 
@@ -13358,6 +13423,118 @@ def test_anthem_s3_script_parsing_builds_current_month_targets():
     assert targets[0].metadata["month_start"] == "2026-06-01"
 
 
+def _example_anthem_employer_source_row() -> dict[str, object]:
+    return {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Anthem",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Employer LLC",
+                "private_context_employer_name": "Example Employer LLC",
+                "private_context_employer_aliases": [
+                    "Example Employer",
+                    "Example Holdings",
+                ],
+                "private_context_employer_ein": "12-3456789",
+                "private_context_erisa_plan_number": "501",
+                "private_context_carrier_policy_number": "POLICY-A",
+                "private_context_evidence_plan_year": "2023",
+                "private_context_current_verification_status": (
+                    "historical_current_unconfirmed"
+                ),
+            }
+        },
+    }
+
+
+def _example_anthem_employer_result() -> dict[str, object]:
+    return {
+        "lastupdated": "2026-07-01",
+        "In-Network Negotiated Rates Files": [
+            {
+                "url": "https://files.example.test/employer-in-network.json.gz",
+                "displayname": "employer-in-network.json.gz",
+            }
+        ],
+        "Out-of-Network Allowed Amounts Files": [
+            {
+                "url": "https://files.example.test/employer-allowed.json.gz",
+                "displayname": "employer-allowed.json.gz",
+            }
+        ],
+    }
+
+
+def test_anthem_employer_result_builds_importable_company_targets():
+    crawl_targets = discovery._anthem_s3_employer_targets(
+        _example_anthem_employer_source_row(),
+        _example_anthem_employer_result(),
+        lookup_url="https://files.example.test/anthem/123456789.json",
+        resolver_by_key={"max_targets": 10},
+        source_url="https://www.anthem.com/ca/machine-readable-file/search/",
+    )
+
+    assert [
+        crawl_target.metadata["target_file_type"]
+        for crawl_target in crawl_targets
+    ] == [
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert crawl_targets[0].metadata["employer_name"] == "Example Employer LLC"
+    assert crawl_targets[0].metadata["aliases"] == [
+        "Example Employer",
+        "Example Holdings",
+    ]
+    assert crawl_targets[0].metadata["ein"] == "12-3456789"
+    assert crawl_targets[0].metadata["carrier_policy_number"] == "POLICY-A"
+    assert crawl_targets[0].metadata["plan_info"] == [
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_name": "Example Employer LLC",
+            "plan_sponsor_name": "Example Employer LLC",
+            "issuer_name": "Anthem",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anthem_missing_employer_result_does_not_fallback_to_national_toc(
+    monkeypatch,
+):
+    fetch_json = AsyncMock()
+    monkeypatch.setattr(
+        discovery,
+        "_head_url",
+        AsyncMock(
+            return_value={
+                "status": "http_error",
+                "http_status": 403,
+            }
+        ),
+    )
+    monkeypatch.setattr(discovery, "_fetch_json", fetch_json)
+
+    with pytest.raises(
+        ValueError,
+        match="no current Anthem employer MRF result for EIN 12-3456789",
+    ):
+        await discovery._resolve_anthem_s3_employer_files(
+            {"source_id": "source_1"},
+            base_url="https://files.example.test/",
+            prefix="anthem",
+            employer_ein="12-3456789",
+            resolver_by_key={},
+            source_url="https://www.anthem.com/ca/machine-readable-file/search/",
+            session=None,
+        )
+
+    fetch_json.assert_not_awaited()
+
+
 def test_fetch_text_decode_response_body_handles_raw_gzip_json():
     payload = discovery._decode_response_body(gzip.compress(b'{"ok": true}'))
 
@@ -13712,6 +13889,35 @@ def test_monthly_toc_templates_generate_current_and_previous_month_targets():
     assert targets[0].metadata["month_start"] == "2026-06-01"
 
 
+def test_kaiser_hawaii_monthly_toc_uses_official_regional_indexes():
+    source_by_field = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Kaiser Foundation Health Plan of Hawaii",
+    }
+    resolver = discovery._source_config()["platform_resolvers"][
+        "kaiser_hawaii_monthly_toc"
+    ]
+
+    targets = discovery._monthly_toc_targets(
+        source_by_field,
+        "https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable",
+        resolver,
+        now=discovery.dt.datetime(2026, 7, 13, 12, 0, 0),
+    )
+
+    assert [target.url for target in targets] == [
+        "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/"
+        "2026-07-01_KFHP-HI_index.json",
+        "https://healthy.kaiserpermanente.org/pricing/innetwork/hi/"
+        "2026-06-01_KFHP-HI_index.json",
+    ]
+    assert all(
+        target.metadata["target_file_type"] == "table-of-contents"
+        for target in targets
+    )
+
+
 def test_bcbsmn_monthly_toc_template_generates_public_index_targets():
     source = {
         "source_id": "source_1",
@@ -13836,7 +14042,6 @@ def test_azure_mrf_listing_targets_from_xml_extracts_toc_metadata():
       </Blobs>
     </EnumerationResults>
     """
-
     targets = discovery._azure_mrf_listing_targets_from_xml(
         source,
         xml,
@@ -13856,6 +14061,7 @@ def test_azure_mrf_listing_targets_from_xml_extracts_toc_metadata():
 
 
 def test_azure_mrf_listing_targets_from_xml_extracts_hostedjson_files():
+    """Verify Azure XML listings expose hosted JSON MRF targets."""
     source = {
         "source_id": "source_1",
         "payer_id": "payer_1",
@@ -13912,8 +14118,7 @@ def test_azure_mrf_listing_targets_from_xml_extracts_hostedjson_files():
     )
 
     assert [target.metadata["target_file_type"] for target in direct_only_targets] == [
-        "in-network",
-        "allowed-amounts",
+        "in-network", "allowed-amounts"
     ]
 
 

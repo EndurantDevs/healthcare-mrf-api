@@ -432,9 +432,11 @@ def _private_query_context_rows() -> list[dict[str, str]]:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
-                rows.append(
-                    {key: str(value or "").strip() for key, value in row.items()}
-                )
+                context_by_field = {
+                    key: str(value or "").strip() for key, value in row.items()
+                }
+                context_by_field["_query_context_scope"] = "private"
+                rows.append(context_by_field)
     return rows
 
 
@@ -464,6 +466,88 @@ def _split_private_query_carrier_cell(value: Any) -> list[str]:
     ]
 
 
+def _private_query_context_list(row: dict[str, str], *keys: str) -> list[str]:
+    return _split_private_query_carrier_cell(_row_value_ci(row, *keys))
+
+
+def _private_query_context_value_at(values: list[str], index: int) -> str | None:
+    if not values:
+        return None
+    if index < len(values):
+        return values[index]
+    if len(values) == 1:
+        return values[0]
+    return None
+
+
+def _private_query_employer_metadata(
+    row: dict[str, str], query: str
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "private_context_employer_name": query,
+        "private_context_scope": _row_value_ci(row, "_query_context_scope")
+        or "private",
+    }
+    aliases = _private_query_context_list(
+        row, "employer_aliases", "aliases", "company_aliases"
+    )
+    optional_metadata_by_key = {
+        "private_context_employer_aliases": aliases,
+        "private_context_employer_ein": _row_value_ci(row, "ein", "employer_ein"),
+        "private_context_erisa_plan_number": _row_value_ci(
+            row, "erisa_plan_number", "plan_number"
+        ),
+        "private_context_evidence_plan_year": _row_value_ci(
+            row, "evidence_plan_year", "plan_year"
+        ),
+        "private_context_current_verification_status": _row_value_ci(
+            row, "current_verification_status", "verification_status"
+        ),
+    }
+    for key, metadata_value in optional_metadata_by_key.items():
+        if metadata_value not in (None, "", []):
+            metadata[key] = metadata_value
+    return metadata
+
+
+def _private_query_carrier_metadata(
+    context_by_field: dict[str, str], benefit_line: str, carrier_index: int
+) -> dict[str, str]:
+    policy_numbers = _private_query_context_list(
+        context_by_field,
+        f"{benefit_line}_policy_numbers",
+        f"{benefit_line}_policy_number",
+        f"{benefit_line}_contract_numbers",
+        f"{benefit_line}_contract_number",
+    )
+    regions = _private_query_context_list(
+        context_by_field,
+        f"{benefit_line}_carrier_regions",
+        f"{benefit_line}_regions",
+    )
+    lookup_types = _private_query_context_list(
+        context_by_field,
+        f"{benefit_line}_lookup_types",
+        f"{benefit_line}_lookup_type",
+    )
+    metadata_by_key = {
+        "private_context_carrier_policy_number": (
+            _private_query_context_value_at(policy_numbers, carrier_index)
+        ),
+        "private_context_carrier_region": (
+            _private_query_context_value_at(regions, carrier_index)
+        ),
+        "private_context_lookup_type": (
+            _private_query_context_value_at(lookup_types, carrier_index)
+        ),
+    }
+    return {
+        key: metadata_value
+        for key, metadata_value in metadata_by_key.items()
+        if metadata_value not in (None, "")
+    }
+
+
 _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("medical", ("medical_carriers", "medical_carrier", "medical")),
     ("dental", ("dental_carriers", "dental_carrier", "dental")),
@@ -471,8 +555,8 @@ _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def _private_query_context_entries() -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
+def _private_query_context_entries() -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
     for row in _private_query_context_rows():
         query = _clean_text(
             _row_value_ci(
@@ -486,23 +570,27 @@ def _private_query_context_entries() -> list[dict[str, str]]:
         )
         if not query:
             continue
+        employer_metadata = _private_query_employer_metadata(row, query)
         for line, columns in _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS:
             carriers: list[str] = []
             for column in columns:
                 carriers.extend(
                     _split_private_query_carrier_cell(_row_value_ci(row, column))
                 )
-            for carrier in carriers:
+            for index, carrier in enumerate(carriers):
                 carrier_query = _clean_text(carrier)
                 if not carrier_query:
                     continue
-                entries.append(
-                    {
-                        "target_payer_query": query,
-                        "carrier_query": carrier_query,
-                        "benefit_line": line,
-                    }
+                context_by_field: dict[str, Any] = {
+                    "target_payer_query": query,
+                    "carrier_query": carrier_query,
+                    "benefit_line": line,
+                    **employer_metadata,
+                }
+                context_by_field.update(
+                    _private_query_carrier_metadata(row, line, index)
                 )
+                entries.append(context_by_field)
     return entries
 
 
@@ -519,7 +607,7 @@ def _candidate_supports_benefit_line(
 
 
 def _candidate_private_query_context_key(
-    candidate: SourceCandidate, entry: dict[str, str]
+    candidate: SourceCandidate, entry: dict[str, Any]
 ) -> tuple[str, str | None, str, str, str]:
     return (
         _clean_text(candidate.payer_name).lower(),
@@ -540,7 +628,7 @@ def _private_query_context_limit() -> int:
         return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
 
 
-def _private_context_candidate_match_cache_key(entry: dict[str, str]) -> tuple[str, str]:
+def _private_context_candidate_match_cache_key(entry: dict[str, Any]) -> tuple[str, str]:
     return (
         _clean_text(entry.get("benefit_line")).lower(),
         _clean_text(entry.get("carrier_query")).lower(),
@@ -586,11 +674,17 @@ def _private_query_expanded_candidates(
             expanded_candidate = _candidate_with_target_payer_query(
                 candidate, entry["target_payer_query"]
             )
+            context_metadata_by_key = {
+                key: metadata_value
+                for key, metadata_value in entry.items()
+                if key not in {"target_payer_query", "carrier_query", "benefit_line"}
+            }
             expanded.append(
                 replace(
                     expanded_candidate,
                     raw_payload={
                         **dict(expanded_candidate.raw_payload or {}),
+                        **context_metadata_by_key,
                         "private_query_context": True,
                         "private_context_benefit_line": entry["benefit_line"],
                         "private_context_carrier_query": entry["carrier_query"],
@@ -1103,6 +1197,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         )
     ):
         return "point32_azure_mrf_directory"
+    if (
+        host == "healthy.kaiserpermanente.org"
+        and path == "/hawaii/front-door/machine-readable"
+    ):
+        return "kaiser_hawaii_monthly_toc"
     if (
         (host in {"www.pbaclaims.com", "pbaclaims.com"} and path.startswith("/mrfs"))
         or (
@@ -5892,6 +5991,30 @@ async def _resolve_healthgram_network_index(
     return targets
 
 
+async def _resolve_anthem_s3_context_files(
+    source_row: dict[str, Any],
+    resolver_by_key: dict[str, Any],
+    toc_patterns: list[tuple[str, str, str]],
+    base_url: str,
+    source_url: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget] | None:
+    employer_ein = _source_private_context_text(
+        source_row, "private_context_employer_ein"
+    )
+    if not employer_ein:
+        return None
+    return await _resolve_anthem_s3_employer_files(
+        source_row,
+        base_url=base_url,
+        prefix=toc_patterns[0][0] if toc_patterns else "anthem",
+        employer_ein=employer_ein,
+        resolver_by_key=resolver_by_key,
+        source_url=source_url,
+        session=session,
+    )
+
+
 async def _resolve_anthem_s3_mrf(
     source: dict[str, Any],
     url: str,
@@ -5931,10 +6054,16 @@ async def _resolve_anthem_s3_mrf(
             break
     if not bases:
         bases = ["https://antm-pt-prod-dataz-nogbd-nophi-us-east1.s3.amazonaws.com/"]
+    patterns = _anthem_s3_toc_patterns_from_script(script_text, source_url=url)
+    context_targets = await _resolve_anthem_s3_context_files(
+        source, resolver, patterns, bases[0], url, session
+    )
+    if context_targets is not None:
+        return context_targets
     targets = _anthem_s3_toc_targets(
         source,
         bases[0],
-        _anthem_s3_toc_patterns_from_script(script_text, source_url=url),
+        patterns,
         resolver,
         source_url=url,
     )
@@ -9112,6 +9241,153 @@ def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[
         seen.add(key)
         urls.append(url)
     return urls
+
+
+def _source_private_context_text(source: dict[str, Any], key: str) -> str:
+    metadata = dict((source or {}).get("metadata_json") or {})
+    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    return _clean_text(metadata.get(key) or raw.get(key))
+
+
+def _anthem_s3_employer_file_type(section_name: str) -> str | None:
+    normalized = _clean_text(section_name).lower()
+    if "out-of-network" in normalized or "allowed amount" in normalized:
+        return "allowed-amounts"
+    if "in-network" in normalized or "out-of-area" in normalized:
+        return "in-network"
+    return None
+
+
+def _anthem_s3_employer_identity(
+    source_row: dict[str, Any],
+) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
+    context_by_key = _import_control_source_context_metadata(source_row)
+    employer_name = _clean_text(
+        context_by_key.get("employer_name")
+        or _source_target_payer_query(source_row)
+        or source_row.get("display_name")
+    )
+    employer_ein = _clean_text(
+        context_by_key.get("ein")
+        or _source_private_context_text(
+            source_row, "private_context_employer_ein"
+        )
+    )
+    plan_id = "".join(character for character in employer_ein if character.isdigit())
+    plan_records = [
+        {
+            "plan_id": plan_id or None,
+            "plan_id_type": "ein" if plan_id else None,
+            "plan_market_type": "group",
+            "plan_name": employer_name,
+            "plan_sponsor_name": employer_name,
+            "issuer_name": source_row.get("display_name"),
+        }
+    ]
+    return context_by_key, employer_name, employer_ein, plan_records
+
+
+def _anthem_s3_employer_targets(
+    source_row: dict[str, Any],
+    employer_result: dict[str, Any],
+    *,
+    lookup_url: str,
+    resolver_by_key: dict[str, Any],
+    source_url: str,
+) -> list[CrawlTarget]:
+    """Build employer-scoped MRF targets from an Anthem EIN lookup result."""
+    context_by_key, employer_name, employer_ein, plan_records = (
+        _anthem_s3_employer_identity(source_row)
+    )
+    max_targets = _as_int(resolver_by_key.get("max_targets")) or 1000
+    crawl_targets: list[CrawlTarget] = []
+    seen_urls: set[str] = set()
+    for section_name, raw_items in employer_result.items():
+        file_type = _anthem_s3_employer_file_type(str(section_name))
+        if not file_type or not isinstance(raw_items, list):
+            continue
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            target_url = str(raw_item.get("url") or "").strip()
+            if not target_url:
+                continue
+            key = _canonical_or_none(target_url) or target_url
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            label = _clean_text(raw_item.get("displayname")) or Path(
+                urlsplit(target_url).path
+            ).name
+            crawl_targets.append(
+                CrawlTarget(
+                    source=source_row,
+                    url=target_url,
+                    label=label or employer_name,
+                    resolved_from_url=lookup_url,
+                    metadata={
+                        "resolver": "anthem_s3_employer_ein",
+                        "target_kind": "file_reference",
+                        "target_file_type": file_type,
+                        "container_format": _container_format(target_url),
+                        "anthem_employer_lookup_url": lookup_url,
+                        "anthem_landing_url": source_url,
+                        "anthem_result_section": section_name,
+                        "anthem_last_updated": employer_result.get("lastupdated"),
+                        "company_name": employer_name,
+                        "employer_name": employer_name,
+                        "ein": employer_ein,
+                        "plan_info": plan_records,
+                        **context_by_key,
+                    },
+                )
+            )
+            if len(crawl_targets) >= max_targets:
+                return crawl_targets
+    return crawl_targets
+
+
+async def _resolve_anthem_s3_employer_files(
+    source_row: dict[str, Any],
+    *,
+    base_url: str,
+    prefix: str,
+    employer_ein: str,
+    resolver_by_key: dict[str, Any],
+    source_url: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    ein_digits = "".join(
+        character for character in employer_ein if character.isdigit()
+    )
+    if len(ein_digits) != 9:
+        raise ValueError(f"invalid Anthem employer EIN: {employer_ein!r}")
+    lookup_url = urljoin(
+        base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{ein_digits}.json"
+    )
+    head = await _head_url(lookup_url, session)
+    if head.get("status") == "http_error":
+        raise ValueError(
+            "no current Anthem employer MRF result for EIN "
+            f"{employer_ein} (HTTP {head.get('http_status')})"
+        )
+    employer_result = await _fetch_json(
+        lookup_url,
+        max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
+        session=session,
+    )
+    crawl_targets = _anthem_s3_employer_targets(
+        source_row,
+        employer_result,
+        lookup_url=lookup_url,
+        resolver_by_key=resolver_by_key,
+        source_url=source_url,
+    )
+    if not crawl_targets:
+        raise ValueError(
+            f"Anthem employer MRF result for EIN {employer_ein} has no file links"
+        )
+    return crawl_targets
 
 
 def _anthem_s3_status_urls_from_script(script_text: str) -> list[str]:
@@ -13765,23 +14041,41 @@ def _import_control_seed_metadata(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _import_control_source_context_metadata(row: dict[str, Any]) -> dict[str, Any]:
-    metadata = row.get("metadata_json") or {}
+def _import_control_source_context_metadata(
+    source_row: dict[str, Any]
+) -> dict[str, Any]:
+    metadata = source_row.get("metadata_json") or {}
     raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
     context_metadata_by_key: dict[str, Any] = {}
-    for key in (
-        "target_payer_query",
-        "private_query_context",
-        "private_context_benefit_line",
-        "private_context_carrier_query",
-    ):
-        value = metadata.get(key)
-        if value is None:
-            value = raw.get(key)
-        if isinstance(value, str):
-            value = _clean_text(value)
-        if value not in (None, ""):
-            context_metadata_by_key[key] = value
+    key_mapping = {
+        "target_payer_query": "target_payer_query",
+        "private_query_context": "private_query_context",
+        "private_context_benefit_line": "private_context_benefit_line",
+        "private_context_carrier_query": "private_context_carrier_query",
+        "private_context_employer_name": "employer_name",
+        "private_context_employer_aliases": "employer_aliases",
+        "private_context_employer_ein": "ein",
+        "private_context_erisa_plan_number": "erisa_plan_number",
+        "private_context_carrier_policy_number": "carrier_policy_number",
+        "private_context_carrier_region": "region",
+        "private_context_lookup_type": "lookup_type",
+        "private_context_evidence_plan_year": "evidence_plan_year",
+        "private_context_current_verification_status": (
+            "current_verification_status"
+        ),
+        "private_context_scope": "query_context_scope",
+    }
+    for source_key, output_key in key_mapping.items():
+        context_value = metadata.get(source_key)
+        if context_value is None:
+            context_value = raw.get(source_key)
+        if isinstance(context_value, str):
+            context_value = _clean_text(context_value)
+        if context_value not in (None, ""):
+            context_metadata_by_key[output_key] = context_value
+    employer_aliases = context_metadata_by_key.get("employer_aliases")
+    if employer_aliases:
+        context_metadata_by_key["aliases"] = employer_aliases
     return context_metadata_by_key
 
 

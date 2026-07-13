@@ -2216,13 +2216,13 @@ def test_ptg2_toc_parser_applies_plan_predicate_before_file_expansion(monkeypatc
                 "reporting_plans": [
                     {
                         "plan_name": "OAP",
-                        "plan_id": "831960637",
-                        "plan_sponsor_name": "OpenAI OpCo, LLC",
+                        "plan_id": "222222222",
+                        "plan_sponsor_name": "Example Target Employer",
                         "plan_market_type": "group",
                     }
                 ],
                 "in_network_files": [
-                    {"location": "https://cdn.test/openai-rates.json.gz"}
+                    {"location": "https://cdn.test/target-rates.json.gz"}
                 ],
             },
         ],
@@ -2243,13 +2243,14 @@ def test_ptg2_toc_parser_applies_plan_predicate_before_file_expansion(monkeypatc
     entries = process_ptg.parse_toc_catalog_entries(
         toc_payload_dict,
         "https://payer.test/toc.json",
-        plan_predicate=lambda plan: "openai" in plan["plan_sponsor_name"].lower(),
+        plan_predicate=lambda plan: "target employer"
+        in plan["plan_sponsor_name"].lower(),
     )
 
     in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
-    assert expanded_locations == ["https://cdn.test/openai-rates.json.gz"]
+    assert expanded_locations == ["https://cdn.test/target-rates.json.gz"]
     assert [entry.original_url for entry in in_network_entries] == [
-        "https://cdn.test/openai-rates.json.gz"
+        "https://cdn.test/target-rates.json.gz"
     ]
 
 

@@ -1018,6 +1018,7 @@ class ResourceFetchResult:
 
     @property
     def bounded(self) -> bool:
+        """Return a fetch result constrained to the requested row limit."""
         return (
             self.row_limit_reached
             or self.page_limit_reached
@@ -2334,6 +2335,7 @@ def _candidate_base_urls(source: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
 
     def add(raw_url: str | None) -> None:
+        """Add one normalized candidate base URL without duplicates."""
         api_base = _canonical_base(raw_url)
         if not api_base:
             return
@@ -3864,6 +3866,7 @@ def _oauth2_cache_key(oauth2: dict[str, Any]) -> str:
 
 
 def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeout: int = 15) -> str | None:
+    """Fetch oauth2 client credentials token sync for provider-directory ingestion."""
     token_url = _resolve_secret_text(oauth2.get("token_url") or oauth2.get("tokenUrl"))
     client_id = _resolve_secret_text(oauth2.get("client_id") or oauth2.get("clientId"))
     client_secret = _resolve_secret_text(oauth2.get("client_secret") or oauth2.get("clientSecret"))
@@ -4966,6 +4969,7 @@ def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | N
 
 
 def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
+    """Run the source row from seed step within provider-directory ingestion."""
     now = _now()
     api_base = _clean_text(row.get("api_base"))
     canonical_api_base = _canonical_base(api_base)
@@ -6110,6 +6114,7 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_capability(source: dict[str, Any], payload: dict[str, Any], probe: dict[str, Any]) -> dict[str, Any]:
+    """Parse capability into normalized provider-directory records."""
     rest_resources: list[str] = []
     search_params: dict[str, list[str]] = {}
     for rest in payload.get("rest") or []:
@@ -6187,6 +6192,7 @@ def parse_fhir_resource(
     run_id: str | None = None,
     normalize_location_contacts: bool = True,
 ) -> tuple[type, dict[str, Any]] | None:
+    """Parse fhir resource into normalized provider-directory records."""
     resource_type = resource.get("resourceType")
     base = _fhir_resource_base_fields(
         source_id,
@@ -7046,10 +7052,12 @@ def provider_directory_address_corroboration_sql(
 
 
 async def publish_provider_directory_address_corroboration_view(db_schema: str | None = None) -> None:
+    """Publish provider directory address corroboration view for provider-directory serving."""
     await db.status(provider_directory_address_corroboration_sql(db_schema))
 
 
 def provider_directory_address_corroboration_select_sql(db_schema: str | None = None) -> str:
+    """Build SQL for provider directory address corroboration select."""
     sql = provider_directory_address_corroboration_sql(db_schema)
     marker = " AS\n"
     if marker not in sql:
@@ -7909,12 +7917,12 @@ async def publish_provider_directory_address_corroboration_table(
     defer_cutover: bool = False,
     network_catalog_metrics_override: dict[str, Any] | None = None,
 ) -> Any:
+    """Publish provider directory address corroboration table for provider-directory serving."""
     schema = db_schema or _schema()
     relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
     effective_source_ids = _clean_source_id_list(source_ids)
     network_catalog_metrics = await _address_corroboration_network_metrics(
-        schema,
-        effective_source_ids,
+        schema, effective_source_ids,
         refresh_network_catalog=refresh_network_catalog,
         metrics_override=network_catalog_metrics_override,
     )
@@ -9690,6 +9698,7 @@ async def publish_provider_directory_location_address_keys(
     seen_table: str | None = None,
     batch_size: int | None = None,
 ) -> int:
+    """Publish provider directory location address keys for provider-directory serving."""
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
         return 0
@@ -10800,6 +10809,7 @@ async def _publish_provider_directory_artifacts(
     publish_corroboration: bool = False,
     publish_artifacts_targets: set[str] | None = None,
 ) -> dict[str, Any]:
+    """Publish provider directory artifacts for provider-directory serving."""
     artifact_bundle = _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get()
     effective_publish_scope_run_id = (
         run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
@@ -11021,6 +11031,7 @@ def provider_directory_location_archive_stage_sql(
     run_id: str | None = None, source_ids: list[str] | tuple[str, ...] | None = None,
     seen_table: str | None = None,
 ) -> str:
+    """Build SQL for provider directory location archive stage."""
     schema = db_schema or _schema()
     stage = stage_table or _provider_directory_location_archive_stage_table_name()
     stage_ref = _qt(schema, stage)
@@ -11244,6 +11255,7 @@ async def publish_provider_directory_location_archive(
     stage_table: str | None = None,
     seen_table: str | None = None,
 ) -> dict[str, Any]:
+    """Publish provider directory location archive for provider-directory serving."""
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
         return {"skipped": True, "reason": "canonical_functions_unavailable"}
@@ -11834,6 +11846,7 @@ async def publish_provider_directory_address_corroboration_if_available(
     refresh_network_catalog: bool = True,
     source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
+    """Publish provider directory address corroboration if available for provider-directory serving."""
     schema = db_schema or _schema()
     if not await _table_exists(schema, "entity_address_unified"):
         return False
@@ -12670,6 +12683,7 @@ async def _copy_upsert_rows(
     *,
     skip_unchanged: bool,
 ) -> int:
+    """Copy upsert rows into the destination tables."""
     table = model.__table__
     schema = table.schema or _schema()
     stage_table = _stage_table_name()
@@ -12792,6 +12806,7 @@ def _status_row_count(status: Any) -> int:
 
 
 def provider_directory_location_contact_backfill_sql(schema: str) -> str:
+    """Build SQL for provider directory location contact backfill."""
     table_ref = _qt(schema, ProviderDirectoryLocation.__tablename__)
     phone_number = _canonical_contact_number_expr("loc.telephone_number", "loc.country_code")
     phone_extension = _contact_extension_expr("loc.telephone_number")
@@ -12828,6 +12843,7 @@ def provider_directory_location_contact_backfill_sql(schema: str) -> str:
 
 
 async def backfill_provider_directory_location_contacts() -> dict[str, Any]:
+    """Backfill provider directory location contacts for existing provider-directory rows."""
     await _ensure_provider_directory_tables()
     updated = _status_row_count(await db.status(provider_directory_location_contact_backfill_sql(_schema())))
     summary = {"location_contact_rows_updated": updated}
@@ -12836,6 +12852,7 @@ async def backfill_provider_directory_location_contacts() -> dict[str, Any]:
 
 
 def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tuple[str, str]:
+    """Build SQL for canonical backfill resource."""
     schema = _schema()
     source_ref = _qt(schema, "provider_directory_source")
     resource_ref = _qt(schema, table_name)
@@ -12960,6 +12977,7 @@ async def backfill_provider_directory_canonical_resources(
     *,
     resources: str | None = None,
 ) -> dict[str, Any]:
+    """Backfill provider directory canonical resources for existing provider-directory rows."""
     await _ensure_provider_directory_tables()
     selected = _selected_resources(resources)
     summary: dict[str, Any] = {
@@ -13041,6 +13059,7 @@ class _AmeriHealthCaritasCatalogParser(HTMLParser):
         self.rows: list[tuple[list[str], list[str]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Capture catalog link metadata from an opening HTML tag."""
         if tag in {"td", "th"}:
             self._in_cell = True
             self._cell_text = []
@@ -13050,10 +13069,12 @@ class _AmeriHealthCaritasCatalogParser(HTMLParser):
                 self._row_links.append(href)
 
     def handle_data(self, data: str) -> None:
+        """Accumulate visible catalog text for the active link."""
         if self._in_cell:
             self._cell_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize the active catalog link when its HTML tag closes."""
         if tag in {"td", "th"} and self._in_cell:
             self._row.append(" ".join(" ".join(self._cell_text).split()))
             self._cell_text = []
@@ -13072,6 +13093,7 @@ class _HtmlLinkParser(HTMLParser):
         self.links: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Capture candidate URLs from an opening HTML tag."""
         if tag != "a" or self._href is not None:
             return
         href = dict(attrs).get("href")
@@ -13081,10 +13103,12 @@ class _HtmlLinkParser(HTMLParser):
         self._text = []
 
     def handle_data(self, data: str) -> None:
+        """Accumulate visible text for the active HTML link."""
         if self._href is not None:
             self._text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        """Finalize the active HTML link when its tag closes."""
         if tag != "a" or self._href is None:
             return
         self.links.append((" ".join(" ".join(self._text).split()), self._href))
@@ -13205,6 +13229,7 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
     source_query: str | None = None,
     source_url: str = CMS_SMA_ENDPOINT_DIRECTORY_URL,
 ) -> list[dict[str, Any]]:
+    """Run the cms sma endpoint directory seed rows from csv step within provider-directory ingestion."""
     rows = list(csv.reader(io.StringIO(csv_text)))
     if len(rows) < 2:
         return []
@@ -13265,6 +13290,7 @@ def _cms_sma_endpoint_directory_seed_rows_from_csv(
         groups: dict[str, dict[str, Any]] = {}
 
         def group_for(api_base: str) -> dict[str, Any]:
+            """Return the seed group bucket for one CMS endpoint row."""
             group = groups.setdefault(
                 api_base,
                 {
@@ -13656,6 +13682,7 @@ def _seed_rows_from_supplemental_catalogs(
     cms_sma_endpoint_directory_path: str | None = None,
     cms_sma_endpoint_directory_url: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build rows from supplemental catalogs used to seed provider-directory discovery."""
     rows: list[dict[str, Any]] = []
     metrics: dict[str, Any] = {"catalogs": {}}
     try:
@@ -15087,6 +15114,7 @@ async def _probe_sources(
     concurrency: int,
     run_id: str | None,
 ) -> tuple[int, int, set[str]]:
+    """Probe sources and record source capabilities."""
     semaphore = asyncio.Semaphore(max(1, min(concurrency, 10)))
     endpoint_rows: list[dict[str, Any]] = []
     capability_rows: list[dict[str, Any]] = []
@@ -15124,6 +15152,7 @@ async def _probe_sources(
             await _upsert_rows(ProviderDirectorySource, source_update_rows)
 
     async def _run_probe(source: dict[str, Any]) -> None:
+        """Probe one source while respecting the shared concurrency limit."""
         async with semaphore:
             started = time.monotonic()
             hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
@@ -17847,12 +17876,14 @@ async def _stream_bulk_export_output_rows(
     requires_access_token: bool | None = None,
     row_progress_handler: Callable[[int], Awaitable[None]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    """Stream bulk export output rows without retaining the full export in memory."""
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     stream_counts_by_name = {"rows_fetched": 0, "rows_written": 0}
     row_limit_by_name = {"reached": False}
 
     async def flush_pending_rows() -> None:
+        """Persist buffered bulk-export rows and clear the pending batch."""
         if row_batch_handler and pending_rows:
             pending_rows_list = list(pending_rows)
             pending_rows.clear()
@@ -17861,6 +17892,7 @@ async def _stream_bulk_export_output_rows(
                 await row_progress_handler(stream_counts_by_name["rows_written"])
 
     def handle_line(raw_line: bytes) -> str | None:
+        """Parse and stage one NDJSON bulk-export line."""
         line = raw_line.strip()
         if not line:
             return None
@@ -18772,6 +18804,7 @@ async def _fetch_bulk_export_resource_rows(
     row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
     retain_rows: bool = True,
 ) -> ResourceFetchResult | None:
+    """Fetch bulk export resource rows for provider-directory ingestion."""
     checkpoint_context = source.get("_pagination_checkpoint_context")
     if (
         per_resource_limit <= 0
@@ -22083,6 +22116,7 @@ async def _fetch_resource_rows(
     deadline_seconds: int = 0,
     pagination_checkpoint: PaginationCheckpointContext | None = None,
 ) -> ResourceFetchResult | None:
+    """Fetch resource rows for provider-directory ingestion."""
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
@@ -22332,6 +22366,7 @@ async def _fetch_resource_rows(
     url: str | None = None
 
     async def flush_pending_rows() -> None:
+        """Persist buffered resource rows and clear the pending batch."""
         if not row_batch_handler or not pending_rows:
             return
         pending_rows_list = list(pending_rows)
@@ -22602,6 +22637,7 @@ async def _fetch_scan_practitioner_role_rows(
     rows_by_resource: dict[str, list[dict[str, Any]]],
     options: ScanPractitionerRoleFetchOptions,
 ) -> ResourceFetchResult:
+    """Fetch scan practitioner role rows for provider-directory ingestion."""
     if options.source is None:
         options = replace(options, source=source)
     await _mark_checkpointed_reverse_lookup_roles_seen(options)
@@ -23001,6 +23037,7 @@ def _linked_resource_candidate_urls(
     reference: str | None = None,
     reference_field: str | None = None,
 ) -> list[str]:
+    """Run the linked resource candidate urls step within provider-directory ingestion."""
     urls: list[str] = []
     reference = _clean_text(reference)
     if reference:
@@ -23150,6 +23187,7 @@ async def _import_linked_resource_rows(
     flush_rows: int | None = None,
     dataset_id: str | None = None,
 ) -> dict[str, int]:
+    """Import linked resource rows into the provider-directory snapshot."""
     if per_source_limit <= 0:
         return {}
     existing = {
@@ -23195,6 +23233,7 @@ async def _import_linked_resource_rows(
     flush_threshold = max(int(flush_rows or _linked_resource_flush_rows()), 1)
 
     async def flush_pending_rows() -> None:
+        """Persist buffered linked resources and clear the pending batch."""
         if not by_model:
             return
         pending = by_model.copy()
@@ -24397,6 +24436,7 @@ async def _delete_stale_resource_rows(
     use_seen_table: bool = False,
     seen_table: str | None = None,
 ) -> int:
+    """Delete stale resource rows after a successful snapshot refresh."""
     if not run_id:
         return 0
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
@@ -27070,6 +27110,7 @@ async def _import_alohr_graphql_source_group(
     dict[str, int],
     dict[str, list[str]],
 ]:
+    """Import alohr graphql source group into the provider-directory snapshot."""
     import_state = _initialize_alohr_graphql_import_state(
         source_group,
         resource_types,
@@ -27081,6 +27122,7 @@ async def _import_alohr_graphql_source_group(
         source_id: str,
         source_item: dict[str, Any],
     ) -> None:
+        """Append one normalized provider from the GraphQL response."""
         _append_alohr_provider_rows(
             resource_rows_by_model,
             source_id,
@@ -27093,6 +27135,7 @@ async def _import_alohr_graphql_source_group(
         source_id: str,
         source_item: dict[str, Any],
     ) -> None:
+        """Append one normalized organization from the GraphQL response."""
         _append_alohr_organization_rows(
             resource_rows_by_model,
             source_id,
@@ -28521,6 +28564,7 @@ async def _import_resources(
     provider_directory_endpoint_scope: str | None = None,
     require_complete_resources: bool = False,
 ) -> dict[str, int]:
+    """Import resources into the provider-directory snapshot."""
     counts: dict[str, int] = {resource: 0 for resource in resources}
     for source_record in sources:
         _assert_resource_acquisition_allowed(source_record, resources)
@@ -28539,10 +28583,12 @@ async def _import_resources(
     progress_timer_by_name = {"next_partial_progress_at": 0.0}
 
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
+        """Merge resource counters into the aggregate import totals."""
         for key, value in source_counts.items():
             target[key] = target.get(key, 0) + value
 
     def merge_resource_stats(target: dict[str, dict[str, Any]], source_stats: dict[str, dict[str, Any]]) -> None:
+        """Merge per-resource statistics into the group summary."""
         for resource_type, entry in source_stats.items():
             target_entry = target.setdefault(resource_type, _empty_resource_stats())
             for key, value in entry.items():
@@ -28562,12 +28608,14 @@ async def _import_resources(
                 target_by_resource[resource_type] = retry_at
 
     def progress_counts_snapshot() -> dict[str, int]:
+        """Return an immutable snapshot of current import counters."""
         snapshot = dict(counts)
         for partial_counts in active_partial_counts.values():
             merge_counts(snapshot, partial_counts)
         return snapshot
 
     def active_group_snapshot() -> list[dict[str, Any]]:
+        """Return a stable snapshot of active provider-directory groups."""
         now = time.monotonic()
         groups: list[dict[str, Any]] = []
         for detail in active_group_details.values():
@@ -28590,6 +28638,7 @@ async def _import_resources(
         )
 
     async def report_progress(force: bool = False) -> None:
+        """Publish current provider-directory import progress."""
         if not progress_callback:
             return
         snapshot: dict[str, int] | None = None
@@ -28609,6 +28658,7 @@ async def _import_resources(
         resource_type: str,
         written: int,
     ) -> None:
+        """Report partial progress when the configured interval elapses."""
         if not progress_callback or written <= 0:
             return
         async with progress_lock:
@@ -28617,6 +28667,7 @@ async def _import_resources(
         await report_progress()
 
     async def clear_partial_progress(group_key: int) -> None:
+        """Clear persisted partial progress for the active source group."""
         async with progress_lock:
             active_partial_counts.pop(group_key, None)
             active_group_details.pop(group_key, None)
@@ -28624,6 +28675,7 @@ async def _import_resources(
     async def import_one_group(
         source_group: list[dict[str, Any]],
     ) -> ResourceImportGroupResult:
+        """Import, validate, and finalize one provider-directory source group."""
         if cancel_ctx is not None:
             await raise_if_cancelled(cancel_ctx, cancel_task)
         group_key = id(source_group)
@@ -28659,6 +28711,7 @@ async def _import_resources(
         scan_role_reverse_lookup_planned = _scan_practitioner_role_reverse_lookup_planned(source, resources)
 
         async def mark_resource_stale_cleanup_ready(resource_type: str, result: ResourceFetchResult) -> None:
+            """Mark one resource type ready for stale-row cleanup."""
             if not stale_cleanup or not _is_resource_fetch_complete_for_publish(result):
                 return
             if seen_stage_table:
@@ -28676,6 +28729,7 @@ async def _import_resources(
                 )
 
         def should_retry_zero_practitioner_role(result: ResourceFetchResult | None) -> bool:
+            """Return whether a zero-role result should be retried."""
             return (
                 result is not None
                 and not scan_role_reverse_lookup_planned
@@ -28760,6 +28814,7 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                """Persist a normalized row batch for the active source group."""
                 if linked_resource_limit > 0 or (
                     scan_role_reverse_lookup_planned
                     and resource_type in _practitioner_role_reverse_lookup_resources(source)
@@ -28890,6 +28945,7 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def retry_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                """Persist a retry batch for the active source group."""
                 written = await _upsert_resource_rows(
                     model,
                     _rows_for_compatibility_source(
@@ -29094,6 +29150,7 @@ async def _import_resources(
             await report_progress(force=True)
 
             async def linked_progress(resource_type: str, written: int) -> None:
+                """Report linked-resource progress for the active source group."""
                 await maybe_report_partial_progress(group_key, resource_type, written)
 
             source_linked_counts = await _import_linked_resource_rows(
@@ -29136,6 +29193,7 @@ async def _import_resources(
     async def run_with_limit(
         source_records: list[dict[str, Any]],
     ) -> ResourceImportGroupResult:
+        """Run one import coroutine under the shared concurrency limit."""
         async with semaphore:
             candidate: EndpointDatasetCandidate | None = None
             diagnostics_by_resource: dict[str, dict[str, Any]] = {}
@@ -29257,6 +29315,7 @@ async def _import_resources(
 
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
     await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
@@ -29582,6 +29641,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 counts: dict[str, int],
                 details: dict[str, Any] | None = None,
             ) -> None:
+                """Publish progress for the active provider-directory resource."""
                 metrics["resource_rows"] = counts
                 active_source_groups = (
                     details.get("active_source_groups", [])
@@ -29787,6 +29847,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
 
 
 async def startup(ctx: dict[str, Any]) -> None:
+    """Initialize provider-directory process dependencies."""
     ctx.setdefault("context", {})
     ctx["context"].setdefault("run", 0)
     ctx["context"].setdefault("start", _now())
@@ -29796,6 +29857,7 @@ async def startup(ctx: dict[str, Any]) -> None:
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    """Release provider-directory process dependencies."""
     ctx.setdefault("context", {})["finished_at"] = _now().isoformat()
 
 
@@ -29844,6 +29906,7 @@ async def main(
     concurrency: int | None = None,
     timeout: int | None = None,
 ) -> dict[str, Any]:
+    """Run the provider-directory import command."""
     ctx: dict[str, Any] = {"context": {"test_mode": test_mode}}
     await startup(ctx)
     task = {
