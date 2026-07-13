@@ -2258,6 +2258,9 @@ def _source_coverage_mode(source: dict[str, Any]) -> str | None:
     )
 
 
+PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON = "coverage_mode_probe_only"
+
+
 def _resource_acquisition_blocked_reason(source: dict[str, Any]) -> str | None:
     """Return the catalog safety reason that forbids generic resource import."""
     validation_status = (_clean_text(source.get("last_validated_status")) or "").lower()
@@ -2271,6 +2274,16 @@ def _resource_acquisition_blocked_reason(source: dict[str, Any]) -> str | None:
     if isinstance(fully_enumerable_resources, list) and not fully_enumerable_resources:
         return "fully_enumerable_resources_empty"
     return None
+
+
+def _assert_resource_acquisition_allowed(source: dict[str, Any]) -> None:
+    blocked_reason = _resource_acquisition_blocked_reason(source)
+    if blocked_reason is None:
+        return
+    source_id = _clean_text(source.get("source_id")) or "unknown-source"
+    raise RuntimeError(
+        f"provider_directory_resource_acquisition_blocked:{source_id}:{blocked_reason}"
+    )
 
 
 def _is_aetna_medicaid_targeted_source(source: dict[str, Any]) -> bool:
@@ -3897,6 +3910,11 @@ def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] 
                 "metadata/resource probes can return CloudFront HTTP 403 from non-allowlisted networks; "
                 "normal probe validation still gates resource import."
             ),
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_blocked_reason": (
+                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+            ),
         },
     }
 
@@ -4136,6 +4154,17 @@ def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | No
                 "InsurancePlan": 1,
             },
             "provider_directory_supported_resources": list(UHC_SUPPORTED_RESOURCES),
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_acquisition_enabled": False,
+            "provider_directory_blocked_reason": (
+                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+            ),
+            "provider_directory_acquisition_blocked_reason": (
+                "The public Optum FLEX endpoint caps core collections at 10,000 rows, "
+                "does not expose a complete residual partition, and cannot prove a "
+                "complete product-scoped provider directory."
+            ),
             "provider_directory_expected_nonempty_resources": sorted(
                 STATE_EXPECTED_NONEMPTY_RESOURCES
             ),
@@ -4480,6 +4509,11 @@ def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | N
             "provider_directory_confirmed_base": SCAN_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": SCAN_DEVELOPER_PORTAL_URL,
             "provider_directory_confirmed_doc_url": SCAN_PROVIDER_DIRECTORY_DOC_URL,
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_blocked_reason": (
+                PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+            ),
         },
     }
 
@@ -22425,6 +22459,8 @@ async def _import_resources(
     require_complete_resources: bool = False,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
+    for source in sources:
+        _assert_resource_acquisition_allowed(source)
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
         sources,

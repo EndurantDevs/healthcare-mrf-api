@@ -410,6 +410,12 @@ def test_source_row_from_seed_overrides_centene_partner_portal_base():
         row["metadata_json"]["provider_directory_special_case_california_base"]
         == importer.CENTENE_PROVIDER_DIRECTORY_CALIFORNIA_BASE
     )
+    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert (
+        row["metadata_json"]["provider_directory_blocked_reason"]
+        == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+    )
 
 
 def test_source_row_from_seed_overrides_centene_stale_generic_base():
@@ -1037,6 +1043,13 @@ def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
     assert row["metadata_json"]["provider_directory_supported_resources"] == list(
         importer.UHC_SUPPORTED_RESOURCES
     )
+    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert row["metadata_json"]["provider_directory_acquisition_enabled"] is False
+    assert (
+        importer._resource_acquisition_blocked_reason(row)
+        == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+    )
     assert importer._resource_start_url(row, "HealthcareService", page_count=100) is None
     assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
 
@@ -1650,6 +1663,12 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
     assert row["metadata_json"]["provider_directory_override"] == "scan_providerdirectory_intersystems"
     assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.SCAN_DEVELOPER_PORTAL_URL
     assert row["metadata_json"]["provider_directory_confirmed_doc_url"] == importer.SCAN_PROVIDER_DIRECTORY_DOC_URL
+    assert row["metadata_json"]["provider_directory_coverage_mode"] == "probe_only"
+    assert row["metadata_json"]["provider_directory_fully_enumerable_resources"] == []
+    assert (
+        row["metadata_json"]["provider_directory_blocked_reason"]
+        == importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+    )
 
 
 def test_source_row_from_seed_uses_normalized_base_for_stable_scan_source_id():
@@ -7943,6 +7962,51 @@ def test_endpoint_dataset_rejects_incomplete_selected_resource(
         candidate,
         diagnostics_by_resource,
     ) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seed_row",
+    [
+        {
+            "id": "scan-probe-only",
+            "org_name": "SCAN Health Plan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "source": "fixture",
+        },
+        {
+            "id": "centene-probe-only",
+            "org_name": "Centene Corporation",
+            "api_base": importer.CENTENE_PROVIDER_DIRECTORY_BASE,
+            "source": "fixture",
+        },
+        {
+            "id": "uhc-probe-only",
+            "org_name": "UnitedHealthcare",
+            "api_base": importer.UHC_PROVIDER_DIRECTORY_BASE,
+            "source": "fixture",
+        },
+    ],
+)
+async def test_probe_only_sources_refuse_resource_acquisition(seed_row):
+    source = importer._source_row_from_seed(seed_row)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"provider_directory_resource_acquisition_blocked:{source['source_id']}"
+            rf":{importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON}"
+        ),
+    ):
+        await importer._import_resources(
+            [source],
+            resources=list(importer.DEFAULT_RESOURCES),
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=1,
+            run_id=None,
+        )
 
 
 @pytest.mark.asyncio
