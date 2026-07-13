@@ -159,13 +159,13 @@ WITH requested_sources AS MATERIALIZED (
        AND dataset.published_at IS NOT NULL
        AND dataset.superseded_at IS NULL
        AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-), current_overlay AS MATERIALIZED (
+), {affected_overlay_ctes}current_overlay AS MATERIALIZED (
     SELECT
         overlay.*,
         dataset.dataset_id,
         dataset.run_id AS dataset_run_id,
         dataset.published_at AS dataset_published_at
-      FROM {overlay_ref} AS overlay
+      FROM {current_overlay_ref} AS overlay
       JOIN endpoint_aliases AS alias
         ON alias.source_id = overlay.source_id
       JOIN current_datasets AS dataset
@@ -2572,6 +2572,7 @@ def _provider_directory_current_overlay_ctes_sql(
     *,
     source_ids: list[str] | tuple[str, ...] | None = None,
     run_id: str | None = None,
+    affected_group_table: str | None = None,
 ) -> str:
     """Return CTEs that retain only current, published dataset overlay rows."""
 
@@ -2589,11 +2590,26 @@ def _provider_directory_current_overlay_ctes_sql(
         if run_id
         else ""
     )
+    affected_overlay_ctes = ""
+    current_overlay_ref = overlay_ref
+    if affected_group_table:
+        affected_overlay_ctes = f"""affected_npis AS MATERIALIZED (
+    SELECT DISTINCT affected.entity_npi AS npi
+      FROM {db_schema}.{affected_group_table} AS affected
+     WHERE affected.entity_npi IS NOT NULL
+), affected_overlay AS MATERIALIZED (
+    SELECT overlay.*
+      FROM {overlay_ref} AS overlay
+      JOIN affected_npis AS affected_npi
+        ON overlay.npi = affected_npi.npi
+), """
+        current_overlay_ref = "affected_overlay"
     return _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE.format(
         source_ref=source_ref,
         requested_source_filter=requested_source_filter,
         dataset_ref=dataset_ref,
-        overlay_ref=overlay_ref,
+        affected_overlay_ctes=affected_overlay_ctes,
+        current_overlay_ref=current_overlay_ref,
         run_filter=run_filter,
         dataset_resource_ref=dataset_resource_ref,
     )
@@ -3804,6 +3820,7 @@ def _provider_directory_partial_overlay_source_select(
     *,
     source_ids: list[str] | tuple[str, ...] | None = None,
     run_id: str | None = None,
+    affected_group_table: str | None = None,
 ) -> str:
     """Project only current, dataset-member Provider Directory overlay rows."""
 
@@ -3824,6 +3841,7 @@ def _provider_directory_partial_overlay_source_select(
             db_schema,
             source_ids=source_ids,
             run_id=run_id,
+            affected_group_table=affected_group_table,
         ),
         entity_name=entity_name,
         entity_subtype=entity_subtype,
@@ -4155,6 +4173,42 @@ def _provider_directory_partial_source_selects(
     if not provider_selects:
         return []
     return filtered
+
+
+def _provider_directory_partial_replacement_source_selects(
+    db_schema: str,
+    available: dict[str, bool],
+    base_source_selects: list[str],
+    *,
+    affected_group_table: str,
+    test_limit_per_source: int | None = None,
+    has_compatibility_data: bool = False,
+) -> list[str]:
+    """Rebuild affected NPIs with every current Provider Directory source."""
+
+    _validate_provider_directory_fence(
+        available,
+        has_compatibility_data=has_compatibility_data,
+        partial_refresh=True,
+    )
+    current_source_selects = [
+        source_select
+        for source_select in base_source_selects
+        if not _is_provider_directory_source_select(db_schema, source_select)
+    ]
+    overlay_source_select = _provider_directory_partial_overlay_source_select(
+        db_schema,
+        available,
+        affected_group_table=affected_group_table,
+    )
+    current_source_selects.append(
+        _bounded_source_select_sql(overlay_source_select, test_limit_per_source)
+    )
+    return _provider_directory_partial_source_selects(
+        db_schema,
+        current_source_selects,
+        affected_group_table=affected_group_table,
+    )
 
 
 def _entity_address_column_names() -> list[str]:
@@ -10185,7 +10239,7 @@ async def process_data(ctx, task=None):
     context["partial_provider_directory_source_batch_size"] = provider_directory_source_batch_size
     context["partial_provider_directory_source_batches"] = len(provider_directory_source_batches)
     address_canon_available = await _address_canon_available(db_schema)
-    source_selects = _source_selects(
+    base_source_selects = _source_selects(
         db_schema,
         available,
         test_limit_per_source=test_limit_per_source,
@@ -10194,7 +10248,7 @@ async def process_data(ctx, task=None):
     source_selects = _current_provider_directory_source_selects(
         db_schema,
         available,
-        source_selects,
+        base_source_selects,
         source_ids=(provider_directory_source_ids if partial_provider_directory_refresh else None),
         run_id=(provider_directory_run_id if partial_provider_directory_refresh else None),
         test_limit_per_source=test_limit_per_source,
@@ -10257,10 +10311,13 @@ async def process_data(ctx, task=None):
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};") or 0
         )
         context["partial_provider_directory_affected_groups"] = affected_group_rows
-        source_selects = _provider_directory_partial_source_selects(
+        source_selects = _provider_directory_partial_replacement_source_selects(
             db_schema,
-            source_selects,
+            available,
+            base_source_selects,
             affected_group_table=affected_group_table,
+            test_limit_per_source=test_limit_per_source,
+            has_compatibility_data=has_compatibility_data,
         )
         if not source_selects:
             raise RuntimeError(

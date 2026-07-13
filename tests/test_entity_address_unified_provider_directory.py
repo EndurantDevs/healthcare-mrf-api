@@ -347,6 +347,31 @@ def test_provider_directory_partial_overlay_expands_selected_aliases_to_endpoint
     assert "selected_source.endpoint_id = sibling_source.endpoint_id" in live_filter
 
 
+def test_provider_directory_partial_replacement_retains_all_current_source_evidence():
+    available = _provider_directory_fenced_available()
+    base_source_selects = entity_address_unified._source_selects("mrf", available)
+
+    replacement_selects = (
+        entity_address_unified._provider_directory_partial_replacement_source_selects(
+            "mrf",
+            available,
+            base_source_selects,
+            affected_group_table="entity_address_unified_pd_groups",
+        )
+    )
+    sql = "\n".join(replacement_selects)
+
+    assert "WHERE source.endpoint_id IS NOT NULL" in sql
+    assert "source.source_id = ANY(" not in sql
+    assert "affected_npis AS MATERIALIZED" in sql
+    assert "affected_overlay AS MATERIALIZED" in sql
+    assert "FROM mrf.entity_address_unified_pd_groups AS affected" in sql
+    assert "overlay.npi = affected_npi.npi" in sql
+    assert "FROM affected_overlay AS overlay" in sql
+    assert "overlay.last_seen_run_id = dataset.run_id" in sql
+    assert "dataset.is_current IS TRUE" in sql
+
+
 def test_provider_directory_partial_live_filter_preserves_unrelated_sources():
     live_filter = entity_address_unified._provider_directory_live_source_filter_sql(
         "mrf",
