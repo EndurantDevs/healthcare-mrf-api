@@ -7,6 +7,7 @@ import urllib.error
 import pytest
 
 from scripts.research import provider_directory_api_evidence_harness as harness
+from scripts.research import provider_directory_api_evidence_db as evidence_db
 from scripts.research import provider_directory_api_evidence_support as support
 
 
@@ -146,16 +147,43 @@ def test_selection_carries_required_state_and_rejects_truncation():
 
 
 def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
-    sql = harness.overlay_sample_sql("mrf")
+    sql = evidence_db.overlay_sample_sql("mrf")
 
     assert '"mrf".provider_directory_address_overlay' in sql
     assert "overlay.source_id = current_source.source_id" in sql
     assert "overlay.last_seen_run_id = current_source.run_id" in sql
-    assert "SELECT DISTINCT ON (overlay.npi)" in sql
-    assert "(overlay.address_key IS NOT NULL) DESC" in sql
-    assert "(NULLIF(overlay.phone_number, '') IS NOT NULL) DESC" in sql
+    assert "NULLIF(overlay.phone_number, '') IS NOT NULL" in sql
+    assert "ORDER BY overlay.resource_type, overlay.resource_id" in sql
     assert "LIMIT $2" in sql
+    assert "provider_directory_dataset_resource" not in sql
     assert "provider_directory_practitioner_role" not in sql
+
+
+@pytest.mark.asyncio
+async def test_overlay_probe_falls_back_to_address_without_phone():
+    class SequencedConn:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                [],
+                [{"source_id": SOURCE_A, "npi": 1234567890, "phone_number": None}],
+            ]
+
+        async def fetch(self, sql, *args):
+            self.calls.append((sql, args))
+            return self.responses.pop(0)
+
+    conn = SequencedConn()
+    samples = await evidence_db.fetch_overlay_samples(
+        conn,
+        schema="mrf",
+        selections=[support.SourceSelection("acquired", SOURCE_A, "acquisition", True)],
+        samples_per_source=1,
+    )
+
+    assert samples[SOURCE_A] == [support.OverlaySample(SOURCE_A, 1234567890, None)]
+    assert "NULLIF(overlay.phone_number, '') IS NOT NULL" in conn.calls[0][0]
+    assert "NULLIF(overlay.phone_number, '') IS NOT NULL" not in conn.calls[1][0]
 
 
 @pytest.mark.asyncio

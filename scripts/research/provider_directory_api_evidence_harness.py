@@ -28,6 +28,7 @@ from scripts.research.provider_directory_api_evidence_support import (
     evaluate_source,
     redact_sensitive,
 )
+from scripts.research.provider_directory_api_evidence_db import fetch_overlay_samples
 from scripts.research.provider_directory_endpoint_acquisition_harness import (
     DEFAULT_MANIFEST,
     load_manifest,
@@ -38,7 +39,6 @@ DEFAULT_API_BASE_URL_ENV = "PROVIDER_DIRECTORY_API_BASE_URL"
 DEFAULT_API_BEARER_TOKEN_ENV = "PROVIDER_DIRECTORY_API_BEARER_TOKEN"
 DEFAULT_API_KEY_ENV = "PROVIDER_DIRECTORY_API_KEY"
 SOURCE_ID_RE = re.compile(r"^pdfhir_[0-9a-f]{24}$")
-IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REQUIRED_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition", "external"})
 
 
@@ -63,12 +63,6 @@ def _utc_now() -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
-
-
-def _quote_identifier(identifier: str, *, label: str) -> str:
-    if not IDENTIFIER_RE.fullmatch(identifier):
-        raise ValueError(f"invalid {label}")
-    return f'"{identifier}"'
 
 
 def _normalized_ids(identifiers: Iterable[str]) -> tuple[str, ...]:
@@ -146,87 +140,6 @@ def _manifest_selections(
                 )
             )
     return selections
-
-
-def overlay_sample_sql(schema: str) -> str:
-    """Return a deterministic, source-indexed, current dataset/overlay probe."""
-    quoted_schema = _quote_identifier(schema, label="database schema")
-    return f"""
-        WITH requested_sources AS MATERIALIZED (
-            SELECT DISTINCT source_id
-              FROM unnest($1::varchar[]) AS requested(source_id)
-        ), current_sources AS MATERIALIZED (
-            SELECT requested.source_id, dataset.dataset_id,
-                   COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
-              FROM requested_sources AS requested
-              JOIN {quoted_schema}.provider_directory_source AS source
-                ON source.source_id = requested.source_id
-              JOIN {quoted_schema}.provider_directory_endpoint_dataset AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
-             WHERE dataset.is_current IS TRUE
-               AND dataset.status = 'published'
-               AND dataset.published_at IS NOT NULL
-               AND dataset.superseded_at IS NULL
-               AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-        )
-        SELECT current_source.source_id, sampled.npi, sampled.phone_number
-          FROM current_sources AS current_source
-          CROSS JOIN LATERAL (
-              SELECT DISTINCT ON (overlay.npi) overlay.npi, overlay.phone_number
-                FROM {quoted_schema}.provider_directory_address_overlay AS overlay
-                JOIN {quoted_schema}.provider_directory_dataset_resource AS resource
-                  ON resource.dataset_id = current_source.dataset_id
-                 AND resource.resource_type = overlay.resource_type
-                 AND resource.resource_id = overlay.resource_id
-               WHERE overlay.source_id = current_source.source_id
-                 AND overlay.last_seen_run_id = current_source.run_id
-                 AND overlay.npi IS NOT NULL
-               ORDER BY overlay.npi,
-                        (overlay.address_key IS NOT NULL) DESC,
-                        (NULLIF(overlay.phone_number, '') IS NOT NULL) DESC,
-                        overlay.source_record_id
-               LIMIT $2
-          ) AS sampled
-         ORDER BY current_source.source_id, sampled.npi;
-    """
-
-
-async def fetch_overlay_samples(
-    conn: Any,
-    *,
-    schema: str,
-    selections: Iterable[SourceSelection],
-    samples_per_source: int,
-) -> dict[str, list[OverlaySample]]:
-    """Fetch no more than five deterministic, de-duplicated samples per source."""
-    if not 1 <= samples_per_source <= 5:
-        raise ValueError("samples_per_source must be between one and five")
-    source_ids = [selection.source_id for selection in selections]
-    samples_by_source = {source_id: [] for source_id in source_ids}
-    if not source_ids:
-        return samples_by_source
-    rows = await conn.fetch(overlay_sample_sql(schema), source_ids, samples_per_source)
-    for row in rows:
-        row_map = getattr(row, "_mapping", row)
-        source_id = str(row_map.get("source_id") or "")
-        npi_value = row_map.get("npi")
-        if source_id not in samples_by_source or npi_value is None:
-            continue
-        samples_by_source[source_id].append(
-            OverlaySample(
-                source_id,
-                int(npi_value),
-                _normalized_phone(row_map.get("phone_number")),
-            )
-        )
-    return samples_by_source
-
-
-def _normalized_phone(phone_value: Any) -> str | None:
-    digits = "".join(
-        character for character in str(phone_value or "") if character.isdigit()
-    )
-    return digits if len(digits) >= 7 else None
 
 
 def _validate_harness_config(config: HarnessConfig) -> None:
