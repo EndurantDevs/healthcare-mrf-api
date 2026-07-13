@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import dataclasses
 import datetime
 import email.utils
 import hashlib
@@ -6477,6 +6478,7 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_a
                 },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
+                "selected_resources": ["Location"],
             },
             {
                 "source_id": "source_b",
@@ -6490,6 +6492,7 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_a
                 },
                 "dataset_id": "dataset_current",
                 "evidence_run_id": "acquisition_root",
+                "selected_resources": ["Location"],
             },
         ]
     )
@@ -6595,6 +6598,7 @@ def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
             },
             "dataset_id": dataset_id,
             "evidence_run_id": "acquisition_root",
+            "selected_resources": ["Location"],
         }
         for dataset_id in ("dataset_a", "dataset_b")
     ]
@@ -6631,7 +6635,7 @@ def test_artifact_dataset_legacy_metadata_uses_current_source_profile():
     )
 
 
-def test_artifact_dataset_rejects_current_or_recorded_profile_drift():
+def test_artifact_dataset_recorded_profile_ignores_alias_profile_drift():
     changed_source_dataset = importer._provider_directory_artifact_dataset_from_row(
         {
             "source_id": "source_a",
@@ -6647,28 +6651,62 @@ def test_artifact_dataset_rejects_current_or_recorded_profile_drift():
         }
     )
     assert changed_source_dataset is not None
+    assert changed_source_dataset.expected_resources == ("Location",)
+    importer._assert_provider_directory_artifact_target_dependencies(
+        importer.ProviderDirectoryArtifactDatasetFence(
+            (changed_source_dataset,)
+        ),
+        publish_artifacts_targets={"location_archive"},
+        publish_corroboration=False,
+    )
+
+
+def test_artifact_dataset_rejects_internal_recorded_profile_drift():
     with pytest.raises(RuntimeError, match="dataset_profile:source_a"):
         importer._assert_provider_directory_artifact_target_dependencies(
             importer.ProviderDirectoryArtifactDatasetFence(
-                (changed_source_dataset,)
+                (
+                    _artifact_dataset(
+                        selected_resources=("Location", "Organization"),
+                        expected_resources=("Location",),
+                        recorded_expected_resources=("Location",),
+                    ),
+                )
             ),
             publish_artifacts_targets={"location_archive"},
             publish_corroboration=False,
         )
 
-    recorded_drift_dataset = _artifact_dataset(
-        selected_resources=("Location", "Organization"),
-        expected_resources=("Location", "Organization"),
-        recorded_expected_resources=("Location",),
-    )
-    with pytest.raises(RuntimeError, match="dataset_recorded_profile:source_a"):
-        importer._assert_provider_directory_artifact_target_dependencies(
-            importer.ProviderDirectoryArtifactDatasetFence(
-                (recorded_drift_dataset,)
-            ),
-            publish_artifacts_targets={"location_archive"},
-            publish_corroboration=False,
+
+def test_artifact_dataset_recorded_profile_unifies_stale_aliases():
+    dataset_rows = [
+        {
+            "source_id": source_id,
+            "endpoint_id": "endpoint_1",
+            "source_record_json": _artifact_source_record(source_id, resources),
+            "dataset_id": "dataset_current",
+            "evidence_run_id": "acquisition_root",
+            "selected_resources": ["Location"],
+            "recorded_expected_resources": ["Location"],
+        }
+        for source_id, resources in (
+            ("source_a", ("Location",)),
+            ("source_b", ("Endpoint", "Location")),
         )
+    ]
+
+    fence = importer._validate_provider_directory_artifact_datasets(
+        dataset_rows,
+        ["source_a"],
+    )
+
+    assert [dataset.source_id for dataset in fence.datasets] == [
+        "source_a",
+        "source_b",
+    ]
+    assert {
+        dataset.expected_resources for dataset in fence.datasets
+    } == {("Location",)}
 
 
 def test_endpoint_dataset_expected_resources_rejects_alias_profile_drift():
@@ -7451,14 +7489,19 @@ class _EndpointDatasetPromotionHarness:
         return resource_batch
 
     async def status(self, sql, **params):
-        if sql.startswith("SET TRANSACTION"):
+        sql_text = str(sql)
+        if sql_text.startswith("SET TRANSACTION"):
             self.events.append("set_snapshot")
-        elif "superseded_at = now()" in sql:
+        elif "superseded_at = now()" in sql_text:
             self.events.append("supersede")
             self.datasets[params["previous_dataset_id"]].update(
                 is_current=False,
                 status=params["status"],
             )
+        elif "resource_type LIKE 'LU:%:pass:%'" in sql_text:
+            self.events.append("clear_partition_proof")
+        elif "provider_directory_pagination_checkpoint" in sql_text:
+            self.events.append("clear_partition_checkpoint")
         else:
             self.events.append("publish")
             self.datasets[params["dataset_id"]].update(
@@ -7527,6 +7570,49 @@ async def test_endpoint_dataset_publication_atomically_supersedes_current(monkey
 
 
 @pytest.mark.asyncio
+async def test_endpoint_dataset_publication_cleans_partition_state_atomically(
+    monkeypatch,
+):
+    harness = _EndpointDatasetPromotionHarness()
+    monkeypatch.setattr(importer.db, "acquire", lambda: harness)
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base="https://example.test/fhir",
+        source_scope_hash="partition_scope",
+        source_ids=("source_a", "source_b"),
+        owner_run_id="run_2",
+        acquisition_root_run_id="run_2",
+        endpoint_id="endpoint_1",
+        dataset_id="dataset_new",
+        lineage_verified=True,
+    )
+    candidate = dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        checkpoint_context=checkpoint_context,
+    )
+    diagnostics_by_resource = {
+        "Practitioner": {
+            "complete": True,
+            "bounded": False,
+            "error": None,
+            "next_url_remaining": False,
+        }
+    }
+
+    publication_summary = await importer._finalize_endpoint_dataset_candidate(
+        candidate,
+        diagnostics_by_resource,
+    )
+
+    assert publication_summary["published"] is True
+    assert harness.committed is True
+    assert harness.events[-3:] == [
+        "clear_partition_proof",
+        "clear_partition_checkpoint",
+        "commit",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_endpoint_dataset_retry_reuses_checkpoint_candidate(monkeypatch):
     expected_dataset_id = importer._endpoint_dataset_candidate_id(
         "endpoint_1",
@@ -7583,6 +7669,95 @@ async def test_endpoint_dataset_retry_reuses_checkpoint_candidate(monkeypatch):
     assert candidate.checkpoint_context.lineage_verified is True
     current_dataset.assert_not_awaited()
     ensure_candidate.assert_awaited_once_with(candidate)
+
+
+class _AtomicCandidateInitializationHarness:
+    def __init__(self, *, fail_checkpoint=False):
+        self.fail_checkpoint = fail_checkpoint
+        self.events = []
+        self.committed = False
+
+    async def __aenter__(self):
+        self.events.append("begin")
+        return self
+
+    async def __aexit__(self, exc_type, _exc, _traceback):
+        self.committed = exc_type is None
+        self.events.append("commit" if self.committed else "rollback")
+
+    async def first(self, sql, **_params):
+        sql_text = str(sql)
+        if "pg_advisory_xact_lock" in sql_text:
+            self.events.append("lock")
+        elif "WHERE dataset_id = :dataset_id" in sql_text:
+            self.events.append("candidate_lookup")
+        else:
+            self.events.append("conflict_lookup")
+        return None
+
+    async def status(self, sql, **_params):
+        sql_text = str(sql)
+        if "provider_directory_pagination_checkpoint" in sql_text:
+            self.events.append("checkpoint_upsert")
+            if self.fail_checkpoint:
+                raise RuntimeError("checkpoint_write_failed")
+        elif "INSERT INTO" in sql_text and "endpoint_dataset" in sql_text:
+            self.events.append("candidate_upsert")
+        else:
+            self.events.append("candidate_rows_clear")
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_partition_candidate_and_initial_checkpoint_share_transaction(
+    monkeypatch,
+):
+    harness = _AtomicCandidateInitializationHarness(fail_checkpoint=True)
+    monkeypatch.setattr(importer.db, "acquire", lambda: harness)
+    directory_source = _last_updated_partition_test_source()
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+    context = dataclasses.replace(
+        _last_updated_partition_test_context(),
+        endpoint_id="endpoint_scan_partition_test",
+        lineage_verified=True,
+    )
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint_scan_partition_test",
+        dataset_id="dataset_partition",
+        acquisition_root_run_id="run_partition",
+        source_ids=("source_scan_partition_test",),
+        selected_resources=("Practitioner",),
+        import_run_id="run_partition",
+        previous_dataset_id=None,
+        expected_resources=("Practitioner",),
+        checkpoint_context=context,
+    )
+    initialization = importer._last_updated_partition_initialization(
+        "Practitioner",
+        partition_config,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint_write_failed"):
+        await importer._ensure_endpoint_dataset_candidate(
+            candidate,
+            (initialization,),
+        )
+
+    assert harness.committed is False
+    assert harness.events == [
+        "begin",
+        "lock",
+        "candidate_lookup",
+        "conflict_lookup",
+        "candidate_upsert",
+        "candidate_rows_clear",
+        "checkpoint_upsert",
+        "rollback",
+    ]
 
 
 @pytest.mark.asyncio
@@ -7723,14 +7898,7 @@ async def test_partition_candidate_reuses_root_lineage(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "candidate_status",
-    [importer.ENDPOINT_DATASET_PUBLISHED, importer.ENDPOINT_DATASET_SUPERSEDED],
-)
-async def test_endpoint_dataset_finalized_candidate_cannot_be_reused(
-    monkeypatch,
-    candidate_status,
-):
+async def test_endpoint_dataset_superseded_candidate_cannot_be_reused(monkeypatch):
     checkpoint_context = importer.PaginationCheckpointContext(
         canonical_api_base="https://shared.example/fhir",
         source_scope_hash="scope_1",
@@ -7757,8 +7925,8 @@ async def test_endpoint_dataset_finalized_candidate_cannot_be_reused(
             return_value={
                 "endpoint_id": "endpoint_1",
                 "acquisition_root_run_id": "run_original",
-                "status": candidate_status,
-                "is_current": candidate_status == importer.ENDPOINT_DATASET_PUBLISHED,
+                "status": importer.ENDPOINT_DATASET_SUPERSEDED,
+                "is_current": False,
             }
         ),
     )
@@ -7775,6 +7943,109 @@ async def test_endpoint_dataset_finalized_candidate_cannot_be_reused(
             pagination_root_run_id="run_original",
             checkpoint_context=checkpoint_context,
         )
+
+
+def _published_endpoint_dataset_test_context():
+    return importer.PaginationCheckpointContext(
+        canonical_api_base="https://shared.example/fhir",
+        source_scope_hash="scope_1",
+        source_ids=("source_a",),
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        lineage_verified=True,
+    )
+
+
+def _published_endpoint_dataset_metadata_by_field():
+    return {
+        "acquisition_root_run_id": "run_original",
+        "selected_resources": ["Practitioner"],
+        "expected_resources": ["Practitioner"],
+        "source_ids": ["source_a"],
+        "resource_diagnostics": {
+            "Practitioner": {
+                "complete": True,
+                "bounded": False,
+                "error": None,
+                "next_url_remaining": False,
+            }
+        },
+    }
+
+
+def _published_endpoint_dataset_source_record():
+    return {
+        "source_id": "source_a",
+        "endpoint_id": "endpoint_1",
+        "metadata_json": {
+            "provider_directory_supported_resources": ["Practitioner"],
+            "provider_directory_fully_enumerable_resources": ["Practitioner"],
+        },
+    }
+
+
+def _install_published_endpoint_dataset_mocks(monkeypatch):
+    checkpoint_lookup = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_checkpoint_candidate_dataset_id",
+        checkpoint_lookup,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_endpoint_dataset_state",
+        AsyncMock(
+            return_value={
+                "endpoint_id": "endpoint_1",
+                "acquisition_root_run_id": "run_original",
+                "status": importer.ENDPOINT_DATASET_PUBLISHED,
+                "is_current": True,
+                "publication_metadata_json": (
+                    _published_endpoint_dataset_metadata_by_field()
+                ),
+            }
+        ),
+    )
+    ensure_candidate = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_ensure_endpoint_dataset_candidate",
+        ensure_candidate,
+    )
+    return checkpoint_lookup, ensure_candidate
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_published_root_is_idempotent(monkeypatch):
+    """A retry of the current root reuses its immutable publication."""
+    checkpoint_context = _published_endpoint_dataset_test_context()
+    dataset_id = importer._endpoint_dataset_candidate_id(
+        "endpoint_1",
+        ("Practitioner",),
+        "run_original",
+    )
+    checkpoint_lookup, ensure_candidate = (
+        _install_published_endpoint_dataset_mocks(monkeypatch)
+    )
+
+    candidate = await importer._prepare_endpoint_dataset_candidate(
+        [_published_endpoint_dataset_source_record()],
+        ["Practitioner"],
+        run_id="run_retry",
+        retry_of_run_id="run_original",
+        pagination_root_run_id="run_original",
+        checkpoint_context=checkpoint_context,
+    )
+
+    assert candidate is not None
+    assert candidate.already_published is True
+    assert candidate.dataset_id == dataset_id
+    assert importer._published_endpoint_dataset_import_summary(candidate)[2] == {
+        "Practitioner": 0
+    }
+    checkpoint_lookup.assert_not_awaited()
+    ensure_candidate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -17469,6 +17740,7 @@ def _last_updated_partition_test_source(**resource_config_overrides):
     }
     return {
         "source_id": "source_scan_partition_test",
+        "endpoint_id": "endpoint_scan_partition_test",
         "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
         "last_validated_status": "valid",
@@ -17535,6 +17807,177 @@ def _new_last_updated_partition_resume(partition_config):
     )
 
 
+def _last_updated_partition_test_window(*, count=1):
+    return importer.TimeWindow(
+        "root",
+        datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+        datetime.datetime(2024, 1, 2, tzinfo=datetime.UTC),
+        count=count,
+    )
+
+
+def test_last_updated_partition_count_url_requires_accurate_total():
+    request_url = importer._last_updated_partition_url(
+        "https://example.test/fhir/Practitioner?_total=estimate&_count=5",
+        _last_updated_partition_test_window(),
+        page_count=10,
+        count_only=True,
+    )
+    query_lookup = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(request_url).query
+    )
+
+    assert query_lookup["_summary"] == ["count"]
+    assert query_lookup["_total"] == ["accurate"]
+    assert "_count" not in query_lookup
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_rejects_non_searchset_bundles(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    non_searchset_bundle_by_field = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "total": 1,
+        "entry": [],
+    }
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(return_value=(200, non_searchset_bundle_by_field, None, 1)),
+    )
+
+    count_fetch = await importer._fetch_last_updated_partition_count(
+        directory_source,
+        "https://example.test/fhir/Practitioner?_summary=count",
+        timeout=3,
+    )
+    page_fetch = await importer._fetch_last_updated_window_page(
+        directory_source,
+        "Practitioner",
+        "https://example.test/fhir/Practitioner",
+        _last_updated_partition_test_window(),
+        timeout=3,
+    )
+
+    assert count_fetch.observation is not None
+    assert count_fetch.observation.kind.value == "unknown"
+    assert count_fetch.error == "non_searchset_count_bundle"
+    assert page_fetch.error == "non_searchset_bundle"
+
+
+@pytest.mark.parametrize(
+    ("last_updated", "expected_error"),
+    [
+        ("2024-01-01T00:00:00Z", None),
+        ("2024-01-01T23:59:59Z", None),
+        ("2024-01-02T00:00:00Z", "resource_last_updated_outside_window"),
+        ("2023-12-31T23:59:59Z", "resource_last_updated_outside_window"),
+        ("not-an-instant", "resource_last_updated_invalid"),
+        (None, "resource_last_updated_invalid"),
+    ],
+)
+def test_last_updated_partition_validates_resource_window(
+    last_updated,
+    expected_error,
+):
+    resource = _last_updated_partition_test_resource("prac-1")
+    resource["meta"]["lastUpdated"] = last_updated
+
+    assert (
+        importer._last_updated_partition_resource_window_error(
+            resource,
+            _last_updated_partition_test_window(),
+        )
+        == expected_error
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_rejects_rows_beyond_exact_count(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                _last_updated_partition_test_bundle(
+                    [
+                        _last_updated_partition_test_resource("prac-1"),
+                        _last_updated_partition_test_resource("prac-2"),
+                    ]
+                ),
+                None,
+                1,
+            )
+        ),
+    )
+
+    window_fetch = await importer._fetch_last_updated_partition_window(
+        directory_source,
+        "Practitioner",
+        "https://example.test/fhir/Practitioner",
+        _last_updated_partition_test_window(count=1),
+        timeout=3,
+        cancel_ctx=None,
+        cancel_task=None,
+        deadline_at=None,
+    )
+
+    assert window_fetch.complete is False
+    assert window_fetch.bounded is True
+    assert window_fetch.error == "window_resource_ceiling_reached"
+    assert window_fetch.resources == ()
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_bounds_unique_next_pages(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    requested_urls = []
+
+    async def fetch_page(_source, request_url, *, timeout):
+        requested_urls.append(request_url)
+        resource_number = len(requested_urls)
+        payload = _last_updated_partition_test_bundle(
+            [
+                _last_updated_partition_test_resource(
+                    f"prac-{resource_number}"
+                )
+            ]
+        )
+        payload["link"] = [
+            {
+                "relation": "next",
+                "url": (
+                    f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner"
+                    f"?page={resource_number + 1}"
+                ),
+            }
+        ]
+        return 200, payload, None, 1
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_page)
+    monkeypatch.setattr(importer, "_max_page_count", lambda: 2)
+
+    window_fetch = await importer._fetch_last_updated_partition_window(
+        directory_source,
+        "Practitioner",
+        f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner?page=1",
+        _last_updated_partition_test_window(count=3),
+        timeout=3,
+        cancel_ctx=None,
+        cancel_task=None,
+        deadline_at=None,
+    )
+
+    assert len(requested_urls) == 2
+    assert window_fetch.complete is False
+    assert window_fetch.bounded is True
+    assert window_fetch.error == "window_page_limit_reached"
+    assert len(window_fetch.resources) == 2
+
+
 class _LastUpdatedPartitionFetchHarness:
     """Capture staged rows and proof records from one partition fetch."""
 
@@ -17557,13 +18000,31 @@ class _LastUpdatedPartitionFetchHarness:
         resources,
         **_kwargs,
     ):
-        self.staged_resources_by_id.update(
-            {resource["id"]: resource for resource in resources}
-        )
-        return {
+        candidate_hashes_by_id = {
             resource["id"]: f"candidate-hash:{resource['id']}"
             for resource in resources
         }
+        return importer.LastUpdatedPartitionStage(
+            rows=tuple(
+                {
+                    "dataset_id": "dataset_partition",
+                    "resource_type": "Practitioner",
+                    "resource_id": resource["id"],
+                    "payload_hash": candidate_hashes_by_id[resource["id"]],
+                    "payload_json": resource,
+                }
+                for resource in resources
+            ),
+            candidate_hashes_by_id=candidate_hashes_by_id,
+        )
+
+    async def _stage_rows(self, _connection, staged_rows):
+        self.staged_resources_by_id.update(
+            {
+                staged_row["resource_id"]: staged_row["payload_json"]
+                for staged_row in staged_rows
+            }
+        )
 
     async def _stream_staged(
         self,
@@ -17624,6 +18085,7 @@ class _LastUpdatedPartitionFetchHarness:
         partition_window,
         pass_number,
         candidate_hashes_by_id=None,
+        **_kwargs,
     ):
         fingerprints_by_id = dict(
             partition_window.passes[pass_number].resource_fingerprints
@@ -17673,11 +18135,30 @@ class _LastUpdatedPartitionFetchHarness:
         )
         monkeypatch.setattr(
             importer,
+            "_upsert_dataset_resource_rows_on_connection",
+            self._stage_rows,
+        )
+        @contextlib.asynccontextmanager
+        async def partition_transaction():
+            yield object()
+
+        monkeypatch.setattr(
+            importer.db,
+            "acquire",
+            partition_transaction,
+        )
+        monkeypatch.setattr(
+            importer,
             "_stream_last_updated_partition_staged_rows",
             self._stream_staged,
         )
 
-    async def _fetch_resource_rows(self, partition_config):
+    async def _fetch_resource_rows(
+        self,
+        partition_config,
+        *,
+        deadline_seconds=0,
+    ):
         fetch_options = importer.LastUpdatedPartitionFetchOptions(
             per_resource_limit=0,
             page_limit=0,
@@ -17688,7 +18169,7 @@ class _LastUpdatedPartitionFetchHarness:
             retain_rows=False,
             cancel_ctx=None,
             cancel_task=None,
-            deadline_seconds=0,
+            deadline_seconds=deadline_seconds,
             pagination_checkpoint=_last_updated_partition_test_context(),
         )
         return await importer._fetch_last_updated_partition_resource_rows(
@@ -17708,6 +18189,7 @@ async def _run_last_updated_partition_test_fetch(
     partition_resume=None,
     save_plan_callback=None,
     fingerprints_by_window_and_pass=None,
+    deadline_seconds=0,
 ):
     """Exercise the production partition path with deterministic test stores."""
     partition_config, config_error = importer._last_updated_partition_config(
@@ -17729,12 +18211,134 @@ async def _run_last_updated_partition_test_fetch(
         durable_resume,
         save_plan_callback,
     )
-    fetch_outcome = await fetch_harness._fetch_resource_rows(partition_config)
+    fetch_outcome = await fetch_harness._fetch_resource_rows(
+        partition_config,
+        deadline_seconds=deadline_seconds,
+    )
     return (
         fetch_outcome,
         fetch_harness.staged_resources_by_id,
         fetch_harness.written_resource_ids,
     )
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_transient_count_remains_resumable(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    saved_plan_statuses = []
+
+    async def fetch_transient(_source, _request_url, *, timeout):
+        return 503, {"resourceType": "OperationOutcome"}, None, 1
+
+    async def save_plan(
+        _context,
+        _resource_type,
+        _partition_config,
+        partition_plan,
+        **_kwargs,
+    ):
+        saved_plan_statuses.append(partition_plan.status.value)
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_transient,
+            save_plan_callback=save_plan,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is True
+    assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in fetch_outcome.error
+    assert fetch_outcome.retry_not_before is not None
+    assert saved_plan_statuses == ["counting"]
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_transient_page_remains_resumable(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    saved_plan_statuses = []
+
+    async def fetch_then_fail(_source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return (
+                200,
+                _last_updated_partition_test_bundle([], total=1),
+                None,
+                1,
+            )
+        return 503, {"resourceType": "OperationOutcome"}, None, 1
+
+    async def save_plan(
+        _context,
+        _resource_type,
+        _partition_config,
+        partition_plan,
+        **_kwargs,
+    ):
+        saved_plan_statuses.append(partition_plan.status.value)
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_then_fail,
+            save_plan_callback=save_plan,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is True
+    assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in fetch_outcome.error
+    assert fetch_outcome.retry_not_before is not None
+    assert saved_plan_statuses == ["acquiring", "acquiring"]
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_deadline_remains_resumable(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    fetch_source_json = AsyncMock()
+    saved_plan_statuses = []
+
+    async def save_plan(
+        _context,
+        _resource_type,
+        _partition_config,
+        partition_plan,
+        **_kwargs,
+    ):
+        saved_plan_statuses.append(partition_plan.status.value)
+
+    monotonic_clock = Mock(side_effect=[100.0, 102.0])
+    monkeypatch.setattr(
+        importer,
+        "_last_updated_partition_monotonic",
+        monotonic_clock,
+    )
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_source_json,
+            save_plan_callback=save_plan,
+            deadline_seconds=1,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.deadline_reached is True
+    assert fetch_outcome.next_url_remaining is True
+    assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in fetch_outcome.error
+    assert saved_plan_statuses == ["counting"]
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+    fetch_source_json.assert_not_awaited()
 
 
 class _PartitionResumeRecorder:
@@ -17752,6 +18356,7 @@ class _PartitionResumeRecorder:
         *,
         pages_processed,
         rows_processed,
+        database_connection=None,
     ):
         checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
             partition_config,
@@ -17943,8 +18548,14 @@ class _DeterministicPartitionResponder:
         lower_bound, _upper_bound = partition_bounds
         if lower_bound != "ge2024-01-01T00:00:00.000000Z":
             return [
-                _last_updated_partition_test_resource("prac-right-1"),
-                _last_updated_partition_test_resource("prac-right-2"),
+                _last_updated_partition_test_resource(
+                    "prac-right-1",
+                    last_updated="2024-01-02T01:00:00Z",
+                ),
+                _last_updated_partition_test_resource(
+                    "prac-right-2",
+                    last_updated="2024-01-02T02:00:00Z",
+                ),
             ]
         volatile_timestamp = (
             "2024-01-01T01:00:00Z"
@@ -18112,6 +18723,174 @@ def test_probe_only_partition_opt_in_must_cover_every_requested_resource():
     ) == "coverage_mode_probe_only"
 
 
+def test_partition_opt_in_is_an_enumerable_endpoint_dataset_resource():
+    source = _last_updated_partition_test_source()
+
+    assert importer._endpoint_dataset_selected_resources(
+        [source],
+        ["Practitioner", "Location"],
+    ) == ["Practitioner"]
+    assert importer._endpoint_dataset_expected_resources([source]) == (
+        "Practitioner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_partition_source_group_binds_candidate_checkpoint_context(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    monkeypatch.setattr(
+        importer,
+        "_select_endpoint_dataset_candidate",
+        AsyncMock(
+            return_value=importer.EndpointDatasetCandidateSelection(
+                dataset_id="dataset_partition",
+                acquisition_root_run_id="run_partition",
+                previous_dataset_id="dataset_previous",
+                reused_from_checkpoint=False,
+            )
+        ),
+    )
+    ensure_candidate = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_ensure_endpoint_dataset_candidate",
+        ensure_candidate,
+    )
+
+    prepared_sources, candidate = (
+        await importer._prepare_resource_import_source_group(
+            [directory_source],
+            ["Practitioner"],
+            run_id="run_partition",
+            retry_of_run_id=None,
+            pagination_root_run_id=None,
+            is_checkpointing_enabled=True,
+        )
+    )
+
+    assert candidate is not None
+    assert candidate.selected_resources == ("Practitioner",)
+    assert candidate.expected_resources == ("Practitioner",)
+    assert candidate.checkpoint_context is not None
+    assert candidate.checkpoint_context.dataset_id == "dataset_partition"
+    assert candidate.checkpoint_context.lineage_verified is True
+    assert prepared_sources[0]["_endpoint_dataset_id"] == "dataset_partition"
+    assert (
+        prepared_sources[0]["_pagination_checkpoint_context"]
+        == candidate.checkpoint_context
+    )
+    ensure_candidate.assert_awaited_once()
+    ensured_candidate, partition_initializations = ensure_candidate.await_args.args
+    assert ensured_candidate is candidate
+    assert len(partition_initializations) == 1
+    assert partition_initializations[0].resource_type == "Practitioner"
+    assert (
+        partition_initializations[0].checkpoint_resource_type
+        == "Practitioner:LastUpdatedPartition"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_resource_keeps_normal_paged_acquisition(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    directory_source["metadata_json"]["provider_directory_supported_resources"] = [
+        "Practitioner",
+        "Location",
+    ]
+    partition_fetch = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_last_updated_partition_resource_rows",
+        partition_fetch,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resource_start_urls",
+        lambda *_args, **_kwargs: ["https://example.test/fhir/Location"],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                _last_updated_partition_test_bundle([]),
+                None,
+                1,
+            )
+        ),
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        directory_source,
+        "Location",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=10,
+        run_id="run_partition",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.fetch_mode == "paged"
+    partition_fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_resource_keeps_normal_bulk_acquisition(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    directory_source["metadata_json"]["provider_directory_supported_resources"] = [
+        "Practitioner",
+        "Location",
+    ]
+    partition_fetch = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_fetch_last_updated_partition_resource_rows",
+        partition_fetch,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_is_source_bulk_export_effective",
+        lambda *_args, **_kwargs: True,
+    )
+    bulk_result = importer.ResourceFetchResult(
+        model=ProviderDirectoryLocation,
+        rows=[],
+        rows_fetched=3,
+        rows_written=3,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+        fetch_mode="bulk_export",
+    )
+    bulk_fetch = AsyncMock(return_value=bulk_result)
+    monkeypatch.setattr(
+        importer,
+        "_fetch_bulk_export_resource_rows",
+        bulk_fetch,
+    )
+
+    fetch_result = await importer._fetch_resource_rows(
+        directory_source,
+        "Location",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=10,
+        timeout=10,
+        run_id="run_partition",
+        bulk_export=True,
+    )
+
+    assert fetch_result is bulk_result
+    bulk_fetch.assert_awaited_once()
+    partition_fetch.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_last_updated_partition_pass_two_never_overwrites_pass_one(monkeypatch):
     window = importer.TimeWindow(
@@ -18142,6 +18921,124 @@ async def test_last_updated_partition_pass_two_never_overwrites_pass_one(monkeyp
         )
 
     store_fingerprints.assert_not_awaited()
+
+
+class _AtomicPartitionPassHarness:
+    """Record transaction ordering and fail the final durable marker."""
+
+    def __init__(self):
+        self.events = []
+        self.connection = object()
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        self.events.append("begin")
+        try:
+            yield self.connection
+        except BaseException:
+            self.events.append("rollback")
+            raise
+        else:
+            self.events.append("commit")
+
+    async def stage_rows(self, observed_connection, _rows):
+        assert observed_connection is self.connection
+        self.events.append("candidate_rows")
+
+    async def store_proof(
+        self,
+        *_args,
+        database_connection=None,
+        **_kwargs,
+    ):
+        assert database_connection is self.connection
+        self.events.append("proof")
+
+    async def save_marker(
+        self,
+        *_args,
+        database_connection=None,
+        **_kwargs,
+    ):
+        assert database_connection is self.connection
+        self.events.append("marker")
+        raise RuntimeError("marker_write_failed")
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(importer.db, "acquire", self.transaction)
+        monkeypatch.setattr(
+            importer,
+            "_upsert_dataset_resource_rows_on_connection",
+            self.stage_rows,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_store_partition_pass_proof",
+            self.store_proof,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_save_last_updated_partition_plan",
+            self.save_marker,
+        )
+
+
+def _atomic_partition_pass_state_and_stage():
+    directory_source, partition_plan = _stable_partition_test_plan()
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None and partition_config is not None
+    state = importer.LastUpdatedPartitionState(
+        context=_last_updated_partition_test_context(),
+        plan=partition_plan,
+        start_url="https://example.test/fhir/Practitioner",
+        pages_fetched=2,
+        rows_fetched=2,
+        deadline_at=None,
+    )
+    candidate_stage = importer.LastUpdatedPartitionStage(
+        rows=(
+            {
+                "dataset_id": "dataset_partition",
+                "resource_type": "Practitioner",
+                "resource_id": "prac-1",
+                "payload_hash": "candidate-hash",
+                "payload_json": {"resource_id": "prac-1"},
+            },
+        ),
+        candidate_hashes_by_id={"prac-1": "candidate-hash"},
+    )
+    return partition_plan, partition_config, state, candidate_stage
+
+
+@pytest.mark.asyncio
+async def test_partition_pass_rows_proof_and_marker_share_transaction(monkeypatch):
+    """Candidate rows, proof, and marker roll back as one transaction."""
+    harness = _AtomicPartitionPassHarness()
+    harness.install(monkeypatch)
+    partition_plan, partition_config, state, candidate_stage = (
+        _atomic_partition_pass_state_and_stage()
+    )
+
+    with pytest.raises(RuntimeError, match="marker_write_failed"):
+        await importer._persist_partition_pass(
+            "Practitioner",
+            partition_config,
+            state,
+            partition_plan.leaf_windows()[0],
+            2,
+            candidate_stage,
+        )
+
+    assert harness.events == [
+        "begin",
+        "candidate_rows",
+        "proof",
+        "marker",
+        "rollback",
+    ]
 
 
 def _stable_partition_test_plan():

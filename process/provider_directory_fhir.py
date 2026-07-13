@@ -72,6 +72,15 @@ from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
+from process.provider_directory_time_partition import (
+    CountObservation,
+    PartitionPlan,
+    PartitionPlanError,
+    PlanStatus,
+    TimeWindow,
+    WindowPass,
+    parse_utc_instant,
+)
 from scripts.provider_directory_support_contract import (
     SupportDocumentationError,
     validate_blocker_registry,
@@ -855,6 +864,20 @@ PAGINATION_CHECKPOINT_ACTIVE = "active"
 PAGINATION_CHECKPOINT_COMPLETE = "complete"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
+LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
+    "provider-directory-fhir-last-updated-v2"
+)
+LAST_UPDATED_PARTITION_METADATA_KEY = (
+    "provider_directory_last_updated_partition_acquisition"
+)
+LAST_UPDATED_PARTITION_CHECKPOINT_SUFFIX = "LastUpdatedPartition"
+LAST_UPDATED_PARTITION_FETCH_MODE = "last_updated_partition"
+LAST_UPDATED_PARTITION_BLOCKED_ERROR = (
+    "provider_directory_last_updated_partition_acquisition_blocked"
+)
+LAST_UPDATED_PARTITION_RETRYABLE_ERROR = (
+    "provider_directory_last_updated_partition_acquisition_retryable"
+)
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
 RESOURCE_FETCH_INCOMPLETE_ERROR = "provider_directory_resource_fetch_incomplete"
 BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-bulk-v1"
@@ -939,6 +962,105 @@ class ResourceFetchResult:
             or self.hard_page_limit_reached
             or self.deadline_reached
         )
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionConfig:
+    """Strict source metadata for one resource's fail-closed acquisition."""
+
+    start: datetime.datetime
+    end: datetime.datetime | None
+    end_mode: str
+    ceiling: int
+    minimum_width: datetime.timedelta
+    page_count: int
+    volatile_metadata_paths: tuple[str, ...]
+
+    def identity(self) -> dict[str, Any]:
+        """Return stable metadata identity without a moving resolved cutoff."""
+        return {
+            "start": self.start.isoformat(timespec="microseconds"),
+            "end": (
+                self.end.isoformat(timespec="microseconds")
+                if self.end is not None
+                else self.end_mode
+            ),
+            "ceiling": self.ceiling,
+            "minimum_width_microseconds": int(
+                self.minimum_width.total_seconds() * 1_000_000
+            ),
+            "page_count": self.page_count,
+            "volatile_metadata_paths": list(self.volatile_metadata_paths),
+            "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+        }
+
+    def root_end(self) -> datetime.datetime:
+        """Resolve a fixed UTC root cutoff for a newly created acquisition."""
+        if self.end is not None:
+            return self.end
+        return datetime.datetime.now(datetime.UTC)
+
+
+@dataclass(frozen=True)
+class LastUpdatedWindowFetch:
+    resources: tuple[dict[str, Any], ...]
+    pages_fetched: int
+    complete: bool
+    bounded: bool = False
+    error: str | None = None
+    transient: bool = False
+    deadline_reached: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class LastUpdatedCountFetch:
+    observation: CountObservation | None
+    pages_fetched: int = 1
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class LastUpdatedWindowPage:
+    resources: tuple[dict[str, Any], ...]
+    next_url: str | None
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionResume:
+    plan: PartitionPlan
+    pages_processed: int = 0
+    rows_processed: int = 0
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionFetchOptions:
+    per_resource_limit: int
+    page_limit: int
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    row_batch_size: int
+    retain_rows: bool
+    cancel_ctx: dict[str, Any] | None
+    cancel_task: dict[str, Any] | None
+    deadline_seconds: int
+    pagination_checkpoint: PaginationCheckpointContext | None
+
+
+@dataclass
+class LastUpdatedPartitionState:
+    context: PaginationCheckpointContext
+    plan: PartitionPlan
+    start_url: str
+    pages_fetched: int
+    rows_fetched: int
+    deadline_at: float | None
 
 
 @dataclass(frozen=True)
@@ -1057,6 +1179,9 @@ class EndpointDatasetCandidate:
     expected_resources: tuple[str, ...] = ()
     checkpoint_context: PaginationCheckpointContext | None = None
     reused_from_checkpoint: bool = False
+    repair_empty_orphan: bool = False
+    already_published: bool = False
+    published_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1065,6 +1190,23 @@ class EndpointDatasetCandidateSelection:
     acquisition_root_run_id: str | None
     previous_dataset_id: str | None
     reused_from_checkpoint: bool
+    repair_empty_orphan: bool = False
+    already_published: bool = False
+    published_metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionInitialization:
+    resource_type: str
+    checkpoint_resource_type: str
+    start_url_hash: str
+    checkpoint_payload: str
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionStage:
+    rows: tuple[dict[str, Any], ...]
+    candidate_hashes_by_id: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -2258,23 +2400,169 @@ def _source_coverage_mode(source: dict[str, Any]) -> str | None:
 PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON = "coverage_mode_probe_only"
 
 
-def _resource_acquisition_blocked_reason(source: dict[str, Any]) -> str | None:
+def _last_updated_partition_resource_configs(
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    raw_config = _source_metadata(source).get(
+        LAST_UPDATED_PARTITION_METADATA_KEY
+    )
+    if not isinstance(raw_config, dict) or raw_config.get("enabled") is not True:
+        return {}
+    resources = raw_config.get("resources")
+    return dict(resources) if isinstance(resources, dict) else {}
+
+
+def _partition_end_value(
+    configured_end: Any,
+) -> tuple[datetime.datetime | None, str]:
+    if configured_end == "resolved_now":
+        return None, "resolved_now"
+    return parse_utc_instant(configured_end), "fixed"
+
+
+def _partition_ceiling_value(raw_ceiling: Any) -> int:
+    if (
+        isinstance(raw_ceiling, bool)
+        or not isinstance(raw_ceiling, int)
+        or raw_ceiling <= 0
+    ):
+        raise ValueError("ceiling_must_be_positive_integer")
+    return raw_ceiling
+
+
+def _partition_width_value(raw_seconds: Any) -> datetime.timedelta:
+    if (
+        isinstance(raw_seconds, bool)
+        or not isinstance(raw_seconds, (int, float))
+        or raw_seconds <= 0
+    ):
+        raise ValueError("minimum_width_seconds_must_be_positive")
+    return datetime.timedelta(seconds=raw_seconds)
+
+
+def _partition_page_count(raw_page_count: Any, ceiling: int) -> int:
+    if (
+        isinstance(raw_page_count, bool)
+        or not isinstance(raw_page_count, int)
+        or raw_page_count <= 0
+        or raw_page_count > ceiling
+    ):
+        raise ValueError("page_count_must_be_positive_and_at_most_ceiling")
+    return raw_page_count
+
+
+def _partition_volatile_paths(raw_paths: Any) -> tuple[str, ...]:
+    if not isinstance(raw_paths, list) or not all(
+        isinstance(path, str) for path in raw_paths
+    ):
+        raise ValueError("volatile_metadata_paths_must_be_string_list")
+    return tuple(raw_paths)
+
+
+def _build_partition_config(
+    resource_settings: dict[str, Any],
+) -> LastUpdatedPartitionConfig:
+    partition_start = parse_utc_instant(resource_settings["start"])
+    partition_end, end_mode = _partition_end_value(resource_settings["end"])
+    ceiling = _partition_ceiling_value(resource_settings["ceiling"])
+    minimum_width = _partition_width_value(
+        resource_settings["minimum_width_seconds"]
+    )
+    page_count = _partition_page_count(
+        resource_settings.get("page_count", min(100, ceiling)),
+        ceiling,
+    )
+    volatile_paths = _partition_volatile_paths(
+        resource_settings.get("volatile_metadata_paths", [])
+    )
+    if partition_end is not None and partition_start >= partition_end:
+        raise ValueError("start_must_precede_end")
+    partition_config = LastUpdatedPartitionConfig(
+        start=partition_start,
+        end=partition_end,
+        end_mode=end_mode,
+        ceiling=ceiling,
+        minimum_width=minimum_width,
+        page_count=page_count,
+        volatile_metadata_paths=volatile_paths,
+    )
+    if partition_end is not None:
+        PartitionPlan.create(
+            partition_start,
+            partition_end,
+            ceiling=ceiling,
+            minimum_width=minimum_width,
+            volatile_metadata_paths=volatile_paths,
+        )
+    return partition_config
+
+
+def _last_updated_partition_config(
+    source_record: dict[str, Any],
+    resource_type: str,
+) -> tuple[LastUpdatedPartitionConfig | None, str | None]:
+    resource_settings = _last_updated_partition_resource_configs(
+        source_record
+    ).get(resource_type)
+    if resource_settings is None:
+        return None, "resource_not_opted_in"
+    if not isinstance(resource_settings, dict):
+        return None, "resource_config_not_object"
+    try:
+        partition_config = _build_partition_config(resource_settings)
+    except (KeyError, TypeError, ValueError, PartitionPlanError) as exc:
+        detail = str(exc) or type(exc).__name__
+        return None, f"invalid_config:{detail}"
+    return partition_config, None
+
+
+def _has_partition_configs_for_resources(
+    source_record: dict[str, Any],
+    requested_resource_types: list[str] | tuple[str, ...] | None,
+) -> bool:
+    if not requested_resource_types:
+        return False
+    return all(
+        _last_updated_partition_config(source_record, resource_type)[0]
+        is not None
+        for resource_type in requested_resource_types
+    )
+
+
+def _resource_acquisition_blocked_reason(
+    source: dict[str, Any],
+    requested_resource_types: list[str] | tuple[str, ...] | None = None,
+) -> str | None:
     """Return the catalog safety reason that forbids generic resource import."""
     validation_status = (_clean_text(source.get("last_validated_status")) or "").lower()
     if validation_status == "shared_backend_unverified":
         return "shared_backend_unverified"
-    if _source_coverage_mode(source) == "probe_only":
+    has_partition_opt_in = _has_partition_configs_for_resources(
+        source,
+        requested_resource_types,
+    )
+    if _source_coverage_mode(source) == "probe_only" and not has_partition_opt_in:
         return "coverage_mode_probe_only"
     fully_enumerable_resources = _source_metadata(source).get(
         "provider_directory_fully_enumerable_resources"
     )
-    if isinstance(fully_enumerable_resources, list) and not fully_enumerable_resources:
+    if (
+        isinstance(fully_enumerable_resources, list)
+        and not fully_enumerable_resources
+        and not has_partition_opt_in
+    ):
         return "fully_enumerable_resources_empty"
     return None
 
 
-def _assert_resource_acquisition_allowed(source: dict[str, Any]) -> None:
-    blocked_reason = _resource_acquisition_blocked_reason(source)
+def _assert_resource_acquisition_allowed(
+    source: dict[str, Any],
+    requested_resource_types: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    blocked_reason = _resource_acquisition_blocked_reason(
+        source,
+        requested_resource_types,
+    )
     if blocked_reason is None:
         return
     source_id = _clean_text(source.get("source_id")) or "unknown-source"
@@ -3587,6 +3875,7 @@ def _select_resource_import_sources(
     open_only: bool,
     include_auth_required: bool,
     checkpoint_retry_source_ids: set[str] | None = None,
+    requested_resource_types: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     selected: list[dict[str, Any]] = []
     metrics = _resource_import_selection_metrics(len(source_rows))
@@ -3595,7 +3884,10 @@ def _select_resource_import_sources(
         if not _canonical_base(source.get("api_base")):
             metrics["source_import_skipped_missing_api_base"] += 1
             continue
-        blocked_reason = _resource_acquisition_blocked_reason(source)
+        blocked_reason = _resource_acquisition_blocked_reason(
+            source,
+            requested_resource_types,
+        )
         if blocked_reason:
             metrics["source_import_skipped_blocked_source"] += 1
             metrics[f"source_import_skipped_blocked_source_{blocked_reason}"] += 1
@@ -7808,6 +8100,35 @@ def _artifact_dataset_all_source_selection_sql(
     """
 
 
+def _artifact_dataset_resource_profile(
+    raw_profile: Any,
+    *,
+    dataset_id: str,
+    field_name: str,
+) -> tuple[str, ...]:
+    decoded_profile = raw_profile
+    if isinstance(decoded_profile, str):
+        try:
+            decoded_profile = json.loads(decoded_profile)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"provider_directory_artifact_dataset_profile_invalid:{dataset_id}:{field_name}"
+            ) from exc
+    if not isinstance(decoded_profile, list):
+        raise RuntimeError(
+            f"provider_directory_artifact_dataset_profile_invalid:{dataset_id}:{field_name}"
+        )
+    resource_types = [_clean_text(entry) for entry in decoded_profile]
+    if (
+        any(resource_type not in DEFAULT_RESOURCES for resource_type in resource_types)
+        or len(set(resource_types)) != len(resource_types)
+    ):
+        raise RuntimeError(
+            f"provider_directory_artifact_dataset_profile_invalid:{dataset_id}:{field_name}"
+        )
+    return tuple(sorted(resource_types))
+
+
 def _provider_directory_artifact_dataset_from_row(
     dataset_row: Any,
 ) -> ProviderDirectoryArtifactDataset | None:
@@ -7818,32 +8139,32 @@ def _provider_directory_artifact_dataset_from_row(
     }
     if not all(value_by_name.values()):
         return None
-    source_record = _json_object(dataset_row_map.get("source_record_json"))
-    expected_resources = _endpoint_dataset_expected_resources([source_record])
+    dataset_id = value_by_name["dataset_id"] or ""
+    selected_resources = _artifact_dataset_resource_profile(
+        dataset_row_map.get("selected_resources"),
+        dataset_id=dataset_id,
+        field_name="selected_resources",
+    )
     raw_recorded_expected_resources = dataset_row_map.get(
         "recorded_expected_resources"
     )
-    recorded_expected_resources = (
-        tuple(sorted(set(_json_text_list(raw_recorded_expected_resources))))
-        if raw_recorded_expected_resources is not None
-        else None
-    )
+    if raw_recorded_expected_resources is None:
+        source_record = _json_object(dataset_row_map.get("source_record_json"))
+        expected_resources = _endpoint_dataset_expected_resources([source_record])
+        recorded_expected_resources = None
+    else:
+        recorded_expected_resources = _artifact_dataset_resource_profile(
+            raw_recorded_expected_resources,
+            dataset_id=dataset_id,
+            field_name="expected_resources",
+        )
+        expected_resources = recorded_expected_resources
     return ProviderDirectoryArtifactDataset(
         source_id=value_by_name["source_id"] or "",
         endpoint_id=value_by_name["endpoint_id"] or "",
-        dataset_id=value_by_name["dataset_id"] or "",
+        dataset_id=dataset_id,
         evidence_run_id=value_by_name["evidence_run_id"] or "",
-        selected_resources=tuple(
-            sorted(
-                set(
-                    _json_text_list(
-                        _pagination_checkpoint_row_mapping(dataset_row).get(
-                            "selected_resources"
-                        )
-                    )
-                )
-            )
-        ),
+        selected_resources=selected_resources,
         expected_resources=expected_resources,
         recorded_expected_resources=recorded_expected_resources,
     )
@@ -17356,6 +17677,1900 @@ async def _fetch_partitioned_resource_rows(
         fetch_mode="partitioned_paged",
         deadline_reached=state.deadline_reached,
     )
+
+
+def _last_updated_partition_checkpoint_resource_type(resource_type: str) -> str:
+    return f"{resource_type}:{LAST_UPDATED_PARTITION_CHECKPOINT_SUFFIX}"
+
+
+def _last_updated_partition_checkpoint_payload(
+    config: LastUpdatedPartitionConfig,
+    plan: PartitionPlan,
+) -> str:
+    planner_checkpoint = plan.to_dict()
+    control_windows = [
+        {
+            **{
+                key: field_value
+                for key, field_value in window.items()
+                if key != "passes"
+            },
+            "completed_passes": sorted(
+                int(pass_number) for pass_number in window["passes"]
+            ),
+        }
+        for window in planner_checkpoint["windows"]
+    ]
+    return json.dumps(
+        {
+            "version": 1,
+            "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+            "config": config.identity(),
+            "control": {
+                "windows": control_windows,
+                "failure": planner_checkpoint["failure"],
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _partition_checkpoint_control(
+    checkpoint_payload: str | None,
+    config: LastUpdatedPartitionConfig,
+) -> dict[str, Any]:
+    checkpoint_dict = json.loads(checkpoint_payload or "")
+    if not isinstance(checkpoint_dict, dict):
+        raise ValueError("checkpoint identity mismatch")
+    control_dict = checkpoint_dict.get("control")
+    if (
+        checkpoint_dict.get("version") != 1
+        or checkpoint_dict.get("strategy_version")
+        != LAST_UPDATED_PARTITION_STRATEGY_VERSION
+        or checkpoint_dict.get("config") != config.identity()
+        or not isinstance(control_dict, dict)
+    ):
+        raise ValueError("checkpoint identity mismatch")
+    return control_dict
+
+
+def _partition_checkpoint_windows(
+    control_dict: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, tuple[int, ...]]]:
+    control_windows = control_dict.get("windows")
+    if not isinstance(control_windows, list):
+        raise ValueError("checkpoint windows missing")
+    planner_windows: list[dict[str, Any]] = []
+    completed_passes_by_window: dict[str, tuple[int, ...]] = {}
+    for control_window in control_windows:
+        if not isinstance(control_window, dict):
+            raise ValueError("checkpoint window invalid")
+        window_id = control_window.get("window_id")
+        completed_passes = control_window.get("completed_passes")
+        if (
+            not isinstance(window_id, str)
+            or not isinstance(completed_passes, list)
+            or any(
+                isinstance(pass_number, bool) or pass_number not in (1, 2)
+                for pass_number in completed_passes
+            )
+            or completed_passes not in ([], [1], [1, 2])
+        ):
+            raise ValueError("checkpoint pass markers invalid")
+        completed_passes_by_window[window_id] = tuple(completed_passes)
+        planner_windows.append(
+            {
+                **{
+                    key: field_value
+                    for key, field_value in control_window.items()
+                    if key != "completed_passes"
+                },
+                "passes": {},
+            }
+        )
+    return planner_windows, completed_passes_by_window
+
+
+def _partition_plan_from_control(
+    control_dict: dict[str, Any],
+    planner_windows: list[dict[str, Any]],
+    config: LastUpdatedPartitionConfig,
+) -> PartitionPlan:
+    config_identity = config.identity()
+    return PartitionPlan.from_dict(
+        {
+            "version": 1,
+            "config": {
+                "ceiling": config.ceiling,
+                "minimum_width_microseconds": config_identity[
+                    "minimum_width_microseconds"
+                ],
+                "volatile_metadata_paths": list(config.volatile_metadata_paths),
+            },
+            "windows": planner_windows,
+            "failure": control_dict.get("failure"),
+        }
+    )
+
+
+def _restore_partition_pass_markers(
+    plan: PartitionPlan,
+    completed_passes_by_window: dict[str, tuple[int, ...]],
+) -> PartitionPlan:
+    if len(completed_passes_by_window) != len(plan.windows):
+        raise ValueError("checkpoint repeats a window ID")
+    for window_id, completed_passes in completed_passes_by_window.items():
+        window = plan.windows[window_id]
+        if completed_passes and window.count is None:
+            raise ValueError("checkpoint completed an uncounted window")
+        window.passes = {
+            pass_number: WindowPass({}) for pass_number in completed_passes
+        }
+    return plan
+
+
+def _last_updated_partition_plan_from_checkpoint(
+    checkpoint_payload: str | None,
+    config: LastUpdatedPartitionConfig,
+) -> PartitionPlan:
+    try:
+        control_dict = _partition_checkpoint_control(checkpoint_payload, config)
+        planner_windows, completed_passes_by_window = (
+            _partition_checkpoint_windows(control_dict)
+        )
+        restored_plan = _partition_plan_from_control(
+            control_dict,
+            planner_windows,
+            config,
+        )
+        return _restore_partition_pass_markers(
+            restored_plan,
+            completed_passes_by_window,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, PartitionPlanError) as exc:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_invalid"
+        ) from exc
+
+
+def _last_updated_partition_start_hash(
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+) -> str:
+    return _identity_hash(
+        {
+            "resource_type": resource_type,
+            "config": config.identity(),
+        }
+    )
+
+
+def _new_last_updated_partition_plan(
+    config: LastUpdatedPartitionConfig,
+) -> PartitionPlan:
+    root_end = config.root_end()
+    if config.start >= root_end:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_root_cutoff_invalid"
+        )
+    return PartitionPlan.create(
+        config.start,
+        root_end,
+        ceiling=config.ceiling,
+        minimum_width=config.minimum_width,
+        volatile_metadata_paths=config.volatile_metadata_paths,
+    )
+
+
+def _last_updated_partition_initialization(
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+) -> LastUpdatedPartitionInitialization:
+    plan = _new_last_updated_partition_plan(config)
+    return LastUpdatedPartitionInitialization(
+        resource_type=resource_type,
+        checkpoint_resource_type=(
+            _last_updated_partition_checkpoint_resource_type(resource_type)
+        ),
+        start_url_hash=_last_updated_partition_start_hash(
+            resource_type,
+            config,
+        ),
+        checkpoint_payload=_last_updated_partition_checkpoint_payload(
+            config,
+            plan,
+        ),
+    )
+
+
+async def _resume_partition_plan(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    checkpoint: dict[str, Any],
+    start_hash: str,
+) -> LastUpdatedPartitionResume:
+    checkpoint_resource_type = _last_updated_partition_checkpoint_resource_type(
+        resource_type
+    )
+    if (
+        _clean_text(checkpoint.get("start_url_hash")) != start_hash
+        or not _has_matching_pagination_checkpoint_identity(checkpoint, context)
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_lineage_conflict"
+        )
+    previous_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+    if previous_owner_run_id and previous_owner_run_id != context.owner_run_id:
+        await _adopt_pagination_checkpoint_owner(
+            context,
+            checkpoint_resource_type,
+            previous_owner_run_id,
+            checkpoint,
+            start_hash,
+        )
+    return LastUpdatedPartitionResume(
+        plan=_last_updated_partition_plan_from_checkpoint(
+            _clean_text(checkpoint.get("next_url")),
+            config,
+        ),
+        pages_processed=int(checkpoint.get("pages_processed") or 0),
+        rows_processed=int(checkpoint.get("rows_processed") or 0),
+    )
+
+
+async def _initialize_partition_plan(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    start_hash: str,
+) -> LastUpdatedPartitionResume:
+    if context.retry_of_run_id and not context.lineage_verified:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_retry_unverified"
+        )
+    plan = _new_last_updated_partition_plan(config)
+    checkpoint_payload = _last_updated_partition_checkpoint_payload(config, plan)
+    await _clear_checkpoint_dataset_resource_type(
+        context,
+        resource_type,
+    )
+    for pass_number in (1, 2):
+        await _clear_checkpoint_dataset_resource_type(
+            context,
+            _last_updated_partition_fingerprint_resource_type(
+                resource_type,
+                pass_number,
+            ),
+        )
+    await _reset_pagination_checkpoint(
+        context,
+        _last_updated_partition_checkpoint_resource_type(resource_type),
+        checkpoint_payload,
+        start_hash,
+    )
+    return LastUpdatedPartitionResume(plan=plan)
+
+
+async def _load_partition_plan(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+) -> LastUpdatedPartitionResume:
+    start_hash = _last_updated_partition_start_hash(resource_type, config)
+    checkpoint = await _fetch_pagination_checkpoint(
+        context,
+        _last_updated_partition_checkpoint_resource_type(resource_type),
+    )
+    if checkpoint:
+        return await _resume_partition_plan(
+            context,
+            resource_type,
+            config,
+            checkpoint,
+            start_hash,
+        )
+    if context.dataset_id and context.lineage_verified:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_missing"
+        )
+    return await _initialize_partition_plan(
+        context,
+        resource_type,
+        config,
+        start_hash,
+    )
+
+
+async def _save_last_updated_partition_plan(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    plan: PartitionPlan,
+    *,
+    pages_processed: int,
+    rows_processed: int,
+    database_connection: Any | None = None,
+) -> None:
+    checkpoint_resource_type = _last_updated_partition_checkpoint_resource_type(
+        resource_type
+    )
+    database_executor = database_connection or db
+    updated = await database_executor.status(
+        f"""
+        UPDATE {_pagination_checkpoint_table_ref()}
+           SET next_url = :checkpoint_payload,
+               state = :state,
+               pages_processed = :pages_processed,
+               rows_processed = :rows_processed,
+               recent_cursor_hashes = '[]'::jsonb,
+               updated_at = now(),
+               completed_at = CASE WHEN :is_complete THEN now() ELSE NULL END
+         WHERE canonical_api_base = :canonical_api_base
+           AND resource_type = :resource_type
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND owner_run_id = :owner_run_id
+           AND dataset_id IS NOT DISTINCT FROM :dataset_id
+           AND source_ids::jsonb = CAST(:source_ids AS jsonb);
+        """,
+        checkpoint_payload=_last_updated_partition_checkpoint_payload(
+            config,
+            plan,
+        ),
+        state=(
+            PAGINATION_CHECKPOINT_COMPLETE
+            if plan.status is PlanStatus.SUCCEEDED
+            else PAGINATION_CHECKPOINT_ACTIVE
+        ),
+        pages_processed=pages_processed,
+        rows_processed=rows_processed,
+        is_complete=plan.status is PlanStatus.SUCCEEDED,
+        canonical_api_base=context.canonical_api_base,
+        resource_type=checkpoint_resource_type,
+        source_scope_hash=context.source_scope_hash,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        owner_run_id=context.owner_run_id,
+        dataset_id=context.dataset_id,
+        source_ids=json.dumps(context.source_ids),
+    )
+    if _coerce_rowcount(updated) <= 0:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_ownership_lost"
+        )
+
+
+def _format_last_updated_partition_instant(value: datetime.datetime) -> str:
+    return value.astimezone(datetime.UTC).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+
+
+def _last_updated_partition_monotonic() -> float:
+    return time.monotonic()
+
+
+def _last_updated_partition_url(
+    start_url: str,
+    window: TimeWindow,
+    *,
+    page_count: int,
+    count_only: bool,
+) -> str:
+    parsed = urllib.parse.urlsplit(start_url)
+    replaced_names = {
+        "_count",
+        "_lastUpdated",
+        "_sort",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (key, query_value)
+        for key, query_value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key not in replaced_names
+    ]
+    query_items.extend(
+        (
+            (
+                "_lastUpdated",
+                f"ge{_format_last_updated_partition_instant(window.start)}",
+            ),
+            (
+                "_lastUpdated",
+                f"lt{_format_last_updated_partition_instant(window.end)}",
+            ),
+        )
+    )
+    if count_only:
+        query_items.extend(
+            (
+                ("_summary", "count"),
+                ("_total", "accurate"),
+            )
+        )
+    else:
+        query_items.extend(
+            (
+                ("_sort", "_lastUpdated,_id"),
+                ("_count", str(page_count)),
+            )
+        )
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query_items, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+def _is_fhir_searchset_bundle(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("resourceType") == "Bundle"
+        and payload.get("type") == "searchset"
+    )
+
+
+def _last_updated_partition_retry_not_before(
+    source_record: dict[str, Any],
+    request_url: str,
+    status_code: int | None,
+    response_payload: dict[str, Any] | None,
+    fetch_error: str | None,
+) -> str | None:
+    diagnostic = _terminal_source_fetch_diagnostic(
+        source_record,
+        request_url,
+    ) or {}
+    return _molina_quota_retry_not_before(
+        source_record,
+        status_code,
+        response_payload,
+    ) or _transient_source_retry_not_before(
+        status_code,
+        response_payload,
+        fetch_error,
+        retry_count=int(diagnostic.get("retry_count") or 0),
+    )
+
+
+async def _fetch_last_updated_partition_count(
+    source_record: dict[str, Any],
+    request_url: str,
+    *,
+    timeout: int,
+) -> LastUpdatedCountFetch:
+    status_code, response_payload, error, _elapsed = await _fetch_source_json(
+        source_record,
+        request_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or error:
+        failure_error = error or f"http_{status_code}"
+        is_transient = _is_transient_source_fetch_failure(status_code, error)
+        return LastUpdatedCountFetch(
+            observation=(
+                None
+                if is_transient
+                else CountObservation.error(failure_error)
+            ),
+            error=failure_error,
+            transient=is_transient,
+            retry_not_before=(
+                _last_updated_partition_retry_not_before(
+                    source_record,
+                    request_url,
+                    status_code,
+                    response_payload,
+                    error,
+                )
+                if is_transient
+                else None
+            ),
+        )
+    if not _is_fhir_searchset_bundle(response_payload):
+        return LastUpdatedCountFetch(
+            CountObservation.unknown(
+                "count response was not a FHIR searchset Bundle"
+            ),
+            error="non_searchset_count_bundle",
+        )
+    total = response_payload.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return LastUpdatedCountFetch(
+            CountObservation.unknown(
+                "Bundle.total was not an exact non-negative integer"
+            ),
+            error="count_total_not_exact",
+        )
+    return LastUpdatedCountFetch(CountObservation.exact(total))
+
+
+def _last_updated_partition_resource_window_error(
+    resource: dict[str, Any],
+    window: TimeWindow,
+) -> str | None:
+    metadata = resource.get("meta")
+    if not isinstance(metadata, dict):
+        return "resource_meta_missing"
+    last_updated_text = metadata.get("lastUpdated")
+    try:
+        last_updated = parse_utc_instant(last_updated_text)
+    except (PartitionPlanError, TypeError, ValueError):
+        return "resource_last_updated_invalid"
+    if last_updated < window.start or last_updated >= window.end:
+        return "resource_last_updated_outside_window"
+    return None
+
+
+def _last_updated_window_page_failure(
+    source_record: dict[str, Any],
+    request_url: str,
+    status_code: int | None,
+    response_payload: dict[str, Any] | None,
+    fetch_error: str | None,
+) -> LastUpdatedWindowPage:
+    is_transient = _is_transient_source_fetch_failure(
+        status_code,
+        fetch_error,
+    )
+    return LastUpdatedWindowPage(
+        resources=(),
+        next_url=None,
+        error=fetch_error or f"http_{status_code}",
+        transient=is_transient,
+        retry_not_before=(
+            _last_updated_partition_retry_not_before(
+                source_record,
+                request_url,
+                status_code,
+                response_payload,
+                fetch_error,
+            )
+            if is_transient
+            else None
+        ),
+    )
+
+
+def _validated_last_updated_page_resources(
+    response_payload: dict[str, Any],
+    resource_type: str,
+    window: TimeWindow,
+) -> tuple[tuple[dict[str, Any], ...], str | None]:
+    page_resources: list[dict[str, Any]] = []
+    for resource_entry in _bundle_entries(response_payload):
+        fhir_resource = resource_entry.get("resource")
+        if (
+            not isinstance(fhir_resource, dict)
+            or fhir_resource.get("resourceType") != resource_type
+        ):
+            return tuple(page_resources), "unexpected_resource_type"
+        window_error = _last_updated_partition_resource_window_error(
+            fhir_resource,
+            window,
+        )
+        if window_error:
+            return tuple(page_resources), window_error
+        page_resources.append(fhir_resource)
+    return tuple(page_resources), None
+
+
+async def _fetch_last_updated_window_page(
+    source_record: dict[str, Any],
+    resource_type: str,
+    request_url: str,
+    window: TimeWindow,
+    *,
+    timeout: int,
+) -> LastUpdatedWindowPage:
+    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        request_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or fetch_error:
+        return _last_updated_window_page_failure(
+            source_record,
+            request_url,
+            status_code,
+            response_payload,
+            fetch_error,
+        )
+    if not _is_fhir_searchset_bundle(response_payload):
+        return LastUpdatedWindowPage((), None, "non_searchset_bundle")
+    page_resources, validation_error = _validated_last_updated_page_resources(
+        response_payload,
+        resource_type,
+        window,
+    )
+    if validation_error:
+        return LastUpdatedWindowPage(page_resources, None, validation_error)
+    try:
+        next_url = _resolved_fhir_next_url(
+            source_record,
+            request_url,
+            _next_link(response_payload),
+        )
+    except ValueError as exc:
+        return LastUpdatedWindowPage(
+            resources=page_resources,
+            next_url=None,
+            error=str(exc),
+        )
+    return LastUpdatedWindowPage(page_resources, next_url)
+
+
+def _incomplete_last_updated_window_fetch(
+    resources: list[dict[str, Any]],
+    pages_fetched: int,
+    error: str,
+    *,
+    bounded: bool = False,
+    transient: bool = False,
+    retry_not_before: str | None = None,
+    deadline_reached: bool = False,
+) -> LastUpdatedWindowFetch:
+    return LastUpdatedWindowFetch(
+        resources=tuple(resources),
+        pages_fetched=pages_fetched,
+        complete=False,
+        bounded=bounded,
+        error=error,
+        transient=transient,
+        retry_not_before=retry_not_before,
+        deadline_reached=deadline_reached,
+    )
+
+
+def _last_updated_window_stop_result(
+    resources: list[dict[str, Any]],
+    pages_fetched: int,
+    hard_page_limit: int,
+    current_url: str,
+    seen_urls: set[str],
+    deadline_at: float | None,
+) -> LastUpdatedWindowFetch | None:
+    if (
+        deadline_at is not None
+        and _last_updated_partition_monotonic() >= deadline_at
+    ):
+        return _incomplete_last_updated_window_fetch(
+            resources,
+            pages_fetched,
+            "deadline_reached",
+            bounded=True,
+            deadline_reached=True,
+        )
+    if pages_fetched >= hard_page_limit:
+        return _incomplete_last_updated_window_fetch(
+            resources,
+            pages_fetched,
+            "window_page_limit_reached",
+            bounded=True,
+        )
+    request_identity = _pagination_url_identity(current_url)
+    if request_identity in seen_urls:
+        return _incomplete_last_updated_window_fetch(
+            resources,
+            pages_fetched,
+            "pagination_loop_detected",
+        )
+    seen_urls.add(request_identity)
+    return None
+
+
+def _last_updated_window_page_failure_result(
+    resources: list[dict[str, Any]],
+    pages_fetched: int,
+    page: LastUpdatedWindowPage,
+    expected_count: int,
+) -> LastUpdatedWindowFetch | None:
+    if len(resources) + len(page.resources) > expected_count:
+        return _incomplete_last_updated_window_fetch(
+            resources,
+            pages_fetched,
+            "window_resource_ceiling_reached",
+            bounded=True,
+        )
+    resources.extend(page.resources)
+    if not page.error:
+        return None
+    return _incomplete_last_updated_window_fetch(
+        resources,
+        pages_fetched,
+        page.error,
+        transient=page.transient,
+        retry_not_before=page.retry_not_before,
+    )
+
+
+async def _fetch_last_updated_partition_window(
+    source_record: dict[str, Any],
+    resource_type: str,
+    request_url: str,
+    window: TimeWindow,
+    *,
+    timeout: int,
+    cancel_ctx: dict[str, Any] | None,
+    cancel_task: dict[str, Any] | None,
+    deadline_at: float | None,
+) -> LastUpdatedWindowFetch:
+    """Fetch one exact-count window without crossing its resource bounds."""
+    collected_resources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    pages_fetched = 0
+    expected_count = window.count
+    if expected_count is None:
+        return _incomplete_last_updated_window_fetch(
+            collected_resources,
+            pages_fetched,
+            "window_count_missing",
+        )
+    hard_page_limit = min(_max_page_count(), max(1, expected_count))
+    current_url: str | None = request_url
+    while current_url:
+        if cancel_ctx is not None:
+            await raise_if_cancelled(cancel_ctx, cancel_task)
+        stop_result = _last_updated_window_stop_result(
+            collected_resources,
+            pages_fetched,
+            hard_page_limit,
+            current_url,
+            seen_urls,
+            deadline_at,
+        )
+        if stop_result is not None:
+            return stop_result
+        page = await _fetch_last_updated_window_page(
+            source_record,
+            resource_type,
+            current_url,
+            window,
+            timeout=timeout,
+        )
+        pages_fetched += 1
+        page_failure = _last_updated_window_page_failure_result(
+            collected_resources,
+            pages_fetched,
+            page,
+            expected_count,
+        )
+        if page_failure is not None:
+            return page_failure
+        current_url = page.next_url
+    return LastUpdatedWindowFetch(
+        resources=tuple(collected_resources),
+        pages_fetched=pages_fetched,
+        complete=True,
+    )
+
+
+def _last_updated_partition_fingerprint_resource_type(
+    resource_type: str,
+    pass_number: int,
+) -> str:
+    return f"LU:{resource_type}:pass:{pass_number}"
+
+
+def _last_updated_partition_window_proof_hash(
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+) -> str:
+    return _identity_hash(
+        {
+            "resource_type": resource_type,
+            "window_id": window_id,
+            "pass_number": pass_number,
+            "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+        }
+    )
+
+
+def _last_updated_partition_fingerprint_row(
+    row: Any,
+) -> tuple[str, str, str]:
+    row_map = _pagination_checkpoint_row_mapping(row)
+    resource_id = _clean_text(row_map.get("resource_id"))
+    payload = row_map.get("payload_json")
+    if not resource_id or not isinstance(payload, dict):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    window_id = _clean_text(payload.get("window_id"))
+    fingerprint = _clean_text(payload.get("fingerprint"))
+    if not window_id or not fingerprint:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    return resource_id, window_id, fingerprint
+
+
+async def _load_last_updated_partition_window_proof(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    *,
+    database_connection: Any | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    database_executor = database_connection or db
+    fingerprint_rows = await database_executor.all(
+        f"""
+        SELECT resource_id, payload_json
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :fingerprint_resource_type
+           AND payload_hash = :window_proof_hash
+         ORDER BY resource_id;
+        """,
+        dataset_id=context.dataset_id,
+        fingerprint_resource_type=(
+            _last_updated_partition_fingerprint_resource_type(
+                resource_type,
+                pass_number,
+            )
+        ),
+        window_proof_hash=_last_updated_partition_window_proof_hash(
+            resource_type,
+            window_id,
+            pass_number,
+        ),
+    )
+    fingerprints_by_id: dict[str, str] = {}
+    candidate_hashes_by_id: dict[str, str] = {}
+    for fingerprint_row in fingerprint_rows:
+        fingerprint_row_map = _pagination_checkpoint_row_mapping(
+            fingerprint_row
+        )
+        resource_id, observed_window_id, fingerprint = (
+            _last_updated_partition_fingerprint_row(fingerprint_row)
+        )
+        if observed_window_id != window_id or resource_id in fingerprints_by_id:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_fingerprint_row_invalid"
+            )
+        fingerprints_by_id[resource_id] = fingerprint
+        proof_payload = fingerprint_row_map["payload_json"]
+        candidate_payload_hash = _clean_text(
+            proof_payload.get("candidate_payload_hash")
+        )
+        if candidate_payload_hash:
+            candidate_hashes_by_id[resource_id] = candidate_payload_hash
+    return fingerprints_by_id, candidate_hashes_by_id
+
+
+async def _load_last_updated_partition_window_fingerprints(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    *,
+    database_connection: Any | None = None,
+) -> dict[str, str]:
+    """Read one ceiling-bounded pass fingerprint map from keyed staging."""
+    fingerprints_by_id, _candidate_hashes_by_id = (
+        await _load_last_updated_partition_window_proof(
+            context,
+            resource_type,
+            window_id,
+            pass_number,
+            database_connection=database_connection,
+        )
+    )
+    return fingerprints_by_id
+
+
+async def _store_last_updated_partition_window_fingerprints(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    fingerprints: dict[str, str],
+    candidate_hashes_by_id: dict[str, str] | None = None,
+    *,
+    database_connection: Any | None = None,
+) -> None:
+    """Persist one immutable fingerprint proof for a partition pass."""
+    candidate_hashes_by_id = candidate_hashes_by_id or {}
+    if candidate_hashes_by_id and set(candidate_hashes_by_id) != set(
+        fingerprints
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_candidate_hash_mismatch"
+        )
+    if await _has_partition_fingerprint_replay(
+        context,
+        resource_type,
+        window_id,
+        pass_number,
+        fingerprints,
+        candidate_hashes_by_id,
+        database_connection=database_connection,
+    ):
+        return
+    fingerprint_resource_type = (
+        _last_updated_partition_fingerprint_resource_type(
+            resource_type,
+            pass_number,
+        )
+    )
+    await _assert_partition_resource_ids_unique(
+        context,
+        fingerprint_resource_type,
+        window_id,
+        fingerprints,
+        database_connection=database_connection,
+    )
+    window_proof_hash = _last_updated_partition_window_proof_hash(
+        resource_type,
+        window_id,
+        pass_number,
+    )
+    staged_fingerprint_rows = _partition_fingerprint_rows(
+        context,
+        fingerprint_resource_type,
+        window_id,
+        window_proof_hash,
+        fingerprints,
+        candidate_hashes_by_id,
+    )
+    if staged_fingerprint_rows:
+        await _write_last_updated_partition_fingerprint_rows(
+            staged_fingerprint_rows,
+            database_connection=database_connection,
+        )
+
+
+async def _write_last_updated_partition_fingerprint_rows(
+    staged_fingerprint_rows: list[dict[str, Any]],
+    *,
+    database_connection: Any | None,
+) -> None:
+    if database_connection is None:
+        await _upsert_rows(
+            ProviderDirectoryDatasetResource,
+            staged_fingerprint_rows,
+        )
+        return
+    await _upsert_dataset_resource_rows_on_connection(
+        database_connection,
+        staged_fingerprint_rows,
+    )
+
+
+async def _has_partition_fingerprint_replay(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    fingerprints_by_id: dict[str, str],
+    candidate_hashes_by_id: dict[str, str],
+    *,
+    database_connection: Any | None = None,
+) -> bool:
+    existing_fingerprints, existing_candidate_hashes = (
+        await _load_last_updated_partition_window_proof(
+            context,
+            resource_type,
+            window_id,
+            pass_number,
+            database_connection=database_connection,
+        )
+    )
+    if not existing_fingerprints:
+        return False
+    if (
+        existing_fingerprints != fingerprints_by_id
+        or existing_candidate_hashes != candidate_hashes_by_id
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_replay_mismatch"
+        )
+    return True
+
+
+async def _assert_partition_resource_ids_unique(
+    context: PaginationCheckpointContext,
+    fingerprint_resource_type: str,
+    window_id: str,
+    fingerprints_by_id: dict[str, str],
+    *,
+    database_connection: Any | None = None,
+) -> None:
+    if not fingerprints_by_id:
+        return
+    database_executor = database_connection or db
+    conflicting_rows = await database_executor.all(
+        f"""
+        SELECT resource_id, payload_json
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :fingerprint_resource_type
+           AND resource_id = ANY(CAST(:resource_ids AS varchar[]));
+        """,
+        dataset_id=context.dataset_id,
+        fingerprint_resource_type=fingerprint_resource_type,
+        resource_ids=sorted(fingerprints_by_id),
+    )
+    for conflicting_row in conflicting_rows:
+        resource_id, existing_window_id, existing_fingerprint = (
+            _last_updated_partition_fingerprint_row(conflicting_row)
+        )
+        if (
+            existing_window_id != window_id
+            or fingerprints_by_id.get(resource_id) != existing_fingerprint
+        ):
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_duplicate_resource_id"
+            )
+
+
+def _partition_fingerprint_rows(
+    context: PaginationCheckpointContext,
+    fingerprint_resource_type: str,
+    window_id: str,
+    window_proof_hash: str,
+    fingerprints_by_id: dict[str, str],
+    candidate_hashes_by_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    fingerprint_rows: list[dict[str, Any]] = []
+    for resource_id, fingerprint in sorted(fingerprints_by_id.items()):
+        proof_payload_dict = {
+            "window_id": window_id,
+            "fingerprint": fingerprint,
+        }
+        if resource_id in candidate_hashes_by_id:
+            proof_payload_dict["candidate_payload_hash"] = candidate_hashes_by_id[
+                resource_id
+            ]
+        fingerprint_rows.append(
+            {
+                "dataset_id": context.dataset_id,
+                "resource_type": fingerprint_resource_type,
+                "resource_id": resource_id,
+                "payload_hash": window_proof_hash,
+                "payload_json": proof_payload_dict,
+            }
+        )
+    return fingerprint_rows
+
+
+async def _upsert_dataset_resource_rows_on_connection(
+    connection: Any,
+    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> None:
+    if not rows:
+        return
+    table = ProviderDirectoryDatasetResource.__table__
+    primary_keys = ["dataset_id", "resource_type", "resource_id"]
+    row_list = list(rows)
+    batch_size = _max_rows_per_statement(len(row_list[0]))
+    for offset in range(0, len(row_list), batch_size):
+        statement = pg_insert(table).values(
+            row_list[offset : offset + batch_size]
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=primary_keys,
+            set_={
+                "payload_hash": statement.excluded.payload_hash,
+                "payload_json": statement.excluded.payload_json,
+            },
+        )
+        await connection.status(statement)
+
+
+async def _store_partition_pass_proof(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window: TimeWindow,
+    pass_number: int,
+    candidate_hashes_by_id: dict[str, str] | None = None,
+    *,
+    database_connection: Any | None = None,
+) -> None:
+    fingerprints = window.passes[pass_number].resource_fingerprints
+    if pass_number == 2:
+        pass_one_fingerprints = (
+            await _load_last_updated_partition_window_fingerprints(
+                context,
+                resource_type,
+                window.window_id,
+                1,
+                database_connection=database_connection,
+            )
+        )
+        if pass_one_fingerprints != fingerprints:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_twin_pass_mismatch"
+            )
+    await _store_last_updated_partition_window_fingerprints(
+        context,
+        resource_type,
+        window.window_id,
+        pass_number,
+        fingerprints,
+        candidate_hashes_by_id,
+        database_connection=database_connection,
+    )
+
+
+async def _stage_last_updated_partition_window(
+    context: PaginationCheckpointContext,
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    resources: tuple[dict[str, Any], ...],
+    *,
+    run_id: str | None,
+    fetch_url: str,
+) -> LastUpdatedPartitionStage:
+    parsed_rows: list[dict[str, Any]] = []
+    for resource in resources:
+        parsed = parse_fhir_resource(
+            source_record["source_id"],
+            resource,
+            acquisition=FHIRAcquisitionContext(
+                fetch_url=fetch_url,
+                fetch_mode="rest_bundle",
+            ),
+            run_id=run_id,
+        )
+        if parsed is None or parsed[0] is not model:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_resource_parse_failed"
+            )
+        parsed_rows.append(parsed[1])
+    staged_rows = _endpoint_dataset_resource_rows(
+        model,
+        parsed_rows,
+        dataset_id=context.dataset_id,
+    )
+    if len(staged_rows) != len(resources):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_stage_count_mismatch"
+        )
+    return LastUpdatedPartitionStage(
+        rows=tuple(staged_rows),
+        candidate_hashes_by_id={
+            staged_row["resource_id"]: staged_row["payload_hash"]
+            for staged_row in staged_rows
+        },
+    )
+
+
+async def _last_updated_partition_candidate_proof_counts(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> tuple[int, int, int, int]:
+    """Count staged candidates and immutable pass-two proof mismatches."""
+    proof_resource_type = _last_updated_partition_fingerprint_resource_type(
+        resource_type,
+        2,
+    )
+    count_row = await db.first(
+        f"""
+        SELECT
+          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+            WHERE dataset_id = :dataset_id AND resource_type = :resource_type) AS candidate_count,
+          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+            WHERE dataset_id = :dataset_id AND resource_type = :proof_resource_type) AS proof_count,
+          (SELECT COUNT(*)
+             FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} candidate
+             LEFT JOIN {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} proof
+               ON proof.dataset_id = candidate.dataset_id
+              AND proof.resource_type = :proof_resource_type
+              AND proof.resource_id = candidate.resource_id
+            WHERE candidate.dataset_id = :dataset_id
+              AND candidate.resource_type = :resource_type
+              AND (proof.resource_id IS NULL OR
+                   proof.payload_json::jsonb ->> 'candidate_payload_hash'
+                   IS DISTINCT FROM candidate.payload_hash)) AS invalid_candidate_count,
+          (SELECT COUNT(*)
+             FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} proof
+             LEFT JOIN {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} candidate
+               ON candidate.dataset_id = proof.dataset_id
+              AND candidate.resource_type = :resource_type
+              AND candidate.resource_id = proof.resource_id
+            WHERE proof.dataset_id = :dataset_id
+              AND proof.resource_type = :proof_resource_type
+              AND candidate.resource_id IS NULL) AS orphan_proof_count;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+        proof_resource_type=proof_resource_type,
+    )
+    count_map = _pagination_checkpoint_row_mapping(count_row)
+    return tuple(
+        int(count_map.get(count_name) or 0)
+        for count_name in (
+            "candidate_count",
+            "proof_count",
+            "invalid_candidate_count",
+            "orphan_proof_count",
+        )
+    )
+
+
+async def _assert_last_updated_partition_candidate_proof(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    plan: PartitionPlan,
+) -> int:
+    """Require exact candidate/proof counts and immutable payload hashes."""
+    expected_count = sum(window.count or 0 for window in plan.leaf_windows())
+    candidate_count, proof_count, invalid_count, orphan_count = (
+        await _last_updated_partition_candidate_proof_counts(
+            context,
+            resource_type,
+        )
+    )
+    if (
+        candidate_count != expected_count
+        or proof_count != expected_count
+        or invalid_count
+        or orphan_count
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_staged_dataset_mismatch"
+        )
+    return expected_count
+
+
+def _partition_output_rows(
+    staged_row_batch: list[Any],
+    source_record: dict[str, Any],
+    run_id: str,
+) -> list[dict[str, Any]]:
+    observed_at = _now()
+    output_rows: list[dict[str, Any]] = []
+    for staged_row in staged_row_batch:
+        staged_row_map = _pagination_checkpoint_row_mapping(staged_row)
+        current_resource_id = _clean_text(staged_row_map.get("resource_id"))
+        canonical_payload = staged_row_map.get("payload_json")
+        if not current_resource_id or not isinstance(canonical_payload, dict):
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_staged_dataset_invalid"
+            )
+        output_rows.append(
+            {
+                **canonical_payload,
+                "source_id": source_record["source_id"],
+                "resource_id": current_resource_id,
+                "last_seen_run_id": run_id,
+                "observed_at": observed_at,
+                "updated_at": observed_at,
+            }
+        )
+    return output_rows
+
+
+async def _stream_last_updated_partition_staged_rows(
+    context: PaginationCheckpointContext,
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    plan: PartitionPlan,
+    *,
+    run_id: str,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]],
+    row_batch_size: int,
+) -> tuple[int, int]:
+    """Verify proof, then keyset-stream staged rows to the normal writer."""
+    expected_count = await _assert_last_updated_partition_candidate_proof(
+        context,
+        resource_type,
+        plan,
+    )
+    written_count = 0
+    streamed_count = 0
+    after_resource_id = ""
+    while True:
+        staged_row_batch = await db.all(
+            f"""
+            SELECT resource_id, payload_json
+              FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+             WHERE dataset_id = :dataset_id
+               AND resource_type = :resource_type
+               AND resource_id > :after_resource_id
+             ORDER BY resource_id
+             LIMIT :batch_size;
+            """,
+            dataset_id=context.dataset_id,
+            resource_type=resource_type,
+            after_resource_id=after_resource_id,
+            batch_size=max(1, row_batch_size),
+        )
+        if not staged_row_batch:
+            break
+        output_rows = _partition_output_rows(
+            staged_row_batch,
+            source_record,
+            run_id,
+        )
+        written_count += await row_batch_handler(model, output_rows)
+        streamed_count += len(output_rows)
+        after_resource_id = output_rows[-1]["resource_id"]
+    if streamed_count != expected_count:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_stream_count_mismatch"
+        )
+    return streamed_count, written_count
+
+
+def _last_updated_partition_failure_result(
+    model: type,
+    plan: PartitionPlan | None,
+    error: str,
+    *,
+    pages_fetched: int = 0,
+    rows_fetched: int = 0,
+    bounded: bool = False,
+) -> ResourceFetchResult:
+    failure = plan.failure if plan is not None else None
+    failure_error = (
+        f"{failure.code}:{failure.message}"
+        if failure is not None
+        else error
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=rows_fetched,
+        rows_written=0,
+        pages_fetched=pages_fetched,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=bounded,
+        next_url_remaining=not bool(failure),
+        error=f"{LAST_UPDATED_PARTITION_BLOCKED_ERROR}:{failure_error}",
+        fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
+        deadline_reached=error == "deadline_reached",
+    )
+
+
+def _last_updated_partition_retry_result(
+    model: type,
+    state: LastUpdatedPartitionState,
+    error: str,
+    *,
+    retry_not_before: str | None = None,
+    deadline_reached: bool = False,
+) -> ResourceFetchResult:
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=state.rows_fetched,
+        rows_written=0,
+        pages_fetched=state.pages_fetched,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=True,
+        error=f"{LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:{error}",
+        fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
+        deadline_reached=deadline_reached,
+        retry_not_before=retry_not_before,
+    )
+
+
+def _partition_preflight_failure(
+    model: type,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    if fetch_options.per_resource_limit > 0 or fetch_options.page_limit > 0:
+        return _last_updated_partition_failure_result(
+            model,
+            None,
+            "bounded_runtime_limits_not_allowed",
+            bounded=True,
+        )
+    if fetch_options.row_batch_handler is None or fetch_options.retain_rows:
+        return _last_updated_partition_failure_result(
+            model,
+            None,
+            "streaming_output_required",
+        )
+    checkpoint_context = fetch_options.pagination_checkpoint
+    if (
+        not isinstance(checkpoint_context, PaginationCheckpointContext)
+        or not checkpoint_context.dataset_id
+        or not fetch_options.run_id
+    ):
+        return _last_updated_partition_failure_result(
+            model,
+            None,
+            "durable_checkpoint_context_required",
+        )
+    return None
+
+
+async def _prepare_partition_state(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> LastUpdatedPartitionState | ResourceFetchResult:
+    start_url = _resource_start_url(
+        source_record,
+        resource_type,
+        page_count=config.page_count,
+    )
+    if not start_url:
+        return _last_updated_partition_failure_result(
+            model,
+            None,
+            "resource_start_url_missing",
+        )
+    checkpoint_context = fetch_options.pagination_checkpoint
+    assert isinstance(checkpoint_context, PaginationCheckpointContext)
+    resume = await _load_partition_plan(
+        checkpoint_context,
+        resource_type,
+        config,
+    )
+    if resume.plan.status is PlanStatus.FAILED:
+        return _last_updated_partition_failure_result(
+            model,
+            resume.plan,
+            "planner_failed",
+            pages_fetched=resume.pages_processed,
+            rows_fetched=resume.rows_processed,
+        )
+    return LastUpdatedPartitionState(
+        context=checkpoint_context,
+        plan=resume.plan,
+        start_url=start_url,
+        pages_fetched=resume.pages_processed,
+        rows_fetched=resume.rows_processed,
+        deadline_at=(
+            _last_updated_partition_monotonic()
+            + fetch_options.deadline_seconds
+            if fetch_options.deadline_seconds > 0
+            else None
+        ),
+    )
+
+
+def _partition_failure_from_state(
+    model: type,
+    state: LastUpdatedPartitionState,
+    error: str,
+    *,
+    bounded: bool = False,
+) -> ResourceFetchResult:
+    return _last_updated_partition_failure_result(
+        model,
+        state.plan,
+        error,
+        pages_fetched=state.pages_fetched,
+        rows_fetched=state.rows_fetched,
+        bounded=bounded,
+    )
+
+
+async def _saved_partition_retry_result(
+    model: type,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    error: str,
+    *,
+    retry_not_before: str | None = None,
+    deadline_reached: bool = False,
+) -> ResourceFetchResult:
+    await _save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    return _last_updated_partition_retry_result(
+        model,
+        state,
+        error,
+        retry_not_before=retry_not_before,
+        deadline_reached=deadline_reached,
+    )
+
+
+def _last_updated_partition_count_url(
+    state: LastUpdatedPartitionState,
+    config: LastUpdatedPartitionConfig,
+    window: TimeWindow,
+) -> str:
+    return _last_updated_partition_url(
+        state.start_url,
+        window,
+        page_count=config.page_count,
+        count_only=True,
+    )
+
+
+async def _observe_partition_counts(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    """Resolve exact leaf counts, durably retaining retryable progress."""
+    while state.plan.pending_count_windows():
+        if (
+            state.deadline_at is not None
+            and _last_updated_partition_monotonic() >= state.deadline_at
+        ):
+            return await _saved_partition_retry_result(
+                model,
+                resource_type,
+                config,
+                state,
+                "deadline_reached",
+                deadline_reached=True,
+            )
+        window = state.plan.pending_count_windows()[0]
+        count_url = _last_updated_partition_count_url(state, config, window)
+        count_fetch = await _fetch_last_updated_partition_count(
+            source_record,
+            count_url,
+            timeout=fetch_options.timeout,
+        )
+        state.pages_fetched += count_fetch.pages_fetched
+        if count_fetch.transient:
+            return await _saved_partition_retry_result(
+                model,
+                resource_type,
+                config,
+                state,
+                count_fetch.error or "count_fetch_transient",
+                retry_not_before=count_fetch.retry_not_before,
+            )
+        if count_fetch.observation is None:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_count_result_invalid"
+            )
+        state.plan.observe_count(window.window_id, count_fetch.observation)
+        await _save_last_updated_partition_plan(
+            state.context,
+            resource_type,
+            config,
+            state.plan,
+            pages_processed=state.pages_fetched,
+            rows_processed=state.rows_fetched,
+        )
+        if state.plan.status is PlanStatus.FAILED:
+            return _partition_failure_from_state(
+                model,
+                state,
+                "count_failed",
+            )
+    return None
+
+
+async def _restore_pass_one_proof(
+    state: LastUpdatedPartitionState,
+    resource_type: str,
+    window: TimeWindow,
+) -> None:
+    pass_one_fingerprints = (
+        await _load_last_updated_partition_window_fingerprints(
+            state.context,
+            resource_type,
+            window.window_id,
+            1,
+        )
+    )
+    if len(pass_one_fingerprints) != window.count:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_pass_one_missing"
+        )
+    window.passes[1] = WindowPass(pass_one_fingerprints)
+
+
+async def _partition_candidate_hashes(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+    window_fetch: LastUpdatedWindowFetch,
+    pass_number: int,
+    request_url: str,
+) -> LastUpdatedPartitionStage | None:
+    if (
+        pass_number != 2
+        or not window_fetch.complete
+        or window_fetch.bounded
+        or state.plan.failure is not None
+    ):
+        return None
+    assert fetch_options.run_id is not None
+    return await _stage_last_updated_partition_window(
+        state.context,
+        source_record,
+        resource_type,
+        model,
+        window_fetch.resources,
+        run_id=fetch_options.run_id,
+        fetch_url=request_url,
+    )
+
+
+async def _persist_partition_pass(
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    window: TimeWindow,
+    pass_number: int,
+    candidate_stage: LastUpdatedPartitionStage | None,
+) -> None:
+    async with db.acquire() as connection:
+        if state.plan.failure is None:
+            if candidate_stage is not None:
+                await _upsert_dataset_resource_rows_on_connection(
+                    connection,
+                    candidate_stage.rows,
+                )
+            await _store_partition_pass_proof(
+                state.context,
+                resource_type,
+                window,
+                pass_number,
+                (
+                    candidate_stage.candidate_hashes_by_id
+                    if candidate_stage is not None
+                    else None
+                ),
+                database_connection=connection,
+            )
+            window.passes = {
+                completed_pass_number: WindowPass({})
+                for completed_pass_number in window.passes
+            }
+        await _save_last_updated_partition_plan(
+            state.context,
+            resource_type,
+            config,
+            state.plan,
+            pages_processed=state.pages_fetched,
+            rows_processed=state.rows_fetched,
+            database_connection=connection,
+        )
+
+
+def _record_partition_window(
+    state: LastUpdatedPartitionState,
+    window: TimeWindow,
+    pass_number: int,
+    window_fetch: LastUpdatedWindowFetch,
+) -> None:
+    state.pages_fetched += window_fetch.pages_fetched
+    state.rows_fetched += len(window_fetch.resources)
+    state.plan.record_pass(
+        window.window_id,
+        pass_number,
+        window_fetch.resources,
+        complete=window_fetch.complete,
+        bounded=window_fetch.bounded,
+    )
+
+
+async def _fetch_partition_window_for_pass(
+    source_record: dict[str, Any],
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+    window: TimeWindow,
+) -> tuple[str, LastUpdatedWindowFetch]:
+    request_url = _last_updated_partition_url(
+        state.start_url,
+        window,
+        page_count=config.page_count,
+        count_only=False,
+    )
+    window_fetch = await _fetch_last_updated_partition_window(
+        source_record,
+        resource_type,
+        request_url,
+        window,
+        timeout=fetch_options.timeout,
+        cancel_ctx=fetch_options.cancel_ctx,
+        cancel_task=fetch_options.cancel_task,
+        deadline_at=state.deadline_at,
+    )
+    return request_url, window_fetch
+
+
+async def _fetch_partition_pass(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+    window: TimeWindow,
+    pass_number: int,
+) -> ResourceFetchResult | None:
+    """Fetch and atomically persist one twin-pass partition proof."""
+    if pass_number == 2:
+        await _restore_pass_one_proof(state, resource_type, window)
+    request_url, window_fetch = await _fetch_partition_window_for_pass(
+        source_record,
+        resource_type,
+        config,
+        state,
+        fetch_options,
+        window,
+    )
+    if window_fetch.transient or window_fetch.deadline_reached:
+        state.pages_fetched += window_fetch.pages_fetched
+        state.rows_fetched += len(window_fetch.resources)
+        return await _saved_partition_retry_result(
+            model,
+            resource_type,
+            config,
+            state,
+            window_fetch.error or "window_fetch_transient",
+            retry_not_before=window_fetch.retry_not_before,
+            deadline_reached=window_fetch.deadline_reached,
+        )
+    _record_partition_window(state, window, pass_number, window_fetch)
+    candidate_stage = await _partition_candidate_hashes(
+        source_record,
+        resource_type,
+        model,
+        state,
+        fetch_options,
+        window_fetch,
+        pass_number,
+        request_url,
+    )
+    await _persist_partition_pass(
+        resource_type,
+        config,
+        state,
+        window,
+        pass_number,
+        candidate_stage,
+    )
+    if state.plan.status is PlanStatus.FAILED:
+        return _partition_failure_from_state(
+            model,
+            state,
+            window_fetch.error or "window_proof_failed",
+            bounded=window_fetch.bounded,
+        )
+    return None
+
+
+async def _fetch_partition_passes(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult | None:
+    for window in state.plan.leaf_windows():
+        for pass_number in (1, 2):
+            if pass_number in window.passes:
+                continue
+            failure = await _fetch_partition_pass(
+                source_record,
+                resource_type,
+                model,
+                config,
+                state,
+                fetch_options,
+                window,
+                pass_number,
+            )
+            if failure is not None:
+                return failure
+    return None
+
+
+async def _finish_partition_fetch(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    state: LastUpdatedPartitionState,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult:
+    if state.plan.status is not PlanStatus.SUCCEEDED:
+        return _partition_failure_from_state(model, state, "proof_incomplete")
+    row_batch_handler = fetch_options.row_batch_handler
+    run_id = fetch_options.run_id
+    assert row_batch_handler is not None and run_id is not None
+    streamed_count, rows_written = await _stream_last_updated_partition_staged_rows(
+        state.context,
+        source_record,
+        resource_type,
+        model,
+        state.plan,
+        run_id=run_id,
+        row_batch_handler=row_batch_handler,
+        row_batch_size=fetch_options.row_batch_size,
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=streamed_count,
+        rows_written=rows_written,
+        pages_fetched=state.pages_fetched,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+        fetch_mode=LAST_UPDATED_PARTITION_FETCH_MODE,
+    )
+
+
+async def _fetch_last_updated_partition_resource_rows(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    config: LastUpdatedPartitionConfig,
+    fetch_options: LastUpdatedPartitionFetchOptions,
+) -> ResourceFetchResult:
+    preflight_failure = _partition_preflight_failure(model, fetch_options)
+    if preflight_failure is not None:
+        return preflight_failure
+    prepared_state = await _prepare_partition_state(
+        source_record,
+        resource_type,
+        model,
+        config,
+        fetch_options,
+    )
+    if isinstance(prepared_state, ResourceFetchResult):
+        return prepared_state
+    count_failure = await _observe_partition_counts(
+        source_record,
+        resource_type,
+        model,
+        config,
+        prepared_state,
+        fetch_options,
+    )
+    if count_failure is not None:
+        return count_failure
+    pass_failure = await _fetch_partition_passes(
+        source_record,
+        resource_type,
+        model,
+        config,
+        prepared_state,
+        fetch_options,
+    )
+    if pass_failure is not None:
+        return pass_failure
+    return await _finish_partition_fetch(
+        source_record,
+        resource_type,
+        model,
+        prepared_state,
+        fetch_options,
+    )
+
+
 async def _fetch_resource_rows(
     source: dict[str, Any],
     resource_type: str,
@@ -17383,6 +19598,43 @@ async def _fetch_resource_rows(
         and resource_type not in supported_resource_types
     ):
         return None
+    raw_partition_config = _source_metadata(source).get(
+        LAST_UPDATED_PARTITION_METADATA_KEY
+    )
+    partition_acquisition_declared = (
+        isinstance(raw_partition_config, dict)
+        and raw_partition_config.get("enabled") is True
+    )
+    if partition_acquisition_declared:
+        partition_config, partition_config_error = (
+            _last_updated_partition_config(source, resource_type)
+        )
+        if partition_config is not None:
+            return await _fetch_last_updated_partition_resource_rows(
+                source,
+                resource_type,
+                model,
+                partition_config,
+                LastUpdatedPartitionFetchOptions(
+                    per_resource_limit=per_resource_limit,
+                    page_limit=page_limit,
+                    timeout=timeout,
+                    run_id=run_id,
+                    row_batch_handler=row_batch_handler,
+                    row_batch_size=row_batch_size,
+                    retain_rows=retain_rows,
+                    cancel_ctx=cancel_ctx,
+                    cancel_task=cancel_task,
+                    deadline_seconds=deadline_seconds,
+                    pagination_checkpoint=pagination_checkpoint,
+                ),
+            )
+        if partition_config_error != "resource_not_opted_in":
+            return _last_updated_partition_failure_result(
+                model,
+                None,
+                partition_config_error or "resource_not_opted_in",
+            )
     resource_timeout = _source_resource_timeout(source, resource_type, timeout)
     start_urls: list[str] | None = None
     bulk_checkpoint_context = (
@@ -20104,9 +22356,13 @@ def _pagination_checkpoint_context(
     canonical_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
+    last_updated_partition_config = _last_updated_partition_resource_configs(
+        source_record
+    )
     supports_checkpoint = (
         canonical_api_base in PAGINATION_CHECKPOINT_API_BASES
         or _is_amerihealth_caritas_provider_api_base(canonical_api_base)
+        or bool(last_updated_partition_config)
     )
     if not run_id or not source_ids or not supports_checkpoint:
         return None
@@ -20118,17 +22374,23 @@ def _pagination_checkpoint_context(
         if pagination_root_run_id and pagination_root_run_id != run_id:
             raise ValueError("provider_directory_pagination_fresh_root_mismatch")
         acquisition_root_run_id = run_id
-    strategy_version = (
-        UHC_PLAN_GRAPH_STRATEGY_VERSION
-        if canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE
-        else PAGINATION_CHECKPOINT_STRATEGY_VERSION
-    )
+    if last_updated_partition_config:
+        strategy_version = LAST_UPDATED_PARTITION_STRATEGY_VERSION
+    elif canonical_api_base == UHC_PROVIDER_DIRECTORY_BASE:
+        strategy_version = UHC_PLAN_GRAPH_STRATEGY_VERSION
+    else:
+        strategy_version = PAGINATION_CHECKPOINT_STRATEGY_VERSION
+    scope_payload_dict = {
+        "strategy_version": strategy_version,
+        "source_ids": sorted(set(source_ids)),
+        "resource_group": _resource_import_group_key(source_record),
+    }
+    if last_updated_partition_config:
+        scope_payload_dict["last_updated_partition_config"] = (
+            last_updated_partition_config
+        )
     scope_payload = json.dumps(
-        {
-            "strategy_version": strategy_version,
-            "source_ids": sorted(set(source_ids)),
-            "resource_group": _resource_import_group_key(source_record),
-        },
+        scope_payload_dict,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -20353,14 +22615,19 @@ async def _assert_locked_endpoint_candidate(
 ) -> None:
     existing_candidate = await connection.first(
         f"""
-        SELECT dataset_id, acquisition_root_run_id, status, is_current
+        SELECT dataset_id, endpoint_id, acquisition_root_run_id, status,
+               is_current, publication_metadata_json
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id
          FOR UPDATE;
         """,
         dataset_id=candidate.dataset_id,
     )
-    if existing_candidate is not None and not candidate.reused_from_checkpoint:
+    if (
+        existing_candidate is not None
+        and not candidate.reused_from_checkpoint
+        and not candidate.repair_empty_orphan
+    ):
         raise RuntimeError("provider_directory_endpoint_dataset_active_conflict")
     existing_candidate_map = _pagination_checkpoint_row_mapping(
         existing_candidate
@@ -20373,6 +22640,70 @@ async def _assert_locked_endpoint_candidate(
         != candidate.acquisition_root_run_id
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
+    if candidate.repair_empty_orphan:
+        expected_metadata_by_field = {
+            "acquisition_root_run_id": candidate.acquisition_root_run_id,
+            "selected_resources": list(candidate.selected_resources),
+            "source_ids": list(candidate.source_ids),
+        }
+        existing_metadata = existing_candidate_map.get(
+            "publication_metadata_json"
+        )
+        if (
+            not existing_candidate_map
+            or _clean_text(existing_candidate_map.get("endpoint_id"))
+            != candidate.endpoint_id
+            or _clean_text(existing_candidate_map.get("status"))
+            != ENDPOINT_DATASET_ACQUIRING
+            or not isinstance(existing_metadata, dict)
+            or any(
+                existing_metadata.get(key) != expected_field_value
+                for key, expected_field_value in expected_metadata_by_field.items()
+            )
+        ):
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_orphan_identity_mismatch"
+            )
+
+
+async def _assert_empty_endpoint_dataset_orphan(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    if not candidate.repair_empty_orphan:
+        return
+    orphan_counts = await connection.first(
+        f"""
+        SELECT
+          (SELECT count(*)
+             FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+            WHERE dataset_id = :dataset_id) AS resource_count,
+          (SELECT count(*)
+             FROM {_pagination_checkpoint_table_ref()}
+            WHERE dataset_id = :dataset_id
+              AND acquisition_root_run_id = :acquisition_root_run_id)
+            AS pagination_checkpoint_count,
+          (SELECT count(*)
+             FROM {_bulk_acquisition_checkpoint_table_ref()}
+            WHERE dataset_id = :dataset_id
+              AND acquisition_root_run_id = :acquisition_root_run_id)
+            AS bulk_checkpoint_count;
+        """,
+        dataset_id=candidate.dataset_id,
+        acquisition_root_run_id=candidate.acquisition_root_run_id,
+    )
+    orphan_count_map = _pagination_checkpoint_row_mapping(orphan_counts)
+    if any(
+        int(orphan_count_map.get(count_name) or 0)
+        for count_name in (
+            "resource_count",
+            "pagination_checkpoint_count",
+            "bulk_checkpoint_count",
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_orphan_not_empty"
+        )
 
 
 async def _assert_no_conflicting_endpoint_candidate(
@@ -20453,11 +22784,16 @@ async def _upsert_endpoint_dataset_candidate(
 
 async def _ensure_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
+    partition_initializations: tuple[
+        LastUpdatedPartitionInitialization,
+        ...,
+    ] = (),
 ) -> None:
     """Serialize and initialize one non-current endpoint dataset candidate."""
     metadata = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
+        "expected_resources": list(candidate.expected_resources),
         "source_ids": list(candidate.source_ids),
     }
     async with db.acquire() as connection:
@@ -20466,6 +22802,7 @@ async def _ensure_endpoint_dataset_candidate(
             endpoint_id=candidate.endpoint_id,
         )
         await _assert_locked_endpoint_candidate(connection, candidate)
+        await _assert_empty_endpoint_dataset_orphan(connection, candidate)
         await _assert_no_conflicting_endpoint_candidate(connection, candidate)
         await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
         if not candidate.reused_from_checkpoint:
@@ -20481,6 +22818,26 @@ async def _ensure_endpoint_dataset_candidate(
                 dataset_id=candidate.dataset_id,
                 acquisition_root_run_id=candidate.acquisition_root_run_id,
             )
+            checkpoint_context = candidate.checkpoint_context
+            if partition_initializations and not isinstance(
+                checkpoint_context,
+                PaginationCheckpointContext,
+            ):
+                raise RuntimeError(
+                    "provider_directory_last_updated_partition_checkpoint_context_missing"
+                )
+            for initialization in partition_initializations:
+                assert isinstance(
+                    checkpoint_context,
+                    PaginationCheckpointContext,
+                )
+                await _reset_pagination_checkpoint(
+                    checkpoint_context,
+                    initialization.checkpoint_resource_type,
+                    initialization.checkpoint_payload,
+                    initialization.start_url_hash,
+                    database_connection=connection,
+                )
 
 
 async def _clear_uncheckpointed_endpoint_dataset_candidate(
@@ -20539,14 +22896,14 @@ def _endpoint_dataset_acquisition_root(
     return acquisition_root_run_id
 
 
-def _assert_endpoint_dataset_selection(
+def _should_repair_empty_endpoint_dataset_orphan(
     existing_dataset_map: dict[str, Any],
     endpoint_id: str,
     acquisition_root_run_id: str | None,
     checkpoint_dataset_id: str | None,
     retry_of_run_id: str | None,
     checkpoint_context: PaginationCheckpointContext | None,
-) -> None:
+) -> bool:
     if (
         existing_dataset_map
         and _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
@@ -20564,11 +22921,53 @@ def _assert_endpoint_dataset_selection(
     }:
         raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
     if existing_dataset_map and checkpoint_dataset_id is None:
-        raise RuntimeError(
-            "provider_directory_endpoint_dataset_uncheckpointed_candidate_exists"
-        )
+        if existing_status != ENDPOINT_DATASET_ACQUIRING:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_uncheckpointed_candidate_exists"
+            )
+        return True
     if retry_of_run_id and checkpoint_context is not None and not existing_dataset_map:
         raise RuntimeError("provider_directory_endpoint_dataset_retry_candidate_missing")
+    return False
+
+
+def _published_endpoint_dataset_selection(
+    existing_dataset_map: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+    acquisition_root_run_id: str | None,
+) -> EndpointDatasetCandidateSelection | None:
+    if not existing_dataset_map:
+        return None
+    existing_status = _clean_text(existing_dataset_map.get("status"))
+    is_current = existing_dataset_map.get("is_current") is True
+    if existing_status == ENDPOINT_DATASET_SUPERSEDED:
+        raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
+    if not (is_current or existing_status == ENDPOINT_DATASET_PUBLISHED):
+        return None
+    if not is_current or existing_status != ENDPOINT_DATASET_PUBLISHED:
+        raise RuntimeError("provider_directory_endpoint_dataset_finalized_state_invalid")
+    if (
+        _clean_text(existing_dataset_map.get("endpoint_id")) != endpoint_id
+        or _clean_text(existing_dataset_map.get("acquisition_root_run_id"))
+        != acquisition_root_run_id
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_root_mismatch")
+    published_metadata = existing_dataset_map.get("publication_metadata_json")
+    if not isinstance(published_metadata, dict):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_published_metadata_invalid"
+        )
+    return EndpointDatasetCandidateSelection(
+        dataset_id=dataset_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+        previous_dataset_id=_clean_text(
+            existing_dataset_map.get("previous_dataset_id")
+        ),
+        reused_from_checkpoint=False,
+        already_published=True,
+        published_metadata=published_metadata,
+    )
 
 
 async def _previous_endpoint_dataset_id(
@@ -20608,6 +23007,35 @@ async def _select_endpoint_dataset_candidate(
         selected_resources,
         owner_key,
     )
+    existing_dataset_map = await _endpoint_dataset_state(dataset_id)
+    published_selection = _published_endpoint_dataset_selection(
+        existing_dataset_map,
+        dataset_id,
+        endpoint_id,
+        acquisition_root_run_id,
+    )
+    if published_selection is not None:
+        return published_selection
+    return await _select_resumable_endpoint_dataset_candidate(
+        existing_dataset_map,
+        dataset_id,
+        endpoint_id,
+        selected_resources,
+        acquisition_root_run_id,
+        retry_of_run_id,
+        checkpoint_context,
+    )
+
+
+async def _select_resumable_endpoint_dataset_candidate(
+    existing_dataset_map: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+    acquisition_root_run_id: str | None,
+    retry_of_run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> EndpointDatasetCandidateSelection:
     checkpoint_dataset_id = await _checkpoint_candidate_dataset_id(
         checkpoint_context,
         endpoint_id,
@@ -20615,10 +23043,7 @@ async def _select_endpoint_dataset_candidate(
     )
     if checkpoint_dataset_id and checkpoint_dataset_id != dataset_id:
         raise RuntimeError("provider_directory_endpoint_dataset_lineage_mismatch")
-    if retry_of_run_id and checkpoint_context and not checkpoint_dataset_id:
-        raise RuntimeError("provider_directory_endpoint_dataset_retry_unverified")
-    existing_dataset_map = await _endpoint_dataset_state(dataset_id)
-    _assert_endpoint_dataset_selection(
+    should_repair_empty_orphan = _should_repair_empty_endpoint_dataset_orphan(
         existing_dataset_map,
         endpoint_id,
         acquisition_root_run_id,
@@ -20626,6 +23051,13 @@ async def _select_endpoint_dataset_candidate(
         retry_of_run_id,
         checkpoint_context,
     )
+    if (
+        retry_of_run_id
+        and checkpoint_context
+        and not checkpoint_dataset_id
+        and not should_repair_empty_orphan
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_retry_unverified")
     previous_dataset_id = await _previous_endpoint_dataset_id(
         existing_dataset_map,
         endpoint_id,
@@ -20636,7 +23068,123 @@ async def _select_endpoint_dataset_candidate(
         acquisition_root_run_id=acquisition_root_run_id,
         previous_dataset_id=previous_dataset_id,
         reused_from_checkpoint=checkpoint_dataset_id is not None,
+        repair_empty_orphan=should_repair_empty_orphan,
     )
+
+
+def _assert_published_endpoint_dataset_replay(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    metadata = candidate.published_metadata
+    if not isinstance(metadata, dict):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_published_metadata_invalid"
+        )
+    expected_identity_by_field = {
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "selected_resources": list(candidate.selected_resources),
+        "expected_resources": list(candidate.expected_resources),
+        "source_ids": list(candidate.source_ids),
+    }
+    if any(
+        metadata.get(key) != expected_field_value
+        for key, expected_field_value in expected_identity_by_field.items()
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_published_identity_mismatch"
+        )
+    if not isinstance(metadata.get("resource_diagnostics"), dict):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_published_diagnostics_invalid"
+        )
+
+
+def _candidate_partition_initializations(
+    source_records: list[dict[str, Any]],
+    candidate: EndpointDatasetCandidate,
+) -> tuple[LastUpdatedPartitionInitialization, ...]:
+    if candidate.reused_from_checkpoint:
+        return ()
+    partition_source = _compatibility_storage_source(source_records)
+    initializations: list[LastUpdatedPartitionInitialization] = []
+    for resource_type in candidate.selected_resources:
+        config, config_error = _last_updated_partition_config(
+            partition_source,
+            resource_type,
+        )
+        if config is None:
+            if config_error == "resource_not_opted_in":
+                continue
+            raise RuntimeError(
+                f"provider_directory_last_updated_partition_{config_error}"
+            )
+        initializations.append(
+            _last_updated_partition_initialization(resource_type, config)
+        )
+    if initializations and not isinstance(
+        candidate.checkpoint_context,
+        PaginationCheckpointContext,
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_checkpoint_context_missing"
+        )
+    return tuple(initializations)
+
+
+def _build_endpoint_dataset_candidate(
+    source_records: list[dict[str, Any]],
+    endpoint_id: str,
+    selected_resources: tuple[str, ...],
+    expected_resources: tuple[str, ...],
+    selection: EndpointDatasetCandidateSelection,
+    run_id: str | None,
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> EndpointDatasetCandidate:
+    bound_checkpoint_context = (
+        replace(
+            checkpoint_context,
+            endpoint_id=endpoint_id,
+            dataset_id=selection.dataset_id,
+            lineage_verified=True,
+        )
+        if checkpoint_context is not None
+        else None
+    )
+    source_ids = tuple(
+        sorted(
+            source_id
+            for source_record in source_records
+            if (source_id := _clean_text(source_record.get("source_id")))
+        )
+    )
+    return EndpointDatasetCandidate(
+        endpoint_id=endpoint_id,
+        dataset_id=selection.dataset_id,
+        acquisition_root_run_id=selection.acquisition_root_run_id,
+        source_ids=source_ids,
+        selected_resources=selected_resources,
+        import_run_id=run_id,
+        previous_dataset_id=selection.previous_dataset_id,
+        expected_resources=expected_resources,
+        checkpoint_context=bound_checkpoint_context,
+        reused_from_checkpoint=selection.reused_from_checkpoint,
+        repair_empty_orphan=selection.repair_empty_orphan,
+        already_published=selection.already_published,
+        published_metadata=selection.published_metadata,
+    )
+
+
+async def _initialize_endpoint_dataset_candidate(
+    candidate: EndpointDatasetCandidate,
+    partition_initializations: tuple[LastUpdatedPartitionInitialization, ...],
+) -> None:
+    if partition_initializations:
+        await _ensure_endpoint_dataset_candidate(
+            candidate,
+            partition_initializations,
+        )
+        return
+    await _ensure_endpoint_dataset_candidate(candidate)
 
 
 async def _prepare_endpoint_dataset_candidate(
@@ -20664,35 +23212,26 @@ async def _prepare_endpoint_dataset_candidate(
         pagination_root_run_id=pagination_root_run_id,
         checkpoint_context=checkpoint_context,
     )
-    bound_checkpoint_context = (
-        replace(
-            checkpoint_context,
-            endpoint_id=endpoint_id,
-            dataset_id=selection.dataset_id,
-            lineage_verified=True,
-        )
-        if checkpoint_context is not None
-        else None
+    candidate = _build_endpoint_dataset_candidate(
+        source_records,
+        endpoint_id,
+        selected_resources,
+        expected_resources,
+        selection,
+        run_id,
+        checkpoint_context,
     )
-    candidate = EndpointDatasetCandidate(
-        endpoint_id=endpoint_id,
-        dataset_id=selection.dataset_id,
-        acquisition_root_run_id=selection.acquisition_root_run_id,
-        source_ids=tuple(
-            sorted(
-                source_id
-                for source_record in source_records
-                if (source_id := _clean_text(source_record.get("source_id")))
-            )
-        ),
-        selected_resources=selected_resources,
-        import_run_id=run_id,
-        previous_dataset_id=selection.previous_dataset_id,
-        expected_resources=expected_resources,
-        checkpoint_context=bound_checkpoint_context,
-        reused_from_checkpoint=selection.reused_from_checkpoint,
+    if candidate.already_published:
+        _assert_published_endpoint_dataset_replay(candidate)
+        return candidate
+    partition_initializations = _candidate_partition_initializations(
+        source_records,
+        candidate,
     )
-    await _ensure_endpoint_dataset_candidate(candidate)
+    await _initialize_endpoint_dataset_candidate(
+        candidate,
+        partition_initializations,
+    )
     return candidate
 
 
@@ -20710,10 +23249,22 @@ def _endpoint_dataset_selected_resources(
     unique_requested_resources = list(dict.fromkeys(requested_resources))
     eligible_resources = supported_resources
     if fully_enumerable_resources is not None:
+        partition_resources = {
+            resource_type
+            for resource_type in _last_updated_partition_resource_configs(
+                source_record
+            )
+            if resource_type in DEFAULT_RESOURCES
+            and _last_updated_partition_config(source_record, resource_type)[0]
+            is not None
+        }
+        enumerable_resources = fully_enumerable_resources.union(
+            partition_resources
+        )
         eligible_resources = (
-            fully_enumerable_resources
+            enumerable_resources
             if eligible_resources is None
-            else eligible_resources.intersection(fully_enumerable_resources)
+            else eligible_resources.intersection(enumerable_resources)
         )
     if eligible_resources is None:
         return unique_requested_resources
@@ -21005,8 +23556,11 @@ async def _reset_pagination_checkpoint(
     resource_type: str,
     start_url: str,
     start_url_hash: str,
+    *,
+    database_connection: Any | None = None,
 ) -> None:
-    await db.status(
+    database_executor = database_connection or db
+    await database_executor.status(
         _pagination_checkpoint_reset_sql(),
         canonical_api_base=context.canonical_api_base,
         resource_type=resource_type,
@@ -21962,8 +24516,9 @@ async def _mark_endpoint_dataset_candidate(
            SET status = :status,
                resource_count = (
                     SELECT count(*)
-                      FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
+                     FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
                      WHERE resource.dataset_id = dataset.dataset_id
+                       AND resource.resource_type NOT LIKE 'LU:%:pass:%'
                ),
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
          WHERE dataset.dataset_id = :dataset_id
@@ -22007,6 +24562,7 @@ def _endpoint_dataset_hash_page_sql(has_cursor: bool) -> str:
         SELECT resource_type, resource_id, payload_hash
           FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
          WHERE dataset_id = :dataset_id
+           AND resource_type NOT LIKE 'LU:%:pass:%'
            {cursor_filter}
          ORDER BY resource_type, resource_id
          LIMIT :batch_size;
@@ -22265,6 +24821,41 @@ async def _validated_endpoint_bulk_transaction_times(
     return candidate_transaction_times
 
 
+async def _clear_published_endpoint_partition_state(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    checkpoint_context = candidate.checkpoint_context
+    if not isinstance(checkpoint_context, PaginationCheckpointContext):
+        return
+    await connection.status(
+        f"""
+        DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type LIKE 'LU:%:pass:%';
+        """,
+        dataset_id=candidate.dataset_id,
+    )
+    await connection.status(
+        f"""
+        DELETE FROM {_pagination_checkpoint_table_ref()}
+         WHERE dataset_id = :dataset_id
+           AND canonical_api_base = :canonical_api_base
+           AND source_scope_hash = :source_scope_hash
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND resource_type = ANY(CAST(:resource_types AS varchar[]));
+        """,
+        dataset_id=candidate.dataset_id,
+        canonical_api_base=checkpoint_context.canonical_api_base,
+        source_scope_hash=checkpoint_context.source_scope_hash,
+        acquisition_root_run_id=checkpoint_context.acquisition_root_run_id,
+        resource_types=[
+            _last_updated_partition_checkpoint_resource_type(resource_type)
+            for resource_type in candidate.selected_resources
+        ],
+    )
+
+
 async def _promote_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
@@ -22309,11 +24900,13 @@ async def _promote_endpoint_dataset_candidate(
             resource_count,
             metadata,
         )
+        await _clear_published_endpoint_partition_state(connection, candidate)
     return {
         "dataset_id": candidate.dataset_id,
         "previous_dataset_id": previous_dataset_id,
         "dataset_hash": dataset_hash,
         "resource_count": resource_count,
+        "published": True,
     }
 
 
@@ -22324,7 +24917,10 @@ async def _finalize_endpoint_dataset_candidate(
     if candidate is None:
         return None
     if _is_endpoint_dataset_publishable(candidate, diagnostics):
-        return await _promote_endpoint_dataset_candidate(candidate, diagnostics)
+        return await _promote_endpoint_dataset_candidate(
+            candidate,
+            diagnostics,
+        )
     status = (
         ENDPOINT_DATASET_FAILED
         if any(diagnostic.get("error") for diagnostic in diagnostics.values())
@@ -22422,6 +25018,34 @@ ResourceImportGroupResult = tuple[
 ]
 
 
+def _published_endpoint_dataset_import_summary(
+    candidate: EndpointDatasetCandidate,
+) -> ResourceImportGroupResult:
+    _assert_published_endpoint_dataset_replay(candidate)
+    assert candidate.published_metadata is not None
+    persisted_diagnostics = candidate.published_metadata[
+        "resource_diagnostics"
+    ]
+    diagnostics_by_resource = {
+        resource_type: dict(persisted_diagnostics[resource_type])
+        for resource_type in candidate.selected_resources
+        if isinstance(persisted_diagnostics.get(resource_type), dict)
+    }
+    if set(diagnostics_by_resource) != set(candidate.selected_resources):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_published_diagnostics_incomplete"
+        )
+    return (
+        list(candidate.source_ids),
+        diagnostics_by_resource,
+        {resource_type: 0 for resource_type in candidate.selected_resources},
+        {},
+        {},
+        {},
+        {},
+    )
+
+
 async def _mark_failed_endpoint_dataset_without_masking(
     candidate: EndpointDatasetCandidate | None,
     diagnostics_by_resource: dict[str, dict[str, Any]],
@@ -22478,7 +25102,7 @@ async def _import_resources(
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     for source_record in sources:
-        _assert_resource_acquisition_allowed(source_record)
+        _assert_resource_acquisition_allowed(source_record, resources)
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
         sources,
@@ -23119,6 +25743,10 @@ async def _import_resources(
                             ),
                         )
                     )
+                    if candidate is not None and candidate.already_published:
+                        return _published_endpoint_dataset_import_summary(
+                            candidate
+                        )
                     try:
                         import_summary = await import_one_group(
                             prepared_source_records
@@ -23479,6 +26107,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 open_only=open_only,
                 include_auth_required=include_auth_required,
                 checkpoint_retry_source_ids=checkpoint_retry_source_ids,
+                requested_resource_types=resources,
             )
             metrics.update(selection_metrics)
             if requested_source_ids and not importable:
