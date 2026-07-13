@@ -979,6 +979,7 @@ async def _copy_manifest_files_direct_with_progress(
     total_steps: int,
     emitted_rows: int | None,
 ) -> dict[str, Any]:
+    """Copy manifest worker files directly while reporting publish progress."""
     existing_paths = _ptg2_existing_manifest_copy_paths(input_paths)
     input_bytes = sum(input_path.stat().st_size for input_path in existing_paths)
     copy_tasks = max(_env_int(PTG2_MANIFEST_DIRECT_COPY_TASKS_ENV, 8), 1)
@@ -1004,6 +1005,7 @@ async def _copy_manifest_files_direct_with_progress(
         semaphore = asyncio.Semaphore(copy_tasks)
 
         async def copy_one(input_path: Path) -> None:
+            """Copy one manifest worker file under the shared concurrency limit."""
             async with semaphore:
                 await copy_func(input_path, target_table=target_table)
 
@@ -1155,6 +1157,7 @@ async def _merge_and_copy_ptg2_manifest_files(
     successful_files: list[dict[str, Any]],
     manifest_stage_table: str,
 ) -> dict[str, Any]:
+    """Merge deferred PTG2 manifest shards and copy them into stage tables."""
     manifest_serving_copy_kind, manifest_serving_copy_func, use_direct_lean_copy = _manifest_serving_copy_settings()
     copy_kinds = [
         manifest_serving_copy_kind,
@@ -1456,6 +1459,7 @@ async def _parse_in_network_file_serving_only(
     ptg2_manifest_stage_table: str | None = None,
     source_network_names: list[str] | str | None = None,
 ) -> dict[str, Any]:
+    """Parse one in-network file into manifest-backed serving artifacts."""
     if not ptg2_manifest_stage_table:
         raise RuntimeError("PTG imports require manifest serving stage tables")
     if rust_stage_tables:
@@ -1589,6 +1593,7 @@ async def _parse_in_network_file_serving_only(
     }
 
     def emit_copy_status(status: str, *, kind: str, copy_file: Path, rows: int, target_table: str | None, started_at: float | None = None) -> None:
+        """Emit structured status for one manifest shard copy."""
         payload: dict[str, Any] = {
             "event": f"PTG2_COPY_SHARD_{status}",
             "kind": kind,
@@ -1601,6 +1606,7 @@ async def _parse_in_network_file_serving_only(
         _emit_screen_line(json.dumps(payload, sort_keys=True))
 
     async def copy_ready_manifest_serving_file(copy_row: dict[str, Any]) -> None:
+        """Copy or defer one ready manifest serving shard."""
         raw_copy_path = str(copy_row.get("path") or "").strip()
         if not raw_copy_path:
             return
@@ -1624,6 +1630,7 @@ async def _parse_in_network_file_serving_only(
         copy_file.unlink(missing_ok=True)
 
     async def copy_ready_manifest_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
+        """Copy or defer one ready manifest dictionary shard."""
         raw_copy_path = str(copy_row.get("path") or "").strip()
         if not raw_copy_path:
             return
@@ -1659,6 +1666,7 @@ async def _parse_in_network_file_serving_only(
         copy_file.unlink(missing_ok=True)
 
     async def wait_for_some_copy_tasks(force: bool = False) -> None:
+        """Drain ready manifest copy tasks when the task window fills."""
         if not compact_copy_tasks:
             return
         if force:
@@ -1859,6 +1867,7 @@ async def _parse_in_network_items(
     source_url: str,
     max_items: int | None = None,
 ) -> None:
+    """Parse legacy in-network items into normalized staging rows."""
     provider_cls = classes["PTGProviderGroup"]
     item_cls = classes["PTGInNetworkItem"]
     billing_cls = classes["PTGBillingCode"]
@@ -2111,6 +2120,7 @@ async def _parse_in_network_file_single_pass(
 
     with open_json_artifact_stream(file_path) as afp:
         def progress_callback() -> None:
+            """Report progress while scanning one in-network artifact."""
             _maybe_log_artifact_progress(
                 file_path,
                 afp,
@@ -2391,6 +2401,7 @@ async def _parse_in_network_file_compact(
     import_month: datetime.date,
     max_items: int | None = None,
 ) -> dict[str, Any]:
+    """Parse one in-network file into compact PTG2 rows."""
     plan_fields = _derive_plan_fields(meta, plan_info)
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     context_row = _ptg2_context_row(plan_fields, import_month, source_version)
@@ -2429,6 +2440,7 @@ async def _parse_in_network_file_compact(
 
     with open_json_artifact_stream(file_path) as afp:
         def progress_callback() -> None:
+            """Report progress while scanning one compact artifact."""
             _maybe_log_artifact_progress(
                 file_path,
                 afp,
@@ -2738,6 +2750,7 @@ async def _process_table_of_contents(
     keep_partial_artifacts: bool | None = None,
     raise_on_error: bool = False,
 ) -> list[dict[str, Any]]:
+    """Download a TOC and build filtered in-network file jobs."""
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
     jobs: list[dict[str, Any]] = []
@@ -3030,6 +3043,7 @@ async def _process_in_network_file(
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
+    """Download and process one in-network file job."""
     url = job["url"]
     description = job.get("description")
     plan_info = job.get("plan_info")
@@ -3819,6 +3833,7 @@ async def main(
         setup_stage_timer.mark("legacy_dynamic_tables")
 
         async def ensure_dynamic_tables(class_names: set[str] | frozenset[str]) -> None:
+            """Create dynamic PTG tables required by the current import path."""
             missing_names = set(class_names) - prepared_dynamic_table_names
             if not missing_names:
                 return
@@ -3973,6 +3988,7 @@ async def main(
         processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
 
         async def record_file_result(result: PTG2FileProcessResult | None) -> None:
+            """Record one completed file result and update live progress."""
             if result is None:
                 return
             if result.success:
@@ -3994,6 +4010,7 @@ async def main(
                 failed_files.append(asdict(result))
 
         async def drain_processing_tasks(*, force: bool = False) -> None:
+            """Drain completed file-processing tasks at the concurrency boundary."""
             if not processing_tasks:
                 return
             if force:
@@ -4008,6 +4025,7 @@ async def main(
                 await record_file_result(task.result())
 
         def file_progress_context(job: dict[str, Any], *, start_pct: float, end_pct: float) -> dict[str, Any]:
+            """Map one file job onto its share of overall progress."""
             try:
                 job_index = max(int(job.get("_ptg_progress_index") or 0), 0)
             except (TypeError, ValueError):
@@ -4023,6 +4041,7 @@ async def main(
             }
 
         async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
+            """Process one downloaded artifact with scoped live progress."""
             job = downloaded.job
             token = set_live_progress_context(**file_progress_context(job, start_pct=20.0, end_pct=90.0))
             try:

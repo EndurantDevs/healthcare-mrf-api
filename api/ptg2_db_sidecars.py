@@ -395,6 +395,7 @@ class PTG2DbArtifactReader:
         self._byte_count = _metadata_int(self.entry, "byte_count", -1)
 
     async def byte_count(self) -> int:
+        """Return the stored artifact size, querying chunk metadata when needed."""
         if self._byte_count >= 0:
             return self._byte_count
         qualified_chunks = f"{_quote_ident(self.schema_name)}.ptg2_artifact_blob_chunk"
@@ -501,6 +502,7 @@ class PTG2DbArtifactReader:
         return chunks_by_number
 
     async def read_at(self, offset: int, length: int) -> bytes:
+        """Read and validate an exact byte range from chunked artifact storage."""
         offset = int(offset)
         length = int(length)
         if offset < 0 or length < 0:
@@ -633,6 +635,7 @@ class PTG2DbArtifactReader:
 
 
 def db_artifact_entry_available(entry: Mapping[str, Any] | None) -> bool:
+    """Return whether an entry references a supported database artifact."""
     return bool(entry and ptg2_artifact_id_from_db_uri(str(entry.get("storage_uri") or "")))
 
 
@@ -1843,6 +1846,7 @@ async def lookup_serving_binary_by_provider_set_patterns_from_db(
     *,
     code_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingProviderSetPattern, ...]:
+    """Load binary serving patterns for one provider set."""
     patterns_by_provider_set = await lookup_serving_binary_by_provider_sets_patterns_from_db(
         session,
         table_name,
@@ -1859,6 +1863,7 @@ async def lookup_serving_binary_by_provider_sets_patterns_from_db(
     *,
     code_keys: Iterable[int] | None = None,
 ) -> dict[int, tuple[PTG2ServingProviderSetPattern, ...]]:
+    """Load binary serving patterns for multiple provider sets."""
     normalized_provider_set_keys = tuple(
         sorted({int(provider_set_key) for provider_set_key in provider_set_keys})
     )
@@ -1918,6 +1923,7 @@ async def lookup_serving_binary_by_provider_set_from_db(
     *,
     code_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingSidecarRow, ...]:
+    """Expand binary serving patterns into rows for one provider set."""
     patterns = await lookup_serving_binary_by_provider_set_patterns_from_db(
         session,
         table_name,
@@ -2221,6 +2227,7 @@ async def lookup_global_sidecar_members_many_from_db(
     max_members: int | None = None,
     require_index_fences: bool = False,
 ) -> dict[bytes, tuple[bytes, ...]]:
+    """Load global membership sidecar members for multiple owners."""
     owner_ids = tuple(dict.fromkeys(_normalize_global_id(owner) for owner in owners))
     if not owner_ids:
         return {}
@@ -2384,6 +2391,7 @@ async def lookup_global_sidecar_members_from_db(
     schema_name: str,
     max_members: int | None = None,
 ) -> tuple[bytes, ...]:
+    """Load global membership sidecar members for one owner."""
     owner_id = _normalize_global_id(owner)
     result = await lookup_global_sidecar_members_many_from_db(
         session,
@@ -2506,6 +2514,7 @@ async def lookup_serving_by_code_sidecar_from_db(
     schema_name: str,
     provider_set_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingSidecarRow, ...]:
+    """Load serving sidecar rows for one code key."""
     reader = PTG2DbArtifactReader(session, entry, schema_name=schema_name)
     _header, price_start, body_start, body_offset, body_len, row_count, price_count = await _lookup_serving_block(
         reader,
@@ -2556,6 +2565,7 @@ async def lookup_serving_by_provider_set_patterns_from_db(
     schema_name: str,
     code_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingProviderSetPattern, ...]:
+    """Load serving sidecar patterns for one provider set."""
     reader = PTG2DbArtifactReader(session, entry, schema_name=schema_name)
     _header, price_start, body_start, body_offset, body_len, pattern_count, price_count = await _lookup_serving_block(
         reader,
@@ -2625,6 +2635,7 @@ async def lookup_serving_by_provider_set_sidecar_from_db(
     schema_name: str,
     code_keys: Iterable[int] | None = None,
 ) -> tuple[PTG2ServingSidecarRow, ...]:
+    """Expand serving sidecar patterns into rows for one provider set."""
     patterns = await lookup_serving_by_provider_set_patterns_from_db(
         session,
         entry,

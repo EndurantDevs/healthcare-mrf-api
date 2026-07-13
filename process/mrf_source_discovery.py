@@ -9386,17 +9386,16 @@ async def _resolve_anthem_s3_employer_files(
     lookup_url = urljoin(
         base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{ein_digits}.json"
     )
-    head = await _head_url(lookup_url, session)
-    if head.get("status") == "http_error":
-        raise ValueError(
-            "no current Anthem employer MRF result for EIN "
-            f"{employer_ein} (HTTP {head.get('http_status')})"
+    try:
+        employer_result = await _fetch_json(
+            lookup_url,
+            max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
+            session=session,
         )
-    employer_result = await _fetch_json(
-        lookup_url,
-        max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
-        session=session,
-    )
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        raise ValueError(
+            f"no current Anthem employer MRF result for EIN {employer_ein}"
+        ) from exc
     crawl_targets = _anthem_s3_employer_targets(
         source_row,
         employer_result,

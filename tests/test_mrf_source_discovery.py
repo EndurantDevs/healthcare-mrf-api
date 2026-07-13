@@ -13597,20 +13597,43 @@ def test_anthem_employer_result_builds_importable_company_targets():
 
 
 @pytest.mark.asyncio
+async def test_anthem_employer_lookup_gets_object_when_head_is_denied(
+    monkeypatch,
+):
+    head_url = AsyncMock(
+        return_value={
+            "status": "http_error",
+            "http_status": 403,
+        }
+    )
+    fetch_json = AsyncMock(return_value=_example_anthem_employer_result())
+    monkeypatch.setattr(discovery, "_head_url", head_url)
+    monkeypatch.setattr(discovery, "_fetch_json", fetch_json)
+
+    crawl_targets = await discovery._resolve_anthem_s3_employer_files(
+        _example_anthem_employer_source_row(),
+        base_url="https://files.example.test/",
+        prefix="anthem",
+        employer_ein="12-3456789",
+        resolver_by_key={},
+        source_url="https://www.anthem.com/ca/machine-readable-file/search/",
+        session=None,
+    )
+
+    head_url.assert_not_awaited()
+    fetch_json.assert_awaited_once_with(
+        "https://files.example.test/anthem/123456789.json",
+        max_bytes=1024 * 1024,
+        session=None,
+    )
+    assert len(crawl_targets) == 2
+
+
+@pytest.mark.asyncio
 async def test_anthem_missing_employer_result_does_not_fallback_to_national_toc(
     monkeypatch,
 ):
-    fetch_json = AsyncMock()
-    monkeypatch.setattr(
-        discovery,
-        "_head_url",
-        AsyncMock(
-            return_value={
-                "status": "http_error",
-                "http_status": 403,
-            }
-        ),
-    )
+    fetch_json = AsyncMock(side_effect=ValueError("access denied"))
     monkeypatch.setattr(discovery, "_fetch_json", fetch_json)
 
     with pytest.raises(
@@ -13627,7 +13650,7 @@ async def test_anthem_missing_employer_result_does_not_fallback_to_national_toc(
             session=None,
         )
 
-    fetch_json.assert_not_awaited()
+    fetch_json.assert_awaited_once()
 
 
 def test_fetch_text_decode_response_body_handles_raw_gzip_json():

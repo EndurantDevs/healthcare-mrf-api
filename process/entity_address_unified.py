@@ -1056,6 +1056,7 @@ async def _compact_hot_row_source_record_ids(
     *,
     context: dict | None = None,
 ) -> int:
+    """Compact source-record identifiers while preserving stage row identity."""
     phase_context = context if context is not None else {}
     if not _env_bool(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
@@ -1161,6 +1162,7 @@ async def _create_stage_indexes(
     *,
     context: dict | None = None,
 ) -> None:
+    """Build configured indexes for one staged entity-address table."""
     phase_context = context if context is not None else {}
     if getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__:
         phase_context["stage_index_profile"] = _stage_index_profile()
@@ -1253,6 +1255,7 @@ async def _create_post_publish_indexes(
     *,
     context: dict | None = None,
 ) -> None:
+    """Build and analyze configured indexes on the published address table."""
     phase_context = context if context is not None else {}
     profile = _post_publish_index_profile()
     phase_context["post_publish_index_profile"] = profile
@@ -1501,6 +1504,7 @@ def _ensure_stage_primary_key_sql(
     table_name: str,
     primary_key_columns: Iterable[str],
 ) -> str:
+    """Build SQL that restores the requested stage-table primary key."""
     columns = list(primary_key_columns)
     if not columns:
         return ""
@@ -1625,6 +1629,7 @@ async def _create_support_stage_indexes(
     context: dict | None = None,
     run_id: str | None = None,
 ) -> None:
+    """Build support-table primary keys and indexes with bounded concurrency."""
     phase_context = context if context is not None else {}
     stage_tables = list(stage_classes.values())
     if not stage_tables:
@@ -2787,6 +2792,7 @@ def _source_selects(
     provider_directory_run_id: str | None = None,
     address_canon_available: bool = True,
 ) -> list[str]:
+    """Build normalized source queries for unified address materialization."""
     selects: list[str] = []
     has_npi = available.get("npi", False)
     has_npi_address = available.get("npi_address", False)
@@ -2809,6 +2815,7 @@ def _source_selects(
         has_provider_directory_location,
     )
     def source_address_key(table_name: str, alias: str) -> str:
+        """Return a typed source address-key expression when available."""
         if available.get(f"{table_name}.address_key", available.get(table_name, False)):
             return f"{alias}.address_key::uuid"
         return "NULL::uuid"
@@ -2987,6 +2994,7 @@ def _source_selects(
         else ""
     )
     def provider_directory_pa_cte(locations_cte_name: str) -> str:
+        """Build the primary NPI-address CTE for provider-directory rows."""
         if not has_npi_address:
             return ""
         return f"""
@@ -4400,6 +4408,7 @@ def _shard_source_selects(
     doctor_clinician_address_ranges: list[tuple[int, int]] | None = None,
     provider_enrollment_ffs_ranges: list[tuple[int, int]] | None = None,
 ) -> list[str]:
+    """Split eligible NPI-backed source queries into bounded ranges."""
     npi_address_ranges = npi_address_ranges or []
     mrf_address_ranges = mrf_address_ranges or []
     doctor_clinician_address_ranges = doctor_clinician_address_ranges or []
@@ -4484,6 +4493,7 @@ def _evidence_stage_table_name(stage_table: str) -> str:
 
 
 def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = True) -> str:
+    """Build SQL for the normalized raw entity-address staging table."""
     storage_mode = "UNLOGGED " if unlogged else ""
     return f"""
     CREATE {storage_mode}TABLE {db_schema}.{raw_table} (
@@ -4556,6 +4566,7 @@ def _address_key_expr(
     table_alias: str | None = None,
 ) -> str:
     def col(name: str) -> str:
+        """Qualify one address column for generated SQL."""
         return f"{table_alias}.{name}" if table_alias else name
 
     if available:
@@ -4583,6 +4594,7 @@ def _enrich_raw_stage_sql(
     checksum_max: int | None = None,
     evidence_shards: int | None = None,
 ) -> str:
+    """Build SQL that enriches raw addresses with canonical archive evidence."""
     archive_join = ""
     archive_fields = ""
     if archive_available:
@@ -5189,6 +5201,7 @@ async def _validate_publish_integrity(
     *,
     test_mode: bool,
 ) -> dict[str, int | dict[str, int]]:
+    """Validate staged address and support-table publish invariants."""
     if test_mode:
         return {}
 
@@ -5428,6 +5441,7 @@ def _insert_raw_from_source_sql(
     *,
     address_canon_available: bool = True,
 ) -> str:
+    """Build SQL that normalizes one source query into the raw stage."""
     return f"""
     INSERT INTO {db_schema}.{raw_table} (
         entity_type,
@@ -5632,6 +5646,7 @@ def _materialize_from_raw_sql(
     address_canon_available: bool = True,
     inline_source_evidence: bool = False,
 ) -> str:
+    """Build SQL that deduplicates raw evidence into unified locations."""
     dedupe_key_expr = _dedupe_key_expr(address_canon_available)
     source_record_ids_select = _source_record_ids_select_sql()
     split_array_aggregates = _env_bool(
@@ -5949,6 +5964,7 @@ def _materialize_sql(
     *,
     address_canon_available: bool = True,
 ) -> str:
+    """Build direct source-to-stage materialization SQL."""
     selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
     dedupe_key_expr = _dedupe_key_expr(address_canon_available)
     source_record_ids_select = _source_record_ids_select_sql()
@@ -6338,6 +6354,7 @@ def _load_multi_source_evidence_base_sql(
     affected_group_table: str | None = None,
     affected_scope: str = "group",
 ) -> str:
+    """Build SQL that seeds normalized multi-source evidence groups."""
     group_hash_expr = _evidence_group_hash_expr(evidence_shards)
     affected_filter = ""
     if affected_group_table:
@@ -6420,6 +6437,7 @@ def _insert_multi_source_evidence_shard_sql(
     evidence_shards: int,
     evidence_shard: int,
 ) -> str:
+    """Build SQL that aggregates one multi-source evidence shard."""
     del stage_table, evidence_shards
     return f"""
     WITH keyed AS MATERIALIZED (
@@ -6709,6 +6727,7 @@ def _evidence_from_raw_sql(
     source_run_id: str,
     node_id: str | None,
 ) -> str:
+    """Build provenance-evidence SQL from normalized raw locations."""
     return f"""
     INSERT INTO {db_schema}.{evidence_stage_table} (
         evidence_id,
@@ -6782,6 +6801,7 @@ def _evidence_from_stage_sql(
     node_id: str | None,
     affected_group_table: str | None = None,
 ) -> str:
+    """Build provenance-evidence SQL from unified staged locations."""
     affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{evidence_stage_table} (
@@ -6988,6 +7008,7 @@ def _facility_anchor_npi_candidate_sql(
     candidate_shards: int = 1,
     candidate_shard: int | None = None,
 ) -> str:
+    """Build ranked facility-to-NPI candidate materialization SQL."""
     candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
     shard_filter = _location_key_shard_filter_sql(
         "t.location_key",
@@ -6996,15 +7017,19 @@ def _facility_anchor_npi_candidate_sql(
     )
 
     def norm_text_sql(expr: str) -> str:
+        """Normalize text for generated SQL comparisons."""
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
 
     def zip5_sql(expr: str) -> str:
+        """Normalize a postal-code expression to ZIP5."""
         return f"LEFT(COALESCE({expr}, ''), 5)"
 
     def phone_sql(expr: str) -> str:
+        """Normalize a phone expression to digits."""
         return f"regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g')"
 
     def ccn_key_sql(expr: str) -> str:
+        """Normalize a CCN expression for deterministic matching."""
         return f"regexp_replace(UPPER(COALESCE({expr}, '')), '[^A-Z0-9]', '', 'g')"
 
     fa_parent_name = "target.health_center_name"
@@ -7906,6 +7931,7 @@ def _support_stage_statements(
     affected_group_table: str | None = None,
     copy_unaffected_bridges: bool = True,
 ) -> list[_SupportStageStatement]:
+    """Build the ordered support-table population plan."""
     available = available or {}
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
     partial_bridge_reuse = bool(affected_group_table)
@@ -8136,6 +8162,7 @@ async def _populate_support_stage_tables(
     affected_group_table: str | None = None,
     copy_unaffected_bridges: bool = True,
 ) -> dict[str, int]:
+    """Populate support stages with bounded parallel execution."""
     phase_context = context if context is not None else {}
     statements = _support_stage_statements(
         db_schema,
@@ -8272,10 +8299,13 @@ def _inference_sql(
     include_nppes_name_inference: bool = False,
     include_nppes_broad_inference: bool = False,
 ) -> str:
+    """Build deterministic facility NPI inference SQL."""
     def norm_text_sql(expr: str) -> str:
+        """Normalize text for generated SQL comparisons."""
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
 
     def zip5_sql(expr: str) -> str:
+        """Normalize a postal-code expression to ZIP5."""
         return f"LEFT(COALESCE({expr}, ''), 5)"
 
     fa_parent_name = "to_jsonb(fa)->>'health_center_name'"
@@ -8870,9 +8900,11 @@ def _inference_sql(
     )
 
     def nppes_address_type_filter(address_type: str | None) -> str:
+        """Build an optional NPPES address-type predicate."""
         return f"           AND a.type = '{address_type}'\n" if address_type else ""
 
     def build_fqhc_parent_nppes_exact_candidates_sql(address_type: str | None) -> str:
+        """Build exact FQHC parent candidates from NPPES names and addresses."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
         return f"""
@@ -8911,6 +8943,7 @@ def _inference_sql(
         """
 
     def build_fqhc_parent_nppes_name_state_candidates_sql(address_type: str | None) -> str:
+        """Build FQHC parent candidates from NPPES names and states."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
         return f"""
@@ -8946,6 +8979,7 @@ def _inference_sql(
         """
 
     def build_fqhc_parent_nppes_address_candidates_sql(address_type: str | None) -> str:
+        """Build FQHC parent candidates from NPPES addresses."""
         if not include_nppes_name_inference:
             return empty_inference_candidates_sql
         return f"""
@@ -10134,6 +10168,7 @@ def _inference_sql(
 
 
 async def process_data(ctx, task=None):
+    """Materialize and optionally publish the unified entity-address dataset."""
     task = task or {}
     ctx.setdefault("context", {})
     context = ctx["context"]
@@ -11649,6 +11684,7 @@ async def process_data(ctx, task=None):
 
 
 async def startup(ctx):
+    """Initialize one entity-address-unified import context."""
     await my_init_db(db)
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
@@ -11669,6 +11705,7 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """Finalize, validate, and publish one entity-address-unified import."""
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
@@ -12142,6 +12179,7 @@ async def main(
     provider_directory_partial_scope: str | None = None,
     provider_directory_source_batch_size: int | None = None,
 ):
+    """Run the entity-address-unified import lifecycle."""
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
