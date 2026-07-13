@@ -3,6 +3,7 @@
 import pytest
 
 from scripts.research import provider_directory_api_evidence_db as evidence_db
+from scripts.research import provider_directory_api_evidence_harness as harness
 from scripts.research import provider_directory_api_evidence_support as support
 
 
@@ -165,11 +166,21 @@ def test_mapped_witness_query_is_current_dataset_fenced_and_per_source_bounded()
 
     affiliation_sql = evidence_db._asyncpg_affiliation_evidence_sql("mrf")
     assert "requested_affiliations AS" in affiliation_sql
-    assert "visible_affiliation_resource.resource_type = 'OrganizationAffiliation'" in (
-        affiliation_sql
-    )
+    assert "WHERE resource.resource_type = 'OrganizationAffiliation'" in affiliation_sql
     assert "LIMIT 8192" in affiliation_sql
     assert ":affiliation_ids" not in affiliation_sql
+
+
+def test_current_dataset_completion_query_fences_one_dataset_per_source():
+    sql = evidence_db.current_dataset_completion_sql("mrf")
+
+    assert "requested_sources AS MATERIALIZED" in sql
+    assert "SELECT DISTINCT source_id FROM requested_resources" in sql
+    assert "HAVING COUNT(*) = 1" in sql
+    assert "dataset.status = 'published'" in sql
+    assert "dataset.superseded_at IS NULL" in sql
+    assert 'LEFT JOIN "mrf".import_run AS terminal_run' in sql
+    assert "resource.dataset_id = dataset.dataset_id" in sql
 
 
 @pytest.mark.asyncio
@@ -190,7 +201,7 @@ async def test_mapped_witness_fetch_uses_exact_production_role_builder():
     role_sql, role_args = conn.calls[1]
     assert len(conn.calls) == 2
     assert "requested_roles AS" in role_sql
-    assert "visible_role_resource.resource_type = 'PractitionerRole'" in role_sql
+    assert "WHERE resource.resource_type = 'PractitionerRole'" in role_sql
     assert "LIMIT 8192" in role_sql
     assert ":role_ids" not in role_sql
     assert role_args == ([SOURCE_A], ["role-1"])
@@ -212,9 +223,7 @@ def test_positive_typed_witnesses_pass_detail_and_search_surfaces():
         selection,
         [support.OverlaySample(SOURCE_A, 1234567890, None)],
         client,
-        candidate_limit=5,
-        api_latency_slo_ms=40.0,
-        api_skip_reason=None,
+        support.SourceEvaluationContext(5, 40.0),
         witnesses=_typed_witness_list(),
     )
 
@@ -226,6 +235,60 @@ def test_positive_typed_witnesses_pass_detail_and_search_surfaces():
     assert len(search_call_list) == 2
 
 
+def test_affiliation_only_witness_completes_without_plan_network_context():
+    selection = support.SourceSelection(
+        "acquired", SOURCE_A, "acquisition", True, ("OrganizationAffiliation",)
+    )
+    witness = support.MappedEvidenceWitness(
+        SOURCE_A, 1234567890, "OrganizationAffiliation", "affiliation-1"
+    )
+
+    source_result = support.evaluate_source(
+        selection,
+        [support.OverlaySample(SOURCE_A, 1234567890, None)],
+        TypedEvidenceClient(),
+        support.SourceEvaluationContext(5, 40.0),
+        witnesses=[witness],
+    )
+
+    capability = source_result["mapped_evidence_capabilities"][
+        "organization_affiliation"
+    ]
+    assert witness.supports_completion is True
+    assert witness.supports_plan_network_context is False
+    assert capability["state"] == "pass"
+
+
+def test_completed_empty_proof_contradicting_exact_affiliation_fails_strictly():
+    selection = support.SourceSelection(
+        "acquired", SOURCE_A, "acquisition", True, ("OrganizationAffiliation",)
+    )
+    witness = support.MappedEvidenceWitness(
+        SOURCE_A, 1234567890, "OrganizationAffiliation", "affiliation-1"
+    )
+    source_result = support.evaluate_source(
+        selection,
+        [support.OverlaySample(SOURCE_A, 1234567890, None)],
+        TypedEvidenceClient(),
+        support.SourceEvaluationContext(5, 40.0),
+        witnesses=[witness],
+        completion_proofs={"OrganizationAffiliation": {"state": "completed_empty"}},
+    )
+
+    capability = source_result["mapped_evidence_capabilities"][
+        "organization_affiliation"
+    ]
+    summary = harness.mapped_completion_summary(
+        require_mapped_evidence=True,
+        source_result_list=[source_result],
+        witness_list_by_source={SOURCE_A: [witness]},
+        witness_probe_error=None,
+    )
+    assert capability["state"] == "fail"
+    assert capability["reason"] == "completion_proof_contradicts_mapped_witness"
+    assert summary["completion_inconclusive"] is True
+
+
 def test_default_gate_reports_typed_mismatch_without_failing_baseline():
     selection = support.SourceSelection(
         "acquired", SOURCE_A, "acquisition", True, ("PractitionerRole",)
@@ -235,9 +298,7 @@ def test_default_gate_reports_typed_mismatch_without_failing_baseline():
         selection,
         [support.OverlaySample(SOURCE_A, 1234567890, None)],
         TypedEvidenceClient(search_network_name=None),
-        candidate_limit=5,
-        api_latency_slo_ms=40.0,
-        api_skip_reason=None,
+        support.SourceEvaluationContext(5, 40.0),
         witnesses=[_typed_witness_list()[0]],
     )
 
@@ -258,9 +319,7 @@ def test_declared_empty_and_undeclared_capability_states_do_not_fail_baseline():
         selection,
         [support.OverlaySample(SOURCE_A, 1234567890, None)],
         TypedEvidenceClient(),
-        candidate_limit=5,
-        api_latency_slo_ms=40.0,
-        api_skip_reason=None,
+        support.SourceEvaluationContext(5, 40.0),
     )
 
     assert source_result["status"] == "pass"

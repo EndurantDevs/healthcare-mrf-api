@@ -7506,6 +7506,37 @@ def _endpoint_dataset_candidate() -> importer.EndpointDatasetCandidate:
     )
 
 
+def test_endpoint_dataset_metadata_has_versioned_completion_proof():
+    candidate = dataclasses.replace(
+        _endpoint_dataset_candidate(),
+        selected_resources=("OrganizationAffiliation",),
+        import_run_id="run_terminal",
+    )
+    diagnostics_by_resource = {
+        "OrganizationAffiliation": {
+            "complete": True,
+            "bounded": False,
+            "error": None,
+            "next_url_remaining": False,
+            "rows_fetched": 0,
+            "rows_written": 0,
+        }
+    }
+
+    metadata = importer._endpoint_dataset_publication_metadata(
+        candidate,
+        diagnostics_by_resource,
+    )
+
+    assert metadata["completion_proof_v1"] == {
+        "acquisition_root_run_id": "run_2",
+        "terminal_run_id": "run_terminal",
+        "source_ids": ["source_a", "source_b"],
+        "selected_resources": ["OrganizationAffiliation"],
+        "resource_diagnostics": diagnostics_by_resource,
+    }
+
+
 @pytest.mark.asyncio
 async def test_incomplete_endpoint_dataset_candidate_is_not_published(monkeypatch):
     mark_candidate = AsyncMock()
@@ -17778,6 +17809,30 @@ def test_address_overlay_affiliation_component_uses_context_contact_fallbacks_an
     assert "WITH overlay_rows AS MATERIALIZED" in sql
     assert "FROM overlay_rows" in sql
     assert sql.count("addr_key_v1(") == 1
+
+
+def test_address_overlay_affiliation_uses_organization_address_only_without_location():
+    sql = importer._address_overlay_component_insert_sql(
+        "mrf",
+        "provider_directory_address_overlay_stage_test",
+        component="organization_affiliation",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
+    compact_sql = " ".join(sql.split())
+
+    assert "WITH direct_locations AS MATERIALIZED" in compact_sql
+    assert "organization_addresses AS" in compact_sql
+    assert "organization.address_json::jsonb" in compact_sql
+    assert (
+        "SELECT * FROM direct_locations UNION ALL SELECT * FROM organization_addresses "
+        "WHERE NOT EXISTS (SELECT 1 FROM direct_locations)"
+    ) in compact_sql
+    assert (
+        "'organization-' || organization.resource_id || '-address-' || addr.ordinal::varchar"
+    ) in compact_sql
+    assert "NULL::varchar AS latitude" in compact_sql
+    assert "NULL::varchar AS longitude" in compact_sql
 
 
 @pytest.mark.parametrize(

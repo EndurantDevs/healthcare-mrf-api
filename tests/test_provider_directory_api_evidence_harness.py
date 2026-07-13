@@ -316,9 +316,7 @@ def test_required_source_fails_when_successful_api_response_exceeds_latency_slo(
         selection,
         [sample],
         SlowClient(),
-        candidate_limit=5,
-        api_latency_slo_ms=40.0,
-        api_skip_reason=None,
+        support.SourceEvaluationContext(5, 40.0),
     )
 
     assert source_result["status"] == "fail"

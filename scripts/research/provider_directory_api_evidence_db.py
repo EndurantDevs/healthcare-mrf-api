@@ -5,6 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from scripts.research.provider_directory_api_completion import (
+    _completion_proof_from_row,
+    current_dataset_completion_sql,
+    fetch_current_dataset_completion_proofs,
+)
 from scripts.research.provider_directory_api_evidence_support import (
     MappedEvidenceWitness,
     NetworkWitness,

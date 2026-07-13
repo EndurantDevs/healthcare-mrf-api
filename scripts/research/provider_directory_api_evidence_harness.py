@@ -9,11 +9,10 @@ import asyncio
 import datetime as dt
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,17 +24,25 @@ from scripts.research.provider_directory_api_evidence_support import (
     MappedEvidenceWitness,
     OverlaySample,
     ProviderDirectoryApiClient,
+    SourceEvaluationContext,
     SourceSelection,
     evaluate_source,
     redact_sensitive,
 )
 from scripts.research.provider_directory_api_evidence_db import (
+    fetch_current_dataset_completion_proofs,
     fetch_mapped_evidence_witnesses,
     fetch_overlay_samples,
 )
 from scripts.research.provider_directory_api_evidence_report import (
     database_failure_result,
     mapped_completion_summary,
+)
+from scripts.research.provider_directory_api_evidence_selection import (
+    HarnessConfig,
+    _normalized_ids,
+    _validate_harness_config,
+    resolve_source_selection,
 )
 from scripts.research.provider_directory_endpoint_acquisition_harness import (
     DEFAULT_MANIFEST,
@@ -46,23 +53,20 @@ from scripts.research.provider_directory_endpoint_acquisition_harness import (
 DEFAULT_API_BASE_URL_ENV = "PROVIDER_DIRECTORY_API_BASE_URL"
 DEFAULT_API_BEARER_TOKEN_ENV = "PROVIDER_DIRECTORY_API_BEARER_TOKEN"
 DEFAULT_API_KEY_ENV = "PROVIDER_DIRECTORY_API_KEY"
-SOURCE_ID_RE = re.compile(r"^pdfhir_[0-9a-f]{24}$")
-REQUIRED_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition", "external"})
 
 
 @dataclass(frozen=True)
-class HarnessConfig:
-    """Non-secret selection and work limits for one evidence run."""
+class CurrentEvidenceProbe:
+    """Current overlay, mapped evidence, and fail-closed probe outcomes."""
 
-    manifest_path: Path
-    schema: str
-    entry_ids: tuple[str, ...]
-    source_ids: tuple[str, ...]
-    max_sources: int
-    samples_per_source: int
-    candidate_limit: int
-    api_latency_slo_ms: float
-    require_mapped_evidence: bool = False
+    samples_by_source: Mapping[str, list[OverlaySample]]
+    witnesses_by_source: Mapping[str, list[MappedEvidenceWitness]]
+    completion_proofs_by_source: Mapping[
+        str, Mapping[str, Mapping[str, Any]]
+    ]
+    database_error: str | None = None
+    witness_probe_error: str | None = None
+    completion_probe_error: str | None = None
 
 
 def _utc_now() -> str:
@@ -74,106 +78,16 @@ def _utc_now() -> str:
     )
 
 
-def _normalized_ids(identifiers: Iterable[str]) -> tuple[str, ...]:
-    return tuple(
-        dict.fromkeys(
-            identifier.strip()
-            for identifier in identifiers
-            if identifier and identifier.strip()
-        )
-    )
-
-
-def resolve_source_selection(
-    manifest: Mapping[str, Any],
-    *,
-    requested_entry_ids: Iterable[str] = (),
-    requested_source_ids: Iterable[str] = (),
-    max_sources: int = 100,
-) -> list[SourceSelection]:
-    """Resolve selected maintained sources or reject a cap that truncates them."""
-    if max_sources < 1:
-        raise ValueError("max_sources must be at least one")
-    entries = manifest.get("entries")
-    if not isinstance(entries, list):
-        raise ValueError("manifest entries are unavailable")
-    requested_entries = _normalized_ids(requested_entry_ids)
-    requested_sources = _normalized_ids(requested_source_ids)
-    entries_by_id = {
-        str(entry.get("entry_id") or ""): entry
-        for entry in entries
-        if isinstance(entry, Mapping)
-    }
-    sources_by_id = {
-        str(source_id): entry_id
-        for entry_id, entry in entries_by_id.items()
-        for source_id in entry.get("source_ids") or []
-    }
-    if set(requested_entries) - set(entries_by_id):
-        raise ValueError("unknown manifest entry selector")
-    if any(not SOURCE_ID_RE.fullmatch(source_id) for source_id in requested_sources):
-        raise ValueError("unknown manifest source selector")
-    if set(requested_sources) - set(sources_by_id):
-        raise ValueError("unknown manifest source selector")
-    selections = _manifest_selections(entries, requested_entries, requested_sources)
-    if len(selections) > max_sources:
-        raise ValueError("selected maintained sources exceed max_sources")
-    return selections
-
-
-def _manifest_selections(
-    entries: list[Any],
-    requested_entries: tuple[str, ...],
-    requested_sources: tuple[str, ...],
-) -> list[SourceSelection]:
-    selections: list[SourceSelection] = []
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            continue
-        entry_id = str(entry.get("entry_id") or "")
-        classification = str(entry.get("classification") or "")
-        resources = tuple(
-            str(resource_type)
-            for resource_type in entry.get("resources") or []
-            if resource_type
-        )
-        for source_id_value in entry.get("source_ids") or []:
-            source_id = str(source_id_value)
-            if requested_entries or requested_sources:
-                if (
-                    entry_id not in requested_entries
-                    and source_id not in requested_sources
-                ):
-                    continue
-            selections.append(
-                SourceSelection(
-                    entry_id,
-                    source_id,
-                    classification,
-                    classification in REQUIRED_CLASSIFICATIONS,
-                    resources,
-                )
-            )
-    return selections
-
-
-def _validate_harness_config(config: HarnessConfig) -> None:
-    if not 1 <= config.candidate_limit <= 20:
-        raise ValueError("candidate_limit must be between one and twenty")
-    if config.api_latency_slo_ms < 0:
-        raise ValueError("api_latency_slo_ms must be zero or greater")
-
-
 async def _current_samples(
     config: HarnessConfig,
     conn: Any,
     selections: list[SourceSelection],
-) -> tuple[
-    dict[str, list[OverlaySample]],
-    dict[str, list[MappedEvidenceWitness]],
-    str | None,
-    str | None,
-]:
+) -> CurrentEvidenceProbe:
+    """Probe current evidence without letting one optional stage hide another."""
+    empty_samples_by_source = {selection.source_id: [] for selection in selections}
+    empty_witnesses_by_source = {
+        selection.source_id: [] for selection in selections
+    }
     try:
         samples_by_source = await fetch_overlay_samples(
             conn,
@@ -182,15 +96,11 @@ async def _current_samples(
             samples_per_source=config.samples_per_source,
         )
     except Exception as exc:
-        empty_samples_by_source = {selection.source_id: [] for selection in selections}
-        empty_witnesses_by_source = {
-            selection.source_id: [] for selection in selections
-        }
-        return (
+        return CurrentEvidenceProbe(
             empty_samples_by_source,
             empty_witnesses_by_source,
-            type(exc).__name__,
-            None,
+            {},
+            database_error=type(exc).__name__,
         )
     try:
         witnesses_by_source = await fetch_mapped_evidence_witnesses(
@@ -199,12 +109,33 @@ async def _current_samples(
             selections=selections,
             witnesses_per_resource=config.samples_per_source,
         )
-        return samples_by_source, witnesses_by_source, None, None
     except Exception as exc:
-        empty_witnesses_by_source = {
-            selection.source_id: [] for selection in selections
-        }
-        return samples_by_source, empty_witnesses_by_source, None, type(exc).__name__
+        return CurrentEvidenceProbe(
+            samples_by_source,
+            empty_witnesses_by_source,
+            {},
+            witness_probe_error=type(exc).__name__,
+        )
+    if not config.require_mapped_evidence:
+        return CurrentEvidenceProbe(samples_by_source, witnesses_by_source, {})
+    try:
+        completion_proofs_by_source = await fetch_current_dataset_completion_proofs(
+            conn,
+            schema=config.schema,
+            selections=selections,
+        )
+        return CurrentEvidenceProbe(
+            samples_by_source,
+            witnesses_by_source,
+            completion_proofs_by_source,
+        )
+    except Exception as exc:
+        return CurrentEvidenceProbe(
+            samples_by_source,
+            witnesses_by_source,
+            {},
+            completion_probe_error=type(exc).__name__,
+        )
 
 
 def _active_api_client(
@@ -227,25 +158,29 @@ def _active_api_client(
 def _source_results(
     config: HarnessConfig,
     selections: list[SourceSelection],
-    samples_by_source: Mapping[str, list[OverlaySample]],
-    witnesses_by_source: Mapping[str, list[MappedEvidenceWitness]],
+    current_probe: CurrentEvidenceProbe,
     api_client: ProviderDirectoryApiClient | None,
     api_skip_reason: str | None,
-    database_error: str | None,
-    witness_probe_error: str | None,
 ) -> list[dict[str, Any]]:
-    if database_error:
+    if current_probe.database_error:
         return [database_failure_result(selection) for selection in selections]
+    evaluation_context = SourceEvaluationContext(
+        config.candidate_limit,
+        config.api_latency_slo_ms,
+        api_skip_reason,
+        current_probe.witness_probe_error,
+        current_probe.completion_probe_error,
+    )
     return [
         evaluate_source(
             selection,
-            samples_by_source.get(selection.source_id, []),
+            current_probe.samples_by_source.get(selection.source_id, []),
             api_client,
-            candidate_limit=config.candidate_limit,
-            api_latency_slo_ms=config.api_latency_slo_ms,
-            api_skip_reason=api_skip_reason,
-            witnesses=witnesses_by_source.get(selection.source_id, []),
-            witness_probe_error=witness_probe_error,
+            evaluation_context,
+            witnesses=current_probe.witnesses_by_source.get(selection.source_id, []),
+            completion_proofs=current_probe.completion_proofs_by_source.get(
+                selection.source_id
+            ),
         )
         for selection in selections
     ]
@@ -255,10 +190,8 @@ def _report_payload(
     config: HarnessConfig,
     selections: list[SourceSelection],
     source_results: list[dict[str, Any]],
-    witnesses_by_source: Mapping[str, list[MappedEvidenceWitness]],
+    current_probe: CurrentEvidenceProbe,
     api_client: ProviderDirectoryApiClient | None,
-    database_error: str | None,
-    witness_probe_error: str | None,
 ) -> dict[str, Any]:
     required_failures = sum(
         source_result["status"] == "fail" and source_result["required"]
@@ -267,13 +200,20 @@ def _report_payload(
     mapped_summary = mapped_completion_summary(
         require_mapped_evidence=config.require_mapped_evidence,
         source_result_list=source_results,
-        witness_list_by_source=witnesses_by_source,
-        witness_probe_error=witness_probe_error,
+        witness_list_by_source=current_probe.witnesses_by_source,
+        witness_probe_error=current_probe.witness_probe_error,
+    )
+    mapped_summary["current_dataset_completion_probe_failed"] = bool(
+        current_probe.completion_probe_error
     )
     return {
         "schema_version": 1,
         "generated_at": _utc_now(),
-        "mode": "api" if api_client is not None and not database_error else "data_only",
+        "mode": (
+            "api"
+            if api_client is not None and not current_probe.database_error
+            else "data_only"
+        ),
         "selection": {
             "entry_ids": list(config.entry_ids),
             "source_ids": list(config.source_ids),
@@ -318,34 +258,24 @@ async def build_report(
     )
     if not selections:
         raise ValueError("no maintained sources selected")
-    (
-        samples_by_source,
-        witnesses_by_source,
-        database_error,
-        witness_probe_error,
-    ) = await _current_samples(config, conn, selections)
+    current_probe = await _current_samples(config, conn, selections)
     active_client, api_skip_reason = _active_api_client(
-        api_config, api_client, database_error
+        api_config, api_client, current_probe.database_error
     )
     source_results = _source_results(
         config,
         selections,
-        samples_by_source,
-        witnesses_by_source,
+        current_probe,
         active_client,
         api_skip_reason,
-        database_error,
-        witness_probe_error,
     )
     return redact_sensitive(
         _report_payload(
             config,
             selections,
             source_results,
-            witnesses_by_source,
+            current_probe,
             active_client,
-            database_error,
-            witness_probe_error,
         )
     )
 

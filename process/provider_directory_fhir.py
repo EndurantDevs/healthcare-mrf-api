@@ -25763,7 +25763,7 @@ def _endpoint_dataset_publication_metadata(
     diagnostics: dict[str, dict[str, Any]],
     **extra: Any,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "expected_resources": list(candidate.expected_resources),
@@ -25772,6 +25772,14 @@ def _endpoint_dataset_publication_metadata(
         "reused_from_checkpoint": candidate.reused_from_checkpoint,
         **extra,
     }
+    metadata["completion_proof_v1"] = {
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "terminal_run_id": candidate.import_run_id,
+        "source_ids": list(candidate.source_ids),
+        "selected_resources": list(candidate.selected_resources),
+        "resource_diagnostics": diagnostics,
+    }
+    return metadata
 
 
 def _is_endpoint_dataset_publishable(
@@ -28909,37 +28917,86 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 ON organization.source_id = affiliation.source_id
                AND organization.resource_id = organization_ref.resource_id
               JOIN LATERAL (
-                  SELECT location.*
-                    FROM (
-                        SELECT direct_location_ref.value
-                          FROM jsonb_array_elements_text(
-                              COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-                          ) AS direct_location_ref(value)
-                        UNION
-                        SELECT service_location_ref.value
-                          FROM jsonb_array_elements_text(
-                              COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
-                          ) AS service_ref(value)
-                          JOIN {healthcare_service_table} AS healthcare_service
-                            ON healthcare_service.source_id = affiliation.source_id
-                           AND healthcare_service.resource_id = NULLIF(
-                                  regexp_replace(service_ref.value, '^.*/', ''),
-                                  ''
-                               )
-                          JOIN LATERAL jsonb_array_elements_text(
-                              COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-                          ) AS service_location_ref(value) ON TRUE
-                    ) AS location_ref
-                    JOIN {location_table} AS location
-                      ON location.source_id = affiliation.source_id
-                     AND location.resource_id = NULLIF(
-                            regexp_replace(location_ref.value, '^.*/', ''),
-                            ''
-                         )
-                   WHERE (location.status IS NULL OR lower(location.status) <> 'inactive')
-                     AND NULLIF(TRIM(location.first_line), '') IS NOT NULL
-                     AND NULLIF(TRIM(location.city_name), '') IS NOT NULL
-                     AND NULLIF(TRIM(location.postal_code), '') IS NOT NULL
+                  WITH direct_locations AS MATERIALIZED (
+                      SELECT
+                          location.resource_id::varchar AS resource_id,
+                          location.address_key::varchar AS address_key,
+                          location.first_line::varchar AS first_line,
+                          location.second_line::varchar AS second_line,
+                          location.city_name::varchar AS city_name,
+                          location.state_name::varchar AS state_name,
+                          location.state_code::varchar AS state_code,
+                          location.postal_code::varchar AS postal_code,
+                          location.country_code::varchar AS country_code,
+                          location.telephone_number::varchar AS telephone_number,
+                          location.fax_number::varchar AS fax_number,
+                          location.phone_number::varchar AS phone_number,
+                          location.fax_number_digits::varchar AS fax_number_digits,
+                          location.latitude::varchar AS latitude,
+                          location.longitude::varchar AS longitude,
+                          location.updated_at AS updated_at
+                        FROM (
+                            SELECT direct_location_ref.value
+                              FROM jsonb_array_elements_text(
+                                  COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                              ) AS direct_location_ref(value)
+                            UNION
+                            SELECT service_location_ref.value
+                              FROM jsonb_array_elements_text(
+                                  COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                              ) AS service_ref(value)
+                              JOIN {healthcare_service_table} AS healthcare_service
+                                ON healthcare_service.source_id = affiliation.source_id
+                               AND healthcare_service.resource_id = NULLIF(
+                                      regexp_replace(service_ref.value, '^.*/', ''),
+                                      ''
+                                   )
+                              JOIN LATERAL jsonb_array_elements_text(
+                                  COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                              ) AS service_location_ref(value) ON TRUE
+                        ) AS location_ref
+                        JOIN {location_table} AS location
+                          ON location.source_id = affiliation.source_id
+                         AND location.resource_id = NULLIF(
+                                regexp_replace(location_ref.value, '^.*/', ''),
+                                ''
+                             )
+                       WHERE (location.status IS NULL OR lower(location.status) <> 'inactive')
+                         AND NULLIF(TRIM(location.first_line), '') IS NOT NULL
+                         AND NULLIF(TRIM(location.city_name), '') IS NOT NULL
+                         AND NULLIF(TRIM(location.postal_code), '') IS NOT NULL
+                  ), organization_addresses AS (
+                      SELECT
+                          ('organization-' || organization.resource_id || '-address-' ||
+                              addr.ordinal::varchar)::varchar AS resource_id,
+                          NULL::varchar AS address_key,
+                          NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
+                          NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
+                          NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
+                          NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
+                          {qschema}.addr_state_code_v1(
+                              NULLIF(TRIM(addr.value->>'state'), '')
+                          )::varchar AS state_code,
+                          NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+                          {org_address_country_expr}::varchar AS country_code,
+                          NULL::varchar AS telephone_number,
+                          NULL::varchar AS fax_number,
+                          NULL::varchar AS phone_number,
+                          NULL::varchar AS fax_number_digits,
+                          NULL::varchar AS latitude,
+                          NULL::varchar AS longitude,
+                          organization.updated_at AS updated_at
+                        FROM jsonb_array_elements(
+                            COALESCE(organization.address_json::jsonb, '[]'::jsonb)
+                        ) WITH ORDINALITY AS addr(value, ordinal)
+                       WHERE NULLIF(TRIM(addr.value->'line'->>0), '') IS NOT NULL
+                         AND NULLIF(TRIM(addr.value->>'city'), '') IS NOT NULL
+                         AND NULLIF(TRIM(addr.value->>'postalCode'), '') IS NOT NULL
+                  )
+                  SELECT * FROM direct_locations
+                  UNION ALL
+                  SELECT * FROM organization_addresses
+                   WHERE NOT EXISTS (SELECT 1 FROM direct_locations)
                   -- Keep the lookup correlated so PostgreSQL uses the location primary key.
                   OFFSET 0
               ) AS loc ON TRUE

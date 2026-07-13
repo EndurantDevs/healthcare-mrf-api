@@ -123,7 +123,7 @@ async def test_strict_completion_is_inconclusive_without_api_calls(
         support.ApiConfig(None, None, None, "X-API-Key", 3.0, data_only=True),
     )
 
-    assert report["summary"]["mapped_role_plan_network_witnesses"] == 1
+    assert report["summary"]["mapped_plan_network_context_witnesses"] == 0
     assert report["summary"]["mapped_evidence_passed_capabilities"] == 0
     assert report["summary"]["mapped_evidence_completion"] == "inconclusive"
     assert report["summary"]["completion_inconclusive"] is True
@@ -174,7 +174,7 @@ def test_strict_completion_requires_every_selected_declared_capability(tmp_path)
     assert summary_map["completion_inconclusive"] is True
 
 
-def test_bare_affiliation_does_not_complete_plan_or_network_gate():
+def test_bare_affiliation_completes_its_capability_without_plan_network_context():
     source_result_list = [
         {
             "mapped_evidence_capabilities": {
@@ -199,8 +199,191 @@ def test_bare_affiliation_does_not_complete_plan_or_network_gate():
         witness_probe_error=None,
     )
 
-    assert summary_map["mapped_evidence_passed_capabilities"] == 0
-    assert summary_map["completion_inconclusive"] is True
+    assert summary_map["mapped_evidence_passed_capabilities"] == 1
+    assert summary_map["mapped_plan_network_context_witnesses"] == 0
+    assert summary_map["completion_inconclusive"] is False
+
+
+def _completed_empty_row(*, resource_type="OrganizationAffiliation"):
+    diagnostic_map = {
+        "complete": True,
+        "bounded": False,
+        "error": None,
+        "next_url_remaining": False,
+        "rows_fetched": 0,
+        "rows_written": 0,
+    }
+    return {
+        "source_id": SOURCE_A,
+        "resource_type": resource_type,
+        "dataset_id": "dataset-arkansas",
+        "acquisition_root_run_id": "run-root",
+        "terminal_run_id": "run-root",
+        "dataset_resource_count": 0,
+        "terminal_importer": "provider-directory-fhir",
+        "terminal_status": "succeeded",
+        "terminal_finished_at": "2026-07-13T12:00:00Z",
+        "terminal_error": None,
+        "terminal_params": {
+            "source_ids": [SOURCE_A],
+            "resources": resource_type,
+        },
+        "terminal_metrics": {
+            "source_ids": [SOURCE_A],
+            "resource_rows": {resource_type: 0},
+            "resource_fetch_completed_source_ids": {resource_type: [SOURCE_A]},
+            "resource_fetch_stats": {
+                resource_type: {
+                    "sources_attempted": 1,
+                    "sources_completed": 1,
+                    "sources_bounded": 0,
+                    "sources_failed": 0,
+                    "sources_empty": 1,
+                    "rows_fetched": 0,
+                }
+            },
+        },
+        "publication_metadata_json": {
+            "completion_proof_v1": {
+                "acquisition_root_run_id": "run-root",
+                "terminal_run_id": "run-root",
+                "source_ids": [SOURCE_A],
+                "selected_resources": [resource_type],
+                "resource_diagnostics": {resource_type: diagnostic_map},
+            }
+        },
+    }
+
+
+def test_arkansas_completed_empty_proof_completes_declared_affiliation():
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    proof = evidence_db._completion_proof_from_row(
+        _completed_empty_row(), SOURCE_A, "OrganizationAffiliation"
+    )
+    selection = support.SourceSelection(
+        "acquired", SOURCE_A, "acquisition", True, ("OrganizationAffiliation",)
+    )
+    source_result = support.evaluate_source(
+        selection,
+        [support.OverlaySample(SOURCE_A, 1234567890, None)],
+        None,
+        support.SourceEvaluationContext(5, 0.0, "data_only_mode"),
+        completion_proofs={"OrganizationAffiliation": proof},
+    )
+
+    capability = source_result["mapped_evidence_capabilities"][
+        "organization_affiliation"
+    ]
+    assert proof["state"] == "completed_empty"
+    assert capability["state"] == "completed_empty"
+    summary_map = harness.mapped_completion_summary(
+        require_mapped_evidence=True,
+        source_result_list=[source_result],
+        witness_list_by_source={SOURCE_A: []},
+        witness_probe_error=None,
+    )
+    assert summary_map["mapped_evidence_completion"] == "pass"
+
+
+def test_current_legacy_metadata_is_accepted_only_with_complete_empty_diagnostics():
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    row = _completed_empty_row()
+    row["publication_metadata_json"] = row["publication_metadata_json"][
+        "completion_proof_v1"
+    ]
+
+    assert (
+        evidence_db._completion_proof_from_row(
+            row, SOURCE_A, "OrganizationAffiliation"
+        )["state"]
+        == "completed_empty"
+    )
+
+
+def test_database_json_null_terminal_error_is_accepted():
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    row = _completed_empty_row()
+    row["terminal_error"] = "null"
+
+    assert (
+        evidence_db._completion_proof_from_row(
+            row, SOURCE_A, "OrganizationAffiliation"
+        )["state"]
+        == "completed_empty"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_state"),
+    [
+        (lambda row: row.pop("publication_metadata_json"), "unproven"),
+        (
+            lambda row: row["publication_metadata_json"]["completion_proof_v1"].update(
+                source_ids=[SOURCE_C]
+            ),
+            "unproven",
+        ),
+        (
+            lambda row: row["publication_metadata_json"]["completion_proof_v1"][
+                "resource_diagnostics"
+            ]["OrganizationAffiliation"].update(bounded=True),
+            "unproven",
+        ),
+        (
+            lambda row: row["publication_metadata_json"]["completion_proof_v1"][
+                "resource_diagnostics"
+            ]["OrganizationAffiliation"].update(error="http_500"),
+            "unproven",
+        ),
+        (lambda row: row.update(dataset_resource_count=1), "positive"),
+    ],
+)
+def test_current_dataset_completion_reader_fails_closed(mutate, expected_state):
+    from scripts.research import provider_directory_api_evidence_db as evidence_db
+
+    row = _completed_empty_row()
+    mutate(row)
+    assert (
+        evidence_db._completion_proof_from_row(
+            row, SOURCE_A, "OrganizationAffiliation"
+        )["state"]
+        == expected_state
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_failure_is_inconclusive(monkeypatch, tmp_path):
+    monkeypatch.setattr(harness, "load_manifest", lambda _path: _manifest())
+
+    async def overlay_samples(_conn, **_kwargs):
+        return {SOURCE_A: [support.OverlaySample(SOURCE_A, 1234567890, None)]}
+
+    async def mapped_witnesses(_conn, **_kwargs):
+        return {SOURCE_A: []}
+
+    async def failed_completion_probe(_conn, **_kwargs):
+        raise RuntimeError("safe test failure")
+
+    monkeypatch.setattr(harness, "fetch_overlay_samples", overlay_samples)
+    monkeypatch.setattr(harness, "fetch_mapped_evidence_witnesses", mapped_witnesses)
+    monkeypatch.setattr(
+        harness, "fetch_current_dataset_completion_proofs", failed_completion_probe
+    )
+    report = await harness.build_report(
+        _harness_config(tmp_path, require_mapped_evidence=True),
+        FakeConn([]),
+        support.ApiConfig(None, None, None, "X-API-Key", 3.0, data_only=True),
+    )
+
+    capability = report["sources"][0]["mapped_evidence_capabilities"][
+        "organization_affiliation"
+    ]
+    assert capability["reason"] == "current_dataset_completion_probe_failed"
+    assert report["summary"]["current_dataset_completion_probe_failed"] is True
+    assert report["summary"]["completion_inconclusive"] is True
 
 
 @pytest.mark.asyncio

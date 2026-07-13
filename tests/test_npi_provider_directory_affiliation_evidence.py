@@ -80,11 +80,15 @@ def test_affiliation_evidence_sql_fences_current_networks_and_resolved_plans():
     assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in sql
+    assert "resource.payload_json::jsonb AS payload_json" in sql
+    assert "current_affiliations AS NOT MATERIALIZED" in sql
+    assert "resource.resource_type = 'OrganizationAffiliation'" in sql
     assert "CAST(:affiliation_ids AS varchar[])" in sql
-    assert "visible_affiliation_resource.resource_type = 'OrganizationAffiliation'" in sql
-    assert "affiliation.last_seen_run_id = visible_affiliation_resource.run_id" in sql
-    assert "network_organization.last_seen_run_id = current_network_organization_resource.run_id" in sql
-    assert "insurance_plan.last_seen_run_id = current_insurance_plan.run_id" in sql
+    assert "JOIN current_affiliations AS affiliation" in sql
+    assert "provider_directory_organization_affiliation AS affiliation" not in sql
+    assert "JOIN current_organizations AS network_organization" in sql
+    assert "JOIN current_affiliation_insurance_plans AS insurance_plan" in sql
+    assert "insurance_plan.last_seen_run_id" not in sql
     assert "affiliation.active IS DISTINCT FROM false" in sql
     assert "network_organization.active IS DISTINCT FROM false" in sql
     assert "network_catalog.refs" not in sql

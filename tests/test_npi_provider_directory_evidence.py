@@ -106,13 +106,16 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "dataset.published_at IS NOT NULL" in sql
     assert "resource.dataset_id = dataset.dataset_id" in sql
     assert "current_resources AS NOT MATERIALIZED" in sql
+    assert "resource.payload_json::jsonb AS payload_json" in sql
+    assert "current_roles AS NOT MATERIALIZED" in sql
+    assert "resource.resource_type = 'PractitionerRole'" in sql
     assert "unnest(CAST(:source_ids AS varchar[]), CAST(:role_ids AS varchar[]))" in sql
     assert "role.source_id = requested.source_id AND role.resource_id = requested.role_id" in sql
-    assert "visible_role_resource.resource_type = 'PractitionerRole'" in sql
-    assert "role.last_seen_run_id = visible_role_resource.run_id" in sql
-    assert "JOIN current_resources AS current_role\n" not in sql
-    assert "current_insurance_plan.resource_type = 'InsurancePlan'" in sql
-    assert "insurance_plan.last_seen_run_id = current_insurance_plan.run_id" in sql
+    assert "JOIN current_roles AS role" in sql
+    assert "provider_directory_practitioner_role AS role" not in sql
+    assert "current_insurance_plans AS NOT MATERIALIZED" in sql
+    assert "JOIN current_insurance_plans AS insurance_plan" in sql
+    assert "insurance_plan.last_seen_run_id" not in sql
     assert "role.active IS DISTINCT FROM false" in sql
     assert "role_organization.active IS DISTINCT FROM false" in sql
     assert "affiliation.active IS DISTINCT FROM false" in sql
@@ -120,11 +123,12 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "(role_organization.organization_ref::varchar)" in sql
     assert "(role_organization.organization_resource_id::varchar)" in sql
     assert "'Organization/' || role_organization.organization_resource_id" in sql
-    assert "affiliation.source_id = organization_candidate.source_id" in sql
+    assert "affiliation_locator.source_id = organization_candidate.source_id" in sql
     assert (
-        "affiliation.participating_organization_ref = organization_candidate.reference"
+        "affiliation_locator.participating_organization_ref = organization_candidate.reference"
         in sql
     )
+    assert "JOIN current_affiliations AS affiliation" in sql
     assert "regexp_replace(affiliation.participating_organization_ref" not in sql
     assert "network_catalog.refs" not in sql
     assert "jsonb_array_elements(network_catalog.refs" not in sql

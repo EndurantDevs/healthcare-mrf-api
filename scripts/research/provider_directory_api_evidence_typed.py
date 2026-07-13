@@ -28,12 +28,13 @@ class MappedEvidenceWitness:
 
     @property
     def supports_completion(self) -> bool:
-        """Return whether the witness proves role, plan, or network evidence."""
-        return bool(
-            self.resource_type == "PractitionerRole"
-            or self.insurance_plan_ids
-            or self.networks
-        )
+        """Return whether this exact resource witness completes its capability."""
+        return self.resource_type in {"PractitionerRole", "OrganizationAffiliation"}
+
+    @property
+    def supports_plan_network_context(self) -> bool:
+        """Return whether the witness additionally exposes plan/network context."""
+        return bool(self.insurance_plan_ids or self.networks)
 
 
 def matching_source_summary_maps(

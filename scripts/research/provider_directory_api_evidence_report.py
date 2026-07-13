@@ -19,6 +19,7 @@ def database_failure_result(selection: SourceSelection) -> dict[str, Any]:
             "declared": resource_type in selection.resources,
             "witness_count": 0,
             "completion_witness_count": 0,
+            "current_dataset_completion": "unproven",
             "state": (
                 "not_observed"
                 if resource_type in selection.resources
@@ -52,8 +53,8 @@ def mapped_completion_summary(
     witness_count = sum(
         len(witness_list) for witness_list in witness_list_by_source.values()
     )
-    completion_witness_count = sum(
-        witness.supports_completion
+    plan_network_context_count = sum(
+        witness.supports_plan_network_context
         for witness_list in witness_list_by_source.values()
         for witness in witness_list
     )
@@ -64,8 +65,7 @@ def mapped_completion_summary(
         if capability_map["declared"]
     ]
     completed_capability_count = sum(
-        capability_map["state"] == "pass"
-        and capability_map.get("completion_witness_count", 0) > 0
+        capability_map["state"] in {"pass", "completed_empty"}
         for capability_map in declared_capability_list
     )
     is_inconclusive = bool(
@@ -77,7 +77,8 @@ def mapped_completion_summary(
     )
     return {
         "mapped_evidence_witnesses": witness_count,
-        "mapped_role_plan_network_witnesses": completion_witness_count,
+        "mapped_plan_network_context_witnesses": plan_network_context_count,
+        "mapped_role_plan_network_witnesses": plan_network_context_count,
         "mapped_evidence_declared_capabilities": len(declared_capability_list),
         "mapped_evidence_passed_capabilities": completed_capability_count,
         "mapped_evidence_incomplete_capabilities": (

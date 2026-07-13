@@ -19,7 +19,9 @@ from typing import Any, Mapping, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
+from sqlalchemy import JSON as SQLAlchemyJSON
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import literal_column, text, tuple_
 
 from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
@@ -43,6 +45,10 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderEnrollmentHomeHealthAgency,
                        ProviderEnrollmentHospice, ProviderEnrollmentHospital,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF,
+                       ProviderDirectoryInsurancePlan,
+                       ProviderDirectoryOrganization,
+                       ProviderDirectoryOrganizationAffiliation,
+                       ProviderDirectoryPractitionerRole,
                        ProviderDirectorySource, db)
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
@@ -325,8 +331,12 @@ ENABLE_NPI_SCHEMA_CACHE = _env_flag(
 _NPI_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
-_NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = None
-_NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
+_NPI_FILTER_CAPABILITIES_CACHE_STATE: dict[
+    str, Optional[tuple[float, str, dict[str, bool]]]
+] = {"entry": None}
+_NPI_PRIMARY_TOTAL_CACHE_STATE: dict[str, Optional[tuple[float, int]]] = {
+    "entry": None
+}
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
 _MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "8.0"))
@@ -562,23 +572,22 @@ def _cache_set(cache: dict[str, tuple[float, Any]], key: str, value: Any) -> Any
 def _filter_cache_get() -> Optional[dict[str, bool]]:
     if not ENABLE_NPI_SCHEMA_CACHE:
         return None
-    global _NPI_FILTER_CAPABILITIES_CACHE
-    if _NPI_FILTER_CAPABILITIES_CACHE is None:
+    cache_entry = _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"]
+    if cache_entry is None:
         return None
-    cached_at, schema_key, value = _NPI_FILTER_CAPABILITIES_CACHE
+    cached_at, schema_key, value = cache_entry
     if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
-        _NPI_FILTER_CAPABILITIES_CACHE = None
+        _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = None
         return None
     if schema_key != (os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"):
-        _NPI_FILTER_CAPABILITIES_CACHE = None
+        _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = None
         return None
     return dict(value)
 
 
 def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
-    global _NPI_FILTER_CAPABILITIES_CACHE
     if ENABLE_NPI_SCHEMA_CACHE:
-        _NPI_FILTER_CAPABILITIES_CACHE = (
+        _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = (
             time.monotonic(),
             os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
             dict(value),
@@ -589,20 +598,19 @@ def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
 def _primary_total_cache_get() -> Optional[int]:
     if not ENABLE_NPI_SCHEMA_CACHE:
         return None
-    global _NPI_PRIMARY_TOTAL_CACHE
-    if _NPI_PRIMARY_TOTAL_CACHE is None:
+    cache_entry = _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"]
+    if cache_entry is None:
         return None
-    cached_at, value = _NPI_PRIMARY_TOTAL_CACHE
+    cached_at, value = cache_entry
     if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
-        _NPI_PRIMARY_TOTAL_CACHE = None
+        _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = None
         return None
     return int(value)
 
 
 def _primary_total_cache_set(value: int) -> int:
-    global _NPI_PRIMARY_TOTAL_CACHE
     if ENABLE_NPI_SCHEMA_CACHE:
-        _NPI_PRIMARY_TOTAL_CACHE = (time.monotonic(), int(value))
+        _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = (time.monotonic(), int(value))
     return int(value)
 
 
@@ -1034,7 +1042,8 @@ def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
         HAVING COUNT(*) = 1
     ), current_datasets AS MATERIALIZED (
         SELECT dataset.endpoint_id, dataset.dataset_id,
-               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
+               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id,
+               dataset.published_at
           FROM {schema}.provider_directory_endpoint_dataset AS dataset
           JOIN current_endpoint_counts AS current_endpoint
             ON current_endpoint.endpoint_id = dataset.endpoint_id
@@ -1046,7 +1055,9 @@ def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
     ), current_resources AS NOT MATERIALIZED (
         SELECT source.source_id, source.canonical_api_base,
                dataset.dataset_id, dataset.run_id,
-               resource.resource_type, resource.resource_id
+               dataset.published_at AS dataset_published_at,
+               resource.resource_type, resource.resource_id,
+               resource.payload_json::jsonb AS payload_json
           FROM {schema}.provider_directory_source AS source
           JOIN current_datasets AS dataset
             ON dataset.endpoint_id = source.endpoint_id
@@ -1054,6 +1065,69 @@ def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
             ON resource.dataset_id = dataset.dataset_id
     )
     """
+
+
+_CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS = (
+    (
+        "current_insurance_plans",
+        "InsurancePlan",
+        ProviderDirectoryInsurancePlan,
+    ),
+    (
+        "current_organizations",
+        "Organization",
+        ProviderDirectoryOrganization,
+    ),
+    (
+        "current_roles",
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+    ),
+    (
+        "current_affiliations",
+        "OrganizationAffiliation",
+        ProviderDirectoryOrganizationAffiliation,
+    ),
+)
+
+
+def _provider_directory_current_payload_column_sql(column: Any) -> str:
+    """Project one normalized typed column from immutable dataset payload."""
+    column_name = column.name
+    if column_name in {"source_id", "resource_id"}:
+        return f"resource.{column_name} AS {column_name}"
+    if column_name == "last_seen_run_id":
+        return "resource.run_id AS last_seen_run_id"
+    if column_name in {"observed_at", "updated_at"}:
+        return f"resource.dataset_published_at AS {column_name}"
+    payload_expr = f"resource.payload_json -> '{column_name}'"
+    if isinstance(column.type, SQLAlchemyJSON):
+        return f"{payload_expr} AS {column_name}"
+    column_type = column.type.compile(dialect=postgresql.dialect())
+    return (
+        f"CAST(resource.payload_json ->> '{column_name}' AS {column_type}) "
+        f"AS {column_name}"
+    )
+
+
+def _current_typed_resource_ctes_sql() -> str:
+    """Expose current immutable dataset payloads with typed-table column names."""
+    cte_sql_list = []
+    for cte_name, resource_type, model in _CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS:
+        selected_columns = ",\n               ".join(
+            _provider_directory_current_payload_column_sql(column)
+            for column in model.__table__.columns
+        )
+        cte_sql_list.append(
+            f"""
+    {cte_name} AS NOT MATERIALIZED (
+        SELECT {selected_columns}
+          FROM current_resources AS resource
+         WHERE resource.resource_type = '{resource_type}'
+    )
+            """.strip()
+        )
+    return ", ".join(cte_sql_list)
 
 
 def _provider_directory_current_resource_join_sql(
@@ -1072,14 +1146,9 @@ def _provider_directory_current_resource_join_sql(
 
 def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
     organization_join = (
-        "LEFT JOIN current_resources AS current_network_organization "
-        "ON current_network_organization.source_id = network.source_id "
-        "AND current_network_organization.resource_type = 'Organization' "
-        "AND current_network_organization.resource_id = network.resource_id "
-        f"LEFT JOIN {schema}.provider_directory_organization AS network_organization "
+        "LEFT JOIN current_organizations AS network_organization "
         "ON network_organization.source_id = network.source_id "
         "AND network_organization.resource_id = network.resource_id "
-        "AND network_organization.last_seen_run_id = current_network_organization.run_id "
         "AND network_organization.active IS DISTINCT FROM false"
     )
     if not has_catalog:
@@ -1098,10 +1167,7 @@ def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -
     return f"{catalog_join} {organization_join}", network_name, provenance
 
 
-def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliations: bool) -> str:
-    """Build active affiliation networks through indexable raw-reference joins."""
-    if not has_affiliations:
-        return """
+_EMPTY_AFFILIATION_NETWORK_CTE_SQL = """
     affiliation_networks AS MATERIALIZED (
         SELECT role.source_id, role.role_id, NULL::varchar AS reference,
                NULL::varchar AS resource_id,
@@ -1110,7 +1176,13 @@ def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliatio
           FROM roles AS role
          WHERE false
     )
-        """
+"""
+
+
+def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliations: bool) -> str:
+    """Build active affiliation networks through indexable raw-reference joins."""
+    if not has_affiliations:
+        return _EMPTY_AFFILIATION_NETWORK_CTE_SQL
     role_organization_id = _provider_directory_reference_resource_id_sql(
         "role.organization_ref",
         "Organization",
@@ -1125,11 +1197,10 @@ def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliatio
                role.organization_ref,
                role_organization.resource_id AS organization_resource_id
           FROM roles AS role
-          JOIN {schema}.provider_directory_organization AS role_organization
+          JOIN current_organizations AS role_organization
             ON role_organization.source_id = role.source_id
            AND role_organization.resource_id = {role_organization_id}
            AND role_organization.active IS DISTINCT FROM false
-          {_provider_directory_current_resource_join_sql("role_organization", "Organization", "current_role_organization")}
     ), affiliation_organization_candidates AS MATERIALIZED (
         SELECT DISTINCT role_organization.source_id, role_organization.role_id,
                organization_candidate.reference
@@ -1148,11 +1219,14 @@ def _provider_directory_affiliation_network_ctes_sql(schema: str, has_affiliatio
                'organization-affiliation-network-derived'::varchar AS plan_provenance,
                'provider_directory_organization_affiliation'::varchar AS evidence_provenance
           FROM affiliation_organization_candidates AS organization_candidate
-          JOIN {schema}.provider_directory_organization_affiliation AS affiliation
-            ON affiliation.source_id = organization_candidate.source_id
+          JOIN {schema}.provider_directory_organization_affiliation AS affiliation_locator
+            ON affiliation_locator.source_id = organization_candidate.source_id
+           AND affiliation_locator.participating_organization_ref = organization_candidate.reference
+          JOIN current_affiliations AS affiliation
+            ON affiliation.source_id = affiliation_locator.source_id
+           AND affiliation.resource_id = affiliation_locator.resource_id
            AND affiliation.participating_organization_ref = organization_candidate.reference
            AND affiliation.active IS DISTINCT FROM false
-          {_provider_directory_current_resource_join_sql("affiliation", "OrganizationAffiliation", "current_affiliation")}
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
          ) AS affiliation_network_ref(value)
@@ -1209,11 +1283,10 @@ def _scoped_current_insurance_plan_ctes_sql(
         SELECT DISTINCT source_id
           FROM {source_cte_name}
     ), {scope_name} AS MATERIALIZED (
-        SELECT current_plan.source_id, current_plan.resource_id, current_plan.run_id
+        SELECT current_plan.*
           FROM {scope_name}_sources AS requested_source
-          JOIN current_resources AS current_plan
+          JOIN current_insurance_plans AS current_plan
             ON current_plan.source_id = requested_source.source_id
-           AND current_plan.resource_type = 'InsurancePlan'
     )
     """
 
@@ -1240,16 +1313,12 @@ def _network_derived_role_plans_cte_sql(schema: str) -> str:
                     ELSE 'organization-affiliation-network-derived'::varchar
                 END AS provenance
           FROM valid_role_networks AS role_network
-          JOIN current_role_insurance_plans AS current_insurance_plan
-            ON current_insurance_plan.source_id = role_network.source_id
           JOIN role_catalog_status AS catalog_status
             ON catalog_status.source_id = role_network.source_id
            AND catalog_status.role_id = role_network.role_id
            AND catalog_status.catalog_complete
-          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+          JOIN current_role_insurance_plans AS insurance_plan
             ON insurance_plan.source_id = role_network.source_id
-           AND insurance_plan.resource_id = current_insurance_plan.resource_id
-           AND insurance_plan.last_seen_run_id = current_insurance_plan.run_id
            AND {insurance_plan_active}
          WHERE EXISTS (
                SELECT 1
@@ -1320,15 +1389,10 @@ def _provider_directory_network_plan_ctes_sql(
                role_network.reference, role_network.resource_id,
                role_network.plan_provenance, role_network.evidence_provenance
           FROM role_networks AS role_network
-          JOIN {schema}.provider_directory_organization AS role_network_organization
+          JOIN current_organizations AS role_network_organization
             ON role_network_organization.source_id = role_network.source_id
            AND role_network_organization.resource_id = role_network.resource_id
            AND role_network_organization.active IS DISTINCT FROM false
-          {_provider_directory_current_resource_join_sql(
-              "role_network_organization",
-              "Organization",
-              "current_role_network_organization",
-          )}
          WHERE role_network.resource_id IS NOT NULL
     ), {plan_ctes_sql}
     """
@@ -1363,11 +1427,8 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
                role.fhir_fetch_url AS role_fhir_fetch_url,
                role.fhir_fetch_mode AS role_fhir_fetch_mode
           FROM requested_roles AS requested
-          JOIN {schema}.provider_directory_practitioner_role AS role
+          JOIN current_roles AS role
             ON role.source_id = requested.source_id AND role.resource_id = requested.role_id
-          {_provider_directory_current_resource_join_sql(
-              "role", "PractitionerRole", "visible_role_resource"
-          )}
          WHERE role.active IS DISTINCT FROM false
     ), direct_plans AS MATERIALIZED (
         SELECT role.source_id, role.role_id, insurance_plan.resource_id,
@@ -1377,13 +1438,10 @@ def _provider_directory_requested_role_ctes_sql(schema: str) -> str:
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(role.insurance_plan_refs, '[]'::jsonb)
          ) AS plan_ref(value)
-          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+          JOIN current_insurance_plans AS insurance_plan
             ON insurance_plan.source_id = role.source_id
            AND insurance_plan.resource_id = {plan_id}
            AND {insurance_plan_active}
-          {_provider_directory_current_resource_join_sql(
-              "insurance_plan", "InsurancePlan", "current_insurance_plan"
-          )}
     )
     """
 
@@ -1528,8 +1586,12 @@ def _provider_directory_role_evidence_sql(
     )
     evidence_union_sql = _provider_directory_evidence_union_sql(schema, has_catalog)
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
+    current_typed_resource_ctes_sql = (
+        _current_typed_resource_ctes_sql()
+    )
     return f"""
-    WITH {current_resource_ctes_sql}, {role_ctes_sql}, evidence AS (
+    WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
+         {role_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
     SELECT evidence.source_id, evidence.role_id, evidence.evidence_type,
@@ -1561,15 +1623,10 @@ def _provider_directory_role_evidence_sql(
         ON evidence.evidence_type = 'role'
        AND role.source_id = evidence.source_id
        AND role.role_id = evidence.role_id
- LEFT JOIN current_resources AS current_plan_detail
+ LEFT JOIN current_insurance_plans AS plan
         ON evidence.evidence_type = 'insurance_plan'
-       AND current_plan_detail.source_id = evidence.source_id
-       AND current_plan_detail.resource_type = 'InsurancePlan'
-       AND current_plan_detail.resource_id = evidence.resource_id
- LEFT JOIN {schema}.provider_directory_insurance_plan AS plan
-        ON plan.source_id = current_plan_detail.source_id
-       AND plan.resource_id = current_plan_detail.resource_id
-       AND plan.last_seen_run_id = current_plan_detail.run_id
+       AND plan.source_id = evidence.source_id
+       AND plan.resource_id = evidence.resource_id
   ORDER BY CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.role_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
@@ -1913,12 +1970,9 @@ def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
                affiliation.resource_id AS affiliation_id,
                affiliation.network_refs::jsonb
           FROM requested_affiliations AS requested
-          JOIN {schema}.provider_directory_organization_affiliation AS affiliation
+          JOIN current_affiliations AS affiliation
             ON affiliation.source_id = requested.source_id
            AND affiliation.resource_id = requested.affiliation_id
-          {_provider_directory_current_resource_join_sql(
-              "affiliation", "OrganizationAffiliation", "visible_affiliation_resource"
-          )}
          WHERE affiliation.active IS DISTINCT FROM false
     ), affiliation_networks AS MATERIALIZED (
         SELECT DISTINCT affiliation.source_id, affiliation.affiliation_id,
@@ -1931,13 +1985,10 @@ def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
     ), valid_affiliation_networks AS MATERIALIZED (
         SELECT affiliation_network.*
           FROM affiliation_networks AS affiliation_network
-          JOIN {schema}.provider_directory_organization AS network_organization
+          JOIN current_organizations AS network_organization
             ON network_organization.source_id = affiliation_network.source_id
            AND network_organization.resource_id = affiliation_network.resource_id
            AND network_organization.active IS DISTINCT FROM false
-          {_provider_directory_current_resource_join_sql(
-              "network_organization", "Organization", "current_network_organization_resource"
-          )}
          WHERE affiliation_network.resource_id IS NOT NULL
     )
     """
@@ -1963,12 +2014,8 @@ def _affiliation_plan_resolution_cte_sql(schema: str) -> str:
                NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
                'organization-affiliation-network-derived'::varchar AS provenance
           FROM valid_affiliation_networks AS affiliation_network
-          JOIN current_affiliation_insurance_plans AS current_insurance_plan
-            ON current_insurance_plan.source_id = affiliation_network.source_id
-          JOIN {schema}.provider_directory_insurance_plan AS insurance_plan
+          JOIN current_affiliation_insurance_plans AS insurance_plan
             ON insurance_plan.source_id = affiliation_network.source_id
-           AND insurance_plan.resource_id = current_insurance_plan.resource_id
-           AND insurance_plan.last_seen_run_id = current_insurance_plan.run_id
            AND {insurance_plan_active}
          WHERE EXISTS (
                SELECT 1
@@ -2073,8 +2120,12 @@ def _provider_directory_affiliation_evidence_sql(
         schema,
         has_catalog,
     )
+    current_typed_resource_ctes_sql = (
+        _current_typed_resource_ctes_sql()
+    )
     return f"""
-    WITH {current_resource_ctes_sql}, {affiliation_ctes_sql},
+    WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
+         {affiliation_ctes_sql},
          {plan_resolution_cte_sql}, {plan_cap_ctes_sql}, evidence AS (
         {evidence_union_sql}
     )
@@ -2094,14 +2145,10 @@ def _provider_directory_affiliation_evidence_sql(
            plan.fhir_fetch_mode AS plan_fhir_fetch_mode,
            COUNT(*) OVER ()::bigint AS evidence_row_total
       FROM evidence
- LEFT JOIN current_affiliation_insurance_plans AS current_insurance_plan
+ LEFT JOIN current_insurance_plans AS plan
         ON evidence.evidence_type = 'insurance_plan'
-       AND current_insurance_plan.source_id = evidence.source_id
-       AND current_insurance_plan.resource_id = evidence.resource_id
- LEFT JOIN {schema}.provider_directory_insurance_plan AS plan
-        ON plan.source_id = current_insurance_plan.source_id
-       AND plan.resource_id = current_insurance_plan.resource_id
-       AND plan.last_seen_run_id = current_insurance_plan.run_id
+       AND plan.source_id = evidence.source_id
+       AND plan.resource_id = evidence.resource_id
   ORDER BY CASE WHEN evidence.evidence_type = 'affiliation' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.affiliation_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};

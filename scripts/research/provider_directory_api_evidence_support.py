@@ -11,6 +11,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
+from scripts.research.provider_directory_api_evidence_models import (
+    OverlaySample,
+    SourceEvaluationContext,
+    SourceSelection,
+)
 from scripts.research.provider_directory_api_evidence_typed import (
     MappedEvidenceWitness,
     NetworkWitness,
@@ -28,6 +33,7 @@ __all__ = (
     "OverlaySample",
     "ProviderDirectoryApiClient",
     "SourceSelection",
+    "SourceEvaluationContext",
     "evaluate_source",
     "has_row_source_provenance",
     "is_within_latency_slo",
@@ -44,26 +50,6 @@ SENSITIVE_FIELD_PARTS = (
     "credential",
     "headers",
 )
-
-
-@dataclass(frozen=True)
-class SourceSelection:
-    """One exact manifest source and its API-readiness requirement."""
-
-    entry_id: str
-    source_id: str
-    classification: str
-    required: bool
-    resources: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class OverlaySample:
-    """One bounded current overlay sample used for API verification."""
-
-    source_id: str
-    npi: int
-    phone: str | None
 
 
 @dataclass(frozen=True)
@@ -323,21 +309,70 @@ def _is_witness_check_passing(witness_check: Mapping[str, Any]) -> bool:
     )
 
 
+def _mapped_resource_capability(
+    selection: SourceSelection,
+    resource_type: str,
+    resource_witnesses: list[MappedEvidenceWitness],
+    capability_checks: list[Mapping[str, Any]],
+    completion_state: str,
+    api_enabled: bool,
+    context: SourceEvaluationContext,
+) -> dict[str, Any]:
+    capability_map: dict[str, Any] = {
+        "declared": resource_type in selection.resources,
+        "witness_count": len(resource_witnesses),
+        "completion_witness_count": sum(
+            witness.supports_completion for witness in resource_witnesses
+        ),
+        "current_dataset_completion": completion_state,
+    }
+    if resource_type not in selection.resources:
+        capability_map["state"] = "not_applicable"
+        return capability_map
+    if not resource_witnesses:
+        capability_map["state"] = (
+            "completed_empty" if completion_state == "completed_empty" else "not_observed"
+        )
+        if context.completion_probe_error:
+            capability_map["reason"] = "current_dataset_completion_probe_failed"
+        elif context.witness_probe_error:
+            capability_map["reason"] = "mapped_evidence_probe_failed"
+        return capability_map
+    if not api_enabled:
+        capability_map["state"] = "fail"
+        capability_map["reason"] = (
+            context.api_skip_reason or "api_credentials_unavailable"
+        )
+        return capability_map
+    if completion_state == "completed_empty":
+        capability_map["state"] = "fail"
+        capability_map["reason"] = "completion_proof_contradicts_mapped_witness"
+        return capability_map
+    capability_map["state"] = (
+        "pass"
+        if capability_checks
+        and all(map(_is_witness_check_passing, capability_checks))
+        else "fail"
+    )
+    return capability_map
+
+
 def _mapped_evidence_capabilities(
     selection: SourceSelection,
     witnesses: list[MappedEvidenceWitness],
     witness_checks: list[Mapping[str, Any]],
+    context: SourceEvaluationContext,
+    completion_proofs: Mapping[str, Mapping[str, Any]] | None,
     *,
     api_enabled: bool,
-    api_skip_reason: str | None,
-    witness_probe_error: str | None,
 ) -> dict[str, dict[str, Any]]:
-    capability_by_name: dict[str, dict[str, Any]] = {}
+    """Classify each declared mapped resource without weakening empty proofs."""
     checks_by_resource = {
         str(check["witness"]["resource_type"]): [] for check in witness_checks
     }
     for check in witness_checks:
         checks_by_resource[str(check["witness"]["resource_type"])].append(check)
+    capability_by_name: dict[str, dict[str, Any]] = {}
     for resource_type, capability_name in (
         ("PractitionerRole", "practitioner_role"),
         ("OrganizationAffiliation", "organization_affiliation"),
@@ -345,31 +380,17 @@ def _mapped_evidence_capabilities(
         resource_witnesses = [
             witness for witness in witnesses if witness.resource_type == resource_type
         ]
-        capability_map: dict[str, Any] = {
-            "declared": resource_type in selection.resources,
-            "witness_count": len(resource_witnesses),
-            "completion_witness_count": sum(
-                witness.supports_completion for witness in resource_witnesses
-            ),
-        }
-        if resource_type not in selection.resources:
-            capability_map["state"] = "not_applicable"
-        elif not resource_witnesses:
-            capability_map["state"] = "not_observed"
-            if witness_probe_error:
-                capability_map["reason"] = "mapped_evidence_probe_failed"
-        elif not api_enabled:
-            capability_map["state"] = "fail"
-            capability_map["reason"] = api_skip_reason or "api_credentials_unavailable"
-        else:
-            capability_checks = checks_by_resource.get(resource_type, [])
-            capability_map["state"] = (
-                "pass"
-                if capability_checks
-                and all(map(_is_witness_check_passing, capability_checks))
-                else "fail"
-            )
-        capability_by_name[capability_name] = capability_map
+        completion_proof = (completion_proofs or {}).get(resource_type, {})
+        completion_state = str(completion_proof.get("state") or "unproven")
+        capability_by_name[capability_name] = _mapped_resource_capability(
+            selection,
+            resource_type,
+            resource_witnesses,
+            checks_by_resource.get(resource_type, []),
+            completion_state,
+            api_enabled,
+            context,
+        )
     return capability_by_name
 
 
@@ -402,12 +423,10 @@ def evaluate_source(
     selection: SourceSelection,
     samples: list[OverlaySample],
     api_client: ProviderDirectoryApiClient | None,
+    context: SourceEvaluationContext,
     *,
-    candidate_limit: int,
-    api_latency_slo_ms: float,
-    api_skip_reason: str | None,
     witnesses: list[MappedEvidenceWitness] | None = None,
-    witness_probe_error: str | None = None,
+    completion_proofs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Verify bounded api-layer detail and phone evidence for one manifest source."""
     witnesses = witnesses or []
@@ -415,16 +434,16 @@ def evaluate_source(
     witness_checks: list[dict[str, Any]] = []
     if api_client is not None:
         witness_checks = [
-            _evaluate_witness(witness, api_client, api_latency_slo_ms)
+            _evaluate_witness(witness, api_client, context.api_latency_slo_ms)
             for witness in witnesses
         ]
     source_result["mapped_evidence_capabilities"] = _mapped_evidence_capabilities(
         selection,
         witnesses,
         witness_checks,
+        context,
+        completion_proofs,
         api_enabled=api_client is not None,
-        api_skip_reason=api_skip_reason,
-        witness_probe_error=witness_probe_error,
     )
     if witness_checks:
         source_result["mapped_evidence_checks"] = witness_checks
@@ -438,15 +457,17 @@ def evaluate_source(
         return source_result
     if api_client is None:
         source_result["status"] = "skip"
-        source_result["reason"] = api_skip_reason or "api_credentials_unavailable"
+        source_result["reason"] = (
+            context.api_skip_reason or "api_credentials_unavailable"
+        )
         return source_result
     source_checks = [
         _evaluate_sample(
             sample,
             selection.source_id,
             api_client,
-            candidate_limit,
-            api_latency_slo_ms,
+            context.candidate_limit,
+            context.api_latency_slo_ms,
         )
         for sample in samples
     ]
