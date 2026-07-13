@@ -51,6 +51,8 @@ from db.models import (
     ProviderDirectoryBulkOutputCheckpoint,
     ProviderDirectoryCapability,
     ProviderDirectoryCanonicalResource,
+    ProviderDirectoryDatasetAffiliationOrganization,
+    ProviderDirectoryDatasetNetworkPlan,
     ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryEndpointDataset,
@@ -171,6 +173,7 @@ FHIR_FETCH_MODES = frozenset(
     {"rest_bundle", "rest_read", "bulk_ndjson", "graphql"}
 )
 _PUBLISH_SCOPE_UNSET = object()
+_DATASET_SERVING_RELATION_ROOT_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
     resource_type.lower() for resource_type in DEFAULT_RESOURCES
 )
@@ -228,6 +231,18 @@ RESOURCE_ENDPOINT_FIELDS = {
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "provider_directory_address_corroboration"
 PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE = "provider_directory_network_catalog"
 PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX = "provider_directory_network_catalog_stage"
+PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = (
+    "provider_directory_dataset_network_plan"
+)
+PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY = "dataset_network_plan"
+PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = (
+    "provider_directory_dataset_affiliation_organization"
+)
+PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY = (
+    "dataset_affiliation_organization"
+)
+PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_VERSION = 1
+PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_VERSION = 1
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
 PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
@@ -254,6 +269,8 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
     "name_idx",
 )
 PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = (
+    "dataset_network_plan",
+    "dataset_affiliation_organization",
     "location_contacts",
     "location_coordinates",
     "resource_id_npis",
@@ -281,6 +298,10 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
         "location_archive",
         "address_overlay",
     ),
+    "dataset_serving_relations": (
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+    ),
     "location": (
         "location_contacts",
         "location_coordinates",
@@ -293,11 +314,23 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
         "location_address_keys",
         "location_archive",
     ),
-    "network": ("network_catalog",),
-    "networks": ("network_catalog",),
+    "network": (
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+        "network_catalog",
+    ),
+    "networks": (
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+        "network_catalog",
+    ),
     "ptg_corroboration": ("corroboration",),
 }
 PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
+    "dataset_network_plan": (frozenset({"InsurancePlan"}),),
+    "dataset_affiliation_organization": (
+        frozenset({"OrganizationAffiliation"}),
+    ),
     "location_contacts": (frozenset({"Location"}),),
     "location_coordinates": (frozenset({"Location"}),),
     "resource_id_npis": (
@@ -325,6 +358,10 @@ PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_ALTERNATIVES = {
     ),
 }
 PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES = {
+    "dataset_network_plan": frozenset({"InsurancePlan"}),
+    "dataset_affiliation_organization": frozenset(
+        {"OrganizationAffiliation"}
+    ),
     "location_contacts": frozenset({"Location"}),
     "location_coordinates": frozenset({"Location"}),
     "resource_id_npis": frozenset({"Organization", "Practitioner"}),
@@ -397,6 +434,8 @@ SOURCE_MODELS = (
 CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryEndpointDataset,
     ProviderDirectoryDatasetResource,
+    ProviderDirectoryDatasetNetworkPlan,
+    ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryCanonicalResource,
     ProviderDirectorySourceResource,
     ProviderDirectoryBulkAcquisitionCheckpoint,
@@ -9624,6 +9663,286 @@ async def backfill_provider_directory_resource_id_npis(
     return updated_counts_by_resource
 
 
+def _unique_artifact_datasets(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> list[ProviderDirectoryArtifactDataset]:
+    datasets_by_id: dict[str, ProviderDirectoryArtifactDataset] = {}
+    for dataset in fence.datasets:
+        incumbent = datasets_by_id.setdefault(dataset.dataset_id, dataset)
+        if incumbent.endpoint_id != dataset.endpoint_id:
+            raise RuntimeError(
+                "provider_directory_artifact_dataset_endpoint_ambiguous:"
+                + dataset.dataset_id
+            )
+    return [datasets_by_id[dataset_id] for dataset_id in sorted(datasets_by_id)]
+
+
+async def _record_current_dataset_serving_relation_proof(
+    dataset: ProviderDirectoryArtifactDataset,
+    metadata_key: str,
+    proof: dict[str, Any],
+) -> None:
+    dataset_ref = _qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    updated = await db.status(
+        f"""
+        UPDATE {dataset_ref}
+           SET publication_metadata_json = jsonb_set(
+               COALESCE(publication_metadata_json::jsonb, '{{}}'::jsonb),
+               '{{{metadata_key}}}',
+               CAST(:proof_json AS jsonb),
+               true
+           )
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+           AND is_current = true
+           AND status = :published_status
+           AND superseded_at IS NULL;
+        """,
+        proof_json=json.dumps(proof, sort_keys=True, default=_json_default),
+        dataset_id=dataset.dataset_id,
+        endpoint_id=dataset.endpoint_id,
+        published_status=ENDPOINT_DATASET_PUBLISHED,
+    )
+    if _coerce_rowcount(updated) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_endpoint_dataset_current_changed"
+        )
+
+
+def _dataset_network_plan_aggregate_proof(
+    dataset_proofs: list[dict[str, Any]],
+    *,
+    build_run_id: str | None,
+) -> dict[str, Any]:
+    count_fields = (
+        "insurance_plan_resource_count",
+        "insurance_plan_with_network_refs_count",
+        "zero_network_reference_plan_count",
+        "malformed_network_refs_payload_count",
+        "network_reference_value_count",
+        "valid_network_reference_count",
+        "invalid_network_reference_count",
+        "expected_edge_count",
+        "edge_count",
+        "duplicate_network_reference_count",
+        "replaced_edge_count",
+    )
+    return {
+        "complete": True,
+        "version": PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_VERSION,
+        "build_run_id": build_run_id,
+        "dataset_count": len(dataset_proofs),
+        "dataset_ids": [proof["dataset_id"] for proof in dataset_proofs],
+        **{
+            field_name: sum(int(proof[field_name]) for proof in dataset_proofs)
+            for field_name in count_fields
+        },
+        "datasets": dataset_proofs,
+    }
+
+
+def _dataset_affiliation_organization_aggregate_proof(
+    dataset_proofs: list[dict[str, Any]],
+    *,
+    build_run_id: str | None,
+) -> dict[str, Any]:
+    count_fields = (
+        "affiliation_resource_count",
+        "affiliation_with_participating_organization_count",
+        "empty_participating_organization_reference_count",
+        "malformed_reference_payload_count",
+        "valid_reference_count",
+        "invalid_reference_count",
+        "expected_edge_count",
+        "edge_count",
+        "replaced_edge_count",
+    )
+    return {
+        "complete": True,
+        "version": (
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_VERSION
+        ),
+        "build_run_id": build_run_id,
+        "dataset_count": len(dataset_proofs),
+        "dataset_ids": [proof["dataset_id"] for proof in dataset_proofs],
+        **{
+            field_name: sum(int(proof[field_name]) for proof in dataset_proofs)
+            for field_name in count_fields
+        },
+        "datasets": dataset_proofs,
+    }
+
+
+async def _rebuild_one_current_dataset_relation_set(
+    dataset: ProviderDirectoryArtifactDataset,
+    *,
+    build_run_id: str | None,
+    should_rebuild_network_plan: bool,
+    should_rebuild_affiliation_organization: bool,
+) -> dict[str, dict[str, Any]]:
+    proof_by_relation: dict[str, dict[str, Any]] = {}
+    if should_rebuild_network_plan:
+        network_proof = await _build_provider_directory_dataset_network_plan(
+            db,
+            dataset.dataset_id,
+            build_run_id=build_run_id,
+        )
+        proof_by_relation[
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY
+        ] = network_proof
+    if should_rebuild_affiliation_organization:
+        affiliation_proof = (
+            await _build_provider_directory_dataset_affiliation_organization(
+                db,
+                dataset.dataset_id,
+                build_run_id=build_run_id,
+            )
+        )
+        proof_by_relation[
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
+        ] = affiliation_proof
+    for metadata_key, relation_proof in proof_by_relation.items():
+        await _record_current_dataset_serving_relation_proof(
+            dataset,
+            metadata_key,
+            relation_proof,
+        )
+    return proof_by_relation
+
+
+def _aggregate_dataset_serving_relation_proofs(
+    proof_list_by_relation: dict[str, list[dict[str, Any]]],
+    *,
+    build_run_id: str | None,
+) -> dict[str, dict[str, Any]]:
+    aggregate_by_relation: dict[str, dict[str, Any]] = {}
+    network_key = PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY
+    affiliation_key = (
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
+    )
+    if network_key in proof_list_by_relation:
+        aggregate_by_relation[network_key] = (
+            _dataset_network_plan_aggregate_proof(
+                proof_list_by_relation[network_key],
+                build_run_id=build_run_id,
+            )
+        )
+    if affiliation_key in proof_list_by_relation:
+        aggregate_by_relation[affiliation_key] = (
+            _dataset_affiliation_organization_aggregate_proof(
+                proof_list_by_relation[affiliation_key],
+                build_run_id=build_run_id,
+            )
+        )
+    return aggregate_by_relation
+
+
+async def _rebuild_current_dataset_serving_relations(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    build_run_id: str | None,
+    should_rebuild_network_plan: bool,
+    should_rebuild_affiliation_organization: bool,
+) -> dict[str, dict[str, Any]]:
+    """Refresh selected dataset relations without global-table cutover."""
+    selected_datasets = _unique_artifact_datasets(fence)
+    proof_list_by_relation: dict[str, list[dict[str, Any]]] = {}
+    if selected_datasets:
+        async with db.transaction():
+            await _lock_artifact_fence_endpoints(fence, db)
+            await _verify_provider_directory_artifact_dataset_fence(fence)
+            for dataset in selected_datasets:
+                proof_by_relation = (
+                    await _rebuild_one_current_dataset_relation_set(
+                        dataset,
+                        build_run_id=build_run_id,
+                        should_rebuild_network_plan=(
+                            should_rebuild_network_plan
+                        ),
+                        should_rebuild_affiliation_organization=(
+                            should_rebuild_affiliation_organization
+                        ),
+                    )
+                )
+                for relation_name, relation_proof in proof_by_relation.items():
+                    proof_list_by_relation.setdefault(
+                        relation_name,
+                        [],
+                    ).append(relation_proof)
+    for relation_name, should_rebuild in (
+        (
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+            should_rebuild_network_plan,
+        ),
+        (
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY,
+            should_rebuild_affiliation_organization,
+        ),
+    ):
+        if should_rebuild:
+            proof_list_by_relation.setdefault(relation_name, [])
+    return _aggregate_dataset_serving_relation_proofs(
+        proof_list_by_relation,
+        build_run_id=build_run_id,
+    )
+
+
+async def _publish_current_dataset_relation_artifacts(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    publish_artifacts_targets: set[str] | None,
+) -> None:
+    should_rebuild_network_plan = is_provider_directory_publish_target_enabled(
+        publish_artifacts_targets,
+        "dataset_network_plan",
+    )
+    should_rebuild_affiliation_organization = (
+        is_provider_directory_publish_target_enabled(
+            publish_artifacts_targets,
+            "dataset_affiliation_organization",
+        )
+    )
+    relation_proof_by_name: dict[str, dict[str, Any]] = {}
+    if should_rebuild_network_plan or should_rebuild_affiliation_organization:
+        relation_proof_by_name = (
+            await _rebuild_current_dataset_serving_relations(
+                fence,
+                build_run_id=run_id,
+                should_rebuild_network_plan=should_rebuild_network_plan,
+                should_rebuild_affiliation_organization=(
+                    should_rebuild_affiliation_organization
+                ),
+            )
+        )
+    metrics.update(relation_proof_by_name)
+    if not should_rebuild_network_plan:
+        metrics[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY] = (
+            _provider_directory_publish_target_skipped()
+        )
+    if not should_rebuild_affiliation_organization:
+        metrics[
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY
+        ] = _provider_directory_publish_target_skipped()
+
+
+def _is_dataset_relation_only_artifact_target(
+    publish_artifacts_targets: set[str] | None,
+) -> bool:
+    dataset_relation_targets = {
+        "dataset_network_plan",
+        "dataset_affiliation_organization",
+    }
+    return (
+        publish_artifacts_targets is not None
+        and publish_artifacts_targets.issubset(dataset_relation_targets)
+    )
+
+
 async def _publish_provider_directory_dataset_artifacts(
     *,
     run_id: str | None,
@@ -9638,6 +9957,17 @@ async def _publish_provider_directory_dataset_artifacts(
         publish_artifacts_targets=publish_artifacts_targets,
         publish_corroboration=publish_corroboration,
     )
+    await _publish_current_dataset_relation_artifacts(
+        fence,
+        run_id=run_id,
+        metrics=metrics,
+        publish_artifacts_targets=publish_artifacts_targets,
+    )
+    if _is_dataset_relation_only_artifact_target(publish_artifacts_targets):
+        metrics["publish_artifacts_targets"] = sorted(
+            publish_artifacts_targets or ()
+        )
+        return metrics
     artifact_resource_types = _provider_directory_artifact_resource_types(
         publish_artifacts_targets,
         publish_corroboration=publish_corroboration,
@@ -10805,10 +11135,17 @@ async def _ensure_provider_directory_tables() -> None:
             using = f"USING {index.get('using')} " if index.get("using") else ""
             where = f" WHERE {index.get('where')}" if index.get("where") else ""
             elements = _provider_directory_index_elements_sql(model, index)
+            included_columns = ", ".join(
+                _q(column_name) for column_name in index.get("include", ())
+            )
+            include = (
+                f" INCLUDE ({included_columns})" if included_columns else ""
+            )
             unique = "UNIQUE " if index.get("unique") else ""
             await db.status(
                 f"CREATE {unique}INDEX IF NOT EXISTS {name} "
-                f"ON {_qt(schema, model.__tablename__)} {using}({elements}){where};"
+                f"ON {_qt(schema, model.__tablename__)} "
+                f"{using}({elements}){include}{where};"
             )
     await _ensure_provider_directory_import_seen_table(schema)
 
@@ -26073,6 +26410,582 @@ async def _import_alohr_graphql_source_group(
     )
 
 
+def _network_plan_source_ctes(
+    dataset_ref: str,
+    resource_ref: str,
+    root_filter: str,
+) -> str:
+    return f"""
+        WITH target_dataset AS MATERIALIZED (
+            SELECT dataset_id, acquisition_root_run_id
+              FROM {dataset_ref}
+             WHERE dataset_id = :dataset_id
+               {root_filter}
+        ), insurance_plans AS MATERIALIZED (
+            SELECT resource.resource_id AS insurance_plan_resource_id,
+                   resource.payload_json::jsonb AS payload_json,
+                   CASE
+                       WHEN jsonb_typeof(
+                            resource.payload_json::jsonb -> 'network_refs'
+                       ) = 'array'
+                       THEN resource.payload_json::jsonb -> 'network_refs'
+                       ELSE '[]'::jsonb
+                   END AS network_refs,
+                   CASE
+                       WHEN resource.payload_json::jsonb ? 'network_refs'
+                        AND resource.payload_json::jsonb -> 'network_refs'
+                            <> 'null'::jsonb
+                        AND jsonb_typeof(
+                            resource.payload_json::jsonb -> 'network_refs'
+                        ) <> 'array'
+                       THEN true
+                       ELSE false
+                   END AS malformed_network_refs
+              FROM {resource_ref} AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'InsurancePlan'
+        ), network_references AS MATERIALIZED (
+            SELECT plan.insurance_plan_resource_id,
+                   reference.ordinality,
+                   CASE
+                       WHEN jsonb_typeof(reference.value) = 'string'
+                       THEN reference.value #>> '{{}}'
+                       ELSE NULL
+                   END AS reference_text
+              FROM insurance_plans AS plan
+             CROSS JOIN LATERAL jsonb_array_elements(plan.network_refs)
+                  WITH ORDINALITY AS reference(value, ordinality)
+        )
+    """
+
+
+def _network_plan_edge_ctes(
+    edge_ref: str,
+    organization_reference_pattern: str,
+) -> str:
+    return f"""
+        , normalized_references AS MATERIALIZED (
+            SELECT insurance_plan_resource_id,
+                   reference_text,
+                   CASE
+                       WHEN BTRIM(reference_text)
+                            ~ '^[A-Za-z0-9.-]{{1,64}}$'
+                       THEN BTRIM(reference_text)
+                       ELSE substring(
+                           BTRIM(reference_text)
+                           FROM '{organization_reference_pattern}'
+                       )
+                   END AS network_resource_id
+              FROM network_references
+        ), expected_edges AS MATERIALIZED (
+            SELECT DISTINCT insurance_plan_resource_id, network_resource_id
+              FROM normalized_references
+             WHERE network_resource_id IS NOT NULL
+        ), inserted_edges AS (
+            INSERT INTO {edge_ref} (
+                dataset_id,
+                network_resource_id,
+                insurance_plan_resource_id,
+                acquisition_root_run_id,
+                build_run_id,
+                built_at
+            )
+            SELECT dataset.dataset_id,
+                   edge.network_resource_id,
+                   edge.insurance_plan_resource_id,
+                   dataset.acquisition_root_run_id,
+                   :build_run_id,
+                   now()
+              FROM expected_edges AS edge
+             CROSS JOIN target_dataset AS dataset
+            RETURNING network_resource_id, insurance_plan_resource_id
+        )
+    """
+
+
+def _network_plan_proof_select() -> str:
+    return """
+        SELECT
+            (SELECT COUNT(*) FROM target_dataset)::bigint
+                AS target_dataset_count,
+            (SELECT acquisition_root_run_id FROM target_dataset LIMIT 1)
+                AS acquisition_root_run_id,
+            (SELECT COUNT(*) FROM insurance_plans)::bigint
+                AS insurance_plan_resource_count,
+            (SELECT COUNT(*) FROM insurance_plans
+              WHERE jsonb_array_length(network_refs) > 0)::bigint
+                AS insurance_plan_with_network_refs_count,
+            (SELECT COUNT(*) FROM insurance_plans
+              WHERE jsonb_array_length(network_refs) = 0)::bigint
+                AS zero_network_reference_plan_count,
+            (SELECT COUNT(*) FROM insurance_plans
+              WHERE malformed_network_refs)::bigint
+                AS malformed_network_refs_payload_count,
+            (SELECT COUNT(*) FROM network_references)::bigint
+                AS network_reference_value_count,
+            (SELECT COUNT(*) FROM normalized_references
+              WHERE network_resource_id IS NOT NULL)::bigint
+                AS valid_network_reference_count,
+            (SELECT COUNT(*) FROM normalized_references
+              WHERE network_resource_id IS NULL)::bigint
+                AS invalid_network_reference_count,
+            (SELECT COUNT(*) FROM expected_edges)::bigint
+                AS expected_edge_count,
+            (SELECT COUNT(*) FROM inserted_edges)::bigint AS edge_count;
+    """
+
+
+def _dataset_network_plan_insert_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    """Build normalized InsurancePlan network edges and return proof counts."""
+    schema = _schema()
+    root_filter = (
+        "AND acquisition_root_run_id IS NOT DISTINCT FROM "
+        ":acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    organization_reference_pattern = (
+        r"(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})"
+        r"(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$"
+    )
+    return "\n".join(
+        (
+            _network_plan_source_ctes(
+                _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                root_filter,
+            ),
+            _network_plan_edge_ctes(
+                _qt(schema, PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE),
+                organization_reference_pattern,
+            ),
+            _network_plan_proof_select(),
+        )
+    )
+
+
+def _dataset_network_plan_count(
+    proof_row: dict[str, Any],
+    field_name: str,
+) -> int:
+    return int(proof_row.get(field_name) or 0)
+
+
+def _validated_serving_relation_root(
+    proof_by_field: dict[str, Any],
+    dataset_id: str,
+    expected_root_run_id: str | None | object,
+    error_prefix: str,
+) -> str | None:
+    if _dataset_network_plan_count(
+        proof_by_field,
+        "target_dataset_count",
+    ) != 1:
+        raise RuntimeError(f"{error_prefix}_dataset_missing:{dataset_id}")
+    root_run_id = _clean_text(proof_by_field.get("acquisition_root_run_id"))
+    if (
+        expected_root_run_id is not _DATASET_SERVING_RELATION_ROOT_UNSET
+        and root_run_id != expected_root_run_id
+    ):
+        raise RuntimeError(f"{error_prefix}_root_mismatch:{dataset_id}")
+    return root_run_id
+
+
+def _assert_serving_relation_complete(
+    proof_by_field: dict[str, Any],
+    dataset_id: str,
+    malformed_field: str,
+    invalid_field: str,
+    error_prefix: str,
+) -> tuple[int, int]:
+    malformed_count = _dataset_network_plan_count(
+        proof_by_field,
+        malformed_field,
+    )
+    invalid_count = _dataset_network_plan_count(proof_by_field, invalid_field)
+    if malformed_count or invalid_count:
+        raise RuntimeError(
+            f"{error_prefix}_invalid_references:{dataset_id}:"
+            f"malformed={malformed_count}:invalid={invalid_count}"
+        )
+    expected_count = _dataset_network_plan_count(
+        proof_by_field,
+        "expected_edge_count",
+    )
+    edge_count = _dataset_network_plan_count(proof_by_field, "edge_count")
+    if edge_count != expected_count:
+        raise RuntimeError(
+            f"{error_prefix}_incomplete:{dataset_id}:"
+            f"expected={expected_count}:actual={edge_count}"
+        )
+    return expected_count, edge_count
+
+
+def _validated_dataset_network_plan_proof(
+    proof_by_field: dict[str, Any],
+    *,
+    dataset_id: str,
+    build_run_id: str | None,
+    replaced_edge_count: int,
+    expected_acquisition_root_run_id: str | None | object,
+) -> dict[str, Any]:
+    error_prefix = "provider_directory_dataset_network_plan"
+    root_run_id = _validated_serving_relation_root(
+        proof_by_field,
+        dataset_id,
+        expected_acquisition_root_run_id,
+        error_prefix,
+    )
+    expected_edge_count, _edge_count = _assert_serving_relation_complete(
+        proof_by_field,
+        dataset_id,
+        "malformed_network_refs_payload_count",
+        "invalid_network_reference_count",
+        error_prefix,
+    )
+    valid_reference_count = _dataset_network_plan_count(
+        proof_by_field,
+        "valid_network_reference_count",
+    )
+    count_fields = (
+        "insurance_plan_resource_count",
+        "insurance_plan_with_network_refs_count",
+        "zero_network_reference_plan_count",
+        "malformed_network_refs_payload_count",
+        "network_reference_value_count",
+        "valid_network_reference_count",
+        "invalid_network_reference_count",
+        "expected_edge_count",
+        "edge_count",
+    )
+    return {
+        "complete": True,
+        "version": PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_VERSION,
+        "dataset_id": dataset_id,
+        "acquisition_root_run_id": root_run_id,
+        "build_run_id": build_run_id,
+        **{
+            field_name: _dataset_network_plan_count(proof_by_field, field_name)
+            for field_name in count_fields
+        },
+        "duplicate_network_reference_count": (
+            valid_reference_count - expected_edge_count
+        ),
+        "replaced_edge_count": replaced_edge_count,
+    }
+
+
+async def _build_provider_directory_dataset_network_plan(
+    executor: Any,
+    dataset_id: str,
+    *,
+    build_run_id: str | None,
+    expected_acquisition_root_run_id: str | None | object = (
+        _DATASET_SERVING_RELATION_ROOT_UNSET
+    ),
+) -> dict[str, Any]:
+    """Replace one dataset's edges inside the caller's transaction."""
+    edge_ref = _qt(
+        _schema(),
+        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
+    )
+    replaced_edge_count = _coerce_rowcount(
+        await executor.status(
+            f"DELETE FROM {edge_ref} WHERE dataset_id = :dataset_id;",
+            dataset_id=dataset_id,
+        )
+    )
+    should_verify_root = (
+        expected_acquisition_root_run_id
+        is not _DATASET_SERVING_RELATION_ROOT_UNSET
+    )
+    query_params_by_name: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "build_run_id": build_run_id,
+    }
+    if should_verify_root:
+        query_params_by_name["acquisition_root_run_id"] = (
+            expected_acquisition_root_run_id
+        )
+    proof_record = await executor.first(
+        _dataset_network_plan_insert_sql(
+            should_verify_acquisition_root=should_verify_root,
+        ),
+        **query_params_by_name,
+    )
+    proof_row = _pagination_checkpoint_row_mapping(proof_record)
+    return _validated_dataset_network_plan_proof(
+        proof_row,
+        dataset_id=dataset_id,
+        build_run_id=build_run_id,
+        replaced_edge_count=replaced_edge_count,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+    )
+
+
+def _affiliation_org_source_ctes(
+    dataset_ref: str,
+    resource_ref: str,
+    root_filter: str,
+) -> str:
+    return f"""
+        WITH target_dataset AS MATERIALIZED (
+            SELECT dataset_id, acquisition_root_run_id
+              FROM {dataset_ref}
+             WHERE dataset_id = :dataset_id
+               {root_filter}
+        ), affiliations AS MATERIALIZED (
+            SELECT resource.resource_id AS affiliation_resource_id,
+                   resource.payload_json::jsonb
+                       -> 'participating_organization_ref' AS reference_json
+              FROM {resource_ref} AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'OrganizationAffiliation'
+        ), normalized_affiliations AS MATERIALIZED (
+            SELECT affiliation_resource_id,
+                   CASE
+                       WHEN jsonb_typeof(reference_json) = 'string'
+                       THEN NULLIF(BTRIM(reference_json #>> '{{}}'), '')
+                       ELSE NULL
+                   END AS reference_text,
+                   CASE
+                       WHEN reference_json IS NULL
+                         OR reference_json = 'null'::jsonb
+                         OR (
+                            jsonb_typeof(reference_json) = 'string'
+                            AND NULLIF(
+                                BTRIM(reference_json #>> '{{}}'),
+                                ''
+                            ) IS NULL
+                         )
+                       THEN true
+                       ELSE false
+                   END AS empty_reference,
+                   CASE
+                       WHEN reference_json IS NOT NULL
+                        AND reference_json <> 'null'::jsonb
+                        AND jsonb_typeof(reference_json) <> 'string'
+                       THEN true
+                       ELSE false
+                   END AS malformed_reference
+              FROM affiliations
+        )
+    """
+
+
+def _affiliation_org_edge_ctes(
+    edge_ref: str,
+    organization_reference_pattern: str,
+) -> str:
+    return f"""
+        , resolved_affiliations AS MATERIALIZED (
+            SELECT affiliation_resource_id,
+                   reference_text,
+                   empty_reference,
+                   malformed_reference,
+                   CASE
+                       WHEN reference_text ~ '^[A-Za-z0-9.-]{{1,64}}$'
+                       THEN reference_text
+                       ELSE substring(
+                           reference_text
+                           FROM '{organization_reference_pattern}'
+                       )
+                   END AS participating_organization_resource_id
+              FROM normalized_affiliations
+        ), expected_edges AS MATERIALIZED (
+            SELECT DISTINCT affiliation_resource_id,
+                   participating_organization_resource_id
+              FROM resolved_affiliations
+             WHERE participating_organization_resource_id IS NOT NULL
+        ), inserted_edges AS (
+            INSERT INTO {edge_ref} (
+                dataset_id,
+                participating_organization_resource_id,
+                affiliation_resource_id,
+                acquisition_root_run_id,
+                build_run_id,
+                built_at
+            )
+            SELECT dataset.dataset_id,
+                   edge.participating_organization_resource_id,
+                   edge.affiliation_resource_id,
+                   dataset.acquisition_root_run_id,
+                   :build_run_id,
+                   now()
+              FROM expected_edges AS edge
+             CROSS JOIN target_dataset AS dataset
+            RETURNING participating_organization_resource_id,
+                      affiliation_resource_id
+        )
+    """
+
+
+def _affiliation_org_proof_select() -> str:
+    return """
+        SELECT
+            (SELECT COUNT(*) FROM target_dataset)::bigint
+                AS target_dataset_count,
+            (SELECT acquisition_root_run_id FROM target_dataset LIMIT 1)
+                AS acquisition_root_run_id,
+            (SELECT COUNT(*) FROM affiliations)::bigint
+                AS affiliation_resource_count,
+            (SELECT COUNT(*) FROM resolved_affiliations
+              WHERE reference_text IS NOT NULL)::bigint
+                AS affiliation_with_participating_organization_count,
+            (SELECT COUNT(*) FROM resolved_affiliations
+              WHERE empty_reference)::bigint
+                AS empty_participating_organization_reference_count,
+            (SELECT COUNT(*) FROM resolved_affiliations
+              WHERE malformed_reference)::bigint
+                AS malformed_reference_payload_count,
+            (SELECT COUNT(*) FROM resolved_affiliations
+              WHERE participating_organization_resource_id IS NOT NULL)::bigint
+                AS valid_reference_count,
+            (SELECT COUNT(*) FROM resolved_affiliations
+              WHERE reference_text IS NOT NULL
+                AND participating_organization_resource_id IS NULL)::bigint
+                AS invalid_reference_count,
+            (SELECT COUNT(*) FROM expected_edges)::bigint
+                AS expected_edge_count,
+            (SELECT COUNT(*) FROM inserted_edges)::bigint AS edge_count;
+    """
+
+
+def _dataset_affiliation_organization_insert_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    """Build normalized OrganizationAffiliation locator edges and counts."""
+    schema = _schema()
+    root_filter = (
+        "AND acquisition_root_run_id IS NOT DISTINCT FROM "
+        ":acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    organization_reference_pattern = (
+        r"(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})"
+        r"(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$"
+    )
+    return "\n".join(
+        (
+            _affiliation_org_source_ctes(
+                _qt(schema, ProviderDirectoryEndpointDataset.__tablename__),
+                _qt(schema, ProviderDirectoryDatasetResource.__tablename__),
+                root_filter,
+            ),
+            _affiliation_org_edge_ctes(
+                _qt(
+                    schema,
+                    PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
+                ),
+                organization_reference_pattern,
+            ),
+            _affiliation_org_proof_select(),
+        )
+    )
+
+
+def _validated_dataset_affiliation_organization_proof(
+    proof_by_field: dict[str, Any],
+    *,
+    dataset_id: str,
+    build_run_id: str | None,
+    replaced_edge_count: int,
+    expected_acquisition_root_run_id: str | None | object,
+) -> dict[str, Any]:
+    error_prefix = "provider_directory_dataset_affiliation_organization"
+    root_run_id = _validated_serving_relation_root(
+        proof_by_field,
+        dataset_id,
+        expected_acquisition_root_run_id,
+        error_prefix,
+    )
+    _assert_serving_relation_complete(
+        proof_by_field,
+        dataset_id,
+        "malformed_reference_payload_count",
+        "invalid_reference_count",
+        error_prefix,
+    )
+    count_fields = (
+        "affiliation_resource_count",
+        "affiliation_with_participating_organization_count",
+        "empty_participating_organization_reference_count",
+        "malformed_reference_payload_count",
+        "valid_reference_count",
+        "invalid_reference_count",
+        "expected_edge_count",
+        "edge_count",
+    )
+    return {
+        "complete": True,
+        "version": (
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_VERSION
+        ),
+        "dataset_id": dataset_id,
+        "acquisition_root_run_id": root_run_id,
+        "build_run_id": build_run_id,
+        **{
+            field_name: _dataset_network_plan_count(proof_by_field, field_name)
+            for field_name in count_fields
+        },
+        "replaced_edge_count": replaced_edge_count,
+    }
+
+
+async def _build_provider_directory_dataset_affiliation_organization(
+    executor: Any,
+    dataset_id: str,
+    *,
+    build_run_id: str | None,
+    expected_acquisition_root_run_id: str | None | object = (
+        _DATASET_SERVING_RELATION_ROOT_UNSET
+    ),
+) -> dict[str, Any]:
+    """Replace one dataset's affiliation locators in the caller transaction."""
+    edge_ref = _qt(
+        _schema(),
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
+    )
+    replaced_edge_count = _coerce_rowcount(
+        await executor.status(
+            f"DELETE FROM {edge_ref} WHERE dataset_id = :dataset_id;",
+            dataset_id=dataset_id,
+        )
+    )
+    should_verify_root = (
+        expected_acquisition_root_run_id
+        is not _DATASET_SERVING_RELATION_ROOT_UNSET
+    )
+    query_params_by_name: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "build_run_id": build_run_id,
+    }
+    if should_verify_root:
+        query_params_by_name["acquisition_root_run_id"] = (
+            expected_acquisition_root_run_id
+        )
+    proof_record = await executor.first(
+        _dataset_affiliation_organization_insert_sql(
+            should_verify_acquisition_root=should_verify_root,
+        ),
+        **query_params_by_name,
+    )
+    return _validated_dataset_affiliation_organization_proof(
+        _pagination_checkpoint_row_mapping(proof_record),
+        dataset_id=dataset_id,
+        build_run_id=build_run_id,
+        replaced_edge_count=replaced_edge_count,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+    )
+
+
 def _endpoint_dataset_publication_metadata(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
@@ -26477,6 +27390,36 @@ async def _clear_published_endpoint_partition_state(
     )
 
 
+async def _build_endpoint_dataset_serving_relations(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, dict[str, Any]]:
+    common_options_by_name = {
+        "build_run_id": candidate.import_run_id,
+        "expected_acquisition_root_run_id": (
+            candidate.acquisition_root_run_id
+        ),
+    }
+    network_plan_proof = await _build_provider_directory_dataset_network_plan(
+        connection,
+        candidate.dataset_id,
+        **common_options_by_name,
+    )
+    affiliation_proof = (
+        await _build_provider_directory_dataset_affiliation_organization(
+            connection,
+            candidate.dataset_id,
+            **common_options_by_name,
+        )
+    )
+    return {
+        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY: network_plan_proof,
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY: (
+            affiliation_proof
+        ),
+    }
+
+
 async def _promote_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
@@ -26501,12 +27444,19 @@ async def _promote_endpoint_dataset_candidate(
             connection,
             candidate.dataset_id,
         )
+        relation_proof_by_name = (
+            await _build_endpoint_dataset_serving_relations(
+                connection,
+                candidate,
+            )
+        )
         metadata = _endpoint_dataset_publication_metadata(
             candidate,
             diagnostics,
             dataset_hash=dataset_hash,
             resource_count=resource_count,
             bulk_transaction_times=candidate_transaction_times,
+            **relation_proof_by_name,
         )
         await _supersede_endpoint_dataset(
             connection,
@@ -26527,6 +27477,7 @@ async def _promote_endpoint_dataset_candidate(
         "previous_dataset_id": previous_dataset_id,
         "dataset_hash": dataset_hash,
         "resource_count": resource_count,
+        **relation_proof_by_name,
         "published": True,
     }
 

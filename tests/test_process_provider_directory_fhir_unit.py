@@ -7792,11 +7792,25 @@ class _EndpointDatasetPromotionHarness:
         return 1
 
 
+def _mock_endpoint_dataset_serving_builds(monkeypatch) -> None:
+    monkeypatch.setattr(
+        importer,
+        "_build_provider_directory_dataset_network_plan",
+        AsyncMock(return_value={"complete": True, "edge_count": 0}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_build_provider_directory_dataset_affiliation_organization",
+        AsyncMock(return_value={"complete": True, "edge_count": 0}),
+    )
+
+
 @pytest.mark.asyncio
 async def test_endpoint_dataset_publication_atomically_supersedes_current(monkeypatch):
     harness = _EndpointDatasetPromotionHarness()
     monkeypatch.setattr(importer.db, "acquire", lambda: harness)
     monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 2)
+    _mock_endpoint_dataset_serving_builds(monkeypatch)
     diagnostics_by_resource = {
         "Practitioner": {
             "complete": True,
@@ -7855,6 +7869,7 @@ async def test_endpoint_dataset_publication_cleans_partition_state_atomically(
 ):
     harness = _EndpointDatasetPromotionHarness()
     monkeypatch.setattr(importer.db, "acquire", lambda: harness)
+    _mock_endpoint_dataset_serving_builds(monkeypatch)
     checkpoint_context = importer.PaginationCheckpointContext(
         canonical_api_base="https://example.test/fhir",
         source_scope_hash="partition_scope",
@@ -9858,6 +9873,8 @@ async def test_process_data_publish_artifacts_only_does_not_scope_to_empty_run(m
 def test_provider_directory_publish_artifact_targets_parse_aliases():
     assert importer._provider_directory_publish_artifact_targets(None) is None
     assert importer._provider_directory_publish_artifact_targets("network, ptg-corroboration") == {
+        "dataset_affiliation_organization",
+        "dataset_network_plan",
         "network_catalog",
         "corroboration",
     }

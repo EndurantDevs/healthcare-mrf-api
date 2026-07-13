@@ -39,6 +39,8 @@ __all__ = (
     "ProviderDirectoryBulkOutputCheckpoint",
     "ProviderDirectoryCapability",
     "ProviderDirectoryCanonicalResource",
+    "ProviderDirectoryDatasetAffiliationOrganization",
+    "ProviderDirectoryDatasetNetworkPlan",
     "ProviderDirectoryDatasetResource",
     "ProviderDirectoryEndpoint",
     "ProviderDirectoryEndpointDataset",
@@ -473,6 +475,94 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
     resource_id = Column(String(256), nullable=False)
     payload_hash = Column(String(64), nullable=False)
     payload_json = Column(JSON, nullable=False)
+
+
+class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_dataset_network_plan"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "dataset_id",
+            "network_resource_id",
+            "insurance_plan_resource_id",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "dataset_id",
+        "network_resource_id",
+        "insurance_plan_resource_id",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("dataset_id", "network_resource_id"),
+            "include": ("insurance_plan_resource_id",),
+            "name": "provider_directory_dataset_network_plan_lookup_idx",
+        },
+    ]
+
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="provider_directory_dataset_network_plan_dataset_id_fkey",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    network_resource_id = Column(String(256), nullable=False)
+    insurance_plan_resource_id = Column(String(256), nullable=False)
+    acquisition_root_run_id = Column(String(64))
+    build_run_id = Column(String(64))
+    built_at = Column(TIMESTAMP, nullable=False)
+
+
+class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_dataset_affiliation_organization"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "dataset_id",
+            "participating_organization_resource_id",
+            "affiliation_resource_id",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "dataset_id",
+        "participating_organization_resource_id",
+        "affiliation_resource_id",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "dataset_id",
+                "participating_organization_resource_id",
+            ),
+            "include": ("affiliation_resource_id",),
+            "name": (
+                "provider_directory_dataset_affiliation_organization_lookup_idx"
+            ),
+        },
+    ]
+
+    dataset_id = Column(
+        String(96),
+        ForeignKey(
+            ProviderDirectoryEndpointDataset.dataset_id,
+            name="pd_dataset_affiliation_org_dataset_id_fkey",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    participating_organization_resource_id = Column(
+        String(256),
+        nullable=False,
+    )
+    affiliation_resource_id = Column(String(256), nullable=False)
+    acquisition_root_run_id = Column(String(64))
+    build_run_id = Column(String(64))
+    built_at = Column(TIMESTAMP, nullable=False)
 
 
 class ProviderDirectorySource(Base, JSONOutputMixin):
