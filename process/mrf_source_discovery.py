@@ -14068,6 +14068,16 @@ def _preview_request_size_bytes(source_id: str, items: list[dict[str, Any]]) -> 
     return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
+def _preview_item_size_bytes(preview_item_map: dict[str, Any]) -> int:
+    return len(
+        json.dumps(
+            preview_item_map,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+
 def _chunk_preview_items_for_request(
     source_id: str,
     preview_item_maps: list[dict[str, Any]],
@@ -14079,16 +14089,24 @@ def _chunk_preview_items_for_request(
     resolved_max_items = max_items or IMPORT_CONTROL_PREVIEW_BATCH_SIZE
     resolved_max_bytes = max_bytes or IMPORT_CONTROL_PREVIEW_MAX_REQUEST_BYTES
     preview_batch_maps: list[dict[str, Any]] = []
+    preview_batch_size = _preview_request_size_bytes(source_id, [])
     for preview_item_map in preview_item_maps:
-        candidate_batch_maps = [*preview_batch_maps, preview_item_map]
+        preview_item_size = _preview_item_size_bytes(preview_item_map)
+        candidate_batch_size = (
+            preview_batch_size
+            + preview_item_size
+            + (1 if preview_batch_maps else 0)
+        )
         if preview_batch_maps and (
-            len(candidate_batch_maps) > resolved_max_items
-            or _preview_request_size_bytes(source_id, candidate_batch_maps) > resolved_max_bytes
+            len(preview_batch_maps) >= resolved_max_items
+            or candidate_batch_size > resolved_max_bytes
         ):
             yield preview_batch_maps
             preview_batch_maps = [preview_item_map]
+            preview_batch_size = _preview_request_size_bytes(source_id, []) + preview_item_size
             continue
-        preview_batch_maps = candidate_batch_maps
+        preview_batch_maps.append(preview_item_map)
+        preview_batch_size = candidate_batch_size
     if preview_batch_maps:
         yield preview_batch_maps
 

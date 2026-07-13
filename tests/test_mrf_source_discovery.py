@@ -10626,6 +10626,37 @@ def test_chunk_preview_items_for_request_respects_serialized_size():
     assert [len(batch) for batch in batches] == [1, 1, 1]
 
 
+def test_chunk_preview_items_serializes_each_item_once(monkeypatch):
+    preview_items = [
+        {
+            "canonical_url": f"https://example.com/rates-{index}.json.gz",
+            "plan_info": [{"plan_id": str(index)}],
+        }
+        for index in range(500)
+    ]
+    original_dumps = discovery.json.dumps
+    serialized_preview_items = []
+
+    def tracked_dumps(payload, *args, **kwargs):
+        if isinstance(payload, dict) and "canonical_url" in payload:
+            serialized_preview_items.append(payload)
+        return original_dumps(payload, *args, **kwargs)
+
+    monkeypatch.setattr(discovery.json, "dumps", tracked_dumps)
+
+    batches = list(
+        discovery._chunk_preview_items_for_request(
+            "ic_source",
+            preview_items,
+            max_items=500,
+            max_bytes=8 * 1024 * 1024,
+        )
+    )
+
+    assert [len(batch) for batch in batches] == [500]
+    assert serialized_preview_items == preview_items
+
+
 def _catalog_snapshot_source_rows():
     return [
         {
