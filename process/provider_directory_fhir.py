@@ -18660,6 +18660,23 @@ async def _fetch_last_updated_partition_count(
             ),
             error="non_searchset_count_bundle",
         )
+    if response_payload.get("entry"):
+        return LastUpdatedCountFetch(
+            CountObservation.unknown(
+                "count response contained resource entries"
+            ),
+            error="count_bundle_contains_entries",
+        )
+    if any(
+        isinstance(link, dict) and link.get("relation") == "next"
+        for link in response_payload.get("link") or []
+    ):
+        return LastUpdatedCountFetch(
+            CountObservation.unknown(
+                "count response contained a next-page link"
+            ),
+            error="count_bundle_has_next_link",
+        )
     total = response_payload.get("total")
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         return LastUpdatedCountFetch(

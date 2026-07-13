@@ -18373,6 +18373,64 @@ async def test_last_updated_partition_rejects_non_searchset_bundles(monkeypatch)
     assert page_fetch.error == "non_searchset_bundle"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unexpected_field", "expected_error"),
+    [
+        (
+            {
+                "entry": [
+                    {
+                        "resource": _last_updated_partition_test_resource(
+                            "prac-1"
+                        )
+                    }
+                ]
+            },
+            "count_bundle_contains_entries",
+        ),
+        (
+            {
+                "link": [
+                    {
+                        "relation": "next",
+                        "url": "https://example.test/fhir/Practitioner?page=2",
+                    }
+                ]
+            },
+            "count_bundle_has_next_link",
+        ),
+    ],
+)
+async def test_last_updated_partition_rejects_paginated_count_bundles(
+    monkeypatch,
+    unexpected_field,
+    expected_error,
+):
+    directory_source = _last_updated_partition_test_source()
+    count_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "total": 1,
+        **unexpected_field,
+    }
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(return_value=(200, count_bundle, None, 1)),
+    )
+
+    count_fetch = await importer._fetch_last_updated_partition_count(
+        directory_source,
+        "https://example.test/fhir/Practitioner?_summary=count",
+        timeout=3,
+    )
+
+    assert count_fetch.observation is not None
+    assert count_fetch.observation.kind.value == "unknown"
+    assert count_fetch.error == expected_error
+
+
 @pytest.mark.parametrize(
     ("last_updated", "expected_error"),
     [
