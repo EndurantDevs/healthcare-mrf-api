@@ -1,7 +1,7 @@
 """Add fixed shared_blocks_v3 storage for postgres_binary_v3.
 
 Revision ID: 20260712120000_ptg2_v3_shared_schema
-Revises: 20260713236000_provider_directory_dataset_insurance_plan
+Revises: 20260713237000_provider_directory_plan_scalars
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from alembic import op
 
 
 revision = "20260712120000_ptg2_v3_shared_schema"
-down_revision = "20260713236000_provider_directory_dataset_insurance_plan"
+down_revision = "20260713237000_provider_directory_plan_scalars"
 branch_labels = None
 depends_on = None
 

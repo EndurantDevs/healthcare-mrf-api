@@ -718,7 +718,7 @@ def test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions(
 
     assert migration.revision == "20260712120000_ptg2_v3_shared_schema"
     assert migration.down_revision == (
-        "20260713236000_provider_directory_dataset_insurance_plan"
+        "20260713237000_provider_directory_plan_scalars"
     )
 
     expected_parents = {
