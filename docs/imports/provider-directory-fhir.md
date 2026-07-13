@@ -382,6 +382,12 @@ plan evidence. Clients that need the typed fields must request
 `include_evidence=true` as well; compact responses are intentionally cheaper
 and are not a partial representation of the full evidence contract.
 
+Provider candidate search keeps directory provenance compact even when
+`include_evidence=true`: it returns the matched source aliases plus raw address
+and phone evidence identifiers, but does not expand the role/network/plan graph
+for every candidate. Fetch the selected provider detail with
+`include_sources=true&include_evidence=true` when that typed graph is required.
+
 Each returned `PractitionerRole` preserves the normalized operational fields
 when supplied by the directory: `available_time`, `not_available`,
 `availability_exceptions`, `new_patient_acceptance`, and `telehealth`, along

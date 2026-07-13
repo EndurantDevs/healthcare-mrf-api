@@ -30,24 +30,36 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     sql = str(query)
 
     assert query_params["phone_digits"] == "4192517960"
+    assert "current_provider_directory_runs AS MATERIALIZED" in sql
+    assert "matching_provider_directory_phone_rows AS MATERIALIZED" in sql
     assert "phone_candidate_rows AS MATERIALIZED" in sql
+    assert "phone_candidates_unranked AS MATERIALIZED" in sql
     assert "phone_candidates AS MATERIALIZED" in sql
     assert "phone_provider_directory_evidence AS MATERIALIZED" in sql
     assert "provider_directory_address_overlay AS overlay" in sql
     assert "dataset.is_current IS TRUE" in sql
     assert "dataset.status = 'published'" in sql
-    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id" in sql
+    assert "dataset.published_at IS NOT NULL" in sql
+    assert "dataset.superseded_at IS NULL" in sql
+    assert "current_run.run_id = overlay.last_seen_run_id" in sql
     assert "false AS provider_directory_matched" in sql
     assert "true AS provider_directory_matched" in sql
     assert "overlay.source_id::varchar" in sql
     assert "overlay.source_record_id::varchar" in sql
+    assert "MAX(candidate.source_count) AS source_count" in sql
+    assert "candidate.provider_directory_matched DESC" in sql
+    assert "candidate.source_count DESC NULLS LAST" in sql
+    assert "LIMIT :candidate_limit" in sql
     assert "MIN(candidate.source_record_id) AS source_record_id" in sql
     assert "GROUP BY candidate.provider_npi, candidate.source_id" in sql
     assert "ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)" in sql
+    assert "JOIN phone_candidates AS selected_candidate" in sql
     assert "FROM phone_candidates AS phone_match" in sql
     assert "LEFT JOIN phone_provider_directory_evidence AS phone_evidence" in sql
     assert "CROSS JOIN LATERAL" in sql
     assert "candidate_address.address_key = phone_match.address_key" in sql
+    assert "candidate_address.source_count DESC NULLS LAST" in sql
+    assert "LIMIT 1 OFFSET 0" in sql
     assert "OFFSET 0" in sql
     assert "(true)::boolean AS phone_matched" in sql
     assert "phone_provider_directory_matched DESC" in sql
@@ -100,3 +112,27 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
         for source_id in endpoint["source_ids"]
     }
     assert attached_source_ids == {cigna_source, contra_source}
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_source_details_stay_compact(monkeypatch):
+    """Candidate search must defer the typed role graph to provider detail."""
+    attach_source_details = AsyncMock()
+    monkeypatch.setattr(
+        npi_module,
+        "_attach_provider_directory_source_details",
+        attach_source_details,
+    )
+    candidate_rows = [{"npi": 1234567890}]
+
+    await npi_module._attach_match_candidate_source_details(
+        candidate_rows,
+        {"include_evidence": True},
+        session="request-session",
+    )
+
+    attach_source_details.assert_awaited_once_with(
+        candidate_rows,
+        include_role_evidence=False,
+        session="request-session",
+    )

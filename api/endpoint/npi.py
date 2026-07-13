@@ -3308,64 +3308,114 @@ def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
     return f"{raw_digits} = :phone_digits"
 
 
+_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = """
+current_provider_directory_runs AS MATERIALIZED (
+    SELECT source.source_id,
+           COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar
+               AS run_id
+      FROM mrf.provider_directory_source AS source
+      JOIN mrf.provider_directory_endpoint_dataset AS dataset
+        ON dataset.endpoint_id = source.endpoint_id
+     WHERE dataset.is_current IS TRUE
+       AND dataset.status = 'published'
+       AND dataset.published_at IS NOT NULL
+       AND dataset.superseded_at IS NULL
+), matching_provider_directory_phone_rows AS MATERIALIZED (
+    SELECT overlay.npi, overlay.address_key, overlay.source_id,
+           overlay.last_seen_run_id, overlay.source_record_id
+      FROM mrf.provider_directory_address_overlay AS overlay
+     WHERE overlay.phone_number = :phone_digits
+       AND overlay.npi IS NOT NULL
+       AND overlay.address_key IS NOT NULL
+)
+"""
+
+
+_PHONE_CANDIDATE_ROWS_CTE = """
+phone_candidate_rows AS MATERIALIZED (
+    SELECT DISTINCT
+           COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
+           phone_address.address_key,
+           false AS provider_directory_matched,
+           NULL::varchar AS source_id,
+           NULL::varchar AS source_record_id,
+           phone_address.source_count::integer AS source_count
+      FROM {address_table_sql} AS phone_address
+     WHERE phone_address.type IN ({service_types})
+       AND phone_address.address_key IS NOT NULL
+       AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
+       AND {direct_phone}
+    UNION ALL
+    SELECT DISTINCT
+           overlay.npi::bigint AS provider_npi,
+           overlay.address_key,
+           true AS provider_directory_matched,
+           overlay.source_id::varchar,
+           overlay.source_record_id::varchar,
+           NULL::integer AS source_count
+      FROM matching_provider_directory_phone_rows AS overlay
+      JOIN current_provider_directory_runs AS current_run
+        ON current_run.source_id = overlay.source_id
+       AND current_run.run_id = overlay.last_seen_run_id
+)
+"""
+
+
+_RANKED_PHONE_CANDIDATE_CTES = """
+phone_candidates_unranked AS MATERIALIZED (
+    SELECT candidate.provider_npi, candidate.address_key,
+           BOOL_OR(candidate.provider_directory_matched) AS provider_directory_matched,
+           MAX(candidate.source_count) AS source_count
+      FROM phone_candidate_rows AS candidate
+  GROUP BY candidate.provider_npi, candidate.address_key
+), phone_candidates AS MATERIALIZED (
+    SELECT candidate.provider_npi, candidate.address_key,
+           candidate.provider_directory_matched
+      FROM phone_candidates_unranked AS candidate
+  ORDER BY candidate.provider_directory_matched DESC,
+           candidate.source_count DESC NULLS LAST,
+           candidate.provider_npi,
+           candidate.address_key
+     LIMIT :candidate_limit
+), phone_provider_directory_evidence AS MATERIALIZED (
+    SELECT evidence.provider_npi,
+           ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)
+               AS source_record_ids
+      FROM (
+            SELECT candidate.provider_npi, candidate.source_id,
+                   MIN(candidate.source_record_id) AS source_record_id
+              FROM phone_candidate_rows AS candidate
+              JOIN phone_candidates AS selected_candidate
+                ON selected_candidate.provider_npi = candidate.provider_npi
+               AND selected_candidate.address_key = candidate.address_key
+             WHERE candidate.provider_directory_matched
+               AND candidate.source_id IS NOT NULL
+               AND candidate.source_record_id IS NOT NULL
+          GROUP BY candidate.provider_npi, candidate.source_id
+      ) AS evidence
+  GROUP BY evidence.provider_npi
+)
+"""
+
+
 def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
     """Return indexed phone candidates, including current FHIR evidence."""
     if not _address_table_is_unified(address_table_sql):
         return None
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
-    return f"""
-    phone_candidate_rows AS MATERIALIZED (
-        SELECT DISTINCT
-               COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
-               phone_address.address_key,
-               false AS provider_directory_matched,
-               NULL::varchar AS source_id,
-               NULL::varchar AS source_record_id
-          FROM {address_table_sql} AS phone_address
-         WHERE phone_address.type IN ({service_types})
-           AND phone_address.address_key IS NOT NULL
-           AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
-           AND {direct_phone}
-        UNION ALL
-        SELECT DISTINCT
-               overlay.npi::bigint AS provider_npi,
-               overlay.address_key,
-               true AS provider_directory_matched,
-               overlay.source_id::varchar,
-               overlay.source_record_id::varchar
-          FROM mrf.provider_directory_address_overlay AS overlay
-          JOIN mrf.provider_directory_source AS source
-            ON source.source_id = overlay.source_id
-          JOIN mrf.provider_directory_endpoint_dataset AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-           AND dataset.is_current IS TRUE
-           AND dataset.status = 'published'
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) = overlay.last_seen_run_id
-         WHERE overlay.phone_number = :phone_digits
-           AND overlay.npi IS NOT NULL
-           AND overlay.address_key IS NOT NULL
-    ), phone_candidates AS MATERIALIZED (
-        SELECT candidate.provider_npi, candidate.address_key,
-               BOOL_OR(candidate.provider_directory_matched) AS provider_directory_matched
-          FROM phone_candidate_rows AS candidate
-      GROUP BY candidate.provider_npi, candidate.address_key
-    ), phone_provider_directory_evidence AS MATERIALIZED (
-        SELECT evidence.provider_npi,
-               ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)
-                   AS source_record_ids
-          FROM (
-                SELECT candidate.provider_npi, candidate.source_id,
-                       MIN(candidate.source_record_id) AS source_record_id
-                  FROM phone_candidate_rows AS candidate
-                 WHERE candidate.provider_directory_matched
-                   AND candidate.source_id IS NOT NULL
-                   AND candidate.source_record_id IS NOT NULL
-              GROUP BY candidate.provider_npi, candidate.source_id
-          ) AS evidence
-      GROUP BY evidence.provider_npi
+    phone_candidate_rows_cte = _PHONE_CANDIDATE_ROWS_CTE.format(
+        address_table_sql=address_table_sql,
+        service_types=service_types,
+        direct_phone=direct_phone,
     )
-    """
+    return ",\n".join(
+        (
+            _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip(),
+            phone_candidate_rows_cte.strip(),
+            _RANKED_PHONE_CANDIDATE_CTES.strip(),
+        )
+    )
 
 
 def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = None) -> str:
@@ -3378,6 +3428,7 @@ def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = No
 
 
 def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
+    exact_phone = _address_phone_digits_filter("candidate_address", address_table_sql)
     return f"""
           FROM phone_candidates AS phone_match
      LEFT JOIN phone_provider_directory_evidence AS phone_evidence
@@ -3387,7 +3438,10 @@ def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -
                  FROM {address_table_sql} AS candidate_address
                 WHERE candidate_address.address_key = phone_match.address_key
                   AND COALESCE(candidate_address.npi, candidate_address.inferred_npi) = phone_match.provider_npi
-                OFFSET 0
+             ORDER BY ({exact_phone}) DESC,
+                      candidate_address.source_count DESC NULLS LAST,
+                      candidate_address.location_key
+                LIMIT 1 OFFSET 0
          ) AS {alias}
     """
 
@@ -5277,6 +5331,22 @@ def _match_candidate_output(
     return {key: value for key, value in candidate.items() if value is not None}
 
 
+async def _attach_match_candidate_source_details(
+    rows: list[dict[str, Any]],
+    params: dict[str, Any],
+    *,
+    session: Any = None,
+) -> None:
+    """Attach compact FHIR provenance without expanding role evidence."""
+    if not (params.get("include_sources") or params.get("include_evidence")):
+        return
+    await _attach_provider_directory_source_details(
+        rows,
+        include_role_evidence=False,
+        session=session,
+    )
+
+
 @blueprint.get("/match-candidates")
 async def match_candidates(request):
     started = time.monotonic()
@@ -5304,8 +5374,7 @@ async def match_candidates(request):
         raise sanic.exceptions.ServiceUnavailable(
             f"match candidate lookup exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second query budget"
         ) from exc
-    if params.get("include_sources") or params.get("include_evidence"):
-        await _attach_provider_directory_source_details(rows, include_role_evidence=bool(params.get("include_evidence")), session=request_session)
+    await _attach_match_candidate_source_details(rows, params, session=request_session)
     enrichment_map = await _fetch_provider_enrichment_summary_map(
         [row.get("npi") for row in rows],
         session=request_session,
