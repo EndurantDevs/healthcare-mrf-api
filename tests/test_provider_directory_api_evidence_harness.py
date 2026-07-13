@@ -134,7 +134,7 @@ class FakeResponse:
 
 
 class AddressAwareClient:
-    """Return mapped evidence only for an unbounded or exact-address request."""
+    """Return mapped evidence only for an exact-address request."""
 
     def __init__(self, source_id, address_key):
         self.source_id = source_id
@@ -146,7 +146,7 @@ class AddressAwareClient:
         if path == "providers/1234567890":
             payload = (
                 _detail_payload(self.source_id)
-                if params.get("address_limit") == "all"
+                if params.get("address_key") == self.address_key
                 else {"data": {"npi": {"address_list": []}}}
             )
         else:
@@ -367,8 +367,8 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
     assert "5550101234" not in json.dumps(report)
 
 
-def test_mapped_witness_checks_exact_address_beyond_default_page():
-    """Exact mapped evidence must not depend on the default address page."""
+def test_mapped_witness_detail_sends_exact_address_key():
+    """Strict witness detail checks request only the proven address."""
     address_key = "00000000-0000-0000-0000-000000000001"
     witness = support.MappedEvidenceWitness(
         SOURCE_A,
@@ -389,7 +389,7 @@ def test_mapped_witness_checks_exact_address_beyond_default_page():
             {
                 "include_sources": "true",
                 "include_evidence": "true",
-                "address_limit": "all",
+                "address_key": address_key,
             },
         ),
         (

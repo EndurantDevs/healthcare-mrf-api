@@ -271,12 +271,12 @@ def _evaluate_witness(
     api_client: ProviderDirectoryApiClient,
     api_latency_slo_ms: float,
 ) -> dict[str, Any]:
+    detail_param_map = {"include_sources": "true", "include_evidence": "true"}
+    if witness.address_key:
+        detail_param_map["address_key"] = witness.address_key
     detail_result = api_client.get_json(
         f"providers/{witness.npi}",
-        {
-            "include_sources": "true", "include_evidence": "true",
-            "address_limit": "all",
-        },
+        detail_param_map,
     )
     search_result = api_client.get_json(
         "providers",

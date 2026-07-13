@@ -723,6 +723,7 @@ def _npi_detail_cache_key(
     address_limit: int | None = None,
     address_offset: int = 0,
     include_address_total: bool = True,
+    address_key: str | None = None,
 ) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
@@ -735,7 +736,8 @@ def _npi_detail_cache_key(
     )
     page_mode = (
         f"alim:{address_limit if address_limit is not None else 'all'}|"
-        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}"
+        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
+        f"akey:{address_key or 'none'}"
     )
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
@@ -8497,6 +8499,14 @@ async def get_npi(request, npi):
     except (TypeError, ValueError):
         address_offset = 0
     include_address_total = _parse_bool_arg(request.args.get("include_address_total"), default=True)
+    raw_address_key = request.args.get("address_key")
+    if raw_address_key is None or not str(raw_address_key).strip():
+        address_key = None
+    else:
+        try:
+            address_key = str(uuid.UUID(str(raw_address_key).strip()))
+        except (AttributeError, TypeError, ValueError):
+            raise sanic.exceptions.InvalidUsage("address_key must be a UUID")
     npi = int(npi)
     request_session = _request_session(request)
     profile_record: dict[str, Any] | None = None
@@ -8533,6 +8543,7 @@ async def get_npi(request, npi):
         address_limit=address_limit,
         address_offset=address_offset,
         include_address_total=include_address_total,
+        address_key=address_key,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -8962,6 +8973,7 @@ async def get_npi(request, npi):
         "address_limit": address_limit,
         "address_offset": address_offset,
         "include_address_total": include_address_total,
+        "address_key": address_key,
     }
     if request_session is not None:
         build_kwargs["session"] = request_session
@@ -8976,7 +8988,20 @@ async def get_npi(request, npi):
     address_total = data.pop("address_total", None)
 
     addresses = data.get("address_list") or []
-    addresses.extend(await _fetch_provider_directory_address_overlay(npi, session=request_session))
+    addresses.extend(
+        await _fetch_provider_directory_address_overlay(
+            npi,
+            address_key=address_key,
+            session=request_session,
+        )
+    )
+    if address_key is not None:
+        addresses = [
+            address
+            for address in addresses
+            if isinstance(address, Mapping)
+            and str(address.get("address_key") or "").lower() == address_key
+        ]
     if not include_extra_info:
         addresses = [address for address in addresses if _is_public_street_level_address(address)]
     addresses = _dedupe_addresses_by_key(addresses)
@@ -9109,6 +9134,7 @@ async def _build_npi_details(
     address_limit: int | None = None,
     address_offset: int = 0,
     include_address_total: bool = True,
+    address_key: str | None = None,
     session: Any = None,
 ) -> dict:
     """Assemble one provider identity, taxonomy, and address detail payload."""
@@ -9183,9 +9209,16 @@ async def _build_npi_details(
     # Keep the serving-type predicate outside this optimization barrier. On
     # PostgreSQL 18, combining it with NPI can otherwise select a ZIP-first
     # partial-index skip scan instead of the direct NPI index.
+    base_address_filters = [address_table.c.npi == npi]
+    if address_key is not None and address_model is EntityAddressUnified:
+        base_address_filters[0] = func.coalesce(
+            address_table.c.npi, address_table.c.inferred_npi
+        ) == npi
+    if address_key is not None:
+        base_address_filters.append(address_table.c.address_key == address_key)
     npi_address_rows = (
         select(*address_columns)
-        .where(address_table.c.npi == npi)
+        .where(*base_address_filters)
         .offset(0)
         .subquery("npi_address_rows")
     )
@@ -9203,7 +9236,7 @@ async def _build_npi_details(
     if address_limit is not None and include_address_total:
         count_npi_rows = (
             select(address_table.c.type)
-            .where(address_table.c.npi == npi)
+            .where(*base_address_filters)
             .offset(0)
             .subquery("count_npi_address_rows")
         )
@@ -9363,6 +9396,7 @@ def _provider_directory_overlay_query_sql(
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
              WHERE overlay.npi = :npi
+               AND (:address_key IS NULL OR overlay.address_key = :address_key)
         )
         SELECT
             npi,
@@ -9400,6 +9434,7 @@ def _provider_directory_overlay_query_sql(
 async def _fetch_provider_directory_address_overlay(
     npi: int,
     *,
+    address_key: str | None = None,
     session: Any = None,
 ) -> list[dict[str, Any]]:
     """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
@@ -9417,7 +9452,11 @@ async def _fetch_provider_directory_address_overlay(
             overlay_columns,
         )
     )
-    overlay_result = await _execute_stmt(overlay_query, session=session, params={"npi": int(npi)})
+    overlay_result = await _execute_stmt(
+        overlay_query,
+        session=session,
+        params={"npi": int(npi), "address_key": address_key},
+    )
     overlay_addresses: list[dict[str, Any]] = []
     for overlay_row in overlay_result.all():
         overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
