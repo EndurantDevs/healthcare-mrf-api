@@ -209,25 +209,6 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
     assert duplicate_suite == line2_suite == inline_suite
     assert address_canon.street_norm("123 Main St Suite 100", "Suite 100") == "123mainst"
     assert address_canon.unit_norm("123 Main St Suite 100", "Suite 100") == "ste100"
-    repeated_bare_unit = address_canon.identity_key_v1(
-        "2227 HALTOM RD STE F",
-        "F",
-        "HALTOM CITY",
-        "TX",
-        "76117",
-        "US",
-    )
-    inline_bare_unit = address_canon.identity_key_v1(
-        "2227 HALTOM RD STE F",
-        "",
-        "HALTOM CITY",
-        "TX",
-        "76117",
-        "US",
-    )
-    assert repeated_bare_unit == inline_bare_unit == "v2|2227haltomrd|stef||TX|76117|US|street"
-    assert address_canon.street_norm("2227 HALTOM RD STE F", "F") == "2227haltomrd"
-    assert address_canon.unit_norm("2227 HALTOM RD STE F", "F") == "stef"
     assert (
         address_canon.identity_key_v1("123 Main St 1st Fl", "1st Floor", "Austin", "TX", "78701", "US")
         == "v2|123mainst|fl1||TX|78701|US|street"
@@ -3671,3 +3652,16 @@ async def test_push_objects_rewrite_dedupes_mrf_address_on_full_unique_key(monke
 
     assert len(captured_chunks) in {1}
     assert len(captured_chunks[0]) in {2}
+
+
+def test_repeated_bare_line2_unit_value_matches_inline_unit():
+    repeated = address_canon.identity_key_v1(
+        "2227 HALTOM RD STE F", "F", "HALTOM CITY", "TX", "76117", "US"
+    )
+    inline = address_canon.identity_key_v1(
+        "2227 HALTOM RD STE F", "", "HALTOM CITY", "TX", "76117", "US"
+    )
+
+    assert repeated == inline == "v2|2227haltomrd|stef||TX|76117|US|street"
+    assert address_canon.street_norm("2227 HALTOM RD STE F", "F") == "2227haltomrd"
+    assert address_canon.unit_norm("2227 HALTOM RD STE F", "F") == "stef"
