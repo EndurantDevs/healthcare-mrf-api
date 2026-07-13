@@ -663,28 +663,32 @@ async def list_import_runs_page(
     """Return a stable cursor page of filtered import runs."""
 
     bounded_limit = max(1, min(int(limit or 50), MAX_IMPORT_RUN_LIST_LIMIT))
-    stmt = select(ImportRun)
+    statement = select(ImportRun)
     if status:
-        stmt = stmt.where(ImportRun.status == status)
+        statement = statement.where(ImportRun.status == status)
     if importer:
-        stmt = stmt.where(ImportRun.importer == importer)
+        statement = statement.where(ImportRun.importer == importer)
     if retry_of_run_id:
-        stmt = stmt.where(ImportRun.retry_of_run_id == retry_of_run_id)
+        statement = statement.where(ImportRun.retry_of_run_id == retry_of_run_id)
     if cursor:
         created_at, run_id = _decode_import_run_cursor(cursor)
-        stmt = stmt.where(
+        statement = statement.where(
             or_(
                 ImportRun.created_at < created_at,
                 and_(ImportRun.created_at == created_at, ImportRun.run_id < run_id),
             )
         )
-    stmt = stmt.order_by(ImportRun.created_at.desc(), ImportRun.run_id.desc()).limit(bounded_limit + 1)
-    query_result = await db.execute(stmt)
+    statement = statement.order_by(
+        ImportRun.created_at.desc(), ImportRun.run_id.desc()
+    ).limit(bounded_limit + 1)
+    query_result = await db.execute(statement)
     run_rows = list(query_result.scalars().all())
     next_cursor = None
     if len(run_rows) > bounded_limit:
-        next_row = run_rows[bounded_limit - 1]
-        next_cursor = _encode_import_run_cursor(next_row.created_at, next_row.run_id)
+        next_run_row = run_rows[bounded_limit - 1]
+        next_cursor = _encode_import_run_cursor(
+            next_run_row.created_at, next_run_row.run_id
+        )
         run_rows = run_rows[:bounded_limit]
     return {
         "items": [normalize_run(run_row) for run_row in run_rows],

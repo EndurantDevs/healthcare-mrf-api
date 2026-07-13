@@ -3398,6 +3398,7 @@ async def _fetch_ffs_summary_overrides(
     *,
     session: Any = None,
 ) -> dict[int, dict[str, Any]]:
+    """Build per-NPI FFS enrollment summary overrides from detail tables."""
     overrides: dict[int, dict[str, Any]] = {}
     enrollment_to_npi: dict[str, int] = {}
     all_enrollment_ids: list[str] = []
@@ -3617,6 +3618,7 @@ def _build_nearby_sql(
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
 ) -> str:
+    """Build the indexed nearby-provider query for the selected address model."""
     taxonomy_from = ""
     taxonomy_where = ""
     if use_taxonomy_filter:
@@ -4273,6 +4275,7 @@ async def _fetch_provider_enrichment_summary_map(
     include_chain: bool = False,
     session: Any = None,
 ) -> dict[int, dict[str, Any]]:
+    """Fetch public provider-enrichment summaries keyed by requested NPI."""
     unique_npis = sorted({int(npi) for npi in npis if npi is not None})
     if not unique_npis:
         return {}
@@ -4490,6 +4493,7 @@ async def _fetch_provider_enrichment_detail(
     include_chain: bool = False,
     session: Any = None,
 ) -> dict[str, Any]:
+    """Fetch enrollment details and visibility metadata for one NPI."""
     detail: dict[str, Any] = {
         "summary": None,
         "enrollments": {
@@ -4877,9 +4881,11 @@ def _extract_name_filters(request) -> list[str]:
 
 async def _compute_npi_counts():
     async def get_npi_count():
+        """Count imported NPI identity rows."""
         return await db.scalar(select(func.count(NPIData.npi)))
 
     async def get_npi_address_count():
+        """Count imported NPI address identity rows."""
         return await db.scalar(select(func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type))))
 
     return await asyncio.gather(get_npi_count(), get_npi_address_count())
@@ -4895,6 +4901,7 @@ def _validate_section_filters(section: Optional[str], classification: Optional[s
 
 @blueprint.get("/")
 async def npi_index_status(request):
+    """Return NPI dataset counts and service release metadata."""
     npi_count, npi_address_count = await _compute_npi_counts()
     data = {
         "date": datetime.utcnow().isoformat(),
@@ -4909,6 +4916,7 @@ async def npi_index_status(request):
 
 @blueprint.get("/active_pharmacists")
 async def active_pharmacists(request):
+    """Count active pharmacists linked to pharmacies by contact data."""
     request_session = _request_session(request)
     state = request.args.get("state", None)
     specialization = request.args.get("specialization", None)
@@ -4956,6 +4964,7 @@ async def active_pharmacists(request):
 
 @blueprint.get("/pharmacists_in_pharmacies")
 async def pharmacists_in_pharmacies(request):
+    """Count pharmacists linked to pharmacies matching requested names."""
     request_session = _request_session(request)
     # Explicit access helps route collectors pick up query params.
     request.args.get("name_like")
@@ -5001,6 +5010,7 @@ async def pharmacists_in_pharmacies(request):
 
 @blueprint.get("/pharmacists_per_pharmacy")
 async def pharmacists_per_pharmacy(request):
+    """Return pharmacist staffing counts grouped by pharmacy."""
     request_session = _request_session(request)
     state = request.args.get("state", None)
     if state and len(state) == 2:
@@ -5250,6 +5260,7 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
 
 
 async def _normalize_match_candidate_params(request) -> dict[str, Any]:
+    """Validate and normalize provider candidate-match query parameters."""
     args = request.args
     unknown_params = sorted(set(args.keys()) - MATCH_CANDIDATE_QUERY_PARAMS)
     if unknown_params:
@@ -5451,6 +5462,7 @@ def _match_candidate_taxonomy_filter_sql(
 
 
 def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tuple[Any, dict[str, Any]]:
+    """Build the bounded provider candidate query and its bound parameters."""
     columns = _match_candidate_column_sql(address_table_sql)
     query_params: dict[str, Any] = {
         "limit": int(params["limit"]),
@@ -5987,6 +5999,7 @@ def _match_candidate_output(
     params: Mapping[str, Any],
     enrichment: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
+    """Build one redacted, scored provider candidate response object."""
     public_row = dict(row)
     _redact_internal_address_fields(public_row)
     taxonomy_list = _json_array_value(row.get("taxonomy_list"))
@@ -6096,6 +6109,7 @@ async def _attach_match_candidate_source_details(
 
 @blueprint.get("/match-candidates")
 async def match_candidates(request):
+    """Return bounded provider candidates for an address or identity query."""
     started = time.monotonic()
     request.args.get("address_site_key")
     request.args.get("address_key")
@@ -6157,6 +6171,7 @@ async def match_candidates(request):
 
 @blueprint.get("/all")
 async def get_all(request):
+    """Search, count, or page through public NPI provider records."""
     count_only = str(request.args.get("count_only", "0")).strip() == "1"
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     response_format = request.args.get("format") or request.args.get("response_format")
@@ -6512,6 +6527,7 @@ async def get_all(request):
     )
 
     async def get_count(filters):
+        """Count providers matching the normalized request filters."""
         classification = filters.get("classification")
         specialization = filters.get("specialization")
         section = filters.get("section")
@@ -6692,6 +6708,7 @@ async def get_all(request):
         return {row[0]: row[1] for row in rows}
 
     async def get_classification_count_map(filters) -> dict:
+        """Return provider counts grouped by NUCC classification."""
         classification = filters.get("classification")
         specialization = filters.get("specialization")
         section = filters.get("section")
@@ -6850,6 +6867,7 @@ async def get_all(request):
         return response.json({"rows": mapping}, default=str)
 
     async def get_sitemap_results(start_offset: int, page_limit: int, classification_value: str) -> list[dict[str, Any]]:
+        """Return a deterministic provider page for sitemap generation."""
         classification_npis = await _get_classification_npi_list(
             classification_value,
             session=request_session,
@@ -6912,6 +6930,7 @@ async def get_all(request):
         return {row[0]: row[1] for row in rows}
 
     async def get_results(start, limit, filters):
+        """Return one provider result page for normalized search filters."""
         classification = filters.get("classification")
         section = filters.get("section")
         display_name = filters.get("display_name")
@@ -7385,6 +7404,7 @@ async def get_all(request):
 
 @blueprint.get("/facilities/providers")
 async def get_facility_connected_providers(request):
+    """Return providers connected to a requested enrolled facility."""
     request_session = _request_session(request)
     facility_type_raw = _normalize_text_filter(request.args.get("facility_type"), param_name="facility_type", max_length=32)
     facility_type = (facility_type_raw or "hospital").lower()
@@ -7714,6 +7734,7 @@ async def get_facility_connected_providers(request):
 
 @blueprint.get("/near/")
 async def get_near_npi(request):
+    """Return providers near coordinates under optional taxonomy filters."""
     request_session = _request_session(request)
     in_long, in_lat = None, None
     if request.args.get("long"):
@@ -8095,6 +8116,7 @@ async def get_near_npi(request):
 
 @blueprint.get("/id/<npi>/full_taxonomy")
 async def get_full_taxonomy_list(_request, npi):
+    """Return all NUCC taxonomy details attached to one NPI."""
     t = []
     npi = int(npi)
     # plan_data = await db.select(
@@ -8117,6 +8139,7 @@ async def get_full_taxonomy_list(_request, npi):
 
 @blueprint.get("/plans_by_npi/<npi>")
 async def get_plans_by_npi(_request, npi):
+    """Return issuer plan links recorded for one NPI."""
 
     data = []
     plan_data = []
@@ -8138,6 +8161,7 @@ async def get_plans_by_npi(_request, npi):
 
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
+    """Return one provider detail document with optional provenance."""
     force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
     include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
     include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
@@ -8348,6 +8372,7 @@ async def get_npi(request, npi):
         geocode_source=None,
         geocode_quality=None,
     ):
+        """Persist geocoding coordinates and provenance for one address."""
         checksum = address["checksum"]
         geo_source = str(geo_source).strip().lower() if geo_source else None
         if geo_source not in {"mapbox", "google", "tiger", "manual", "openaddresses"}:
@@ -8457,6 +8482,7 @@ async def get_npi(request, npi):
             logger.warning("Could not archive address checksum=%s: %s", checksum, exc)
 
     async def _update_address(x):
+        """Geocode one address when it does not already have coordinates."""
         if x.get("lat"):
             return x
         postal_code = x.get("postal_code")
@@ -8792,6 +8818,7 @@ async def _build_npi_details(
     include_address_total: bool = True,
     session: Any = None,
 ) -> dict:
+    """Assemble one provider identity, taxonomy, and address detail payload."""
     npi_data_table = NPIData.__table__
     taxonomy_table = NPIDataTaxonomy.__table__
     taxonomy_group_table = NPIDataTaxonomyGroup.__table__

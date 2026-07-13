@@ -893,23 +893,27 @@ def process_group_end():
 @click.command(help="Run CMSGOV MRF Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def mrf(test: bool):
+    """Run the CMS machine-readable-file importer."""
     _run(initiate_mrf(test_mode=test))
 
 @click.command(help="Finish CMSGOV MRF Import")
 @click.option("--test", is_flag=True, help="Finalize the test-schema import.")
 @click.option("--import-id", help="Override the import_id/import_date used during finalize.")
 def mrf_end(test: bool, import_id: str | None):
+    """Finalize one CMS machine-readable-file import."""
     _run(finish_mrf(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run Plan Attributes Import from CMS.gov")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def plan_attributes(test: bool):
+    """Run the CMS plan-attribute importer."""
     _run(initiate_plan_attributes(test_mode=test))
 
 @click.command(help="Run NPPES Import with Weekly updates")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def npi(test: bool):
+    """Run the weekly NPPES provider import."""
     _run(initiate_npi(test_mode=test))
 
 @click.command(help="Run Transparency in Coverage (PTG) Import")
@@ -971,6 +975,7 @@ def ptg(
     keep_artifacts_on_failure: bool = False,
     test: bool = False,
 ):
+    """Run a filtered Transparency in Coverage import."""
     if keep_artifacts_on_failure:
         keep_partial_artifacts = True
     _run(
@@ -999,12 +1004,14 @@ def ptg(
 @click.command(help="Run NUCC Taxonomy Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def nucc(test: bool):
+    """Run the NUCC taxonomy importer."""
     _run(initiate_nucc(test_mode=test))
 
 
 @click.command(help="Run CMS official RC/POS code-set import")
 @click.option("--test", is_flag=True, help="Import a small official-code sample for a quick smoke run.")
 def code_sets(test: bool):
+    """Run the CMS reference code-set importer."""
     _run(initiate_code_sets(test_mode=test))
 
 
@@ -1029,6 +1036,7 @@ def ms_drg(
     manual_toc_url: str | None,
     import_id: str | None,
 ):
+    """Run the CMS MS-DRG reference importer."""
     _run(
         initiate_ms_drg(
             test_mode=test,
@@ -1049,6 +1057,7 @@ def ms_drg(
 @click.option("--artifact-root", help="Directory for retained terminology source artifacts.")
 @click.option("--force-download", is_flag=True, help="Redownload source artifacts even when retained files exist.")
 def clinical_reference(test: bool, import_id: str | None, sources: str | None, artifact_root: str | None, force_download: bool):
+    """Import configured clinical terminology reference sources."""
     _run(
         initiate_clinical_reference(
             test_mode=test,
@@ -1064,6 +1073,7 @@ def clinical_reference(test: bool, import_id: str | None, sources: str | None, a
 @click.option("--test", is_flag=True, help="Build from a staged test import id.")
 @click.option("--import-id", help="Override import id/date suffix for staging.")
 def terminology_synonyms(test: bool, import_id: str | None):
+    """Materialize terminology synonym and crosswalk indexes."""
     _run(initiate_terminology_synonyms(test_mode=test, import_id=import_id))
 
 
@@ -1071,6 +1081,7 @@ def terminology_synonyms(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def claims_pricing(test: bool, import_id: str | None):
+    """Run the CMS claims-pricing importer."""
     _run(initiate_claims_pricing(test_mode=test, import_id=import_id))
 
 
@@ -1078,6 +1089,7 @@ def claims_pricing(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def claims_procedures(test: bool, import_id: str | None):
+    """Run the CMS claims-procedure importer."""
     _run(initiate_claims_pricing(test_mode=test, import_id=import_id))
 
 
@@ -1087,6 +1099,7 @@ def claims_procedures(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def claims_pricing_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    """Finalize one queued claims-pricing import."""
     _run(
         finish_claims_pricing(
             import_id=import_id,
@@ -1101,6 +1114,7 @@ def claims_pricing_end(import_id: str, run_id: str, test: bool, manifest_path: s
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def drug_claims(test: bool, import_id: str | None):
+    """Run the CMS Part D claims importer."""
     _run(initiate_drug_claims(test_mode=test, import_id=import_id))
 
 
@@ -1110,6 +1124,7 @@ def drug_claims(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def drug_claims_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    """Finalize one queued Part D claims import."""
     _run(
         finish_drug_claims(
             import_id=import_id,
@@ -1124,12 +1139,14 @@ def drug_claims_end(import_id: str, run_id: str, test: bool, manifest_path: str 
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def provider_quality(test: bool, import_id: str | None):
+    """Run the provider-quality importer."""
     _run(initiate_provider_quality(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run provider enrichment import (PECOS + Medicare enrollment)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def provider_enrichment(test: bool):
+    """Run the provider-enrichment importer."""
     _run(initiate_provider_enrichment(test_mode=test))
 
 
@@ -1282,6 +1299,7 @@ def provider_directory_fhir(
     concurrency: int | None,
     timeout: int | None,
 ):
+    """Run a configured Provider Directory FHIR refresh."""
     _run(
         initiate_provider_directory_fhir(
             test_mode=test,
@@ -1332,6 +1350,7 @@ def provider_directory_fhir(
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    """Finalize one queued provider-quality import."""
     _run(
         finish_provider_quality(
             import_id=import_id,
@@ -1346,6 +1365,7 @@ def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path:
 @click.option("--test", is_flag=True, help="Process a smaller subset for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def partd_formulary_network(test: bool, import_id: str | None):
+    """Run the Part D formulary and pharmacy-network importer."""
     _run(initiate_partd_formulary_network(test_mode=test, import_id=import_id))
 
 
@@ -1353,42 +1373,49 @@ def partd_formulary_network(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Process a smaller synthetic subset for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def pharmacy_license(test: bool, import_id: str | None):
+    """Run the state pharmacy-license importer."""
     _run(initiate_pharmacy_license(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run CDC PLACES ZCTA import (latest year only)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def places_zcta(test: bool):
+    """Run the CDC PLACES ZCTA importer."""
     _run(initiate_places_zcta(test_mode=test))
 
 
 @click.command(help="Run LEHD/LODES workplace aggregate import")
 @click.option("--test", is_flag=True, help="Process a small subset of states for a quick smoke run.")
 def lodes(test: bool):
+    """Run the LEHD workplace aggregate importer."""
     _run(initiate_lodes(test_mode=test))
 
 
 @click.command(help="Run CMS Medicare Enrollment Dashboard import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def medicare_enrollment(test: bool):
+    """Run the CMS Medicare enrollment importer."""
     _run(initiate_medicare_enrollment(test_mode=test))
 
 
 @click.command(help="Run CMS Doctors and Clinicians import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def cms_doctors(test: bool):
+    """Run the CMS Doctors and Clinicians importer."""
     _run(initiate_cms_doctors(test_mode=test))
 
 
 @click.command(help="Run Facility Anchors import (HRSA FQHCs + CMS Hospitals)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def facility_anchors(test: bool):
+    """Run the facility-anchor importer."""
     _run(initiate_facility_anchors(test_mode=test))
 
 
 @click.command(help="Run Pharmacy Economics import (SDUD + NADAC + FUL margins)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def pharmacy_economics(test: bool):
+    """Run the pharmacy-economics importer."""
     _run(initiate_pharmacy_economics(test_mode=test))
 
 
@@ -1442,6 +1469,7 @@ def entity_address_unified(
     provider_directory_partial_scope: str | None,
     provider_directory_source_batch_size: int | None,
 ):
+    """Materialize the unified entity-address dataset."""
     _run(
         initiate_entity_address_unified(
             test_mode=test,
@@ -1506,6 +1534,7 @@ def openaddresses(
     zip_restore_concurrency: int | None,
     zip_restore_shards: int | None,
 ):
+    """Refresh the US OpenAddresses cache and archive coordinates."""
     _run(
         initiate_openaddresses(
             test_mode=test,
@@ -1554,6 +1583,7 @@ def address_archive_v2_migrate(
     enqueue: bool,
     test: bool,
 ):
+    """Migrate the legacy address archive to the canonical v2 schema."""
     _run(
         initiate_address_archive_migration(
             dry_run=dry_run,
@@ -1607,6 +1637,7 @@ def mrf_source_discovery_command(
     crawl_target_limit: int | None,
     test: bool,
 ):
+    """Discover, crawl, and synchronize configured MRF sources."""
     _run(
         initiate_mrf_source_discovery(
             test_mode=test,
@@ -1637,6 +1668,7 @@ def mrf_source_discovery_command(
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Unused; kept for command signature consistency.")
 def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    """Finalize one queued Part D formulary-network import."""
     _run(
         finish_partd_formulary_network(
             import_id=import_id,
@@ -1653,6 +1685,7 @@ def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifes
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Unused; kept for command signature consistency.")
 def pharmacy_license_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    """Finalize one queued pharmacy-license import."""
     _run(
         finish_pharmacy_license(
             import_id=import_id,

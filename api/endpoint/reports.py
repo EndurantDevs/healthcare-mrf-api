@@ -1792,6 +1792,7 @@ LIMIT 1;
 
 @blueprint.get("/pharmacies/markets")
 async def list_pharmacy_markets(request):
+    """List pharmacy market summaries under the requested filters."""
     session = _get_session(request)
     args = request.args
     args.get("page")
@@ -1868,6 +1869,7 @@ async def list_pharmacy_markets(request):
 
 @blueprint.get("/pharmacies/markets/<market_id>")
 async def get_pharmacy_market_by_id(request, market_id):
+    """Return one pharmacy market summary by stable market identifier."""
     session = _get_session(request)
     market_id = str(market_id or "").strip()
     if not _MARKET_ID_PATTERN.fullmatch(market_id):
@@ -1901,6 +1903,7 @@ async def get_pharmacy_market_by_id(request, market_id):
 
 @blueprint.get("/pharmacies/rankings/access")
 async def list_pharmacy_access_rankings(request):
+    """Rank pharmacy markets by the selected access metric."""
     session = _get_session(request)
     args = request.args
     args.get("page")
@@ -1970,6 +1973,7 @@ async def list_pharmacy_access_rankings(request):
 
 @blueprint.get("/pharmacies/chains/summary")
 async def get_pharmacy_chain_summary(request):
+    """Return pharmacy-chain coverage and access summary metrics."""
     session = _get_session(request)
     request.args.get("name_like")
     names = _extract_name_like_filters(request.args)
@@ -2021,6 +2025,7 @@ async def get_pharmacy_chain_summary(request):
 
 @blueprint.get("/pharmacies/state-stats", name="pharmacy_state_stats")
 async def get_pharmacy_state_stats(request):
+    """Return state-level pharmacy access summary metrics."""
     session = _get_session(request)
     states, staffing_helper_available = await _query_pharmacy_state_stats(session)
     return response.json(
@@ -2033,6 +2038,7 @@ async def get_pharmacy_state_stats(request):
 
 @blueprint.get("/pharmacies/<npi>/market-context")
 async def get_pharmacy_market_context(request, npi):
+    """Return market context for one pharmacy NPI."""
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()

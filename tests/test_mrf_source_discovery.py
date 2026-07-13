@@ -1980,6 +1980,101 @@ def test_query_expansion_toc_plan_fallback_is_resolver_scoped():
     assert matched_target.metadata["company_name"] == "Sample Employer"
 
 
+def test_monthly_toc_query_expansion_scans_reporting_plan_identity():
+    """Monthly carrier indexes must be searched inside reporting plans."""
+    query_source_dict = _synthetic_query_source()
+    crawl_target = discovery.CrawlTarget(
+        source=query_source_dict,
+        url="https://example.test/2026-07-01_carrier_index.json",
+        label="Carrier-wide monthly index",
+        metadata={"resolver": "monthly_toc_templates"},
+    )
+
+    [matched_target] = discovery._filter_query_expansion_targets(
+        [crawl_target], "Sample Employer"
+    )
+
+    assert matched_target.url == crawl_target.url
+    assert matched_target.metadata["query_expansion_match"] is True
+    assert matched_target.metadata["query_expansion_match_scope"] == "toc_plan"
+
+
+def _synthetic_private_query_source():
+    """Build a source carrying fictional private employer identity variants."""
+    query_source_dict = _synthetic_query_source()
+    query_source_dict["metadata_json"]["raw"].update(
+        {
+            "target_payer_query": "Sample Holdings, LLC",
+            "private_context_employer_name": "Sample Holdings, LLC",
+            "private_context_employer_aliases": [
+                "Sample Employer",
+                "Sample Holdings",
+            ],
+            "private_context_employer_ein": "12-3456789",
+            "private_context_carrier_policy_number": "POL-654321",
+        }
+    )
+    return query_source_dict
+
+
+def test_private_query_identities_include_alias_and_identifier_variants():
+    """Private identity extraction preserves names and normalized identifiers."""
+    assert discovery._source_target_payer_queries(
+        _synthetic_private_query_source()
+    ) == (
+        "Sample Holdings, LLC",
+        "Sample Employer",
+        "Sample Holdings",
+        "12-3456789",
+        "123456789",
+        "POL-654321",
+        "654321",
+    )
+
+
+def test_private_query_identities_filter_alias_and_policy_plan_matches():
+    """Private aliases and stable identifiers find differently labeled plans."""
+    query_source_dict = _synthetic_private_query_source()
+    toc_payload = _synthetic_toc_payload(
+        (
+            "Sample Employer Choice Plan",
+            "111111111",
+            "https://example.test/alias-match.json.gz",
+        ),
+        (
+            "Regional Choice Plan",
+            "654321",
+            "https://example.test/policy-match.json.gz",
+        ),
+        (
+            "Unrelated Employer Choice Plan",
+            "222222222",
+            "https://example.test/unrelated.json.gz",
+        ),
+    )
+
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        query_source_dict,
+        "https://example.test/carrier-index.json",
+        toc_payload,
+        filter_to_target_query=True,
+    )
+
+    assert [plan_row["plan_id"] for plan_row in plan_rows] == [
+        "111111111",
+        "654321",
+    ]
+    assert [file_row["url"] for file_row in file_rows] == [
+        "https://example.test/alias-match.json.gz",
+        "https://example.test/policy-match.json.gz",
+    ]
+    assert all(
+        file_row["metadata_json"]["plan_info"][0]["company_name"]
+        == "Sample Holdings, LLC"
+        for file_row in file_rows
+    )
+
+
 def test_toc_rows_filter_to_matching_reporting_plans_and_files():
     query_source_dict = _synthetic_query_source()
     toc_payload = _synthetic_toc_payload(
@@ -2035,7 +2130,7 @@ def test_toc_rows_merge_plan_info_before_filtering_shared_file_urls():
 
 @pytest.mark.asyncio
 async def test_query_filtered_toc_stream_retains_only_matching_structures(monkeypatch):
-    discovery_source = _synthetic_query_source()
+    discovery_source = _synthetic_private_query_source()
     toc_payload = _synthetic_toc_payload(
         (
             "Sample Employer Choice Plan",

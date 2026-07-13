@@ -180,8 +180,8 @@ class DiscoveryResult:
     import_control_sources_synced: int = 0
     import_control_plans_synced: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
-
     def as_dict(self) -> dict[str, Any]:
+        """Serialize discovery counters, errors, and run identity."""
         return {
             "providers": self.providers,
             "candidates": self.candidates,
@@ -291,7 +291,9 @@ TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "sapphire",
     "auxiant_wordpress",
 )
-TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset({"cigna_static_mrf_lookup"})
+TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset(
+    {"cigna_static_mrf_lookup", "monthly_toc_templates"}
+)
 SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
     platform: rank
     for rank, platform in enumerate(TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS)
@@ -2279,7 +2281,7 @@ class _BoundedAsyncReader:
 async def _read_query_matching_structures(
     response: aiohttp.ClientResponse,
     *,
-    target_query: str,
+    target_queries: Iterable[str],
     max_bytes: int,
 ) -> list[dict[str, Any]]:
     """Stream one TOC response and retain structures matching the query."""
@@ -2305,7 +2307,7 @@ async def _read_query_matching_structures(
             plan
             for plan in (structure.get("reporting_plans") or [])
             if isinstance(plan, dict)
-            and _is_plan_info_query_match(plan, target_query)
+            and _is_plan_info_query_match(plan, target_queries)
         ]
         if matching_plans:
             structure["reporting_plans"] = matching_plans
@@ -2342,8 +2344,8 @@ async def _fetch_query_filtered_toc(
     session: aiohttp.ClientSession | None = None,
 ) -> dict[str, Any]:
     """Stream a carrier-wide TOC and retain only target-query structures."""
-    target_query = _source_target_payer_query(crawl_target.source)
-    if not target_query:
+    target_queries = _source_target_payer_queries(crawl_target.source)
+    if not target_queries:
         raise ValueError("target payer query is required for filtered TOC streaming")
     await _assert_fetch_url_allowed(crawl_target.url)
     if session is None:
@@ -2371,7 +2373,7 @@ async def _fetch_query_filtered_toc(
         await _assert_fetch_url_allowed(str(response.url))
         matching_structures = await _read_query_matching_structures(
             response,
-            target_query=target_query,
+            target_queries=target_queries,
             max_bytes=max_bytes,
         )
     return _query_filtered_toc_document(
@@ -3250,9 +3252,12 @@ def _toc_rows_from_content(
     plan_rows: list[dict[str, Any]] = []
     file_rows: list[dict[str, Any]] = []
     target_query = _source_target_payer_query(source)
+    target_queries = _source_target_payer_queries(source)
     plan_predicate = None
-    if filter_to_target_query and target_query:
-        plan_predicate = lambda plan: _is_plan_info_query_match(plan, target_query)
+    if filter_to_target_query and target_queries:
+        plan_predicate = lambda plan: _is_plan_info_query_match(
+            plan, target_queries
+        )
     if plan_predicate is None:
         entries = parse_toc_catalog_entries(toc, str(url))
     else:
@@ -3267,8 +3272,9 @@ def _toc_rows_from_content(
             entry.plan_info or (),
             target_query,
             filter_to_target_query=filter_to_target_query,
+            target_queries=target_queries,
         )
-        if filter_to_target_query and target_query and not plan_info:
+        if filter_to_target_query and target_queries and not plan_info:
             continue
         for plan in plan_info:
             plan_id = str(plan.get("plan_id") or "").strip()
@@ -9249,6 +9255,21 @@ def _source_private_context_text(source: dict[str, Any], key: str) -> str:
     return _clean_text(metadata.get(key) or raw.get(key))
 
 
+def _source_private_context_values(
+    source: dict[str, Any], key: str
+) -> tuple[str, ...]:
+    """Return normalized list values from one private source-context field."""
+    metadata = dict((source or {}).get("metadata_json") or {})
+    raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+    value = metadata.get(key)
+    if value in (None, ""):
+        value = raw.get(key)
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return tuple(
+        dict.fromkeys(_clean_text(item) for item in values if _clean_text(item))
+    )
+
+
 def _anthem_s3_employer_file_type(section_name: str) -> str | None:
     normalized = _clean_text(section_name).lower()
     if "out-of-network" in normalized or "allowed amount" in normalized:
@@ -11776,48 +11797,89 @@ def _query_expanded_plan_info(
     target_query: str | None,
     *,
     filter_to_target_query: bool = False,
+    target_queries: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Normalize plan labels and retain plans matching any private identity."""
     query = _clean_text(target_query)
-    items: list[dict[str, Any]] = []
+    query_values = _plan_info_query_values(target_queries or query)
+    normalized_plans: list[dict[str, Any]] = []
     for raw_plan in plan_info:
         if not isinstance(raw_plan, dict):
             continue
-        if filter_to_target_query and not _is_plan_info_query_match(raw_plan, query):
+        matching_query = _matching_plan_info_query(raw_plan, query_values)
+        if filter_to_target_query and query_values and not matching_query:
             continue
-        item = dict(raw_plan)
+        normalized_plan_dict = dict(raw_plan)
         plan_name, sponsor_name = _healthsparq_query_plan_label(
-            item.get("plan_name") or item.get("planName"), query
+            normalized_plan_dict.get("plan_name")
+            or normalized_plan_dict.get("planName"),
+            matching_query or query,
         )
         if plan_name:
-            item["plan_name"] = plan_name
+            normalized_plan_dict["plan_name"] = plan_name
+        if matching_query and query:
+            sponsor_name = query
         if sponsor_name:
-            item.setdefault("plan_sponsor_name", sponsor_name)
-            item.setdefault("company_name", sponsor_name)
-        items.append(item)
-    return items
+            normalized_plan_dict.setdefault("plan_sponsor_name", sponsor_name)
+            normalized_plan_dict.setdefault("company_name", sponsor_name)
+        normalized_plans.append(normalized_plan_dict)
+    return normalized_plans
 
 
-def _is_plan_info_query_match(plan: dict[str, Any], query: str | None) -> bool:
-    if not _clean_text(query):
-        return True
-    return _search_values_match_query(
-        [
-            plan.get("plan_name"),
-            plan.get("planName"),
-            plan.get("plan_sponsor_name"),
-            plan.get("plan_sponser_name"),
-            plan.get("sponsor_name"),
-            plan.get("issuer_name"),
-            plan.get("company_name"),
-            plan.get("plan_id"),
-            plan.get("planId"),
-            plan.get("plan_id_type"),
-            plan.get("planIdType"),
-            plan.get("plan_market_type"),
-            plan.get("planMarketType"),
-        ],
-        query,
+def _plan_info_query_values(
+    query: str | Iterable[str] | None,
+) -> tuple[str, ...]:
+    """Coerce one or many plan search values into a stable query tuple."""
+    raw_queries = [query] if isinstance(query, str) or query is None else query
+    return tuple(
+        dict.fromkeys(
+            _clean_text(query_value)
+            for query_value in raw_queries
+            if _clean_text(query_value)
+        )
     )
+
+
+def _plan_info_search_values(plan: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the plan identity values eligible for target-query matching."""
+    return (
+        plan.get("plan_name"),
+        plan.get("planName"),
+        plan.get("plan_sponsor_name"),
+        plan.get("plan_sponser_name"),
+        plan.get("sponsor_name"),
+        plan.get("issuer_name"),
+        plan.get("company_name"),
+        plan.get("plan_id"),
+        plan.get("planId"),
+        plan.get("plan_id_type"),
+        plan.get("planIdType"),
+        plan.get("plan_market_type"),
+        plan.get("planMarketType"),
+    )
+
+
+def _matching_plan_info_query(
+    plan: dict[str, Any], query: str | Iterable[str] | None
+) -> str | None:
+    """Return the first employer identity that matches one reporting plan."""
+    search_values = _plan_info_search_values(plan)
+    return next(
+        (
+            query_value
+            for query_value in _plan_info_query_values(query)
+            if _search_values_match_query(search_values, query_value)
+        ),
+        None,
+    )
+
+
+def _is_plan_info_query_match(
+    plan: dict[str, Any], query: str | Iterable[str] | None
+) -> bool:
+    """Return whether a plan matches any requested employer identity."""
+    query_values = _plan_info_query_values(query)
+    return not query_values or bool(_matching_plan_info_query(plan, query_values))
 
 
 def _healthsparq_plan_info(
@@ -12688,6 +12750,45 @@ def _source_target_payer_query(source: dict[str, Any]) -> str | None:
         if query:
             return query
     return None
+
+
+def _source_target_payer_queries(source_row: dict[str, Any]) -> tuple[str, ...]:
+    """Return private employer names and stable identifiers used to scan TOCs."""
+    query_values: list[str] = []
+    canonical_query = _source_target_payer_query(source_row)
+    if canonical_query:
+        query_values.append(canonical_query)
+    employer_name = _source_private_context_text(
+        source_row, "private_context_employer_name"
+    )
+    if employer_name:
+        query_values.append(employer_name)
+    query_values.extend(
+        _source_private_context_values(
+            source_row, "private_context_employer_aliases"
+        )
+    )
+    for identifier_key in (
+        "private_context_employer_ein",
+        "private_context_carrier_policy_number",
+    ):
+        identifier = _source_private_context_text(source_row, identifier_key)
+        if not identifier:
+            continue
+        query_values.append(identifier)
+        identifier_digits = "".join(
+            character for character in identifier if character.isdigit()
+        )
+        if len(identifier_digits) >= 6 and identifier_digits != identifier:
+            query_values.append(identifier_digits)
+    queries_by_normalized_value: dict[str, str] = {}
+    for query_value in query_values:
+        normalized_query_value = _clean_text(query_value)
+        if normalized_query_value:
+            queries_by_normalized_value.setdefault(
+                normalized_query_value.lower(), normalized_query_value
+            )
+    return tuple(queries_by_normalized_value.values())
 
 
 def _crawl_target_search_values(target: CrawlTarget) -> list[Any]:
