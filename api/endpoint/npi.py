@@ -137,6 +137,7 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
+PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY = "phone_source_record_ids"
 PROVIDER_DIRECTORY_CATALOG_ALIAS_COLUMNS = (
     # Catalog labels describe ingestion aliases, not provider-verified products.
     "source_id",
@@ -894,13 +895,22 @@ def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]
     return source_ids
 
 
+def _provider_directory_record_ids_from_address(address: Mapping[str, Any]) -> list[Any]:
+    return _merge_unique_list_values(
+        address.get("source_record_ids"),
+        address.get(PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY),
+    )
+
+
 def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> list[str]:
     source_ids: list[str] = []
     seen: set[str] = set()
     for address in addresses or []:
         if not isinstance(address, Mapping):
             continue
-        for source_id in _provider_directory_source_ids_from_record_ids(address.get("source_record_ids")):
+        for source_id in _provider_directory_source_ids_from_record_ids(
+            _provider_directory_record_ids_from_address(address)
+        ):
             if source_id in seen:
                 continue
             seen.add(source_id)
@@ -933,7 +943,7 @@ def _provider_directory_role_keys_from_addresses(
         if not isinstance(address, Mapping):
             continue
         for role_key in _directory_role_keys_from_records(
-            address.get("source_record_ids")
+            _provider_directory_record_ids_from_address(address)
         ):
             if role_key in seen_set:
                 continue
@@ -972,7 +982,7 @@ def _provider_directory_affiliation_keys_from_addresses(
         if not isinstance(address, Mapping):
             continue
         for affiliation_key in _directory_affiliation_keys_from_records(
-            address.get("source_record_ids")
+            _provider_directory_record_ids_from_address(address)
         ):
             if affiliation_key in seen_set:
                 continue
@@ -2647,12 +2657,17 @@ async def _attach_provider_directory_source_details(
     for address in addresses:
         if not isinstance(address, dict):
             continue
-        address_source_ids = _provider_directory_source_ids_from_record_ids(
-            address.get("source_record_ids")
+        provider_directory_record_ids = _provider_directory_record_ids_from_address(
+            address
         )
-        address_role_keys = _directory_role_keys_from_records(address.get("source_record_ids"))
+        address_source_ids = _provider_directory_source_ids_from_record_ids(
+            provider_directory_record_ids
+        )
+        address_role_keys = _directory_role_keys_from_records(
+            provider_directory_record_ids
+        )
         address_affiliation_keys = _directory_affiliation_keys_from_records(
-            address.get("source_record_ids")
+            provider_directory_record_ids
         )
         endpoint_provenance = _provider_directory_endpoint_provenance(
             address_source_ids,
@@ -3301,21 +3316,23 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
     return f"""
-    phone_candidates AS MATERIALIZED (
+    phone_candidate_rows AS MATERIALIZED (
         SELECT DISTINCT
                COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
                phone_address.address_key,
-               false AS provider_directory_matched
+               false AS provider_directory_matched,
+               NULL::varchar AS source_record_id
           FROM {address_table_sql} AS phone_address
          WHERE phone_address.type IN ({service_types})
            AND phone_address.address_key IS NOT NULL
            AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
            AND {direct_phone}
-        UNION
+        UNION ALL
         SELECT DISTINCT
                overlay.npi::bigint AS provider_npi,
                overlay.address_key,
-               true AS provider_directory_matched
+               true AS provider_directory_matched,
+               overlay.source_record_id::varchar
           FROM mrf.provider_directory_address_overlay AS overlay
           JOIN mrf.provider_directory_source AS source
             ON source.source_id = overlay.source_id
@@ -3327,6 +3344,19 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
          WHERE overlay.phone_number = :phone_digits
            AND overlay.npi IS NOT NULL
            AND overlay.address_key IS NOT NULL
+    ), phone_candidates AS MATERIALIZED (
+        SELECT candidate.provider_npi, candidate.address_key,
+               BOOL_OR(candidate.provider_directory_matched) AS provider_directory_matched
+          FROM phone_candidate_rows AS candidate
+      GROUP BY candidate.provider_npi, candidate.address_key
+    ), phone_provider_directory_evidence AS MATERIALIZED (
+        SELECT candidate.provider_npi,
+               ARRAY_AGG(DISTINCT candidate.source_record_id ORDER BY candidate.source_record_id)
+                   AS source_record_ids
+          FROM phone_candidate_rows AS candidate
+         WHERE candidate.provider_directory_matched
+           AND candidate.source_record_id IS NOT NULL
+      GROUP BY candidate.provider_npi
     )
     """
 
@@ -3343,6 +3373,8 @@ def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = No
 def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
     return f"""
           FROM phone_candidates AS phone_match
+     LEFT JOIN phone_provider_directory_evidence AS phone_evidence
+            ON phone_evidence.provider_npi = phone_match.provider_npi
          CROSS JOIN LATERAL (
                SELECT candidate_address.*
                  FROM {address_table_sql} AS candidate_address
@@ -4651,6 +4683,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     phone_candidates_cte = None
     address_from_sql = f"FROM {address_table_sql} AS a"
     phone_provider_directory_match = "false"
+    phone_source_record_ids = "ARRAY[]::varchar[]"
     if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
         address_from_sql = _address_phone_candidates_lateral_from(
@@ -4658,6 +4691,9 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             "a",
         )
         phone_provider_directory_match = "phone_match.provider_directory_matched"
+        phone_source_record_ids = (
+            "COALESCE(phone_evidence.source_record_ids, ARRAY[]::varchar[])"
+        )
         selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
     geo_locator_where: list[str] = []
@@ -4762,6 +4798,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    {columns['address_precision']} AS address_precision,
                    {columns['address_sources']} AS address_sources,
                    {columns['source_record_ids']} AS source_record_ids,
+                   {phone_source_record_ids} AS phone_source_record_ids,
                    {columns['source_count']}::integer AS source_count,
                    {columns['independent_source_count']}::integer AS independent_source_count,
                    {columns['multi_source_confirmed']}::boolean AS multi_source_confirmed,
@@ -5219,11 +5256,19 @@ def _match_candidate_output(
     if params.get("include_sources") and fhir_sources:
         candidate["provider_directory_sources"] = fhir_sources
     if params.get("include_evidence"):
-        candidate["evidence"] = {
+        evidence = {
             "provider_enrichment_summary": dict(enrichment or {}),
             "source_record_ids": _json_array_value(row.get("source_record_ids")),
             "address_sources": address_sources,
         }
+        phone_source_record_ids = _json_array_value(
+            row.get(PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY)
+        )
+        if phone_source_record_ids:
+            evidence[PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY] = (
+                phone_source_record_ids
+            )
+        candidate["evidence"] = evidence
     return {key: value for key, value in candidate.items() if value is not None}
 
 
