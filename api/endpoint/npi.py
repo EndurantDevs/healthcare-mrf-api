@@ -3304,7 +3304,8 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
     phone_candidates AS MATERIALIZED (
         SELECT DISTINCT
                COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
-               phone_address.address_key
+               phone_address.address_key,
+               false AS provider_directory_matched
           FROM {address_table_sql} AS phone_address
          WHERE phone_address.type IN ({service_types})
            AND phone_address.address_key IS NOT NULL
@@ -3313,7 +3314,8 @@ def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
         UNION
         SELECT DISTINCT
                overlay.npi::bigint AS provider_npi,
-               overlay.address_key
+               overlay.address_key,
+               true AS provider_directory_matched
           FROM mrf.provider_directory_address_overlay AS overlay
           JOIN mrf.provider_directory_source AS source
             ON source.source_id = overlay.source_id
@@ -4648,12 +4650,14 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             break
     phone_candidates_cte = None
     address_from_sql = f"FROM {address_table_sql} AS a"
+    phone_provider_directory_match = "false"
     if selected_locator_name == "phone" and _address_table_is_unified(address_table_sql):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
         address_from_sql = _address_phone_candidates_lateral_from(
             address_table_sql,
             "a",
         )
+        phone_provider_directory_match = "phone_match.provider_directory_matched"
         selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
     geo_locator_where: list[str] = []
@@ -4767,6 +4771,8 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    ({address_site_match})::boolean AS address_site_key_matched,
                    ({address_key_match})::boolean AS address_key_matched,
                    ({phone_match})::boolean AS phone_matched,
+                   ({phone_provider_directory_match})::boolean
+                       AS phone_provider_directory_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
               {address_from_sql}
              WHERE {' AND '.join(address_where)}
@@ -4774,6 +4780,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    address_site_key_matched DESC,
                    address_key_matched DESC,
                    phone_matched DESC,
+                   phone_provider_directory_matched DESC,
                    geo_distance_miles ASC NULLS LAST,
                    source_count DESC NULLS LAST,
                    location_key
