@@ -3,11 +3,11 @@
 import io
 import json
 import urllib.error
-from argparse import Namespace
 
 import pytest
 
 from scripts.research import provider_directory_api_evidence_harness as harness
+from scripts.research import provider_directory_api_evidence_support as support
 
 
 SOURCE_A = "pdfhir_0123456789abcdef01234567"
@@ -110,7 +110,7 @@ class FakeResponse:
 
 
 def _api_config(base_url="https://api.example.test/api/v1", **overrides):
-    return harness.ApiConfig(
+    return support.ApiConfig(
         base_url=base_url,
         bearer_token="very-secret-token",
         api_key=None,
@@ -121,7 +121,7 @@ def _api_config(base_url="https://api.example.test/api/v1", **overrides):
 
 
 def _harness_config(tmp_path, entry_ids=("acquired",), max_sources=100):
-    return Namespace(
+    return harness.HarnessConfig(
         manifest_path=tmp_path / "manifest.json",
         schema="mrf",
         entry_ids=entry_ids,
@@ -167,7 +167,7 @@ async def test_required_missing_evidence_fails_but_probe_only_missing_evidence_s
     report = await harness.build_report(
         _harness_config(tmp_path, entry_ids=("acquired", "probe")),
         FakeConn([]),
-        harness.ApiConfig(None, None, None, "X-API-Key", 3.0, data_only=True),
+        support.ApiConfig(None, None, None, "X-API-Key", 3.0, data_only=True),
     )
 
     acquired, probe = report["sources"]
@@ -201,7 +201,7 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
         _harness_config(tmp_path),
         conn,
         _api_config(),
-        harness.ProviderDirectoryApiClient(_api_config(), opener=opener),
+        support.ProviderDirectoryApiClient(_api_config(), opener=opener),
     )
 
     source_result = report["sources"][0]
@@ -231,20 +231,20 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
     [(40.0, 40.0, True), (40.01, 40.0, False), (400.0, 0.0, True)],
 )
 def test_latency_slo_boundary(latency_ms, latency_slo_ms, expected):
-    result = harness.HttpResult(200, latency_ms, {}, None)
+    result = support.HttpResult(200, latency_ms, {}, None)
 
-    assert harness._within_latency_slo(result, latency_slo_ms) is expected
+    assert support.is_within_latency_slo(result, latency_slo_ms) is expected
 
 
 def test_required_source_fails_when_successful_api_response_exceeds_latency_slo():
-    selection = harness.SourceSelection("acquired", SOURCE_A, "acquisition", True)
-    sample = harness.OverlaySample(SOURCE_A, 1234567890, None)
+    selection = support.SourceSelection("acquired", SOURCE_A, "acquisition", True)
+    sample = support.OverlaySample(SOURCE_A, 1234567890, None)
 
     class SlowClient:
         def get_json(self, _path, _params):
-            return harness.HttpResult(200, 40.01, _detail_payload(SOURCE_A), None)
+            return support.HttpResult(200, 40.01, _detail_payload(SOURCE_A), None)
 
-    source_result = harness.evaluate_source(
+    source_result = support.evaluate_source(
         selection,
         [sample],
         SlowClient(),
@@ -263,14 +263,14 @@ def test_source_provenance_requires_fhir_and_accepts_both_id_shapes():
         "provider_directory_sources": [_source_summary_map(SOURCE_A, source_ids=True)]
     }
 
-    assert harness.has_row_source_provenance(provider_row_map, SOURCE_A) is True
+    assert support.has_row_source_provenance(provider_row_map, SOURCE_A) is True
     provider_row_map["provider_directory_sources"][0]["catalog_aliases_verified"] = True
-    assert harness.has_row_source_provenance(provider_row_map, SOURCE_A) is False
+    assert support.has_row_source_provenance(provider_row_map, SOURCE_A) is False
     provider_row_map["provider_directory_sources"][0][
         "catalog_aliases_verified"
     ] = False
     provider_row_map["provider_directory_sources"][0]["source"] = "not_fhir"
-    assert harness.has_row_source_provenance(provider_row_map, SOURCE_A) is False
+    assert support.has_row_source_provenance(provider_row_map, SOURCE_A) is False
 
 
 def test_http_error_and_report_redaction_never_include_raw_secret_text():
@@ -284,7 +284,7 @@ def test_http_error_and_report_redaction_never_include_raw_secret_text():
             io.BytesIO(b'{"message":"very-secret-token"}'),
         )
 
-    result = harness.ProviderDirectoryApiClient(_api_config(), opener=opener).get_json(
+    result = support.ProviderDirectoryApiClient(_api_config(), opener=opener).get_json(
         "providers/1", {}
     )
     assert (result.status_code, result.error) == (401, "http_error")

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Verify current Provider Directory evidence through the client-facing api-layer contract."""
+
 from __future__ import annotations
+
 import argparse
 import asyncio
 import datetime as dt
@@ -9,21 +11,28 @@ import json
 import os
 import re
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Iterable, Mapping
+
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from scripts.research.provider_directory_api_evidence_support import (
+    ApiConfig,
+    OverlaySample,
+    ProviderDirectoryApiClient,
+    SourceSelection,
+    evaluate_source,
+    redact_sensitive,
+)
 from scripts.research.provider_directory_endpoint_acquisition_harness import (
     DEFAULT_MANIFEST,
     load_manifest,
 )
+
 
 DEFAULT_API_BASE_URL_ENV = "PROVIDER_DIRECTORY_API_BASE_URL"
 DEFAULT_API_BEARER_TOKEN_ENV = "PROVIDER_DIRECTORY_API_BEARER_TOKEN"
@@ -31,57 +40,20 @@ DEFAULT_API_KEY_ENV = "PROVIDER_DIRECTORY_API_KEY"
 SOURCE_ID_RE = re.compile(r"^pdfhir_[0-9a-f]{24}$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REQUIRED_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition", "external"})
-SENSITIVE_FIELD_PARTS = (
-    "authorization",
-    "token",
-    "secret",
-    "password",
-    "api_key",
-    "credential",
-    "headers",
-)
 
 
 @dataclass(frozen=True)
-class SourceSelection:
-    entry_id: str
-    source_id: str
-    classification: str
-    required: bool
+class HarnessConfig:
+    """Non-secret selection and work limits for one evidence run."""
 
-
-@dataclass(frozen=True)
-class OverlaySample:
-    source_id: str
-    npi: int
-    phone: str | None
-
-
-@dataclass(frozen=True)
-class ApiConfig:
-    """API settings whose credentials remain in memory only."""
-
-    base_url: str | None
-    bearer_token: str | None
-    api_key: str | None
-    api_key_header: str
-    timeout_seconds: float
-    data_only: bool = False
-
-    @property
-    def is_enabled(self) -> bool:
-        """Return whether authenticated API calls are allowed."""
-        return bool(
-            self.base_url and (self.bearer_token or self.api_key) and not self.data_only
-        )
-
-
-@dataclass(frozen=True)
-class HttpResult:
-    status_code: int | None
-    latency_ms: float
-    payload: Mapping[str, Any] | None
-    error: str | None = None
+    manifest_path: Path
+    schema: str
+    entry_ids: tuple[str, ...]
+    source_ids: tuple[str, ...]
+    max_sources: int
+    samples_per_source: int
+    candidate_limit: int
+    api_latency_slo_ms: float
 
 
 def _utc_now() -> str:
@@ -93,15 +65,19 @@ def _utc_now() -> str:
     )
 
 
-def _quote_identifier(value: str, *, label: str) -> str:
-    if not IDENTIFIER_RE.fullmatch(value):
+def _quote_identifier(identifier: str, *, label: str) -> str:
+    if not IDENTIFIER_RE.fullmatch(identifier):
         raise ValueError(f"invalid {label}")
-    return f'"{value}"'
+    return f'"{identifier}"'
 
 
-def _normalized_ids(values: Iterable[str]) -> tuple[str, ...]:
+def _normalized_ids(identifiers: Iterable[str]) -> tuple[str, ...]:
     return tuple(
-        dict.fromkeys(value.strip() for value in values if value and value.strip())
+        dict.fromkeys(
+            identifier.strip()
+            for identifier in identifiers
+            if identifier and identifier.strip()
+        )
     )
 
 
@@ -112,7 +88,7 @@ def resolve_source_selection(
     requested_source_ids: Iterable[str] = (),
     max_sources: int = 100,
 ) -> list[SourceSelection]:
-    """Resolve all selected maintained sources or reject a cap that would truncate them."""
+    """Resolve selected maintained sources or reject a cap that truncates them."""
     if max_sources < 1:
         raise ValueError("max_sources must be at least one")
     entries = manifest.get("entries")
@@ -136,6 +112,17 @@ def resolve_source_selection(
         raise ValueError("unknown manifest source selector")
     if set(requested_sources) - set(sources_by_id):
         raise ValueError("unknown manifest source selector")
+    selections = _manifest_selections(entries, requested_entries, requested_sources)
+    if len(selections) > max_sources:
+        raise ValueError("selected maintained sources exceed max_sources")
+    return selections
+
+
+def _manifest_selections(
+    entries: list[Any],
+    requested_entries: tuple[str, ...],
+    requested_sources: tuple[str, ...],
+) -> list[SourceSelection]:
     selections: list[SourceSelection] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -158,8 +145,6 @@ def resolve_source_selection(
                     classification in REQUIRED_CLASSIFICATIONS,
                 )
             )
-    if len(selections) > max_sources:
-        raise ValueError("selected maintained sources exceed max_sources")
     return selections
 
 
@@ -168,13 +153,20 @@ def overlay_sample_sql(schema: str) -> str:
     quoted_schema = _quote_identifier(schema, label="database schema")
     return f"""
         WITH requested_sources AS MATERIALIZED (
-            SELECT DISTINCT source_id FROM unnest($1::varchar[]) AS requested(source_id)
+            SELECT DISTINCT source_id
+              FROM unnest($1::varchar[]) AS requested(source_id)
         ), current_sources AS MATERIALIZED (
-            SELECT requested.source_id, dataset.dataset_id, COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
-              FROM requested_sources AS requested JOIN {quoted_schema}.provider_directory_source AS source ON source.source_id = requested.source_id
-              JOIN {quoted_schema}.provider_directory_endpoint_dataset AS dataset ON dataset.endpoint_id = source.endpoint_id
-             WHERE dataset.is_current IS TRUE AND dataset.status = 'published'
-               AND dataset.published_at IS NOT NULL AND dataset.superseded_at IS NULL
+            SELECT requested.source_id, dataset.dataset_id,
+                   COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
+              FROM requested_sources AS requested
+              JOIN {quoted_schema}.provider_directory_source AS source
+                ON source.source_id = requested.source_id
+              JOIN {quoted_schema}.provider_directory_endpoint_dataset AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+             WHERE dataset.is_current IS TRUE
+               AND dataset.status = 'published'
+               AND dataset.published_at IS NOT NULL
+               AND dataset.superseded_at IS NULL
                AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
         )
         SELECT current_source.source_id, sampled.npi, sampled.phone_number
@@ -182,9 +174,12 @@ def overlay_sample_sql(schema: str) -> str:
           CROSS JOIN LATERAL (
               SELECT DISTINCT ON (overlay.npi) overlay.npi, overlay.phone_number
                 FROM {quoted_schema}.provider_directory_address_overlay AS overlay
-                JOIN {quoted_schema}.provider_directory_dataset_resource AS resource ON resource.dataset_id = current_source.dataset_id
-                 AND resource.resource_type = overlay.resource_type AND resource.resource_id = overlay.resource_id
-               WHERE overlay.source_id = current_source.source_id AND overlay.last_seen_run_id = current_source.run_id
+                JOIN {quoted_schema}.provider_directory_dataset_resource AS resource
+                  ON resource.dataset_id = current_source.dataset_id
+                 AND resource.resource_type = overlay.resource_type
+                 AND resource.resource_id = overlay.resource_id
+               WHERE overlay.source_id = current_source.source_id
+                 AND overlay.last_seen_run_id = current_source.run_id
                  AND overlay.npi IS NOT NULL
                ORDER BY overlay.npi,
                         (overlay.address_key IS NOT NULL) DESC,
@@ -227,283 +222,25 @@ async def fetch_overlay_samples(
     return samples_by_source
 
 
-def _normalized_phone(value: Any) -> str | None:
-    digits = "".join(character for character in str(value or "") if character.isdigit())
+def _normalized_phone(phone_value: Any) -> str | None:
+    digits = "".join(
+        character for character in str(phone_value or "") if character.isdigit()
+    )
     return digits if len(digits) >= 7 else None
 
 
-def _masked_phone(phone: str | None) -> str | None:
-    return f"***-***-{phone[-4:]}" if phone else None
-
-
-def _validated_api_base_url(base_url: str | None) -> str | None:
-    candidate = str(base_url or "").strip().rstrip("/")
-    if not candidate:
-        return None
-    parsed = urllib.parse.urlsplit(candidate)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("API base URL must be credential-free HTTP(S) URL")
-    return candidate
-
-
-class ProviderDirectoryApiClient:
-    """Credential-safe api-layer JSON client with explicit request timeouts."""
-
-    def __init__(
-        self, config: ApiConfig, opener: Callable[..., Any] = urllib.request.urlopen
-    ):
-        self.config = config
-        self.opener = opener
-        self.base_url = _validated_api_base_url(config.base_url)
-        if config.timeout_seconds <= 0:
-            raise ValueError("API timeout must be greater than zero")
-        if not re.fullmatch(r"[A-Za-z0-9-]+", config.api_key_header):
-            raise ValueError("API key header is invalid")
-
-    def get_json(self, path: str, params: Mapping[str, str]) -> HttpResult:
-        """Request one api-layer object without retaining response text on errors."""
-        if not self.config.is_enabled or not self.base_url:
-            raise RuntimeError("API client is disabled")
-        request = urllib.request.Request(
-            f"{self.base_url}/{self._api_path(path)}?{urllib.parse.urlencode(params)}",
-            headers=self._headers(),
-            method="GET",
-        )
-        started = time.monotonic()
-        try:
-            with self.opener(request, timeout=self.config.timeout_seconds) as response:
-                status_code = int(
-                    getattr(response, "status", None) or response.getcode()
-                )
-                decoded = json.loads(response.read(2 * 1024 * 1024).decode("utf-8"))
-            payload = decoded if isinstance(decoded, Mapping) else None
-            error = None if payload is not None else "non_object_json"
-            return HttpResult(status_code, _elapsed_ms(started), payload, error)
-        except urllib.error.HTTPError as exc:
-            return HttpResult(int(exc.code), _elapsed_ms(started), None, "http_error")
-        except urllib.error.URLError:
-            return HttpResult(None, _elapsed_ms(started), None, "network_error")
-        except TimeoutError:
-            return HttpResult(None, _elapsed_ms(started), None, "timeout")
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return HttpResult(None, _elapsed_ms(started), None, "invalid_json")
-        except OSError:
-            return HttpResult(None, _elapsed_ms(started), None, "network_error")
-
-    def _api_path(self, path: str) -> str:
-        return path if self.base_url.endswith("/api/v1") else f"api/v1/{path}"
-
-    def _headers(self) -> dict[str, str]:
-        header_map = {
-            "Accept": "application/json",
-            "User-Agent": "healthporta-provider-directory-evidence/1.0",
-        }
-        if self.config.bearer_token:
-            header_map["Authorization"] = f"Bearer {self.config.bearer_token}"
-        if self.config.api_key:
-            header_map[self.config.api_key_header] = self.config.api_key
-        return header_map
-
-
-def _elapsed_ms(started: float) -> float:
-    return round((time.monotonic() - started) * 1000.0, 2)
-
-
-def _envelope_rows(payload: Mapping[str, Any] | None, field: str) -> list[Any]:
-    data_map = payload.get("data") if isinstance(payload, Mapping) else None
-    if field == "address_list":
-        data_map = data_map.get("npi") if isinstance(data_map, Mapping) else None
-    rows = data_map.get(field) if isinstance(data_map, Mapping) else None
-    return rows if isinstance(rows, list) else []
-
-
-def has_row_source_provenance(row: Any, source_id: str) -> bool:
-    """Return whether one api-layer row exposes the requested FHIR source."""
-    if not isinstance(row, Mapping):
-        return False
-    summaries = row.get("provider_directory_sources")
-    if not isinstance(summaries, list):
-        return False
-    for summary in summaries:
-        if not isinstance(summary, Mapping):
-            continue
-        if summary.get("source") != "provider_directory_fhir":
-            continue
-        if summary.get("catalog_aliases_verified") is not False:
-            continue
-        source_ids = summary.get("source_ids")
-        if isinstance(source_ids, list) and source_id in {
-            str(value) for value in source_ids
-        }:
-            return True
-        aliases = summary.get("catalog_aliases")
-        if isinstance(aliases, list) and any(
-            isinstance(alias, Mapping)
-            and str(alias.get("source_id") or "") == source_id
-            for alias in aliases
-        ):
-            return True
-    return False
-
-
-def _has_detail_source(payload: Mapping[str, Any] | None, source_id: str) -> bool:
-    return any(
-        has_row_source_provenance(row, source_id)
-        for row in _envelope_rows(payload, "address_list")
-    )
-
-
-def _has_phone_candidate_source(
-    payload: Mapping[str, Any] | None, source_id: str, npi: int
-) -> bool:
-    return any(
-        isinstance(row, Mapping)
-        and int(row.get("npi") or 0) == npi
-        and has_row_source_provenance(row, source_id)
-        for row in _envelope_rows(payload, "candidates")
-    )
-
-
-def _http_summary(http_result: HttpResult) -> dict[str, Any]:
-    summary_map: dict[str, Any] = {
-        "status_code": http_result.status_code,
-        "latency_ms": http_result.latency_ms,
-    }
-    if http_result.error:
-        summary_map["error"] = http_result.error
-    return summary_map
-
-
-def _within_latency_slo(http_result: HttpResult, latency_slo_ms: float) -> bool:
-    """Return whether a request meets the enabled client-facing latency SLO."""
-    return latency_slo_ms == 0 or http_result.latency_ms <= latency_slo_ms
-
-
-def evaluate_source(
-    selection: SourceSelection,
-    samples: list[OverlaySample],
-    api_client: ProviderDirectoryApiClient | None,
-    *,
-    candidate_limit: int,
-    api_latency_slo_ms: float,
-    api_skip_reason: str | None,
-) -> dict[str, Any]:
-    """Verify bounded api-layer detail and phone evidence for one manifest source."""
-    source_result_map: dict[str, Any] = {
-        "entry_id": selection.entry_id,
-        "source_id": selection.source_id,
-        "classification": selection.classification,
-        "required": selection.required,
-        "samples": [
-            {"npi": sample.npi, "phone": _masked_phone(sample.phone)}
-            for sample in samples
-        ],
-    }
-    if not samples:
-        source_result_map["status"] = "fail" if selection.required else "skip"
-        source_result_map["reason"] = (
-            "required_current_overlay_dataset_evidence_not_found"
-            if selection.required
-            else "probe_only_current_overlay_dataset_evidence_not_found"
-        )
-        return source_result_map
-    if api_client is None:
-        source_result_map["status"] = "skip"
-        source_result_map["reason"] = api_skip_reason or "api_credentials_unavailable"
-        return source_result_map
-    checks: list[dict[str, Any]] = []
-    for sample in samples:
-        detail = api_client.get_json(
-            f"providers/{sample.npi}",
-            {"include_sources": "true", "include_evidence": "true"},
-        )
-        check_map: dict[str, Any] = {"npi": sample.npi, "detail": _http_summary(detail)}
-        check_map["detail_source_present"] = (
-            detail.status_code == 200
-            and _has_detail_source(detail.payload, selection.source_id)
-        )
-        check_map["detail_within_latency_slo"] = _within_latency_slo(
-            detail, api_latency_slo_ms
-        )
-        if sample.phone:
-            phone_result = api_client.get_json(
-                "providers/match-candidates",
-                {
-                    "phone": sample.phone,
-                    "limit": str(candidate_limit),
-                    "include_sources": "true",
-                    "include_evidence": "true",
-                },
-            )
-            check_map["phone_match_candidates"] = _http_summary(phone_result)
-            check_map["phone_source_present"] = (
-                phone_result.status_code == 200
-                and _has_phone_candidate_source(
-                    phone_result.payload, selection.source_id, sample.npi
-                )
-            )
-            check_map["phone_within_latency_slo"] = _within_latency_slo(
-                phone_result, api_latency_slo_ms
-            )
-        checks.append(check_map)
-    source_result_map["checks"] = checks
-    source_result_map["status"] = (
-        "pass"
-        if all(
-            check["detail_source_present"]
-            and check["detail_within_latency_slo"]
-            and check.get("phone_source_present", True)
-            and check.get("phone_within_latency_slo", True)
-            for check in checks
-        )
-        else "fail"
-    )
-    return source_result_map
-
-
-def redact_sensitive(value: Any) -> Any:
-    """Strip sensitive keyed values before report serialization."""
-    if isinstance(value, Mapping):
-        return {
-            str(key): redact_sensitive(nested)
-            for key, nested in value.items()
-            if not any(
-                part in str(key).lower().replace("-", "_")
-                for part in SENSITIVE_FIELD_PARTS
-            )
-        }
-    if isinstance(value, list):
-        return [redact_sensitive(item) for item in value]
-    return value
-
-
-async def build_report(
-    config: Any,
-    conn: Any,
-    api_config: ApiConfig,
-    api_client: ProviderDirectoryApiClient | None = None,
-) -> dict[str, Any]:
-    """Build a credential-safe report, failing required sources without current evidence."""
+def _validate_harness_config(config: HarnessConfig) -> None:
     if not 1 <= config.candidate_limit <= 20:
         raise ValueError("candidate_limit must be between one and twenty")
     if config.api_latency_slo_ms < 0:
         raise ValueError("api_latency_slo_ms must be zero or greater")
-    manifest_map = load_manifest(config.manifest_path)
-    selections = resolve_source_selection(
-        manifest_map,
-        requested_entry_ids=config.entry_ids,
-        requested_source_ids=config.source_ids,
-        max_sources=config.max_sources,
-    )
-    if not selections:
-        raise ValueError("no maintained sources selected")
+
+
+async def _current_samples(
+    config: HarnessConfig,
+    conn: Any,
+    selections: list[SourceSelection],
+) -> tuple[dict[str, list[OverlaySample]], str | None]:
     try:
         samples_by_source = await fetch_overlay_samples(
             conn,
@@ -511,43 +248,79 @@ async def build_report(
             selections=selections,
             samples_per_source=config.samples_per_source,
         )
-        db_error = None
+        return samples_by_source, None
     except Exception as exc:
-        samples_by_source = {selection.source_id: [] for selection in selections}
-        db_error = type(exc).__name__
-    api_skip_reason = None
-    active_client = api_client if api_config.is_enabled else None
-    if db_error:
-        api_skip_reason = "database_probe_failed"
-    elif active_client is None and api_config.is_enabled:
-        active_client = ProviderDirectoryApiClient(api_config)
-    elif not api_config.is_enabled:
-        api_skip_reason = (
-            "data_only_mode" if api_config.data_only else "api_credentials_unavailable"
-        )
-    source_results = [
-        (
-            _database_failure_result(selection)
-            if db_error
-            else evaluate_source(
-                selection,
-                samples_by_source.get(selection.source_id, []),
-                active_client,
-                candidate_limit=config.candidate_limit,
-                api_latency_slo_ms=config.api_latency_slo_ms,
-                api_skip_reason=api_skip_reason,
-            )
+        empty_samples_by_source = {selection.source_id: [] for selection in selections}
+        return empty_samples_by_source, type(exc).__name__
+
+
+def _active_api_client(
+    api_config: ApiConfig,
+    api_client: ProviderDirectoryApiClient | None,
+    database_error: str | None,
+) -> tuple[ProviderDirectoryApiClient | None, str | None]:
+    if database_error:
+        return None, "database_probe_failed"
+    if api_client is not None and api_config.is_enabled:
+        return api_client, None
+    if api_config.is_enabled:
+        return ProviderDirectoryApiClient(api_config), None
+    skip_reason = (
+        "data_only_mode" if api_config.data_only else "api_credentials_unavailable"
+    )
+    return None, skip_reason
+
+
+def _database_failure_result(selection: SourceSelection) -> dict[str, Any]:
+    return {
+        "entry_id": selection.entry_id,
+        "source_id": selection.source_id,
+        "classification": selection.classification,
+        "required": selection.required,
+        "status": "fail" if selection.required else "skip",
+        "reason": "database_probe_failed",
+        "samples": [],
+    }
+
+
+def _source_results(
+    config: HarnessConfig,
+    selections: list[SourceSelection],
+    samples_by_source: Mapping[str, list[OverlaySample]],
+    api_client: ProviderDirectoryApiClient | None,
+    api_skip_reason: str | None,
+    database_error: str | None,
+) -> list[dict[str, Any]]:
+    if database_error:
+        return [_database_failure_result(selection) for selection in selections]
+    return [
+        evaluate_source(
+            selection,
+            samples_by_source.get(selection.source_id, []),
+            api_client,
+            candidate_limit=config.candidate_limit,
+            api_latency_slo_ms=config.api_latency_slo_ms,
+            api_skip_reason=api_skip_reason,
         )
         for selection in selections
     ]
+
+
+def _report_payload(
+    config: HarnessConfig,
+    selections: list[SourceSelection],
+    source_results: list[dict[str, Any]],
+    api_client: ProviderDirectoryApiClient | None,
+    database_error: str | None,
+) -> dict[str, Any]:
     required_failures = sum(
-        source_result_map["status"] == "fail" and source_result_map["required"]
-        for source_result_map in source_results
+        source_result["status"] == "fail" and source_result["required"]
+        for source_result in source_results
     )
-    report_map = {
+    return {
         "schema_version": 1,
         "generated_at": _utc_now(),
-        "mode": "api" if active_client is not None and not db_error else "data_only",
+        "mode": "api" if api_client is not None and not database_error else "data_only",
         "selection": {
             "entry_ids": list(config.entry_ids),
             "source_ids": list(config.source_ids),
@@ -558,27 +331,55 @@ async def build_report(
             "api_latency_slo_ms": config.api_latency_slo_ms,
         },
         "summary": {
-            "pass": sum(item["status"] == "pass" for item in source_results),
-            "fail": sum(item["status"] == "fail" for item in source_results),
-            "skip": sum(item["status"] == "skip" for item in source_results),
+            "pass": sum(
+                source_result["status"] == "pass" for source_result in source_results
+            ),
+            "fail": sum(
+                source_result["status"] == "fail" for source_result in source_results
+            ),
+            "skip": sum(
+                source_result["status"] == "skip" for source_result in source_results
+            ),
             "required_sources_failed": required_failures,
         },
         "sources": source_results,
     }
-    return redact_sensitive(report_map)
 
 
-def _database_failure_result(selection: SourceSelection) -> dict[str, Any]:
-    status = "fail" if selection.required else "skip"
-    return {
-        "entry_id": selection.entry_id,
-        "source_id": selection.source_id,
-        "classification": selection.classification,
-        "required": selection.required,
-        "status": status,
-        "reason": "database_probe_failed",
-        "samples": [],
-    }
+async def build_report(
+    config: HarnessConfig,
+    conn: Any,
+    api_config: ApiConfig,
+    api_client: ProviderDirectoryApiClient | None = None,
+) -> dict[str, Any]:
+    """Build a credential-safe report, failing required sources without evidence."""
+    _validate_harness_config(config)
+    manifest = load_manifest(config.manifest_path)
+    selections = resolve_source_selection(
+        manifest,
+        requested_entry_ids=config.entry_ids,
+        requested_source_ids=config.source_ids,
+        max_sources=config.max_sources,
+    )
+    if not selections:
+        raise ValueError("no maintained sources selected")
+    samples_by_source, database_error = await _current_samples(config, conn, selections)
+    active_client, api_skip_reason = _active_api_client(
+        api_config, api_client, database_error
+    )
+    source_results = _source_results(
+        config,
+        selections,
+        samples_by_source,
+        active_client,
+        api_skip_reason,
+        database_error,
+    )
+    return redact_sensitive(
+        _report_payload(
+            config, selections, source_results, active_client, database_error
+        )
+    )
 
 
 async def _connect(args: argparse.Namespace) -> Any:
@@ -600,21 +401,11 @@ async def _connect(args: argparse.Namespace) -> Any:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse explicit database/API settings without printing their secret values."""
+    """Parse explicit database/API settings without printing secret values."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument(
-        "--entry-id",
-        action="append",
-        default=[],
-        help="Exact manifest entry_id; repeatable.",
-    )
-    parser.add_argument(
-        "--source-id",
-        action="append",
-        default=[],
-        help="Exact manifest source_id; repeatable.",
-    )
+    parser.add_argument("--entry-id", action="append", default=[])
+    parser.add_argument("--source-id", action="append", default=[])
     parser.add_argument("--max-sources", type=int, default=100)
     parser.add_argument("--samples-per-source", type=int, default=1)
     parser.add_argument("--phone-candidate-limit", type=int, default=5)
@@ -641,18 +432,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default=os.getenv(DEFAULT_API_KEY_ENV) or "")
     parser.add_argument("--api-key-header", default="X-API-Key")
     parser.add_argument("--api-timeout-seconds", type=float, default=15.0)
-    parser.add_argument(
-        "--api-latency-slo-ms",
-        type=float,
-        default=40.0,
-        help="Maximum API latency per check in milliseconds; zero disables the SLO.",
-    )
-    parser.add_argument(
-        "--data-only",
-        action="store_true",
-        help="Inspect current DB evidence without API calls.",
-    )
+    parser.add_argument("--api-latency-slo-ms", type=float, default=40.0)
+    parser.add_argument("--data-only", action="store_true")
     return parser.parse_args(argv)
+
+
+def _harness_config(args: argparse.Namespace) -> HarnessConfig:
+    return HarnessConfig(
+        manifest_path=args.manifest,
+        schema=args.db_schema,
+        entry_ids=_normalized_ids(args.entry_id),
+        source_ids=_normalized_ids(args.source_id),
+        max_sources=args.max_sources,
+        samples_per_source=args.samples_per_source,
+        candidate_limit=args.phone_candidate_limit,
+        api_latency_slo_ms=args.api_latency_slo_ms,
+    )
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -667,19 +462,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         args.api_timeout_seconds,
         args.data_only,
     )
-    args.entry_ids = _normalized_ids(args.entry_id)
-    args.source_ids = _normalized_ids(args.source_id)
-    args.schema = args.db_schema
-    args.candidate_limit = args.phone_candidate_limit
     conn = await _connect(args)
     try:
-        return await build_report(args, conn, api_config)
+        return await build_report(_harness_config(args), conn, api_config)
     finally:
         await conn.close()
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Print the safe JSON report and return nonzero for required source failures."""
+    """Print the safe JSON report and return nonzero for required failures."""
     try:
         report = asyncio.run(run(parse_args(argv)))
         print(json.dumps(redact_sensitive(report), indent=2, sort_keys=True))
