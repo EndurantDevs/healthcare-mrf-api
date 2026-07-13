@@ -20,12 +20,29 @@ MIGRATION_PATH = (
     / "versions"
     / "20260710110000_provider_directory_bulk_checkpoints.py"
 )
+NEXT_POLL_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260713200000_provider_directory_bulk_next_poll.py"
+)
 
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "provider_directory_bulk_checkpoint_migration",
         MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_next_poll_migration():
+    spec = importlib.util.spec_from_file_location(
+        "provider_directory_bulk_next_poll_migration",
+        NEXT_POLL_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -122,7 +139,10 @@ def test_bulk_checkpoint_migration_matches_models(monkeypatch):
     assert set(recorder.tables) == set(models_by_table)
     for table_name, model_cls in models_by_table.items():
         recorded_columns = _recorded_columns(recorder.tables[table_name])
-        assert tuple(recorded_columns) == tuple(model_cls.__table__.columns.keys())
+        model_columns = list(model_cls.__table__.columns.keys())
+        if table_name == "provider_directory_bulk_acquisition_checkpoint":
+            model_columns.remove("next_poll_at")
+        assert tuple(recorded_columns) == tuple(model_columns)
         assert recorder.tables[table_name]["schema"] == model_cls.__table__.schema
 
     acquisition_columns = _recorded_columns(
@@ -145,4 +165,28 @@ def test_bulk_checkpoint_migration_matches_models(monkeypatch):
     assert root_index["unique"] is True
     assert str(root_index["postgresql_where"]) == (
         "acquisition_root_run_id IS NOT NULL"
+    )
+
+
+def test_bulk_next_poll_migration_extends_acquisition_checkpoint(monkeypatch):
+    migration = _load_next_poll_migration()
+    recorder = _OpRecorder()
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.upgrade()
+
+    assert migration.revision == "20260713200000_provider_directory_bulk_next_poll"
+    assert migration.down_revision == (
+        "20260713193000_address_canonical_incomplete_line2_unit"
+    )
+    assert len(recorder.added_columns) == 1
+    added_column = recorder.added_columns[0]
+    assert added_column["table"] == (
+        ProviderDirectoryBulkAcquisitionCheckpoint.__tablename__
+    )
+    assert added_column["column"].name == "next_poll_at"
+    assert added_column["column"].nullable is True
+    assert added_column["schema"] == (
+        ProviderDirectoryBulkAcquisitionCheckpoint.__table__.schema
     )

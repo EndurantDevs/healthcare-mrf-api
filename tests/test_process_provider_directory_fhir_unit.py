@@ -9432,11 +9432,12 @@ async def test_process_data_does_not_import_valid_non_fhir_retest_rows_without_v
 @pytest.mark.asyncio
 async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
     """Verify this provider-directory regression contract."""
+    import_resources = AsyncMock(return_value={"Location": 2})
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
-    monkeypatch.setattr(importer, "_import_resources", AsyncMock(return_value={"Location": 2}))
+    monkeypatch.setattr(importer, "_import_resources", import_resources)
     monkeypatch.setattr(
         importer,
         "backfill_provider_directory_location_contacts",
@@ -9468,9 +9469,15 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
             "resources": "Location",
             "publish_artifacts": True,
             "publish_corroboration": True,
+            "bulk_export_max_pending_seconds": 23456,
         },
     )
     assert metrics["resource_rows"] == {"Location": 2}
+    assert metrics["bulk_export_max_pending_seconds"] == 23456
+    assert (
+        import_resources.await_args.kwargs["bulk_export_max_pending_seconds"]
+        == 23456
+    )
     assert metrics["sources_import_attempted"] == 1
     assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert metrics["location_coordinates_backfilled"] == 6
@@ -9513,10 +9520,15 @@ async def test_main_forwards_publish_artifact_targets(monkeypatch):
         test_mode=True,
         publish_artifacts_only=True,
         publish_artifacts_targets="corroboration",
+        bulk_export_max_pending_seconds=12345,
     )
 
     assert result == {"published": True}
     assert process_data_mock.await_args.args[1]["publish_artifacts_targets"] == "corroboration"
+    assert (
+        process_data_mock.await_args.args[1]["bulk_export_max_pending_seconds"]
+        == 12345
+    )
 
 
 def _stub_artifact_dataset_scope(monkeypatch) -> None:
@@ -13553,6 +13565,9 @@ def _bulk_fetch_options():
         row_batch_handler=_bulk_test_write_batch,
         row_batch_size=2,
         retain_rows=False,
+        bulk_export_max_pending_seconds=(
+            importer.DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+        ),
     )
 
 
@@ -13580,6 +13595,11 @@ class _BulkCheckpointMemory:
         monkeypatch.setattr(importer, "_reserve_bulk_export_checkpoint", self.reserve)
         monkeypatch.setattr(importer, "_release_bulk_export_reservation", self.release)
         monkeypatch.setattr(importer, "_accept_bulk_export_checkpoint", self.accept)
+        monkeypatch.setattr(
+            importer,
+            "_persist_bulk_export_next_poll_at",
+            self.persist_next_poll_at,
+        )
         monkeypatch.setattr(importer, "_persist_bulk_export_manifest", self.persist_manifest)
         monkeypatch.setattr(importer, "_load_bulk_output_checkpoints", self.load_outputs)
         monkeypatch.setattr(importer, "_begin_bulk_export_output", self.begin_output)
@@ -13623,6 +13643,12 @@ class _BulkCheckpointMemory:
             "state": state,
             "rows_written": 0,
             "error": None,
+            "accepted_at": (
+                importer._bulk_export_now_utc()
+                if state != importer.BULK_EXPORT_CHECKPOINT_STARTING
+                else None
+            ),
+            "next_poll_at": None,
         }
 
     def seed_accepted(self, identity, status_url):
@@ -13712,10 +13738,17 @@ class _BulkCheckpointMemory:
                 else None
             )
             checkpoint["state"] = importer.BULK_EXPORT_CHECKPOINT_ACCEPTED
+            checkpoint["accepted_at"] = importer._bulk_export_now_utc()
         elif importer._bulk_checkpoint_status_url(checkpoint) != status_url:
             raise RuntimeError("bulk_export_status_url_mismatch")
         self.event_log.append(("accept", status_url))
         return dict(checkpoint)
+
+    async def persist_next_poll_at(self, identity, next_poll_at):
+        checkpoint = self.checkpoint_by_id[identity.checkpoint_id]
+        assert checkpoint["owner_run_id"] == identity.owner_run_id
+        checkpoint["next_poll_at"] = next_poll_at
+        self.event_log.append(("next_poll", next_poll_at))
 
     async def persist_manifest(self, identity, manifest):
         checkpoint = self.checkpoint_by_id[identity.checkpoint_id]
@@ -13930,6 +13963,7 @@ def test_bulk_checkpoint_models_persist_contract():
         "state",
         "error",
         "accepted_at",
+        "next_poll_at",
         "manifest_received_at",
         "completed_at",
         "failed_at",
@@ -13949,6 +13983,88 @@ def test_bulk_checkpoint_models_persist_contract():
     }.issubset(output_columns)
     assert ProviderDirectoryBulkAcquisitionCheckpoint in importer.CANONICAL_RESOURCE_MODELS
     assert ProviderDirectoryBulkOutputCheckpoint in importer.CANONICAL_RESOURCE_MODELS
+
+
+def test_bulk_export_pending_default_and_retry_after_formats():
+    observed_at = datetime.datetime(2026, 7, 13, 12, 0, tzinfo=datetime.UTC)
+    retry_at = observed_at + datetime.timedelta(days=2, seconds=17)
+
+    assert importer.DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS == 7 * 24 * 60 * 60
+    assert importer._bulk_export_retry_after_seconds(
+        "172817",
+        now_utc=observed_at,
+    ) == 172817.0
+    assert importer._bulk_export_retry_after_seconds(
+        email.utils.format_datetime(retry_at, usegmt=True),
+        now_utc=observed_at,
+    ) == 172817.0
+
+
+@pytest.mark.asyncio
+async def test_bulk_poll_honors_durable_next_poll_boundary(monkeypatch):
+    accepted_at = datetime.datetime(2026, 7, 13, 10, 0, tzinfo=datetime.UTC)
+    next_poll_at = accepted_at + datetime.timedelta(minutes=20)
+    observed_times = iter((accepted_at, next_poll_at))
+    sleep_mock = AsyncMock()
+    status_payload = _bulk_status_payload()
+    http_get = AsyncMock(return_value=(200, {}, status_payload, None))
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: next(observed_times))
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(importer, "_bulk_http_get_json", http_get)
+
+    status_payload_result, poll_error, polls = await importer._bulk_export_poll_manifest(
+        object(),
+        _bulk_test_source(),
+        "https://providerdirectory.api.aetna.com/fhir/status/1",
+        resource_type="Practitioner",
+        timeout=1,
+        poll_options=importer.BulkExportPollOptions(
+            accepted_at=accepted_at,
+            next_poll_at=next_poll_at,
+        ),
+    )
+
+    assert status_payload_result == status_payload
+    assert poll_error is None
+    assert polls == 1
+    sleep_mock.assert_awaited_once_with(20 * 60)
+    http_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bulk_final_poll_persists_full_retry_after_without_sleep(monkeypatch):
+    observed_at = datetime.datetime(2026, 7, 13, 12, 0, tzinfo=datetime.UTC)
+    next_poll_handler = AsyncMock()
+    sleep_mock = AsyncMock()
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_POLLS", "1")
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: observed_at)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(
+        importer,
+        "_bulk_http_get_json",
+        AsyncMock(return_value=(202, {"retry-after": "864000"}, None, None)),
+    )
+
+    status_payload, poll_error, polls = await importer._bulk_export_poll_manifest(
+        object(),
+        _bulk_test_source(),
+        "https://providerdirectory.api.aetna.com/fhir/status/1",
+        resource_type="Practitioner",
+        timeout=1,
+        poll_options=importer.BulkExportPollOptions(
+            accepted_at=observed_at,
+            max_pending_seconds=2 * 24 * 60 * 60,
+            next_poll_handler=next_poll_handler,
+        ),
+    )
+
+    assert status_payload is None
+    assert poll_error == "bulk_export_timeout"
+    assert polls == 1
+    next_poll_handler.assert_awaited_once_with(
+        observed_at + datetime.timedelta(days=2)
+    )
+    sleep_mock.assert_not_awaited()
 
 
 def _assert_completed_bulk_checkpoint(checkpoint: dict[str, Any]) -> None:
@@ -14047,6 +14163,62 @@ async def test_bulk_checkpoint_blocks_unknown_acceptance(
     assert fetch_result.error == "bulk_export_acceptance_outcome_unknown"
     checkpoint = checkpoint_memory.checkpoint_by_id[checkpoint_identity.checkpoint_id]
     assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_FAILED
+
+
+@pytest.mark.asyncio
+async def test_bulk_checkpoint_deadline_is_shared_across_retry_and_never_restarts(
+    monkeypatch,
+    bulk_checkpoint_key,
+):
+    checkpoint_memory = _BulkCheckpointMemory()
+    original_context = _bulk_test_context(owner_run_id="run_1", root_run_id="root_1")
+    retry_context = _bulk_test_context(
+        owner_run_id="run_retry",
+        retry_of_run_id="run_1",
+        root_run_id="root_1",
+    )
+    original_identity = _bulk_test_identity(original_context)
+    retry_identity = _bulk_test_identity(retry_context)
+    assert retry_identity.checkpoint_id == original_identity.checkpoint_id
+    checkpoint_memory.seed_accepted(
+        original_identity,
+        f"{original_identity.canonical_api_base}/status/pending",
+    )
+    observed_at = datetime.datetime(2026, 7, 13, 12, 0, tzinfo=datetime.UTC)
+    accepted_at = observed_at - datetime.timedelta(days=8)
+    checkpoint_memory.checkpoint_by_id[original_identity.checkpoint_id][
+        "accepted_at"
+    ] = accepted_at
+    checkpoint_memory.install(monkeypatch)
+    start_or_poll = AsyncMock(
+        side_effect=AssertionError("expired accepted export must not restart or poll")
+    )
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: observed_at)
+    monkeypatch.setattr(importer, "_bulk_http_get_json", start_or_poll)
+
+    first_result = await importer._fetch_checkpointed_bulk_export_resource_rows(
+        _bulk_test_source(retry_identity.canonical_api_base),
+        "Practitioner",
+        retry_context,
+        _bulk_fetch_options(),
+    )
+    second_result = await importer._fetch_checkpointed_bulk_export_resource_rows(
+        _bulk_test_source(retry_identity.canonical_api_base),
+        "Practitioner",
+        retry_context,
+        _bulk_fetch_options(),
+    )
+
+    assert first_result is not None
+    assert first_result.error == importer.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    assert second_result is not None
+    assert second_result.error == importer.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    start_or_poll.assert_not_awaited()
+    checkpoint = checkpoint_memory.checkpoint_by_id[retry_identity.checkpoint_id]
+    assert checkpoint["accepted_at"] == accepted_at
+    assert checkpoint["owner_run_id"] == "run_retry"
+    assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_FAILED
+    assert checkpoint["status_url_ciphertext"] is None
 
 
 @pytest.mark.asyncio

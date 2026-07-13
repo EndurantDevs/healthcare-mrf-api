@@ -610,6 +610,18 @@ job, or expired output fails closed. The importer never starts a replacement
 export inside the same candidate after acceptance, and the prior current
 endpoint dataset remains untouched.
 
+Checkpointed exports have a finite pending allowance measured from the
+persisted `accepted_at`, so retry descendants share the original deadline. The
+task field `bulk_export_max_pending_seconds` and environment variable
+`HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_PENDING_SECONDS` configure the
+allowance; the default is seven days to cover Aetna's observed long-running
+exports. Every HTTP 202 stores `next_poll_at`. Both delta-seconds and HTTP-date
+`Retry-After` values are preserved up to the pending deadline, and a retry waits
+for that durable boundary before polling. At expiry the checkpoint fails with
+`bulk_export_status_deadline_exceeded`, clears encrypted status/manifest/output
+capabilities, and cannot submit a replacement export. An operator must start a
+fresh acquisition root/candidate to request a new export.
+
 Each checkpointed resource also holds a PostgreSQL session advisory lock for
 the complete request/poll/stream lifecycle. A competing retry fails retryably
 before checkpoint adoption while that worker is alive. Before every streamed

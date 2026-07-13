@@ -1063,6 +1063,7 @@ class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
     created_at = Column(TIMESTAMP, nullable=False)
     accepted_at = Column(TIMESTAMP)
     last_polled_at = Column(TIMESTAMP)
+    next_poll_at = Column(TIMESTAMP)
     manifest_received_at = Column(TIMESTAMP)
     completed_at = Column(TIMESTAMP)
     failed_at = Column(TIMESTAMP)

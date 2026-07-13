@@ -498,6 +498,7 @@ DEFAULT_STREAM_BATCH_SIZE = 5000
 ENDPOINT_DATASET_HASH_BATCH_SIZE = 10000
 DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
+DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
 DEFAULT_LOCATION_COORDINATE_BATCH_SIZE = 50000
 PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
@@ -889,6 +890,9 @@ BULK_EXPORT_CHECKPOINT_STREAMING = "streaming"
 BULK_EXPORT_CHECKPOINT_RETRYABLE = "retryable"
 BULK_EXPORT_CHECKPOINT_COMPLETE = "complete"
 BULK_EXPORT_CHECKPOINT_FAILED = "failed"
+BULK_EXPORT_STATUS_DEADLINE_EXCEEDED = (
+    "bulk_export_status_deadline_exceeded"
+)
 BULK_EXPORT_CAPABILITY_CIPHER_PREFIX = "fernet:v1:"
 BULK_EXPORT_DEFAULT_LEASE_SECONDS = 900
 BULK_EXPORT_MIN_LEASE_SECONDS = 60
@@ -1174,6 +1178,31 @@ class BulkExportFetchOptions:
     row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]]
     row_batch_size: int
     retain_rows: bool
+    bulk_export_max_pending_seconds: int = (
+        DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+    )
+
+
+@dataclass(frozen=True)
+class BulkExportPollOptions:
+    lease_handler: Callable[[], Awaitable[None]] | None = None
+    accepted_at: Any | None = None
+    next_poll_at: Any | None = None
+    max_pending_seconds: int = DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+    next_poll_handler: (
+        Callable[[datetime.datetime], Awaitable[None]] | None
+    ) = None
+
+
+@dataclass(frozen=True)
+class BulkExportPollContext:
+    source_record: dict[str, Any]
+    resource_type: str
+    status_url: str
+    poll_limit: int
+    poll_seconds: int
+    pending_deadline: datetime.datetime | None
+    options: BulkExportPollOptions
 
 
 @dataclass
@@ -14938,6 +14967,71 @@ def _retry_after_seconds(value: str | None) -> int | None:
         return None
 
 
+def _bulk_export_now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+def _bulk_export_utc_datetime(value: Any, *, error: str) -> datetime.datetime:
+    if isinstance(value, datetime.datetime):
+        parsed_value = value
+    else:
+        value_text = _clean_text(value)
+        if not value_text:
+            raise ValueError(error)
+        try:
+            parsed_value = datetime.datetime.fromisoformat(
+                value_text.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(error) from exc
+    if parsed_value.tzinfo is None:
+        parsed_value = parsed_value.replace(tzinfo=datetime.UTC)
+    return parsed_value.astimezone(datetime.UTC)
+
+
+def _bulk_export_pending_deadline(
+    accepted_at: Any,
+    max_pending_seconds: int,
+) -> datetime.datetime:
+    accepted_time = _bulk_export_utc_datetime(
+        accepted_at,
+        error="bulk_export_checkpoint_accepted_at_invalid",
+    )
+    return accepted_time + datetime.timedelta(
+        seconds=max(1, int(max_pending_seconds))
+    )
+
+
+def _bulk_export_retry_after_seconds(
+    value: str | None,
+    *,
+    now_utc: datetime.datetime | None = None,
+) -> float | None:
+    retry_after = _clean_text(value)
+    if not retry_after:
+        return None
+    try:
+        delay_seconds = int(retry_after)
+    except ValueError:
+        delay_seconds = None
+    if delay_seconds is not None:
+        return float(max(0, delay_seconds))
+    try:
+        retry_at = email.utils.parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.UTC)
+    current_time = now_utc or _bulk_export_now_utc()
+    return max(
+        0.0,
+        (
+            retry_at.astimezone(datetime.UTC)
+            - current_time.astimezone(datetime.UTC)
+        ).total_seconds(),
+    )
+
+
 def _bulk_export_output_urls(payload: dict[str, Any] | None, resource_type: str) -> list[str]:
     if not isinstance(payload, dict):
         return []
@@ -15147,6 +15241,142 @@ async def _bulk_export_poll_outputs(
     return None, "bulk_export_timeout", max(1, max_polls)
 
 
+def _bulk_export_pending_poll_times(
+    options: BulkExportPollOptions,
+) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    pending_deadline = (
+        _bulk_export_pending_deadline(
+            options.accepted_at,
+            options.max_pending_seconds,
+        )
+        if options.accepted_at is not None
+        else None
+    )
+    next_poll_at = (
+        _bulk_export_utc_datetime(
+            options.next_poll_at,
+            error="bulk_export_checkpoint_next_poll_at_invalid",
+        )
+        if options.next_poll_at is not None
+        else None
+    )
+    return pending_deadline, next_poll_at
+
+
+async def _wait_for_bulk_export_poll_boundary(
+    next_poll_at: datetime.datetime | None,
+    pending_deadline: datetime.datetime | None,
+) -> str | None:
+    current_time = _bulk_export_now_utc()
+    if pending_deadline is not None and current_time >= pending_deadline:
+        return BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    if next_poll_at is None or current_time >= next_poll_at:
+        return None
+    sleep_until = (
+        min(next_poll_at, pending_deadline)
+        if pending_deadline is not None
+        else next_poll_at
+    )
+    await asyncio.sleep(max(0.0, (sleep_until - current_time).total_seconds()))
+    if (
+        pending_deadline is not None
+        and _bulk_export_now_utc() >= pending_deadline
+    ):
+        return BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    return None
+
+
+def _next_bulk_export_poll_at(
+    retry_after: str | None,
+    poll_seconds: int,
+    current_time: datetime.datetime,
+    pending_deadline: datetime.datetime | None,
+) -> datetime.datetime:
+    retry_after_seconds = _bulk_export_retry_after_seconds(
+        retry_after,
+        now_utc=current_time,
+    )
+    delay_seconds = (
+        retry_after_seconds
+        if retry_after_seconds is not None
+        else max(0, poll_seconds)
+    )
+    next_poll_at = current_time + datetime.timedelta(seconds=delay_seconds)
+    return (
+        min(next_poll_at, pending_deadline)
+        if pending_deadline is not None
+        else next_poll_at
+    )
+
+
+async def _handle_bulk_export_pending_poll(
+    context: BulkExportPollContext,
+    headers: dict[str, str],
+    poll: int,
+) -> tuple[datetime.datetime | None, str | None]:
+    current_time = _bulk_export_now_utc()
+    if (
+        context.pending_deadline is not None
+        and current_time >= context.pending_deadline
+    ):
+        return None, BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    next_poll_at = _next_bulk_export_poll_at(
+        headers.get("retry-after"),
+        context.poll_seconds,
+        current_time,
+        context.pending_deadline,
+    )
+    if context.options.next_poll_handler is not None:
+        await context.options.next_poll_handler(next_poll_at)
+    if poll == 1 or poll % 10 == 0:
+        _bulk_export_log(
+            "poll_wait",
+            source_id=context.source_record.get("source_id"),
+            resource=context.resource_type,
+            poll=poll,
+            max_polls=context.poll_limit,
+            status=202,
+            sleep_seconds=max(0.0, (next_poll_at - current_time).total_seconds()),
+            status_url=_bulk_capability_log_identity(context.status_url),
+        )
+    if poll >= context.poll_limit:
+        return next_poll_at, "bulk_export_timeout"
+    wait_error = await _wait_for_bulk_export_poll_boundary(
+        next_poll_at,
+        context.pending_deadline,
+    )
+    return next_poll_at, wait_error
+
+
+def _bulk_export_finished_poll_result(
+    context: BulkExportPollContext,
+    poll: int,
+    status_code: int | None,
+    status_payload: dict[str, Any] | None,
+    request_error: str | None,
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    if request_error:
+        _bulk_export_log_poll_error(
+            context.source_record,
+            context.resource_type,
+            poll,
+            context.poll_limit,
+            request_error,
+        )
+        return None, request_error, poll
+    if status_code == 200:
+        if not _bulk_export_status_payload(status_payload):
+            return None, "bulk_export_status_non_bulk_payload", poll
+        return status_payload, _bulk_export_payload_error(status_payload), poll
+    _bulk_export_log_poll_http_error(
+        context.source_record,
+        context.resource_type,
+        poll,
+        status_code,
+    )
+    return None, f"bulk_export_status_http_{status_code}", poll
+
+
 async def _bulk_export_poll_manifest(
     session: aiohttp.ClientSession,
     source_record: dict[str, Any],
@@ -15154,55 +15384,57 @@ async def _bulk_export_poll_manifest(
     *,
     resource_type: str,
     timeout: int,
-    lease_handler: Callable[[], Awaitable[None]] | None = None,
+    poll_options: BulkExportPollOptions | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, int]:
     """Poll one accepted export while extending its ownership lease."""
+    options = poll_options or BulkExportPollOptions()
     max_polls, poll_seconds = _bulk_export_poll_settings()
-    for poll in range(1, max(1, max_polls) + 1):
+    poll_limit = max(1, max_polls)
+    try:
+        pending_deadline, next_poll_at = _bulk_export_pending_poll_times(options)
+    except ValueError as exc:
+        return None, str(exc), 0
+    context = BulkExportPollContext(
+        source_record=source_record,
+        resource_type=resource_type,
+        status_url=status_url,
+        poll_limit=poll_limit,
+        poll_seconds=poll_seconds,
+        pending_deadline=pending_deadline,
+        options=options,
+    )
+    for poll in range(1, poll_limit + 1):
+        wait_error = await _wait_for_bulk_export_poll_boundary(
+            next_poll_at,
+            pending_deadline,
+        )
+        if wait_error:
+            return None, wait_error, poll - 1
         status_code, headers, status_payload, request_error = await _bulk_http_get_json(
             session,
             source_record,
             status_url,
             timeout=timeout,
         )
-        if lease_handler:
-            await lease_handler()
-        if request_error:
-            _bulk_export_log_poll_error(
-                source_record,
-                resource_type,
-                poll,
-                max_polls,
-                request_error,
-            )
-            return None, request_error, poll
-        if status_code == 202:
-            await _bulk_export_sleep_after_poll_wait(
-                source_record,
-                resource_type,
-                poll,
-                max_polls,
+        if options.lease_handler:
+            await options.lease_handler()
+        if status_code == 202 and request_error is None:
+            next_poll_at, wait_error = await _handle_bulk_export_pending_poll(
+                context,
                 headers,
-                poll_seconds,
-                status_url,
-            )
-            continue
-        if status_code == 200:
-            if not _bulk_export_status_payload(status_payload):
-                return None, "bulk_export_status_non_bulk_payload", poll
-            return (
-                status_payload,
-                _bulk_export_payload_error(status_payload),
                 poll,
             )
-        _bulk_export_log_poll_http_error(
-            source_record,
-            resource_type,
+            if wait_error:
+                return None, wait_error, poll
+            continue
+        return _bulk_export_finished_poll_result(
+            context,
             poll,
             status_code,
+            status_payload,
+            request_error,
         )
-        return None, f"bulk_export_status_http_{status_code}", poll
-    return None, "bulk_export_timeout", max(1, max_polls)
+    return None, "bulk_export_timeout", poll_limit
 
 
 def _bulk_export_log_poll_error(
@@ -15231,6 +15463,8 @@ async def _bulk_export_sleep_after_poll_wait(
     poll_seconds: int,
     status_url: str,
 ) -> None:
+    if poll >= max(1, max_polls):
+        return
     sleep_seconds = _retry_after_seconds(headers.get("retry-after")) or poll_seconds
     if poll == 1 or poll % 10 == 0:
         _bulk_export_log(
@@ -15373,7 +15607,7 @@ async def _load_bulk_export_checkpoint(
                start_url_hash, status_url_ciphertext, status_url_hash,
                manifest_hash, manifest_ciphertext, manifest_json, state,
                rows_written, error, lease_expires_at, created_at,
-               accepted_at, last_polled_at, manifest_received_at,
+               accepted_at, last_polled_at, next_poll_at, manifest_received_at,
                completed_at, failed_at, updated_at
           FROM {_bulk_acquisition_checkpoint_table_ref()}
          WHERE checkpoint_id = :checkpoint_id;
@@ -15608,6 +15842,9 @@ def _is_bulk_export_error_terminal(error: str | None) -> bool:
         "bulk_export_manifest_mismatch",
         "bulk_export_manifest_checkpoint_corrupt",
         "bulk_export_status_non_bulk_payload",
+        BULK_EXPORT_STATUS_DEADLINE_EXCEEDED,
+        "bulk_export_checkpoint_accepted_at_invalid",
+        "bulk_export_checkpoint_next_poll_at_invalid",
         "bulk_export_checkpoint_output_bounded",
         "bulk_export_checkpoint_ciphertext_invalid",
         "bulk_export_non_public_dns_address",
@@ -15660,6 +15897,35 @@ async def _record_bulk_export_checkpoint_error(
         raise RuntimeError("bulk_export_checkpoint_ownership_lost")
     if terminal:
         await _clear_bulk_export_capabilities(identity)
+
+
+async def _persist_bulk_export_next_poll_at(
+    identity: BulkExportCheckpointIdentity,
+    next_poll_at: datetime.datetime,
+) -> None:
+    normalized_next_poll_at = next_poll_at.astimezone(datetime.UTC).replace(
+        tzinfo=None
+    )
+    updated_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET next_poll_at = :next_poll_at,
+               last_polled_at = now(),
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id
+           AND state NOT IN (:complete_state, :failed_state);
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        next_poll_at=normalized_next_poll_at,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+        complete_state=BULK_EXPORT_CHECKPOINT_COMPLETE,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+    )
+    if _coerce_rowcount(updated_count) <= 0:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
 
 
 async def _clear_bulk_export_capabilities(
@@ -15809,6 +16075,7 @@ async def _persist_bulk_export_manifest(
                    state = :state,
                    error = NULL,
                    last_polled_at = now(),
+                   next_poll_at = NULL,
                    lease_expires_at = now() + make_interval(secs => :lease_seconds),
                    manifest_received_at = COALESCE(manifest_received_at, now()),
                    updated_at = now()
@@ -16420,7 +16687,16 @@ async def _poll_checkpointed_bulk_export_manifest(
     checkpoint: dict[str, Any],
     *,
     timeout: int,
+    max_pending_seconds: int,
 ) -> tuple[dict[str, Any] | None, str | None, int]:
+    if checkpoint.get("accepted_at") is None:
+        checkpoint_error = "bulk_export_checkpoint_accepted_at_invalid"
+        await _record_bulk_export_checkpoint_error(
+            identity,
+            checkpoint_error,
+            terminal=True,
+        )
+        return None, checkpoint_error, 0
     try:
         stored_status_url = _bulk_checkpoint_status_url(checkpoint)
         status_url = _resolved_bulk_export_status_url(
@@ -16442,7 +16718,16 @@ async def _poll_checkpointed_bulk_export_manifest(
         status_url,
         resource_type=identity.resource_type,
         timeout=timeout,
-        lease_handler=partial(_refresh_bulk_export_rows_written, identity),
+        poll_options=BulkExportPollOptions(
+            lease_handler=partial(_refresh_bulk_export_rows_written, identity),
+            accepted_at=checkpoint.get("accepted_at"),
+            next_poll_at=checkpoint.get("next_poll_at"),
+            max_pending_seconds=max_pending_seconds,
+            next_poll_handler=partial(
+                _persist_bulk_export_next_poll_at,
+                identity,
+            ),
+        ),
     )
     if poll_error:
         await _record_bulk_export_checkpoint_error(
@@ -16500,6 +16785,7 @@ async def _checkpointed_bulk_export_manifest(
     *,
     initial_status_payload: dict[str, Any] | None,
     timeout: int,
+    max_pending_seconds: int,
 ) -> tuple[BulkExportManifest | None, str | None, int]:
     try:
         stored_manifest = _bulk_manifest_from_checkpoint(
@@ -16527,6 +16813,7 @@ async def _checkpointed_bulk_export_manifest(
                 identity,
                 checkpoint,
                 timeout=timeout,
+                max_pending_seconds=max_pending_seconds,
             )
         )
         if poll_error:
@@ -17012,6 +17299,9 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
             checkpoint,
             initial_status_payload=initial_status_payload,
             timeout=fetch_options.timeout,
+            max_pending_seconds=(
+                fetch_options.bulk_export_max_pending_seconds
+            ),
         )
         if manifest_error or manifest is None:
             return _checkpointed_bulk_fetch_result(
@@ -17057,6 +17347,15 @@ async def _fetch_bulk_export_resource_rows(
             checkpoint_context,
             BulkExportFetchOptions(
                 timeout=timeout,
+                bulk_export_max_pending_seconds=(
+                    max(
+                        1,
+                        int(
+                            source.get("_bulk_export_max_pending_seconds")
+                            or DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+                        ),
+                    )
+                ),
                 run_id=run_id,
                 row_batch_handler=row_batch_handler,
                 row_batch_size=row_batch_size,
@@ -19735,6 +20034,9 @@ async def _fetch_resource_rows(
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
     bulk_export: bool = False,
+    bulk_export_max_pending_seconds: int = (
+        DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+    ),
     deadline_seconds: int = 0,
     pagination_checkpoint: PaginationCheckpointContext | None = None,
 ) -> ResourceFetchResult | None:
@@ -19833,10 +20135,15 @@ async def _fetch_resource_rows(
         per_resource_limit=per_resource_limit,
         checkpoint_context=bulk_checkpoint_context,
     ):
-        bulk_source_lookup = source
+        bulk_source_lookup = {
+            **source,
+            "_bulk_export_max_pending_seconds": (
+                bulk_export_max_pending_seconds
+            ),
+        }
         if bulk_checkpoint_context is not None:
             bulk_source_lookup = {
-                **source,
+                **bulk_source_lookup,
                 "_pagination_checkpoint_context": bulk_checkpoint_context,
             }
         result = await _fetch_bulk_export_resource_rows(
@@ -25314,6 +25621,9 @@ async def _import_resources(
     stream_batch_size: int = 0,
     source_concurrency: int = 1,
     bulk_export: bool = False,
+    bulk_export_max_pending_seconds: int = (
+        DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
+    ),
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
     progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
@@ -25612,6 +25922,9 @@ async def _import_resources(
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
                 bulk_export=bulk_export,
+                bulk_export_max_pending_seconds=(
+                    bulk_export_max_pending_seconds
+                ),
                 deadline_seconds=resource_deadline_seconds,
                 pagination_checkpoint=source.get("_pagination_checkpoint_context"),
             )
@@ -26125,6 +26438,16 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         0 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_STREAM_BATCH_SIZE", DEFAULT_STREAM_BATCH_SIZE),
     )
     bulk_export = _bulk_export_enabled(task.get("bulk_export"))
+    bulk_export_max_pending_seconds = max(
+        1,
+        _int_or_default(
+            task.get("bulk_export_max_pending_seconds"),
+            _env_int(
+                "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_PENDING_SECONDS",
+                DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS,
+            ),
+        ),
+    )
     source_concurrency = _int_or_default(
         task.get("source_concurrency"),
         1 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_CONCURRENCY", 1),
@@ -26288,6 +26611,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "page_count": page_count,
             "stream_batch_size": stream_batch_size,
             "bulk_export": bulk_export,
+            "bulk_export_max_pending_seconds": (
+                bulk_export_max_pending_seconds
+            ),
             "bulk_export_mode": _bulk_export_mode_metrics(bulk_export, {}),
             "source_concurrency": source_concurrency,
             "stale_cleanup": stale_cleanup,
@@ -26433,6 +26759,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     stream_batch_size=stream_batch_size,
                     source_concurrency=source_concurrency,
                     bulk_export=bulk_export,
+                    bulk_export_max_pending_seconds=(
+                        bulk_export_max_pending_seconds
+                    ),
                     cancel_ctx=ctx,
                     cancel_task={**task, "run_id": run_id},
                     progress_callback=resource_progress,
@@ -26624,6 +26953,7 @@ async def main(
     page_count: int | None = None,
     stream_batch_size: int | None = None,
     bulk_export: bool | None = None,
+    bulk_export_max_pending_seconds: int | None = None,
     source_concurrency: int | None = None,
     concurrency: int | None = None,
     timeout: int | None = None,
@@ -26671,6 +27001,7 @@ async def main(
         "page_count": page_count,
         "stream_batch_size": stream_batch_size,
         "bulk_export": bulk_export,
+        "bulk_export_max_pending_seconds": bulk_export_max_pending_seconds,
         "source_concurrency": source_concurrency,
         "concurrency": concurrency,
         "timeout": timeout,
