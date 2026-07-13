@@ -22,13 +22,21 @@ if str(ROOT) not in sys.path:
 
 from scripts.research.provider_directory_api_evidence_support import (
     ApiConfig,
+    MappedEvidenceWitness,
     OverlaySample,
     ProviderDirectoryApiClient,
     SourceSelection,
     evaluate_source,
     redact_sensitive,
 )
-from scripts.research.provider_directory_api_evidence_db import fetch_overlay_samples
+from scripts.research.provider_directory_api_evidence_db import (
+    fetch_mapped_evidence_witnesses,
+    fetch_overlay_samples,
+)
+from scripts.research.provider_directory_api_evidence_report import (
+    database_failure_result,
+    mapped_completion_summary,
+)
 from scripts.research.provider_directory_endpoint_acquisition_harness import (
     DEFAULT_MANIFEST,
     load_manifest,
@@ -54,6 +62,7 @@ class HarnessConfig:
     samples_per_source: int
     candidate_limit: int
     api_latency_slo_ms: float
+    require_mapped_evidence: bool = False
 
 
 def _utc_now() -> str:
@@ -123,6 +132,11 @@ def _manifest_selections(
             continue
         entry_id = str(entry.get("entry_id") or "")
         classification = str(entry.get("classification") or "")
+        resources = tuple(
+            str(resource_type)
+            for resource_type in entry.get("resources") or []
+            if resource_type
+        )
         for source_id_value in entry.get("source_ids") or []:
             source_id = str(source_id_value)
             if requested_entries or requested_sources:
@@ -137,6 +151,7 @@ def _manifest_selections(
                     source_id,
                     classification,
                     classification in REQUIRED_CLASSIFICATIONS,
+                    resources,
                 )
             )
     return selections
@@ -153,7 +168,12 @@ async def _current_samples(
     config: HarnessConfig,
     conn: Any,
     selections: list[SourceSelection],
-) -> tuple[dict[str, list[OverlaySample]], str | None]:
+) -> tuple[
+    dict[str, list[OverlaySample]],
+    dict[str, list[MappedEvidenceWitness]],
+    str | None,
+    str | None,
+]:
     try:
         samples_by_source = await fetch_overlay_samples(
             conn,
@@ -161,10 +181,30 @@ async def _current_samples(
             selections=selections,
             samples_per_source=config.samples_per_source,
         )
-        return samples_by_source, None
     except Exception as exc:
         empty_samples_by_source = {selection.source_id: [] for selection in selections}
-        return empty_samples_by_source, type(exc).__name__
+        empty_witnesses_by_source = {
+            selection.source_id: [] for selection in selections
+        }
+        return (
+            empty_samples_by_source,
+            empty_witnesses_by_source,
+            type(exc).__name__,
+            None,
+        )
+    try:
+        witnesses_by_source = await fetch_mapped_evidence_witnesses(
+            conn,
+            schema=config.schema,
+            selections=selections,
+            witnesses_per_resource=config.samples_per_source,
+        )
+        return samples_by_source, witnesses_by_source, None, None
+    except Exception as exc:
+        empty_witnesses_by_source = {
+            selection.source_id: [] for selection in selections
+        }
+        return samples_by_source, empty_witnesses_by_source, None, type(exc).__name__
 
 
 def _active_api_client(
@@ -184,28 +224,18 @@ def _active_api_client(
     return None, skip_reason
 
 
-def _database_failure_result(selection: SourceSelection) -> dict[str, Any]:
-    return {
-        "entry_id": selection.entry_id,
-        "source_id": selection.source_id,
-        "classification": selection.classification,
-        "required": selection.required,
-        "status": "fail" if selection.required else "skip",
-        "reason": "database_probe_failed",
-        "samples": [],
-    }
-
-
 def _source_results(
     config: HarnessConfig,
     selections: list[SourceSelection],
     samples_by_source: Mapping[str, list[OverlaySample]],
+    witnesses_by_source: Mapping[str, list[MappedEvidenceWitness]],
     api_client: ProviderDirectoryApiClient | None,
     api_skip_reason: str | None,
     database_error: str | None,
+    witness_probe_error: str | None,
 ) -> list[dict[str, Any]]:
     if database_error:
-        return [_database_failure_result(selection) for selection in selections]
+        return [database_failure_result(selection) for selection in selections]
     return [
         evaluate_source(
             selection,
@@ -214,6 +244,8 @@ def _source_results(
             candidate_limit=config.candidate_limit,
             api_latency_slo_ms=config.api_latency_slo_ms,
             api_skip_reason=api_skip_reason,
+            witnesses=witnesses_by_source.get(selection.source_id, []),
+            witness_probe_error=witness_probe_error,
         )
         for selection in selections
     ]
@@ -223,12 +255,20 @@ def _report_payload(
     config: HarnessConfig,
     selections: list[SourceSelection],
     source_results: list[dict[str, Any]],
+    witnesses_by_source: Mapping[str, list[MappedEvidenceWitness]],
     api_client: ProviderDirectoryApiClient | None,
     database_error: str | None,
+    witness_probe_error: str | None,
 ) -> dict[str, Any]:
     required_failures = sum(
         source_result["status"] == "fail" and source_result["required"]
         for source_result in source_results
+    )
+    mapped_summary = mapped_completion_summary(
+        require_mapped_evidence=config.require_mapped_evidence,
+        source_result_list=source_results,
+        witness_list_by_source=witnesses_by_source,
+        witness_probe_error=witness_probe_error,
     )
     return {
         "schema_version": 1,
@@ -242,6 +282,7 @@ def _report_payload(
             "samples_per_source": config.samples_per_source,
             "phone_candidate_limit": config.candidate_limit,
             "api_latency_slo_ms": config.api_latency_slo_ms,
+            "require_mapped_evidence": config.require_mapped_evidence,
         },
         "summary": {
             "pass": sum(
@@ -254,6 +295,7 @@ def _report_payload(
                 source_result["status"] == "skip" for source_result in source_results
             ),
             "required_sources_failed": required_failures,
+            **mapped_summary,
         },
         "sources": source_results,
     }
@@ -276,7 +318,12 @@ async def build_report(
     )
     if not selections:
         raise ValueError("no maintained sources selected")
-    samples_by_source, database_error = await _current_samples(config, conn, selections)
+    (
+        samples_by_source,
+        witnesses_by_source,
+        database_error,
+        witness_probe_error,
+    ) = await _current_samples(config, conn, selections)
     active_client, api_skip_reason = _active_api_client(
         api_config, api_client, database_error
     )
@@ -284,13 +331,21 @@ async def build_report(
         config,
         selections,
         samples_by_source,
+        witnesses_by_source,
         active_client,
         api_skip_reason,
         database_error,
+        witness_probe_error,
     )
     return redact_sensitive(
         _report_payload(
-            config, selections, source_results, active_client, database_error
+            config,
+            selections,
+            source_results,
+            witnesses_by_source,
+            active_client,
+            database_error,
+            witness_probe_error,
         )
     )
 
@@ -347,6 +402,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-timeout-seconds", type=float, default=15.0)
     parser.add_argument("--api-latency-slo-ms", type=float, default=40.0)
     parser.add_argument("--data-only", action="store_true")
+    parser.add_argument(
+        "--require-mapped-evidence",
+        action="store_true",
+        help=(
+            "Return inconclusive when selected sources have no mapped "
+            "role, plan, or network witness."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -360,6 +423,7 @@ def _harness_config(args: argparse.Namespace) -> HarnessConfig:
         samples_per_source=args.samples_per_source,
         candidate_limit=args.phone_candidate_limit,
         api_latency_slo_ms=args.api_latency_slo_ms,
+        require_mapped_evidence=args.require_mapped_evidence,
     )
 
 
@@ -387,7 +451,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = asyncio.run(run(parse_args(argv)))
         print(json.dumps(redact_sensitive(report), indent=2, sort_keys=True))
-        return 1 if report["summary"]["required_sources_failed"] else 0
+        return (
+            1
+            if report["summary"]["required_sources_failed"]
+            or report["summary"].get("completion_inconclusive")
+            else 0
+        )
     except Exception as exc:  # Never serialize command arguments or exception text.
         print(
             json.dumps({"status": "error", "error": type(exc).__name__}, sort_keys=True)

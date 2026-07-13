@@ -11,6 +11,29 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
+from scripts.research.provider_directory_api_evidence_typed import (
+    MappedEvidenceWitness,
+    NetworkWitness,
+    has_all_witness,
+    has_detail_witness,
+    matching_source_summary_maps,
+)
+
+
+__all__ = (
+    "ApiConfig",
+    "HttpResult",
+    "MappedEvidenceWitness",
+    "NetworkWitness",
+    "OverlaySample",
+    "ProviderDirectoryApiClient",
+    "SourceSelection",
+    "evaluate_source",
+    "has_row_source_provenance",
+    "is_within_latency_slo",
+    "redact_sensitive",
+)
+
 
 SENSITIVE_FIELD_PARTS = (
     "authorization",
@@ -31,6 +54,7 @@ class SourceSelection:
     source_id: str
     classification: str
     required: bool
+    resources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,31 +185,7 @@ def _envelope_rows(payload: Mapping[str, Any] | None, field: str) -> list[Any]:
 
 def has_row_source_provenance(row: Any, source_id: str) -> bool:
     """Return whether one api-layer row exposes the requested FHIR source."""
-    if not isinstance(row, Mapping):
-        return False
-    summaries = row.get("provider_directory_sources")
-    if not isinstance(summaries, list):
-        return False
-    for summary in summaries:
-        if not isinstance(summary, Mapping):
-            continue
-        if summary.get("source") != "provider_directory_fhir":
-            continue
-        if summary.get("catalog_aliases_verified") is not False:
-            continue
-        source_ids = summary.get("source_ids")
-        if isinstance(source_ids, list) and source_id in {
-            str(source_value) for source_value in source_ids
-        }:
-            return True
-        aliases = summary.get("catalog_aliases")
-        if isinstance(aliases, list) and any(
-            isinstance(alias, Mapping)
-            and str(alias.get("source_id") or "") == source_id
-            for alias in aliases
-        ):
-            return True
-    return False
+    return bool(matching_source_summary_maps(row, source_id))
 
 
 def _has_detail_source(payload: Mapping[str, Any] | None, source_id: str) -> bool:
@@ -253,7 +253,6 @@ def _evaluate_sample(
             "phone": sample.phone,
             "limit": str(candidate_limit),
             "include_sources": "true",
-            "include_evidence": "true",
         },
     )
     source_check_map.update(
@@ -269,6 +268,107 @@ def _evaluate_sample(
         }
     )
     return source_check_map
+
+
+def _safe_witness_summary(witness: MappedEvidenceWitness) -> dict[str, Any]:
+    return {
+        "npi": witness.npi,
+        "resource_type": witness.resource_type,
+        "resource_id": witness.resource_id,
+        "insurance_plan_ids": list(witness.insurance_plan_ids),
+        "network_ids": [network.resource_id for network in witness.networks],
+    }
+
+
+def _evaluate_witness(
+    witness: MappedEvidenceWitness,
+    api_client: ProviderDirectoryApiClient,
+    api_latency_slo_ms: float,
+) -> dict[str, Any]:
+    detail_result = api_client.get_json(
+        f"providers/{witness.npi}",
+        {"include_sources": "true", "include_evidence": "true"},
+    )
+    all_result = api_client.get_json(
+        "providers/all",
+        {
+            "npi": str(witness.npi),
+            "include_sources": "true",
+            "include_evidence": "true",
+        },
+    )
+    return {
+        "witness": _safe_witness_summary(witness),
+        "detail": _http_summary(detail_result),
+        "detail_evidence_present": detail_result.status_code == 200
+        and has_detail_witness(detail_result.payload, witness),
+        "detail_within_latency_slo": is_within_latency_slo(
+            detail_result, api_latency_slo_ms
+        ),
+        "all": _http_summary(all_result),
+        "all_evidence_present": all_result.status_code == 200
+        and has_all_witness(all_result.payload, witness),
+        "all_within_latency_slo": is_within_latency_slo(all_result, api_latency_slo_ms),
+    }
+
+
+def _is_witness_check_passing(witness_check: Mapping[str, Any]) -> bool:
+    return bool(
+        witness_check["detail_evidence_present"]
+        and witness_check["detail_within_latency_slo"]
+        and witness_check["all_evidence_present"]
+        and witness_check["all_within_latency_slo"]
+    )
+
+
+def _mapped_evidence_capabilities(
+    selection: SourceSelection,
+    witnesses: list[MappedEvidenceWitness],
+    witness_checks: list[Mapping[str, Any]],
+    *,
+    api_enabled: bool,
+    api_skip_reason: str | None,
+    witness_probe_error: str | None,
+) -> dict[str, dict[str, Any]]:
+    capability_by_name: dict[str, dict[str, Any]] = {}
+    checks_by_resource = {
+        str(check["witness"]["resource_type"]): [] for check in witness_checks
+    }
+    for check in witness_checks:
+        checks_by_resource[str(check["witness"]["resource_type"])].append(check)
+    for resource_type, capability_name in (
+        ("PractitionerRole", "practitioner_role"),
+        ("OrganizationAffiliation", "organization_affiliation"),
+    ):
+        resource_witnesses = [
+            witness for witness in witnesses if witness.resource_type == resource_type
+        ]
+        capability_map: dict[str, Any] = {
+            "declared": resource_type in selection.resources,
+            "witness_count": len(resource_witnesses),
+            "completion_witness_count": sum(
+                witness.supports_completion for witness in resource_witnesses
+            ),
+        }
+        if resource_type not in selection.resources:
+            capability_map["state"] = "not_applicable"
+        elif not resource_witnesses:
+            capability_map["state"] = "not_observed"
+            if witness_probe_error:
+                capability_map["reason"] = "mapped_evidence_probe_failed"
+        elif not api_enabled:
+            capability_map["state"] = "fail"
+            capability_map["reason"] = api_skip_reason or "api_credentials_unavailable"
+        else:
+            capability_checks = checks_by_resource.get(resource_type, [])
+            capability_map["state"] = (
+                "pass"
+                if capability_checks
+                and all(map(_is_witness_check_passing, capability_checks))
+                else "fail"
+            )
+        capability_by_name[capability_name] = capability_map
+    return capability_by_name
 
 
 def _is_source_check_passing(source_check: Mapping[str, Any]) -> bool:
@@ -288,6 +388,7 @@ def _base_source_result(
         "source_id": selection.source_id,
         "classification": selection.classification,
         "required": selection.required,
+        "resources": list(selection.resources),
         "samples": [
             {"npi": sample.npi, "phone": _masked_phone(sample.phone)}
             for sample in samples
@@ -303,9 +404,28 @@ def evaluate_source(
     candidate_limit: int,
     api_latency_slo_ms: float,
     api_skip_reason: str | None,
+    witnesses: list[MappedEvidenceWitness] | None = None,
+    witness_probe_error: str | None = None,
 ) -> dict[str, Any]:
     """Verify bounded api-layer detail and phone evidence for one manifest source."""
+    witnesses = witnesses or []
     source_result = _base_source_result(selection, samples)
+    witness_checks: list[dict[str, Any]] = []
+    if api_client is not None:
+        witness_checks = [
+            _evaluate_witness(witness, api_client, api_latency_slo_ms)
+            for witness in witnesses
+        ]
+    source_result["mapped_evidence_capabilities"] = _mapped_evidence_capabilities(
+        selection,
+        witnesses,
+        witness_checks,
+        api_enabled=api_client is not None,
+        api_skip_reason=api_skip_reason,
+        witness_probe_error=witness_probe_error,
+    )
+    if witness_checks:
+        source_result["mapped_evidence_checks"] = witness_checks
     if not samples:
         source_result["status"] = "fail" if selection.required else "skip"
         source_result["reason"] = (

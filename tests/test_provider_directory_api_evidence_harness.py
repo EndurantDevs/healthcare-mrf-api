@@ -23,16 +23,24 @@ def _manifest():
                 "entry_id": "acquired",
                 "classification": "acquisition",
                 "source_ids": [SOURCE_A],
+                "resources": [
+                    "InsurancePlan",
+                    "PractitionerRole",
+                    "Organization",
+                    "OrganizationAffiliation",
+                ],
             },
             {
                 "entry_id": "probe",
                 "classification": "probe_only",
                 "source_ids": [SOURCE_B],
+                "resources": [],
             },
             {
                 "entry_id": "external",
                 "classification": "external",
                 "source_ids": [SOURCE_C],
+                "resources": ["Organization", "OrganizationAffiliation"],
             },
         ]
     }
@@ -43,9 +51,24 @@ def _source_summary_map(source_id, *, source_ids=False):
         "source": "provider_directory_fhir",
         "catalog_aliases_verified": False,
         "catalog_aliases": [{"source_id": source_id, "org_name": "Example"}],
-        "practitioner_roles": [{"resource_id": "role-1"}],
+        "practitioner_role_ids": ["role-1"],
+        "practitioner_roles": [
+            {
+                "resource_type": "PractitionerRole",
+                "source_id": source_id,
+                "resource_id": "role-1",
+            }
+        ],
+        "organization_affiliation_ids": ["affiliation-1"],
         "insurance_plans": [{"resource_id": "plan-1"}],
-        "networks": [{"resource_id": "network-1"}],
+        "networks": [
+            {
+                "resource_type": "Organization",
+                "resource_id": "network-1",
+                "name": "Example Network",
+                "reference": "Organization/network-1",
+            }
+        ],
         "evidence_metadata": {"returned": 1},
     }
     if source_ids:
@@ -76,6 +99,21 @@ def _candidate_payload(source_id):
                 {
                     "npi": 1234567890,
                     "provider_directory_sources": [_source_summary_map(source_id)],
+                }
+            ]
+        }
+    }
+
+
+def _all_payload(source_id, summary_map=None):
+    return {
+        "data": {
+            "rows": [
+                {
+                    "npi": 1234567890,
+                    "provider_directory_sources": [
+                        summary_map or _source_summary_map(source_id, source_ids=True)
+                    ],
                 }
             ]
         }
@@ -121,7 +159,13 @@ def _api_config(base_url="https://api.example.test/api/v1", **overrides):
     )
 
 
-def _harness_config(tmp_path, entry_ids=("acquired",), max_sources=100):
+def _harness_config(
+    tmp_path,
+    entry_ids=("acquired",),
+    max_sources=100,
+    *,
+    require_mapped_evidence=False,
+):
     return harness.HarnessConfig(
         manifest_path=tmp_path / "manifest.json",
         schema="mrf",
@@ -131,6 +175,7 @@ def _harness_config(tmp_path, entry_ids=("acquired",), max_sources=100):
         samples_per_source=1,
         candidate_limit=5,
         api_latency_slo_ms=0.0,
+        require_mapped_evidence=require_mapped_evidence,
     )
 
 
@@ -142,6 +187,13 @@ def test_selection_carries_required_state_and_rejects_truncation():
         ("probe_only", False),
         ("external", True),
     ]
+    assert selections[0].resources == (
+        "InsurancePlan",
+        "PractitionerRole",
+        "Organization",
+        "OrganizationAffiliation",
+    )
+    assert selections[1].resources == ()
     with pytest.raises(ValueError, match="exceed max_sources"):
         harness.resolve_source_selection(_manifest(), max_sources=2)
 
@@ -242,10 +294,13 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
         "https://api.example.test/api/v1/providers/1234567890",
         "https://api.example.test/api/v1/providers/match-candidates",
     ]
-    assert all(
-        "include_sources=true" in url and "include_evidence=true" in url
-        for url, _, _ in observed_requests
-    )
+    request_url_list = [url for url, _, _ in observed_requests]
+    detail_url = request_url_list[0]
+    match_url = request_url_list[1]
+    assert "include_sources=true" in detail_url
+    assert "include_evidence=true" in detail_url
+    assert "include_sources=true" in match_url
+    assert "include_evidence" not in match_url
     assert any(
         dict(headers).get("Authorization") == "Bearer very-secret-token"
         for _, headers, _ in observed_requests
