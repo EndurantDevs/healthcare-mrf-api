@@ -1310,6 +1310,37 @@ async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_import_runs_page_filters_retry_parent(monkeypatch):
+    statements = []
+
+    class FakeScalars:
+        def all(self):
+            return []
+
+    class FakeResult:
+        def scalars(self):
+            return FakeScalars()
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(statement)
+            return FakeResult()
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+
+    page = await control_imports.list_import_runs_page(
+        importer="provider-directory-fhir",
+        retry_of_run_id="run_parent",
+        limit=2,
+    )
+
+    assert page == {"items": [], "next_cursor": None}
+    compiled_params = statements[0].compile().params
+    assert compiled_params["importer_1"] == "provider-directory-fhir"
+    assert compiled_params["retry_of_run_id_1"] == "run_parent"
+
+
+@pytest.mark.asyncio
 async def test_create_import_run_persists_enqueued_state(monkeypatch):
     statements = []
 
@@ -2666,14 +2697,28 @@ async def test_control_list_imports_uses_cursor_list_envelope(monkeypatch):
         return {"items": [{"run_id": "run_1", "status": "queued"}], "next_cursor": "cursor_2"}
 
     monkeypatch.setattr(control, "list_import_runs_page", fake_list_import_runs_page)
-    request = authed_request(args={"limit": "1", "cursor": "cursor_1"})
+    request = authed_request(
+        args={
+            "limit": "1",
+            "cursor": "cursor_1",
+            "retry_of_run_id": "run_parent",
+        }
+    )
 
     response = await control.control_list_imports(request)
     payload = json.loads(response.body)
 
     assert response.status == 200
     assert payload == {"items": [{"run_id": "run_1", "status": "queued"}], "next_cursor": "cursor_2"}
-    assert calls == [{"status": None, "importer": None, "limit": 1, "cursor": "cursor_1"}]
+    assert calls == [
+        {
+            "status": None,
+            "importer": None,
+            "retry_of_run_id": "run_parent",
+            "limit": 1,
+            "cursor": "cursor_1",
+        }
+    ]
 
 
 @pytest.mark.asyncio

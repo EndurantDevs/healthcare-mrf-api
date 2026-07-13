@@ -233,6 +233,7 @@ async def control_list_imports(request):
         page = await list_import_runs_page(
             status=args.get("status"),
             importer=args.get("importer"),
+            retry_of_run_id=args.get("retry_of_run_id"),
             limit=int(args.get("limit") or 50),
             cursor=args.get("cursor"),
         )

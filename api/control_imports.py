@@ -633,16 +633,32 @@ def _finish_function(importer: str):
 
 
 async def list_import_runs(
-    *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
+    *,
+    status: str | None = None,
+    importer: str | None = None,
+    retry_of_run_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return the items from one filtered import-run page."""
 
-    page = await list_import_runs_page(status=status, importer=importer, limit=limit, cursor=cursor)
+    page = await list_import_runs_page(
+        status=status,
+        importer=importer,
+        retry_of_run_id=retry_of_run_id,
+        limit=limit,
+        cursor=cursor,
+    )
     return page["items"]
 
 
 async def list_import_runs_page(
-    *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
+    *,
+    status: str | None = None,
+    importer: str | None = None,
+    retry_of_run_id: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     """Return a stable cursor page of filtered import runs."""
 
@@ -652,6 +668,8 @@ async def list_import_runs_page(
         stmt = stmt.where(ImportRun.status == status)
     if importer:
         stmt = stmt.where(ImportRun.importer == importer)
+    if retry_of_run_id:
+        stmt = stmt.where(ImportRun.retry_of_run_id == retry_of_run_id)
     if cursor:
         created_at, run_id = _decode_import_run_cursor(cursor)
         stmt = stmt.where(
