@@ -73,6 +73,26 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "OFFSET 0" in sql
     assert "(true)::boolean AS phone_matched" in sql
     assert "phone_provider_directory_matched DESC" in sql
+    final_order = sql.rsplit("ORDER BY f.address_site_key_matched DESC", 1)[1]
+    assert (
+        "f.phone_matched DESC,\n"
+        "               f.phone_provider_directory_matched DESC,\n"
+        "               f.geo_distance_miles ASC NULLS LAST"
+    ) in final_order
+
+
+def test_match_candidate_sort_keeps_provider_directory_phone_match_first():
+    provider_directory_match_dict = {"npi": 1730166224, "match_score": 0.25}
+    corroborated_direct_match_dict = {
+        "npi": 1306486022,
+        "match_score": 0.30,
+        "sources": {"fhir": {"source_count": 3}},
+    }
+
+    assert npi_module._match_candidate_sort_key(
+        provider_directory_match_dict,
+        phone_provider_directory_matched=True,
+    ) < npi_module._match_candidate_sort_key(corroborated_direct_match_dict)
 
 
 @pytest.mark.asyncio

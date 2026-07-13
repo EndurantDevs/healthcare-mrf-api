@@ -654,6 +654,9 @@ PROVIDER_DIRECTORY_VISIBILITY_TABLES = (
 PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = (
     "provider_directory_dataset_network_plan"
 )
+PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = (
+    "provider_directory_dataset_insurance_plan"
+)
 PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = (
     "provider_directory_dataset_affiliation_organization"
 )
@@ -1066,7 +1069,42 @@ def _dataset_relation_ready_sql(metadata_key: str) -> str:
     """
 
 
-def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
+def _provider_directory_current_plan_resources_sql(
+    schema: str,
+    has_dataset_insurance_plan: bool,
+) -> str:
+    """Read immutable plan payloads from the compact projection when available."""
+    if not has_dataset_insurance_plan:
+        return """
+    current_plan_resources AS NOT MATERIALIZED (
+        SELECT resource.*
+          FROM current_resources AS resource
+         WHERE resource.resource_type = 'InsurancePlan'
+    )
+        """
+    return f"""
+    current_plan_resources AS NOT MATERIALIZED (
+        SELECT source.source_id, source.canonical_api_base,
+               dataset.dataset_id, dataset.run_id,
+               dataset.published_at AS dataset_published_at,
+               dataset.dataset_network_plan_complete,
+               dataset.dataset_affiliation_organization_complete,
+               'InsurancePlan'::varchar AS resource_type,
+               resource.resource_id,
+               resource.payload_json::jsonb AS payload_json
+          FROM {schema}.provider_directory_source AS source
+          JOIN current_datasets AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+          JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE} AS resource
+            ON resource.dataset_id = dataset.dataset_id
+    )
+    """
+
+
+def _provider_directory_current_resource_ctes_sql(
+    schema: str,
+    has_dataset_insurance_plan: bool = False,
+) -> str:
     """Resolve resources through the one current, fully published endpoint dataset."""
     network_plan_ready_sql = _dataset_relation_ready_sql("dataset_network_plan")
     affiliation_ready_sql = _dataset_relation_ready_sql(
@@ -1107,7 +1145,7 @@ def _provider_directory_current_resource_ctes_sql(schema: str) -> str:
             ON dataset.endpoint_id = source.endpoint_id
           JOIN {schema}.provider_directory_dataset_resource AS resource
             ON resource.dataset_id = dataset.dataset_id
-    )
+    ), {_provider_directory_current_plan_resources_sql(schema, has_dataset_insurance_plan)}
     """
 
 
@@ -1179,7 +1217,7 @@ def _current_typed_resource_ctes_sql() -> str:
             f"""
     {cte_name} AS NOT MATERIALIZED (
         SELECT {selected_columns}
-          FROM current_resources AS resource
+          FROM {"current_plan_resources" if resource_type == "InsurancePlan" else "current_resources"} AS resource
          WHERE resource.resource_type = '{resource_type}'
     )
             """.strip()
@@ -1528,8 +1566,17 @@ def _dataset_role_plan_resources_sql(
     schema: str,
     insurance_plan_identifier: str,
     insurance_plan_active: str,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Load only active immutable plan payloads referenced by candidates."""
+    resource_table = (
+        PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE
+        if has_dataset_insurance_plan
+        else "provider_directory_dataset_resource"
+    )
+    resource_type_filter = (
+        "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
+    )
     return f"""
     dataset_network_plan_resource_keys AS MATERIALIZED (
         SELECT DISTINCT candidate.dataset_id, candidate.resource_id
@@ -1538,10 +1585,10 @@ def _dataset_role_plan_resources_sql(
         SELECT candidate.dataset_id, insurance_plan.resource_id,
                NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
           FROM dataset_network_plan_resource_keys AS candidate
-          JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
+          JOIN {schema}.{resource_table} AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
-           AND insurance_plan.resource_type = 'InsurancePlan'
            AND insurance_plan.resource_id = candidate.resource_id
+           {resource_type_filter}
            AND {insurance_plan_active}
     ), dataset_network_derived_plans AS MATERIALIZED (
         SELECT candidate.source_id, candidate.role_id,
@@ -1555,7 +1602,10 @@ def _dataset_role_plan_resources_sql(
     """
 
 
-def _dataset_role_plan_sql(schema: str) -> str:
+def _dataset_role_plan_sql(
+    schema: str,
+    has_dataset_insurance_plan: bool,
+) -> str:
     """Build indexed immutable role-to-plan resolution CTEs."""
     insurance_plan_status = (
         "insurance_plan.payload_json::jsonb ->> 'status'"
@@ -1572,6 +1622,7 @@ def _dataset_role_plan_sql(schema: str) -> str:
         schema,
         insurance_plan_identifier,
         insurance_plan_active,
+        has_dataset_insurance_plan,
     )
     return f"""
     {candidate_sql}, {resource_sql}
@@ -1635,6 +1686,7 @@ def _legacy_role_plan_sql(has_dataset_network_plan: bool) -> str:
 def _network_derived_role_plans_cte_sql(
     schema: str,
     has_dataset_network_plan: bool,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Derive role plans from dataset edges with a legacy JSON fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
@@ -1647,7 +1699,7 @@ def _network_derived_role_plans_cte_sql(
         ),
     )
     dataset_plan_cte_sql = (
-        _dataset_role_plan_sql(schema)
+        _dataset_role_plan_sql(schema, has_dataset_insurance_plan)
         if has_dataset_network_plan
         else """
     dataset_network_derived_plans AS MATERIALIZED (
@@ -1676,13 +1728,18 @@ def _provider_directory_catalog_plan_ctes_sql(
     schema: str,
     has_catalog: bool,
     has_dataset_network_plan: bool,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Build catalog-gated role plan CTEs without expanding catalog payloads."""
     if not has_catalog:
         return _missing_catalog_plan_ctes_sql()
     return f"""
     {_role_catalog_status_cte_sql(schema)},
-    {_network_derived_role_plans_cte_sql(schema, has_dataset_network_plan)}
+    {_network_derived_role_plans_cte_sql(
+        schema,
+        has_dataset_network_plan,
+        has_dataset_insurance_plan,
+    )}
     """
 
 
@@ -1692,6 +1749,7 @@ def _provider_directory_network_plan_ctes_sql(
     has_catalog: bool,
     has_dataset_network_plan: bool,
     has_dataset_affiliation_organization: bool,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Build same-source network intersection CTEs for role plan evidence."""
     role_network_id = _provider_directory_reference_resource_id_sql(
@@ -1707,6 +1765,7 @@ def _provider_directory_network_plan_ctes_sql(
         schema,
         has_catalog,
         has_dataset_network_plan,
+        has_dataset_insurance_plan,
     )
     return f"""
     direct_role_networks AS MATERIALIZED (
@@ -1895,6 +1954,7 @@ def _provider_directory_role_ctes_sql(
     has_catalog: bool,
     has_dataset_network_plan: bool,
     has_dataset_affiliation_organization: bool,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Compose keyed role, network, capped-plan, and network-evidence CTEs."""
     requested_role_ctes_sql = _provider_directory_requested_role_ctes_sql(schema)
@@ -1904,6 +1964,7 @@ def _provider_directory_role_ctes_sql(
         has_catalog,
         has_dataset_network_plan,
         has_dataset_affiliation_organization,
+        has_dataset_insurance_plan,
     )
     plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
     evidence_network_id = _provider_directory_reference_resource_id_sql(
@@ -2010,7 +2071,7 @@ _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
         ON evidence.evidence_type = 'role'
        AND role.source_id = evidence.source_id
        AND role.role_id = evidence.role_id
- LEFT JOIN current_resources AS plan
+ LEFT JOIN current_plan_resources AS plan
         ON evidence.evidence_type = 'insurance_plan'
        AND plan.source_id = evidence.source_id
        AND plan.resource_type = 'InsurancePlan'
@@ -2027,11 +2088,13 @@ def _provider_directory_role_evidence_sql(
     has_affiliations: bool = True,
     has_dataset_network_plan: bool = False,
     has_dataset_affiliation_organization: bool = False,
+    has_dataset_insurance_plan: bool = False,
 ) -> str:
     """Build exact-key role evidence SQL with dataset-gated relation fallbacks."""
     return _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE.format(
         current_resource_ctes_sql=_provider_directory_current_resource_ctes_sql(
-            schema
+            schema,
+            has_dataset_insurance_plan,
         ),
         current_typed_resource_ctes_sql=_current_typed_resource_ctes_sql(),
         role_ctes_sql=_provider_directory_role_ctes_sql(
@@ -2040,6 +2103,7 @@ def _provider_directory_role_evidence_sql(
             has_catalog,
             has_dataset_network_plan,
             has_dataset_affiliation_organization,
+            has_dataset_insurance_plan,
         ),
         evidence_union_sql=_provider_directory_evidence_union_sql(
             schema,
@@ -2389,6 +2453,7 @@ async def _fetch_provider_directory_role_evidence_map(
     *,
     session: Any = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch bounded role evidence without scanning immutable resource payloads."""
     bounded_keys = list(dict.fromkeys(role_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
     if not bounded_keys:
         return {}
@@ -2398,42 +2463,35 @@ async def _fetch_provider_directory_role_evidence_map(
                 bounded_keys,
                 session=evidence_session,
             )
-    required_tables = [
-        await _table_exists(table_name, session=session)
-        for table_name in (
+    table_flags = await _provider_directory_evidence_tables(
+        session,
+        required_names=(
             *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
             "provider_directory_practitioner_role",
             "provider_directory_insurance_plan",
             "provider_directory_organization",
-        )
-    ]
-    if not all(required_tables):
+        ),
+        optional_names=(
+            "provider_directory_organization_affiliation",
+            "provider_directory_network_catalog",
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
+            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+        ),
+    )
+    if table_flags is None:
         return {}
-    has_affiliations = await _table_exists(
-        "provider_directory_organization_affiliation",
-        session=session,
-    )
-    has_catalog = await _table_exists("provider_directory_network_catalog", session=session)
-    has_dataset_network_plan = await _table_exists(
-        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
-        session=session,
-    )
-    has_dataset_affiliation_organization = await _table_exists(
-        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
-        session=session,
-    )
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    if not getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
-        await session.execute(text("SET LOCAL jit = off"))
-        setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
+    await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
         text(
             _provider_directory_role_evidence_sql(
                 schema,
-                has_catalog,
-                has_affiliations,
-                has_dataset_network_plan,
-                has_dataset_affiliation_organization,
+                table_flags["provider_directory_network_catalog"],
+                table_flags["provider_directory_organization_affiliation"],
+                table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
+                table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
+                table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
             )
         ),
         session=session,
@@ -2443,6 +2501,31 @@ async def _fetch_provider_directory_role_evidence_map(
         },
     )
     return _map_provider_directory_role_evidence(evidence_result.all())
+
+
+async def _provider_directory_evidence_tables(
+    session: Any,
+    *,
+    required_names: Sequence[str],
+    optional_names: Sequence[str],
+) -> dict[str, bool] | None:
+    required_flags = [
+        await _table_exists(table_name, session=session)
+        for table_name in required_names
+    ]
+    if not all(required_flags):
+        return None
+    return {
+        table_name: await _table_exists(table_name, session=session)
+        for table_name in optional_names
+    }
+
+
+async def _disable_provider_directory_evidence_jit(session: Any) -> None:
+    if getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
+        return
+    await session.execute(text("SET LOCAL jit = off"))
+    setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
 
 
 def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
@@ -2491,7 +2574,10 @@ def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
     """
 
 
-def _dataset_affiliation_plan_sql(schema: str) -> str:
+def _dataset_affiliation_plan_sql(
+    schema: str,
+    has_dataset_insurance_plan: bool,
+) -> str:
     insurance_plan_status = (
         "insurance_plan.payload_json::jsonb ->> 'status'"
     )
@@ -2501,6 +2587,14 @@ def _dataset_affiliation_plan_sql(schema: str) -> str:
     insurance_plan_active = (
         "COALESCE(NULLIF(LOWER(BTRIM("
         f"{insurance_plan_status})), ''), 'active') = 'active'"
+    )
+    resource_table = (
+        PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE
+        if has_dataset_insurance_plan
+        else "provider_directory_dataset_resource"
+    )
+    resource_type_filter = (
+        "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
     )
     return f"""
     dataset_affiliation_plan_candidates AS MATERIALIZED (
@@ -2520,10 +2614,10 @@ def _dataset_affiliation_plan_sql(schema: str) -> str:
         SELECT candidate.dataset_id, insurance_plan.resource_id,
                NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier
           FROM dataset_affiliation_plan_resource_keys AS candidate
-          JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
+          JOIN {schema}.{resource_table} AS insurance_plan
             ON insurance_plan.dataset_id = candidate.dataset_id
-           AND insurance_plan.resource_type = 'InsurancePlan'
            AND insurance_plan.resource_id = candidate.resource_id
+           {resource_type_filter}
            AND {insurance_plan_active}
     ), dataset_affiliation_plans AS MATERIALIZED (
         SELECT candidate.source_id, candidate.affiliation_id,
@@ -2577,6 +2671,7 @@ def _legacy_affiliation_plan_sql(has_dataset_network_plan: bool) -> str:
 def _affiliation_plan_resolution_cte_sql(
     schema: str,
     has_dataset_network_plan: bool,
+    has_dataset_insurance_plan: bool,
 ) -> str:
     """Resolve affiliation plans from dataset edges with a legacy fallback."""
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
@@ -2589,7 +2684,7 @@ def _affiliation_plan_resolution_cte_sql(
         ),
     )
     dataset_plan_cte_sql = (
-        _dataset_affiliation_plan_sql(schema)
+        _dataset_affiliation_plan_sql(schema, has_dataset_insurance_plan)
         if has_dataset_network_plan
         else """
     dataset_affiliation_plans AS MATERIALIZED (
@@ -2696,15 +2791,20 @@ def _provider_directory_affiliation_evidence_sql(
     schema: str,
     has_catalog: bool,
     has_dataset_network_plan: bool = False,
+    has_dataset_insurance_plan: bool = False,
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
-    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
+    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
+        schema,
+        has_dataset_insurance_plan,
+    )
     affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(
         schema
     )
     plan_resolution_cte_sql = _affiliation_plan_resolution_cte_sql(
         schema,
         has_dataset_network_plan,
+        has_dataset_insurance_plan,
     )
     plan_cap_ctes_sql = _affiliation_plan_cap_ctes_sql()
     evidence_union_sql = _provider_directory_affiliation_evidence_union_sql(
@@ -2731,7 +2831,7 @@ def _provider_directory_affiliation_evidence_sql(
            evidence_count.evidence_row_total
       FROM evidence
  CROSS JOIN evidence_count
- LEFT JOIN current_resources AS plan
+ LEFT JOIN current_plan_resources AS plan
         ON evidence.evidence_type = 'insurance_plan'
        AND plan.source_id = evidence.source_id
        AND plan.resource_type = 'InsurancePlan'
@@ -2798,6 +2898,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     *,
     session: Any = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    """Fetch bounded affiliation evidence through compact serving relations."""
     bounded_keys = list(dict.fromkeys(affiliation_key_list))[
         :MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS
     ]
@@ -2809,34 +2910,30 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 bounded_keys,
                 session=evidence_session,
             )
-    required_tables = [
-        await _table_exists(table_name, session=session)
-        for table_name in (
+    table_flags = await _provider_directory_evidence_tables(
+        session,
+        required_names=(
             *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
             "provider_directory_insurance_plan",
             "provider_directory_organization",
-        )
-    ]
-    if not all(required_tables):
+        ),
+        optional_names=(
+            "provider_directory_network_catalog",
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
+            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+        ),
+    )
+    if table_flags is None:
         return {}
-    has_catalog = await _table_exists(
-        "provider_directory_network_catalog",
-        session=session,
-    )
-    has_dataset_network_plan = await _table_exists(
-        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
-        session=session,
-    )
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    if not getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
-        await session.execute(text("SET LOCAL jit = off"))
-        setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
+    await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
         text(
             _provider_directory_affiliation_evidence_sql(
                 schema,
-                has_catalog,
-                has_dataset_network_plan,
+                table_flags["provider_directory_network_catalog"],
+                table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
+                table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
             )
         ),
         session=session,
@@ -5683,6 +5780,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
       ORDER BY f.address_site_key_matched DESC,
                f.address_key_matched DESC,
                f.phone_matched DESC,
+               f.phone_provider_directory_matched DESC,
                f.geo_distance_miles ASC NULLS LAST,
                f.source_count DESC NULLS LAST,
                f.npi
@@ -5945,15 +6043,52 @@ def _is_match_candidate_provider_type_matched(item: Mapping[str, Any]) -> bool:
     return bool(taxonomy_signal.get("provider_type_matched"))
 
 
-def _match_candidate_sort_key(item: Mapping[str, Any]) -> tuple[float, int, int, int]:
-    """Sort strongest, most corroborated candidates first."""
+def _match_candidate_sort_key(
+    item: Mapping[str, Any],
+    *,
+    phone_provider_directory_matched: bool = False,
+) -> tuple[int, float, int, int, int]:
+    """Keep exact directory phone witnesses ahead of score tie-breakers."""
 
     return (
+        -int(phone_provider_directory_matched),
         -float(item.get("match_score") or 0),
         -int(_is_match_candidate_provider_type_matched(item)),
         -_match_candidate_source_count(item),
         int(item.get("npi") or 0),
     )
+
+
+def _rank_match_candidate_outputs(
+    candidate_rows: Sequence[Mapping[str, Any]],
+    candidate_params: Mapping[str, Any],
+    enrichment_map: Mapping[int, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rank directory phone witnesses before applying the public result limit."""
+    ranked_candidates = [
+        (
+            _match_candidate_output(
+                candidate_row,
+                candidate_params,
+                enrichment_map.get(int(candidate_row["npi"])),
+            ),
+            bool(candidate_row.get("phone_provider_directory_matched")),
+        )
+        for candidate_row in candidate_rows
+        if candidate_row.get("npi") is not None
+    ]
+    ranked_candidates.sort(
+        key=lambda ranked: _match_candidate_sort_key(
+            ranked[0],
+            phone_provider_directory_matched=ranked[1],
+        )
+    )
+    return [
+        candidate
+        for candidate, _phone_provider_directory_matched in ranked_candidates[
+            : int(candidate_params["limit"])
+        ]
+    ]
 
 
 def _provider_type_filter_matched(row: Mapping[str, Any], params: Mapping[str, Any]) -> bool:
@@ -6140,13 +6275,7 @@ async def match_candidates(request):
         [row.get("npi") for row in rows],
         session=request_session,
     )
-    candidates = [
-        _match_candidate_output(row, params, enrichment_map.get(int(row["npi"])))
-        for row in rows
-        if row.get("npi") is not None
-    ]
-    candidates.sort(key=_match_candidate_sort_key)
-    candidates = candidates[: int(params["limit"])]
+    candidates = _rank_match_candidate_outputs(rows, params, enrichment_map)
     return response.json(
         {
             "candidates": candidates,

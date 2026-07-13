@@ -108,7 +108,7 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
         "plan.payload_json::jsonb - ARRAY[",
         "current_insurance_plans AS NOT MATERIALIZED",
         "WHERE resource.resource_type = 'InsurancePlan'",
-        "LEFT JOIN current_resources AS plan",
+        "LEFT JOIN current_plan_resources AS plan",
     ):
         assert column in sql
     assert "network_catalog.refs" not in sql

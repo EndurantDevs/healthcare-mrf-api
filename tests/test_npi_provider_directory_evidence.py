@@ -332,6 +332,7 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path(monkeypat
         "provider_directory_network_catalog",
         "provider_directory_dataset_network_plan",
         "provider_directory_dataset_affiliation_organization",
+        "provider_directory_dataset_insurance_plan",
     ]
 
 

@@ -306,7 +306,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-id", action="append", default=[])
     parser.add_argument("--max-sources", type=int, default=100)
     parser.add_argument("--samples-per-source", type=int, default=1)
-    parser.add_argument("--phone-candidate-limit", type=int, default=5)
+    parser.add_argument("--phone-candidate-limit", type=int, default=20)
     parser.add_argument(
         "--db-host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1"
     )

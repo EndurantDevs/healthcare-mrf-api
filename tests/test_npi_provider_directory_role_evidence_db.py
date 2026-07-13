@@ -24,6 +24,8 @@ async def _insert_dataset_resource(
     resource_id: str,
     resource_payload: dict,
 ) -> None:
+    payload_hash = f"hash-{dataset_id}-{resource_type}-{resource_id}"
+    payload_json = json.dumps(resource_payload)
     await session.execute(
         text(
             f"INSERT INTO {schema}.provider_directory_dataset_resource "
@@ -35,10 +37,25 @@ async def _insert_dataset_resource(
             "dataset_id": dataset_id,
             "resource_type": resource_type,
             "resource_id": resource_id,
-            "payload_hash": f"hash-{dataset_id}-{resource_type}-{resource_id}",
-            "payload_json": json.dumps(resource_payload),
+            "payload_hash": payload_hash,
+            "payload_json": payload_json,
         },
     )
+    if resource_type == "InsurancePlan":
+        await session.execute(
+            text(
+                f"INSERT INTO {schema}.provider_directory_dataset_insurance_plan "
+                "(dataset_id, resource_id, payload_hash, payload_json) "
+                "VALUES (:dataset_id, :resource_id, :payload_hash, "
+                "CAST(:payload_json AS jsonb))"
+            ),
+            {
+                "dataset_id": dataset_id,
+                "resource_id": resource_id,
+                "payload_hash": payload_hash,
+                "payload_json": payload_json,
+            },
+        )
 
 
 async def _insert_endpoint_rows(session, schema: str, endpoint_rows: list[tuple[str, str]]) -> None:
@@ -387,6 +404,7 @@ async def test_provider_directory_role_evidence_sql_explains_with_array_binds():
         has_catalog=True,
         has_dataset_network_plan=True,
         has_dataset_affiliation_organization=True,
+        has_dataset_insurance_plan=True,
     )
 
     plan = await db.all(
@@ -406,6 +424,7 @@ async def test_provider_directory_affiliation_evidence_sql_explains_with_dataset
         schema,
         has_catalog=True,
         has_dataset_network_plan=True,
+        has_dataset_insurance_plan=True,
     )
 
     plan = await db.all(
@@ -426,6 +445,7 @@ async def test_role_evidence_executes_relation_fallback_and_zero_edge_contracts(
         has_catalog=True,
         has_dataset_network_plan=True,
         has_dataset_affiliation_organization=True,
+        has_dataset_insurance_plan=True,
     )
 
     async with db.transaction() as session:

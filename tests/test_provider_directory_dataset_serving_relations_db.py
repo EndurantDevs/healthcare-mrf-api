@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 import asyncio
+import hashlib
 import importlib
 import json
 import uuid
@@ -39,8 +40,18 @@ async def _create_tables(database: Database, schema: str) -> None:
         "dataset_id varchar(96) NOT NULL, "
         "resource_type varchar(64) NOT NULL, "
         "resource_id varchar(256) NOT NULL, "
+        "payload_hash varchar(64) NOT NULL, "
         "payload_json jsonb NOT NULL, "
         "PRIMARY KEY (dataset_id, resource_type, resource_id)"
+        ");"
+    )
+    await database.status(
+        f"CREATE TABLE {schema}.provider_directory_dataset_insurance_plan ("
+        "dataset_id varchar(96) NOT NULL, "
+        "resource_id varchar(256) NOT NULL, "
+        "payload_hash varchar(64) NOT NULL, "
+        "payload_json jsonb NOT NULL, "
+        "PRIMARY KEY (dataset_id, resource_id)"
         ");"
     )
     await database.status(
@@ -70,15 +81,17 @@ async def _insert_resource(
     resource_id: str,
     payload: dict,
 ) -> None:
+    payload_json = json.dumps(payload, sort_keys=True)
     await database.status(
         f"INSERT INTO {schema}.provider_directory_dataset_resource "
-        "(dataset_id, resource_type, resource_id, payload_json) "
-        "VALUES (:dataset_id, :resource_type, :resource_id, "
+        "(dataset_id, resource_type, resource_id, payload_hash, payload_json) "
+        "VALUES (:dataset_id, :resource_type, :resource_id, :payload_hash, "
         "CAST(:payload_json AS jsonb));",
         dataset_id=dataset_id,
         resource_type=resource_type,
         resource_id=resource_id,
-        payload_json=json.dumps(payload),
+        payload_hash=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        payload_json=payload_json,
     )
 
 
@@ -170,6 +183,10 @@ async def _insert_sentinel_relation_fixtures(
     database: Database,
     schema: str,
 ) -> None:
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_dataset_insurance_plan "
+        "VALUES ('dataset-b', 'sentinel-plan', repeat('0', 64), '{}'::jsonb);"
+    )
     await database.status(
         f"INSERT INTO {schema}.provider_directory_dataset_network_plan "
         "VALUES ('dataset-b', 'sentinel-network', 'sentinel-plan');"
@@ -273,6 +290,11 @@ def _assert_affiliation_edges(affiliation_proof, affiliation_edge_rows) -> None:
 
 
 async def _assert_dataset_b_sentinels(database: Database, schema: str) -> None:
+    assert await database.scalar(
+        f"SELECT count(*) FROM {schema}."
+        "provider_directory_dataset_insurance_plan "
+        "WHERE dataset_id = 'dataset-b';"
+    ) == 1
     assert await database.scalar(
         f"SELECT count(*) FROM {schema}."
         "provider_directory_dataset_network_plan "

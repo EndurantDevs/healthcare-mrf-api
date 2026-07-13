@@ -88,4 +88,7 @@ def upgrade():
 
 
 def downgrade():
-    op.drop_index(INDEX_NAME, table_name=TABLE_NAME, schema=_schema())
+    schema = _schema()
+    if not _table_exists(op.get_bind(), schema):
+        return
+    op.drop_index(INDEX_NAME, table_name=TABLE_NAME, schema=schema)

@@ -129,6 +129,7 @@ async def test_match_candidate_params_geo_defaults_radius():
     )
 
     assert params["radius_miles"] == 1.0
+    assert params["limit"] == 5
 
 
 @pytest.mark.asyncio
@@ -386,8 +387,6 @@ def test_match_candidate_sort_key_orders_ties():
             },
         ]
     ) == 1730166224
-
-
 @pytest.mark.asyncio
 async def test_match_candidates_route_shapes_payload(monkeypatch):
     async def fake_rows(params, *, session=None):

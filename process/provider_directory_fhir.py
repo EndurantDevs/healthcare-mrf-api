@@ -52,6 +52,7 @@ from db.models import (
     ProviderDirectoryCapability,
     ProviderDirectoryCanonicalResource,
     ProviderDirectoryDatasetAffiliationOrganization,
+    ProviderDirectoryDatasetInsurancePlan,
     ProviderDirectoryDatasetNetworkPlan,
     ProviderDirectoryDatasetResource,
     ProviderDirectoryEndpoint,
@@ -239,6 +240,9 @@ PROVIDER_DIRECTORY_NETWORK_CATALOG_TABLE = "provider_directory_network_catalog"
 PROVIDER_DIRECTORY_NETWORK_CATALOG_STAGE_PREFIX = "provider_directory_network_catalog_stage"
 PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = (
     "provider_directory_dataset_network_plan"
+)
+PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = (
+    "provider_directory_dataset_insurance_plan"
 )
 PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY = "dataset_network_plan"
 PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = (
@@ -452,6 +456,7 @@ SOURCE_MODELS = (
 CANONICAL_RESOURCE_MODELS = (
     ProviderDirectoryEndpointDataset,
     ProviderDirectoryDatasetResource,
+    ProviderDirectoryDatasetInsurancePlan,
     ProviderDirectoryDatasetNetworkPlan,
     ProviderDirectoryDatasetAffiliationOrganization,
     ProviderDirectoryCanonicalResource,
@@ -10067,6 +10072,9 @@ def _dataset_network_plan_aggregate_proof(
         "edge_count",
         "duplicate_network_reference_count",
         "replaced_edge_count",
+        "plan_projection_count",
+        "replaced_plan_projection_count",
+        "inserted_plan_projection_count",
     )
     return {
         "complete": True,
@@ -27536,6 +27544,193 @@ def _dataset_network_plan_edge_insert_sql(
     )
 
 
+def _dataset_insurance_plan_projection_insert_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    schema = _schema()
+    root_filter = (
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    dataset_ref = _qt(schema, ProviderDirectoryEndpointDataset.__tablename__)
+    resource_ref = _qt(schema, ProviderDirectoryDatasetResource.__tablename__)
+    projection_ref = _qt(
+        schema,
+        PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+    )
+    return f"""
+        WITH target_dataset AS MATERIALIZED (
+            SELECT dataset_id
+              FROM {dataset_ref}
+             WHERE dataset_id = :dataset_id
+               {root_filter}
+        )
+        INSERT INTO {projection_ref} (
+            dataset_id,
+            resource_id,
+            payload_hash,
+            payload_json
+        )
+        SELECT dataset.dataset_id,
+               resource.resource_id,
+               resource.payload_hash,
+               resource.payload_json
+          FROM {resource_ref} AS resource
+          JOIN target_dataset AS dataset
+            ON dataset.dataset_id = resource.dataset_id
+         WHERE resource.resource_type = 'InsurancePlan';
+    """
+
+
+def _dataset_insurance_plan_projection_proof_sql(
+    *,
+    should_verify_acquisition_root: bool,
+) -> str:
+    """Build exactness proof SQL for the compact InsurancePlan projection."""
+    schema = _schema()
+    root_filter = (
+        "AND COALESCE(acquisition_root_run_id, import_run_id) "
+        "IS NOT DISTINCT FROM :acquisition_root_run_id"
+        if should_verify_acquisition_root
+        else ""
+    )
+    dataset_ref = _qt(schema, ProviderDirectoryEndpointDataset.__tablename__)
+    resource_ref = _qt(schema, ProviderDirectoryDatasetResource.__tablename__)
+    projection_ref = _qt(
+        schema,
+        PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+    )
+    return (
+        _dataset_insurance_plan_projection_source_ctes(
+            dataset_ref,
+            resource_ref,
+            projection_ref,
+            root_filter,
+        )
+        + _dataset_insurance_plan_projection_proof_select()
+    )
+
+
+def _dataset_insurance_plan_projection_source_ctes(
+    dataset_ref: str,
+    resource_ref: str,
+    projection_ref: str,
+    root_filter: str,
+) -> str:
+    return f"""
+        WITH target_dataset AS MATERIALIZED (
+            SELECT dataset_id,
+                   COALESCE(acquisition_root_run_id, import_run_id)
+                       AS acquisition_root_run_id
+              FROM {dataset_ref}
+             WHERE dataset_id = :dataset_id
+               {root_filter}
+        ), source_plans AS MATERIALIZED (
+            SELECT resource.resource_id,
+                   resource.payload_hash,
+                   resource.payload_json
+              FROM {resource_ref} AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'InsurancePlan'
+        ), projected_plans AS MATERIALIZED (
+            SELECT projection.resource_id,
+                   projection.payload_hash,
+                   projection.payload_json
+              FROM {projection_ref} AS projection
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = projection.dataset_id
+        )
+    """
+
+
+def _dataset_insurance_plan_projection_proof_select() -> str:
+    return """
+        SELECT
+            (SELECT COUNT(*) FROM target_dataset)::bigint
+                AS target_dataset_count,
+            (SELECT acquisition_root_run_id FROM target_dataset LIMIT 1)
+                AS acquisition_root_run_id,
+            (SELECT COUNT(*) FROM source_plans)::bigint
+                AS insurance_plan_resource_count,
+            (SELECT COUNT(*) FROM projected_plans)::bigint
+                AS plan_projection_count,
+            (SELECT COUNT(*)
+               FROM source_plans AS source
+               LEFT JOIN projected_plans AS projection
+                 ON projection.resource_id = source.resource_id
+              WHERE projection.resource_id IS NULL
+                 OR projection.payload_hash IS DISTINCT FROM source.payload_hash
+                 OR projection.payload_json::jsonb
+                    IS DISTINCT FROM source.payload_json::jsonb)::bigint
+                AS missing_or_mismatched_plan_projection_count,
+            (SELECT COUNT(*)
+               FROM projected_plans AS projection
+               LEFT JOIN source_plans AS source
+                 ON source.resource_id = projection.resource_id
+              WHERE source.resource_id IS NULL)::bigint
+                AS unexpected_plan_projection_count;
+    """
+
+
+def _validated_dataset_insurance_plan_projection_proof(
+    proof_by_field: dict[str, Any],
+    *,
+    dataset_id: str,
+    expected_acquisition_root_run_id: str | None | object,
+    replaced_plan_projection_count: int,
+    inserted_plan_projection_count: int,
+) -> dict[str, int | str | None | bool]:
+    error_prefix = "provider_directory_dataset_insurance_plan"
+    root_run_id = _validated_serving_relation_root(
+        proof_by_field,
+        dataset_id,
+        expected_acquisition_root_run_id,
+        error_prefix,
+    )
+    source_count = _dataset_network_plan_count(
+        proof_by_field,
+        "insurance_plan_resource_count",
+    )
+    projection_count = _dataset_network_plan_count(
+        proof_by_field,
+        "plan_projection_count",
+    )
+    missing_or_mismatched_count = _dataset_network_plan_count(
+        proof_by_field,
+        "missing_or_mismatched_plan_projection_count",
+    )
+    unexpected_count = _dataset_network_plan_count(
+        proof_by_field,
+        "unexpected_plan_projection_count",
+    )
+    if (
+        projection_count != source_count
+        or inserted_plan_projection_count != source_count
+        or missing_or_mismatched_count
+        or unexpected_count
+    ):
+        raise RuntimeError(
+            "provider_directory_dataset_insurance_plan_incomplete:"
+            f"{dataset_id}:source={source_count}:projection={projection_count}:"
+            f"inserted={inserted_plan_projection_count}:"
+            f"missing_or_mismatched={missing_or_mismatched_count}:"
+            f"unexpected={unexpected_count}"
+        )
+    return {
+        "complete": True,
+        "dataset_id": dataset_id,
+        "acquisition_root_run_id": root_run_id,
+        "insurance_plan_resource_count": source_count,
+        "plan_projection_count": projection_count,
+        "replaced_plan_projection_count": replaced_plan_projection_count,
+        "inserted_plan_projection_count": inserted_plan_projection_count,
+    }
+
+
 def _dataset_network_plan_count(
     proof_row: dict[str, Any],
     field_name: str,
@@ -27594,6 +27789,42 @@ def _assert_serving_relation_complete(
     return expected_count
 
 
+DATASET_NETWORK_PLAN_COUNT_FIELDS = (
+    "insurance_plan_resource_count",
+    "insurance_plan_with_network_refs_count",
+    "zero_network_reference_plan_count",
+    "malformed_network_refs_payload_count",
+    "network_reference_value_count",
+    "valid_network_reference_count",
+    "invalid_network_reference_count",
+    "expected_edge_count",
+)
+
+
+def _plan_projection_proof_counts(
+    proof_by_field: dict[str, Any],
+    plan_projection_proof_map: dict[str, int | str | None | bool] | None,
+) -> dict[str, int]:
+    if plan_projection_proof_map is None:
+        source_count = _dataset_network_plan_count(
+            proof_by_field,
+            "insurance_plan_resource_count",
+        )
+        return {
+            "plan_projection_count": source_count,
+            "replaced_plan_projection_count": 0,
+            "inserted_plan_projection_count": source_count,
+        }
+    return {
+        field_name: int(plan_projection_proof_map[field_name])
+        for field_name in (
+            "plan_projection_count",
+            "replaced_plan_projection_count",
+            "inserted_plan_projection_count",
+        )
+    }
+
+
 def _validated_dataset_network_plan_proof(
     proof_by_field: dict[str, Any],
     *,
@@ -27602,7 +27833,9 @@ def _validated_dataset_network_plan_proof(
     replaced_edge_count: int,
     inserted_edge_count: int,
     expected_acquisition_root_run_id: str | None | object,
+    plan_projection_proof_map: dict[str, int | str | None | bool] | None = None,
 ) -> dict[str, Any]:
+    """Validate dataset-scoped network edges and projection replacement counts."""
     error_prefix = "provider_directory_dataset_network_plan"
     root_run_id = _validated_serving_relation_root(
         proof_by_field,
@@ -27622,15 +27855,9 @@ def _validated_dataset_network_plan_proof(
         proof_by_field,
         "valid_network_reference_count",
     )
-    count_fields = (
-        "insurance_plan_resource_count",
-        "insurance_plan_with_network_refs_count",
-        "zero_network_reference_plan_count",
-        "malformed_network_refs_payload_count",
-        "network_reference_value_count",
-        "valid_network_reference_count",
-        "invalid_network_reference_count",
-        "expected_edge_count",
+    projection_counts_by_field = _plan_projection_proof_counts(
+        proof_by_field,
+        plan_projection_proof_map,
     )
     return {
         "complete": True,
@@ -27640,13 +27867,14 @@ def _validated_dataset_network_plan_proof(
         "build_run_id": build_run_id,
         **{
             field_name: _dataset_network_plan_count(proof_by_field, field_name)
-            for field_name in count_fields
+            for field_name in DATASET_NETWORK_PLAN_COUNT_FIELDS
         },
         "edge_count": inserted_edge_count,
         "duplicate_network_reference_count": (
             valid_reference_count - expected_edge_count
         ),
         "replaced_edge_count": replaced_edge_count,
+        **projection_counts_by_field,
     }
 
 
@@ -27710,6 +27938,41 @@ async def _replace_dataset_serving_relation_edges(
     return replaced_edge_count, inserted_edge_count
 
 
+async def _replace_dataset_insurance_plan_projection(
+    executor: Any,
+    *,
+    dataset_id: str,
+    should_verify_root: bool,
+    query_params_by_name: dict[str, Any],
+    expected_acquisition_root_run_id: str | None | object,
+) -> dict[str, int | str | None | bool]:
+    replaced_count, inserted_count = await _replace_dataset_serving_relation_edges(
+        executor,
+        dataset_id=dataset_id,
+        edge_ref=_qt(
+            _schema(),
+            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+        ),
+        insert_sql=_dataset_insurance_plan_projection_insert_sql(
+            should_verify_acquisition_root=should_verify_root
+        ),
+        query_params_by_name=query_params_by_name,
+    )
+    projection_record = await executor.first(
+        _dataset_insurance_plan_projection_proof_sql(
+            should_verify_acquisition_root=should_verify_root,
+        ),
+        **query_params_by_name,
+    )
+    return _validated_dataset_insurance_plan_projection_proof(
+        _pagination_checkpoint_row_mapping(projection_record),
+        dataset_id=dataset_id,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+        replaced_plan_projection_count=replaced_count,
+        inserted_plan_projection_count=inserted_count,
+    )
+
+
 async def _build_provider_directory_dataset_network_plan(
     executor: Any,
     dataset_id: str,
@@ -27720,11 +27983,9 @@ async def _build_provider_directory_dataset_network_plan(
     ),
 ) -> dict[str, Any]:
     """Replace one dataset's edges inside the caller's transaction."""
-    should_verify_root, query_params_by_name = (
-        _dataset_serving_relation_query_options(
-            dataset_id,
-            expected_acquisition_root_run_id,
-        )
+    should_verify_root, query_params_by_name = _dataset_serving_relation_query_options(
+        dataset_id,
+        expected_acquisition_root_run_id,
     )
     proof_record = await executor.first(
         _dataset_network_plan_proof_sql(
@@ -27740,6 +28001,13 @@ async def _build_provider_directory_dataset_network_plan(
         malformed_field="malformed_network_refs_payload_count",
         invalid_field="invalid_network_reference_count",
         error_prefix="provider_directory_dataset_network_plan",
+    )
+    plan_projection_proof_map = await _replace_dataset_insurance_plan_projection(
+        executor,
+        dataset_id=dataset_id,
+        should_verify_root=should_verify_root,
+        query_params_by_name=query_params_by_name,
+        expected_acquisition_root_run_id=expected_acquisition_root_run_id,
     )
     replaced_edge_count, inserted_edge_count = (
         await _replace_dataset_serving_relation_edges(
@@ -27762,6 +28030,7 @@ async def _build_provider_directory_dataset_network_plan(
         replaced_edge_count=replaced_edge_count,
         inserted_edge_count=inserted_edge_count,
         expected_acquisition_root_run_id=expected_acquisition_root_run_id,
+        plan_projection_proof_map=plan_projection_proof_map,
     )
 
 

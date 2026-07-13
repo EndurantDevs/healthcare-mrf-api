@@ -149,6 +149,7 @@ def _harness_config(
     entry_ids=("acquired",),
     max_sources=100,
     *,
+    candidate_limit=20,
     require_mapped_evidence=False,
 ):
     return harness.HarnessConfig(
@@ -158,7 +159,7 @@ def _harness_config(
         source_ids=(),
         max_sources=max_sources,
         samples_per_source=1,
-        candidate_limit=5,
+        candidate_limit=candidate_limit,
         api_latency_slo_ms=0.0,
         require_mapped_evidence=require_mapped_evidence,
     )
@@ -181,6 +182,17 @@ def test_selection_carries_required_state_and_rejects_truncation():
     assert selections[1].resources == ()
     with pytest.raises(ValueError, match="exceed max_sources"):
         harness.resolve_source_selection(_manifest(), max_sources=2)
+
+
+def test_phone_candidate_limit_defaults_to_validation_cap():
+    args = harness.parse_args([])
+
+    assert args.phone_candidate_limit == 20
+    harness._validate_harness_config(harness._harness_config(args))
+
+    over_cap = harness.parse_args(["--phone-candidate-limit", "21"])
+    with pytest.raises(ValueError, match="between one and twenty"):
+        harness._validate_harness_config(harness._harness_config(over_cap))
 
 
 def test_overlay_query_is_current_deterministic_and_has_no_role_scan():
@@ -285,6 +297,7 @@ async def test_api_layer_routes_envelopes_and_typed_source_variants(
     assert "include_sources=true" in detail_url
     assert "include_evidence=true" in detail_url
     assert "include_sources=true" in match_url
+    assert "limit=20" in match_url
     assert "include_evidence" not in match_url
     assert any(
         dict(headers).get("Authorization") == "Bearer very-secret-token"

@@ -75,11 +75,13 @@ def test_relation_evidence_deduplicates_before_payload_projection():
         "mrf",
         has_catalog=True,
         has_dataset_network_plan=True,
+        has_dataset_insurance_plan=True,
     )
     affiliation_sql = npi_module._provider_directory_affiliation_evidence_sql(
         "mrf",
         has_catalog=True,
         has_dataset_network_plan=True,
+        has_dataset_insurance_plan=True,
     )
 
     for evidence_sql in (role_sql, affiliation_sql):
@@ -88,7 +90,12 @@ def test_relation_evidence_deduplicates_before_payload_projection():
         assert "CROSS JOIN evidence_count" in evidence_sql
         assert "COUNT(*) OVER ()" not in evidence_sql
         assert "plan.payload_json::jsonb - ARRAY[" in evidence_sql
-        assert "LEFT JOIN current_resources AS plan" in evidence_sql
+        assert "LEFT JOIN current_plan_resources AS plan" in evidence_sql
+        assert "provider_directory_dataset_insurance_plan" in evidence_sql
+        assert (
+            "JOIN mrf.provider_directory_dataset_resource AS insurance_plan"
+            not in evidence_sql
+        )
     assert "dataset_network_plan_candidates AS MATERIALIZED" in role_sql
     assert "dataset_network_plan_resource_keys AS MATERIALIZED" in role_sql
     assert "SELECT DISTINCT candidate.dataset_id, candidate.resource_id" in role_sql
