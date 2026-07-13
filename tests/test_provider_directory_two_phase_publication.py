@@ -394,6 +394,22 @@ async def test_multi_endpoint_reader_sees_atomic_bundle_and_pointers(monkeypatch
 
 async def _prepare_retry_cleanup_failure(database, schema):
     """Create finalized retry state whose second delete fails."""
+    dataset_fence = await _prepare_retry_cleanup_state(database, schema)
+    await database.status(
+        f"CREATE FUNCTION {schema}.fail_retry_cleanup() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'forced retry cleanup failure'; END; $$;"
+    )
+    await database.status(
+        f"CREATE TRIGGER fail_retry_cleanup BEFORE DELETE ON "
+        f"{schema}.provider_directory_pagination_checkpoint "
+        f"FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_retry_cleanup();"
+    )
+    return dataset_fence
+
+
+async def _prepare_retry_cleanup_state(database, schema):
+    """Create finalized candidate retry state eligible for cleanup."""
     await _insert_validated_shared_dataset(database, schema)
     dataset_fence = await importer._resolve_provider_directory_artifact_datasets(
         ["source_primary"],
@@ -426,16 +442,6 @@ async def _prepare_retry_cleanup_failure(database, schema):
         ":payload_hash, CAST('{}' AS json));",
         payload_hash="7" * 64,
     )
-    await database.status(
-        f"CREATE FUNCTION {schema}.fail_retry_cleanup() RETURNS trigger "
-        "LANGUAGE plpgsql AS $$ BEGIN "
-        "RAISE EXCEPTION 'forced retry cleanup failure'; END; $$;"
-    )
-    await database.status(
-        f"CREATE TRIGGER fail_retry_cleanup BEFORE DELETE ON "
-        f"{schema}.provider_directory_pagination_checkpoint "
-        f"FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_retry_cleanup();"
-    )
     return dataset_fence
 
 
@@ -455,9 +461,9 @@ async def _retry_cleanup_counts(database, schema):
 async def test_retry_cleanup_rolls_back_and_recovers_after_publication(monkeypatch):
     """A cleanup failure cannot half-delete state and a replay can finish it."""
     async with _dataset_database(monkeypatch) as (database, schema):
-        dataset_fence = await _prepare_retry_cleanup_failure(database, schema)
+        await _prepare_retry_cleanup_failure(database, schema)
         assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            dataset_fence
+            ["dataset_candidate"]
         ) == []
         assert await _retry_cleanup_counts(database, schema) == (1, 1)
         await database.status(
@@ -465,6 +471,6 @@ async def test_retry_cleanup_rolls_back_and_recovers_after_publication(monkeypat
             f"{schema}.provider_directory_pagination_checkpoint;"
         )
         assert await importer._clear_promoted_endpoint_dataset_retry_state(
-            dataset_fence
+            ["dataset_candidate"]
         ) == ["dataset_candidate"]
         assert await _retry_cleanup_counts(database, schema) == (0, 0)

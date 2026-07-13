@@ -11154,21 +11154,21 @@ async def _record_artifact_promotion_metrics(
     promoted_stage_count: int,
 ) -> dict[str, Any]:
     """Record pointer promotion and best-effort retry-state cleanup."""
-    publish_metrics_by_name["artifact_promoted_dataset_ids"] = (
-        sorted(
-            dataset.dataset_id for dataset in fence.promotion_datasets
-        )
+    promoted_dataset_ids = (
+        sorted({dataset.dataset_id for dataset in fence.promotion_datasets})
         if promoted_stage_count > 0
         else []
     )
+    publish_metrics_by_name["artifact_promoted_dataset_ids"] = promoted_dataset_ids
     retry_cleanup_expected_ids = (
-        sorted({dataset.dataset_id for dataset in fence.datasets})
-        if promoted_stage_count > 0
-        and fence.should_select_validated_candidates
+        promoted_dataset_ids
+        if fence.should_select_validated_candidates
         else []
     )
     retry_cleanup_cleared_ids = (
-        await _clear_promoted_endpoint_dataset_retry_state(fence)
+        await _clear_promoted_endpoint_dataset_retry_state(
+            retry_cleanup_expected_ids
+        )
         if retry_cleanup_expected_ids
         else []
     )
@@ -11356,24 +11356,39 @@ async def _delete_endpoint_dataset_retry_state(
 
 
 async def _clear_promoted_endpoint_dataset_retry_state(
-    fence: ProviderDirectoryArtifactDatasetFence,
+    dataset_ids: Iterable[str],
 ) -> list[str]:
-    """Atomically clear retry state for selected datasets once finalized."""
+    """Atomically clear retry state for exact promoted datasets once finalized."""
     selected_dataset_ids = sorted(
-        {dataset.dataset_id for dataset in fence.datasets}
+        {
+            cleaned_dataset_id
+            for dataset_id in dataset_ids
+            if (cleaned_dataset_id := _clean_text(dataset_id))
+        }
     )
     if not selected_dataset_ids:
         return []
     try:
-        async with db.transaction():
-            finalized_dataset_ids = (
-                await _locked_finalized_retry_cleanup_dataset_ids(
-                    selected_dataset_ids
+        async with asyncio.timeout(
+            PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+        ):
+            async with db.transaction():
+                await db.status(
+                    "SET LOCAL lock_timeout = "
+                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
                 )
-            )
-            if finalized_dataset_ids != selected_dataset_ids:
-                return []
-            await _delete_endpoint_dataset_retry_state(selected_dataset_ids)
+                await db.status(
+                    "SET LOCAL statement_timeout = "
+                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+                )
+                finalized_dataset_ids = (
+                    await _locked_finalized_retry_cleanup_dataset_ids(
+                        selected_dataset_ids
+                    )
+                )
+                if finalized_dataset_ids != selected_dataset_ids:
+                    return []
+                await _delete_endpoint_dataset_retry_state(selected_dataset_ids)
     except Exception:
         LOGGER.warning(
             "Provider Directory retry-state cleanup remains pending for %s",
