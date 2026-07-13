@@ -2495,6 +2495,12 @@ paths:
           required: true
           schema:
             type: integer
+        - name: address_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Restrict the returned address list and evidence to one canonical address UUID
         - name: force_address_update
           in: query
           schema:

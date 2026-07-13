@@ -1185,11 +1185,10 @@ async def test_get_npi_uses_cached_address(monkeypatch):
 async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "false")
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "false")
-    calls = 0
+    build_calls = []
 
     async def fake_build(_npi, **_kwargs):
-        nonlocal calls
-        calls += 1
+        build_calls.append(_npi)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1236,7 +1235,7 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     payload = json.loads(first.body)
     assert payload["address_list"][0]["lat"] is None
     assert first.body == second.body
-    assert calls == 1
+    assert len(build_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1298,11 +1297,10 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_uses_response_cache(monkeypatch):
-    calls = 0
+    build_calls = []
 
     async def fake_build(_npi, **_kwargs):
-        nonlocal calls
-        calls += 1
+        build_calls.append(_npi)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1331,16 +1329,15 @@ async def test_get_npi_uses_response_cache(monkeypatch):
 
     assert json.loads(first.body)["npi"] == 1518379601
     assert first.body == second.body
-    assert calls == 1
+    assert len(build_calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch):
-    calls = 0
+    build_calls = []
 
     async def fake_build(_npi, **_kwargs):
-        nonlocal calls
-        calls += 1
+        build_calls.append(_npi)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1372,7 +1369,7 @@ async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch)
     )
     await npi_module.get_npi(force_request, "1518379601")
 
-    assert calls == 2
+    assert len(build_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1624,7 +1621,7 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
                     return self
 
                 async def status(self):
-                    pass
+                    return None
             return _Stmt()
 
         async def insert(self, *args, **kwargs):
@@ -1636,7 +1633,7 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
                     return self
 
                 async def status(self):
-                    pass
+                    return None
             return _Stmt()
 
         async def scalar(self, *_args, **_kwargs):
