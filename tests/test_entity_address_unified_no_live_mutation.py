@@ -48,6 +48,11 @@ def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> N
     monkeypatch.setattr(entity_address_unified, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(entity_address_unified.db, "scalar", AsyncMock(return_value=100))
     monkeypatch.setattr(entity_address_unified, "_run_sql_phase", run_sql)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_inherit_archive_coordinates",
+        AsyncMock(return_value={"inherited_rows": 0, "ambiguous_rows": 0}),
+    )
     monkeypatch.setattr(entity_address_unified, "_validate_publish_integrity", validate)
     monkeypatch.setattr(entity_address_unified, "_publish_staged_entity_address_tables", publish)
     monkeypatch.setattr(entity_address_unified, "mark_control_run", mark)

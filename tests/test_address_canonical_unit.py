@@ -2705,6 +2705,11 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_inherit_archive_coordinates",
+        AsyncMock(return_value={"inherited_rows": 0, "ambiguous_rows": 0}),
+    )
     monkeypatch.setattr(entity_address_unified, "_support_stage_classes", lambda _import_date: {})
     monkeypatch.setattr(entity_address_unified, "mark_control_run", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_publish_staged_entity_address_tables", publish_mock)
@@ -3447,16 +3452,44 @@ def test_entity_address_unified_archive_coordinate_backfill_sql_only_fills_missi
     )
 
     assert "UPDATE mrf.entity_address_unified_20260614 AS t" in sql
-    assert "SET lat = CASE WHEN t.lat IS NULL OR t.long IS NULL" in sql
-    assert "THEN a.lat ELSE t.lat END" in sql
-    assert "long = CASE WHEN t.lat IS NULL OR t.long IS NULL" in sql
-    assert "THEN a.long ELSE t.long END" in sql
+    assert "SET lat = a.lat" in sql
+    assert "long = a.long" in sql
     assert "FROM mrf.address_archive_v2 AS a" in sql
     assert "a.merged_into IS NULL" in sql
-    assert "a.lat IS NOT NULL" in sql
-    assert "a.long IS NOT NULL" in sql
+    assert "NOT (a.lat IS NULL OR a.long IS NULL" in sql
+    assert "a.lat < -90 OR a.lat > 90" in sql
+    assert "a.long < -180 OR a.long > 180" in sql
     assert "t.lat IS NULL OR t.long IS NULL" in sql
     assert "ABS(t.lat) < 0.0000001" in sql
+
+
+def test_legacy_coordinate_inheritance_sql():
+    sql = entity_address_unified._inherit_archive_coordinates_sql(
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+    normalized = sql.lower()
+
+    assert "update mrf.entity_address_unified_20260614 as target" in normalized
+    assert "set lat = candidates.lat" in normalized
+    assert "long = candidates.long" in normalized
+    assert "legacy.identity_version < eligible.current_identity_version" in normalized
+    assert "legacy.line1_norm = eligible.line1_norm" in normalized
+    assert "legacy.city_norm = eligible.city_norm" in normalized
+    assert "legacy.state_code = eligible.state_code" in normalized
+    assert "legacy.zip5 = eligible.zip5" in normalized
+    assert "legacy.country_code = eligible.country_code" in normalized
+    assert "current_archive.country_code = 'us'" in normalized
+    assert "current_archive.precision = 'street'" in normalized
+    assert "legacy.merged_into is null" in normalized
+    assert "legacy.precision = 'street'" in normalized
+    assert "count(distinct legacy.address_key)" in normalized
+    assert "candidates.candidate_count = 1" in normalized
+    assert "candidate_count > 1" in normalized
+    assert "update mrf.address_archive_v2" not in normalized
+    assert "entity_address_unified as target" not in normalized
+    for fuzzy_predicate in ("similarity(", "levenshtein(", "st_distance", "<->", "limit 1"):
+        assert fuzzy_predicate not in normalized
 
 
 def test_entity_address_unified_clear_invalid_coordinates_sql_nulls_bad_pairs():

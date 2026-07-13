@@ -4886,19 +4886,144 @@ def _coordinate_missing_or_invalid_sql(alias: str) -> str:
 
 def _backfill_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
     target_coordinate_missing = _coordinate_missing_or_invalid_sql("t")
+    archive_coordinate_missing = _coordinate_missing_or_invalid_sql("a")
     return f"""
     UPDATE {db_schema}.{table_name} AS t
-       SET lat = CASE WHEN {target_coordinate_missing} THEN a.lat ELSE t.lat END,
-           long = CASE WHEN {target_coordinate_missing} THEN a.long ELSE t.long END
+       SET lat = a.lat,
+           long = a.long
       FROM {db_schema}.address_archive_v2 AS a
      WHERE t.address_key IS NOT NULL
        AND a.address_key = t.address_key
        AND a.merged_into IS NULL
-       AND a.lat IS NOT NULL
-       AND a.long IS NOT NULL
-       AND NOT (ABS(a.lat) < 0.0000001 AND ABS(a.long) < 0.0000001)
+       AND NOT ({archive_coordinate_missing})
        AND ({target_coordinate_missing});
     """
+
+
+def _archive_coordinate_eligible_targets_sql(
+    db_schema: str,
+    table_name: str,
+    target_coordinate_missing: str,
+) -> str:
+    return f"""
+    eligible_targets AS MATERIALIZED (
+        SELECT
+            target.ctid AS target_row_id,
+            current_archive.address_key AS current_address_key,
+            current_archive.identity_version AS current_identity_version,
+            current_archive.line1_norm,
+            current_archive.city_norm,
+            current_archive.state_code,
+            current_archive.zip5,
+            current_archive.country_code
+          FROM {db_schema}.{table_name} AS target
+          JOIN {db_schema}.address_archive_v2 AS current_archive
+            ON current_archive.address_key = target.address_key
+           AND current_archive.merged_into IS NULL
+         WHERE ({target_coordinate_missing})
+           AND target.address_precision = 'street'
+           AND current_archive.precision = 'street'
+           AND current_archive.country_code = 'US'
+           AND NULLIF(BTRIM(current_archive.line1_norm), '') IS NOT NULL
+           AND NULLIF(BTRIM(current_archive.city_norm), '') IS NOT NULL
+           AND NULLIF(BTRIM(current_archive.state_code), '') IS NOT NULL
+           AND NULLIF(BTRIM(current_archive.zip5), '') IS NOT NULL
+           AND NULLIF(BTRIM(current_archive.country_code), '') IS NOT NULL
+    )
+    """
+
+
+def _archive_coordinate_candidate_groups_sql(
+    db_schema: str,
+    legacy_coordinate_missing: str,
+) -> str:
+    return f"""
+    candidate_groups AS MATERIALIZED (
+        SELECT
+            eligible.target_row_id,
+            MIN(legacy.lat) AS lat,
+            MIN(legacy.long) AS long,
+            COUNT(DISTINCT legacy.address_key)::bigint AS candidate_count
+          FROM eligible_targets AS eligible
+          JOIN {db_schema}.address_archive_v2 AS legacy
+            ON legacy.identity_version < eligible.current_identity_version
+           AND legacy.address_key <> eligible.current_address_key
+           AND legacy.line1_norm = eligible.line1_norm
+           AND legacy.city_norm = eligible.city_norm
+           AND legacy.state_code = eligible.state_code
+           AND legacy.zip5 = eligible.zip5
+           AND legacy.country_code = eligible.country_code
+         WHERE legacy.merged_into IS NULL
+           AND legacy.precision = 'street'
+           AND legacy.country_code = 'US'
+           AND NOT ({legacy_coordinate_missing})
+      GROUP BY eligible.target_row_id
+    )
+    """
+
+
+def _inherit_archive_coordinates_sql(db_schema: str, table_name: str) -> str:
+    """Inherit coordinates from one exact older identity without changing identity fields."""
+    target_coordinate_missing = _coordinate_missing_or_invalid_sql("target")
+    legacy_coordinate_missing = _coordinate_missing_or_invalid_sql("legacy")
+    eligible_targets_sql = _archive_coordinate_eligible_targets_sql(
+        db_schema,
+        table_name,
+        target_coordinate_missing,
+    )
+    candidate_groups_sql = _archive_coordinate_candidate_groups_sql(
+        db_schema,
+        legacy_coordinate_missing,
+    )
+    return f"""
+    WITH {eligible_targets_sql},
+    {candidate_groups_sql},
+    inherited AS (
+        UPDATE {db_schema}.{table_name} AS target
+           SET lat = candidates.lat,
+               long = candidates.long
+          FROM candidate_groups AS candidates
+         WHERE target.ctid = candidates.target_row_id
+           AND candidates.candidate_count = 1
+           AND ({target_coordinate_missing})
+        RETURNING 1
+    )
+    SELECT
+        (SELECT COUNT(*)::bigint FROM inherited) AS inherited_rows,
+        (
+            SELECT COUNT(*)::bigint
+              FROM candidate_groups
+             WHERE candidate_count > 1
+        ) AS ambiguous_rows;
+    """
+
+
+async def _inherit_archive_coordinates(db_schema: str, table_name: str) -> dict[str, int]:
+    rows = await db.all(_inherit_archive_coordinates_sql(db_schema, table_name))
+    if not rows:
+        return {"inherited_rows": 0, "ambiguous_rows": 0}
+    metrics = _row_mapping(rows[0])
+    return {
+        "inherited_rows": int(metrics.get("inherited_rows") or 0),
+        "ambiguous_rows": int(metrics.get("ambiguous_rows") or 0),
+    }
+
+
+def _archive_coordinate_publish_metrics(context: dict) -> dict[str, int]:
+    return {
+        "archive_coordinate_backfill_rows": int(
+            context.get("archive_coordinate_backfill_rows") or 0
+        ),
+        "archive_coordinate_same_key_backfill_rows": int(
+            context.get("archive_coordinate_same_key_backfill_rows") or 0
+        ),
+        "archive_coordinate_inherited_rows": int(
+            context.get("archive_coordinate_inherited_rows") or 0
+        ),
+        "archive_coordinate_ambiguous_rows": int(
+            context.get("archive_coordinate_ambiguous_rows") or 0
+        ),
+    }
 
 
 def _clear_invalid_coordinates_sql(db_schema: str, table_name: str) -> str:
@@ -11677,7 +11802,7 @@ async def shutdown(ctx):
         and _defer_publish_validation()
     )
     if await _table_exists(db_schema, "address_archive_v2"):
-        archive_coordinate_backfill_rows = await _run_sql_phase(
+        archive_coordinate_same_key_backfill_rows = await _run_sql_phase(
             _backfill_archive_coordinates_sql(db_schema, stage_cls.__tablename__),
             context=context,
             run_id=run_id,
@@ -11690,9 +11815,37 @@ async def shutdown(ctx):
             emit_start=True,
             emit_done=True,
         )
-        context["archive_coordinate_backfill_rows"] = int(archive_coordinate_backfill_rows or 0)
+        context["archive_coordinate_same_key_backfill_rows"] = int(
+            archive_coordinate_same_key_backfill_rows or 0
+        )
+        inheritance_phase = "entity-address-unified inheriting exact legacy archive coordinates"
+        inheritance_started = time.monotonic()
+        inheritance_metrics = await _inherit_archive_coordinates(
+            db_schema,
+            stage_cls.__tablename__,
+        )
+        _record_phase_timing(
+            context,
+            inheritance_phase,
+            time.monotonic() - inheritance_started,
+            inheritance_metrics["inherited_rows"],
+        )
+        context["archive_coordinate_inherited_rows"] = inheritance_metrics["inherited_rows"]
+        context["archive_coordinate_ambiguous_rows"] = inheritance_metrics["ambiguous_rows"]
+        context["archive_coordinate_backfill_rows"] = (
+            context["archive_coordinate_same_key_backfill_rows"]
+            + context["archive_coordinate_inherited_rows"]
+        )
+        logger.info(
+            "EntityAddressUnified exact legacy coordinate inheritance: inherited=%d ambiguous=%d",
+            context["archive_coordinate_inherited_rows"],
+            context["archive_coordinate_ambiguous_rows"],
+        )
     else:
         context["archive_coordinate_backfill_rows"] = 0
+        context["archive_coordinate_same_key_backfill_rows"] = 0
+        context["archive_coordinate_inherited_rows"] = 0
+        context["archive_coordinate_ambiguous_rows"] = 0
     same_provider_address_backfill_rows = await _run_sql_phase(
         _backfill_same_provider_address_fields_sql(db_schema, stage_cls.__tablename__),
         context=context,
@@ -11794,6 +11947,7 @@ async def shutdown(ctx):
     logger.info("EntityAddressUnified publish complete: rows=%d", published_rows)
 
     def _published_metrics() -> dict:
+        """Return the stable control-run metrics emitted after stage publication."""
         return {
             "rows": published_rows,
             "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
@@ -11830,9 +11984,7 @@ async def shutdown(ctx):
             "support_counts": context.get("support_counts") or {},
             "serving_only_refresh": serving_only_refresh,
             "support_stage_skipped": bool(context.get("support_stage_skipped")),
-            "archive_coordinate_backfill_rows": int(
-                context.get("archive_coordinate_backfill_rows") or 0
-            ),
+            **_archive_coordinate_publish_metrics(context),
             "same_provider_address_backfill_rows": int(
                 context.get("same_provider_address_backfill_rows") or 0
             ),
