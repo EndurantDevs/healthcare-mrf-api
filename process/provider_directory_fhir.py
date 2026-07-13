@@ -140,6 +140,27 @@ PLAN_NET_ACCEPTING_PATIENTS_CODES = frozenset(
         "existptfam",
     }
 )
+PLAN_NET_DELIVERY_METHOD_EXTENSION_URLS = frozenset(
+    url.lower()
+    for url in {
+        (
+            "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/delivery-method"
+        ),
+        (
+            "https://hl7.org/fhir/us/davinci-pdex-plan-net/"
+            "StructureDefinition/delivery-method"
+        ),
+    }
+)
+REVIEWED_TELEHEALTH_EXTENSION_URLS = frozenset(
+    {
+        "https://healthporta.com/fhir/provider-directory/telehealth",
+    }
+)
+FHIR_FETCH_MODES = frozenset(
+    {"rest_bundle", "rest_read", "bulk_ndjson", "graphql"}
+)
 _PUBLISH_SCOPE_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
     resource_type.lower() for resource_type in DEFAULT_RESOURCES
@@ -885,6 +906,17 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
 
 
 @dataclass(frozen=True)
+class FHIRAcquisitionContext:
+    self_url: str | None = None
+    fetch_url: str | None = None
+    fetch_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fetch_mode is not None and self.fetch_mode not in FHIR_FETCH_MODES:
+            raise ValueError(f"unsupported FHIR fetch mode: {self.fetch_mode}")
+
+
+@dataclass(frozen=True)
 class ResourceFetchResult:
     model: type
     rows: list[dict[str, Any]]
@@ -1363,6 +1395,7 @@ class _PractitionerRoleReverseLookupState:
                 request.source["source_id"],
                 bundle_payload,
                 request.options.run_id,
+                fetch_url=next_lookup_url,
             )
             await self.add_practitioner_role_page(resource_rows)
             next_link = _next_link(bundle_payload)
@@ -1921,6 +1954,49 @@ def _canonical_base(api_base: str | None) -> str | None:
         return text.rstrip("/")
     path = parsed.path.rstrip("/")
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+
+def _sanitized_fhir_url_identity(url: str | None) -> str | None:
+    """Return a persistence-safe URL identity without credentials or query values."""
+
+    text = _clean_text(url)
+    if not text:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme and not parsed.hostname:
+        return urllib.parse.urlunsplit(
+            (parsed.scheme.lower(), "", parsed.path, "", "")
+        )
+    if not parsed.scheme or not parsed.hostname:
+        return parsed.path or None
+    hostname = parsed.hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path, "", "")
+    )
+
+
+def _fhir_acquisition_fields(
+    resource: dict[str, Any],
+    acquisition: FHIRAcquisitionContext | None,
+) -> dict[str, Any]:
+    metadata = resource.get("meta")
+    return {
+        "fhir_meta": metadata if isinstance(metadata, dict) else None,
+        "fhir_self_url": _sanitized_fhir_url_identity(
+            acquisition.self_url if acquisition else None
+        ),
+        "fhir_fetch_url": _sanitized_fhir_url_identity(
+            acquisition.fetch_url if acquisition else None
+        ),
+        "fhir_fetch_mode": acquisition.fetch_mode if acquisition else None,
+    }
 
 
 def _parent_base_url(api_base: str) -> str | None:
@@ -4726,6 +4802,179 @@ def _plan_net_accepting_patients(resource: dict[str, Any]) -> list[dict[str, str
     ]
 
 
+def _normalized_identifier(identifier: Any) -> dict[str, Any] | None:
+    if not isinstance(identifier, dict):
+        return None
+    period = identifier.get("period") if isinstance(identifier.get("period"), dict) else {}
+    identifier_map = {
+        "use": _clean_text(identifier.get("use")),
+        "type_codes": _codings(identifier.get("type")),
+        "system": _clean_text(identifier.get("system")),
+        "value": _clean_text(identifier.get("value")),
+        "period_start": _clean_text(period.get("start")),
+        "period_end": _clean_text(period.get("end")),
+        "assigner_ref": _first_reference(identifier.get("assigner")),
+    }
+    return {
+        key: value
+        for key, value in identifier_map.items()
+        if value not in (None, [], {})
+    } or None
+
+
+def _normalized_identifiers(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        normalized
+        for identifier in value
+        if (normalized := _normalized_identifier(identifier)) is not None
+    ]
+
+
+def _normalized_insurance_plan_backbones(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for plan in resource.get("plan") or []:
+        if not isinstance(plan, dict):
+            continue
+        rows.append(
+            {
+                "identifiers": _normalized_identifiers(plan.get("identifier")),
+                "type_codes": _codings(plan.get("type")),
+                "coverage_area_refs": _references(plan.get("coverageArea")),
+                "network_refs": _references(plan.get("network")),
+            }
+        )
+    return rows
+
+
+def _normalized_quantity(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    quantity_map = {
+        "value": value.get("value"),
+        "comparator": _clean_text(value.get("comparator")),
+        "unit": _clean_text(value.get("unit")),
+        "system": _clean_text(value.get("system")),
+        "code": _clean_text(value.get("code")),
+    }
+    return {
+        key: quantity_value
+        for key, quantity_value in quantity_map.items()
+        if quantity_value is not None
+    } or None
+
+
+def _normalized_insurance_plan_benefits(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    benefits: list[dict[str, Any]] = []
+    for benefit in value:
+        if not isinstance(benefit, dict):
+            continue
+        limits = []
+        for limit in benefit.get("limit") or []:
+            if not isinstance(limit, dict):
+                continue
+            limits.append(
+                {
+                    "value": _normalized_quantity(limit.get("value")),
+                    "code_codes": _codings(limit.get("code")),
+                }
+            )
+        benefits.append(
+            {
+                "type_codes": _codings(benefit.get("type")),
+                "requirement": _clean_text(benefit.get("requirement")),
+                "limits": limits,
+            }
+        )
+    return benefits
+
+
+def _normalized_insurance_plan_coverage(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    coverage_rows: list[dict[str, Any]] = []
+    for coverage in resource.get("coverage") or []:
+        if not isinstance(coverage, dict):
+            continue
+        coverage_rows.append(
+            {
+                "type_codes": _codings(coverage.get("type")),
+                "network_refs": _references(coverage.get("network")),
+                "benefits": _normalized_insurance_plan_benefits(
+                    coverage.get("benefit")
+                ),
+            }
+        )
+    return coverage_rows
+
+
+def _extension_url(extension: dict[str, Any]) -> str:
+    return (_clean_text(extension.get("url")) or "").split("|", 1)[0].rstrip("/").lower()
+
+
+def _reviewed_telehealth(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    telehealth_entries: list[dict[str, Any]] = []
+    for extension in resource.get("extension") or []:
+        if not isinstance(extension, dict):
+            continue
+        extension_url = _extension_url(extension)
+        if extension_url in REVIEWED_TELEHEALTH_EXTENSION_URLS:
+            if isinstance(extension.get("valueBoolean"), bool):
+                telehealth_entries.append({"supported": extension["valueBoolean"]})
+            continue
+        if extension_url not in PLAN_NET_DELIVERY_METHOD_EXTENSION_URLS:
+            continue
+        type_codes: list[dict[str, Any]] = []
+        virtual_modalities: list[dict[str, Any]] = []
+        for nested in extension.get("extension") or []:
+            if not isinstance(nested, dict):
+                continue
+            if nested.get("url") == "type":
+                type_codes.extend(_codings(nested.get("valueCodeableConcept")))
+            elif nested.get("url") == "virtualModalities":
+                virtual_modalities.extend(
+                    _codings(nested.get("valueCodeableConcept"))
+                )
+        type_tokens = {
+            (_clean_text(coding.get("code")) or "").lower()
+            for coding in type_codes
+        }
+        if "virtual" in type_tokens or virtual_modalities:
+            telehealth_entries.append(
+                {
+                    "supported": True,
+                    "type_codes": type_codes,
+                    "virtual_modalities": virtual_modalities,
+                }
+            )
+    return telehealth_entries
+
+
+def _practitioner_role_completeness_fields(
+    resource: dict[str, Any],
+) -> dict[str, Any]:
+    new_patient_entries = _plan_net_accepting_patients(resource)
+    return {
+        "accepting_patients": new_patient_entries,
+        "available_time": [
+            entry
+            for entry in resource.get("availableTime") or []
+            if isinstance(entry, dict)
+        ],
+        "not_available": [
+            entry
+            for entry in resource.get("notAvailable") or []
+            if isinstance(entry, dict)
+        ],
+        "availability_exceptions": _clean_text(
+            resource.get("availabilityExceptions")
+        ),
+        "new_patient_acceptance": new_patient_entries,
+        "telehealth": _reviewed_telehealth(resource),
+    }
+
+
 def _first_reference(value: Any) -> str | None:
     refs = _references(value)
     return refs[0] if refs else None
@@ -5060,24 +5309,42 @@ def parse_capability(source: dict[str, Any], payload: dict[str, Any], probe: dic
     }
 
 
+def _fhir_resource_base_fields(
+    source_id: str,
+    resource: dict[str, Any],
+    resource_url: str | None,
+    acquisition: FHIRAcquisitionContext | None,
+    run_id: str | None,
+) -> dict[str, Any]:
+    observed_at = _now()
+    return {
+        "source_id": source_id,
+        "resource_id": _resource_id(resource),
+        "resource_url": resource_url,
+        **_fhir_acquisition_fields(resource, acquisition),
+        "last_seen_run_id": run_id,
+        "observed_at": observed_at,
+        "updated_at": observed_at,
+    }
+
+
 def parse_fhir_resource(
     source_id: str,
     resource: dict[str, Any],
     *,
     resource_url: str | None = None,
+    acquisition: FHIRAcquisitionContext | None = None,
     run_id: str | None = None,
     normalize_location_contacts: bool = True,
 ) -> tuple[type, dict[str, Any]] | None:
     resource_type = resource.get("resourceType")
-    observed_at = _now()
-    base = {
-        "source_id": source_id,
-        "resource_id": _resource_id(resource),
-        "resource_url": resource_url,
-        "last_seen_run_id": run_id,
-        "observed_at": observed_at,
-        "updated_at": observed_at,
-    }
+    base = _fhir_resource_base_fields(
+        source_id,
+        resource,
+        resource_url,
+        acquisition,
+        run_id,
+    )
     if resource_type == "InsurancePlan":
         period_start, period_end = _period(resource)
         plan = next((item for item in resource.get("plan") or [] if isinstance(item, dict)), {})
@@ -5097,6 +5364,11 @@ def parse_fhir_resource(
         row = {
             **base,
             "plan_identifier": identifier,
+            "product_identifiers": _normalized_identifiers(
+                resource.get("identifier")
+            ),
+            "plan_backbones": _normalized_insurance_plan_backbones(resource),
+            "coverage": _normalized_insurance_plan_coverage(resource),
             "status": _clean_text(resource.get("status")),
             "name": _clean_text(resource.get("name")),
             "aliases": resource.get("alias") or [],
@@ -5173,7 +5445,7 @@ def parse_fhir_resource(
             "specialty_codes": _codings(resource.get("specialty")),
             "code_codes": _codings(resource.get("code")),
             "telecom": _telecom(resource),
-            "accepting_patients": resource.get("availableTime") or resource.get("extension") or [],
+            **_practitioner_role_completeness_fields(resource),
             "period_start": period_start,
             "period_end": period_end,
         }
@@ -5372,6 +5644,10 @@ def _append_alohr_parsed_resource(
         source_id,
         resource,
         resource_url=f"{ALOHR_GRAPHQL_URL}#{resource.get('resourceType')}/{resource.get('id')}",
+        acquisition=FHIRAcquisitionContext(
+            fetch_url=ALOHR_GRAPHQL_URL,
+            fetch_mode="graphql",
+        ),
         run_id=run_id,
         normalize_location_contacts=resource.get("resourceType") != "Location",
     )
@@ -10308,6 +10584,10 @@ def _canonical_resource_rows(
             "resource_type": resource_type,
             "resource_id": resource_id,
             "resource_url": row.get("resource_url"),
+            "fhir_meta": row.get("fhir_meta"),
+            "fhir_self_url": row.get("fhir_self_url"),
+            "fhir_fetch_url": row.get("fhir_fetch_url"),
+            "fhir_fetch_mode": row.get("fhir_fetch_mode"),
             "payload_hash": payload_hash,
             "payload_json": payload,
             "first_seen_run_id": run_id,
@@ -10711,6 +10991,10 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
             resource_type,
             resource_id,
             resource_url,
+            fhir_meta,
+            fhir_self_url,
+            fhir_fetch_url,
+            fhir_fetch_mode,
             payload_hash,
             payload_json,
             first_seen_run_id,
@@ -10722,6 +11006,10 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
                resource_type,
                resource_id,
                resource_url,
+               fhir_meta,
+               fhir_self_url,
+               fhir_fetch_url,
+               fhir_fetch_mode,
                payload_hash,
                payload_json,
                first_seen_run_id,
@@ -10734,6 +11022,10 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
                    {resource_type_literal} AS resource_type,
                    r.resource_id,
                    r.resource_url,
+                   r.fhir_meta,
+                   r.fhir_self_url,
+                   r.fhir_fetch_url,
+                   r.fhir_fetch_mode,
                    md5(({payload_sql})::text) AS payload_hash,
                    {payload_sql} AS payload_json,
                    r.last_seen_run_id AS first_seen_run_id,
@@ -10752,6 +11044,10 @@ def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tup
           ) AS ranked
         ON CONFLICT (canonical_api_base, resource_type, resource_id) DO UPDATE
             SET resource_url = EXCLUDED.resource_url,
+                fhir_meta = EXCLUDED.fhir_meta,
+                fhir_self_url = EXCLUDED.fhir_self_url,
+                fhir_fetch_url = EXCLUDED.fhir_fetch_url,
+                fhir_fetch_mode = EXCLUDED.fhir_fetch_mode,
                 payload_hash = EXCLUDED.payload_hash,
                 payload_json = EXCLUDED.payload_json,
                 first_seen_run_id = COALESCE(
@@ -12961,6 +13257,17 @@ def _bundle_entries(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
         if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
             entries.append(entry)
     return entries
+
+
+def _rest_bundle_acquisition(
+    entry: dict[str, Any],
+    fetch_url: str,
+) -> FHIRAcquisitionContext:
+    return FHIRAcquisitionContext(
+        self_url=_clean_text(entry.get("fullUrl")),
+        fetch_url=fetch_url,
+        fetch_mode="rest_bundle",
+    )
 
 
 def _next_link(payload: dict[str, Any] | None) -> str | None:
@@ -15347,6 +15654,10 @@ async def _stream_bulk_export_output_rows(
             source["source_id"],
             resource,
             resource_url=_bulk_capability_log_identity(url),
+            acquisition=FHIRAcquisitionContext(
+                fetch_url=_bulk_capability_log_identity(url),
+                fetch_mode="bulk_ndjson",
+            ),
             run_id=run_id,
             normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
         )
@@ -16550,6 +16861,7 @@ async def _consume_partition_entries(
     source_record: dict[str, Any],
     resource_type: str,
     bundle_entries: list[dict[str, Any]],
+    fetch_url: str,
     pending_resource_rows: list[dict[str, Any]],
     fetch_options: PartitionFetchOptions,
 ) -> None:
@@ -16558,6 +16870,7 @@ async def _consume_partition_entries(
             source_record["source_id"],
             entry_record["resource"],
             resource_url=_clean_text(entry_record.get("fullUrl")),
+            acquisition=_rest_bundle_acquisition(entry_record, fetch_url),
             run_id=fetch_options.run_id,
             normalize_location_contacts=not (resource_type == "Location" and fetch_options.row_batch_handler),
         )
@@ -16698,6 +17011,7 @@ async def _split_partition_page_result(
         request.source_record,
         request.resource_type,
         residual_entries,
+        request.current_url,
         request.pending_resource_rows,
         request.fetch_options,
     )
@@ -16759,6 +17073,7 @@ async def _fetch_partition_page(
         request.source_record,
         request.resource_type,
         _partition_page_entries(request, fhir_payload),
+        request.current_url,
         request.pending_resource_rows,
         request.fetch_options,
     )
@@ -17323,6 +17638,7 @@ async def _fetch_resource_rows(
                     source["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
+                    acquisition=_rest_bundle_acquisition(entry, url),
                     run_id=run_id,
                     normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
                 )
@@ -17544,6 +17860,7 @@ async def _fetch_scan_practitioner_role_rows(
                     source["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
+                    acquisition=_rest_bundle_acquisition(entry, url),
                     run_id=options.run_id,
                 )
                 if not parsed:
@@ -17647,6 +17964,8 @@ def _parse_practitioner_role_reverse_lookup_rows(
     source_id: str,
     payload: dict[str, Any],
     run_id: str | None,
+    *,
+    fetch_url: str,
 ) -> list[dict[str, Any]]:
     """Parse PractitionerRole rows from a reverse lookup Bundle payload."""
     resource_rows: list[dict[str, Any]] = []
@@ -17655,6 +17974,7 @@ def _parse_practitioner_role_reverse_lookup_rows(
             source_id,
             entry["resource"],
             resource_url=_clean_text(entry.get("fullUrl")),
+            acquisition=_rest_bundle_acquisition(entry, fetch_url),
             run_id=run_id,
         )
         if not parsed:
@@ -17951,13 +18271,22 @@ async def _fetch_linked_resource_row(
         if status_code != 200 or error or not payload:
             continue
         resource_payload = payload
+        acquisition = FHIRAcquisitionContext(
+            self_url=url,
+            fetch_url=url,
+            fetch_mode="rest_read",
+        )
         if payload.get("resourceType") == "Bundle":
             entries = _bundle_entries(payload)
-            resource_payload = entries[0]["resource"] if entries else {}
+            bundle_entry = entries[0] if entries else None
+            resource_payload = bundle_entry["resource"] if bundle_entry else {}
+            if bundle_entry:
+                acquisition = _rest_bundle_acquisition(bundle_entry, url)
         parsed = parse_fhir_resource(
             source["source_id"],
             resource_payload,
             resource_url=url,
+            acquisition=acquisition,
             run_id=run_id,
         )
         if parsed and parsed[1].get("resource_id") == resource_id:
@@ -18226,6 +18555,7 @@ async def _advance_uhc_plan_graph_collection(
         source_record,
         resource_type,
         bundle_payload,
+        fetch_url=request_url,
         network_reference=network_reference,
         run_id=run_id,
         rows_by_id=state.rows_by_id,
@@ -18325,6 +18655,7 @@ def _merge_uhc_plan_graph_bundle_rows(
     resource_type: str,
     bundle_payload: dict[str, Any],
     *,
+    fetch_url: str,
     network_reference: str | None,
     run_id: str | None,
     rows_by_id: dict[str, dict[str, Any]],
@@ -18348,6 +18679,7 @@ def _merge_uhc_plan_graph_bundle_rows(
             source_record["source_id"],
             bundle_entry["resource"],
             resource_url=_clean_text(bundle_entry.get("fullUrl")),
+            acquisition=_rest_bundle_acquisition(bundle_entry, fetch_url),
             run_id=run_id,
         )
         if (

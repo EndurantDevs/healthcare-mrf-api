@@ -60,10 +60,28 @@ def _fixture_resources() -> list[dict[str, Any]]:
         {
             "resourceType": "InsurancePlan",
             "id": "plan-1",
-            "identifier": [{"system": "https://example.test/plan-id", "value": "H1234-001"}],
+            "meta": {"versionId": "3", "lastUpdated": "2026-07-13T12:00:00Z"},
+            "identifier": [
+                {"system": "https://example.test/product-id", "value": "product-1"},
+                {"system": "https://example.test/issuer-id", "value": "issuer-1"},
+            ],
             "status": "active",
             "name": "Fixture Gold HMO",
             "network": [{"reference": "Organization/net-1"}],
+            "plan": [
+                {
+                    "identifier": [{"value": "H1234-001"}],
+                    "type": {"coding": [{"code": "gold"}]},
+                    "network": [{"reference": "Organization/net-1"}],
+                }
+            ],
+            "coverage": [
+                {
+                    "type": {"coding": [{"code": "medical"}]},
+                    "network": [{"reference": "Organization/net-1"}],
+                    "benefit": [{"type": {"coding": [{"code": "pcp"}]}}],
+                }
+            ],
         },
         {
             "resourceType": "Practitioner",
@@ -95,6 +113,27 @@ def _fixture_resources() -> list[dict[str, Any]]:
             "healthcareService": [{"reference": "HealthcareService/service-1"}],
             "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
             "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+            "availableTime": [{"daysOfWeek": ["mon"], "availableStartTime": "09:00:00"}],
+            "notAvailable": [{"description": "Fixture holiday"}],
+            "availabilityExceptions": "Call for holiday hours",
+            "extension": [
+                {
+                    "url": (
+                        "http://hl7.org/fhir/us/davinci-pdex-plan-net/"
+                        "StructureDefinition/newpatients"
+                    ),
+                    "extension": [
+                        {
+                            "url": "acceptingPatients",
+                            "valueCodeableConcept": {"coding": [{"code": "newpt"}]},
+                        }
+                    ],
+                },
+                {
+                    "url": "https://healthporta.com/fhir/provider-directory/telehealth",
+                    "valueBoolean": True,
+                },
+            ],
         },
         {
             "resourceType": "HealthcareService",
@@ -122,6 +161,53 @@ def _fixture_resources() -> list[dict[str, Any]]:
     ]
 
 
+def _parse_fixture_resources(importer: Any) -> list[tuple[type, dict[str, Any]] | None]:
+    parsed_resources = []
+    for resource in _fixture_resources():
+        resource_type = resource["resourceType"]
+        resource_id = resource["id"]
+        parsed_resources.append(
+            importer.parse_fhir_resource(
+                "fixture_source",
+                resource,
+                resource_url=f"https://fixture.example/fhir/{resource_type}/{resource_id}",
+                acquisition=importer.FHIRAcquisitionContext(
+                    self_url=f"https://fixture.example/fhir/{resource_type}/{resource_id}",
+                    fetch_url=(
+                        f"https://fixture.example/fhir/{resource_type}"
+                        "?_page_token=fixture-secret"
+                    ),
+                    fetch_mode="rest_bundle",
+                ),
+                run_id="fixture-run",
+            )
+        )
+    return parsed_resources
+
+
+def _fixture_completeness_checks(
+    parsed_resources: list[tuple[type, dict[str, Any]] | None],
+) -> dict[str, bool]:
+    rows_by_table = {
+        model.__tablename__: row
+        for parsed_resource in parsed_resources
+        if parsed_resource is not None
+        for model, row in [parsed_resource]
+    }
+    plan_row = rows_by_table.get("provider_directory_insurance_plan", {})
+    role_row = rows_by_table.get("provider_directory_practitioner_role", {})
+    return {
+        "plan_products": len(plan_row.get("product_identifiers") or []) == 2,
+        "plan_backbones": len(plan_row.get("plan_backbones") or []) == 1,
+        "plan_coverage": len(plan_row.get("coverage") or []) == 1,
+        "role_availability": len(role_row.get("available_time") or []) == 1,
+        "role_new_patients": role_row.get("new_patient_acceptance") == [{"code": "newpt"}],
+        "role_telehealth": role_row.get("telehealth") == [{"supported": True}],
+        "meta": plan_row.get("fhir_meta", {}).get("versionId") == "3",
+        "provenance": plan_row.get("fhir_fetch_url") == "https://fixture.example/fhir/InsurancePlan",
+    }
+
+
 def _run_fixture_case() -> CaseResult:
     started = time.monotonic()
     try:
@@ -145,17 +231,27 @@ def _run_fixture_case() -> CaseResult:
             },
             {"status": "valid", "http_status": 200, "response_time_ms": 12, "url": "https://fixture.example/fhir/metadata"},
         )
-        parsed = [importer.parse_fhir_resource("fixture_source", item) for item in _fixture_resources()]
+        parsed = _parse_fixture_resources(importer)
         resource_counts: dict[str, int] = {}
         for model, _row in (item for item in parsed if item):
             resource_counts[model.__tablename__] = resource_counts.get(model.__tablename__, 0) + 1
-        status = "succeeded" if capability["fhir_version"] == "4.0.1" and len(parsed) == 6 else "failed"
+        completeness_checks = _fixture_completeness_checks(parsed)
+        is_complete = (
+            capability["fhir_version"] == "4.0.1"
+            and len(parsed) == 6
+            and all(completeness_checks.values())
+        )
+        status = "succeeded" if is_complete else "failed"
         return CaseResult(
             case_id="fixture-parser",
             kind="fixture",
             status=status,
             elapsed_seconds=time.monotonic() - started,
-            metrics={"supported_resources": capability["supported_resources"], "resource_counts": resource_counts},
+            metrics={
+                "supported_resources": capability["supported_resources"],
+                "resource_counts": resource_counts,
+                "completeness_checks": completeness_checks,
+            },
         )
     except Exception as exc:
         return CaseResult(
