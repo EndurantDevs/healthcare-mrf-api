@@ -98,8 +98,9 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
         "plan.product_identifiers::jsonb AS plan_product_identifiers",
         "plan.plan_backbones::jsonb AS plan_backbones",
         "plan.coverage::jsonb AS plan_coverage",
-        "LEFT JOIN current_resources AS current_plan_detail",
-        "LEFT JOIN mrf.provider_directory_insurance_plan AS plan",
+        "current_insurance_plans AS NOT MATERIALIZED",
+        "WHERE resource.resource_type = 'InsurancePlan'",
+        "LEFT JOIN current_insurance_plans AS plan",
     ):
         assert column in sql
     assert "network_catalog.refs" not in sql
@@ -119,9 +120,9 @@ def test_current_insurance_plan_ctes_start_from_requested_sources():
     ):
         assert f"{scope_name}_sources AS MATERIALIZED" in sql
         assert f"FROM {source_cte}" in sql
-        assert "JOIN current_resources AS current_plan" in sql
+        assert "JOIN current_insurance_plans AS current_plan" in sql
         assert "current_plan.source_id = requested_source.source_id" in sql
-        assert f"JOIN {scope_name} AS current_insurance_plan" in sql
+        assert f"JOIN {scope_name} AS insurance_plan" in sql
     assert "network_catalog.refs" not in role_sql
     assert "network_catalog.refs" not in affiliation_sql
     assert "plan.plan_backbones::jsonb AS plan_backbones" in affiliation_sql
