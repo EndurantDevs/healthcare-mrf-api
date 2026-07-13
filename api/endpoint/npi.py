@@ -3396,7 +3396,6 @@ phone_candidates_unranked AS MATERIALIZED (
               FROM phone_candidate_rows AS candidate
               JOIN phone_candidates AS selected_candidate
                 ON selected_candidate.provider_npi = candidate.provider_npi
-               AND selected_candidate.address_key = candidate.address_key
              WHERE candidate.provider_directory_matched
                AND candidate.source_id IS NOT NULL
                AND candidate.source_record_id IS NOT NULL

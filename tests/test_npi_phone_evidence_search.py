@@ -62,6 +62,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "GROUP BY candidate.provider_npi, candidate.source_id" in sql
     assert "ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)" in sql
     assert "JOIN phone_candidates AS selected_candidate" in sql
+    assert "selected_candidate.address_key = candidate.address_key" not in sql
     assert "FROM phone_candidates AS phone_match" in sql
     assert "LEFT JOIN phone_provider_directory_evidence AS phone_evidence" in sql
     assert "CROSS JOIN LATERAL" in sql
