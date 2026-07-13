@@ -13,6 +13,7 @@ import io
 import json
 import importlib
 import string
+import urllib.parse
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -650,6 +651,50 @@ def test_aetna_commercial_checkpoint_scope_includes_strategy_version():
     assert importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE in (
         importer.PAGINATION_CHECKPOINT_API_BASES
     )
+    assert checkpoint_context is not None
+    assert checkpoint_context.source_scope_hash == hashlib.sha256(
+        expected_scope_payload.encode("utf-8")
+    ).hexdigest()
+
+
+def test_last_updated_partition_checkpoint_scope_includes_partition_identity():
+    partition_resources_by_type = {
+        "Practitioner": {
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2024-01-03T00:00:00Z",
+            "ceiling": 10,
+            "minimum_width_seconds": 3600,
+        }
+    }
+    source_lookup = {
+        "source_id": "partitioned-source",
+        "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        "metadata_json": {
+            importer.LAST_UPDATED_PARTITION_METADATA_KEY: {
+                "enabled": True,
+                "resources": partition_resources_by_type,
+            }
+        },
+    }
+
+    checkpoint_context = importer._pagination_checkpoint_context(
+        source_lookup,
+        ["partitioned-source"],
+        run_id="run_1",
+        retry_of_run_id=None,
+    )
+    expected_scope_payload = json.dumps(
+        {
+            "strategy_version": importer.LAST_UPDATED_PARTITION_STRATEGY_VERSION,
+            "source_ids": ["partitioned-source"],
+            "resource_group": importer._resource_import_group_key(source_lookup),
+            "last_updated_partition_config": partition_resources_by_type,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
     assert checkpoint_context is not None
     assert checkpoint_context.source_scope_hash == hashlib.sha256(
         expected_scope_payload.encode("utf-8")
@@ -17409,3 +17454,791 @@ async def test_overlay_publish_skips_run_scope_without_sources(monkeypatch):
     }
     ensure_overlay.assert_awaited_once_with("mrf")
     status.assert_not_awaited()
+
+
+def _last_updated_partition_test_source(**resource_config_overrides):
+    """Build a probe-only source with one partition-enabled resource."""
+    resource_config_by_field = {
+        "start": "2024-01-01T00:00:00Z",
+        "end": "2024-01-03T00:00:00Z",
+        "ceiling": 10,
+        "minimum_width_seconds": 3600,
+        "page_count": 10,
+        "volatile_metadata_paths": ["/meta/lastUpdated"],
+        **resource_config_overrides,
+    }
+    return {
+        "source_id": "source_scan_partition_test",
+        "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        "last_validated_status": "valid",
+        "metadata_json": {
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_fully_enumerable_resources": [],
+            importer.LAST_UPDATED_PARTITION_METADATA_KEY: {
+                "enabled": True,
+                "resources": {"Practitioner": resource_config_by_field},
+            },
+        },
+    }
+
+
+def _last_updated_partition_test_context():
+    """Build the durable checkpoint identity shared by partition tests."""
+    return importer.PaginationCheckpointContext(
+        canonical_api_base=importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        source_scope_hash="scan-partition-scope",
+        source_ids=("source_scan_partition_test",),
+        owner_run_id="run_partition",
+        acquisition_root_run_id="run_partition",
+        dataset_id="dataset_partition",
+    )
+
+
+def _last_updated_partition_test_resource(
+    resource_id: str,
+    *,
+    family: str = "Stable",
+    last_updated: str = "2024-01-01T01:00:00Z",
+):
+    """Build one Practitioner whose volatile timestamp can vary by pass."""
+    return {
+        "resourceType": "Practitioner",
+        "id": resource_id,
+        "meta": {"lastUpdated": last_updated},
+        "name": [{"family": family}],
+    }
+
+
+def _last_updated_partition_test_bundle(resources, *, total=None):
+    """Wrap partition test resources in a searchset Bundle."""
+    payload = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": resource} for resource in resources],
+    }
+    if total is not None:
+        payload["total"] = total
+    return payload
+
+
+def _new_last_updated_partition_resume(partition_config):
+    """Build the initial durable state for a partition acquisition."""
+    return importer.LastUpdatedPartitionResume(
+        importer.PartitionPlan.create(
+            partition_config.start,
+            partition_config.end,
+            ceiling=partition_config.ceiling,
+            minimum_width=partition_config.minimum_width,
+            volatile_metadata_paths=partition_config.volatile_metadata_paths,
+        )
+    )
+
+
+class _LastUpdatedPartitionFetchHarness:
+    """Capture staged rows and proof records from one partition fetch."""
+
+    def __init__(self, directory_source, fingerprints_by_window_and_pass=None):
+        self.directory_source = directory_source
+        self.staged_resources_by_id = {}
+        self.written_resource_ids = []
+        self.fingerprints_by_window_and_pass = (
+            fingerprints_by_window_and_pass
+            if fingerprints_by_window_and_pass is not None
+            else {}
+        )
+
+    async def _stage_window(
+        self,
+        _context,
+        _source,
+        _resource_type,
+        _model,
+        resources,
+        **_kwargs,
+    ):
+        self.staged_resources_by_id.update(
+            {resource["id"]: resource for resource in resources}
+        )
+        return {
+            resource["id"]: f"candidate-hash:{resource['id']}"
+            for resource in resources
+        }
+
+    async def _stream_staged(
+        self,
+        _context,
+        _source,
+        _resource_type,
+        _model,
+        partition_plan,
+        *,
+        row_batch_handler,
+        **_kwargs,
+    ):
+        expected_resource_ids = {
+            resource_id
+            for partition_window in partition_plan.leaf_windows()
+            for resource_id in self.fingerprints_by_window_and_pass[
+                (partition_window.window_id, 2)
+            ]
+        }
+        assert set(self.staged_resources_by_id) == expected_resource_ids
+        output_rows = [
+            {
+                "source_id": self.directory_source["source_id"],
+                "resource_id": resource_id,
+            }
+            for resource_id in sorted(self.staged_resources_by_id)
+        ]
+        written_count = await row_batch_handler(
+            ProviderDirectoryPractitioner,
+            output_rows,
+        )
+        return len(output_rows), written_count
+
+    async def _write_rows(self, _model, output_rows):
+        self.written_resource_ids.extend(
+            output_row["resource_id"] for output_row in output_rows
+        )
+        return len(output_rows)
+
+    async def _load_fingerprints(
+        self,
+        _context,
+        _resource_type,
+        window_id,
+        pass_number,
+    ):
+        return dict(
+            self.fingerprints_by_window_and_pass.get(
+                (window_id, pass_number),
+                {},
+            )
+        )
+
+    async def _verify_and_store(
+        self,
+        _context,
+        _resource_type,
+        partition_window,
+        pass_number,
+        candidate_hashes_by_id=None,
+    ):
+        fingerprints_by_id = dict(
+            partition_window.passes[pass_number].resource_fingerprints
+        )
+        if pass_number == 2:
+            assert self.fingerprints_by_window_and_pass[
+                (partition_window.window_id, 1)
+            ] == fingerprints_by_id
+        self.fingerprints_by_window_and_pass[
+            (partition_window.window_id, pass_number)
+        ] = fingerprints_by_id
+        if pass_number == 2:
+            assert set(candidate_hashes_by_id or {}) == set(fingerprints_by_id)
+
+    def _install_importer_mocks(
+        self,
+        monkeypatch,
+        fetch_source_json,
+        partition_resume,
+        save_plan_callback,
+    ):
+        monkeypatch.setattr(
+            importer,
+            "_load_partition_plan",
+            AsyncMock(return_value=partition_resume),
+        )
+        monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+        monkeypatch.setattr(
+            importer,
+            "_save_last_updated_partition_plan",
+            save_plan_callback or AsyncMock(),
+        )
+        monkeypatch.setattr(
+            importer,
+            "_stage_last_updated_partition_window",
+            self._stage_window,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_load_last_updated_partition_window_fingerprints",
+            self._load_fingerprints,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_store_partition_pass_proof",
+            self._verify_and_store,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_stream_last_updated_partition_staged_rows",
+            self._stream_staged,
+        )
+
+    async def _fetch_resource_rows(self, partition_config):
+        fetch_options = importer.LastUpdatedPartitionFetchOptions(
+            per_resource_limit=0,
+            page_limit=0,
+            timeout=3,
+            run_id="run_partition",
+            row_batch_handler=self._write_rows,
+            row_batch_size=2,
+            retain_rows=False,
+            cancel_ctx=None,
+            cancel_task=None,
+            deadline_seconds=0,
+            pagination_checkpoint=_last_updated_partition_test_context(),
+        )
+        return await importer._fetch_last_updated_partition_resource_rows(
+            self.directory_source,
+            "Practitioner",
+            ProviderDirectoryPractitioner,
+            partition_config,
+            fetch_options,
+        )
+
+
+async def _run_last_updated_partition_test_fetch(
+    monkeypatch,
+    directory_source,
+    fetch_source_json,
+    *,
+    partition_resume=None,
+    save_plan_callback=None,
+    fingerprints_by_window_and_pass=None,
+):
+    """Exercise the production partition path with deterministic test stores."""
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None
+    assert partition_config is not None
+    durable_resume = partition_resume or _new_last_updated_partition_resume(
+        partition_config
+    )
+    fetch_harness = _LastUpdatedPartitionFetchHarness(
+        directory_source,
+        fingerprints_by_window_and_pass,
+    )
+    fetch_harness._install_importer_mocks(
+        monkeypatch,
+        fetch_source_json,
+        durable_resume,
+        save_plan_callback,
+    )
+    fetch_outcome = await fetch_harness._fetch_resource_rows(partition_config)
+    return (
+        fetch_outcome,
+        fetch_harness.staged_resources_by_id,
+        fetch_harness.written_resource_ids,
+    )
+
+
+class _PartitionResumeRecorder:
+    """Persist the first pass and interrupt before its verification pass."""
+
+    def __init__(self):
+        self.persisted_resume = None
+
+    async def _save_and_interrupt(
+        self,
+        _context,
+        _resource_type,
+        partition_config,
+        partition_plan,
+        *,
+        pages_processed,
+        rows_processed,
+    ):
+        checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
+            partition_config,
+            partition_plan,
+        )
+        restored_plan = importer._last_updated_partition_plan_from_checkpoint(
+            checkpoint_payload,
+            partition_config,
+        )
+        self.persisted_resume = importer.LastUpdatedPartitionResume(
+            restored_plan,
+            pages_processed=pages_processed,
+            rows_processed=rows_processed,
+        )
+        has_unverified_first_pass = any(
+            1 in partition_window.passes and 2 not in partition_window.passes
+            for partition_window in partition_plan.leaf_windows()
+        )
+        if has_unverified_first_pass:
+            raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_acquisition_resumes_after_pass_one(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    practitioner_resource = _last_updated_partition_test_resource("prac-1")
+    fingerprints_by_window_and_pass = {}
+    first_requested_urls = []
+
+    async def first_fetch(_source, request_url, *, timeout):
+        first_requested_urls.append(request_url)
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=1), None, 1
+        return 200, _last_updated_partition_test_bundle(
+            [practitioner_resource]
+        ), None, 1
+
+    resume_recorder = _PartitionResumeRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            first_fetch,
+            save_plan_callback=resume_recorder._save_and_interrupt,
+            fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+        )
+
+    assert resume_recorder.persisted_resume is not None
+    assert len(first_requested_urls) == 2
+    resumed_requested_urls = []
+
+    async def resumed_fetch(_source, request_url, *, timeout):
+        resumed_requested_urls.append(request_url)
+        return 200, _last_updated_partition_test_bundle(
+            [practitioner_resource]
+        ), None, 1
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            resumed_fetch,
+            partition_resume=resume_recorder.persisted_resume,
+            fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+        )
+    )
+
+    assert fetch_outcome.complete is True
+    assert fetch_outcome.fetch_mode == importer.LAST_UPDATED_PARTITION_FETCH_MODE
+    assert set(staged_resources_by_id) == {"prac-1"}
+    assert written_resource_ids == ["prac-1"]
+    assert len(resumed_requested_urls) == 1
+    assert "_summary=count" not in resumed_requested_urls[0]
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_acquisition_blocks_count_mismatch(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=2), None, 1
+        return 200, _last_updated_partition_test_bundle(
+            [_last_updated_partition_test_resource("prac-1")]
+        ), None, 1
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert "count_mismatch" in fetch_outcome.error
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_acquisition_rejects_duplicate_ids(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    duplicate_resource = _last_updated_partition_test_resource("prac-duplicate")
+
+    async def fetch_source_json(_source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=2), None, 1
+        return 200, _last_updated_partition_test_bundle(
+            [duplicate_resource, duplicate_resource]
+        ), None, 1
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert "duplicate_resource_id" in fetch_outcome.error
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+class _UnstableTwinPassResponder:
+    """Return a changed stable field during the verification pass."""
+
+    def __init__(self):
+        self.family_names_by_pass = iter(("First", "Changed"))
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        if "_summary=count" in request_url:
+            return 200, _last_updated_partition_test_bundle([], total=1), None, 1
+        family_name = next(self.family_names_by_pass)
+        practitioner_resource = _last_updated_partition_test_resource(
+            "prac-1",
+            family=family_name,
+        )
+        return 200, _last_updated_partition_test_bundle(
+            [practitioner_resource]
+        ), None, 1
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_acquisition_blocks_unstable_twin_pass(monkeypatch):
+    directory_source = _last_updated_partition_test_source()
+    responder = _UnstableTwinPassResponder()
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert "twin_pass_mismatch" in fetch_outcome.error
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+class _DeterministicPartitionResponder:
+    """Serve one split partition with volatile-only pass differences."""
+
+    def __init__(self):
+        self.requested_urls = []
+
+    def _count_for_bounds(self, partition_bounds):
+        counts_by_bounds = {
+            (
+                "ge2024-01-01T00:00:00.000000Z",
+                "lt2024-01-03T00:00:00.000000Z",
+            ): 3,
+            (
+                "ge2024-01-01T00:00:00.000000Z",
+                "lt2024-01-02T00:00:00.000000Z",
+            ): 1,
+            (
+                "ge2024-01-02T00:00:00.000000Z",
+                "lt2024-01-03T00:00:00.000000Z",
+            ): 2,
+        }
+        return counts_by_bounds[partition_bounds]
+
+    def _resources_for_bounds(self, partition_bounds):
+        lower_bound, _upper_bound = partition_bounds
+        if lower_bound != "ge2024-01-01T00:00:00.000000Z":
+            return [
+                _last_updated_partition_test_resource("prac-right-1"),
+                _last_updated_partition_test_resource("prac-right-2"),
+            ]
+        volatile_timestamp = (
+            "2024-01-01T01:00:00Z"
+            if len(self.requested_urls) % 2
+            else "2024-01-01T01:00:01Z"
+        )
+        return [
+            _last_updated_partition_test_resource(
+                "prac-left",
+                last_updated=volatile_timestamp,
+            )
+        ]
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        self.requested_urls.append(request_url)
+        query_lookup = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(request_url).query
+        )
+        partition_bounds = tuple(query_lookup["_lastUpdated"])
+        if query_lookup.get("_summary") == ["count"]:
+            partition_count = self._count_for_bounds(partition_bounds)
+            return 200, _last_updated_partition_test_bundle(
+                [],
+                total=partition_count,
+            ), None, 1
+        practitioner_resources = self._resources_for_bounds(partition_bounds)
+        return 200, _last_updated_partition_test_bundle(
+            practitioner_resources
+        ), None, 1
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_acquisition_succeeds_deterministically(monkeypatch):
+    directory_source = _last_updated_partition_test_source(
+        ceiling=2,
+        page_count=2,
+        minimum_width_seconds=3600,
+    )
+    responder = _DeterministicPartitionResponder()
+
+    assert (
+        importer._resource_acquisition_blocked_reason(
+            directory_source,
+            ["Practitioner"],
+        )
+        is None
+    )
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is True
+    assert fetch_outcome.rows_fetched == 3
+    assert set(staged_resources_by_id) == {
+        "prac-left",
+        "prac-right-1",
+        "prac-right-2",
+    }
+    assert written_resource_ids == ["prac-left", "prac-right-1", "prac-right-2"]
+    count_windows = [
+        urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["_lastUpdated"]
+        for url in responder.requested_urls
+        if "_summary=count" in url
+    ]
+    assert count_windows == [
+        ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-03T00:00:00.000000Z"],
+        ["ge2024-01-01T00:00:00.000000Z", "lt2024-01-02T00:00:00.000000Z"],
+        ["ge2024-01-02T00:00:00.000000Z", "lt2024-01-03T00:00:00.000000Z"],
+    ]
+
+
+def test_last_updated_partition_checkpoint_omits_resource_fingerprints():
+    directory_source = _last_updated_partition_test_source()
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None
+    assert partition_config is not None
+    partition_plan = importer.PartitionPlan.create(
+        partition_config.start,
+        partition_config.end,
+        ceiling=partition_config.ceiling,
+        minimum_width=partition_config.minimum_width,
+        volatile_metadata_paths=partition_config.volatile_metadata_paths,
+    )
+    partition_plan.observe_count("root", importer.CountObservation.exact(1))
+    partition_plan.record_pass(
+        "root",
+        1,
+        [_last_updated_partition_test_resource("sensitive-resource-id")],
+        complete=True,
+    )
+
+    checkpoint_payload = importer._last_updated_partition_checkpoint_payload(
+        partition_config,
+        partition_plan,
+    )
+
+    assert "sensitive-resource-id" not in checkpoint_payload
+    assert json.loads(checkpoint_payload)["control"]["windows"][0][
+        "completed_passes"
+    ] == [1]
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_resolves_root_cutoff_once(monkeypatch):
+    directory_source = _last_updated_partition_test_source(end="resolved_now")
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None
+    assert partition_config is not None
+    assert partition_config.identity()["end"] == "resolved_now"
+    monkeypatch.setattr(
+        importer,
+        "_fetch_pagination_checkpoint",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_clear_checkpoint_dataset_resource_type",
+        AsyncMock(),
+    )
+    reset_checkpoint = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_reset_pagination_checkpoint",
+        reset_checkpoint,
+    )
+    before_resolution = datetime.datetime.now(datetime.UTC)
+
+    resume = await importer._load_partition_plan(
+        _last_updated_partition_test_context(),
+        "Practitioner",
+        partition_config,
+    )
+
+    after_resolution = datetime.datetime.now(datetime.UTC)
+    root_window = resume.plan.windows["root"]
+    assert before_resolution <= root_window.end <= after_resolution
+    durable_payload = reset_checkpoint.await_args.args[2]
+    restored_plan = importer._last_updated_partition_plan_from_checkpoint(
+        durable_payload,
+        partition_config,
+    )
+    assert restored_plan.windows["root"].end == root_window.end
+
+
+def test_probe_only_partition_opt_in_must_cover_every_requested_resource():
+    source = _last_updated_partition_test_source()
+
+    assert importer._resource_acquisition_blocked_reason(
+        source,
+        ["Practitioner"],
+    ) is None
+    assert importer._resource_acquisition_blocked_reason(
+        source,
+        ["Practitioner", "Location"],
+    ) == "coverage_mode_probe_only"
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_pass_two_never_overwrites_pass_one(monkeypatch):
+    window = importer.TimeWindow(
+        "root",
+        datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+        datetime.datetime(2024, 1, 2, tzinfo=datetime.UTC),
+        count=1,
+        passes={2: importer.WindowPass({"prac-1": "pass-two-hash"})},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_last_updated_partition_window_fingerprints",
+        AsyncMock(return_value={"prac-1": "pass-one-hash"}),
+    )
+    store_fingerprints = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_store_last_updated_partition_window_fingerprints",
+        store_fingerprints,
+    )
+
+    with pytest.raises(RuntimeError, match="twin_pass_mismatch"):
+        await importer._store_partition_pass_proof(
+            _last_updated_partition_test_context(),
+            "Practitioner",
+            window,
+            2,
+        )
+
+    store_fingerprints.assert_not_awaited()
+
+
+def _stable_partition_test_plan():
+    """Build a verified two-resource plan for staged-row streaming."""
+    directory_source = _last_updated_partition_test_source()
+    partition_config, config_error = importer._last_updated_partition_config(
+        directory_source,
+        "Practitioner",
+    )
+    assert config_error is None
+    assert partition_config is not None
+    partition_plan = importer.PartitionPlan.create(
+        partition_config.start,
+        partition_config.end,
+        ceiling=partition_config.ceiling,
+        minimum_width=partition_config.minimum_width,
+        volatile_metadata_paths=partition_config.volatile_metadata_paths,
+    )
+    partition_plan.observe_count("root", importer.CountObservation.exact(2))
+    stable_resources = [
+        _last_updated_partition_test_resource("prac-1"),
+        _last_updated_partition_test_resource("prac-2"),
+    ]
+    partition_plan.record_pass("root", 1, stable_resources, complete=True)
+    partition_plan.record_pass("root", 2, stable_resources, complete=True)
+    partition_plan.windows["root"].passes = {
+        1: importer.WindowPass({}),
+        2: importer.WindowPass({}),
+    }
+    return directory_source, partition_plan
+
+
+class _StagedPartitionRowResponder:
+    """Serve deterministic keyset pages from the staged-row relation."""
+
+    def __init__(self):
+        self.requested_cursors = []
+
+    async def _fetch_rows(self, _sql, **query_params):
+        cursor = query_params["after_resource_id"]
+        self.requested_cursors.append(cursor)
+        rows_by_cursor = {
+            "": [
+                {
+                    "resource_id": "prac-1",
+                    "payload_json": {"resource_id": "prac-1"},
+                }
+            ],
+            "prac-1": [
+                {
+                    "resource_id": "prac-2",
+                    "payload_json": {"resource_id": "prac-2"},
+                }
+            ],
+            "prac-2": [],
+        }
+        return rows_by_cursor[cursor]
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_staged_rows_stream_with_keyset(monkeypatch):
+    directory_source, partition_plan = _stable_partition_test_plan()
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(
+            return_value={
+                "candidate_count": 2,
+                "proof_count": 2,
+                "invalid_candidate_count": 0,
+                "orphan_proof_count": 0,
+            }
+        ),
+    )
+    row_responder = _StagedPartitionRowResponder()
+    monkeypatch.setattr(importer.db, "all", row_responder._fetch_rows)
+    written_batches = []
+
+    async def write_batch(_model, output_rows):
+        written_batches.append(
+            [output_row["resource_id"] for output_row in output_rows]
+        )
+        return len(output_rows)
+
+    streamed_count, written_count = (
+        await importer._stream_last_updated_partition_staged_rows(
+            _last_updated_partition_test_context(),
+            directory_source,
+            "Practitioner",
+            ProviderDirectoryPractitioner,
+            partition_plan,
+            run_id="run_partition",
+            row_batch_handler=write_batch,
+            row_batch_size=1,
+        )
+    )
+
+    assert streamed_count == written_count == 2
+    assert row_responder.requested_cursors == ["", "prac-1", "prac-2"]
+    assert written_batches == [["prac-1"], ["prac-2"]]
