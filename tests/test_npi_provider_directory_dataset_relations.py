@@ -31,9 +31,13 @@ def test_role_sql_uses_dataset_relations():
     assert "provider_directory_dataset_network_plan AS network_plan" in sql
     assert "network_plan.dataset_id = role_network.dataset_id" in sql
     assert "network_plan.network_resource_id = role_network.resource_id" in sql
-    assert "JOIN current_insurance_plans AS insurance_plan" in sql
-    assert "insurance_plan.resource_id = network_plan.insurance_plan_resource_id" in sql
-    assert "network_plan.insurance_plan_resource_id = direct_plan.resource_id" in sql
+    assert "dataset_network_plan_candidates AS MATERIALIZED" in sql
+    assert "network_plan.insurance_plan_resource_id AS resource_id" in sql
+    assert "JOIN mrf.provider_directory_dataset_resource AS insurance_plan" in sql
+    assert "insurance_plan.dataset_id = candidate.dataset_id" in sql
+    assert "insurance_plan.resource_id = candidate.resource_id" in sql
+    assert "direct_plan.resource_id =" in sql
+    assert "network_plan.insurance_plan_resource_id" in sql
     assert "provider_directory_dataset_affiliation_organization" in sql
     assert "affiliation_locator.dataset_id = role_organization.dataset_id" in sql
 

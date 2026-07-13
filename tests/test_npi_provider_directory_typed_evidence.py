@@ -65,22 +65,24 @@ def _typed_plan_evidence_map():
         "name": None,
         "reference": None,
         "provenance": "network-derived",
-        "plan_status": "active",
-        "plan_name": "Example Choice",
-        "plan_aliases": ["Choice"],
-        "plan_type_codes": [{"code": "medical"}],
-        "plan_owned_by_ref": "Organization/owner-1",
-        "plan_administered_by_ref": "Organization/admin-1",
-        "plan_period_start": "2026-01-01",
-        "plan_product_identifiers": [{"value": "product-1"}],
-        "plan_backbones": [
-            {"type": "plan", "identifier": [{"value": "backbone-a"}]},
-            {"type": "plan"},
-        ],
-        "plan_coverage": {"type": "medical"},
-        "plan_fhir_meta": {"lastUpdated": "2026-07-13T12:00:00Z"},
-        "plan_fhir_fetch_url": "https://example.test/fhir/InsurancePlan/plan-name-only",
-        "plan_fhir_fetch_mode": "read",
+        "plan_payload_json": {
+            "status": "active",
+            "name": "Example Choice",
+            "aliases": ["Choice"],
+            "type_codes": [{"code": "medical"}],
+            "owned_by_ref": "Organization/owner-1",
+            "administered_by_ref": "Organization/admin-1",
+            "period_start": "2026-01-01",
+            "product_identifiers": [{"value": "product-1"}],
+            "plan_backbones": [
+                {"type": "plan", "identifier": [{"value": "backbone-a"}]},
+                {"type": "plan"},
+            ],
+            "coverage": {"type": "medical"},
+            "fhir_meta": {"lastUpdated": "2026-07-13T12:00:00Z"},
+            "fhir_fetch_url": "https://example.test/fhir/InsurancePlan/plan-name-only",
+            "fhir_fetch_mode": "read",
+        },
     }
 
 
@@ -95,12 +97,10 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
         "role.available_time::jsonb AS role_available_time",
         "role.new_patient_acceptance::jsonb AS role_new_patient_acceptance",
         "role.telehealth AS role_telehealth",
-        "plan.product_identifiers::jsonb AS plan_product_identifiers",
-        "plan.plan_backbones::jsonb AS plan_backbones",
-        "plan.coverage::jsonb AS plan_coverage",
+        "plan.payload_json::jsonb - ARRAY[",
         "current_insurance_plans AS NOT MATERIALIZED",
         "WHERE resource.resource_type = 'InsurancePlan'",
-        "LEFT JOIN current_insurance_plans AS plan",
+        "LEFT JOIN current_resources AS plan",
     ):
         assert column in sql
     assert "network_catalog.refs" not in sql
@@ -125,7 +125,17 @@ def test_legacy_insurance_plan_ctes_start_from_incomplete_requested_sources():
         assert f"JOIN {scope_name} AS insurance_plan" in sql
     assert "network_catalog.refs" not in role_sql
     assert "network_catalog.refs" not in affiliation_sql
-    assert "plan.plan_backbones::jsonb AS plan_backbones" in affiliation_sql
+    assert "plan.payload_json::jsonb - ARRAY[" in affiliation_sql
+    for excluded_field in (
+        "network_refs",
+        "coverage_area_refs",
+        "plan_json",
+        "resource_id",
+        "resource_url",
+        "plan_identifier",
+    ):
+        assert f"'{excluded_field}'" in role_sql
+        assert f"'{excluded_field}'" in affiliation_sql
 
 
 def test_affiliation_evidence_maps_typed_plan_details():

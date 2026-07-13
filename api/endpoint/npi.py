@@ -1488,12 +1488,21 @@ def _scoped_current_insurance_plan_ctes_sql(
 
 
 def _dataset_role_plan_sql(schema: str) -> str:
-    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    insurance_plan_status = (
+        "insurance_plan.payload_json::jsonb ->> 'status'"
+    )
+    insurance_plan_identifier = (
+        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
+    )
+    insurance_plan_active = (
+        "COALESCE(NULLIF(LOWER(BTRIM("
+        f"{insurance_plan_status})), ''), 'active') = 'active'"
+    )
     return f"""
-    dataset_network_derived_plans AS MATERIALIZED (
-        SELECT role_network.source_id, role_network.role_id,
-               insurance_plan.resource_id,
-               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
+    dataset_network_plan_candidates AS MATERIALIZED (
+        SELECT role_network.dataset_id, role_network.source_id,
+               role_network.role_id,
+               network_plan.insurance_plan_resource_id AS resource_id,
                CASE WHEN BOOL_OR(role_network.plan_provenance = 'network-derived')
                     THEN 'network-derived'::varchar
                     ELSE 'organization-affiliation-network-derived'::varchar
@@ -1507,11 +1516,6 @@ def _dataset_role_plan_sql(schema: str) -> str:
           JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE} AS network_plan
             ON network_plan.dataset_id = role_network.dataset_id
            AND network_plan.network_resource_id = role_network.resource_id
-          JOIN current_insurance_plans AS insurance_plan
-            ON insurance_plan.dataset_id = network_plan.dataset_id
-           AND insurance_plan.source_id = role_network.source_id
-           AND insurance_plan.resource_id = network_plan.insurance_plan_resource_id
-           AND {insurance_plan_active}
          WHERE role_network.dataset_network_plan_complete
            AND NOT EXISTS (
                SELECT 1
@@ -1519,10 +1523,23 @@ def _dataset_role_plan_sql(schema: str) -> str:
                 WHERE direct_plan.dataset_id = role_network.dataset_id
                   AND direct_plan.source_id = role_network.source_id
                   AND direct_plan.role_id = role_network.role_id
-                  AND direct_plan.resource_id = insurance_plan.resource_id
+                  AND direct_plan.resource_id =
+                      network_plan.insurance_plan_resource_id
            )
-      GROUP BY role_network.source_id, role_network.role_id,
-               insurance_plan.resource_id, insurance_plan.plan_identifier
+      GROUP BY role_network.dataset_id, role_network.source_id,
+               role_network.role_id,
+               network_plan.insurance_plan_resource_id
+    ), dataset_network_derived_plans AS MATERIALIZED (
+        SELECT candidate.source_id, candidate.role_id,
+               insurance_plan.resource_id,
+               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier,
+               candidate.provenance
+          FROM dataset_network_plan_candidates AS candidate
+          JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
+            ON insurance_plan.dataset_id = candidate.dataset_id
+           AND insurance_plan.resource_type = 'InsurancePlan'
+           AND insurance_plan.resource_id = candidate.resource_id
+           AND {insurance_plan_active}
     )
     """
 
@@ -1918,10 +1935,23 @@ def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> st
     """
 
 
+def _provider_directory_plan_evidence_payload_sql(alias: str) -> str:
+    """Project response fields once without carrying large network locators."""
+    return f"""
+        ({alias}.payload_json::jsonb - ARRAY[
+            'network_refs', 'coverage_area_refs', 'plan_json',
+            'resource_id', 'resource_url', 'plan_identifier'
+        ]::text[])
+    """.strip()
+
+
 _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
     WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
          {role_ctes_sql}, evidence AS (
         {evidence_union_sql}
+    ), evidence_count AS MATERIALIZED (
+        SELECT COUNT(*)::bigint AS evidence_row_total
+          FROM evidence
     )
     SELECT evidence.source_id, evidence.role_id, evidence.evidence_type,
            evidence.resource_id, evidence.identifier, evidence.name, evidence.reference,
@@ -1934,27 +1964,18 @@ _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE = """
            role.role_not_available, role.role_availability_exceptions,
            role.role_new_patient_acceptance, role.role_telehealth, role.role_fhir_meta,
            role.role_fhir_self_url, role.role_fhir_fetch_url, role.role_fhir_fetch_mode,
-           plan.status AS plan_status, plan.name AS plan_name,
-           plan.aliases::jsonb AS plan_aliases, plan.type_codes::jsonb AS plan_type_codes,
-           plan.owned_by_ref AS plan_owned_by_ref,
-           plan.administered_by_ref AS plan_administered_by_ref,
-           plan.period_start AS plan_period_start, plan.period_end AS plan_period_end,
-           plan.product_identifiers::jsonb AS plan_product_identifiers,
-           plan.plan_backbones::jsonb AS plan_backbones,
-           plan.coverage::jsonb AS plan_coverage,
-           plan.fhir_meta::jsonb AS plan_fhir_meta,
-           plan.fhir_self_url AS plan_fhir_self_url,
-           plan.fhir_fetch_url AS plan_fhir_fetch_url,
-           plan.fhir_fetch_mode AS plan_fhir_fetch_mode,
-           COUNT(*) OVER ()::bigint AS evidence_row_total
+           {plan_payload_sql} AS plan_payload_json,
+           evidence_count.evidence_row_total
       FROM evidence
+ CROSS JOIN evidence_count
  LEFT JOIN roles AS role
         ON evidence.evidence_type = 'role'
        AND role.source_id = evidence.source_id
        AND role.role_id = evidence.role_id
- LEFT JOIN current_insurance_plans AS plan
+ LEFT JOIN current_resources AS plan
         ON evidence.evidence_type = 'insurance_plan'
        AND plan.source_id = evidence.source_id
+       AND plan.resource_type = 'InsurancePlan'
        AND plan.resource_id = evidence.resource_id
   ORDER BY CASE WHEN evidence_type = 'role' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.role_id, evidence.evidence_type, evidence.resource_id
@@ -1986,6 +2007,7 @@ def _provider_directory_role_evidence_sql(
             schema,
             has_catalog,
         ),
+        plan_payload_sql=_provider_directory_plan_evidence_payload_sql("plan"),
         max_evidence_rows=MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS,
     )
 
@@ -2009,12 +2031,44 @@ def _provider_directory_plan_metadata(mapping: Mapping[str, Any]) -> dict[str, A
     }
 
 
-def _provider_directory_period(mapping: Mapping[str, Any], prefix: str) -> dict[str, Any] | None:
-    period_map = {
-        key: mapping.get(f"{prefix}_period_{key}")
-        for key in ("start", "end")
-        if mapping.get(f"{prefix}_period_{key}") is not None
-    }
+def _provider_directory_evidence_payload(
+    mapping: Mapping[str, Any],
+    field_name: str,
+) -> Mapping[str, Any]:
+    value = mapping.get(field_name)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            value = json.loads(value)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _provider_directory_evidence_field(
+    mapping: Mapping[str, Any],
+    prefix: str,
+    payload_map: Mapping[str, Any],
+    field_name: str,
+) -> Any:
+    if field_name in payload_map:
+        return payload_map[field_name]
+    return mapping.get(f"{prefix}_{field_name}")
+
+
+def _provider_directory_period(
+    mapping: Mapping[str, Any],
+    prefix: str,
+    payload_map: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    payload_map = payload_map or {}
+    period_map = {}
+    for key in ("start", "end"):
+        value = _provider_directory_evidence_field(
+            mapping,
+            prefix,
+            payload_map,
+            f"period_{key}",
+        )
+        if value is not None:
+            period_map[key] = value
     return period_map or None
 
 
@@ -2105,13 +2159,27 @@ def _provider_directory_fhir_meta(value: Any) -> dict[str, Any] | None:
 def _provider_directory_fhir_provenance(
     mapping: Mapping[str, Any],
     prefix: str,
+    payload_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    payload_map = payload_map or {}
     provenance_map: dict[str, Any] = {}
-    meta = _provider_directory_fhir_meta(mapping.get(f"{prefix}_fhir_meta"))
+    meta = _provider_directory_fhir_meta(
+        _provider_directory_evidence_field(
+            mapping,
+            prefix,
+            payload_map,
+            "fhir_meta",
+        )
+    )
     if meta is not None:
         provenance_map["meta"] = meta
     for field_name in ("self_url", "fetch_url", "fetch_mode"):
-        field_value = mapping.get(f"{prefix}_fhir_{field_name}")
+        field_value = _provider_directory_evidence_field(
+            mapping,
+            prefix,
+            payload_map,
+            f"fhir_{field_name}",
+        )
         if field_value is not None:
             normalized_value = (
                 _provider_directory_fhir_url_identity(field_value)
@@ -2160,6 +2228,10 @@ def _append_provider_directory_plan_evidence(
     role_evidence: dict[str, Any],
     plan_keys: set[tuple[Any, ...]],
 ) -> None:
+    plan_payload = _provider_directory_evidence_payload(
+        mapping,
+        "plan_payload_json",
+    )
     plan_detail_map = {
         "resource_type": "InsurancePlan",
         "resource_id": mapping["resource_id"],
@@ -2181,15 +2253,23 @@ def _append_provider_directory_plan_evidence(
         "backbones",
         "coverage",
     ):
-        source_field = f"plan_{field_name}"
         output_field = "plan_backbones" if field_name == "backbones" else field_name
-        field_value = mapping.get(source_field)
+        field_value = _provider_directory_evidence_field(
+            mapping,
+            "plan",
+            plan_payload,
+            output_field,
+        )
         if field_value is not None:
             plan_detail_map[output_field] = field_value
-    period = _provider_directory_period(mapping, "plan")
+    period = _provider_directory_period(mapping, "plan", plan_payload)
     if period is not None:
         plan_detail_map["period"] = period
-    provenance = _provider_directory_fhir_provenance(mapping, "plan")
+    provenance = _provider_directory_fhir_provenance(
+        mapping,
+        "plan",
+        plan_payload,
+    )
     if provenance is not None:
         plan_detail_map["fhir_provenance"] = provenance
     plan_fields = tuple(
@@ -2372,24 +2452,38 @@ def _provider_directory_requested_affiliation_ctes_sql(schema: str) -> str:
 
 
 def _dataset_affiliation_plan_sql(schema: str) -> str:
-    insurance_plan_active = _insurance_plan_active_sql("insurance_plan")
+    insurance_plan_status = (
+        "insurance_plan.payload_json::jsonb ->> 'status'"
+    )
+    insurance_plan_identifier = (
+        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
+    )
+    insurance_plan_active = (
+        "COALESCE(NULLIF(LOWER(BTRIM("
+        f"{insurance_plan_status})), ''), 'active') = 'active'"
+    )
     return f"""
-    dataset_affiliation_plans AS MATERIALIZED (
-        SELECT DISTINCT affiliation_network.source_id,
+    dataset_affiliation_plan_candidates AS MATERIALIZED (
+        SELECT DISTINCT affiliation_network.dataset_id,
+               affiliation_network.source_id,
                affiliation_network.affiliation_id,
-               insurance_plan.resource_id,
-               NULLIF(BTRIM(insurance_plan.plan_identifier), '')::varchar AS identifier,
-               'organization-affiliation-network-derived'::varchar AS provenance
+               network_plan.insurance_plan_resource_id AS resource_id
           FROM valid_affiliation_networks AS affiliation_network
           JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE} AS network_plan
             ON network_plan.dataset_id = affiliation_network.dataset_id
            AND network_plan.network_resource_id = affiliation_network.resource_id
-          JOIN current_insurance_plans AS insurance_plan
-            ON insurance_plan.dataset_id = network_plan.dataset_id
-           AND insurance_plan.source_id = affiliation_network.source_id
-           AND insurance_plan.resource_id = network_plan.insurance_plan_resource_id
-           AND {insurance_plan_active}
          WHERE affiliation_network.dataset_network_plan_complete
+    ), dataset_affiliation_plans AS MATERIALIZED (
+        SELECT candidate.source_id, candidate.affiliation_id,
+               insurance_plan.resource_id,
+               NULLIF(BTRIM({insurance_plan_identifier}), '')::varchar AS identifier,
+               'organization-affiliation-network-derived'::varchar AS provenance
+          FROM dataset_affiliation_plan_candidates AS candidate
+          JOIN {schema}.provider_directory_dataset_resource AS insurance_plan
+            ON insurance_plan.dataset_id = candidate.dataset_id
+           AND insurance_plan.resource_type = 'InsurancePlan'
+           AND insurance_plan.resource_id = candidate.resource_id
+           AND {insurance_plan_active}
     )
     """
 
@@ -2576,26 +2670,22 @@ def _provider_directory_affiliation_evidence_sql(
          {affiliation_ctes_sql},
          {plan_resolution_cte_sql}, {plan_cap_ctes_sql}, evidence AS (
         {evidence_union_sql}
+    ), evidence_count AS MATERIALIZED (
+        SELECT COUNT(*)::bigint AS evidence_row_total
+          FROM evidence
     )
     SELECT evidence.source_id, evidence.affiliation_id, evidence.evidence_type,
            evidence.resource_id, evidence.identifier, evidence.name, evidence.reference,
            evidence.provenance, evidence.plan_returned, evidence.plan_total,
            evidence.plan_truncated, evidence.catalog_complete,
-           plan.status AS plan_status, plan.name AS plan_name,
-           plan.aliases::jsonb AS plan_aliases, plan.type_codes::jsonb AS plan_type_codes,
-           plan.owned_by_ref AS plan_owned_by_ref,
-           plan.administered_by_ref AS plan_administered_by_ref,
-           plan.period_start AS plan_period_start, plan.period_end AS plan_period_end,
-           plan.product_identifiers::jsonb AS plan_product_identifiers,
-           plan.plan_backbones::jsonb AS plan_backbones, plan.coverage::jsonb AS plan_coverage,
-           plan.fhir_meta::jsonb AS plan_fhir_meta, plan.fhir_self_url AS plan_fhir_self_url,
-           plan.fhir_fetch_url AS plan_fhir_fetch_url,
-           plan.fhir_fetch_mode AS plan_fhir_fetch_mode,
-           COUNT(*) OVER ()::bigint AS evidence_row_total
+           {_provider_directory_plan_evidence_payload_sql("plan")} AS plan_payload_json,
+           evidence_count.evidence_row_total
       FROM evidence
- LEFT JOIN current_insurance_plans AS plan
+ CROSS JOIN evidence_count
+ LEFT JOIN current_resources AS plan
         ON evidence.evidence_type = 'insurance_plan'
        AND plan.source_id = evidence.source_id
+       AND plan.resource_type = 'InsurancePlan'
        AND plan.resource_id = evidence.resource_id
   ORDER BY CASE WHEN evidence.evidence_type = 'affiliation' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.affiliation_id, evidence.evidence_type, evidence.resource_id
@@ -8711,31 +8801,45 @@ async def _build_npi_details(
     # 'practice'/'site', so the legacy primary/secondary-only filter silently
     # dropped all TiC addresses. Widen the filter for the unified model only;
     # legacy NPIAddress behaviour is unchanged.
-    if address_model is EntityAddressUnified:
-        address_type_clause = address_table.c.type.in_(
-            ("primary", "secondary", "practice", "site")
+    def _address_type_clause(table: Any) -> Any:
+        if address_model is EntityAddressUnified:
+            return table.c.type.in_(
+                ("primary", "secondary", "practice", "site")
+            )
+        return or_(
+            table.c.type == "primary",
+            table.c.type == "secondary",
         )
-    else:
-        address_type_clause = or_(
-            address_table.c.type == "primary",
-            address_table.c.type == "secondary",
-        )
-    address_subquery_base = (
+
+    # Keep the serving-type predicate outside this optimization barrier. On
+    # PostgreSQL 18, combining it with NPI can otherwise select a ZIP-first
+    # partial-index skip scan instead of the direct NPI index.
+    npi_address_rows = (
         select(*address_columns)
-        .where((address_table.c.npi == npi) & address_type_clause)
+        .where(address_table.c.npi == npi)
+        .offset(0)
+        .subquery("npi_address_rows")
+    )
+    address_subquery_base = (
+        select(*npi_address_rows.c)
+        .where(_address_type_clause(npi_address_rows))
         # Deterministic order so address_offset paging is stable across requests.
         .order_by(
-            address_table.c.type,
-            address_table.c.first_line,
-            address_table.c.city_name,
+            npi_address_rows.c.type,
+            npi_address_rows.c.first_line,
+            npi_address_rows.c.city_name,
         )
     )
     address_total: int | None = None
     if address_limit is not None and include_address_total:
-        count_stmt = (
-            select(func.count())
-            .select_from(address_table)
-            .where((address_table.c.npi == npi) & address_type_clause)
+        count_npi_rows = (
+            select(address_table.c.type)
+            .where(address_table.c.npi == npi)
+            .offset(0)
+            .subquery("count_npi_address_rows")
+        )
+        count_stmt = select(func.count()).select_from(count_npi_rows).where(
+            _address_type_clause(count_npi_rows)
         )
         if session is not None:
             total_res = await session.execute(count_stmt)
@@ -8752,25 +8856,69 @@ async def _build_npi_details(
     except NameError:
         address_subquery = address_subquery_base
 
+    taxonomy_aggregate = (
+        select(
+            taxonomy_table.c.npi,
+            func.json_agg(
+                literal_column(
+                    f'distinct "{NPIDataTaxonomy.__tablename__}"'
+                )
+            ).label("rows"),
+        )
+        .select_from(taxonomy_table)
+        .where(taxonomy_table.c.npi == npi)
+        .group_by(taxonomy_table.c.npi)
+        .subquery("taxonomy_aggregate")
+    )
+    taxonomy_group_aggregate = (
+        select(
+            taxonomy_group_table.c.npi,
+            func.json_agg(
+                literal_column(
+                    f'distinct "{NPIDataTaxonomyGroup.__tablename__}"'
+                )
+            ).label("rows"),
+        )
+        .select_from(taxonomy_group_table)
+        .where(taxonomy_group_table.c.npi == npi)
+        .group_by(taxonomy_group_table.c.npi)
+        .subquery("taxonomy_group_aggregate")
+    )
     select_columns = [
         npi_data_table,
-        func.json_agg(literal_column(f'distinct "{NPIDataTaxonomy.__tablename__}"')),
-        func.json_agg(literal_column(f'distinct "{NPIDataTaxonomyGroup.__tablename__}"')),
+        taxonomy_aggregate.c.rows,
+        taxonomy_group_aggregate.c.rows,
     ]
-    join_clause = npi_data_table.outerjoin(taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi).outerjoin(
-        taxonomy_group_table,
-        npi_data_table.c.npi == taxonomy_group_table.c.npi,
+    join_clause = npi_data_table.outerjoin(
+        taxonomy_aggregate,
+        npi_data_table.c.npi == taxonomy_aggregate.c.npi,
+    ).outerjoin(
+        taxonomy_group_aggregate,
+        npi_data_table.c.npi == taxonomy_group_aggregate.c.npi,
     )
     if hasattr(address_subquery, "c"):
-        join_clause = join_clause.outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
-        select_columns.append(func.json_agg(literal_column('distinct "address_list"')))
+        address_aggregate = (
+            select(
+                address_subquery.c.npi,
+                func.json_agg(
+                    literal_column('distinct "address_list"')
+                ).label("rows"),
+            )
+            .select_from(address_subquery)
+            .group_by(address_subquery.c.npi)
+            .subquery("address_aggregate")
+        )
+        join_clause = join_clause.outerjoin(
+            address_aggregate,
+            npi_data_table.c.npi == address_aggregate.c.npi,
+        )
+        select_columns.append(address_aggregate.c.rows)
     else:
         select_columns.append(literal_column("NULL::json"))
     query = (
         db.select(*select_columns)
         .select_from(join_clause)
         .where(npi_data_table.c.npi == npi)
-        .group_by(npi_data_table.c.npi)
     )
 
     if session is not None:

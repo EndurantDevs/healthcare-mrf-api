@@ -1547,7 +1547,7 @@ async def test_build_npi_details_empty(monkeypatch):
     fake_db = FakeDB()
     monkeypatch.setattr(npi_module, 'db', fake_db)
     monkeypatch.setattr(npi_module.random, 'choice', lambda seq: seq[0])
-    monkeypatch.setattr(npi_module, 'select', lambda *_args, **_kwargs: FakeQuery([]))
+    # Keep SQLAlchemy select objects for the NPI-first optimization barrier.
 
     result = await npi_module._build_npi_details(123)
     assert result == {}
