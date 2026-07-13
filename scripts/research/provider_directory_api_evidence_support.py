@@ -14,8 +14,8 @@ from typing import Any, Callable, Mapping
 from scripts.research.provider_directory_api_evidence_typed import (
     MappedEvidenceWitness,
     NetworkWitness,
-    has_all_witness,
     has_detail_witness,
+    has_provider_search_witness,
     matching_source_summary_maps,
 )
 
@@ -289,8 +289,8 @@ def _evaluate_witness(
         f"providers/{witness.npi}",
         {"include_sources": "true", "include_evidence": "true"},
     )
-    all_result = api_client.get_json(
-        "providers/all",
+    search_result = api_client.get_json(
+        "providers",
         {
             "npi": str(witness.npi),
             "include_sources": "true",
@@ -305,10 +305,12 @@ def _evaluate_witness(
         "detail_within_latency_slo": is_within_latency_slo(
             detail_result, api_latency_slo_ms
         ),
-        "all": _http_summary(all_result),
-        "all_evidence_present": all_result.status_code == 200
-        and has_all_witness(all_result.payload, witness),
-        "all_within_latency_slo": is_within_latency_slo(all_result, api_latency_slo_ms),
+        "provider_search": _http_summary(search_result),
+        "provider_search_evidence_present": search_result.status_code == 200
+        and has_provider_search_witness(search_result.payload, witness),
+        "provider_search_within_latency_slo": is_within_latency_slo(
+            search_result, api_latency_slo_ms
+        ),
     }
 
 
@@ -316,8 +318,8 @@ def _is_witness_check_passing(witness_check: Mapping[str, Any]) -> bool:
     return bool(
         witness_check["detail_evidence_present"]
         and witness_check["detail_within_latency_slo"]
-        and witness_check["all_evidence_present"]
-        and witness_check["all_within_latency_slo"]
+        and witness_check["provider_search_evidence_present"]
+        and witness_check["provider_search_within_latency_slo"]
     )
 
 

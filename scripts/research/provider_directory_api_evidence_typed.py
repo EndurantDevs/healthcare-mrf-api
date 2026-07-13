@@ -94,21 +94,36 @@ def has_detail_witness(
     )
 
 
-def has_all_witness(
+def has_provider_search_witness(
     response_payload: Mapping[str, Any] | None,
     witness: MappedEvidenceWitness,
 ) -> bool:
-    """Return whether the providers/all response exposes one exact witness."""
+    """Return whether the provider collection exposes one exact witness."""
     if not isinstance(response_payload, Mapping):
         return False
     data_map = response_payload.get("data")
     response_map = data_map if isinstance(data_map, Mapping) else response_payload
-    provider_row_list = response_map.get("rows")
-    if not isinstance(provider_row_list, list):
+    provider_item_list = response_map.get("items")
+    if not isinstance(provider_item_list, list):
+        provider_item_list = response_map.get("rows")
+    if not isinstance(provider_item_list, list):
         return False
     return any(
-        _has_provider_row_witness(provider_row, witness)
-        for provider_row in provider_row_list
+        _has_provider_item_witness(provider_item, witness)
+        for provider_item in provider_item_list
+    )
+
+
+def _has_provider_item_witness(
+    provider_item: Any, witness: MappedEvidenceWitness
+) -> bool:
+    if _has_provider_row_witness(provider_item, witness):
+        return True
+    if not isinstance(provider_item, Mapping):
+        return False
+    address_list = provider_item.get("address_list")
+    return isinstance(address_list, list) and any(
+        _has_provider_row_witness(address_map, witness) for address_map in address_list
     )
 
 

@@ -105,21 +105,6 @@ def _candidate_payload(source_id):
     }
 
 
-def _all_payload(source_id, summary_map=None):
-    return {
-        "data": {
-            "rows": [
-                {
-                    "npi": 1234567890,
-                    "provider_directory_sources": [
-                        summary_map or _source_summary_map(source_id, source_ids=True)
-                    ],
-                }
-            ]
-        }
-    }
-
-
 class FakeConn:
     def __init__(self, rows):
         self.rows = rows

@@ -48,14 +48,18 @@ def _detail_payload():
     }
 
 
-def _all_payload(*, network_name="Example Network"):
+def _search_payload(*, network_name="Example Network"):
     return {
         "data": {
-            "rows": [
+            "items": [
                 {
                     "npi": 1234567890,
-                    "provider_directory_sources": [
-                        _source_summary_map(network_name=network_name)
+                    "address_list": [
+                        {
+                            "provider_directory_sources": [
+                                _source_summary_map(network_name=network_name)
+                            ]
+                        }
                     ],
                 }
             ]
@@ -128,15 +132,15 @@ class SequencedEvidenceConn:
 
 
 class TypedEvidenceClient:
-    def __init__(self, *, all_network_name="Example Network"):
+    def __init__(self, *, search_network_name="Example Network"):
         self.calls = []
-        self.all_network_name = all_network_name
+        self.search_network_name = search_network_name
 
     def get_json(self, path, params):
         self.calls.append((path, params))
         response_payload = (
-            _all_payload(network_name=self.all_network_name)
-            if path == "providers/all"
+            _search_payload(network_name=self.search_network_name)
+            if path == "providers"
             else _detail_payload()
         )
         return support.HttpResult(200, 1.0, response_payload)
@@ -193,7 +197,7 @@ async def test_mapped_witness_fetch_uses_exact_production_role_builder():
     assert witness_list_by_source[SOURCE_A] == [_typed_witness_list()[0]]
 
 
-def test_positive_typed_witnesses_pass_detail_and_all_surfaces():
+def test_positive_typed_witnesses_pass_detail_and_search_surfaces():
     """Both public provider surfaces must expose each exact typed witness."""
     selection = support.SourceSelection(
         "acquired",
@@ -218,8 +222,8 @@ def test_positive_typed_witnesses_pass_detail_and_all_surfaces():
     capability_by_name = source_result["mapped_evidence_capabilities"]
     assert capability_by_name["practitioner_role"]["state"] == "pass"
     assert capability_by_name["organization_affiliation"]["state"] == "pass"
-    all_call_list = [call for call in client.calls if call[0] == "providers/all"]
-    assert len(all_call_list) == 2
+    search_call_list = [call for call in client.calls if call[0] == "providers"]
+    assert len(search_call_list) == 2
 
 
 def test_default_gate_reports_typed_mismatch_without_failing_baseline():
@@ -230,7 +234,7 @@ def test_default_gate_reports_typed_mismatch_without_failing_baseline():
     source_result = support.evaluate_source(
         selection,
         [support.OverlaySample(SOURCE_A, 1234567890, None)],
-        TypedEvidenceClient(all_network_name=None),
+        TypedEvidenceClient(search_network_name=None),
         candidate_limit=5,
         api_latency_slo_ms=40.0,
         api_skip_reason=None,
@@ -240,7 +244,10 @@ def test_default_gate_reports_typed_mismatch_without_failing_baseline():
     assert source_result["status"] == "pass"
     capability_map = source_result["mapped_evidence_capabilities"]["practitioner_role"]
     assert capability_map["state"] == "fail"
-    assert source_result["mapped_evidence_checks"][0]["all_evidence_present"] is False
+    assert (
+        source_result["mapped_evidence_checks"][0]["provider_search_evidence_present"]
+        is False
+    )
 
 
 def test_declared_empty_and_undeclared_capability_states_do_not_fail_baseline():
