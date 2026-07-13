@@ -3814,6 +3814,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert counts["Organization"] == 1
     assert counts["OrganizationAffiliation"] == 0
     assert ProviderDirectoryOrganizationAffiliation not in upserts
+    assert "OrganizationAffiliation" not in diagnostics
     assert upserts[ProviderDirectoryOrganization][0]["npi"] == 1992793046
     assert diagnostics["Practitioner"]["complete"] is True
     assert diagnostics["Organization"]["rows_written"] == 1

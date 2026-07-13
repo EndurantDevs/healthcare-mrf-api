@@ -27345,7 +27345,7 @@ async def _import_alohr_graphql_source_group(
             "providerOrgs",
             "providerOrganizations",
             append_organization,
-            ("Organization", "Location", "OrganizationAffiliation"),
+            ("Organization", "Location"),
             ALOHR_ORGANIZATION_CHECKPOINT_RESOURCE,
         ),
     )

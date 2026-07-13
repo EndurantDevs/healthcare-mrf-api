@@ -30,7 +30,7 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "OAuth2 client credentials | Bulk" in rendered_document
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
     assert "_count=100 preserves Plan-Net network extensions; _count=75 returns false-empty search sets" in rendered_document
-    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole, OrganizationAffiliation" in rendered_document
+    assert "ALOHR (`alohr`) | Externally supported | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
     assert "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
     assert "AmeriHealth Caritas DC (`amerihealth-dc`) | Probe-only" in rendered_document
