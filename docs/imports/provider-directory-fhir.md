@@ -113,6 +113,24 @@ Use this sequence for a campaign or documentation review:
    lifecycle anchors; the CI job runs them with the other Provider Directory
    checks.
 
+5. After artifact publication and the unified refresh, verify current source
+   evidence through the client-facing API contract. The harness checks exact
+   source provenance on provider detail and phone-match responses, defaults to
+   the 40 ms API latency SLO, and exits nonzero when a maintained acquisition
+   source has no current evidence or fails an API check:
+
+   ```bash
+   PROVIDER_DIRECTORY_API_BASE_URL="$HEALTHPORTA_API_BASE_URL" \
+   PROVIDER_DIRECTORY_API_BEARER_TOKEN="$HEALTHPORTA_API_TOKEN" \
+   ./venv314/bin/python scripts/research/provider_directory_api_evidence_harness.py \
+     --max-sources 100
+   ```
+
+   Use `--data-only` when API credentials are intentionally unavailable. This
+   still fails maintained acquisition sources that have no current overlay
+   evidence; it skips only the HTTP checks. Use `--api-latency-slo-ms 0` only
+   for diagnostics where latency enforcement is deliberately disabled.
+
 ## Source
 
 The importer uses the public `provider-directory-db` SQLite catalog by default:
