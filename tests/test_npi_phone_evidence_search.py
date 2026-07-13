@@ -54,7 +54,7 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
 async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
     cigna_source = "pdfhir_cigna"
     contra_source = "pdfhir_contra"
-    candidate = {
+    candidate_dict = {
         "source_record_ids": [
             f"provider_directory_fhir:organization_address:{cigna_source}:org-1:1"
         ],
@@ -66,7 +66,7 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
             ),
         ],
     }
-    source_details = {
+    source_details_by_id = {
         cigna_source: {
             "source_id": cigna_source,
             "endpoint_id": "endpoint-cigna",
@@ -78,14 +78,14 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
             "canonical_api_base": "https://contra.example/fhir",
         },
     }
-    fetch_details = AsyncMock(return_value=source_details)
+    fetch_details = AsyncMock(return_value=source_details_by_id)
     monkeypatch.setattr(
         npi_module,
         "_fetch_provider_directory_source_detail_map",
         fetch_details,
     )
 
-    await npi_module._attach_provider_directory_source_details([candidate])
+    await npi_module._attach_provider_directory_source_details([candidate_dict])
 
     fetch_details.assert_awaited_once_with(
         [cigna_source, contra_source],
@@ -93,7 +93,7 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
     )
     attached_source_ids = {
         source_id
-        for endpoint in candidate["provider_directory_sources"]
+        for endpoint in candidate_dict["provider_directory_sources"]
         for source_id in endpoint["source_ids"]
     }
     assert attached_source_ids == {cigna_source, contra_source}

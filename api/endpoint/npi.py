@@ -137,7 +137,6 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
-PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY = "phone_source_record_ids"
 PROVIDER_DIRECTORY_CATALOG_ALIAS_COLUMNS = (
     # Catalog labels describe ingestion aliases, not provider-verified products.
     "source_id",
@@ -898,7 +897,7 @@ def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]
 def _provider_directory_record_ids_from_address(address: Mapping[str, Any]) -> list[Any]:
     return _merge_unique_list_values(
         address.get("source_record_ids"),
-        address.get(PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY),
+        address.get("phone_source_record_ids"),
     )
 
 
@@ -5256,19 +5255,17 @@ def _match_candidate_output(
     if params.get("include_sources") and fhir_sources:
         candidate["provider_directory_sources"] = fhir_sources
     if params.get("include_evidence"):
-        evidence = {
+        evidence_dict = {
             "provider_enrichment_summary": dict(enrichment or {}),
             "source_record_ids": _json_array_value(row.get("source_record_ids")),
             "address_sources": address_sources,
         }
         phone_source_record_ids = _json_array_value(
-            row.get(PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY)
+            row.get("phone_source_record_ids")
         )
         if phone_source_record_ids:
-            evidence[PROVIDER_DIRECTORY_PHONE_SOURCE_RECORD_IDS_KEY] = (
-                phone_source_record_ids
-            )
-        candidate["evidence"] = evidence
+            evidence_dict["phone_source_record_ids"] = phone_source_record_ids
+        candidate["evidence"] = evidence_dict
     return {key: value for key, value in candidate.items() if value is not None}
 
 
