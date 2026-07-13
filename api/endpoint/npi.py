@@ -9396,7 +9396,10 @@ def _provider_directory_overlay_query_sql(
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
              WHERE overlay.npi = :npi
-               AND (:address_key IS NULL OR overlay.address_key = :address_key)
+               AND (
+                   CAST(:address_key AS uuid) IS NULL
+                   OR overlay.address_key = CAST(:address_key AS uuid)
+               )
         )
         SELECT
             npi,

@@ -29,6 +29,16 @@ def test_npi_detail_cache_key_tracks_exact_address_key():
     assert unfiltered_key != exact_address_key
 
 
+def test_overlay_query_types_optional_address_key_as_uuid():
+    """Give PostgreSQL a stable type for nullable exact-address parameters."""
+    sql = npi_module._provider_directory_overlay_query_sql(
+        {"lat", "long", "address_key"}
+    )
+
+    assert sql.count("CAST(:address_key AS uuid)") == 2
+    assert ":address_key IS NULL" not in sql
+
+
 def _address_key_detail_payloads(address_key):
     """Return deterministic base and overlay fixtures for exact-address detail."""
     return (
